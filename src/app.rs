@@ -634,7 +634,8 @@ fn push_command_output_block(
 ) {
     let running = is_running_activity(item);
     let marker = if running { active_spinner() } else { "▸" };
-    let state = if running { "running" } else { "collapsed" };
+    let state = tool_block_state_label(item, running);
+    let state_style = tool_block_state_style(item, running, palette);
     let duration = item
         .duration_ms
         .map(format_duration_ms)
@@ -651,7 +652,9 @@ fn push_command_output_block(
             item.title.clone(),
             palette.text().add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("  {state}{duration}"), palette.muted()),
+        Span::styled("  ", palette.muted()),
+        Span::styled(state, state_style),
+        Span::styled(duration, palette.muted()),
     ]));
 
     if let Some(invocation) = tool_invocation_text(item) {
@@ -687,6 +690,11 @@ fn push_command_output_block(
         .filter(|output| !output.trim().is_empty())
     {
         push_tool_output_preview(lines, palette, output_preview);
+    } else if !running {
+        lines.push(Line::from(vec![
+            Span::styled("    │ ", palette.border()),
+            Span::styled("details collapsed", palette.muted()),
+        ]));
     }
 
     let mut metadata = Vec::new();
@@ -704,6 +712,32 @@ fn push_command_output_block(
             Span::styled("    ", palette.border()),
             Span::styled(metadata.join(" | "), palette.muted()),
         ]));
+    }
+}
+
+fn tool_block_state_label(item: &ActivityItem, running: bool) -> &'static str {
+    if running {
+        return "running";
+    }
+    if matches!(item.success, Some(false)) || matches!(item.status.as_str(), "failed" | "error") {
+        return "failed";
+    }
+    if item
+        .output_preview
+        .as_deref()
+        .is_some_and(|output| !output.trim().is_empty())
+    {
+        return "preview";
+    }
+    "collapsed"
+}
+
+fn tool_block_state_style(item: &ActivityItem, running: bool, palette: Palette) -> Style {
+    match tool_block_state_label(item, running) {
+        "running" => palette.selected(),
+        "failed" => Style::default().fg(palette.danger),
+        "preview" => Style::default().fg(palette.success),
+        _ => palette.muted(),
     }
 }
 
@@ -886,6 +920,11 @@ fn push_inline_progress_card(lines: &mut Vec<Line<'static>>, palette: Palette, a
     if running.is_empty() && app.active_turn().is_none() {
         return;
     }
+    let status_text = if running.is_empty() {
+        "Thinking".to_string()
+    } else {
+        app.status.clone()
+    };
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
@@ -894,7 +933,7 @@ fn push_inline_progress_card(lines: &mut Vec<Line<'static>>, palette: Palette, a
         Span::styled("  ", palette.muted()),
         Span::styled(active_spinner(), palette.selected()),
         Span::styled(" ", palette.muted()),
-        Span::styled(app.status.clone(), palette.text()),
+        Span::styled(status_text, palette.text()),
     ]));
 
     for item in running.into_iter().rev() {
@@ -1471,6 +1510,11 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
         ),
         Span::styled(" | state ", palette.title().bg(palette.surface_alt)),
         Span::styled(
+            run_state_marker(&app.run_state).to_string(),
+            run_state_style(&app.run_state, palette).bg(palette.surface_alt),
+        ),
+        Span::styled(" ", palette.muted().bg(palette.surface_alt)),
+        Span::styled(
             app.run_state.label().to_string(),
             run_state_style(&app.run_state, palette).bg(palette.surface_alt),
         ),
@@ -1504,6 +1548,16 @@ fn run_state_style(state: &SessionRunState, palette: Palette) -> Style {
         SessionRunState::Error { .. } => Style::default()
             .fg(palette.danger)
             .add_modifier(Modifier::BOLD),
+    }
+}
+
+fn run_state_marker(state: &SessionRunState) -> &'static str {
+    match state {
+        SessionRunState::InProgress => active_spinner(),
+        SessionRunState::Blocked { .. } => "!",
+        SessionRunState::Success => "✓",
+        SessionRunState::Error { .. } => "x",
+        SessionRunState::Idle => "·",
     }
 }
 
@@ -2256,7 +2310,8 @@ mod tests {
         assert!(text.contains("Progress"));
         assert!(text.contains("call call-1"));
         assert!(text.contains("gpt-5-codex"));
-        assert!(text.contains("state running"));
+        assert!(text.contains("state"));
+        assert!(text.contains("running"));
         assert!(text.contains("approval gated"));
         assert!(text.contains("1 msgs/0 tasks"));
     }
@@ -2303,6 +2358,86 @@ mod tests {
         assert!(text.contains("18ms"));
         assert!(!text.contains("Command  ▸ shell"));
         assert!(!text.contains("Tool  ▸ write_file"));
+    }
+
+    #[test]
+    fn render_tool_blocks_show_state_preview_failure_and_collapsed_detail() {
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("show tool states")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_turn(turn_id.clone())
+                .with_tool_call("preview-1")
+                .with_detail("cargo test")
+                .with_output_preview("6 passed")
+                .with_success(true)
+                .with_duration_ms(1200),
+        );
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "failed")
+                .with_turn(turn_id.clone())
+                .with_tool_call("fail-1")
+                .with_detail("npm install")
+                .with_success(false)
+                .with_duration_ms(70_000),
+        );
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "read_file", "complete")
+                .with_turn(turn_id)
+                .with_tool_call("collapsed-1")
+                .with_detail("src/lib.rs")
+                .with_success(true),
+        );
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("preview"));
+        assert!(text.contains("failed"));
+        assert!(text.contains("details collapsed"));
+        assert!(text.contains("elapsed 70s"));
+        assert!(text.contains("6 passed"));
+    }
+
+    #[test]
+    fn render_active_turn_progress_uses_spinner_without_logs_or_timestamps() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("think")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: TurnId::new(),
+                    text: String::new(),
+                }),
+            }],
+            0,
+            "Queued turn/start".into(),
+            None,
+            false,
+        );
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("Progress"));
+        assert!(text.contains("Thinking"));
+        assert!(!text.contains("INFO "));
+        assert!(!text.contains("2026-"));
+        assert!(!text.contains("tool_ids="));
     }
 
     #[test]
