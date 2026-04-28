@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
@@ -43,11 +43,7 @@ fn inspector_visible(app: &AppState) -> bool {
 }
 
 fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
-    let composer_height = if app.pending_messages.is_empty() {
-        3
-    } else {
-        6
-    };
+    let composer_height = composer_height(app);
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -59,15 +55,12 @@ fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
 
     frame.render_widget(render_transcript(app, palette, root[0].height), root[0]);
     frame.render_widget(render_composer(app, palette), root[1]);
+    set_composer_cursor(frame, app, root[1]);
     frame.render_widget(render_status(app, palette), root[2]);
 }
 
 fn render_inspector_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
-    let composer_height = if app.pending_messages.is_empty() {
-        4
-    } else {
-        7
-    };
+    let composer_height = composer_height(app);
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -112,7 +105,20 @@ fn render_inspector_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palet
     frame.render_widget(render_workspace(app, palette, right[1].height), right[1]);
     frame.render_widget(render_git(app, palette, right[2].height), right[2]);
     frame.render_widget(render_composer(app, palette), root[1]);
+    set_composer_cursor(frame, app, root[1]);
     frame.render_widget(render_status(app, palette), root[2]);
+}
+
+fn composer_height(app: &AppState) -> u16 {
+    let pending_rows = if app.pending_messages.is_empty() {
+        0
+    } else {
+        let shown_messages = app.pending_messages.len().min(2) as u16;
+        let overflow_row = u16::from(app.pending_messages.len() > 2);
+        1 + shown_messages + overflow_row
+    };
+
+    pending_rows + 5
 }
 
 fn is_running_activity(item: &ActivityItem) -> bool {
@@ -1320,17 +1326,6 @@ fn render_git(app: &AppState, palette: Palette, area_height: u16) -> Paragraph<'
 }
 
 fn render_composer(app: &AppState, palette: Palette) -> Paragraph<'static> {
-    let hint = if app.composer.is_empty() {
-        "Ask Octos to change code...".to_string()
-    } else {
-        app.composer.clone()
-    };
-    let style = if app.composer.is_empty() {
-        palette.muted()
-    } else {
-        palette.text()
-    };
-
     let mut lines = Vec::new();
     if !app.pending_messages.is_empty() {
         lines.push(Line::from(vec![Span::styled(
@@ -1350,10 +1345,27 @@ fn render_composer(app: &AppState, palette: Palette) -> Paragraph<'static> {
             )]));
         }
     }
+    lines.push(Line::from(Span::styled(
+        " ",
+        palette.text().bg(palette.surface),
+    )));
     lines.push(Line::from(vec![
         Span::styled(" › ", palette.selected().bg(palette.surface)),
-        Span::styled(hint, style.bg(palette.surface)),
+        Span::styled(app.composer.clone(), palette.text().bg(palette.surface)),
+        Span::styled("▌", palette.selected().bg(palette.surface)),
+        if app.composer.is_empty() {
+            Span::styled(
+                " Ask Octos to change code...",
+                palette.muted().bg(palette.surface),
+            )
+        } else {
+            Span::styled("", palette.text().bg(palette.surface))
+        },
     ]));
+    lines.push(Line::from(Span::styled(
+        " ",
+        palette.text().bg(palette.surface),
+    )));
 
     Paragraph::new(Text::from(lines))
         .style(Style::default().fg(palette.text).bg(palette.surface))
@@ -1367,6 +1379,38 @@ fn render_composer(app: &AppState, palette: Palette) -> Paragraph<'static> {
             .border_style(palette.border()),
         )
         .wrap(Wrap { trim: false })
+}
+
+fn set_composer_cursor(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
+    if app.focus != FocusPane::Composer {
+        return;
+    }
+    if let Some(position) = composer_cursor_position(app, area) {
+        frame.set_cursor_position(position);
+    }
+}
+
+fn composer_cursor_position(app: &AppState, area: Rect) -> Option<Position> {
+    if area.width <= 2 || area.height <= 2 {
+        return None;
+    }
+
+    let pending_rows = if app.pending_messages.is_empty() {
+        0
+    } else {
+        let shown_messages = app.pending_messages.len().min(2) as u16;
+        let overflow_row = u16::from(app.pending_messages.len() > 2);
+        1 + shown_messages + overflow_row
+    };
+    let input_y = area.y + 2 + pending_rows;
+    if input_y >= area.y + area.height.saturating_sub(1) {
+        return None;
+    }
+
+    let text_width = app.composer.chars().count() as u16;
+    let inner_right = area.x + area.width.saturating_sub(2);
+    let input_x = area.x + 4 + text_width;
+    Some(Position::new(input_x.min(inner_right), input_y))
 }
 
 fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
@@ -1826,15 +1870,28 @@ mod tests {
         Message, SessionKey,
         ui_protocol::{ApprovalId, PreviewId, TaskRuntimeState, TurnId},
     };
-    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+    use ratatui::{
+        Terminal,
+        backend::{Backend, TestBackend},
+        buffer::Buffer,
+        layout::Position,
+    };
 
     fn rendered_buffer(app: &AppState, palette: Palette) -> Buffer {
+        rendered_buffer_and_cursor(app, palette).0
+    }
+
+    fn rendered_buffer_and_cursor(app: &AppState, palette: Palette) -> (Buffer, Position) {
         let backend = TestBackend::new(120, 42);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| render(frame, app, palette))
             .expect("render succeeds");
-        terminal.backend().buffer().clone()
+        let cursor = terminal
+            .backend_mut()
+            .get_cursor_position()
+            .expect("cursor position");
+        (terminal.backend().buffer().clone(), cursor)
     }
 
     fn rendered_text(app: &AppState) -> String {
@@ -2055,6 +2112,70 @@ mod tests {
         let pending_style =
             style_for_text(&buffer, "it did not do error recovery?").expect("pending style");
         assert_eq!(pending_style.bg, Some(palette.surface));
+    }
+
+    #[test]
+    fn render_composer_is_tall_and_places_cursor_in_input() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.composer = "fix tests".into();
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let (buffer, cursor) = rendered_buffer_and_cursor(&app, palette);
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert_eq!(composer_height(&app), 5);
+        assert!(text.contains("fix tests▌"));
+        assert_eq!(
+            cursor,
+            composer_cursor_position(&app, Rect::new(0, 36, 120, 5)).expect("cursor")
+        );
+    }
+
+    #[test]
+    fn render_empty_composer_shows_cursor_before_hint() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let (buffer, cursor) = rendered_buffer_and_cursor(&app, palette);
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("› ▌ Ask Octos to change code"));
+        assert_eq!(
+            cursor,
+            composer_cursor_position(&app, Rect::new(0, 36, 120, 5)).expect("cursor")
+        );
     }
 
     #[test]
