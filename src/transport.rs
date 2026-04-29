@@ -13,11 +13,12 @@ use octos_core::app_ui::{
 use octos_core::ui_protocol::{
     ApprovalCommandDetails, ApprovalDiffDetails, ApprovalFilesystemDetails, ApprovalNetworkDetails,
     ApprovalRequestedEvent, ApprovalSandboxDetails, ApprovalSandboxEscalationDetails,
-    ApprovalSandboxEscalationEndpoint, ApprovalTypedDetails, MessageDeltaEvent, OutputCursor,
-    PreviewId, SessionOpened, TaskOutputDeltaEvent, TaskOutputReadResult, TaskRuntimeState,
-    TaskUpdatedEvent, ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent,
-    TurnId, TurnStartedEvent, UiCursor, UiNotification, UiProgressEvent, WarningEvent,
-    approval_kinds, methods,
+    ApprovalSandboxEscalationEndpoint, ApprovalScopesListResult, ApprovalTypedDetails,
+    MessageDeltaEvent, OutputCursor, PreviewId, SessionOpenResult, SessionOpened,
+    TaskOutputDeltaEvent, TaskOutputReadResult, TaskRuntimeState, TaskUpdatedEvent,
+    ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnId,
+    TurnStartedEvent, UiCursor, UiNotification, WarningEvent, approval_kinds, methods,
+    rpc_error_codes,
 };
 use octos_core::ui_protocol::{
     JSON_RPC_VERSION, RpcRequest, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
@@ -25,7 +26,6 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_V1,
 };
 use octos_core::{Message, SessionKey, TaskId};
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::{net::TcpStream, runtime::Runtime};
 use tokio_tungstenite::{
@@ -381,6 +381,7 @@ impl ProtocolAppUiBackend {
             }
             AppUiCommand::InterruptTurn(_)
             | AppUiCommand::RespondApproval(_)
+            | AppUiCommand::ListApprovalScopes(_)
             | AppUiCommand::GetDiffPreview(_)
             | AppUiCommand::ReadTaskOutput(_) => {
                 self.queue.push_back(
@@ -610,6 +611,7 @@ fn rpc_request_from_command(
         AppUiCommand::SubmitPrompt(params) => serde_json::to_value(params),
         AppUiCommand::InterruptTurn(params) => serde_json::to_value(params),
         AppUiCommand::RespondApproval(params) => serde_json::to_value(params),
+        AppUiCommand::ListApprovalScopes(params) => serde_json::to_value(params),
         AppUiCommand::GetDiffPreview(params) => serde_json::to_value(params),
         AppUiCommand::ReadTaskOutput(params) => serde_json::to_value(params),
     }
@@ -779,6 +781,21 @@ fn success_response_to_app_event(
     };
 
     match pending_request.method.as_str() {
+        methods::SESSION_OPEN => match serde_json::from_value::<SessionOpenResult>(result) {
+            Ok(result) => Ok(Some(
+                AppUiEvent::Protocol(UiNotification::SessionOpened(result.opened)).into(),
+            )),
+            Err(err) => Ok(Some(
+                app_error(
+                    "invalid_result",
+                    format!(
+                        "failed to decode UI protocol result for {}: {err}",
+                        methods::SESSION_OPEN
+                    ),
+                )
+                .into(),
+            )),
+        },
         methods::DIFF_PREVIEW_GET => match serde_json::from_value::<DiffPreviewGetResult>(result) {
             Ok(result) => Ok(Some(ClientEvent::DiffPreview(result))),
             Err(err) => Ok(Some(
@@ -828,7 +845,36 @@ fn success_response_to_app_event(
             })
             .into(),
         )),
+        methods::APPROVAL_SCOPES_LIST => {
+            match serde_json::from_value::<ApprovalScopesListResult>(result) {
+                Ok(result) => Ok(Some(
+                    AppUiEvent::Status(AppUiStatus {
+                        message: approval_scopes_status(&result),
+                    })
+                    .into(),
+                )),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            methods::APPROVAL_SCOPES_LIST
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
         _ => Ok(None),
+    }
+}
+
+fn approval_scopes_status(result: &ApprovalScopesListResult) -> String {
+    let count = result.scopes.len();
+    match count {
+        0 => "No persisted approval scopes for this session".into(),
+        1 => "1 persisted approval scope for this session".into(),
+        _ => format!("{count} persisted approval scopes for this session"),
     }
 }
 
@@ -938,55 +984,21 @@ fn response_id(
 }
 
 fn notification_to_app_event(method: &str, params: Value) -> AppUiEvent {
-    let notification = match method {
-        methods::SESSION_OPEN => decode_params(method, params).map(UiNotification::SessionOpened),
-        methods::TURN_STARTED => decode_params(method, params).map(UiNotification::TurnStarted),
-        methods::TURN_COMPLETED => decode_params(method, params).map(UiNotification::TurnCompleted),
-        methods::TURN_ERROR => decode_params(method, params).map(UiNotification::TurnError),
-        methods::MESSAGE_DELTA => decode_params(method, params).map(UiNotification::MessageDelta),
-        methods::TOOL_STARTED => decode_params(method, params).map(UiNotification::ToolStarted),
-        methods::TOOL_PROGRESS => decode_params(method, params).map(UiNotification::ToolProgress),
-        methods::TOOL_COMPLETED => decode_params(method, params).map(UiNotification::ToolCompleted),
-        methods::APPROVAL_REQUESTED => {
-            decode_params(method, params).map(UiNotification::ApprovalRequested)
-        }
-        methods::TASK_UPDATED => decode_params(method, params).map(UiNotification::TaskUpdated),
-        methods::TASK_OUTPUT_DELTA => {
-            decode_params(method, params).map(UiNotification::TaskOutputDelta)
-        }
-        methods::WARNING => decode_params(method, params).map(UiNotification::Warning),
-        methods::PROGRESS_UPDATED => {
-            return match decode_params::<UiProgressEvent>(method, params) {
-                Ok(progress) => AppUiEvent::Progress(progress),
-                Err(err) => app_error(
-                    "invalid_params",
-                    format!("failed to decode UI protocol params for {method}: {err}"),
-                ),
-            };
-        }
-        _ => {
-            return app_error(
-                "unknown_notification",
-                format!("unknown UI protocol notification: {method}"),
-            );
-        }
-    };
-
-    match notification {
+    match UiNotification::from_method_and_params(method, params) {
+        Ok(UiNotification::ProgressUpdated(progress)) => AppUiEvent::Progress(progress),
         Ok(notification) => AppUiEvent::Protocol(notification),
+        Err(err) if err.code == rpc_error_codes::METHOD_NOT_FOUND => app_error(
+            "unknown_notification",
+            format!("unknown UI protocol notification: {method}"),
+        ),
         Err(err) => app_error(
             "invalid_params",
-            format!("failed to decode UI protocol params for {method}: {err}"),
+            format!(
+                "failed to decode UI protocol params for {method}: {}",
+                err.message
+            ),
         ),
     }
-}
-
-fn decode_params<T>(method: &str, params: Value) -> Result<T>
-where
-    T: DeserializeOwned,
-{
-    serde_json::from_value(params)
-        .wrap_err_with(|| format!("failed to decode UI protocol params for {method}"))
 }
 
 fn rpc_error_code(error: &Value) -> String {
@@ -1269,6 +1281,15 @@ impl AppUiBackend for MockAppUiBackend {
                 }));
                 Ok(())
             }
+            AppUiCommand::ListApprovalScopes(_) => {
+                self.queue.push_back(
+                    AppUiEvent::Status(AppUiStatus {
+                        message: "Mock backend has no persisted approval scopes.".into(),
+                    })
+                    .into(),
+                );
+                Ok(())
+            }
             AppUiCommand::GetDiffPreview(params) => {
                 self.queue
                     .push_back(ClientEvent::DiffPreview(DiffPreviewGetResult {
@@ -1495,8 +1516,9 @@ fn mock_diff_preview(session_id: SessionKey, preview_id: PreviewId) -> DiffPrevi
 mod tests {
     use super::*;
     use octos_core::ui_protocol::{
-        ApprovalDecision, ApprovalRespondParams, DiffPreviewGetParams, InputItem, PreviewId,
-        SessionOpenParams, TaskOutputReadParams, TurnInterruptParams, TurnStartParams,
+        ApprovalDecision, ApprovalRespondParams, ApprovalScopesListParams, DiffPreviewGetParams,
+        InputItem, PreviewId, SessionOpenParams, TaskOutputReadParams, TurnInterruptParams,
+        TurnStartParams,
     };
     use serde_json::json;
 
@@ -1528,6 +1550,23 @@ mod tests {
         assert!(request.params.get("kind").is_none());
         assert_eq!(request.params["input"][0]["kind"], "text");
         assert_eq!(request.params["input"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn protocol_command_serializes_approval_scopes_list() {
+        let request = rpc_request_from_command(
+            "tui-8".into(),
+            AppUiCommand::ListApprovalScopes(ApprovalScopesListParams {
+                session_id: SessionKey("local:test".into()),
+            }),
+        )
+        .expect("request encodes");
+
+        assert_eq!(request.jsonrpc, "2.0");
+        assert_eq!(request.id, "tui-8");
+        assert_eq!(request.method, methods::APPROVAL_SCOPES_LIST);
+        assert_eq!(request.params["session_id"], "local:test");
+        assert!(request.params.get("kind").is_none());
     }
 
     #[test]
@@ -1771,6 +1810,99 @@ mod tests {
         assert_eq!(result.source, "future_cache");
         assert_eq!(result.preview.files[0].status, "copied");
         assert_eq!(result.preview.files[0].hunks[0].lines[0].kind, "metadata");
+        assert!(backend.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn protocol_backend_maps_session_open_result_to_opened_notification() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            base_url: Some("wss://example.test/ui-protocol".into()),
+            ..AppUiLaunch::default()
+        });
+        let session_id = SessionKey("local:test".into());
+        let request = backend
+            .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                session_id: session_id.clone(),
+                profile_id: Some("coding".into()),
+                cwd: Some("/repo".into()),
+                after: None,
+            }))
+            .expect("request builds");
+
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": {
+                "opened": {
+                    "session_id": session_id,
+                    "active_profile_id": "coding",
+                    "workspace_root": "/repo",
+                    "cursor": {
+                        "stream": "session_events",
+                        "seq": 11
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let event = backend
+            .decode_rpc_text(&frame)
+            .expect("session open response decodes")
+            .expect("session opened event");
+        let event = unwrap_app_event(event);
+
+        let AppUiEvent::Protocol(UiNotification::SessionOpened(opened)) = event else {
+            panic!("expected session opened notification");
+        };
+        assert_eq!(opened.session_id.0, "local:test");
+        assert_eq!(opened.workspace_root.as_deref(), Some("/repo"));
+        assert_eq!(opened.cursor.as_ref().map(|cursor| cursor.seq), Some(11));
+        assert!(backend.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn protocol_backend_maps_approval_scopes_list_success_to_status() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            base_url: Some("wss://example.test/ui-protocol".into()),
+            ..AppUiLaunch::default()
+        });
+        let session_id = SessionKey("local:test".into());
+        let request = backend
+            .build_tracked_request(AppUiCommand::ListApprovalScopes(
+                ApprovalScopesListParams {
+                    session_id: session_id.clone(),
+                },
+            ))
+            .expect("request builds");
+
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": {
+                "scopes": [{
+                    "session_id": session_id,
+                    "scope": "session",
+                    "scope_match": "cargo test",
+                    "decision": "approve"
+                }]
+            }
+        })
+        .to_string();
+
+        let event = backend
+            .decode_rpc_text(&frame)
+            .expect("approval scopes response decodes")
+            .expect("status event");
+        let event = unwrap_app_event(event);
+
+        let AppUiEvent::Status(status) = event else {
+            panic!("expected status event");
+        };
+        assert_eq!(
+            status.message,
+            "1 persisted approval scope for this session"
+        );
         assert!(backend.pending_requests.is_empty());
     }
 

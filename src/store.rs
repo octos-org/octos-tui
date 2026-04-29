@@ -1,6 +1,7 @@
 use octos_core::app_ui::{AppUiCommand, AppUiEvent, AppUiSnapshot};
 use octos_core::ui_protocol::{
-    ApprovalRespondParams, DiffPreviewGetParams, InputItem, MessageDeltaEvent,
+    ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
+    ApprovalRespondParams, DiffPreviewGetParams, InputItem, MessageDeltaEvent, ReplayLossyEvent,
     TaskOutputDeltaEvent, TaskOutputReadParams, TaskUpdatedEvent, TurnCompletedEvent,
     TurnErrorEvent, TurnInterruptParams, TurnStartParams, UiNotification, UiProgressEvent,
 };
@@ -584,7 +585,85 @@ impl Store {
             }
             UiNotification::TurnCompleted(event) => self.commit_live_reply(event),
             UiNotification::TurnError(event) => self.fail_live_reply(event),
+            UiNotification::ApprovalAutoResolved(event) => self.apply_approval_auto_resolved(event),
+            UiNotification::ApprovalDecided(event) => self.apply_approval_decided(event),
+            UiNotification::ApprovalCancelled(event) => self.apply_approval_cancelled(event),
+            UiNotification::ProgressUpdated(event) => self.apply_progress(event),
+            UiNotification::ReplayLossy(event) => self.apply_replay_lossy(event),
         }
+    }
+
+    fn apply_approval_auto_resolved(
+        &mut self,
+        event: ApprovalAutoResolvedEvent,
+    ) -> Option<AppUiCommand> {
+        let decision = event.decision.as_wire_str().to_owned();
+        let scope = event.scope.clone();
+        let scope_match = event.scope_match.clone();
+        let tool_name = event.tool_name.clone();
+        let cleared = self.clear_matching_approval(&event.approval_id);
+        self.state.push_activity(
+            ActivityItem::new(ActivityKind::Approval, tool_name, format!("auto-resolved {decision}"))
+                .with_turn(event.turn_id)
+                .with_detail(format!("scope={scope} match={scope_match}")),
+        );
+        if cleared {
+            self.state.set_run_state_in_progress();
+        }
+        self.state.status = format!("Approval auto-resolved ({decision}) by scope policy");
+        None
+    }
+
+    fn apply_approval_decided(&mut self, event: ApprovalDecidedEvent) -> Option<AppUiCommand> {
+        let decision = event.decision.as_wire_str().to_owned();
+        let detail = if event.auto_resolved {
+            format!("auto-resolved by {}", event.decided_by)
+        } else {
+            format!("decided by {}", event.decided_by)
+        };
+        let cleared = self.clear_matching_approval(&event.approval_id);
+        self.state.push_activity(
+            ActivityItem::new(ActivityKind::Approval, "decision", decision.clone())
+                .with_turn(event.turn_id)
+                .with_detail(detail.clone()),
+        );
+        if cleared {
+            self.state.set_run_state_in_progress();
+        }
+        self.state.status = format!("Approval decided: {decision} ({detail})");
+        None
+    }
+
+    fn apply_approval_cancelled(&mut self, event: ApprovalCancelledEvent) -> Option<AppUiCommand> {
+        let reason = event.reason.clone();
+        let cleared = self.clear_matching_approval(&event.approval_id);
+        self.state.push_activity(
+            ActivityItem::new(ActivityKind::Approval, "cancelled", reason.clone())
+                .with_turn(event.turn_id),
+        );
+        if cleared {
+            self.state.set_run_state_in_progress();
+        }
+        self.state.status = format!("Approval cancelled: {reason}");
+        None
+    }
+
+    fn apply_replay_lossy(&mut self, event: ReplayLossyEvent) -> Option<AppUiCommand> {
+        let cursor_hint = event
+            .last_durable_cursor
+            .as_ref()
+            .map(|cursor| format!(" (last durable seq {})", cursor.seq))
+            .unwrap_or_default();
+        let message = format!(
+            "Replay lossy: {} dropped{cursor_hint}; reconnect to rehydrate",
+            event.dropped_count,
+        );
+        self.state.push_activity(
+            ActivityItem::new(ActivityKind::Warning, "replay_lossy", message.clone())
+                .with_detail("durable cursor diverged"),
+        );
+        self.state.status = message;
+        None
     }
 
     fn apply_task_update(&mut self, event: TaskUpdatedEvent) {
@@ -731,6 +810,18 @@ impl Store {
             .sessions
             .iter_mut()
             .find(|session| &session.id == session_id)
+    }
+
+    fn clear_matching_approval(&mut self, approval_id: &ApprovalId) -> bool {
+        let matches = self
+            .state
+            .approval
+            .as_ref()
+            .is_some_and(|approval| &approval.approval_id == approval_id);
+        if matches {
+            self.state.approval = None;
+        }
+        matches
     }
 
     fn find_task_mut(
@@ -971,10 +1062,11 @@ mod tests {
     use super::*;
     use octos_core::SessionKey;
     use octos_core::ui_protocol::{
-        ApprovalDecision, ApprovalDiffDetails, ApprovalId, ApprovalRequestedEvent,
-        ApprovalTypedDetails, OutputCursor, PreviewId, TaskRuntimeState, ToolCompletedEvent,
-        ToolStartedEvent, TurnId, UiFileMutationNotice, UiProgressMetadata, approval_kinds,
-        approval_scopes, progress_kinds,
+        ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalDecision,
+        ApprovalDiffDetails, ApprovalId, ApprovalRequestedEvent, ApprovalTypedDetails,
+        OutputCursor, PreviewId, ReplayLossyEvent, TaskRuntimeState, ToolCompletedEvent,
+        ToolStartedEvent, TurnId, UiCursor, UiFileMutationNotice, UiProgressMetadata,
+        approval_kinds, approval_scopes, progress_kinds,
     };
 
     fn store_with_live_reply(turn_id: TurnId, text: impl Into<String>) -> Store {
@@ -1260,6 +1352,101 @@ mod tests {
             Some(approval_scopes::REQUEST)
         );
         assert_eq!(store.state.status, "Approval denied: Run command");
+    }
+
+    #[test]
+    fn approval_lifecycle_notifications_clear_matching_modal() {
+        let mut store = store_with_empty_session();
+        let (session_id, approval_id) = open_generic_approval(&mut store);
+        assert!(store.state.approval.is_some());
+        assert_eq!(store.state.run_state.label(), "blocked");
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalDecided(
+            ApprovalDecidedEvent::manual(
+                session_id,
+                approval_id,
+                TurnId::new(),
+                ApprovalDecision::Approve,
+                "server",
+            ),
+        )));
+
+        assert!(store.state.approval.is_none());
+        assert_eq!(store.state.run_state.label(), "running");
+        assert_eq!(
+            store.state.status,
+            "Approval decided: approve (decided by server)"
+        );
+        assert!(store.state.activity.iter().any(|activity| {
+            activity.kind == ActivityKind::Approval && activity.title == "decision"
+        }));
+    }
+
+    #[test]
+    fn approval_cancelled_notification_clears_matching_modal() {
+        let mut store = store_with_empty_session();
+        let (session_id, approval_id) = open_generic_approval(&mut store);
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalCancelled(
+            ApprovalCancelledEvent::turn_interrupted(session_id, approval_id, TurnId::new()),
+        )));
+
+        assert!(store.state.approval.is_none());
+        assert_eq!(store.state.run_state.label(), "running");
+        assert_eq!(store.state.status, "Approval cancelled: turn_interrupted");
+    }
+
+    #[test]
+    fn approval_auto_resolved_notification_records_policy_decision() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalAutoResolved(
+            ApprovalAutoResolvedEvent {
+                session_id,
+                approval_id: ApprovalId::new(),
+                turn_id: TurnId::new(),
+                tool_name: "shell".into(),
+                scope: approval_scopes::SESSION.into(),
+                scope_match: "cargo test".into(),
+                decision: ApprovalDecision::Approve,
+            },
+        )));
+
+        assert_eq!(
+            store.state.status,
+            "Approval auto-resolved (approve) by scope policy"
+        );
+        assert!(store.state.activity.iter().any(|activity| {
+            activity.kind == ActivityKind::Approval
+                && activity.title == "shell"
+                && activity.status == "auto-resolved approve"
+        }));
+    }
+
+    #[test]
+    fn replay_lossy_notification_surfaces_rehydrate_status() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ReplayLossy(
+            ReplayLossyEvent {
+                session_id,
+                dropped_count: 3,
+                last_durable_cursor: Some(UiCursor {
+                    stream: "session_events".into(),
+                    seq: 42,
+                }),
+            },
+        )));
+
+        assert_eq!(
+            store.state.status,
+            "Replay lossy: 3 dropped (last durable seq 42); reconnect to rehydrate"
+        );
+        assert!(store.state.activity.iter().any(|activity| {
+            activity.kind == ActivityKind::Warning && activity.title == "replay_lossy"
+        }));
     }
 
     #[test]
