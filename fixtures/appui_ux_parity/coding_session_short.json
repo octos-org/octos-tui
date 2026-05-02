@@ -1,0 +1,1829 @@
+{
+  "schema": "octos-tui.appui-ux-fixture.v1",
+  "name": "issue-7-coding-session-short",
+  "description": "Deterministic CI-safe AppUI UX parity fixture for WebSocket and future stdio transports.",
+  "mode": "ci-short",
+  "thresholds": {
+    "long_output_lines": 8,
+    "long_diff_lines": 12,
+    "collapsed_preview_lines": 1
+  },
+  "records": [
+    {
+      "seq": 1,
+      "direction": "client_to_server",
+      "kind": "request",
+      "method": "session/open",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "ws-1",
+          "method": "session/open",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "profile_id": "coding",
+            "cwd": "/tmp/octos-tui-fixture"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdin",
+        "line": 1,
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "stdio-1",
+          "method": "session/open",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "profile_id": "coding",
+            "cwd": "/tmp/octos-tui-fixture"
+          }
+        }
+      }
+    },
+    {
+      "seq": 2,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "session/open",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "session/open",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "active_profile_id": "coding",
+            "workspace_root": "/tmp/octos-tui-fixture",
+            "cursor": {
+              "stream": "ui",
+              "seq": 1
+            }
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 2,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "session/open",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "active_profile_id": "coding",
+            "workspace_root": "/tmp/octos-tui-fixture",
+            "cursor": {
+              "stream": "ui",
+              "seq": 1
+            }
+          }
+        }
+      }
+    },
+    {
+      "seq": 3,
+      "direction": "client_to_server",
+      "kind": "request",
+      "method": "turn/start",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "ws-2",
+          "method": "turn/start",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "input": [
+              {
+                "kind": "text",
+                "text": "Add a deterministic fixture and show the validation plan."
+              }
+            ]
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdin",
+        "line": 3,
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "stdio-2",
+          "method": "turn/start",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "input": [
+              {
+                "kind": "text",
+                "text": "Add a deterministic fixture and show the validation plan."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "seq": 4,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "turn/started",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "turn/started",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "timestamp": "2026-05-02T00:00:01Z"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 4,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "turn/started",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "timestamp": "2026-05-02T00:00:01Z"
+          }
+        }
+      }
+    },
+    {
+      "seq": 5,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "message/delta",
+      "ui": {
+        "plan_placement": "sticky_work_pane"
+      },
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "message/delta",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "text": "Plan\n- [ ] Normalize WebSocket frames\n- [ ] Compare future stdio frames\n\n| Surface | Expected | Notes |\n|---|---|---|\n| Transcript | user before assistant | deterministic |\n| Work pane | sticky plan/status | metadata-backed |"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 5,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "message/delta",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "text": "Plan\n- [ ] Normalize WebSocket frames\n- [ ] Compare future stdio frames\n\n| Surface | Expected | Notes |\n|---|---|---|\n| Transcript | user before assistant | deterministic |\n| Work pane | sticky plan/status | metadata-backed |"
+          }
+        }
+      }
+    },
+    {
+      "seq": 6,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "progress/updated",
+      "ui": {
+        "placement": "sticky_work_pane"
+      },
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "progress/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "metadata": {
+              "kind": "status",
+              "message": "Thinking"
+            }
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 6,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "progress/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "metadata": {
+              "kind": "status",
+              "message": "Thinking"
+            }
+          }
+        }
+      }
+    },
+    {
+      "seq": 7,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "task/updated",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "task/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000005",
+            "title": "Build/test fixture",
+            "state": "pending",
+            "runtime_detail": "queued cargo test"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 7,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "task/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000005",
+            "title": "Build/test fixture",
+            "state": "pending",
+            "runtime_detail": "queued cargo test"
+          }
+        }
+      }
+    },
+    {
+      "seq": 8,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "task/updated",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "task/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000005",
+            "title": "Build/test fixture",
+            "state": "running",
+            "runtime_detail": "running cargo test --test appui_ux_fixture"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 8,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "task/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000005",
+            "title": "Build/test fixture",
+            "state": "running",
+            "runtime_detail": "running cargo test --test appui_ux_fixture"
+          }
+        }
+      }
+    },
+    {
+      "seq": 9,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "tool/started",
+      "ui": {
+        "activity_label": "Testing"
+      },
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "tool/started",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "tool_call_id": "shell-1",
+            "tool_name": "shell",
+            "arguments": {
+              "command": "cargo test --test appui_ux_fixture"
+            }
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 9,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "tool/started",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "tool_call_id": "shell-1",
+            "tool_name": "shell",
+            "arguments": {
+              "command": "cargo test --test appui_ux_fixture"
+            }
+          }
+        }
+      }
+    },
+    {
+      "seq": 10,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "tool/progress",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "tool/progress",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "tool_call_id": "shell-1",
+            "message": "Running cargo test",
+            "progress_pct": 50
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 10,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "tool/progress",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "tool_call_id": "shell-1",
+            "message": "Running cargo test",
+            "progress_pct": 50
+          }
+        }
+      }
+    },
+    {
+      "seq": 11,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "tool/completed",
+      "ui": {
+        "activity_label": "Testing",
+        "collapsed_by_default": true
+      },
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "tool/completed",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "tool_call_id": "shell-1",
+            "tool_name": "shell",
+            "success": true,
+            "duration_ms": 1200,
+            "output_preview": "test line 01: ok\ntest line 02: ok\ntest line 03: ok\ntest line 04: ok\ntest line 05: ok\ntest line 06: ok\ntest line 07: ok\ntest line 08: ok\ntest line 09: ok\ntest line 10: ok"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 11,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "tool/completed",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "tool_call_id": "shell-1",
+            "tool_name": "shell",
+            "success": true,
+            "duration_ms": 1200,
+            "output_preview": "test line 01: ok\ntest line 02: ok\ntest line 03: ok\ntest line 04: ok\ntest line 05: ok\ntest line 06: ok\ntest line 07: ok\ntest line 08: ok\ntest line 09: ok\ntest line 10: ok"
+          }
+        }
+      }
+    },
+    {
+      "seq": 12,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "task/output/delta",
+      "ui": {
+        "collapsed_by_default": true
+      },
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "task/output/delta",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000005",
+            "cursor": {
+              "offset": 180
+            },
+            "text": "test line 01: ok\ntest line 02: ok\ntest line 03: ok\ntest line 04: ok\ntest line 05: ok\ntest line 06: ok\ntest line 07: ok\ntest line 08: ok\ntest line 09: ok\ntest line 10: ok"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 12,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "task/output/delta",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000005",
+            "cursor": {
+              "offset": 180
+            },
+            "text": "test line 01: ok\ntest line 02: ok\ntest line 03: ok\ntest line 04: ok\ntest line 05: ok\ntest line 06: ok\ntest line 07: ok\ntest line 08: ok\ntest line 09: ok\ntest line 10: ok"
+          }
+        }
+      }
+    },
+    {
+      "seq": 13,
+      "direction": "client_to_server",
+      "kind": "request",
+      "method": "task/output/read",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "ws-3",
+          "method": "task/output/read",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000005",
+            "cursor": {
+              "offset": 0
+            },
+            "limit_bytes": 4096
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdin",
+        "line": 13,
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "stdio-3",
+          "method": "task/output/read",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000005",
+            "cursor": {
+              "offset": 0
+            },
+            "limit_bytes": 4096
+          }
+        }
+      }
+    },
+    {
+      "seq": 14,
+      "direction": "server_to_client",
+      "kind": "response",
+      "method": "task/output/read",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "ws-3",
+          "result": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000005",
+            "source": "runtime_projection",
+            "cursor": {
+              "offset": 0
+            },
+            "next_cursor": {
+              "offset": 180
+            },
+            "text": "test line 01: ok\ntest line 02: ok\ntest line 03: ok\ntest line 04: ok\ntest line 05: ok\ntest line 06: ok\ntest line 07: ok\ntest line 08: ok\ntest line 09: ok\ntest line 10: ok",
+            "bytes_read": 180,
+            "total_bytes": 180,
+            "truncated": false,
+            "complete": true,
+            "live_tail_supported": true,
+            "task_status": "completed",
+            "runtime_state": "completed",
+            "lifecycle_state": "done",
+            "output_files": [],
+            "limitations": []
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 14,
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "stdio-3",
+          "result": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000005",
+            "source": "runtime_projection",
+            "cursor": {
+              "offset": 0
+            },
+            "next_cursor": {
+              "offset": 180
+            },
+            "text": "test line 01: ok\ntest line 02: ok\ntest line 03: ok\ntest line 04: ok\ntest line 05: ok\ntest line 06: ok\ntest line 07: ok\ntest line 08: ok\ntest line 09: ok\ntest line 10: ok",
+            "bytes_read": 180,
+            "total_bytes": 180,
+            "truncated": false,
+            "complete": true,
+            "live_tail_supported": true,
+            "task_status": "completed",
+            "runtime_state": "completed",
+            "lifecycle_state": "done",
+            "output_files": [],
+            "limitations": []
+          }
+        }
+      }
+    },
+    {
+      "seq": 15,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "progress/updated",
+      "ui": {
+        "placement": "sticky_work_pane"
+      },
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "progress/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "metadata": {
+              "kind": "file_mutation",
+              "file_mutation": {
+                "path": "src/app.rs",
+                "operation": "modify",
+                "preview_id": "00000000-0000-4000-8000-000000000003",
+                "tool_call_id": "edit-1",
+                "bytes_written": 256
+              },
+              "message": "modify src/app.rs | diff preview ready"
+            }
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 15,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "progress/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "metadata": {
+              "kind": "file_mutation",
+              "file_mutation": {
+                "path": "src/app.rs",
+                "operation": "modify",
+                "preview_id": "00000000-0000-4000-8000-000000000003",
+                "tool_call_id": "edit-1",
+                "bytes_written": 256
+              },
+              "message": "modify src/app.rs | diff preview ready"
+            }
+          }
+        }
+      }
+    },
+    {
+      "seq": 16,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "approval/requested",
+      "ui": {
+        "placement": "sticky_work_pane",
+        "focus": "composer",
+        "blocks_turn": true
+      },
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "approval/requested",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "approval_id": "00000000-0000-4000-8000-000000000004",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "tool_name": "diff_edit",
+            "title": "Approve fixture diff",
+            "body": "Review pending diff before applying.",
+            "approval_kind": "diff",
+            "risk": "medium",
+            "typed_details": {
+              "kind": "diff",
+              "diff": {
+                "preview_id": "00000000-0000-4000-8000-000000000003",
+                "operation": "modify",
+                "file_count": 1,
+                "additions": 9,
+                "deletions": 4,
+                "summary": "Add AppUI UX fixture validator."
+              }
+            },
+            "render_hints": {
+              "default_decision": "deny",
+              "primary_label": "Approve once",
+              "secondary_label": "Deny",
+              "danger": false,
+              "monospace_fields": [
+                "body"
+              ]
+            }
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 16,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "approval/requested",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "approval_id": "00000000-0000-4000-8000-000000000004",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "tool_name": "diff_edit",
+            "title": "Approve fixture diff",
+            "body": "Review pending diff before applying.",
+            "approval_kind": "diff",
+            "risk": "medium",
+            "typed_details": {
+              "kind": "diff",
+              "diff": {
+                "preview_id": "00000000-0000-4000-8000-000000000003",
+                "operation": "modify",
+                "file_count": 1,
+                "additions": 9,
+                "deletions": 4,
+                "summary": "Add AppUI UX fixture validator."
+              }
+            },
+            "render_hints": {
+              "default_decision": "deny",
+              "primary_label": "Approve once",
+              "secondary_label": "Deny",
+              "danger": false,
+              "monospace_fields": [
+                "body"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "seq": 17,
+      "direction": "client_to_server",
+      "kind": "request",
+      "method": "diff/preview/get",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "ws-4",
+          "method": "diff/preview/get",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "preview_id": "00000000-0000-4000-8000-000000000003"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdin",
+        "line": 17,
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "stdio-4",
+          "method": "diff/preview/get",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "preview_id": "00000000-0000-4000-8000-000000000003"
+          }
+        }
+      }
+    },
+    {
+      "seq": 18,
+      "direction": "server_to_client",
+      "kind": "response",
+      "method": "diff/preview/get",
+      "ui": {
+        "collapsed_by_default": true
+      },
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "ws-4",
+          "result": {
+            "status": "ready",
+            "source": "pending_store",
+            "preview": {
+              "session_id": "octos-tui:e2e-issue-7",
+              "preview_id": "00000000-0000-4000-8000-000000000003",
+              "title": "Approve fixture diff",
+              "files": [
+                {
+                  "path": "tests/appui_ux_fixture.rs",
+                  "old_path": null,
+                  "status": "modified",
+                  "hunks": [
+                    {
+                      "header": "@@ -1,4 +1,13 @@",
+                      "lines": [
+                        {
+                          "kind": "context",
+                          "content": "use serde::Deserialize;",
+                          "old_line": 1,
+                          "new_line": 1
+                        },
+                        {
+                          "kind": "removed",
+                          "content": "fn smoke() {}",
+                          "old_line": 2,
+                          "new_line": null
+                        },
+                        {
+                          "kind": "added",
+                          "content": "fn websocket_and_stdio_records_normalize_to_same_semantics() {",
+                          "old_line": null,
+                          "new_line": 2
+                        },
+                        {
+                          "kind": "added",
+                          "content": "    let fixture = load_fixture();",
+                          "old_line": null,
+                          "new_line": 3
+                        },
+                        {
+                          "kind": "added",
+                          "content": "    assert_eq!(normalize(&fixture, \"websocket\"), normalize(&fixture, \"stdio\"));",
+                          "old_line": null,
+                          "new_line": 4
+                        },
+                        {
+                          "kind": "added",
+                          "content": "}",
+                          "old_line": null,
+                          "new_line": 5
+                        },
+                        {
+                          "kind": "context",
+                          "content": "",
+                          "old_line": 3,
+                          "new_line": 6
+                        },
+                        {
+                          "kind": "added",
+                          "content": "fn fixture_covers_known_ux_assertions() {",
+                          "old_line": null,
+                          "new_line": 7
+                        },
+                        {
+                          "kind": "added",
+                          "content": "    assert!(true);",
+                          "old_line": null,
+                          "new_line": 8
+                        },
+                        {
+                          "kind": "added",
+                          "content": "}",
+                          "old_line": null,
+                          "new_line": 9
+                        },
+                        {
+                          "kind": "context",
+                          "content": "",
+                          "old_line": 4,
+                          "new_line": 10
+                        },
+                        {
+                          "kind": "added",
+                          "content": "fn live_soak_is_manual() {",
+                          "old_line": null,
+                          "new_line": 11
+                        },
+                        {
+                          "kind": "added",
+                          "content": "    assert!(true);",
+                          "old_line": null,
+                          "new_line": 12
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 18,
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "stdio-4",
+          "result": {
+            "status": "ready",
+            "source": "pending_store",
+            "preview": {
+              "session_id": "octos-tui:e2e-issue-7",
+              "preview_id": "00000000-0000-4000-8000-000000000003",
+              "title": "Approve fixture diff",
+              "files": [
+                {
+                  "path": "tests/appui_ux_fixture.rs",
+                  "old_path": null,
+                  "status": "modified",
+                  "hunks": [
+                    {
+                      "header": "@@ -1,4 +1,13 @@",
+                      "lines": [
+                        {
+                          "kind": "context",
+                          "content": "use serde::Deserialize;",
+                          "old_line": 1,
+                          "new_line": 1
+                        },
+                        {
+                          "kind": "removed",
+                          "content": "fn smoke() {}",
+                          "old_line": 2,
+                          "new_line": null
+                        },
+                        {
+                          "kind": "added",
+                          "content": "fn websocket_and_stdio_records_normalize_to_same_semantics() {",
+                          "old_line": null,
+                          "new_line": 2
+                        },
+                        {
+                          "kind": "added",
+                          "content": "    let fixture = load_fixture();",
+                          "old_line": null,
+                          "new_line": 3
+                        },
+                        {
+                          "kind": "added",
+                          "content": "    assert_eq!(normalize(&fixture, \"websocket\"), normalize(&fixture, \"stdio\"));",
+                          "old_line": null,
+                          "new_line": 4
+                        },
+                        {
+                          "kind": "added",
+                          "content": "}",
+                          "old_line": null,
+                          "new_line": 5
+                        },
+                        {
+                          "kind": "context",
+                          "content": "",
+                          "old_line": 3,
+                          "new_line": 6
+                        },
+                        {
+                          "kind": "added",
+                          "content": "fn fixture_covers_known_ux_assertions() {",
+                          "old_line": null,
+                          "new_line": 7
+                        },
+                        {
+                          "kind": "added",
+                          "content": "    assert!(true);",
+                          "old_line": null,
+                          "new_line": 8
+                        },
+                        {
+                          "kind": "added",
+                          "content": "}",
+                          "old_line": null,
+                          "new_line": 9
+                        },
+                        {
+                          "kind": "context",
+                          "content": "",
+                          "old_line": 4,
+                          "new_line": 10
+                        },
+                        {
+                          "kind": "added",
+                          "content": "fn live_soak_is_manual() {",
+                          "old_line": null,
+                          "new_line": 11
+                        },
+                        {
+                          "kind": "added",
+                          "content": "    assert!(true);",
+                          "old_line": null,
+                          "new_line": 12
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "seq": 19,
+      "direction": "client_to_server",
+      "kind": "request",
+      "method": "approval/respond",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "ws-5",
+          "method": "approval/respond",
+          "params": {
+            "approval_id": "00000000-0000-4000-8000-000000000004",
+            "decision": "approve",
+            "approval_scope": "request",
+            "client_note": "deterministic fixture approval"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdin",
+        "line": 19,
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "stdio-5",
+          "method": "approval/respond",
+          "params": {
+            "approval_id": "00000000-0000-4000-8000-000000000004",
+            "decision": "approve",
+            "approval_scope": "request",
+            "client_note": "deterministic fixture approval"
+          }
+        }
+      }
+    },
+    {
+      "seq": 20,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "approval/decided",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "approval/decided",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "approval_id": "00000000-0000-4000-8000-000000000004",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "decision": "approve",
+            "scope": "request",
+            "decided_at": "2026-05-02T00:00:08Z",
+            "decided_by": "e2e-user",
+            "auto_resolved": false,
+            "client_note": "deterministic fixture approval"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 20,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "approval/decided",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "approval_id": "00000000-0000-4000-8000-000000000004",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "decision": "approve",
+            "scope": "request",
+            "decided_at": "2026-05-02T00:00:08Z",
+            "decided_by": "e2e-user",
+            "auto_resolved": false,
+            "client_note": "deterministic fixture approval"
+          }
+        }
+      }
+    },
+    {
+      "seq": 21,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "tool/started",
+      "ui": {
+        "activity_label": "Editing"
+      },
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "tool/started",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "tool_call_id": "edit-1",
+            "tool_name": "diff_edit",
+            "arguments": {
+              "path": "tests/appui_ux_fixture.rs",
+              "diff": "@@ -1 +1 @@"
+            }
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 21,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "tool/started",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "tool_call_id": "edit-1",
+            "tool_name": "diff_edit",
+            "arguments": {
+              "path": "tests/appui_ux_fixture.rs",
+              "diff": "@@ -1 +1 @@"
+            }
+          }
+        }
+      }
+    },
+    {
+      "seq": 22,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "tool/completed",
+      "ui": {
+        "activity_label": "Editing",
+        "collapsed_by_default": false
+      },
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "tool/completed",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "tool_call_id": "edit-1",
+            "tool_name": "diff_edit",
+            "success": true,
+            "duration_ms": 80,
+            "output_preview": "Applied fixture diff."
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 22,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "tool/completed",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "tool_call_id": "edit-1",
+            "tool_name": "diff_edit",
+            "success": true,
+            "duration_ms": 80,
+            "output_preview": "Applied fixture diff."
+          }
+        }
+      }
+    },
+    {
+      "seq": 23,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "task/updated",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "task/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000005",
+            "title": "Build/test fixture",
+            "state": "completed",
+            "runtime_detail": "cargo test passed"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 23,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "task/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000005",
+            "title": "Build/test fixture",
+            "state": "completed",
+            "runtime_detail": "cargo test passed"
+          }
+        }
+      }
+    },
+    {
+      "seq": 24,
+      "direction": "client_to_server",
+      "kind": "request",
+      "method": "turn/start",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "ws-6",
+          "method": "turn/start",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000002",
+            "input": [
+              {
+                "kind": "text",
+                "text": "Stop the background grep and summarize status."
+              }
+            ]
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdin",
+        "line": 24,
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "stdio-6",
+          "method": "turn/start",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000002",
+            "input": [
+              {
+                "kind": "text",
+                "text": "Stop the background grep and summarize status."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "seq": 25,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "turn/started",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "turn/started",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000002",
+            "timestamp": "2026-05-02T00:00:12Z"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 25,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "turn/started",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000002",
+            "timestamp": "2026-05-02T00:00:12Z"
+          }
+        }
+      }
+    },
+    {
+      "seq": 26,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "task/updated",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "task/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000006",
+            "title": "Background grep",
+            "state": "running",
+            "runtime_detail": "scanning generated captures"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 26,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "task/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000006",
+            "title": "Background grep",
+            "state": "running",
+            "runtime_detail": "scanning generated captures"
+          }
+        }
+      }
+    },
+    {
+      "seq": 27,
+      "direction": "client_to_server",
+      "kind": "request",
+      "method": "turn/interrupt",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "ws-7",
+          "method": "turn/interrupt",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000002"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdin",
+        "line": 27,
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "stdio-7",
+          "method": "turn/interrupt",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000002"
+          }
+        }
+      }
+    },
+    {
+      "seq": 28,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "task/updated",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "task/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000006",
+            "title": "Background grep",
+            "state": "failed",
+            "runtime_detail": "cancelled by interrupt"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 28,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "task/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "task_id": "00000000-0000-4000-8000-000000000006",
+            "title": "Background grep",
+            "state": "failed",
+            "runtime_detail": "cancelled by interrupt"
+          }
+        }
+      }
+    },
+    {
+      "seq": 29,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "turn/error",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "turn/error",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000002",
+            "code": "interrupted",
+            "message": "Turn interrupted by user"
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 29,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "turn/error",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000002",
+            "code": "interrupted",
+            "message": "Turn interrupted by user"
+          }
+        }
+      }
+    },
+    {
+      "seq": 30,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "protocol/replay_lossy",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "protocol/replay_lossy",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "dropped_count": 1,
+            "last_durable_cursor": {
+              "stream": "ui",
+              "seq": 28
+            }
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 30,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "protocol/replay_lossy",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "dropped_count": 1,
+            "last_durable_cursor": {
+              "stream": "ui",
+              "seq": 28
+            }
+          }
+        }
+      }
+    },
+    {
+      "seq": 31,
+      "direction": "client_to_server",
+      "kind": "request",
+      "method": "session/open",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7-reconnect",
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "ws-8",
+          "method": "session/open",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "profile_id": "coding",
+            "cwd": "/tmp/octos-tui-fixture",
+            "after": {
+              "stream": "ui",
+              "seq": 28
+            }
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdin",
+        "line": 31,
+        "wire": {
+          "jsonrpc": "2.0",
+          "id": "stdio-8",
+          "method": "session/open",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "profile_id": "coding",
+            "cwd": "/tmp/octos-tui-fixture",
+            "after": {
+              "stream": "ui",
+              "seq": 28
+            }
+          }
+        }
+      }
+    },
+    {
+      "seq": 32,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "session/open",
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7-reconnect",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "session/open",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "active_profile_id": "coding",
+            "workspace_root": "/tmp/octos-tui-fixture",
+            "cursor": {
+              "stream": "ui",
+              "seq": 29
+            }
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 32,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "session/open",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "active_profile_id": "coding",
+            "workspace_root": "/tmp/octos-tui-fixture",
+            "cursor": {
+              "stream": "ui",
+              "seq": 29
+            }
+          }
+        }
+      }
+    }
+  ],
+  "expected": {
+    "normalized_sequence": [
+      {
+        "event": "session.open.request",
+        "session_id": "octos-tui:e2e-issue-7",
+        "cwd": "/tmp/octos-tui-fixture",
+        "profile_id": "coding"
+      },
+      {
+        "event": "session.opened",
+        "session_id": "octos-tui:e2e-issue-7",
+        "cwd": "/tmp/octos-tui-fixture",
+        "profile_id": "coding",
+        "cursor_seq": 1
+      },
+      {
+        "event": "message.user",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "role": "user",
+        "content": "Add a deterministic fixture and show the validation plan."
+      },
+      {
+        "event": "turn.started",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001"
+      },
+      {
+        "event": "message.assistant_delta",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "role": "assistant",
+        "content": "Plan\n- [ ] Normalize WebSocket frames\n- [ ] Compare future stdio frames\n\n| Surface | Expected | Notes |\n|---|---|---|\n| Transcript | user before assistant | deterministic |\n| Work pane | sticky plan/status | metadata-backed |",
+        "contains_markdown_table": true,
+        "plan_step_count": 2,
+        "plan_placement": "sticky_work_pane"
+      },
+      {
+        "event": "status.update",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "message": "Thinking",
+        "placement": "sticky_work_pane"
+      },
+      {
+        "event": "task.pending",
+        "session_id": "octos-tui:e2e-issue-7",
+        "task_id": "00000000-0000-4000-8000-000000000005",
+        "title": "Build/test fixture",
+        "state": "pending",
+        "runtime_detail": "queued cargo test"
+      },
+      {
+        "event": "task.running",
+        "session_id": "octos-tui:e2e-issue-7",
+        "task_id": "00000000-0000-4000-8000-000000000005",
+        "title": "Build/test fixture",
+        "state": "running",
+        "runtime_detail": "running cargo test --test appui_ux_fixture"
+      },
+      {
+        "event": "activity.tool.started",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "tool_call_id": "shell-1",
+        "tool_name": "shell",
+        "activity_label": "Testing"
+      },
+      {
+        "event": "activity.tool.progress",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "tool_call_id": "shell-1",
+        "message": "Running cargo test",
+        "status": "50%"
+      },
+      {
+        "event": "activity.tool.completed",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "tool_call_id": "shell-1",
+        "tool_name": "shell",
+        "activity_label": "Testing",
+        "success": true,
+        "output_line_count": 10,
+        "long_output": true,
+        "collapsed_by_default": true
+      },
+      {
+        "event": "task.output_delta",
+        "session_id": "octos-tui:e2e-issue-7",
+        "task_id": "00000000-0000-4000-8000-000000000005",
+        "cursor_offset": 180,
+        "line_count": 10,
+        "long_output": true,
+        "collapsed_by_default": true
+      },
+      {
+        "event": "task.output.read_requested",
+        "session_id": "octos-tui:e2e-issue-7",
+        "task_id": "00000000-0000-4000-8000-000000000005",
+        "limit_bytes": 4096
+      },
+      {
+        "event": "task.output.read_result",
+        "session_id": "octos-tui:e2e-issue-7",
+        "task_id": "00000000-0000-4000-8000-000000000005",
+        "line_count": 10,
+        "complete": true,
+        "task_status": "completed"
+      },
+      {
+        "event": "progress.file_mutation",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "path": "src/app.rs",
+        "operation": "modify",
+        "preview_id": "00000000-0000-4000-8000-000000000003",
+        "message": "modify src/app.rs | diff preview ready",
+        "placement": "sticky_work_pane"
+      },
+      {
+        "event": "approval.requested",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "approval_id": "00000000-0000-4000-8000-000000000004",
+        "tool_name": "diff_edit",
+        "title": "Approve fixture diff",
+        "approval_kind": "diff",
+        "risk": "medium",
+        "preview_id": "00000000-0000-4000-8000-000000000003",
+        "blocks_turn": true,
+        "focus": "composer",
+        "placement": "sticky_work_pane"
+      },
+      {
+        "event": "diff.preview.requested",
+        "session_id": "octos-tui:e2e-issue-7",
+        "preview_id": "00000000-0000-4000-8000-000000000003"
+      },
+      {
+        "event": "diff.preview.ready",
+        "session_id": "octos-tui:e2e-issue-7",
+        "preview_id": "00000000-0000-4000-8000-000000000003",
+        "status": "ready",
+        "source": "pending_store",
+        "line_count": 13,
+        "long_diff": true,
+        "collapsed_by_default": true
+      },
+      {
+        "event": "approval.responded",
+        "approval_id": "00000000-0000-4000-8000-000000000004",
+        "decision": "approve",
+        "approval_scope": "request"
+      },
+      {
+        "event": "approval.decided",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "approval_id": "00000000-0000-4000-8000-000000000004",
+        "decision": "approve",
+        "scope": "request",
+        "decided_by": "e2e-user"
+      },
+      {
+        "event": "activity.tool.started",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "tool_call_id": "edit-1",
+        "tool_name": "diff_edit",
+        "activity_label": "Editing"
+      },
+      {
+        "event": "activity.tool.completed",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "tool_call_id": "edit-1",
+        "tool_name": "diff_edit",
+        "activity_label": "Editing",
+        "success": true,
+        "output_line_count": 1,
+        "long_output": false,
+        "collapsed_by_default": false
+      },
+      {
+        "event": "task.completed",
+        "session_id": "octos-tui:e2e-issue-7",
+        "task_id": "00000000-0000-4000-8000-000000000005",
+        "title": "Build/test fixture",
+        "state": "completed",
+        "runtime_detail": "cargo test passed"
+      },
+      {
+        "event": "message.user",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000002",
+        "role": "user",
+        "content": "Stop the background grep and summarize status."
+      },
+      {
+        "event": "turn.started",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000002"
+      },
+      {
+        "event": "task.running",
+        "session_id": "octos-tui:e2e-issue-7",
+        "task_id": "00000000-0000-4000-8000-000000000006",
+        "title": "Background grep",
+        "state": "running",
+        "runtime_detail": "scanning generated captures"
+      },
+      {
+        "event": "turn.interrupt.request",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000002"
+      },
+      {
+        "event": "task.cancelled",
+        "session_id": "octos-tui:e2e-issue-7",
+        "task_id": "00000000-0000-4000-8000-000000000006",
+        "title": "Background grep",
+        "state": "failed",
+        "runtime_detail": "cancelled by interrupt"
+      },
+      {
+        "event": "turn.cancelled",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000002",
+        "code": "interrupted",
+        "message": "Turn interrupted by user"
+      },
+      {
+        "event": "replay.lossy",
+        "session_id": "octos-tui:e2e-issue-7",
+        "dropped_count": 1,
+        "last_durable_seq": 28
+      },
+      {
+        "event": "session.open.request",
+        "session_id": "octos-tui:e2e-issue-7",
+        "cwd": "/tmp/octos-tui-fixture",
+        "profile_id": "coding",
+        "cursor_after_seq": 28
+      },
+      {
+        "event": "session.opened",
+        "session_id": "octos-tui:e2e-issue-7",
+        "cwd": "/tmp/octos-tui-fixture",
+        "profile_id": "coding",
+        "cursor_seq": 29
+      }
+    ],
+    "ux_assertions": {
+      "ci_offline": true,
+      "requires_real_model_output": false,
+      "user_bubble_must_precede_assistant": true,
+      "approval_must_block_until_decision": true,
+      "required_activity_labels": [
+        "Testing",
+        "Editing"
+      ],
+      "sticky_placement": "sticky_work_pane",
+      "permission_focus": "composer"
+    },
+    "live_soak": {
+      "manual_only": true,
+      "duration_minutes": 60,
+      "requires_env": [
+        "OCTOS_TUI_UX_LIVE_SOAK=1",
+        "OCTOS_TUI_PROTOCOL_ENDPOINT=ws://127.0.0.1:7777/ui"
+      ],
+      "artifact_dir": "e2e/test-results-tui-coding-ux/<run-id>"
+    }
+  }
+}

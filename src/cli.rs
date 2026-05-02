@@ -9,6 +9,7 @@ pub enum Mode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ThemeName {
+    Terminal,
     Slate,
     Codex,
     Claude,
@@ -132,6 +133,13 @@ mod tests {
         let cli = Cli::try_parse_from(["octos-tui", "--theme", "claude"]).expect("cli parses");
 
         assert_eq!(cli.theme, super::ThemeName::Claude);
+    }
+
+    #[test]
+    fn parses_terminal_theme_choice() {
+        let cli = Cli::try_parse_from(["octos-tui", "--theme", "terminal"]).expect("cli parses");
+
+        assert_eq!(cli.theme, super::ThemeName::Terminal);
     }
 
     #[test]

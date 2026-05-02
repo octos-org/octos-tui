@@ -2,22 +2,36 @@ use octos_core::app_ui::{AppUiCommand, AppUiEvent, AppUiSnapshot};
 use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
     ApprovalRespondParams, DiffPreviewGetParams, InputItem, MessageDeltaEvent, ReplayLossyEvent,
-    TaskOutputDeltaEvent, TaskOutputReadParams, TaskUpdatedEvent, TurnCompletedEvent,
-    TurnErrorEvent, TurnInterruptParams, TurnStartParams, UiNotification, UiProgressEvent,
+    TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState, TaskUpdatedEvent,
+    TurnCompletedEvent, TurnErrorEvent, TurnInterruptParams, TurnStartParams, UiNotification,
+    UiProgressEvent,
 };
 use octos_core::{Message, TaskId};
 use serde_json::Value;
 
 use crate::{
-    client_event::ClientEvent,
+    client_event::{ClientEvent, PermissionProfileClientEvent},
+    menu::{
+        CommandEntry, CommandRegistry, CommandResolution, LocalAction, MenuAction, MenuAppSnapshot,
+        MenuBuildResult, MenuContext, MenuId, TerminalSize, providers::core_menu_registry,
+    },
     model::{
         ActivityItem, ActivityKind, AppState, ApprovalModalAction, ApprovalModalState,
         DiffHunkContext, DiffPreviewGetResult, FocusPane, LiveReply, SessionView, TaskView,
+        complete_plan_steps_in_text, task_state_label,
     },
 };
 
 const TASK_OUTPUT_TAIL_BYTES: usize = 600;
 const TASK_OUTPUT_READ_LIMIT_BYTES: u64 = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct SlashCommandMatch {
+    pub name: String,
+    pub description: String,
+    pub available: bool,
+}
 
 pub struct Store {
     pub state: AppState,
@@ -35,13 +49,17 @@ impl Store {
     }
 
     pub fn compose_command(&mut self) -> Option<AppUiCommand> {
+        let prompt = self.state.composer.trim().to_string();
+        if prompt.starts_with('/') {
+            return self.dispatch_slash_command(&prompt);
+        }
+
         if self.state.readonly {
             self.state.status = "Read-only mode: turn/start disabled".into();
             self.state.clear_current_composer_draft();
             return None;
         }
 
-        let prompt = self.state.composer.trim().to_string();
         if prompt.is_empty() {
             return None;
         }
@@ -59,22 +77,418 @@ impl Store {
         self.start_prompt_turn(prompt, "Queued turn/start")
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn slash_command_matches(&self, query: &str) -> Vec<SlashCommandMatch> {
+        let registry = CommandRegistry::with_core_commands();
+        let query = query.trim().trim_start_matches('/').to_ascii_lowercase();
+        let ctx = self.state.availability_context();
+        let mut matches = registry
+            .visible_commands(&ctx)
+            .into_iter()
+            .filter_map(|visible| {
+                let command = visible.command;
+                let names = std::iter::once(command.name).chain(command.aliases.iter().copied());
+                let rank = if query.is_empty() {
+                    Some(0)
+                } else if names
+                    .clone()
+                    .any(|name| name.eq_ignore_ascii_case(query.as_str()))
+                {
+                    Some(0)
+                } else if names
+                    .clone()
+                    .any(|name| name.to_ascii_lowercase().starts_with(&query))
+                {
+                    Some(1)
+                } else if names
+                    .clone()
+                    .any(|name| name.to_ascii_lowercase().contains(&query))
+                    || command.description.to_ascii_lowercase().contains(&query)
+                {
+                    Some(2)
+                } else {
+                    None
+                }?;
+                Some((
+                    rank,
+                    SlashCommandMatch {
+                        name: command.slash_name(),
+                        description: command.description.into(),
+                        available: visible.availability.is_available(),
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|(rank, command)| (*rank, command.name.clone()));
+        matches.into_iter().map(|(_, command)| command).collect()
+    }
+
+    fn dispatch_slash_command(&mut self, draft: &str) -> Option<AppUiCommand> {
+        let registry = CommandRegistry::with_core_commands();
+        let resolution = registry.resolve(draft);
+        self.state.clear_current_composer_draft();
+
+        match resolution {
+            CommandResolution::Found {
+                command,
+                invocation: _,
+            } => {
+                let availability = registry.evaluate(command, &self.state.availability_context());
+                if !availability.is_available() {
+                    let command_name = command.slash_name();
+                    self.show_unavailable_slash_command(
+                        &command_name,
+                        availability
+                            .reason
+                            .as_deref()
+                            .unwrap_or("command is unavailable"),
+                    );
+                    return None;
+                }
+                self.dispatch_command_entry(&command.entry)
+            }
+            CommandResolution::EmptyCommand => {
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
+                None
+            }
+            CommandResolution::Unknown { invocation } => {
+                self.show_unknown_slash_command(&format!("/{}", invocation.name), draft);
+                None
+            }
+            CommandResolution::NotCommand => None,
+        }
+    }
+
+    fn dispatch_command_entry(&mut self, entry: &CommandEntry) -> Option<AppUiCommand> {
+        match entry {
+            CommandEntry::OpenMenu(id) => {
+                self.open_menu(id.clone());
+                None
+            }
+            CommandEntry::LocalAction(action) => self.dispatch_local_action(action.clone()),
+            CommandEntry::AppUiAction(action) => {
+                self.state.status = format!(
+                    "AppUI command `{}` is advertised but not wired yet",
+                    action.method()
+                );
+                None
+            }
+            CommandEntry::PromptTemplate(template) => {
+                self.start_prompt_turn((*template).to_string(), "Queued prompt template")
+            }
+        }
+    }
+
+    fn dispatch_local_action(&mut self, action: LocalAction) -> Option<AppUiCommand> {
+        match action {
+            LocalAction::ShowProcessStatus => {
+                self.show_local_process_status();
+                None
+            }
+            LocalAction::StopActiveTurn => {
+                let had_active_turn = self.state.active_turn().is_some();
+                let command = self.interrupt_command();
+                if !had_active_turn {
+                    self.push_local_activity(
+                        ActivityKind::Warning,
+                        "local /stop",
+                        "No active turn to interrupt",
+                        Some("Nothing was sent to the backend."),
+                    );
+                }
+                command
+            }
+            LocalAction::ShowHelp => {
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
+                None
+            }
+            LocalAction::SetTheme(theme) => {
+                self.state.status = format!("Theme selected: {theme}");
+                None
+            }
+            LocalAction::SaveStatusLine(items) => {
+                self.state.status = format!("Status line layout selected: {}", items.join(", "));
+                None
+            }
+            LocalAction::SaveTerminalTitle(items) => {
+                self.state.status = format!("Terminal title layout selected: {}", items.join(", "));
+                None
+            }
+            LocalAction::SaveKeymap => {
+                self.state.status = "Keymap save is not wired yet".into();
+                None
+            }
+            LocalAction::RefreshMenu(id) => {
+                self.open_menu(id);
+                None
+            }
+            LocalAction::Custom(name) => {
+                self.state.status = format!("Local menu action `{name}` is not wired yet");
+                None
+            }
+        }
+    }
+
+    pub fn open_menu(&mut self, id: MenuId) {
+        self.state.menu_stack.open(id);
+        self.refresh_active_menu();
+        if let Some(frame) = self.state.menu_stack.active() {
+            self.state.status = format!("Menu: {}", frame.id);
+        }
+    }
+
+    pub fn close_menu(&mut self) -> bool {
+        if self.state.menu_stack.close().is_some() {
+            self.refresh_active_menu();
+            if let Some(frame) = self.state.menu_stack.active() {
+                self.state.status = format!("Menu: {}", frame.id);
+            }
+            return true;
+        }
+        false
+    }
+
+    pub fn close_all_menus(&mut self) -> bool {
+        if self.state.menu_stack.is_empty() {
+            return false;
+        }
+        self.state.menu_stack.close_all();
+        self.state.active_menu = None;
+        true
+    }
+
+    pub fn select_next_menu_item(&mut self) -> bool {
+        let Some(frame) = self.state.menu_stack.active_mut() else {
+            return false;
+        };
+        let len = active_menu_item_len(self.state.active_menu.as_ref());
+        if len == 0 {
+            return true;
+        }
+        frame.selected_index = (frame.selected_index + 1) % len;
+        self.refresh_active_menu();
+        true
+    }
+
+    pub fn select_prev_menu_item(&mut self) -> bool {
+        let Some(frame) = self.state.menu_stack.active_mut() else {
+            return false;
+        };
+        let len = active_menu_item_len(self.state.active_menu.as_ref());
+        if len == 0 {
+            return true;
+        }
+        frame.selected_index = if frame.selected_index == 0 {
+            len - 1
+        } else {
+            frame.selected_index - 1
+        };
+        self.refresh_active_menu();
+        true
+    }
+
+    pub fn accept_active_menu_item(&mut self) -> Option<AppUiCommand> {
+        let selected_index = self
+            .state
+            .menu_stack
+            .active()
+            .map(|frame| frame.selected_index)
+            .unwrap_or(0);
+        let Some(action) = self
+            .state
+            .active_menu
+            .as_ref()
+            .and_then(|menu| active_menu_selected_action(menu, selected_index))
+        else {
+            return None;
+        };
+        self.dispatch_menu_action(action)
+    }
+
+    fn dispatch_menu_action(&mut self, action: MenuAction) -> Option<AppUiCommand> {
+        match action {
+            MenuAction::OpenMenu(id) => {
+                self.open_menu(id);
+                None
+            }
+            MenuAction::ReplaceMenu(id) => {
+                self.state.menu_stack.replace(id);
+                self.refresh_active_menu();
+                if let Some(frame) = self.state.menu_stack.active() {
+                    self.state.status = format!("Menu: {}", frame.id);
+                }
+                None
+            }
+            MenuAction::Close => {
+                self.close_menu();
+                None
+            }
+            MenuAction::CloseAll => {
+                self.close_all_menus();
+                None
+            }
+            MenuAction::Local(action) => self.dispatch_local_action(action),
+            MenuAction::SendAppUi(command) => Some(command),
+            MenuAction::SubmitPrompt(prompt) => {
+                self.start_prompt_turn(prompt, "Queued menu prompt")
+            }
+            MenuAction::Noop => None,
+        }
+    }
+
+    pub fn refresh_active_menu(&mut self) {
+        let Some(frame) = self.state.menu_stack.active().cloned() else {
+            self.state.active_menu = None;
+            return;
+        };
+        let path = self.state.menu_stack.path();
+        let app = self.menu_app_snapshot();
+        let availability = self.state.availability_context();
+        let ctx = MenuContext {
+            availability,
+            app,
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &path,
+        };
+        let result = core_menu_registry().build(&frame.id, &ctx);
+        let len = active_menu_item_len(Some(&result));
+        if len > 0
+            && let Some(frame) = self.state.menu_stack.active_mut()
+        {
+            frame.selected_index = frame.selected_index.min(len.saturating_sub(1));
+        }
+        self.state.active_menu = Some(result);
+    }
+
+    fn refresh_active_menu_if_open(&mut self) {
+        if self.state.menu_stack.is_active() {
+            self.refresh_active_menu();
+        }
+    }
+
+    fn menu_app_snapshot(&self) -> MenuAppSnapshot<'_> {
+        let selected_session = self.state.active_session();
+        let selected_task = self.state.active_task();
+        MenuAppSnapshot {
+            status: Some(self.state.status.as_str()),
+            target: self.state.target.as_deref(),
+            cwd: Some(self.state.workspace.root.as_str()),
+            current_model: None,
+            current_profile: selected_session.and_then(|session| session.profile_id.as_deref()),
+            permission_profile: selected_session
+                .and_then(|session| self.state.permission_profile_for(&session.id)),
+            selected_session_id: selected_session.map(|session| &session.id),
+            selected_session_title: selected_session.map(|session| session.title.as_str()),
+            selected_task_title: selected_task.map(|task| task.title.as_str()),
+            background_task_count: self
+                .state
+                .sessions
+                .iter()
+                .flat_map(|session| session.tasks.iter())
+                .filter(|task| {
+                    matches!(
+                        task.state,
+                        TaskRuntimeState::Pending | TaskRuntimeState::Running
+                    )
+                })
+                .count(),
+        }
+    }
+
+    fn show_local_process_status(&mut self) {
+        let counts = count_tasks(self);
+        let turn = self
+            .state
+            .active_turn()
+            .map(|(_, turn_id)| format!("active turn {}", short_id(&turn_id.0.to_string())))
+            .unwrap_or_else(|| "idle".into());
+        let selected_task = self
+            .state
+            .active_task()
+            .map(|task| {
+                format!(
+                    "selected task: {} [{}]",
+                    task.title,
+                    task_state_label(task.state)
+                )
+            })
+            .unwrap_or_else(|| "selected task: none".into());
+        let staged = self.state.pending_messages.len();
+        let status = format!(
+            "Local /ps: {turn}; tasks {} total ({} running, {} pending, {} done, {} failed); {staged} staged",
+            counts.total, counts.running, counts.pending, counts.done, counts.failed
+        );
+        let detail = format!(
+            "run state: {} | {selected_task} | {} activity item(s)",
+            self.state.run_state.label(),
+            self.state.activity.len()
+        );
+
+        self.state.focus = FocusPane::Tasks;
+        self.state.status = status.clone();
+        self.state.scroll_transcript_to_latest();
+        self.push_local_activity(ActivityKind::Progress, "local /ps", status, Some(detail));
+    }
+
+    fn show_unknown_slash_command(&mut self, command: &str, draft: &str) {
+        let ctx = self.state.availability_context();
+        let status = format!(
+            "Unknown slash command: {command}. Try {}.",
+            slash_command_try_hint(&ctx)
+        );
+        self.state.status = status.clone();
+        self.push_local_activity(
+            ActivityKind::Warning,
+            "local slash command",
+            status,
+            Some(format!("Ignored input: {draft}")),
+        );
+    }
+
+    fn show_unavailable_slash_command(&mut self, command: &str, reason: &str) {
+        let status = format!("{command} is unavailable: {reason}");
+        self.state.status = status.clone();
+        self.push_local_activity(
+            ActivityKind::Warning,
+            "local slash command",
+            status,
+            Some("The command was resolved by the registry but did not pass availability gates."),
+        );
+    }
+
+    fn push_local_activity(
+        &mut self,
+        kind: ActivityKind,
+        title: impl Into<String>,
+        status: impl Into<String>,
+        detail: Option<impl Into<String>>,
+    ) {
+        let mut item = ActivityItem::new(kind, title, status);
+        if let Some(detail) = detail {
+            item = item.with_detail(detail);
+        }
+        self.state.push_activity(item);
+    }
+
     fn start_prompt_turn(
         &mut self,
         prompt: String,
         status: impl Into<String>,
     ) -> Option<AppUiCommand> {
         let session_id = self.active_session()?.id.clone();
-        self.state
-            .active_session_mut()?
-            .messages
-            .push(Message::user(prompt.clone()));
+        let turn_id = octos_core::ui_protocol::TurnId::new();
+        self.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            prompt.clone(),
+        );
         self.state.scroll_transcript_to_latest();
         self.state.status = status.into();
         self.state.set_run_state_in_progress();
         Some(AppUiCommand::SubmitPrompt(TurnStartParams {
             session_id,
-            turn_id: octos_core::ui_protocol::TurnId::new(),
+            turn_id,
             input: vec![InputItem::Text { text: prompt }],
         }))
     }
@@ -120,7 +534,11 @@ impl Store {
         };
 
         self.state.status = format!("Approval {}: {}", action.status_label(), approval.title);
-        self.state.set_run_state_in_progress();
+        if self.state.active_turn().is_some() {
+            self.state.set_run_state_in_progress();
+        } else if self.state.run_state.is_active() {
+            self.state.set_run_state_success();
+        }
         self.state.approval_auto_open = true;
 
         let mut params = ApprovalRespondParams::new(
@@ -303,13 +721,41 @@ impl Store {
                 self.apply_diff_preview_result(result);
                 None
             }
+            ClientEvent::PermissionProfile(event) => {
+                self.apply_permission_profile_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
         }
     }
 
     pub fn apply_event(&mut self, event: AppUiEvent) -> Option<AppUiCommand> {
-        match event {
+        let command = match event {
             AppUiEvent::Snapshot(snapshot) => {
-                self.state = AppState::from_snapshot(snapshot);
+                let composer = self.state.composer.clone();
+                let composer_drafts = self.state.composer_drafts.clone();
+                let pending_messages = self.state.pending_messages.clone();
+                let optimistic_user_messages = self.state.optimistic_user_messages.clone();
+                let approval_auto_open = self.state.approval_auto_open;
+                let expanded_tool_outputs = self.state.expanded_tool_outputs;
+                let menu_stack = self.state.menu_stack.clone();
+                let previous_capabilities = self.state.capabilities.clone();
+                let permission_profiles = self.state.permission_profiles.clone();
+
+                let mut state = AppState::from_snapshot(snapshot);
+                if state.capabilities.is_none() {
+                    state.capabilities = previous_capabilities;
+                }
+                state.composer = composer;
+                state.composer_drafts = composer_drafts;
+                state.pending_messages = pending_messages;
+                state.optimistic_user_messages = optimistic_user_messages;
+                state.approval_auto_open = approval_auto_open;
+                state.expanded_tool_outputs = expanded_tool_outputs;
+                state.menu_stack = menu_stack;
+                state.permission_profiles = permission_profiles;
+                state.restore_optimistic_user_messages();
+                self.state = state;
                 None
             }
             AppUiEvent::Protocol(notification) => self.apply_notification(notification),
@@ -336,7 +782,9 @@ impl Store {
                 self.state.set_run_state_error(error.message);
                 None
             }
-        }
+        };
+        self.refresh_active_menu_if_open();
+        command
     }
 
     pub fn apply_diff_preview_result(&mut self, result: DiffPreviewGetResult) {
@@ -351,8 +799,20 @@ impl Store {
         self.state.status = format!("Diff preview {status}: {title} ({file_count} files)");
     }
 
+    fn apply_permission_profile_event(&mut self, event: PermissionProfileClientEvent) {
+        self.state
+            .set_permission_profile(event.session_id, event.current);
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "permissions",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
     fn apply_progress(&mut self, event: UiProgressEvent) -> Option<AppUiCommand> {
         let status = progress_status(&event);
+        let record_activity = should_record_progress_activity(&event);
         let diff_preview_request = event.metadata.file_mutation.as_ref().and_then(|notice| {
             notice
                 .preview_id
@@ -367,22 +827,24 @@ impl Store {
             };
             format!("{} {}{preview}", notice.operation, notice.path)
         });
-        let mut item = ActivityItem::new(
-            ActivityKind::Progress,
-            event
-                .metadata
-                .label
-                .clone()
-                .unwrap_or_else(|| event.metadata.kind.clone()),
-            status.clone(),
-        );
-        if let Some(turn_id) = event.turn_id.clone() {
-            item = item.with_turn(turn_id);
+        if record_activity {
+            let mut item = ActivityItem::new(
+                ActivityKind::Progress,
+                event
+                    .metadata
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| event.metadata.kind.clone()),
+                status.clone(),
+            );
+            if let Some(turn_id) = event.turn_id.clone() {
+                item = item.with_turn(turn_id);
+            }
+            if let Some(detail) = event.metadata.detail.clone().or(mutation_detail) {
+                item = item.with_detail(detail);
+            }
+            self.state.push_activity(item);
         }
-        if let Some(detail) = event.metadata.detail.or(mutation_detail) {
-            item = item.with_detail(detail);
-        }
-        self.state.push_activity(item);
         if event.turn_id.is_some() {
             self.state.set_run_state_in_progress();
         }
@@ -401,7 +863,9 @@ impl Store {
             return None;
         }
 
-        self.state.status = status;
+        if !is_noisy_progress_status(&status) {
+            self.state.status = status;
+        }
         None
     }
 
@@ -563,9 +1027,6 @@ impl Store {
                 let mut approval = ApprovalModalState::from_event(event);
                 approval.visible = self.state.approval_auto_open;
                 let diff_preview_id = approval.diff_preview_id();
-                if diff_preview_id.is_some() {
-                    approval.visible = false;
-                }
                 self.state.approval = Some(approval);
                 self.state.focus = FocusPane::Composer;
                 self.state.set_run_state_blocked(title.clone());
@@ -625,9 +1086,13 @@ impl Store {
         let tool_name = event.tool_name.clone();
         let cleared = self.clear_matching_approval(&event.approval_id);
         self.state.push_activity(
-            ActivityItem::new(ActivityKind::Approval, tool_name, format!("auto-resolved {decision}"))
-                .with_turn(event.turn_id)
-                .with_detail(format!("scope={scope} match={scope_match}")),
+            ActivityItem::new(
+                ActivityKind::Approval,
+                tool_name,
+                format!("auto-resolved {decision}"),
+            )
+            .with_turn(event.turn_id)
+            .with_detail(format!("scope={scope} match={scope_match}")),
         );
         if cleared {
             self.state.set_run_state_in_progress();
@@ -742,6 +1207,7 @@ impl Store {
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
         let seq = event.cursor.map(|cursor| cursor.seq).unwrap_or(0);
+        let complete_live_plan = self.turn_had_completion_activity(&event.turn_id);
         let (status, reset_scroll, completed_current_turn) = {
             let Some(session) = self.find_session_mut(&event.session_id) else {
                 return None;
@@ -749,7 +1215,12 @@ impl Store {
             let title = session.title.clone();
             match session.live_reply.take() {
                 Some(live_reply) if live_reply.turn_id == event.turn_id => {
-                    session.messages.push(Message::assistant(live_reply.text));
+                    let text = if complete_live_plan {
+                        complete_plan_steps_in_text(&live_reply.text)
+                    } else {
+                        live_reply.text
+                    };
+                    session.messages.push(Message::assistant(text));
                     (
                         format!("Turn completed in {title} at seq {seq}"),
                         true,
@@ -834,6 +1305,25 @@ impl Store {
             .find(|session| &session.id == session_id)
     }
 
+    fn turn_had_completion_activity(&self, turn_id: &octos_core::ui_protocol::TurnId) -> bool {
+        self.state.activity.iter().any(|activity| {
+            activity.turn_id.as_ref() == Some(turn_id)
+                && match activity.kind {
+                    ActivityKind::Tool => {
+                        activity.status == "complete" && activity.success != Some(false)
+                    }
+                    ActivityKind::Progress => {
+                        activity.title == octos_core::ui_protocol::progress_kinds::FILE_MUTATION
+                            || activity
+                                .detail
+                                .as_deref()
+                                .is_some_and(|detail| detail.contains("diff preview ready"))
+                    }
+                    ActivityKind::Approval | ActivityKind::Warning | ActivityKind::Error => false,
+                }
+        })
+    }
+
     fn clear_matching_approval(&mut self, approval_id: &ApprovalId) -> bool {
         let matches = self
             .state
@@ -856,6 +1346,84 @@ impl Store {
             .iter_mut()
             .find(|task| &task.id == task_id)
     }
+}
+
+fn slash_command_try_hint(ctx: &crate::menu::AvailabilityContext<'_>) -> String {
+    let registry = CommandRegistry::with_core_commands();
+    let names = registry
+        .visible_commands(ctx)
+        .iter()
+        .take(3)
+        .map(|visible| visible.command.slash_name())
+        .collect::<Vec<_>>();
+    match names.len() {
+        0 => "a registered command".into(),
+        1 => names[0].clone(),
+        2 => format!("{} or {}", names[0], names[1]),
+        _ => {
+            let last = names.last().expect("non-empty command names");
+            format!("{}, or {last}", names[..names.len() - 1].join(", "))
+        }
+    }
+}
+
+fn active_menu_item_len(menu: Option<&MenuBuildResult>) -> usize {
+    match menu {
+        Some(MenuBuildResult::Ready(spec)) => spec.items.len(),
+        Some(MenuBuildResult::Loading(_))
+        | Some(MenuBuildResult::Unavailable(_))
+        | Some(MenuBuildResult::Error(_))
+        | None => 0,
+    }
+}
+
+fn active_menu_selected_action(
+    menu: &MenuBuildResult,
+    selected_index: usize,
+) -> Option<MenuAction> {
+    match menu {
+        MenuBuildResult::Ready(spec) => spec
+            .items
+            .get(selected_index)
+            .filter(|item| item.is_enabled())
+            .map(|item| item.action.clone()),
+        MenuBuildResult::Loading(_)
+        | MenuBuildResult::Unavailable(_)
+        | MenuBuildResult::Error(_) => None,
+    }
+}
+
+#[derive(Default)]
+struct TaskCounts {
+    total: usize,
+    pending: usize,
+    running: usize,
+    done: usize,
+    failed: usize,
+}
+
+fn count_tasks(store: &Store) -> TaskCounts {
+    let mut counts = TaskCounts::default();
+    for task in store
+        .state
+        .sessions
+        .iter()
+        .flat_map(|session| session.tasks.iter())
+    {
+        counts.total += 1;
+        match task_state_label(task.state) {
+            "pending" => counts.pending += 1,
+            "running" => counts.running += 1,
+            "done" => counts.done += 1,
+            "failed" | "cancelled" => counts.failed += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 fn tool_invocation_detail(tool_name: &str, arguments: &Value) -> Option<String> {
@@ -1079,6 +1647,53 @@ fn progress_status(event: &UiProgressEvent) -> String {
     format!("Progress: {}", metadata.kind)
 }
 
+fn is_noisy_progress_status(status: &str) -> bool {
+    let normalized = status.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    status.contains("[progress]")
+        || normalized.contains("token/cost_update")
+        || normalized.contains("token_cost_update")
+        || normalized == "token_cost"
+}
+
+fn should_record_progress_activity(event: &UiProgressEvent) -> bool {
+    let metadata = &event.metadata;
+    if metadata.file_mutation.is_some() || metadata.retry.is_some() {
+        return true;
+    }
+
+    !is_low_value_progress_metadata(metadata)
+}
+
+fn is_low_value_progress_metadata(metadata: &octos_core::ui_protocol::UiProgressMetadata) -> bool {
+    metadata.token_cost.is_some()
+        || is_low_value_progress_name(&metadata.kind)
+        || metadata
+            .label
+            .as_deref()
+            .is_some_and(is_low_value_progress_name)
+}
+
+fn is_low_value_progress_name(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    matches!(
+        normalized.as_str(),
+        "thinking"
+            | "response"
+            | "stream_start"
+            | "stream_end"
+            | "token_cost"
+            | "token_cost_update"
+            | "cost_update"
+            | "token_usage"
+            | "token_usage_update"
+            | "tokens"
+            | "tool_started"
+            | "tool_progress"
+            | "tool_completed"
+            | "turn_completed"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,7 +1703,8 @@ mod tests {
         ApprovalDiffDetails, ApprovalId, ApprovalRequestedEvent, ApprovalTypedDetails,
         OutputCursor, PreviewId, ReplayLossyEvent, TaskRuntimeState, ToolCompletedEvent,
         ToolStartedEvent, TurnId, UiCursor, UiFileMutationNotice, UiProgressMetadata,
-        approval_kinds, approval_scopes, progress_kinds,
+        UiProtocolCapabilities, UiTokenCostUpdate, approval_kinds, approval_scopes, methods,
+        progress_kinds,
     };
 
     fn store_with_live_reply(turn_id: TurnId, text: impl Into<String>) -> Store {
@@ -1140,6 +1756,218 @@ mod tests {
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
         }
+    }
+
+    fn protocol_store_with_methods(methods: &[&str]) -> Store {
+        let mut store = store_with_empty_session();
+        store.state.target = Some("ws://example.test/ui-protocol".into());
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods(
+            methods.iter().copied(),
+        ));
+        store
+    }
+
+    fn help_menu_labels(store: &Store) -> Vec<String> {
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected active ready menu");
+        };
+        spec.items.iter().map(|item| item.label.clone()).collect()
+    }
+
+    #[test]
+    fn slash_command_registry_matches_exact_alias_and_prefix() {
+        let store = store_with_empty_session();
+
+        let exact = store.slash_command_matches("/ps");
+        assert_eq!(exact[0].name, "/ps");
+        assert!(exact[0].available);
+        assert!(exact.iter().any(|command| command.name == "/ps"));
+
+        let alias = store.slash_command_matches("/?");
+        assert_eq!(alias[0].name, "/help");
+
+        let prefix = store.slash_command_matches("he");
+        assert_eq!(prefix[0].name, "/help");
+        assert!(prefix.iter().any(|command| command.name == "/help"));
+    }
+
+    #[test]
+    fn compose_command_dispatches_help_slash_without_prompt_submission() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "/help".into();
+
+        let command = store.compose_command();
+
+        assert!(command.is_none());
+        assert!(store.state.composer.is_empty());
+        assert!(store.state.sessions[0].messages.is_empty());
+        assert!(store.state.pending_messages.is_empty());
+        assert!(store.state.menu_stack.is_active());
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_HELP)
+        );
+    }
+
+    #[test]
+    fn unknown_slash_during_active_turn_is_local_error_not_staged_prompt() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "working");
+        store.state.composer = "/wat".into();
+
+        let command = store.compose_command();
+
+        assert!(command.is_none());
+        assert!(store.state.composer.is_empty());
+        assert!(store.state.pending_messages.is_empty());
+        assert!(store.state.sessions[0].messages.is_empty());
+        assert_eq!(
+            store.state.status,
+            "Unknown slash command: /wat. Try /ps, /stop, or /help."
+        );
+        let activity = store.state.activity.last().expect("local warning activity");
+        assert_eq!(activity.kind, ActivityKind::Warning);
+        assert_eq!(activity.title, "local slash command");
+    }
+
+    #[test]
+    fn slash_matches_follow_full_partial_and_missing_capabilities() {
+        let mut no_capability = store_with_empty_session();
+        no_capability.state.target = Some("ws://example.test/ui-protocol".into());
+        let no_capability_names = no_capability
+            .slash_command_matches("")
+            .into_iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+        assert!(no_capability_names.contains(&"/status".into()));
+        assert!(no_capability_names.contains(&"/permissions".into()));
+        assert!(!no_capability_names.contains(&"/model".into()));
+        assert!(!no_capability_names.contains(&"/mcp".into()));
+
+        let partial = protocol_store_with_methods(&[methods::APPROVAL_SCOPES_LIST]);
+        let partial_names = partial
+            .slash_command_matches("")
+            .into_iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+        assert!(partial_names.contains(&"/permissions".into()));
+        assert!(!partial_names.contains(&"/model".into()));
+        assert!(!partial_names.contains(&"/mcp".into()));
+
+        let full = protocol_store_with_methods(&[
+            methods::APPROVAL_SCOPES_LIST,
+            crate::menu::registry::APPUI_METHOD_MODEL_LIST,
+            crate::menu::registry::APPUI_METHOD_MCP_STATUS_LIST,
+        ]);
+        let full_names = full
+            .slash_command_matches("")
+            .into_iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+        assert!(full_names.contains(&"/model".into()));
+        assert!(full_names.contains(&"/permissions".into()));
+        assert!(full_names.contains(&"/mcp".into()));
+    }
+
+    #[test]
+    fn readonly_slash_stop_is_intercepted_without_prompt_submission() {
+        let mut store = store_with_empty_session();
+        store.state.readonly = true;
+        store.state.composer = "/stop".into();
+
+        let command = store.compose_command();
+
+        assert!(command.is_none());
+        assert!(store.state.composer.is_empty());
+        assert!(store.state.pending_messages.is_empty());
+        assert!(store.state.sessions[0].messages.is_empty());
+        assert_eq!(
+            store.state.status,
+            "/stop is unavailable: blocked in read-only mode"
+        );
+    }
+
+    #[test]
+    fn session_bound_slash_is_intercepted_without_open_session() {
+        let mut store = Store {
+            state: AppState::new(
+                Vec::new(),
+                0,
+                "ready".into(),
+                Some("ws://example.test/ui-protocol".into()),
+                false,
+            ),
+        };
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            methods::APPROVAL_SCOPES_LIST,
+        ]));
+        store.state.composer = "/permissions".into();
+
+        let command = store.compose_command();
+
+        assert!(command.is_none());
+        assert!(store.state.composer.is_empty());
+        assert!(store.state.pending_messages.is_empty());
+        assert_eq!(
+            store.state.status,
+            "/permissions is unavailable: requires an open session"
+        );
+    }
+
+    #[test]
+    fn unavailable_slash_during_active_turn_is_not_staged_as_prompt() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "working");
+        store.state.target = Some("ws://example.test/ui-protocol".into());
+        store.state.composer = "/model".into();
+
+        let command = store.compose_command();
+
+        assert!(command.is_none());
+        assert!(store.state.composer.is_empty());
+        assert!(store.state.pending_messages.is_empty());
+        assert!(store.state.sessions[0].messages.is_empty());
+        assert_eq!(
+            store.state.status,
+            "/model is unavailable: AppUI capabilities are not available"
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_active_menu_stack_and_rebuilds_from_capabilities() {
+        let mut store = protocol_store_with_methods(&[]);
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
+        assert!(help_menu_labels(&store).contains(&"/status".to_string()));
+        assert!(help_menu_labels(&store).contains(&"/permissions".to_string()));
+        assert!(!help_menu_labels(&store).contains(&"/model".to_string()));
+
+        let session = store.state.sessions[0].clone();
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![session],
+            selected_session: 0,
+            status: "snapshot replay".into(),
+            target: Some("ws://example.test/ui-protocol".into()),
+            capabilities: Some(UiProtocolCapabilities::new(
+                &[crate::menu::registry::APPUI_METHOD_MODEL_LIST],
+                &[],
+            )),
+            readonly: false,
+        }));
+
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_HELP)
+        );
+        assert!(help_menu_labels(&store).contains(&"/model".to_string()));
+        assert!(help_menu_labels(&store).contains(&"/permissions".to_string()));
     }
 
     #[test]
@@ -1253,6 +2081,93 @@ mod tests {
     }
 
     #[test]
+    fn compose_command_commits_user_prompt_before_protocol_output() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "complete m9 contract".into();
+
+        let command = store
+            .compose_command()
+            .expect("submitted prompt emits command");
+
+        let AppUiCommand::SubmitPrompt(params) = command else {
+            panic!("expected prompt submission");
+        };
+        let messages = &store.state.sessions[0].messages;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role.as_str(), "user");
+        assert_eq!(messages[0].content, "complete m9 contract");
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            ApprovalRequestedEvent::generic(
+                params.session_id,
+                ApprovalId::new(),
+                params.turn_id,
+                "shell",
+                "Run command",
+                "cargo test -p octos-core ui_protocol",
+            ),
+        )));
+
+        let messages = &store.state.sessions[0].messages;
+        assert_eq!(messages[0].role.as_str(), "user");
+        assert_eq!(messages[0].content, "complete m9 contract");
+        assert!(store.state.approval.is_some());
+        assert_eq!(
+            store.state.activity.last().map(|item| item.kind),
+            Some(ActivityKind::Approval)
+        );
+    }
+
+    #[test]
+    fn snapshot_replay_keeps_submitted_prompt_before_approval_output() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.composer = "complete m9 contract".into();
+
+        let command = store
+            .compose_command()
+            .expect("submitted prompt emits command");
+        let AppUiCommand::SubmitPrompt(params) = command else {
+            panic!("expected prompt submission");
+        };
+
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            selected_session: 0,
+            status: "replayed snapshot".into(),
+            target: None,
+            capabilities: Some(
+                octos_core::ui_protocol::UiProtocolCapabilities::first_server_slice(),
+            ),
+            readonly: false,
+        }));
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            ApprovalRequestedEvent::generic(
+                session_id,
+                ApprovalId::new(),
+                params.turn_id,
+                "shell",
+                "Run command",
+                "cargo test -p octos-core ui_protocol",
+            ),
+        )));
+
+        let messages = &store.state.sessions[0].messages;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role.as_str(), "user");
+        assert_eq!(messages[0].content, "complete m9 contract");
+        assert!(store.state.approval.is_some());
+    }
+
+    #[test]
     fn completed_turn_submits_next_staged_message() {
         let turn_id = TurnId::new();
         let mut store = store_with_live_reply(turn_id.clone(), "done");
@@ -1285,6 +2200,89 @@ mod tests {
         assert_eq!(store.state.run_state.label(), "running");
     }
 
+    #[test]
+    fn queued_prompt_survives_snapshot_without_entering_old_chat_history() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "working");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.sessions[0].messages = vec![
+            Message::user("old prompt"),
+            Message::assistant("old answer"),
+        ];
+        store.state.composer = "queued next".into();
+
+        let command = store.compose_command();
+
+        assert!(command.is_none());
+        assert_eq!(store.state.pending_messages, vec!["queued next"]);
+        assert!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .all(|message| message.content != "queued next")
+        );
+
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("old prompt"),
+                    Message::assistant("old answer"),
+                ],
+                tasks: vec![],
+                live_reply: Some(LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: "working".into(),
+                }),
+            }],
+            selected_session: 0,
+            status: "replayed snapshot".into(),
+            target: None,
+            capabilities: Some(
+                octos_core::ui_protocol::UiProtocolCapabilities::first_server_slice(),
+            ),
+            readonly: false,
+        }));
+
+        assert_eq!(store.state.pending_messages, vec!["queued next"]);
+        assert!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .all(|message| message.content != "queued next")
+        );
+
+        let command = store
+            .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+                TurnCompletedEvent {
+                    session_id: session_id.clone(),
+                    turn_id,
+                    cursor: None,
+                },
+            )))
+            .expect("queued prompt submits after active turn completes");
+
+        let AppUiCommand::SubmitPrompt(params) = command else {
+            panic!("expected queued prompt submission");
+        };
+        assert_eq!(params.session_id, session_id);
+        assert_eq!(
+            params.input,
+            vec![InputItem::Text {
+                text: "queued next".into()
+            }]
+        );
+
+        let messages = &store.state.sessions[0].messages;
+        assert_eq!(messages[0].content, "old prompt");
+        assert_eq!(messages[1].content, "old answer");
+        assert_eq!(messages[2].content, "working");
+        assert_eq!(messages[3].role.as_str(), "user");
+        assert_eq!(messages[3].content, "queued next");
+    }
+
     fn open_generic_approval(store: &mut Store) -> (SessionKey, ApprovalId) {
         let session_id = store.state.sessions[0].id.clone();
         let approval_id = ApprovalId::new();
@@ -1305,7 +2303,7 @@ mod tests {
 
     #[test]
     fn approval_request_opens_modal_and_approve_request_emits_scoped_command() {
-        let mut store = store_with_empty_session();
+        let mut store = store_with_live_reply(TurnId::new(), "working");
         let (session_id, approval_id) = open_generic_approval(&mut store);
 
         let approval = store.state.approval.as_ref().expect("approval is visible");
@@ -1334,6 +2332,27 @@ mod tests {
             "Approval approved for this request: Run command"
         );
         assert_eq!(store.state.run_state.label(), "running");
+    }
+
+    #[test]
+    fn approval_response_does_not_restart_completed_turn() {
+        let mut store = store_with_empty_session();
+        let (_, approval_id) = open_generic_approval(&mut store);
+        store.state.set_run_state_success();
+
+        let command = store
+            .respond_approval_command(ApprovalModalAction::ApproveSession)
+            .expect("approval response command");
+
+        let AppUiCommand::RespondApproval(params) = command else {
+            panic!("expected approval response command");
+        };
+        assert_eq!(params.approval_id, approval_id);
+        assert_eq!(
+            params.approval_scope.as_deref(),
+            Some(approval_scopes::SESSION)
+        );
+        assert_eq!(store.state.run_state.label(), "done");
     }
 
     #[test]
@@ -1524,8 +2543,50 @@ mod tests {
                 .state
                 .approval
                 .as_ref()
-                .is_some_and(|approval| !approval.visible)
+                .is_some_and(|approval| approval.visible)
         );
+    }
+
+    #[test]
+    fn completed_turn_marks_live_plan_done_after_successful_tool_activity() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(
+            turn_id.clone(),
+            "Plan:\n1. [ ] Fix store/model progress handling\n2. [ ] Run tests",
+        );
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
+            ToolStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                tool_call_id: "call-1".into(),
+                tool_name: "shell".into(),
+                arguments: Some(serde_json::json!({"command": "cargo test"})),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolCompleted(
+            ToolCompletedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                tool_call_id: "call-1".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                output_preview: Some("tests passed".into()),
+                duration_ms: Some(100),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                turn_id,
+                cursor: None,
+            },
+        )));
+
+        let content = &store.state.sessions[0].messages[0].content;
+        assert!(content.contains("- [x] Fix store/model progress handling"));
+        assert!(content.contains("- [x] Run tests"));
     }
 
     #[test]
@@ -1957,6 +3018,61 @@ mod tests {
         )));
 
         assert_eq!(store.state.status, "Thinking");
+    }
+
+    #[test]
+    fn low_value_progress_updates_status_without_activity() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.status = "Working".into();
+        let mut token_cost = UiTokenCostUpdate::new();
+        token_cost.total_tokens = Some(123);
+
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id.clone(),
+            Some(TurnId::new()),
+            UiProgressMetadata::token_cost(token_cost),
+        )));
+
+        assert_eq!(store.state.status, "Working");
+        assert!(store.state.activity.is_empty());
+        assert_eq!(store.state.run_state.label(), "running");
+
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id.clone(),
+            None,
+            UiProgressMetadata::new(progress_kinds::STREAM_END).with_message("stream closed"),
+        )));
+
+        assert_eq!(store.state.status, "stream closed");
+        assert!(store.state.activity.is_empty());
+
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id,
+            Some(TurnId::new()),
+            UiProgressMetadata::new("tool_completed").with_message("[progress] tool_completed"),
+        )));
+
+        assert_eq!(store.state.status, "stream closed");
+        assert!(store.state.activity.is_empty());
+    }
+
+    #[test]
+    fn important_progress_still_records_activity() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id,
+            None,
+            UiProgressMetadata::file_mutation(UiFileMutationNotice::new("src/main.rs", "modify")),
+        )));
+
+        assert_eq!(store.state.activity.len(), 1);
+        let activity = &store.state.activity[0];
+        assert_eq!(activity.kind, ActivityKind::Progress);
+        assert_eq!(activity.title, progress_kinds::FILE_MUTATION);
+        assert_eq!(activity.status, "File mutation: modify src/main.rs");
     }
 
     #[test]

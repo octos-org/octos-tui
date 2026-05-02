@@ -1,11 +1,19 @@
-use octos_core::app_ui::{AppUiLiveReply, AppUiSession, AppUiSnapshot, AppUiTask, APP_UI_API_V1};
+use std::time::Instant;
+
+use octos_core::app_ui::{APP_UI_API_V1, AppUiLiveReply, AppUiSession, AppUiSnapshot, AppUiTask};
 use octos_core::ui_protocol::{
-    approval_scopes, ApprovalDecision, ApprovalId, ApprovalRenderHints, ApprovalRequestedEvent,
-    ApprovalTypedDetails, OutputCursor, PreviewId, TaskRuntimeState, TurnId, UiPaneSnapshot,
+    ApprovalDecision, ApprovalId, ApprovalRenderHints, ApprovalRequestedEvent,
+    ApprovalTypedDetails, OutputCursor, PermissionProfileSelection, PreviewId, TaskRuntimeState,
+    TurnId, UiPaneSnapshot, UiProtocolCapabilities, approval_scopes,
 };
-use octos_core::{SessionKey, TaskId};
+use octos_core::{Message, SessionKey, TaskId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::menu::{
+    AvailabilityContext, CapabilitySet, ConnectionState, MenuBuildResult, MenuStack, RuntimeMode,
+    TaskActivity,
+};
 
 pub type LiveReply = AppUiLiveReply;
 pub type SessionView = AppUiSession;
@@ -62,6 +70,10 @@ impl SessionRunState {
             Self::Idle | Self::InProgress | Self::Success => None,
         }
     }
+
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::InProgress | Self::Blocked { .. })
+    }
 }
 
 impl Default for SessionRunState {
@@ -83,23 +95,45 @@ pub struct AppState {
     pub composer: String,
     pub composer_drafts: Vec<ComposerDraft>,
     pub pending_messages: Vec<String>,
+    pub optimistic_user_messages: Vec<OptimisticUserMessage>,
     pub status: String,
     pub target: Option<String>,
     pub readonly: bool,
     pub protocol_version: &'static str,
     pub run_state: SessionRunState,
+    pub run_state_started_at: Option<Instant>,
     pub approval_auto_open: bool,
     pub approval: Option<ApprovalModalState>,
     pub task_output: TaskOutputDetailState,
     pub task_output_cursors: Vec<TaskOutputCursor>,
     pub diff_preview: DiffPreviewPaneState,
     pub activity: Vec<ActivityItem>,
+    pub expanded_tool_outputs: bool,
+    pub menu_stack: MenuStack,
+    pub active_menu: Option<MenuBuildResult>,
+    pub capabilities: Option<CapabilitySet>,
+    pub permission_profiles: Vec<SessionPermissionProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposerDraft {
     pub session_id: SessionKey,
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptimisticUserMessage {
+    pub session_id: SessionKey,
+    pub turn_id: TurnId,
+    pub content: String,
+    pub anchor_index: usize,
+    pub prior_matching_user_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPermissionProfile {
+    pub session_id: SessionKey,
+    pub current: PermissionProfileSelection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +169,12 @@ pub struct ActivityItem {
     pub duration_ms: Option<u64>,
     pub turn_id: Option<TurnId>,
     pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanStep {
+    pub text: String,
+    pub completed: bool,
 }
 
 impl ActivityItem {
@@ -922,14 +962,19 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 impl AppState {
     pub fn from_snapshot(snapshot: AppUiSnapshot) -> Self {
         let panes = SnapshotPaneSeed::from_snapshot(&snapshot);
-        Self::new_with_panes(
+        let capabilities = snapshot.capabilities.clone();
+        let mut state = Self::new_with_panes(
             snapshot.sessions,
             snapshot.selected_session,
             snapshot.status,
             snapshot.target,
             snapshot.readonly,
             panes,
-        )
+        );
+        if let Some(capabilities) = capabilities {
+            state.set_capabilities(capabilities);
+        }
+        state
     }
 
     pub fn new(
@@ -958,6 +1003,8 @@ impl AppState {
         };
         let run_state = initial_run_state(&sessions, selected_session);
 
+        let run_state_started_at = run_state.is_active().then(Instant::now);
+
         Self {
             sessions,
             selected_session,
@@ -970,18 +1017,101 @@ impl AppState {
             composer: String::new(),
             composer_drafts: Vec::new(),
             pending_messages: Vec::new(),
+            optimistic_user_messages: Vec::new(),
             status,
             target,
             readonly,
             protocol_version: APP_UI_API_V1,
             run_state,
+            run_state_started_at,
             approval_auto_open: true,
             approval: None,
             task_output: TaskOutputDetailState::default(),
             task_output_cursors: Vec::new(),
             diff_preview: DiffPreviewPaneState::default(),
             activity: Vec::new(),
+            expanded_tool_outputs: false,
+            menu_stack: MenuStack::new(),
+            active_menu: None,
+            capabilities: None,
+            permission_profiles: Vec::new(),
         }
+    }
+
+    pub fn permission_profile_for(
+        &self,
+        session_id: &SessionKey,
+    ) -> Option<PermissionProfileSelection> {
+        self.permission_profiles
+            .iter()
+            .find(|profile| &profile.session_id == session_id)
+            .map(|profile| profile.current)
+    }
+
+    pub fn set_permission_profile(
+        &mut self,
+        session_id: SessionKey,
+        current: PermissionProfileSelection,
+    ) {
+        let current = current.normalized();
+        if let Some(profile) = self
+            .permission_profiles
+            .iter_mut()
+            .find(|profile| profile.session_id == session_id)
+        {
+            profile.current = current;
+        } else {
+            self.permission_profiles.push(SessionPermissionProfile {
+                session_id,
+                current,
+            });
+        }
+    }
+
+    pub fn availability_context(&self) -> AvailabilityContext<'_> {
+        AvailabilityContext {
+            task: if self.active_turn().is_some()
+                || self.active_task().is_some_and(|task| {
+                    matches!(
+                        task.state,
+                        TaskRuntimeState::Pending | TaskRuntimeState::Running
+                    )
+                }) {
+                TaskActivity::Running
+            } else {
+                TaskActivity::Idle
+            },
+            approval_modal_visible: self
+                .approval
+                .as_ref()
+                .is_some_and(|approval| approval.visible),
+            readonly: self.readonly,
+            runtime: if self
+                .target
+                .as_deref()
+                .is_some_and(|target| target.starts_with("ws://") || target.starts_with("wss://"))
+            {
+                RuntimeMode::Protocol
+            } else {
+                RuntimeMode::Mock
+            },
+            connection: if self
+                .target
+                .as_deref()
+                .is_some_and(|target| target.starts_with("ws://") || target.starts_with("wss://"))
+            {
+                ConnectionState::Connected
+            } else {
+                ConnectionState::Disconnected
+            },
+            capabilities: self.capabilities.as_ref(),
+            feature_flags: &[],
+            session_open: !self.sessions.is_empty(),
+        }
+    }
+
+    pub fn set_capabilities(&mut self, capabilities: UiProtocolCapabilities) {
+        self.capabilities = Some(CapabilitySet::from(&capabilities));
     }
 
     pub fn apply_pane_snapshot(&mut self, panes: UiPaneSnapshot) {
@@ -1066,6 +1196,61 @@ impl AppState {
         let session = self.active_session()?;
         let live_reply = session.live_reply.as_ref()?;
         Some((&session.id, &live_reply.turn_id))
+    }
+
+    pub fn record_submitted_user_prompt(
+        &mut self,
+        session_id: SessionKey,
+        turn_id: TurnId,
+        content: String,
+    ) {
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            return;
+        };
+        let optimistic = OptimisticUserMessage {
+            prior_matching_user_count: matching_user_message_count(session, &content),
+            anchor_index: session.messages.len(),
+            session_id,
+            turn_id,
+            content,
+        };
+        self.optimistic_user_messages.push(optimistic);
+        const MAX_OPTIMISTIC_USER_MESSAGES: usize = 64;
+        if self.optimistic_user_messages.len() > MAX_OPTIMISTIC_USER_MESSAGES {
+            let excess = self.optimistic_user_messages.len() - MAX_OPTIMISTIC_USER_MESSAGES;
+            self.optimistic_user_messages.drain(0..excess);
+        }
+        self.restore_optimistic_user_messages();
+    }
+
+    pub fn restore_optimistic_user_messages(&mut self) {
+        let mut retained = Vec::new();
+        for optimistic in self.optimistic_user_messages.clone() {
+            let Some(session) = self
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == optimistic.session_id)
+            else {
+                retained.push(optimistic);
+                continue;
+            };
+            if matching_user_message_count(session, &optimistic.content)
+                > optimistic.prior_matching_user_count
+            {
+                continue;
+            }
+
+            let insert_at = optimistic.anchor_index.min(session.messages.len());
+            session
+                .messages
+                .insert(insert_at, Message::user(optimistic.content.clone()));
+            retained.push(optimistic);
+        }
+        self.optimistic_user_messages = retained;
     }
 
     pub fn has_pending_messages(&self) -> bool {
@@ -1258,13 +1443,20 @@ impl AppState {
 
     pub fn set_run_state_idle(&mut self) {
         self.run_state = SessionRunState::Idle;
+        self.run_state_started_at = None;
     }
 
     pub fn set_run_state_in_progress(&mut self) {
+        if !self.run_state.is_active() {
+            self.run_state_started_at = Some(Instant::now());
+        }
         self.run_state = SessionRunState::InProgress;
     }
 
     pub fn set_run_state_blocked(&mut self, message: impl Into<String>) {
+        if !self.run_state.is_active() {
+            self.run_state_started_at = Some(Instant::now());
+        }
         self.run_state = SessionRunState::Blocked {
             message: message.into(),
         };
@@ -1272,16 +1464,34 @@ impl AppState {
 
     pub fn set_run_state_success(&mut self) {
         self.run_state = SessionRunState::Success;
+        self.run_state_started_at = None;
     }
 
     pub fn set_run_state_error(&mut self, message: impl Into<String>) {
         self.run_state = SessionRunState::Error {
             message: message.into(),
         };
+        self.run_state_started_at = None;
     }
 
     pub fn refresh_run_state_from_selection(&mut self) {
         self.run_state = initial_run_state(&self.sessions, self.selected_session);
+        self.run_state_started_at = self.run_state.is_active().then(Instant::now);
+    }
+
+    pub fn run_state_elapsed_secs(&self) -> Option<u64> {
+        self.run_state_started_at
+            .filter(|_| self.run_state.is_active())
+            .map(|started| started.elapsed().as_secs())
+    }
+
+    pub fn toggle_tool_output_expansion(&mut self) {
+        self.expanded_tool_outputs = !self.expanded_tool_outputs;
+        self.status = if self.expanded_tool_outputs {
+            "Expanded tool output cards".into()
+        } else {
+            "Collapsed tool output cards".into()
+        };
     }
 
     pub fn persist_composer_draft_for_selected_session(&mut self) {
@@ -1325,6 +1535,238 @@ impl AppState {
     }
 }
 
+pub fn extract_plan_steps(app: &AppState) -> Vec<PlanStep> {
+    let Some(session) = app.active_session() else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    if let Some(live_reply) = session.live_reply.as_ref() {
+        candidates.push(live_reply.text.as_str());
+    }
+    candidates.extend(
+        session
+            .messages
+            .iter()
+            .rev()
+            .filter(|message| message.role.as_str() == "assistant")
+            .map(|message| message.content.as_str()),
+    );
+
+    let mut plans = candidates.into_iter().filter_map(plan_steps_from_text);
+    let Some(mut plan) = plans.next() else {
+        return Vec::new();
+    };
+    for older_plan in plans {
+        merge_completed_plan_steps(&mut plan, &older_plan);
+    }
+    plan
+}
+
+pub fn complete_plan_steps_in_text(text: &str) -> String {
+    let mut in_plan = false;
+    let mut changed = false;
+    let mut completed_any = false;
+    let mut output = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            output.push(line.to_string());
+            if completed_any {
+                in_plan = false;
+            }
+            continue;
+        }
+
+        if is_plan_heading(trimmed) {
+            in_plan = true;
+            output.push(line.to_string());
+            continue;
+        }
+
+        if let Some(step) = plan_step_from_line(trimmed, in_plan) {
+            let indent_len = line.len() - line.trim_start().len();
+            let indent = &line[..indent_len];
+            output.push(format!("{indent}- [x] {}", step.text));
+            changed = true;
+            completed_any = true;
+            in_plan = true;
+            continue;
+        }
+
+        output.push(line.to_string());
+        if completed_any {
+            in_plan = false;
+        }
+    }
+
+    if changed {
+        let mut joined = output.join("\n");
+        if text.ends_with('\n') {
+            joined.push('\n');
+        }
+        joined
+    } else {
+        text.to_string()
+    }
+}
+
+fn plan_steps_from_text(text: &str) -> Option<Vec<PlanStep>> {
+    let mut in_plan = false;
+    let mut steps = Vec::new();
+    let mut in_code_fence = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+        if in_code_fence {
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            if in_plan && !steps.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        if is_plan_heading(trimmed) {
+            in_plan = true;
+            continue;
+        }
+
+        if let Some(step) = plan_step_from_line(trimmed, in_plan) {
+            steps.push(step);
+            in_plan = true;
+            continue;
+        }
+
+        if in_plan && !steps.is_empty() {
+            break;
+        }
+    }
+
+    (!steps.is_empty()).then_some(steps)
+}
+
+fn merge_completed_plan_steps(plan: &mut [PlanStep], completed_source: &[PlanStep]) {
+    for step in plan.iter_mut().filter(|step| !step.completed) {
+        if completed_source.iter().any(|candidate| {
+            candidate.completed
+                && normalize_plan_text(&candidate.text) == normalize_plan_text(&step.text)
+        }) {
+            step.completed = true;
+        }
+    }
+}
+
+fn normalize_plan_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn plan_step_from_line(line: &str, in_plan: bool) -> Option<PlanStep> {
+    let mut rest = line.trim();
+    let mut completed = None;
+    let mut saw_marker = false;
+    let mut saw_number = false;
+    let mut saw_checkbox = false;
+    let mut saw_plain_bullet = false;
+
+    for _ in 0..6 {
+        rest = rest.trim_start();
+        if let Some((checked, next)) = strip_checkbox(rest) {
+            completed = Some(checked);
+            saw_marker = true;
+            saw_checkbox = true;
+            rest = next;
+            continue;
+        }
+        if let Some(next) = strip_bullet(rest) {
+            saw_marker = true;
+            saw_plain_bullet = true;
+            rest = next;
+            continue;
+        }
+        if let Some(next) = strip_number(rest) {
+            saw_marker = true;
+            saw_number = true;
+            rest = next;
+            continue;
+        }
+        break;
+    }
+
+    if !saw_marker {
+        return None;
+    }
+    if saw_plain_bullet && !saw_checkbox && !saw_number && !in_plan {
+        return None;
+    }
+
+    let text = rest.trim_start_matches(['.', ')', ' ']).trim();
+    if text.is_empty() || text.chars().count() > 160 {
+        return None;
+    }
+
+    Some(PlanStep {
+        text: text.to_string(),
+        completed: completed.unwrap_or(false),
+    })
+}
+
+fn strip_checkbox(line: &str) -> Option<(bool, &str)> {
+    let rest = line.strip_prefix('[')?;
+    let (marker, rest) = rest.split_once(']')?;
+    let completed = match marker.trim() {
+        "x" | "X" => true,
+        "" => false,
+        _ => return None,
+    };
+    Some((completed, rest.trim_start()))
+}
+
+fn strip_bullet(line: &str) -> Option<&str> {
+    line.strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+}
+
+fn strip_number(line: &str) -> Option<&str> {
+    let split = line.find(['.', ')'])?;
+    let (number, rest) = line.split_at(split);
+    if number.is_empty() || number.len() > 3 || !number.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let rest = rest[1..].trim_start();
+    (!rest.is_empty()).then_some(rest)
+}
+
+fn is_plan_heading(line: &str) -> bool {
+    let heading = line
+        .trim_start_matches('#')
+        .trim()
+        .trim_end_matches(':')
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        heading.as_str(),
+        "plan"
+            | "steps"
+            | "next steps"
+            | "implementation plan"
+            | "task plan"
+            | "todo"
+            | "checklist"
+    )
+}
+
 fn initial_run_state(sessions: &[SessionView], selected_session: usize) -> SessionRunState {
     if sessions
         .get(selected_session)
@@ -1335,6 +1777,14 @@ fn initial_run_state(sessions: &[SessionView], selected_session: usize) -> Sessi
     } else {
         SessionRunState::Idle
     }
+}
+
+fn matching_user_message_count(session: &SessionView, content: &str) -> usize {
+    session
+        .messages
+        .iter()
+        .filter(|message| message.role.as_str() == "user" && message.content == content)
+        .count()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1380,11 +1830,11 @@ fn preview_id_from_text(text: &str) -> Option<PreviewId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use octos_core::Message;
     use octos_core::ui_protocol::{
         UiArtifactPaneItem, UiArtifactPaneSnapshot, UiGitHistoryItem, UiGitPaneSnapshot,
         UiGitStatusItem, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
     };
-    use octos_core::Message;
 
     fn state_with_task(task: TaskView) -> AppState {
         AppState::new(
@@ -1424,6 +1874,7 @@ mod tests {
             selected_session: 0,
             status: "Mock backend ready".into(),
             target: Some("local mock snapshot".into()),
+            capabilities: Some(UiProtocolCapabilities::first_server_slice()),
             readonly: false,
         };
 
@@ -1432,31 +1883,39 @@ mod tests {
         assert!(state.artifacts.items.iter().any(|item| {
             item.title == "AppUi bootstrap snapshot" && item.source == "local mock snapshot"
         }));
-        assert!(state
-            .artifacts
-            .items
-            .iter()
-            .any(|item| item.title == "protocol spike output tail"
-                && item.status == "bootstrap: seeded mock session"));
+        assert!(
+            state
+                .artifacts
+                .items
+                .iter()
+                .any(|item| item.title == "protocol spike output tail"
+                    && item.status == "bootstrap: seeded mock session")
+        );
         assert!(state.artifacts.items.iter().any(|item| {
             item.title == "protocol spike diff preview" && item.status == preview_id.0.to_string()
         }));
-        assert!(state
-            .workspace
-            .contract
-            .iter()
-            .any(|line| line.contains(APP_UI_API_V1)));
-        assert!(state
-            .workspace
-            .entries
-            .iter()
-            .any(|entry| entry.label == "protocol spike" && entry.detail == "running"));
+        assert!(
+            state
+                .workspace
+                .contract
+                .iter()
+                .any(|line| line.contains(APP_UI_API_V1))
+        );
+        assert!(
+            state
+                .workspace
+                .entries
+                .iter()
+                .any(|entry| entry.label == "protocol spike" && entry.detail == "running")
+        );
         assert_eq!(state.git.branch, "m9.7/mock-snapshot");
-        assert!(state
-            .git
-            .history
-            .iter()
-            .any(|entry| entry.summary == "seed missing pane snapshots"));
+        assert!(
+            state
+                .git
+                .history
+                .iter()
+                .any(|entry| entry.summary == "seed missing pane snapshots")
+        );
     }
 
     #[test]
@@ -1466,6 +1925,7 @@ mod tests {
             selected_session: 0,
             status: "Protocol backend connected".into(),
             target: Some("wss://example.test/ui-protocol".into()),
+            capabilities: Some(UiProtocolCapabilities::first_server_slice()),
             readonly: true,
         };
 
@@ -1476,22 +1936,28 @@ mod tests {
                 && item.status == "waiting for artifact payloads"
         }));
         assert_eq!(state.workspace.root, "wss://example.test/ui-protocol");
-        assert!(state
-            .workspace
-            .contract
-            .iter()
-            .any(|line| line.contains("pane.snapshots.v1")));
-        assert!(state
-            .workspace
-            .contract
-            .iter()
-            .any(|line| line == "readonly launch: commands disabled"));
+        assert!(
+            state
+                .workspace
+                .contract
+                .iter()
+                .any(|line| line.contains("pane.snapshots.v1"))
+        );
+        assert!(
+            state
+                .workspace
+                .contract
+                .iter()
+                .any(|line| line == "readonly launch: commands disabled")
+        );
         assert_eq!(state.git.branch, "not supplied");
-        assert!(state
-            .git
-            .status
-            .iter()
-            .any(|item| item.detail.contains("protocol snapshot")));
+        assert!(
+            state
+                .git
+                .status
+                .iter()
+                .any(|item| item.detail.contains("protocol snapshot"))
+        );
     }
 
     #[test]
@@ -1640,5 +2106,176 @@ mod tests {
         assert_eq!(result.source, "future_cache");
         assert_eq!(result.preview.files[0].status, "copied");
         assert_eq!(result.preview.files[0].hunks[0].lines[0].kind, "metadata");
+    }
+
+    #[test]
+    fn extracted_plan_steps_normalize_numbered_markdown_checkboxes() {
+        let state = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant(
+                    "Plan:\n1. [ ] Fix data model\n2) [x] Run focused tests",
+                )],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+
+        assert_eq!(
+            extract_plan_steps(&state),
+            vec![
+                PlanStep {
+                    text: "Fix data model".into(),
+                    completed: false,
+                },
+                PlanStep {
+                    text: "Run focused tests".into(),
+                    completed: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_extraction_rejects_prose_and_long_bullets() {
+        let long_line = format!(
+            "Plan:\n- {}",
+            "This is explanatory prose ".repeat(12).trim()
+        );
+        let state = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::assistant(
+                        "The plan parser should not treat this explanatory paragraph as a task.",
+                    ),
+                    Message::assistant(long_line),
+                ],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+
+        assert!(extract_plan_steps(&state).is_empty());
+    }
+
+    #[test]
+    fn completing_plan_steps_rewrites_only_real_plan_items() {
+        let text = "Plan:\n1. [ ] Fix model\n2. Run tests\n\nReasoning stays unchecked.";
+
+        assert_eq!(
+            complete_plan_steps_in_text(text),
+            "Plan:\n- [x] Fix model\n- [x] Run tests\n\nReasoning stays unchecked."
+        );
+        assert_eq!(
+            complete_plan_steps_in_text("1. [ ] Fix model\n2. Run tests"),
+            "- [x] Fix model\n- [x] Run tests"
+        );
+    }
+
+    #[test]
+    fn optimistic_user_prompt_restores_missing_duplicate_at_submit_anchor() {
+        let session_id = SessionKey("local:test".into());
+        let mut state = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("repeat"), Message::assistant("old answer")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        state.record_submitted_user_prompt(session_id.clone(), TurnId::new(), "repeat".into());
+        assert_eq!(state.sessions[0].messages[2].content, "repeat");
+
+        let optimistic_user_messages = state.optimistic_user_messages.clone();
+        let mut replayed = AppState::new(
+            vec![SessionView {
+                id: session_id,
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("repeat"),
+                    Message::assistant("old answer"),
+                    Message::assistant("server-side output without echoed prompt"),
+                ],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        replayed.optimistic_user_messages = optimistic_user_messages;
+
+        replayed.restore_optimistic_user_messages();
+
+        let messages = &replayed.sessions[0].messages;
+        assert_eq!(messages[0].content, "repeat");
+        assert_eq!(messages[1].content, "old answer");
+        assert_eq!(messages[2].role.as_str(), "user");
+        assert_eq!(messages[2].content, "repeat");
+        assert_eq!(
+            messages[3].content,
+            "server-side output without echoed prompt"
+        );
+    }
+
+    #[test]
+    fn optimistic_user_prompt_drops_when_server_echo_confirms_it() {
+        let session_id = SessionKey("local:test".into());
+        let mut state = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+
+        state.record_submitted_user_prompt(session_id, TurnId::new(), "confirmed prompt".into());
+        assert_eq!(state.optimistic_user_messages.len(), 1);
+        state.sessions[0].messages = vec![
+            Message::assistant("ready"),
+            Message::user("confirmed prompt"),
+            Message::assistant("server echoed the prompt"),
+        ];
+
+        state.restore_optimistic_user_messages();
+
+        assert!(state.optimistic_user_messages.is_empty());
+        assert_eq!(
+            state.sessions[0]
+                .messages
+                .iter()
+                .filter(|message| message.role.as_str() == "user"
+                    && message.content == "confirmed prompt")
+                .count(),
+            1
+        );
     }
 }

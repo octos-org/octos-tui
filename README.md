@@ -6,6 +6,9 @@ Standalone terminal UI client for the Octos AppUi/UI Protocol.
 the server/runtime and shared `octos-core` protocol types; this repo owns the
 terminal client and connects to `octos serve` over the UI Protocol WebSocket.
 
+Architecture and ownership boundaries are documented in
+`docs/ARCHITECTURE.md`.
+
 ## Repository Layout
 
 For source builds, keep `octos` and `octos-tui` as sibling directories:
@@ -53,6 +56,7 @@ cd octos-tui
 CARGO_TARGET_DIR=/tmp/octos-tui-target cargo test
 CARGO_TARGET_DIR=/tmp/octos-tui-target cargo run -- --mode mock
 CARGO_TARGET_DIR=/tmp/octos-tui-target cargo run -- --mode mock --theme claude
+CARGO_TARGET_DIR=/tmp/octos-tui-target cargo run -- --mode mock --theme terminal
 ```
 
 `CARGO_TARGET_DIR=/tmp/octos-tui-target` is optional. It avoids target directory
@@ -148,8 +152,12 @@ cargo run -- \
 Available themes:
 
 ```text
-codex, claude, slate, solarized
+codex, claude, slate, solarized, terminal
 ```
+
+The `terminal` theme keeps foreground and background surfaces on the terminal
+defaults where ratatui supports it, using only restrained ANSI colors for
+borders, accents, and error states.
 
 Diff context controls:
 
@@ -158,12 +166,27 @@ Diff context controls:
 `c` stages the selected hunk as next-turn context
 ```
 
+Local composer slash commands:
+
+```text
+/ps shows local task/process status and focuses the Tasks pane
+/stop interrupts the active turn, or reports locally when nothing is active
+/help shows local slash-command help
+```
+
+Unknown slash commands are handled locally with a warning and are not sent to
+the model.
+
 The current AppUi/UI Protocol v1 bridge stages selected diff context as prompt
 text. Structured context attachments are tracked as a formal UPCR in
 `docs/M9_31_CONTEXT_ATTACHMENTS_UPCR.md`.
 
 The visual parity harness assertions for Codex-vs-Octos tmux comparison are
 tracked in `docs/M9_33_VISUAL_PARITY_HARNESS.md`.
+
+The coding-agent prompt shape that supports clean plan and summary rendering is
+documented in `docs/CODING_UX_PROMPT_CONTRACT.md`. The TUI renders defensively,
+but this contract belongs in the server profile or harness prompt.
 
 ## Dashboard and Server Startup
 
@@ -339,7 +362,7 @@ During live review, `octos-tui` should show:
 --profile-id <profile-id>
 --auth-token <token>
 --readonly
---theme codex|claude|slate|solarized
+--theme codex|claude|slate|solarized|terminal
 ```
 
 Environment variables:

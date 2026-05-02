@@ -3,6 +3,7 @@ pub mod cli;
 pub mod client_event;
 pub mod event_loop;
 pub mod keymap;
+pub mod menu;
 pub mod model;
 pub mod store;
 pub mod theme;

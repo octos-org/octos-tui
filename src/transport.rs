@@ -1,35 +1,33 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    time::Duration,
-};
+use std::collections::{HashMap, VecDeque};
 
 use chrono::Utc;
 use eyre::{Result, WrapErr, eyre};
 use futures::{SinkExt, StreamExt};
 use octos_core::app_ui::{
-    AppUiCommand, AppUiError, AppUiEvent, AppUiLaunch, AppUiSession, AppUiSnapshot, AppUiStatus,
-    AppUiTask,
+    AppUiCommand, AppUiEndpoint, AppUiError, AppUiEvent, AppUiLaunch, AppUiSession, AppUiSnapshot,
+    AppUiStatus, AppUiTask,
 };
 use octos_core::ui_protocol::{
     ApprovalCommandDetails, ApprovalDiffDetails, ApprovalFilesystemDetails, ApprovalNetworkDetails,
     ApprovalRequestedEvent, ApprovalSandboxDetails, ApprovalSandboxEscalationDetails,
     ApprovalSandboxEscalationEndpoint, ApprovalScopesListResult, ApprovalTypedDetails,
-    MessageDeltaEvent, OutputCursor, PreviewId, SessionOpenResult, SessionOpened,
-    TaskOutputDeltaEvent, TaskOutputReadResult, TaskRuntimeState, TaskUpdatedEvent,
-    ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnId,
-    TurnStartedEvent, UiCursor, UiNotification, UiPaneSnapshot, WarningEvent, approval_kinds,
-    methods, rpc_error_codes,
+    MessageDeltaEvent, OutputCursor, PermissionProfileListResult, PermissionProfileSelection,
+    PermissionProfileSetResult, PreviewId, SessionOpenResult, SessionOpened, TaskOutputDeltaEvent,
+    TaskOutputReadResult, TaskRuntimeState, TaskUpdatedEvent, ToolCompletedEvent,
+    ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnId, TurnStartedEvent, UiCursor,
+    UiNotification, UiPaneSnapshot, UiProtocolCapabilities, WarningEvent, approval_kinds, methods,
+    rpc_error_codes,
 };
 use octos_core::ui_protocol::{
-    JSON_RPC_VERSION, RpcRequest, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    JSON_RPC_VERSION, MAX_TEXT_FRAME_BYTES, RpcRequest, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
     UI_PROTOCOL_V1,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde_json::Value;
-use tokio::{net::TcpStream, runtime::Runtime};
+use tokio::{runtime::Runtime, sync::mpsc};
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    connect_async,
     tungstenite::{
         Message as WsMessage, client::IntoClientRequest, handshake::client::Request as WsRequest,
     },
@@ -37,13 +35,9 @@ use tokio_tungstenite::{
 
 use crate::{
     cli::{Cli, Mode},
-    client_event::ClientEvent,
+    client_event::{ClientEvent, PermissionProfileClientEvent},
     model::{DiffPreview, DiffPreviewFile, DiffPreviewGetResult, DiffPreviewHunk, DiffPreviewLine},
 };
-
-const PROTOCOL_POLL_TIMEOUT: Duration = Duration::from_millis(1);
-
-type ProtocolWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub trait AppUiBackend {
     fn bootstrap(&mut self) -> Result<AppUiSnapshot>;
@@ -60,12 +54,15 @@ pub fn build_backend(cli: &Cli) -> Box<dyn AppUiBackend> {
 }
 
 fn launch_from_cli(cli: &Cli) -> AppUiLaunch {
+    let auth_token = auth_token_from_cli(cli);
     AppUiLaunch {
-        base_url: cli.base_url.clone(),
+        endpoint: cli
+            .base_url
+            .clone()
+            .map(|url| AppUiEndpoint::websocket(url, auth_token)),
         session_id: cli.session.clone().map(SessionKey),
         profile_id: cli.profile_id.clone(),
         cwd: launch_cwd_from_cli(cli),
-        auth_token: auth_token_from_cli(cli),
         readonly: cli.readonly,
     }
 }
@@ -97,13 +94,11 @@ pub struct ProtocolAppUiBackend {
     launch: AppUiLaunch,
     runtime: Option<Runtime>,
     runtime_error: Option<String>,
-    stream: Option<ProtocolWsStream>,
+    driver: Option<ProtocolTransportDriver>,
     connection_state: ProtocolConnectionState,
     disconnected_status_reported: bool,
     queue: VecDeque<ClientEvent>,
-    pending_requests: HashMap<String, PendingRequest>,
-    session_cursors: HashMap<SessionKey, UiCursor>,
-    next_request_id: u64,
+    protocol: ProtocolExchange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,109 +112,55 @@ struct PendingRequest {
     method: String,
 }
 
-impl ProtocolAppUiBackend {
-    pub fn new(launch: AppUiLaunch) -> Self {
-        let (runtime, runtime_error) = match Runtime::new() {
-            Ok(runtime) => (Some(runtime), None),
-            Err(err) => (None, Some(err.to_string())),
-        };
+#[derive(Debug, Default)]
+struct ProtocolExchange {
+    pending_requests: HashMap<String, PendingRequest>,
+    session_cursors: HashMap<SessionKey, UiCursor>,
+    next_request_id: u64,
+}
 
-        Self {
-            launch,
-            runtime,
-            runtime_error,
-            stream: None,
-            connection_state: ProtocolConnectionState::Disconnected,
-            disconnected_status_reported: false,
-            queue: VecDeque::new(),
-            pending_requests: HashMap::new(),
-            session_cursors: HashMap::new(),
-            next_request_id: 0,
-        }
-    }
+enum ProtocolTransportDriver {
+    WebSocket(WebSocketTransportDriver),
+}
 
-    fn runtime(&self) -> Result<&Runtime> {
-        self.runtime
-            .as_ref()
-            .ok_or_else(|| runtime_unavailable(self.runtime_error.as_deref()))
-    }
+enum TransportCommand {
+    Text(String),
+    Pong(Vec<u8>),
+}
 
-    fn endpoint(&self) -> Result<&str> {
-        let endpoint = self
-            .launch
-            .base_url
-            .as_deref()
-            .ok_or_else(|| eyre!("--mode protocol requires --endpoint <ws://...|wss://...>"))?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransportFrame {
+    Text(String),
+    Binary(Vec<u8>),
+    Ping(Vec<u8>),
+    Pong,
+    Close,
+}
 
-        if is_websocket_url(endpoint) {
-            Ok(endpoint)
-        } else {
-            Err(eyre!(
-                "UI protocol endpoint must be a WebSocket URL starting with ws:// or wss://"
-            ))
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransportEvent {
+    Frame(TransportFrame),
+    Disconnected(String),
+    Error {
+        code: String,
+        message: String,
+        disconnect: bool,
+    },
+}
 
+struct WebSocketTransportDriver {
+    endpoint: String,
+    auth_token: Option<String>,
+    command_tx: Option<mpsc::UnboundedSender<TransportCommand>>,
+    event_rx: Option<mpsc::UnboundedReceiver<TransportEvent>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    connected: bool,
+}
+
+impl ProtocolExchange {
     fn next_request_id(&mut self) -> String {
         self.next_request_id += 1;
         format!("tui-{}", self.next_request_id)
-    }
-
-    fn ensure_connected(&mut self) -> Result<()> {
-        if self.launch.readonly {
-            return Err(eyre!(
-                "read-only protocol backend does not open network connections"
-            ));
-        }
-
-        if self.stream.is_some() {
-            return Ok(());
-        }
-
-        let endpoint = self.endpoint()?.to_string();
-        let request = websocket_request(&endpoint, self.launch.auth_token.as_deref())?;
-        let runtime = self.runtime()?;
-        let (stream, _) = runtime
-            .block_on(async { connect_async(request).await })
-            .wrap_err_with(|| format!("failed to connect UI protocol endpoint {endpoint}"))?;
-
-        self.stream = Some(stream);
-        self.mark_connected(&endpoint);
-        Ok(())
-    }
-
-    fn mark_connected(&mut self, endpoint: &str) {
-        let should_report_reconnect = self.disconnected_status_reported;
-        self.connection_state = ProtocolConnectionState::Connected;
-        self.disconnected_status_reported = false;
-
-        if should_report_reconnect {
-            self.queue.push_back(
-                AppUiEvent::Status(AppUiStatus {
-                    message: format!("UI protocol reconnected to {endpoint}."),
-                })
-                .into(),
-            );
-        }
-    }
-
-    fn mark_disconnected(&mut self, message: impl Into<String>) {
-        self.stream = None;
-        self.pending_requests.clear();
-
-        let should_report = self.connection_state != ProtocolConnectionState::Disconnected
-            || !self.disconnected_status_reported;
-        self.connection_state = ProtocolConnectionState::Disconnected;
-
-        if should_report {
-            self.queue.push_back(
-                AppUiEvent::Status(AppUiStatus {
-                    message: message.into(),
-                })
-                .into(),
-            );
-            self.disconnected_status_reported = true;
-        }
     }
 
     fn build_tracked_request(
@@ -249,6 +190,14 @@ impl ProtocolAppUiBackend {
         AppUiCommand::OpenSession(params)
     }
 
+    fn decode_rpc_text(&mut self, text: &str) -> Result<Option<ClientEvent>> {
+        let event = rpc_text_to_app_event_with_pending(text, &mut self.pending_requests)?;
+        if let Some(ClientEvent::App(event)) = &event {
+            self.record_event_state(event);
+        }
+        Ok(event)
+    }
+
     fn record_event_state(&mut self, event: &AppUiEvent) {
         match event {
             AppUiEvent::Protocol(UiNotification::SessionOpened(opened)) => {
@@ -271,29 +220,414 @@ impl ProtocolAppUiBackend {
         }
     }
 
-    fn decode_rpc_text(&mut self, text: &str) -> Result<Option<ClientEvent>> {
-        let event = rpc_text_to_app_event_with_pending(text, &mut self.pending_requests)?;
-        if let Some(ClientEvent::App(event)) = &event {
-            self.record_event_state(event);
+    fn cancel_pending_requests(&mut self, reason: &str) -> Vec<AppUiEvent> {
+        let mut pending_requests = self.pending_requests.drain().collect::<Vec<_>>();
+        pending_requests.sort_by(|(left_id, _), (right_id, _)| left_id.cmp(right_id));
+
+        pending_requests
+            .into_iter()
+            .map(|(id, request)| {
+                app_error(
+                    "request_cancelled",
+                    format!("{} request {id} cancelled: {reason}", request.method),
+                )
+            })
+            .collect()
+    }
+}
+
+impl ProtocolTransportDriver {
+    fn from_endpoint(endpoint: &AppUiEndpoint) -> Result<Self> {
+        match endpoint {
+            AppUiEndpoint::WebSocket { url, auth_token } if is_websocket_url(url) => {
+                Ok(Self::WebSocket(WebSocketTransportDriver::new(
+                    url.clone(),
+                    auth_token.clone(),
+                )))
+            }
+            AppUiEndpoint::WebSocket { .. } => Err(eyre!(
+                "UI protocol endpoint must be a WebSocket URL starting with ws:// or wss://"
+            )),
+            AppUiEndpoint::Stdio { command, .. } => Err(eyre!(
+                "UI protocol stdio transport for {command} is not implemented yet; add a channel-driven stdio adapter at the protocol driver boundary"
+            )),
+            AppUiEndpoint::UnixSocket { path, .. } => Err(eyre!(
+                "UI protocol Unix socket transport for {path} is not implemented yet; add a stream driver at the protocol driver boundary"
+            )),
+            AppUiEndpoint::Tcp { address, .. } => Err(eyre!(
+                "UI protocol TCP transport for {address} is not implemented yet; add a stream driver at the protocol driver boundary"
+            )),
+            AppUiEndpoint::InProcess { name } => Err(eyre!(
+                "UI protocol in-process transport {name} is not implemented yet; add a local driver at the protocol driver boundary"
+            )),
         }
-        Ok(event)
+    }
+
+    fn label(&self) -> &str {
+        match self {
+            Self::WebSocket(driver) => driver.label(),
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        match self {
+            Self::WebSocket(driver) => driver.is_connected(),
+        }
+    }
+
+    fn connect(&mut self, runtime: &Runtime) -> Result<()> {
+        match self {
+            Self::WebSocket(driver) => driver.connect(runtime),
+        }
+    }
+
+    fn disconnect(&mut self) {
+        match self {
+            Self::WebSocket(driver) => driver.disconnect(),
+        }
+    }
+
+    fn send_text(&mut self, text: String) -> Result<()> {
+        match self {
+            Self::WebSocket(driver) => driver.send_text(text),
+        }
+    }
+
+    fn send_pong(&mut self, payload: Vec<u8>) -> Result<()> {
+        match self {
+            Self::WebSocket(driver) => driver.send_pong(payload),
+        }
+    }
+
+    fn poll_event(&mut self) -> Result<Option<TransportEvent>> {
+        match self {
+            Self::WebSocket(driver) => driver.poll_event(),
+        }
+    }
+}
+
+impl WebSocketTransportDriver {
+    fn new(endpoint: String, auth_token: Option<String>) -> Self {
+        Self {
+            endpoint,
+            auth_token,
+            command_tx: None,
+            event_rx: None,
+            task: None,
+            connected: false,
+        }
+    }
+
+    fn label(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+
+    fn connect(&mut self, runtime: &Runtime) -> Result<()> {
+        if self.connected {
+            return Ok(());
+        }
+
+        self.disconnect();
+
+        let request = websocket_request(&self.endpoint, self.auth_token.as_deref())?;
+        let (stream, _) = runtime
+            .block_on(async { connect_async(request).await })
+            .wrap_err_with(|| {
+                format!("failed to connect UI protocol endpoint {}", self.endpoint)
+            })?;
+        let (mut sink, mut stream) = stream.split();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+
+        let task = runtime.spawn(async move {
+            loop {
+                tokio::select! {
+                    command = command_rx.recv() => {
+                        let Some(command) = command else {
+                            break;
+                        };
+                        let result = match command {
+                            TransportCommand::Text(text) => {
+                                sink.send(WsMessage::Text(text.into())).await
+                            }
+                            TransportCommand::Pong(payload) => {
+                                sink.send(WsMessage::Pong(payload.into())).await
+                            }
+                        };
+
+                        if let Err(err) = result {
+                            let _ = event_tx.send(TransportEvent::Error {
+                                code: "transport_send".into(),
+                                message: format!("failed to send UI protocol WebSocket message: {err}"),
+                                disconnect: true,
+                            });
+                            break;
+                        }
+                    }
+                    message = stream.next() => {
+                        let Some(message) = message else {
+                            let _ = event_tx.send(TransportEvent::Disconnected(
+                                "UI protocol WebSocket closed; reconnect will retry on next send/read.".into(),
+                            ));
+                            break;
+                        };
+
+                        match message {
+                            Ok(WsMessage::Text(text)) => {
+                                if event_tx
+                                    .send(TransportEvent::Frame(TransportFrame::Text(text.to_string())))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(WsMessage::Binary(bytes)) => {
+                                if event_tx
+                                    .send(TransportEvent::Frame(TransportFrame::Binary(bytes.to_vec())))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(WsMessage::Ping(payload)) => {
+                                if event_tx
+                                    .send(TransportEvent::Frame(TransportFrame::Ping(payload.to_vec())))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(WsMessage::Pong(_)) => {
+                                if event_tx
+                                    .send(TransportEvent::Frame(TransportFrame::Pong))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(WsMessage::Close(_)) => {
+                                let _ = event_tx.send(TransportEvent::Frame(TransportFrame::Close));
+                                break;
+                            }
+                            Ok(WsMessage::Frame(_)) => {}
+                            Err(err) => {
+                                let _ = event_tx.send(TransportEvent::Error {
+                                    code: "transport_read".into(),
+                                    message: format!("failed to read UI protocol WebSocket message: {err}"),
+                                    disconnect: true,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        self.command_tx = Some(command_tx);
+        self.event_rx = Some(event_rx);
+        self.task = Some(task);
+        self.connected = true;
+        Ok(())
+    }
+
+    fn disconnect(&mut self) {
+        self.command_tx = None;
+        self.event_rx = None;
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.connected = false;
+    }
+
+    fn send_text(&mut self, text: String) -> Result<()> {
+        self.command_tx
+            .as_ref()
+            .filter(|_| self.connected)
+            .ok_or_else(|| eyre!("UI protocol WebSocket is not connected"))?
+            .send(TransportCommand::Text(text))
+            .map_err(|_| eyre!("UI protocol WebSocket writer is closed"))
+    }
+
+    fn send_pong(&mut self, payload: Vec<u8>) -> Result<()> {
+        self.command_tx
+            .as_ref()
+            .filter(|_| self.connected)
+            .ok_or_else(|| eyre!("UI protocol WebSocket is not connected"))?
+            .send(TransportCommand::Pong(payload))
+            .map_err(|_| eyre!("UI protocol WebSocket writer is closed"))
+    }
+
+    fn poll_event(&mut self) -> Result<Option<TransportEvent>> {
+        let Some(event_rx) = self.event_rx.as_mut() else {
+            return Ok(None);
+        };
+
+        match event_rx.try_recv() {
+            Ok(event) => {
+                if matches!(
+                    event,
+                    TransportEvent::Disconnected(_)
+                        | TransportEvent::Error {
+                            disconnect: true,
+                            ..
+                        }
+                        | TransportEvent::Frame(TransportFrame::Close)
+                ) {
+                    self.connected = false;
+                }
+                Ok(Some(event))
+            }
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.connected = false;
+                Ok(Some(TransportEvent::Disconnected(
+                    "UI protocol WebSocket driver stopped; reconnect will retry on next send/read."
+                        .into(),
+                )))
+            }
+        }
+    }
+}
+
+impl ProtocolAppUiBackend {
+    pub fn new(launch: AppUiLaunch) -> Self {
+        let (runtime, runtime_error) = match Runtime::new() {
+            Ok(runtime) => (Some(runtime), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
+
+        Self {
+            launch,
+            runtime,
+            runtime_error,
+            driver: None,
+            connection_state: ProtocolConnectionState::Disconnected,
+            disconnected_status_reported: false,
+            queue: VecDeque::new(),
+            protocol: ProtocolExchange::default(),
+        }
+    }
+
+    fn endpoint_label(&self) -> Result<String> {
+        self.launch
+            .endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.label().to_string())
+            .ok_or_else(|| eyre!("--mode protocol requires --endpoint <ws://...|wss://...>"))
+    }
+
+    fn ensure_driver(&mut self) -> Result<()> {
+        if self.driver.is_none() {
+            let endpoint =
+                self.launch.endpoint.as_ref().ok_or_else(|| {
+                    eyre!("--mode protocol requires --endpoint <ws://...|wss://...>")
+                })?;
+            self.driver = Some(ProtocolTransportDriver::from_endpoint(endpoint)?);
+        }
+        Ok(())
+    }
+
+    fn ensure_connected(&mut self) -> Result<()> {
+        if self
+            .driver
+            .as_ref()
+            .is_some_and(ProtocolTransportDriver::is_connected)
+        {
+            return Ok(());
+        }
+
+        self.ensure_driver()?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| runtime_unavailable(self.runtime_error.as_deref()))?;
+        let driver = self
+            .driver
+            .as_mut()
+            .ok_or_else(|| eyre!("UI protocol transport driver is not initialized"))?;
+
+        driver.connect(runtime)?;
+        let endpoint = driver.label().to_string();
+        self.mark_connected(&endpoint);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn is_connected(&self) -> bool {
+        self.driver
+            .as_ref()
+            .is_some_and(ProtocolTransportDriver::is_connected)
+    }
+
+    fn mark_connected(&mut self, endpoint: &str) {
+        let should_report_reconnect = self.disconnected_status_reported;
+        self.connection_state = ProtocolConnectionState::Connected;
+        self.disconnected_status_reported = false;
+
+        if should_report_reconnect {
+            self.queue.push_back(
+                AppUiEvent::Status(AppUiStatus {
+                    message: format!("UI protocol reconnected to {endpoint}."),
+                })
+                .into(),
+            );
+        }
+    }
+
+    fn mark_disconnected(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if let Some(driver) = self.driver.as_mut() {
+            driver.disconnect();
+        }
+        let cancelled_requests = self.protocol.cancel_pending_requests(&message);
+
+        let should_report = self.connection_state != ProtocolConnectionState::Disconnected
+            || !self.disconnected_status_reported;
+        self.connection_state = ProtocolConnectionState::Disconnected;
+
+        if should_report {
+            self.queue
+                .push_back(AppUiEvent::Status(AppUiStatus { message }).into());
+            self.disconnected_status_reported = true;
+        }
+        self.queue
+            .extend(cancelled_requests.into_iter().map(Into::into));
+    }
+
+    fn build_tracked_request(
+        &mut self,
+        command: AppUiCommand,
+    ) -> Result<RpcRequest<serde_json::Value>> {
+        self.protocol.build_tracked_request(command)
+    }
+
+    fn decode_rpc_text(&mut self, text: &str) -> Result<Option<ClientEvent>> {
+        self.protocol.decode_rpc_text(text)
+    }
+
+    fn readonly_allows_command(command: &AppUiCommand) -> bool {
+        matches!(
+            command,
+            AppUiCommand::OpenSession(_)
+                | AppUiCommand::ListApprovalScopes(_)
+                | AppUiCommand::ListPermissionProfiles(_)
+                | AppUiCommand::GetDiffPreview(_)
+                | AppUiCommand::ReadTaskOutput(_)
+        )
     }
 
     fn send_text(&mut self, text: String) -> Result<()> {
         self.ensure_connected()?;
-
-        let send_result = {
-            let runtime = self
-                .runtime
-                .as_ref()
-                .ok_or_else(|| runtime_unavailable(self.runtime_error.as_deref()))?;
-            let stream = self
-                .stream
-                .as_mut()
-                .ok_or_else(|| eyre!("UI protocol websocket is not connected"))?;
-
-            runtime.block_on(async { stream.send(WsMessage::Text(text.into())).await })
-        };
+        let send_result = self
+            .driver
+            .as_mut()
+            .ok_or_else(|| eyre!("UI protocol transport driver is not initialized"))?
+            .send_text(text);
 
         match send_result {
             Ok(()) => Ok(()),
@@ -306,7 +640,7 @@ impl ProtocolAppUiBackend {
         }
     }
 
-    fn read_next_message(&mut self) -> Result<Option<WsMessage>> {
+    fn read_next_transport_event(&mut self) -> Result<Option<TransportEvent>> {
         if let Err(err) = self.ensure_connected() {
             self.mark_disconnected(format!(
                 "UI protocol disconnected; reconnect will retry on next send/read: {err:#}"
@@ -314,48 +648,107 @@ impl ProtocolAppUiBackend {
             return Ok(None);
         }
 
-        let read_result = {
-            let runtime = self
-                .runtime
-                .as_ref()
-                .ok_or_else(|| runtime_unavailable(self.runtime_error.as_deref()))?;
-            let stream = self
-                .stream
-                .as_mut()
-                .ok_or_else(|| eyre!("UI protocol websocket is not connected"))?;
-
-            runtime.block_on(async {
-                tokio::time::timeout(PROTOCOL_POLL_TIMEOUT, stream.next()).await
-            })
-        };
+        let read_result = self
+            .driver
+            .as_mut()
+            .ok_or_else(|| eyre!("UI protocol transport driver is not initialized"))?
+            .poll_event();
 
         match read_result {
-            Ok(Some(Ok(message))) => Ok(Some(message)),
-            Ok(Some(Err(err))) => {
+            Ok(event) => Ok(event),
+            Err(err) => {
                 self.mark_disconnected(
                     "UI protocol disconnected while reading; reconnect will retry on next send/read.",
                 );
                 self.queue.push_back(
                     AppUiEvent::Error(AppUiError {
                         code: "transport_read".into(),
-                        message: format!("failed to read UI protocol websocket message: {err}"),
+                        message: format!("failed to read UI protocol transport message: {err}"),
                     })
                     .into(),
                 );
                 Ok(None)
             }
-            Ok(None) => {
+        }
+    }
+
+    fn handle_transport_event(&mut self, event: TransportEvent) -> Result<Option<ClientEvent>> {
+        match event {
+            TransportEvent::Frame(frame) => self.handle_transport_frame(frame),
+            TransportEvent::Disconnected(message) => {
+                self.mark_disconnected(message);
+                Ok(self.queue.pop_front())
+            }
+            TransportEvent::Error {
+                code,
+                message,
+                disconnect,
+            } => {
+                if disconnect {
+                    self.mark_disconnected(
+                        "UI protocol disconnected; reconnect will retry on next send/read.",
+                    );
+                }
+                self.queue
+                    .push_back(AppUiEvent::Error(AppUiError { code, message }).into());
+                Ok(self.queue.pop_front())
+            }
+        }
+    }
+
+    fn handle_transport_frame(&mut self, frame: TransportFrame) -> Result<Option<ClientEvent>> {
+        match frame {
+            TransportFrame::Text(text) => self.decode_rpc_text(&text),
+            TransportFrame::Binary(bytes) => {
+                let text = match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        return Ok(Some(
+                            AppUiEvent::Error(AppUiError {
+                                code: "malformed_frame".into(),
+                                message: format!(
+                                    "UI protocol binary frame was not UTF-8 JSON: {err}"
+                                ),
+                            })
+                            .into(),
+                        ));
+                    }
+                };
+                self.decode_rpc_text(&text)
+            }
+            TransportFrame::Ping(payload) => {
+                let pong_result = self
+                    .driver
+                    .as_mut()
+                    .ok_or_else(|| eyre!("UI protocol transport driver is not initialized"))?
+                    .send_pong(payload);
+                if let Err(err) = pong_result {
+                    self.mark_disconnected(
+                        "UI protocol disconnected while sending pong; reconnect will retry on next send/read.",
+                    );
+                    self.queue.push_back(
+                        AppUiEvent::Error(AppUiError {
+                            code: "transport_send".into(),
+                            message: format!("failed to send UI protocol pong: {err}"),
+                        })
+                        .into(),
+                    );
+                    return Ok(self.queue.pop_front());
+                }
+                Ok(None)
+            }
+            TransportFrame::Pong => Ok(None),
+            TransportFrame::Close => {
                 self.mark_disconnected(
                     "UI protocol WebSocket closed; reconnect will retry on next send/read.",
                 );
-                Ok(None)
+                Ok(self.queue.pop_front())
             }
-            Err(_) => Ok(None),
         }
     }
 
     #[allow(unreachable_patterns)]
-    fn enqueue_readonly_response(&mut self, command: AppUiCommand) {
+    fn enqueue_readonly_blocked_response(&mut self, command: AppUiCommand) {
         let method = command.method().to_string();
         match command {
             AppUiCommand::SubmitPrompt(params) => {
@@ -370,21 +763,9 @@ impl ProtocolAppUiBackend {
                     .into(),
                 );
             }
-            AppUiCommand::OpenSession(_) => {
-                self.queue.push_back(
-                    AppUiEvent::Status(AppUiStatus {
-                        message:
-                            "Read-only mode skipped session/open; no network request was sent."
-                                .into(),
-                    })
-                    .into(),
-                );
-            }
             AppUiCommand::InterruptTurn(_)
             | AppUiCommand::RespondApproval(_)
-            | AppUiCommand::ListApprovalScopes(_)
-            | AppUiCommand::GetDiffPreview(_)
-            | AppUiCommand::ReadTaskOutput(_) => {
+            | AppUiCommand::SetPermissionProfile(_) => {
                 self.queue.push_back(
                     AppUiEvent::Error(AppUiError {
                         code: "readonly".into(),
@@ -398,9 +779,9 @@ impl ProtocolAppUiBackend {
             _ => {
                 self.queue.push_back(
                     AppUiEvent::Error(AppUiError {
-                        code: "readonly".into(),
+                        code: "readonly_policy".into(),
                         message: format!(
-                            "Read-only mode blocks unsupported {method}; no network request was sent."
+                            "Read-only mode unexpectedly blocked read-style {method}; no network request was sent."
                         ),
                     })
                     .into(),
@@ -412,12 +793,20 @@ impl ProtocolAppUiBackend {
 
 impl AppUiBackend for ProtocolAppUiBackend {
     fn bootstrap(&mut self) -> Result<AppUiSnapshot> {
-        let endpoint = self.endpoint()?.to_string();
-        if self.launch.readonly {
-            return Ok(protocol_snapshot_from_launch(&self.launch, &endpoint));
+        let endpoint = self.endpoint_label()?;
+        if let Err(err) = self.ensure_connected() {
+            if self.launch.readonly {
+                let message =
+                    format!("Protocol backend read-only; no network connection opened: {err:#}");
+                self.mark_disconnected(message.clone());
+                return Ok(protocol_readonly_offline_snapshot_from_launch(
+                    &self.launch,
+                    &endpoint,
+                    message,
+                ));
+            }
+            return Err(err);
         }
-
-        self.ensure_connected()?;
 
         if let Some(session_id) = self.launch.session_id.clone() {
             self.send(AppUiCommand::OpenSession(
@@ -434,8 +823,8 @@ impl AppUiBackend for ProtocolAppUiBackend {
     }
 
     fn send(&mut self, command: AppUiCommand) -> Result<()> {
-        if self.launch.readonly {
-            self.enqueue_readonly_response(command);
+        if self.launch.readonly && !Self::readonly_allows_command(&command) {
+            self.enqueue_readonly_blocked_response(command);
             return Ok(());
         }
 
@@ -443,12 +832,26 @@ impl AppUiBackend for ProtocolAppUiBackend {
         let request_id = request.id.clone();
         let method = request.method.clone();
         let text = serde_json::to_string(&request).wrap_err("failed to encode JSON-RPC request")?;
+        if text.len() > MAX_TEXT_FRAME_BYTES {
+            self.protocol.pending_requests.remove(&request_id);
+            self.queue.push_back(
+                AppUiEvent::Error(AppUiError {
+                    code: "frame_too_large".into(),
+                    message: format!(
+                        "encoded {method} request {request_id} is {} bytes; max is {MAX_TEXT_FRAME_BYTES}",
+                        text.len()
+                    ),
+                })
+                .into(),
+            );
+            return Ok(());
+        }
 
         if let Err(err) = self.send_text(text) {
             self.mark_disconnected(format!(
                 "UI protocol disconnected; reconnect will retry on next send/read: {err:#}"
             ));
-            self.pending_requests.remove(&request_id);
+            self.protocol.pending_requests.remove(&request_id);
             self.queue.push_back(
                 AppUiEvent::Error(AppUiError {
                     code: "transport_send".into(),
@@ -466,84 +869,16 @@ impl AppUiBackend for ProtocolAppUiBackend {
             return Ok(Some(event));
         }
 
-        if self.launch.readonly {
-            return Ok(None);
-        }
-
         loop {
-            let Some(message) = self.read_next_message()? else {
+            let Some(event) = self.read_next_transport_event()? else {
                 if let Some(event) = self.queue.pop_front() {
                     return Ok(Some(event));
                 }
                 return Ok(None);
             };
 
-            match message {
-                WsMessage::Text(text) => {
-                    if let Some(event) = self.decode_rpc_text(text.as_str())? {
-                        return Ok(Some(event));
-                    }
-                }
-                WsMessage::Binary(bytes) => {
-                    let text = match String::from_utf8(bytes.to_vec()) {
-                        Ok(text) => text,
-                        Err(err) => {
-                            return Ok(Some(
-                                AppUiEvent::Error(AppUiError {
-                                    code: "malformed_frame".into(),
-                                    message: format!(
-                                        "UI protocol binary frame was not UTF-8 JSON: {err}"
-                                    ),
-                                })
-                                .into(),
-                            ));
-                        }
-                    };
-                    if let Some(event) = self.decode_rpc_text(&text)? {
-                        return Ok(Some(event));
-                    }
-                }
-                WsMessage::Ping(payload) => {
-                    let pong_result = {
-                        let runtime = self
-                            .runtime
-                            .as_ref()
-                            .ok_or_else(|| runtime_unavailable(self.runtime_error.as_deref()))?;
-                        let stream = self
-                            .stream
-                            .as_mut()
-                            .ok_or_else(|| eyre!("UI protocol websocket is not connected"))?;
-
-                        runtime.block_on(async { stream.send(WsMessage::Pong(payload)).await })
-                    };
-                    if let Err(err) = pong_result {
-                        self.mark_disconnected(
-                            "UI protocol disconnected while sending pong; reconnect will retry on next send/read.",
-                        );
-                        self.queue.push_back(
-                            AppUiEvent::Error(AppUiError {
-                                code: "transport_send".into(),
-                                message: format!("failed to send UI protocol pong: {err}"),
-                            })
-                            .into(),
-                        );
-                        if let Some(event) = self.queue.pop_front() {
-                            return Ok(Some(event));
-                        }
-                        return Ok(None);
-                    }
-                }
-                WsMessage::Pong(_) => {}
-                WsMessage::Close(_) => {
-                    self.mark_disconnected(
-                        "UI protocol WebSocket closed; reconnect will retry on next send/read.",
-                    );
-                    if let Some(event) = self.queue.pop_front() {
-                        return Ok(Some(event));
-                    }
-                    return Ok(None);
-                }
-                WsMessage::Frame(_) => {}
+            if let Some(event) = self.handle_transport_event(event)? {
+                return Ok(Some(event));
             }
         }
     }
@@ -588,7 +923,7 @@ fn protocol_snapshot_from_launch(launch: &AppUiLaunch, endpoint: &str) -> AppUiS
             title: "Protocol session".into(),
             profile_id: launch.profile_id.clone(),
             messages: vec![Message::system(if launch.readonly {
-                format!("Read-only {UI_PROTOCOL_V1} session; no WebSocket connection opened")
+                format!("Read-only {UI_PROTOCOL_V1} session; mutating commands disabled")
             } else {
                 format!("Connected to {UI_PROTOCOL_V1} over WebSocket")
             })],
@@ -601,16 +936,30 @@ fn protocol_snapshot_from_launch(launch: &AppUiLaunch, endpoint: &str) -> AppUiS
     AppUiSnapshot {
         sessions,
         selected_session: 0,
-        status: if launch.readonly {
-            "Protocol backend read-only; no network connection opened.".into()
+        status: if launch.readonly && launch.session_id.is_some() {
+            "Protocol backend connected read-only; session/open sent.".into()
+        } else if launch.readonly {
+            "Protocol backend connected read-only. Pass --session to open an existing session."
+                .into()
         } else if launch.session_id.is_some() {
             "Protocol backend connected; session/open sent.".into()
         } else {
             "Protocol backend connected. Pass --session to open an interactive session.".into()
         },
         target: Some(endpoint.into()),
+        capabilities: Some(UiProtocolCapabilities::first_server_slice()),
         readonly: launch.readonly,
     }
+}
+
+fn protocol_readonly_offline_snapshot_from_launch(
+    launch: &AppUiLaunch,
+    endpoint: &str,
+    status: String,
+) -> AppUiSnapshot {
+    let mut snapshot = protocol_snapshot_from_launch(launch, endpoint);
+    snapshot.status = status;
+    snapshot
 }
 
 #[allow(unreachable_patterns)]
@@ -625,6 +974,8 @@ fn rpc_request_from_command(
         AppUiCommand::InterruptTurn(params) => serde_json::to_value(params),
         AppUiCommand::RespondApproval(params) => serde_json::to_value(params),
         AppUiCommand::ListApprovalScopes(params) => serde_json::to_value(params),
+        AppUiCommand::ListPermissionProfiles(params) => serde_json::to_value(params),
+        AppUiCommand::SetPermissionProfile(params) => serde_json::to_value(params),
         AppUiCommand::GetDiffPreview(params) => serde_json::to_value(params),
         AppUiCommand::ReadTaskOutput(params) => serde_json::to_value(params),
         _ => {
@@ -653,6 +1004,19 @@ fn rpc_text_to_app_event_with_pending(
     text: &str,
     pending_requests: &mut HashMap<String, PendingRequest>,
 ) -> Result<Option<ClientEvent>> {
+    if text.len() > MAX_TEXT_FRAME_BYTES {
+        return Ok(Some(
+            app_error(
+                "frame_too_large",
+                format!(
+                    "UI protocol frame is {} bytes; max is {MAX_TEXT_FRAME_BYTES}",
+                    text.len()
+                ),
+            )
+            .into(),
+        ));
+    }
+
     let value = match serde_json::from_str(text) {
         Ok(value) => value,
         Err(err) => {
@@ -883,6 +1247,36 @@ fn success_response_to_app_event(
                 )),
             }
         }
+        methods::PERMISSION_PROFILE_LIST => {
+            match serde_json::from_value::<PermissionProfileListResult>(result) {
+                Ok(result) => Ok(Some(permission_profile_list_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            methods::PERMISSION_PROFILE_LIST
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        methods::PERMISSION_PROFILE_SET => {
+            match serde_json::from_value::<PermissionProfileSetResult>(result) {
+                Ok(result) => Ok(Some(permission_profile_set_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            methods::PERMISSION_PROFILE_SET
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
         _ => Ok(None),
     }
 }
@@ -903,6 +1297,35 @@ fn approval_scopes_status(result: &ApprovalScopesListResult) -> String {
         1 => "1 persisted approval scope for this session".into(),
         _ => format!("{count} persisted approval scopes for this session"),
     }
+}
+
+fn permission_profile_list_status(result: &PermissionProfileListResult) -> String {
+    format!("Permissions: {}", result.current.summary())
+}
+
+fn permission_profile_list_event(result: PermissionProfileListResult) -> ClientEvent {
+    ClientEvent::PermissionProfile(PermissionProfileClientEvent {
+        message: permission_profile_list_status(&result),
+        session_id: result.session_id,
+        current: result.current,
+    })
+}
+
+fn permission_profile_set_status(result: &PermissionProfileSetResult) -> String {
+    let prefix = if result.applied {
+        "Permissions updated"
+    } else {
+        "Permissions unchanged"
+    };
+    format!("{prefix}: {}", result.current.summary())
+}
+
+fn permission_profile_set_event(result: PermissionProfileSetResult) -> ClientEvent {
+    ClientEvent::PermissionProfile(PermissionProfileClientEvent {
+        message: permission_profile_set_status(&result),
+        session_id: result.session_id,
+        current: result.current,
+    })
 }
 
 fn task_output_display_text(result: &TaskOutputReadResult) -> String {
@@ -1085,6 +1508,7 @@ fn session_opened_compat(
 pub struct MockAppUiBackend {
     queue: VecDeque<ClientEvent>,
     launch: AppUiLaunch,
+    permission_profiles: HashMap<SessionKey, PermissionProfileSelection>,
 }
 
 impl MockAppUiBackend {
@@ -1092,6 +1516,7 @@ impl MockAppUiBackend {
         Self {
             queue: VecDeque::new(),
             launch,
+            permission_profiles: HashMap::new(),
         }
     }
 
@@ -1104,8 +1529,9 @@ impl MockAppUiBackend {
 
     fn target_label(&self) -> Option<String> {
         self.launch
-            .base_url
-            .clone()
+            .endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.label().to_string())
             .or_else(|| Some("local mock snapshot".into()))
     }
 
@@ -1278,6 +1704,7 @@ impl AppUiBackend for MockAppUiBackend {
                 "Mock backend ready. Start typing to exercise M9.1 app-ui events.".into()
             },
             target: self.target_label(),
+            capabilities: Some(UiProtocolCapabilities::first_server_slice()),
             readonly: self.launch.readonly,
         })
     }
@@ -1334,6 +1761,38 @@ impl AppUiBackend for MockAppUiBackend {
                     })
                     .into(),
                 );
+                Ok(())
+            }
+            AppUiCommand::ListPermissionProfiles(params) => {
+                let current = self
+                    .permission_profiles
+                    .get(&params.session_id)
+                    .copied()
+                    .unwrap_or_default();
+                self.queue
+                    .push_back(permission_profile_list_event(PermissionProfileListResult {
+                        session_id: params.session_id,
+                        current,
+                        profiles: Vec::new(),
+                    }));
+                Ok(())
+            }
+            AppUiCommand::SetPermissionProfile(params) => {
+                let previous = self
+                    .permission_profiles
+                    .get(&params.session_id)
+                    .copied()
+                    .unwrap_or_default();
+                let current = params.update.apply_to(previous);
+                let applied = current != previous;
+                self.permission_profiles
+                    .insert(params.session_id.clone(), current);
+                self.queue
+                    .push_back(permission_profile_set_event(PermissionProfileSetResult {
+                        session_id: params.session_id,
+                        current,
+                        applied,
+                    }));
                 Ok(())
             }
             AppUiCommand::GetDiffPreview(params) => {
@@ -1566,16 +2025,132 @@ mod tests {
     use super::*;
     use octos_core::ui_protocol::{
         ApprovalDecision, ApprovalRespondParams, ApprovalScopesListParams, DiffPreviewGetParams,
-        InputItem, PreviewId, SessionOpenParams, TaskOutputReadParams, TurnInterruptParams,
-        TurnStartParams,
+        InputItem, PermissionNetworkPolicy, PermissionProfileListParams, PermissionProfileMode,
+        PermissionProfileSetParams, PermissionProfileUpdate, PreviewId, SessionOpenParams,
+        TaskOutputReadParams, TurnInterruptParams, TurnStartParams,
     };
     use serde_json::json;
+    use std::{
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
 
     fn unwrap_app_event(event: ClientEvent) -> AppUiEvent {
         let ClientEvent::App(event) = event else {
             panic!("expected app event");
         };
         *event
+    }
+
+    struct ProtocolCaptureServer {
+        endpoint: String,
+        received: mpsc::Receiver<Value>,
+        thread: thread::JoinHandle<()>,
+    }
+
+    impl ProtocolCaptureServer {
+        fn recv_json(&self) -> Value {
+            self.received
+                .recv_timeout(Duration::from_secs(2))
+                .expect("protocol server captured request")
+        }
+
+        fn join(self) {
+            self.thread.join().expect("protocol server exits cleanly");
+        }
+    }
+
+    fn spawn_protocol_capture_server(
+        expected_requests: usize,
+        respond_to_session_open: bool,
+    ) -> ProtocolCaptureServer {
+        let (addr_tx, addr_rx) = mpsc::channel();
+        let (frame_tx, frame_rx) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let runtime = Runtime::new().expect("test protocol server runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind protocol test server");
+                let addr = listener.local_addr().expect("protocol test server addr");
+                addr_tx.send(addr).expect("send protocol test server addr");
+
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept protocol test connection");
+                let mut ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("accept protocol test websocket");
+
+                for _ in 0..expected_requests {
+                    let Some(message) = ws.next().await else {
+                        break;
+                    };
+                    let message = message.expect("read protocol test websocket message");
+                    let text = match message {
+                        WsMessage::Text(text) => text.to_string(),
+                        WsMessage::Binary(bytes) => {
+                            String::from_utf8(bytes.to_vec()).expect("binary request is UTF-8")
+                        }
+                        _ => continue,
+                    };
+                    let frame: Value =
+                        serde_json::from_str(&text).expect("request is JSON-RPC object");
+                    frame_tx
+                        .send(frame.clone())
+                        .expect("capture protocol test request");
+
+                    if respond_to_session_open
+                        && frame.get("method").and_then(Value::as_str)
+                            == Some(methods::SESSION_OPEN)
+                    {
+                        let response = json!({
+                            "jsonrpc": "2.0",
+                            "id": frame.get("id").cloned().expect("request id"),
+                            "result": {
+                                "opened": {
+                                    "session_id": frame["params"]["session_id"].clone(),
+                                    "active_profile_id": "coding",
+                                    "workspace_root": "/repo",
+                                    "cursor": {
+                                        "stream": "session_events",
+                                        "seq": 1
+                                    }
+                                }
+                            }
+                        });
+                        ws.send(WsMessage::Text(response.to_string().into()))
+                            .await
+                            .expect("send protocol test response");
+                    }
+                }
+            });
+        });
+        let addr = addr_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("protocol test server starts");
+
+        ProtocolCaptureServer {
+            endpoint: format!("ws://{addr}/ui-protocol"),
+            received: frame_rx,
+            thread,
+        }
+    }
+
+    fn next_event_until(backend: &mut ProtocolAppUiBackend) -> ClientEvent {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(event) = backend.next_event().expect("poll protocol backend") {
+                return event;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for protocol event"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
@@ -1602,6 +2177,33 @@ mod tests {
     }
 
     #[test]
+    fn protocol_turn_start_request_preserves_submitted_prompt_text() {
+        let request = rpc_request_from_command(
+            "tui-9".into(),
+            AppUiCommand::SubmitPrompt(TurnStartParams {
+                session_id: SessionKey("local:test".into()),
+                turn_id: TurnId::new(),
+                input: vec![
+                    InputItem::Text {
+                        text: "complete m9 contract".into(),
+                    },
+                    InputItem::Text {
+                        text: "second paragraph".into(),
+                    },
+                ],
+            }),
+        )
+        .expect("request encodes");
+
+        assert_eq!(request.method, methods::TURN_START);
+        assert_eq!(request.params["session_id"], "local:test");
+        assert_eq!(request.params["input"][0]["kind"], "text");
+        assert_eq!(request.params["input"][0]["text"], "complete m9 contract");
+        assert_eq!(request.params["input"][1]["kind"], "text");
+        assert_eq!(request.params["input"][1]["text"], "second paragraph");
+    }
+
+    #[test]
     fn protocol_command_serializes_approval_scopes_list() {
         let request = rpc_request_from_command(
             "tui-8".into(),
@@ -1616,6 +2218,104 @@ mod tests {
         assert_eq!(request.method, methods::APPROVAL_SCOPES_LIST);
         assert_eq!(request.params["session_id"], "local:test");
         assert!(request.params.get("kind").is_none());
+    }
+
+    #[test]
+    fn protocol_command_serializes_permission_profile_commands() {
+        let session_id = SessionKey("local:test".into());
+        let list = rpc_request_from_command(
+            "tui-9".into(),
+            AppUiCommand::ListPermissionProfiles(PermissionProfileListParams {
+                session_id: session_id.clone(),
+            }),
+        )
+        .expect("list request encodes");
+        assert_eq!(list.method, methods::PERMISSION_PROFILE_LIST);
+        assert_eq!(list.params["session_id"], "local:test");
+
+        let set = rpc_request_from_command(
+            "tui-10".into(),
+            AppUiCommand::SetPermissionProfile(PermissionProfileSetParams {
+                session_id,
+                update: PermissionProfileUpdate {
+                    mode: None,
+                    network: Some(PermissionNetworkPolicy::Allow),
+                },
+            }),
+        )
+        .expect("set request encodes");
+        assert_eq!(set.method, methods::PERMISSION_PROFILE_SET);
+        assert_eq!(set.params["update"]["network"], "allow");
+        assert!(set.params["update"].get("mode").is_none());
+    }
+
+    #[test]
+    fn protocol_readonly_policy_allows_read_style_and_blocks_mutations() {
+        let session_id = SessionKey("local:test".into());
+        let read_style_commands = [
+            AppUiCommand::OpenSession(SessionOpenParams {
+                session_id: session_id.clone(),
+                profile_id: Some("coding".into()),
+                cwd: Some("/repo".into()),
+                after: None,
+            }),
+            AppUiCommand::ListApprovalScopes(ApprovalScopesListParams {
+                session_id: session_id.clone(),
+            }),
+            AppUiCommand::ListPermissionProfiles(PermissionProfileListParams {
+                session_id: session_id.clone(),
+            }),
+            AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
+                session_id: session_id.clone(),
+                preview_id: PreviewId::new(),
+            }),
+            AppUiCommand::ReadTaskOutput(TaskOutputReadParams {
+                session_id: session_id.clone(),
+                task_id: TaskId::new(),
+                cursor: Some(OutputCursor { offset: 0 }),
+                limit_bytes: Some(4096),
+            }),
+        ];
+        for command in &read_style_commands {
+            assert!(
+                ProtocolAppUiBackend::readonly_allows_command(command),
+                "{} should stay available in read-only mode",
+                command.method()
+            );
+        }
+
+        let mutating_commands = [
+            AppUiCommand::SubmitPrompt(TurnStartParams {
+                session_id: session_id.clone(),
+                turn_id: TurnId::new(),
+                input: vec![InputItem::Text {
+                    text: "hello".into(),
+                }],
+            }),
+            AppUiCommand::InterruptTurn(TurnInterruptParams {
+                session_id: session_id.clone(),
+                turn_id: TurnId::new(),
+            }),
+            AppUiCommand::RespondApproval(ApprovalRespondParams::new(
+                session_id.clone(),
+                octos_core::ui_protocol::ApprovalId::new(),
+                ApprovalDecision::Deny,
+            )),
+            AppUiCommand::SetPermissionProfile(PermissionProfileSetParams {
+                session_id,
+                update: PermissionProfileUpdate {
+                    mode: None,
+                    network: Some(PermissionNetworkPolicy::Allow),
+                },
+            }),
+        ];
+        for command in &mutating_commands {
+            assert!(
+                !ProtocolAppUiBackend::readonly_allows_command(command),
+                "{} should be blocked in read-only mode",
+                command.method()
+            );
+        }
     }
 
     #[test]
@@ -1771,9 +2471,141 @@ mod tests {
     }
 
     #[test]
+    fn protocol_exchange_tracks_requests_without_transport() {
+        let mut exchange = ProtocolExchange::default();
+        let session_id = SessionKey("local:test".into());
+        let request = exchange
+            .build_tracked_request(AppUiCommand::ListApprovalScopes(ApprovalScopesListParams {
+                session_id: session_id.clone(),
+            }))
+            .expect("request builds");
+
+        assert_eq!(
+            exchange.pending_requests.get(&request.id),
+            Some(&PendingRequest {
+                method: methods::APPROVAL_SCOPES_LIST.into(),
+            })
+        );
+
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": {
+                "scopes": []
+            }
+        })
+        .to_string();
+        let event = exchange
+            .decode_rpc_text(&frame)
+            .expect("response decodes")
+            .expect("status event");
+        let event = unwrap_app_event(event);
+
+        let AppUiEvent::Status(status) = event else {
+            panic!("expected approval scopes status");
+        };
+        assert_eq!(
+            status.message,
+            "No persisted approval scopes for this session"
+        );
+        assert!(exchange.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn protocol_exchange_replays_session_cursor_without_transport() {
+        let mut exchange = ProtocolExchange::default();
+        let session_id = SessionKey("local:test".into());
+        let cursor = UiCursor {
+            stream: "session_events".into(),
+            seq: 21,
+        };
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": methods::SESSION_OPEN,
+            "params": {
+                "session_id": session_id.clone(),
+                "active_profile_id": "coding",
+                "cursor": cursor.clone()
+            }
+        })
+        .to_string();
+
+        exchange
+            .decode_rpc_text(&frame)
+            .expect("session/opened decodes")
+            .expect("session opened event");
+        let request = exchange
+            .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                session_id: session_id.clone(),
+                profile_id: Some("coding".into()),
+                cwd: None,
+                after: None,
+            }))
+            .expect("request builds");
+
+        assert_eq!(request.params["after"]["stream"], json!(cursor.stream));
+        assert_eq!(request.params["after"]["seq"], json!(cursor.seq));
+    }
+
+    #[test]
+    fn protocol_backend_cancels_pending_requests_on_disconnect() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        let request = backend
+            .build_tracked_request(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+            }))
+            .expect("request builds");
+        backend.mark_connected("wss://example.test/ui-protocol");
+
+        backend.mark_disconnected("transport closed for test");
+
+        assert!(backend.protocol.pending_requests.is_empty());
+        let status = backend.queue.pop_front().expect("disconnect status");
+        let status = unwrap_app_event(status);
+        assert!(matches!(status, AppUiEvent::Status(_)));
+
+        let cancelled = backend.queue.pop_front().expect("cancelled request");
+        let cancelled = unwrap_app_event(cancelled);
+        let AppUiEvent::Error(error) = cancelled else {
+            panic!("expected cancellation error");
+        };
+        assert_eq!(error.code, "request_cancelled");
+        assert!(error.message.contains(methods::DIFF_PREVIEW_GET));
+        assert!(error.message.contains(&request.id));
+        assert!(error.message.contains("transport closed for test"));
+    }
+
+    #[test]
+    fn protocol_backend_maps_malformed_transport_frame_to_error() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch::default());
+
+        let event = backend
+            .handle_transport_frame(TransportFrame::Binary(vec![0xff]))
+            .expect("malformed frame is recoverable")
+            .expect("error event");
+        let event = unwrap_app_event(event);
+
+        let AppUiEvent::Error(error) = event else {
+            panic!("expected malformed frame error");
+        };
+        assert_eq!(error.code, "malformed_frame");
+        assert!(error.message.contains("not UTF-8 JSON"));
+    }
+
+    #[test]
     fn protocol_backend_tracks_requests_and_clears_success_acks() {
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
-            base_url: Some("wss://example.test/ui-protocol".into()),
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
             ..AppUiLaunch::default()
         });
 
@@ -1788,7 +2620,7 @@ mod tests {
             .expect("request builds");
 
         assert_eq!(
-            backend.pending_requests.get(&request.id),
+            backend.protocol.pending_requests.get(&request.id),
             Some(&PendingRequest {
                 method: methods::TURN_START.into(),
             })
@@ -1803,13 +2635,16 @@ mod tests {
         let event = backend.decode_rpc_text(&frame).expect("ack decodes");
 
         assert!(event.is_none());
-        assert!(backend.pending_requests.is_empty());
+        assert!(backend.protocol.pending_requests.is_empty());
     }
 
     #[test]
     fn protocol_backend_maps_diff_preview_success_to_client_event() {
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
-            base_url: Some("wss://example.test/ui-protocol".into()),
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
             ..AppUiLaunch::default()
         });
         let session_id = SessionKey("local:test".into());
@@ -1859,13 +2694,16 @@ mod tests {
         assert_eq!(result.source, "future_cache");
         assert_eq!(result.preview.files[0].status, "copied");
         assert_eq!(result.preview.files[0].hunks[0].lines[0].kind, "metadata");
-        assert!(backend.pending_requests.is_empty());
+        assert!(backend.protocol.pending_requests.is_empty());
     }
 
     #[test]
     fn protocol_backend_maps_session_open_result_to_opened_notification() {
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
-            base_url: Some("wss://example.test/ui-protocol".into()),
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
             ..AppUiLaunch::default()
         });
         let session_id = SessionKey("local:test".into());
@@ -1907,13 +2745,16 @@ mod tests {
         assert_eq!(opened.session_id.0, "local:test");
         assert_eq!(opened.workspace_root.as_deref(), Some("/repo"));
         assert_eq!(opened.cursor.as_ref().map(|cursor| cursor.seq), Some(11));
-        assert!(backend.pending_requests.is_empty());
+        assert!(backend.protocol.pending_requests.is_empty());
     }
 
     #[test]
     fn protocol_backend_maps_approval_scopes_list_success_to_status() {
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
-            base_url: Some("wss://example.test/ui-protocol".into()),
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
             ..AppUiLaunch::default()
         });
         let session_id = SessionKey("local:test".into());
@@ -1950,13 +2791,107 @@ mod tests {
             status.message,
             "1 persisted approval scope for this session"
         );
-        assert!(backend.pending_requests.is_empty());
+        assert!(backend.protocol.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn protocol_backend_maps_permission_profile_success_to_client_state() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        let session_id = SessionKey("local:test".into());
+        let list_request = backend
+            .build_tracked_request(AppUiCommand::ListPermissionProfiles(
+                PermissionProfileListParams {
+                    session_id: session_id.clone(),
+                },
+            ))
+            .expect("list request builds");
+        let list_frame = json!({
+            "jsonrpc": "2.0",
+            "id": list_request.id,
+            "result": {
+                "session_id": session_id,
+                "current": {
+                    "mode": "workspace-write",
+                    "network": "deny"
+                },
+                "profiles": []
+            }
+        })
+        .to_string();
+
+        let event = backend
+            .decode_rpc_text(&list_frame)
+            .expect("permission list response decodes")
+            .expect("permission profile event");
+        let ClientEvent::PermissionProfile(profile) = event else {
+            panic!("expected permission profile event");
+        };
+        assert_eq!(
+            profile.message,
+            "Permissions: Workspace Write, network blocked"
+        );
+        assert_eq!(profile.session_id, SessionKey("local:test".into()));
+        assert_eq!(profile.current, PermissionProfileSelection::default());
+
+        let set_request = backend
+            .build_tracked_request(AppUiCommand::SetPermissionProfile(
+                PermissionProfileSetParams {
+                    session_id: SessionKey("local:test".into()),
+                    update: PermissionProfileUpdate {
+                        mode: Some(PermissionProfileMode::DangerFullAccess),
+                        network: Some(PermissionNetworkPolicy::Allow),
+                    },
+                },
+            ))
+            .expect("set request builds");
+        let set_frame = json!({
+            "jsonrpc": "2.0",
+            "id": set_request.id,
+            "result": {
+                "session_id": "local:test",
+                "current": {
+                    "mode": "danger-full-access",
+                    "network": "allow"
+                },
+                "applied": true
+            }
+        })
+        .to_string();
+
+        let event = backend
+            .decode_rpc_text(&set_frame)
+            .expect("permission set response decodes")
+            .expect("permission profile event");
+        let ClientEvent::PermissionProfile(profile) = event else {
+            panic!("expected permission profile event");
+        };
+        assert_eq!(
+            profile.message,
+            "Permissions updated: Full Access, network allowed"
+        );
+        assert_eq!(
+            profile.current,
+            PermissionProfileSelection {
+                mode: PermissionProfileMode::DangerFullAccess,
+                network: PermissionNetworkPolicy::Allow,
+            }
+        );
+        assert!(backend.protocol.pending_requests.is_empty());
     }
 
     #[test]
     fn protocol_backend_maps_task_output_read_success_to_output_delta() {
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
-            base_url: Some("wss://example.test/ui-protocol".into()),
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
             ..AppUiLaunch::default()
         });
         let session_id = SessionKey("local:test".into());
@@ -2006,13 +2941,16 @@ mod tests {
         assert_eq!(event.session_id.0, "local:test");
         assert_eq!(event.cursor, OutputCursor { offset: 31 });
         assert_eq!(event.text, "task output window\n");
-        assert!(backend.pending_requests.is_empty());
+        assert!(backend.protocol.pending_requests.is_empty());
     }
 
     #[test]
     fn protocol_backend_preserves_task_output_metadata_when_window_omits_it() {
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
-            base_url: Some("wss://example.test/ui-protocol".into()),
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
             ..AppUiLaunch::default()
         });
         let session_id = SessionKey("local:test".into());
@@ -2071,13 +3009,16 @@ mod tests {
                 .text
                 .contains("limitations:\n- snapshot projection, not live stdout")
         );
-        assert!(backend.pending_requests.is_empty());
+        assert!(backend.protocol.pending_requests.is_empty());
     }
 
     #[test]
     fn protocol_backend_maps_interrupt_success_to_cancel_status() {
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
-            base_url: Some("wss://example.test/ui-protocol".into()),
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
             ..AppUiLaunch::default()
         });
         let request = backend
@@ -2106,13 +3047,16 @@ mod tests {
             status.message,
             "Interrupt acknowledged; active turn cancelled"
         );
-        assert!(backend.pending_requests.is_empty());
+        assert!(backend.protocol.pending_requests.is_empty());
     }
 
     #[test]
     fn protocol_backend_maps_error_responses_with_request_context() {
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
-            base_url: Some("wss://example.test/ui-protocol".into()),
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
             ..AppUiLaunch::default()
         });
         let request = backend
@@ -2147,7 +3091,7 @@ mod tests {
         assert!(error.message.contains(methods::SESSION_OPEN));
         assert!(error.message.contains(&request.id));
         assert!(error.message.contains("missing session"));
-        assert!(backend.pending_requests.is_empty());
+        assert!(backend.protocol.pending_requests.is_empty());
     }
 
     #[test]
@@ -2179,7 +3123,10 @@ mod tests {
     #[test]
     fn protocol_session_open_request_includes_cwd() {
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
-            base_url: Some("wss://example.test/ui-protocol".into()),
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
             cwd: Some("/tmp/project".into()),
             ..AppUiLaunch::default()
         });
@@ -2208,7 +3155,10 @@ mod tests {
         };
         let turn_id = TurnId::new();
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
-            base_url: Some("wss://example.test/ui-protocol".into()),
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
             ..AppUiLaunch::default()
         });
 
@@ -2232,7 +3182,7 @@ mod tests {
             AppUiEvent::Protocol(UiNotification::SessionOpened(_))
         ));
         assert_eq!(
-            backend.session_cursors.get(&session_id),
+            backend.protocol.session_cursors.get(&session_id),
             Some(&opened_cursor)
         );
 
@@ -2250,7 +3200,10 @@ mod tests {
             .decode_rpc_text(&turn_completed)
             .expect("turn/completed decodes")
             .expect("event");
-        assert_eq!(backend.session_cursors.get(&session_id), Some(&turn_cursor));
+        assert_eq!(
+            backend.protocol.session_cursors.get(&session_id),
+            Some(&turn_cursor)
+        );
 
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
@@ -2269,36 +3222,100 @@ mod tests {
     }
 
     #[test]
-    fn protocol_backend_readonly_bootstrap_is_network_free() {
+    fn protocol_backend_readonly_bootstrap_connects_opens_and_reads_existing_session() {
+        let server = spawn_protocol_capture_server(2, true);
+        let session_id = SessionKey("session-123".into());
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
-            base_url: Some("ws://127.0.0.1:1/ui-protocol".into()),
-            session_id: Some(SessionKey("session-123".into())),
+            endpoint: Some(AppUiEndpoint::websocket(server.endpoint.clone(), None)),
+            session_id: Some(session_id.clone()),
+            profile_id: Some("coding".into()),
+            cwd: Some("/repo".into()),
             readonly: true,
             ..AppUiLaunch::default()
         });
 
-        let snapshot = backend
-            .bootstrap()
-            .expect("readonly bootstrap does not connect");
+        let snapshot = backend.bootstrap().expect("readonly bootstrap connects");
 
         assert_eq!(snapshot.sessions[0].id.0, "session-123");
         assert!(snapshot.status.contains("read-only"));
         assert!(
             snapshot.sessions[0].messages[0]
                 .content
-                .contains("no WebSocket connection opened")
+                .contains("mutating commands disabled")
         );
-        assert!(backend.stream.is_none());
+        assert!(backend.is_connected());
+        assert_eq!(backend.connection_state, ProtocolConnectionState::Connected);
+
+        let open_request = server.recv_json();
+        assert_eq!(open_request["method"], methods::SESSION_OPEN);
+        assert_eq!(open_request["params"]["session_id"], json!("session-123"));
+        assert_eq!(open_request["params"]["cwd"], json!("/repo"));
+
+        let event = next_event_until(&mut backend);
+        let event = unwrap_app_event(event);
+        let AppUiEvent::Protocol(UiNotification::SessionOpened(opened)) = event else {
+            panic!("expected session opened notification");
+        };
+        assert_eq!(opened.session_id, session_id);
+        assert_eq!(opened.workspace_root.as_deref(), Some("/repo"));
+
+        let preview_id = PreviewId::new();
+        backend
+            .send(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
+                session_id: opened.session_id,
+                preview_id: preview_id.clone(),
+            }))
+            .expect("readonly diff preview request sends");
+
+        let diff_request = server.recv_json();
+        assert_eq!(diff_request["method"], methods::DIFF_PREVIEW_GET);
+        assert_eq!(diff_request["params"]["preview_id"], json!(preview_id));
+        server.join();
+    }
+
+    #[test]
+    fn protocol_backend_readonly_bootstrap_survives_connection_failure() {
+        let session_id = SessionKey("session-123".into());
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            session_id: Some(session_id.clone()),
+            profile_id: Some("coding".into()),
+            readonly: true,
+            ..AppUiLaunch::default()
+        });
+        backend.runtime = None;
+        backend.runtime_error = Some("runtime unavailable for test".into());
+
+        let snapshot = backend
+            .bootstrap()
+            .expect("readonly bootstrap returns offline snapshot");
+
+        assert!(snapshot.readonly);
+        assert_eq!(snapshot.sessions[0].id, session_id);
+        assert!(snapshot.status.contains("read-only"));
+        assert!(snapshot.status.contains("no network connection opened"));
         assert_eq!(
             backend.connection_state,
             ProtocolConnectionState::Disconnected
         );
+        let event = backend.queue.pop_front().expect("offline status event");
+        let event = unwrap_app_event(event);
+        let AppUiEvent::Status(status) = event else {
+            panic!("expected status event");
+        };
+        assert!(status.message.contains("no network connection opened"));
     }
 
     #[test]
     fn protocol_backend_records_disconnected_status() {
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
-            base_url: Some("wss://example.test/ui-protocol".into()),
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
             ..AppUiLaunch::default()
         });
 
@@ -2320,7 +3337,10 @@ mod tests {
     #[test]
     fn protocol_snapshot_honors_requested_session() {
         let launch = AppUiLaunch {
-            base_url: Some("wss://example.test/ui-protocol".into()),
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
             session_id: Some(SessionKey("session-123".into())),
             profile_id: Some("coding".into()),
             readonly: true,
@@ -2339,22 +3359,39 @@ mod tests {
     }
 
     #[test]
-    fn protocol_backend_readonly_submit_prompt_emits_warning_without_network() {
+    fn protocol_backend_readonly_blocks_mutations_without_network() {
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
-            base_url: Some("wss://example.test/ui-protocol".into()),
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
             readonly: true,
             ..AppUiLaunch::default()
         });
+        let session_id = SessionKey("local:test".into());
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
-                session_id: SessionKey("local:test".into()),
+                session_id: session_id.clone(),
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
                     text: "hello".into(),
                 }],
             }))
             .expect("readonly send is local");
+        backend
+            .send(AppUiCommand::InterruptTurn(TurnInterruptParams {
+                session_id: session_id.clone(),
+                turn_id: TurnId::new(),
+            }))
+            .expect("readonly interrupt is local");
+        backend
+            .send(AppUiCommand::RespondApproval(ApprovalRespondParams::new(
+                session_id,
+                octos_core::ui_protocol::ApprovalId::new(),
+                ApprovalDecision::Deny,
+            )))
+            .expect("readonly approval response is local");
 
         let event = backend.next_event().expect("poll").expect("warning");
         let event = unwrap_app_event(event);
@@ -2362,6 +3399,26 @@ mod tests {
             event,
             AppUiEvent::Protocol(UiNotification::Warning(_))
         ));
+        let event = backend
+            .next_event()
+            .expect("poll")
+            .expect("interrupt error");
+        let event = unwrap_app_event(event);
+        let AppUiEvent::Error(error) = event else {
+            panic!("expected interrupt readonly error");
+        };
+        assert!(error.message.contains(methods::TURN_INTERRUPT));
+
+        let event = backend
+            .next_event()
+            .expect("poll")
+            .expect("approval response error");
+        let event = unwrap_app_event(event);
+        let AppUiEvent::Error(error) = event else {
+            panic!("expected approval readonly error");
+        };
+        assert!(error.message.contains(methods::APPROVAL_RESPOND));
+        assert!(!backend.is_connected());
     }
 
     #[test]
@@ -2382,6 +3439,63 @@ mod tests {
 
         let first = backend.next_event().expect("poll");
         assert!(first.is_some());
+    }
+
+    #[test]
+    fn mock_backend_submit_prompt_does_not_replace_session_before_approval() {
+        let mut backend = MockAppUiBackend::default();
+        let snapshot = backend.bootstrap().expect("bootstrap");
+        let session_id = snapshot.sessions[0].id.clone();
+
+        let opened = backend.next_event().expect("poll").expect("session opened");
+        let opened = unwrap_app_event(opened);
+        let AppUiEvent::Protocol(UiNotification::SessionOpened(opened)) = opened else {
+            panic!("expected bootstrap session/opened");
+        };
+        assert_eq!(opened.session_id, session_id);
+
+        let turn_id = TurnId::new();
+        backend
+            .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                input: vec![InputItem::Text {
+                    text: "complete m9 contract".into(),
+                }],
+            }))
+            .expect("submit prompt");
+
+        let mut saw_turn_started = false;
+        loop {
+            let event = backend
+                .next_event()
+                .expect("poll")
+                .expect("mock turn event before approval");
+            let event = unwrap_app_event(event);
+            match event {
+                AppUiEvent::Snapshot(_) => {
+                    panic!("turn/send must not emit a snapshot that can erase optimistic user text")
+                }
+                AppUiEvent::Protocol(UiNotification::SessionOpened(_)) => {
+                    panic!("turn/send must not reopen the session before approval")
+                }
+                AppUiEvent::Protocol(UiNotification::TurnStarted(event)) => {
+                    assert_eq!(event.session_id, session_id);
+                    assert_eq!(event.turn_id, turn_id);
+                    saw_turn_started = true;
+                }
+                AppUiEvent::Protocol(UiNotification::ApprovalRequested(event)) => {
+                    assert_eq!(event.session_id, session_id);
+                    assert_eq!(event.turn_id, turn_id);
+                    assert!(
+                        saw_turn_started,
+                        "approval must follow turn/started so store state is active first"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
     }
 
     #[test]
@@ -2457,7 +3571,10 @@ mod tests {
     #[test]
     fn mock_backend_bootstrap_honors_launch_options() {
         let mut backend = MockAppUiBackend::new(AppUiLaunch {
-            base_url: Some("wss://example.test/ui-protocol".into()),
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
             session_id: Some(SessionKey("session-123".into())),
             profile_id: Some("review".into()),
             readonly: true,

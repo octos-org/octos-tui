@@ -91,6 +91,11 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
+    if is_control_char(&key, 'o') {
+        store.state.toggle_tool_output_expansion();
+        return KeyAction::Continue;
+    }
+
     if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
         return handle_plain_key(store, key);
     }
@@ -125,6 +130,10 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
 
     if store.state.task_output.active {
         return handle_task_output_key(store, key);
+    }
+
+    if store.state.menu_stack.is_active() {
+        return handle_menu_key(store, key);
     }
 
     match key.code {
@@ -173,9 +182,7 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             store.state.composer.pop();
         }
         KeyCode::Enter if store.state.focus == FocusPane::Composer => {
-            if let Some(command) = store.compose_command() {
-                return KeyAction::Send(command);
-            }
+            return handle_composer_enter(store);
         }
         KeyCode::Char('o') if store.state.focus == FocusPane::Tasks => {
             if let Some(command) = store.read_task_output_command() {
@@ -199,13 +206,87 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             store.stage_selected_diff_context();
         }
         KeyCode::Char(ch) => {
+            let opens_slash_popup = ch == '/' && store.state.composer.is_empty();
             store.state.composer.push(ch);
             store.state.focus = FocusPane::Composer;
+            if opens_slash_popup {
+                store.open_menu(crate::menu::MenuId::from(crate::menu::registry::MENU_HELP));
+            }
         }
         _ => {}
     }
 
     KeyAction::Continue
+}
+
+fn handle_composer_enter(store: &mut Store) -> KeyAction {
+    store
+        .compose_command()
+        .map_or(KeyAction::Continue, KeyAction::Send)
+}
+
+fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
+    match key.code {
+        KeyCode::Esc => {
+            store.close_menu();
+        }
+        KeyCode::Backspace if slash_help_query_active(store) => {
+            store.state.composer.pop();
+            sync_slash_help_search_query(store);
+        }
+        KeyCode::Char(ch) if slash_help_should_capture_char(store, ch) => {
+            store.state.composer.push(ch);
+            sync_slash_help_search_query(store);
+        }
+        KeyCode::Enter => {
+            if slash_help_query_active(store) {
+                return handle_composer_enter(store);
+            }
+            if let Some(command) = store.accept_active_menu_item() {
+                return KeyAction::Send(command);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            store.select_next_menu_item();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            store.select_prev_menu_item();
+        }
+        _ => {}
+    }
+
+    KeyAction::Continue
+}
+
+fn slash_help_query_active(store: &Store) -> bool {
+    store
+        .state
+        .menu_stack
+        .active()
+        .is_some_and(|frame| frame.id.as_str() == crate::menu::registry::MENU_HELP)
+        && store.state.composer.starts_with('/')
+        && store.state.composer.len() > 1
+}
+
+fn slash_help_should_capture_char(store: &Store, ch: char) -> bool {
+    store
+        .state
+        .menu_stack
+        .active()
+        .is_some_and(|frame| frame.id.as_str() == crate::menu::registry::MENU_HELP)
+        && store.state.composer.starts_with('/')
+        && (store.state.composer.len() > 1 || !matches!(ch, 'j' | 'k'))
+}
+
+fn sync_slash_help_search_query(store: &mut Store) {
+    if let Some(frame) = store.state.menu_stack.active_mut() {
+        frame.search_query = store
+            .state
+            .composer
+            .strip_prefix('/')
+            .unwrap_or(store.state.composer.as_str())
+            .to_string();
+    }
 }
 
 fn handle_approval_modal_key(store: &mut Store, key: KeyEvent) -> KeyAction {
@@ -318,7 +399,7 @@ fn is_alt_char(key: &KeyEvent, expected: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AppState, LiveReply, SessionView, TaskView};
+    use crate::model::{ActivityKind, AppState, LiveReply, SessionView, TaskView};
     use octos_core::{
         SessionKey, TaskId,
         ui_protocol::{
@@ -562,6 +643,211 @@ mod tests {
         ));
         assert!(store.state.composer.is_empty());
         assert_eq!(store.state.status, "Cleared composer draft");
+    }
+
+    #[test]
+    fn ctrl_o_toggles_tool_output_expansion_without_leaving_composer() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+
+        assert!(matches!(
+            handle_key(
+                &mut store,
+                modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL)
+            ),
+            KeyAction::Continue
+        ));
+        assert!(store.state.expanded_tool_outputs);
+        assert_eq!(store.state.focus, FocusPane::Composer);
+        assert_eq!(store.state.status, "Expanded tool output cards");
+
+        assert!(matches!(
+            handle_key(
+                &mut store,
+                modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL)
+            ),
+            KeyAction::Continue
+        ));
+        assert!(!store.state.expanded_tool_outputs);
+        assert_eq!(store.state.status, "Collapsed tool output cards");
+    }
+
+    #[test]
+    fn typing_slash_opens_registry_backed_menu() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('/'))),
+            KeyAction::Continue
+        ));
+
+        assert_eq!(store.state.composer, "/");
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_HELP)
+        );
+        let expected = crate::menu::CommandRegistry::with_core_commands()
+            .visible_commands(&store.state.availability_context())
+            .into_iter()
+            .map(|visible| visible.command.slash_name())
+            .collect::<Vec<_>>();
+        let Some(crate::menu::MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref()
+        else {
+            panic!("expected registry help menu");
+        };
+        let actual = spec
+            .items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn exact_slash_command_typed_through_popup_dispatches_command() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.target = Some("ws://127.0.0.1:50080/api/ui-protocol/ws".into());
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            octos_core::ui_protocol::methods::PERMISSION_PROFILE_LIST,
+            octos_core::ui_protocol::methods::PERMISSION_PROFILE_SET,
+        ]));
+
+        for ch in "/permissions".chars() {
+            assert!(matches!(
+                handle_key(&mut store, key(KeyCode::Char(ch))),
+                KeyAction::Continue
+            ));
+        }
+
+        assert_eq!(store.state.composer, "/permissions");
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.search_query.as_str()),
+            Some("permissions")
+        );
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Enter)),
+            KeyAction::Continue
+        ));
+
+        assert!(store.state.composer.is_empty());
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_PERMISSIONS)
+        );
+    }
+
+    #[test]
+    fn slash_ps_is_handled_locally_without_prompt_submission() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.composer = "/ps".into();
+        store.state.sessions[0].tasks.push(TaskView {
+            id: TaskId::new(),
+            title: "cargo test".into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: Some("running tests".into()),
+            output_tail: "test output".into(),
+        });
+        store.state.sessions[0].tasks.push(TaskView {
+            id: TaskId::new(),
+            title: "format".into(),
+            state: TaskRuntimeState::Completed,
+            runtime_detail: None,
+            output_tail: String::new(),
+        });
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Enter)),
+            KeyAction::Continue
+        ));
+
+        assert!(store.state.composer.is_empty());
+        assert!(store.state.sessions[0].messages.is_empty());
+        assert_eq!(store.state.focus, FocusPane::Tasks);
+        assert!(store.state.status.contains("Local /ps: idle"));
+        assert!(store.state.status.contains("2 total"));
+        assert_eq!(
+            store.state.activity.last().map(|item| item.title.as_str()),
+            Some("local /ps")
+        );
+    }
+
+    #[test]
+    fn slash_stop_interrupts_active_turn_without_prompt_submission() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.composer = "/stop".into();
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: turn_id.clone(),
+            text: "streaming".into(),
+        });
+
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+
+        let KeyAction::Send(AppUiCommand::InterruptTurn(params)) = action else {
+            panic!("expected interrupt command");
+        };
+        assert_eq!(params.turn_id, turn_id);
+        assert!(store.state.composer.is_empty());
+        assert!(store.state.sessions[0].messages.is_empty());
+        assert_eq!(store.state.status, "Interrupt requested for active turn");
+    }
+
+    #[test]
+    fn slash_stop_without_active_turn_reports_local_message() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.composer = "/stop".into();
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Enter)),
+            KeyAction::Continue
+        ));
+
+        assert!(store.state.composer.is_empty());
+        assert!(store.state.sessions[0].messages.is_empty());
+        assert_eq!(store.state.status, "No active turn to interrupt");
+        let activity = store.state.activity.last().expect("local activity");
+        assert_eq!(activity.kind, ActivityKind::Warning);
+        assert_eq!(activity.title, "local /stop");
+    }
+
+    #[test]
+    fn unknown_slash_command_reports_help_without_prompt_submission() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.composer = "/wat".into();
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Enter)),
+            KeyAction::Continue
+        ));
+
+        assert!(store.state.composer.is_empty());
+        assert!(store.state.sessions[0].messages.is_empty());
+        assert_eq!(
+            store.state.status,
+            "Unknown slash command: /wat. Try /ps, /stop, or /help."
+        );
+        let activity = store.state.activity.last().expect("local activity");
+        assert_eq!(activity.kind, ActivityKind::Warning);
+        assert_eq!(activity.title, "local slash command");
     }
 
     #[test]

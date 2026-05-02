@@ -21,6 +21,20 @@ pub struct Palette {
 impl Palette {
     pub fn for_theme(theme: ThemeName) -> Self {
         match theme {
+            ThemeName::Terminal => Self {
+                surface: Color::Reset,
+                surface_alt: Color::Reset,
+                frame: Color::DarkGray,
+                accent: Color::Cyan,
+                highlight: Color::Yellow,
+                text: Color::Reset,
+                muted: Color::DarkGray,
+                success: Color::Cyan,
+                success_bg: Color::Reset,
+                danger: Color::Red,
+                danger_bg: Color::Reset,
+                diff_context_bg: Color::Reset,
+            },
             ThemeName::Slate => Self {
                 surface: Color::Rgb(20, 25, 35),
                 surface_alt: Color::Rgb(28, 34, 46),
@@ -98,5 +112,35 @@ impl Palette {
 
     pub fn muted(self) -> Style {
         Style::default().fg(self.muted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::Color;
+
+    use super::Palette;
+    use crate::cli::ThemeName;
+
+    #[test]
+    fn terminal_theme_uses_terminal_default_surfaces() {
+        let palette = Palette::for_theme(ThemeName::Terminal);
+
+        assert_eq!(palette.surface, Color::Reset);
+        assert_eq!(palette.surface_alt, Color::Reset);
+        assert_eq!(palette.text, Color::Reset);
+        assert_eq!(palette.diff_context_bg, Color::Reset);
+        assert_eq!(palette.success_bg, Color::Reset);
+        assert_eq!(palette.danger_bg, Color::Reset);
+    }
+
+    #[test]
+    fn terminal_theme_avoids_forced_green_highlights() {
+        let palette = Palette::for_theme(ThemeName::Terminal);
+
+        assert_ne!(palette.highlight, Color::Green);
+        assert_ne!(palette.highlight, Color::LightGreen);
+        assert_ne!(palette.success, Color::Green);
+        assert_ne!(palette.success, Color::LightGreen);
     }
 }
