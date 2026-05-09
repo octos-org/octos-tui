@@ -6,11 +6,7 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 use octos_core::{
     app_ui::AppUiCommand,
-    ui_protocol::{
-        ApprovalScopesListParams, PermissionNetworkPolicy, PermissionProfileListParams,
-        PermissionProfileMode, PermissionProfileSelection, PermissionProfileSetParams,
-        PermissionProfileUpdate, methods,
-    },
+    ui_protocol::{ApprovalScopesListParams, methods},
 };
 
 use crate::menu::{
@@ -23,6 +19,10 @@ use crate::menu::{
         APPUI_METHOD_PERMISSION_PROFILE_SET, MENU_HELP, MENU_KEYMAP, MENU_MCP, MENU_MODEL,
         MENU_PERMISSIONS, MENU_STATUS, MENU_STATUS_LINE, MENU_THEME, MENU_TITLE,
     },
+};
+use crate::permission_profile::{
+    PermissionNetworkPolicy, PermissionProfileMode, PermissionProfileSelection,
+    PermissionProfileUpdate,
 };
 
 pub fn core_menu_registry() -> MenuRegistry {
@@ -456,9 +456,7 @@ fn permission_profile_items(
         MenuItem::new(
             "permissions.profile.refresh",
             "Refresh permission profiles",
-            MenuAction::SendAppUi(AppUiCommand::ListPermissionProfiles(
-                PermissionProfileListParams { session_id },
-            )),
+            MenuAction::Noop,
         )
         .with_description("Requires profile/list.")
         .maybe_disabled(profile_list_reason),
@@ -569,12 +567,10 @@ fn permission_network_items(
 }
 
 fn permission_set_action(
-    session_id: octos_core::SessionKey,
-    update: PermissionProfileUpdate,
+    _session_id: octos_core::SessionKey,
+    _update: PermissionProfileUpdate,
 ) -> MenuAction {
-    MenuAction::SendAppUi(AppUiCommand::SetPermissionProfile(
-        PermissionProfileSetParams { session_id, update },
-    ))
+    MenuAction::Noop
 }
 
 fn approval_scopes_refresh_item(
@@ -631,7 +627,7 @@ fn permission_action_disabled_reason(
         action,
         AppUiActionKind::PermissionProfileList | AppUiActionKind::PermissionProfileSet
     ) {
-        None
+        Some("permission/profile commands are not exposed by current octos-core".into())
     } else {
         Some(typed_gap.into())
     }
@@ -1019,12 +1015,12 @@ mod tests {
     }
 
     #[test]
-    fn permissions_menu_sends_profile_commands_when_capability_exists() {
+    fn permissions_menu_disables_profile_commands_even_when_legacy_labels_exist() {
         let registry = core_menu_registry();
         let capabilities = CapabilitySet::from_methods([
             methods::APPROVAL_SCOPES_LIST,
-            methods::PERMISSION_PROFILE_LIST,
-            methods::PERMISSION_PROFILE_SET,
+            APPUI_METHOD_PERMISSION_PROFILE_LIST,
+            APPUI_METHOD_PERMISSION_PROFILE_SET,
         ]);
         let session_id = SessionKey("local:test".into());
         let ctx = MenuContext {
@@ -1049,30 +1045,36 @@ mod tests {
             .iter()
             .find(|item| item.id == "permissions.full_access")
             .expect("full access row");
-        assert!(full_access.is_enabled());
-        assert!(matches!(
-            &full_access.action,
-            MenuAction::SendAppUi(AppUiCommand::SetPermissionProfile(_))
-        ));
+        assert!(!full_access.is_enabled());
+        assert!(matches!(&full_access.action, MenuAction::Noop));
+        assert!(
+            full_access
+                .disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not exposed by current octos-core"))
+        );
 
         let refresh = spec
             .items
             .iter()
             .find(|item| item.id == "permissions.profile.refresh")
             .expect("profile refresh row");
-        assert!(refresh.is_enabled());
-        assert!(matches!(
-            &refresh.action,
-            MenuAction::SendAppUi(AppUiCommand::ListPermissionProfiles(_))
-        ));
+        assert!(!refresh.is_enabled());
+        assert!(matches!(&refresh.action, MenuAction::Noop));
+        assert!(
+            refresh
+                .disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not exposed by current octos-core"))
+        );
     }
 
     #[test]
     fn permissions_menu_marks_known_permission_profile_state() {
         let registry = core_menu_registry();
         let capabilities = CapabilitySet::from_methods([
-            methods::PERMISSION_PROFILE_LIST,
-            methods::PERMISSION_PROFILE_SET,
+            APPUI_METHOD_PERMISSION_PROFILE_LIST,
+            APPUI_METHOD_PERMISSION_PROFILE_SET,
         ]);
         let session_id = SessionKey("local:test".into());
         let ctx = MenuContext {

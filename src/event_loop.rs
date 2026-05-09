@@ -714,8 +714,8 @@ mod tests {
         store.state.focus = FocusPane::Composer;
         store.state.target = Some("ws://127.0.0.1:50080/api/ui-protocol/ws".into());
         store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
-            octos_core::ui_protocol::methods::PERMISSION_PROFILE_LIST,
-            octos_core::ui_protocol::methods::PERMISSION_PROFILE_SET,
+            crate::menu::registry::APPUI_METHOD_PERMISSION_PROFILE_LIST,
+            crate::menu::registry::APPUI_METHOD_PERMISSION_PROFILE_SET,
         ]));
 
         for ch in "/permissions".chars() {

@@ -1,6 +1,6 @@
-use octos_core::{SessionKey, app_ui::AppUiEvent, ui_protocol::PermissionProfileSelection};
+use octos_core::{SessionKey, app_ui::AppUiEvent};
 
-use crate::model::DiffPreviewGetResult;
+use crate::{model::DiffPreviewGetResult, permission_profile::PermissionProfileSelection};
 
 #[derive(Debug, Clone)]
 pub enum ClientEvent {

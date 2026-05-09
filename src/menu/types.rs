@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use octos_core::app_ui::AppUiCommand;
 
 use crate::menu::availability::{AvailabilityContext, CommandAvailability};
+use crate::permission_profile::PermissionProfileSelection;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MenuId(String);
@@ -131,10 +132,8 @@ impl AppUiActionKind {
             Self::ApprovalScopesList => octos_core::ui_protocol::methods::APPROVAL_SCOPES_LIST,
             Self::ModelList => "model/list",
             Self::SessionStatusRead => "session/status/read",
-            Self::PermissionProfileList => {
-                octos_core::ui_protocol::methods::PERMISSION_PROFILE_LIST
-            }
-            Self::PermissionProfileSet => octos_core::ui_protocol::methods::PERMISSION_PROFILE_SET,
+            Self::PermissionProfileList => "permission/profile/list",
+            Self::PermissionProfileSet => "permission/profile/set",
             Self::ApprovalScopesClear => "approval/scopes/clear",
             Self::McpStatusList => "mcp/status/list",
             Self::Custom { method, .. } => method,
@@ -432,7 +431,7 @@ pub struct MenuAppSnapshot<'a> {
     pub cwd: Option<&'a str>,
     pub current_model: Option<&'a str>,
     pub current_profile: Option<&'a str>,
-    pub permission_profile: Option<octos_core::ui_protocol::PermissionProfileSelection>,
+    pub permission_profile: Option<PermissionProfileSelection>,
     pub selected_session_id: Option<&'a octos_core::SessionKey>,
     pub selected_session_title: Option<&'a str>,
     pub selected_task_title: Option<&'a str>,

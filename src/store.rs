@@ -1,10 +1,10 @@
 use octos_core::app_ui::{AppUiCommand, AppUiEvent, AppUiSnapshot};
 use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
-    ApprovalRespondParams, DiffPreviewGetParams, InputItem, MessageDeltaEvent, ReplayLossyEvent,
-    TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState, TaskUpdatedEvent,
-    TurnCompletedEvent, TurnErrorEvent, TurnInterruptParams, TurnStartParams, UiNotification,
-    UiProgressEvent,
+    ApprovalRespondParams, DiffPreviewGetParams, InputItem, MessageDeltaEvent,
+    MessagePersistedEvent, ReplayLossyEvent, TaskOutputDeltaEvent, TaskOutputReadParams,
+    TaskRuntimeState, TaskUpdatedEvent, TurnCompletedEvent, TurnErrorEvent, TurnInterruptParams,
+    TurnSpawnCompleteEvent, TurnStartParams, UiNotification, UiProgressEvent,
 };
 use octos_core::{Message, TaskId};
 use serde_json::Value;
@@ -873,6 +873,7 @@ impl Store {
         match notification {
             UiNotification::SessionOpened(event) => {
                 let session_id = event.session_id.clone();
+                self.state.set_capabilities(event.capabilities.clone());
                 if let Some(panes) = event.panes {
                     self.state.apply_pane_snapshot(panes);
                 }
@@ -1073,7 +1074,42 @@ impl Store {
             UiNotification::ApprovalCancelled(event) => self.apply_approval_cancelled(event),
             UiNotification::ProgressUpdated(event) => self.apply_progress(event),
             UiNotification::ReplayLossy(event) => self.apply_replay_lossy(event),
+            UiNotification::MessagePersisted(event) => self.apply_message_persisted(event),
+            UiNotification::TurnSpawnComplete(event) => self.apply_turn_spawn_complete(event),
         }
+    }
+
+    fn apply_message_persisted(&mut self, event: MessagePersistedEvent) -> Option<AppUiCommand> {
+        let attachment_count = event.media.len();
+        let attachment_hint = match attachment_count {
+            0 => String::new(),
+            1 => " with 1 attachment".into(),
+            count => format!(" with {count} attachments"),
+        };
+        self.state.status = format!(
+            "Persisted {} message seq {}{}",
+            event.role, event.seq, attachment_hint
+        );
+        None
+    }
+
+    fn apply_turn_spawn_complete(&mut self, event: TurnSpawnCompleteEvent) -> Option<AppUiCommand> {
+        if let Some(session) = self.find_session_mut(&event.session_id) {
+            let mut message = Message::assistant(event.content);
+            message.media = event.media;
+            message.thread_id = event
+                .thread_id
+                .or(event.response_to_client_message_id.clone());
+            session.messages.push(message);
+            session.live_reply = None;
+            self.state.scroll_transcript_to_latest();
+        }
+        self.state.set_run_state_success();
+        self.state.status = format!(
+            "Background task {} persisted assistant message seq {}",
+            event.task_id, event.seq
+        );
+        None
     }
 
     fn apply_approval_auto_resolved(
@@ -1703,8 +1739,7 @@ mod tests {
         ApprovalDiffDetails, ApprovalId, ApprovalRequestedEvent, ApprovalTypedDetails,
         OutputCursor, PreviewId, ReplayLossyEvent, TaskRuntimeState, ToolCompletedEvent,
         ToolStartedEvent, TurnId, UiCursor, UiFileMutationNotice, UiProgressMetadata,
-        UiProtocolCapabilities, UiTokenCostUpdate, approval_kinds, approval_scopes, methods,
-        progress_kinds,
+        UiTokenCostUpdate, approval_kinds, approval_scopes, methods, progress_kinds,
     };
 
     fn store_with_live_reply(turn_id: TurnId, text: impl Into<String>) -> Store {
@@ -1938,7 +1973,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_preserves_active_menu_stack_and_rebuilds_from_capabilities() {
+    fn snapshot_preserves_active_menu_stack_and_session_capabilities() {
         let mut store = protocol_store_with_methods(&[]);
         store.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
         assert!(help_menu_labels(&store).contains(&"/status".to_string()));
@@ -1946,15 +1981,24 @@ mod tests {
         assert!(!help_menu_labels(&store).contains(&"/model".to_string()));
 
         let session = store.state.sessions[0].clone();
+        let opened: octos_core::ui_protocol::SessionOpened =
+            serde_json::from_value(serde_json::json!({
+                "session_id": session.id,
+                "capabilities": octos_core::ui_protocol::UiProtocolCapabilities::new(
+                    &[crate::menu::registry::APPUI_METHOD_MODEL_LIST],
+                    &[],
+                ),
+            }))
+            .expect("session/opened fixture");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+        assert!(help_menu_labels(&store).contains(&"/model".to_string()));
+
+        let session = store.state.sessions[0].clone();
         store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
             sessions: vec![session],
             selected_session: 0,
             status: "snapshot replay".into(),
             target: Some("ws://example.test/ui-protocol".into()),
-            capabilities: Some(UiProtocolCapabilities::new(
-                &[crate::menu::registry::APPUI_METHOD_MODEL_LIST],
-                &[],
-            )),
             readonly: false,
         }));
 
@@ -2143,9 +2187,6 @@ mod tests {
             selected_session: 0,
             status: "replayed snapshot".into(),
             target: None,
-            capabilities: Some(
-                octos_core::ui_protocol::UiProtocolCapabilities::first_server_slice(),
-            ),
             readonly: false,
         }));
 
@@ -2240,9 +2281,6 @@ mod tests {
             selected_session: 0,
             status: "replayed snapshot".into(),
             target: None,
-            capabilities: Some(
-                octos_core::ui_protocol::UiProtocolCapabilities::first_server_slice(),
-            ),
             readonly: false,
         }));
 

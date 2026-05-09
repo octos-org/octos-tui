@@ -3,8 +3,8 @@ use std::time::Instant;
 use octos_core::app_ui::{APP_UI_API_V1, AppUiLiveReply, AppUiSession, AppUiSnapshot, AppUiTask};
 use octos_core::ui_protocol::{
     ApprovalDecision, ApprovalId, ApprovalRenderHints, ApprovalRequestedEvent,
-    ApprovalTypedDetails, OutputCursor, PermissionProfileSelection, PreviewId, TaskRuntimeState,
-    TurnId, UiPaneSnapshot, UiProtocolCapabilities, approval_scopes,
+    ApprovalTypedDetails, OutputCursor, PreviewId, TaskRuntimeState, TurnId, UiPaneSnapshot,
+    UiProtocolCapabilities, approval_scopes,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ use crate::menu::{
     AvailabilityContext, CapabilitySet, ConnectionState, MenuBuildResult, MenuStack, RuntimeMode,
     TaskActivity,
 };
+use crate::permission_profile::PermissionProfileSelection;
 
 pub type LiveReply = AppUiLiveReply;
 pub type SessionView = AppUiSession;
@@ -962,19 +963,14 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 impl AppState {
     pub fn from_snapshot(snapshot: AppUiSnapshot) -> Self {
         let panes = SnapshotPaneSeed::from_snapshot(&snapshot);
-        let capabilities = snapshot.capabilities.clone();
-        let mut state = Self::new_with_panes(
+        Self::new_with_panes(
             snapshot.sessions,
             snapshot.selected_session,
             snapshot.status,
             snapshot.target,
             snapshot.readonly,
             panes,
-        );
-        if let Some(capabilities) = capabilities {
-            state.set_capabilities(capabilities);
-        }
-        state
+        )
     }
 
     pub fn new(
@@ -1874,7 +1870,6 @@ mod tests {
             selected_session: 0,
             status: "Mock backend ready".into(),
             target: Some("local mock snapshot".into()),
-            capabilities: Some(UiProtocolCapabilities::first_server_slice()),
             readonly: false,
         };
 
@@ -1925,7 +1920,6 @@ mod tests {
             selected_session: 0,
             status: "Protocol backend connected".into(),
             target: Some("wss://example.test/ui-protocol".into()),
-            capabilities: Some(UiProtocolCapabilities::first_server_slice()),
             readonly: true,
         };
 

@@ -5,6 +5,7 @@ pub mod event_loop;
 pub mod keymap;
 pub mod menu;
 pub mod model;
+pub mod permission_profile;
 pub mod store;
 pub mod theme;
 pub mod transport;
