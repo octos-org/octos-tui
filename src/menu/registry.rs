@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use octos_core::ui_protocol::UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1;
+
 use crate::menu::availability::{
     AvailabilityContext, AvailabilityStatus, CommandAvailability, evaluate_command,
 };
@@ -370,7 +372,8 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             aliases: &["permission"],
             description: "Review or change approval, filesystem, and network permissions.",
             category: CommandCategory::Session,
-            availability: CommandAvailability::app_ui_read(&[]),
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_required_features(&[UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1]),
             inline_args: InlineArgMode::None,
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_PERMISSIONS)),
         },
@@ -388,7 +391,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
 
 #[cfg(test)]
 mod tests {
-    use octos_core::ui_protocol::methods;
+    use octos_core::ui_protocol::{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, methods};
 
     use super::*;
     use crate::menu::availability::{
@@ -467,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_shows_permissions_entry_without_permission_methods() {
+    fn default_registry_hides_permissions_without_approval_feature() {
         let registry = CommandRegistry::with_core_commands();
         let capabilities = CapabilitySet::from_methods([methods::TURN_INTERRUPT]);
         let ctx = AvailabilityContext {
@@ -491,9 +494,25 @@ mod tests {
         assert!(available.contains(&"stop"));
         assert!(available.contains(&"theme"));
         assert!(available.contains(&"status"));
-        assert!(available.contains(&"permissions"));
+        assert!(!available.contains(&"permissions"));
         assert!(!available.contains(&"model"));
         assert!(!available.contains(&"mcp"));
+
+        let approval_capabilities = CapabilitySet::from_methods_and_features(
+            [methods::TURN_INTERRUPT],
+            [UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1],
+        );
+        let approval_ctx = AvailabilityContext {
+            capabilities: Some(&approval_capabilities),
+            ..ctx
+        };
+        let available: Vec<_> = registry
+            .available_commands(&approval_ctx)
+            .into_iter()
+            .map(|command| command.name)
+            .collect();
+
+        assert!(available.contains(&"permissions"));
     }
 
     #[test]
@@ -516,7 +535,7 @@ mod tests {
             .map(|visible| visible.command.name)
             .collect();
         assert!(no_capability.contains(&"status"));
-        assert!(no_capability.contains(&"permissions"));
+        assert!(!no_capability.contains(&"permissions"));
         assert!(!no_capability.contains(&"model"));
         assert!(!no_capability.contains(&"mcp"));
 
@@ -530,15 +549,18 @@ mod tests {
             .into_iter()
             .map(|visible| visible.command.name)
             .collect();
-        assert!(partial.contains(&"permissions"));
+        assert!(!partial.contains(&"permissions"));
         assert!(!partial.contains(&"model"));
         assert!(!partial.contains(&"mcp"));
 
-        let full_capabilities = CapabilitySet::from_methods([
-            methods::APPROVAL_SCOPES_LIST,
-            APPUI_METHOD_MODEL_LIST,
-            APPUI_METHOD_MCP_STATUS_LIST,
-        ]);
+        let full_capabilities = CapabilitySet::from_methods_and_features(
+            [
+                methods::APPROVAL_SCOPES_LIST,
+                APPUI_METHOD_MODEL_LIST,
+                APPUI_METHOD_MCP_STATUS_LIST,
+            ],
+            [UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1],
+        );
         let full_ctx = AvailabilityContext {
             capabilities: Some(&full_capabilities),
             ..no_capability_ctx

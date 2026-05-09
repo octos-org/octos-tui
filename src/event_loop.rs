@@ -404,7 +404,7 @@ mod tests {
         SessionKey, TaskId,
         ui_protocol::{
             ApprovalDecision, ApprovalId, ApprovalRequestedEvent, PreviewId, TaskRuntimeState,
-            TurnId, UiNotification, approval_scopes,
+            TurnId, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UiNotification, approval_scopes,
         },
     };
 
@@ -713,10 +713,13 @@ mod tests {
         let mut store = store_with_sessions(1);
         store.state.focus = FocusPane::Composer;
         store.state.target = Some("ws://127.0.0.1:50080/api/ui-protocol/ws".into());
-        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
-            crate::menu::registry::APPUI_METHOD_PERMISSION_PROFILE_LIST,
-            crate::menu::registry::APPUI_METHOD_PERMISSION_PROFILE_SET,
-        ]));
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [
+                crate::menu::registry::APPUI_METHOD_PERMISSION_PROFILE_LIST,
+                crate::menu::registry::APPUI_METHOD_PERMISSION_PROFILE_SET,
+            ],
+            [UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1],
+        ));
 
         for ch in "/permissions".chars() {
             assert!(matches!(

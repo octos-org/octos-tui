@@ -70,6 +70,11 @@ impl CommandAvailability {
         self
     }
 
+    pub fn with_required_features(mut self, required_features: &'static [&'static str]) -> Self {
+        self.required_features = required_features;
+        self
+    }
+
     pub fn with_unavailable_policy(mut self, unavailable: UnavailablePolicy) -> Self {
         self.unavailable = unavailable;
         self

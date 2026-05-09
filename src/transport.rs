@@ -7,6 +7,7 @@ use octos_core::app_ui::{
     AppUiCommand, AppUiError, AppUiEvent, AppUiLaunch, AppUiSession, AppUiSnapshot, AppUiStatus,
     AppUiTask,
 };
+use octos_core::ui_protocol::UI_PROTOCOL_V1;
 use octos_core::ui_protocol::{
     ApprovalCommandDetails, ApprovalDiffDetails, ApprovalFilesystemDetails, ApprovalNetworkDetails,
     ApprovalRequestedEvent, ApprovalSandboxDetails, ApprovalSandboxEscalationDetails,
@@ -14,10 +15,6 @@ use octos_core::ui_protocol::{
     PreviewId, RpcRequest, SessionOpened, TaskOutputDeltaEvent, TaskRuntimeState, TaskUpdatedEvent,
     ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnId,
     TurnStartedEvent, UiCursor, UiNotification, UiPaneSnapshot, WarningEvent, approval_kinds,
-};
-use octos_core::ui_protocol::{
-    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_V1,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use tokio::{runtime::Runtime, sync::mpsc};
@@ -30,7 +27,7 @@ use tokio_tungstenite::{
 
 use crate::{
     cli::{Cli, Mode},
-    client_driver::{ClientDriver, MAX_TEXT_FRAME_BYTES},
+    client_driver::{ClientDriver, MAX_TEXT_FRAME_BYTES, default_client_capabilities},
     client_event::ClientEvent,
     model::{DiffPreview, DiffPreviewFile, DiffPreviewGetResult, DiffPreviewHunk, DiffPreviewLine},
 };
@@ -99,6 +96,7 @@ pub struct ProtocolAppUiBackend {
     disconnected_status_reported: bool,
     queue: VecDeque<ClientEvent>,
     protocol: ClientDriver,
+    client_hello_sent: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -404,6 +402,7 @@ impl ProtocolAppUiBackend {
             disconnected_status_reported: false,
             queue: VecDeque::new(),
             protocol: ClientDriver::default(),
+            client_hello_sent: false,
         }
     }
 
@@ -477,6 +476,8 @@ impl ProtocolAppUiBackend {
         if let Some(driver) = self.driver.as_mut() {
             driver.disconnect();
         }
+        self.client_hello_sent = false;
+        self.protocol.reset_negotiation();
         let cancelled_requests = self.protocol.cancel_pending_requests(&message);
 
         let should_report = self.connection_state != ProtocolConnectionState::Disconnected
@@ -497,6 +498,17 @@ impl ProtocolAppUiBackend {
         command: AppUiCommand,
     ) -> Result<RpcRequest<serde_json::Value>> {
         self.protocol.build_tracked_request(command)
+    }
+
+    fn ensure_client_hello_sent(&mut self) -> Result<bool> {
+        if self.client_hello_sent {
+            return Ok(true);
+        }
+
+        let request = self.protocol.build_client_hello_request()?;
+        let sent = self.send_rpc_request(request)?;
+        self.client_hello_sent = sent;
+        Ok(sent)
     }
 
     fn decode_rpc_text(&mut self, text: &str) -> Result<Option<ClientEvent>> {
@@ -532,11 +544,51 @@ impl ProtocolAppUiBackend {
         }
     }
 
+    fn send_rpc_request(&mut self, request: RpcRequest<serde_json::Value>) -> Result<bool> {
+        let request_id = request.id.clone();
+        let method = request.method.clone();
+        let text = serde_json::to_string(&request).wrap_err("failed to encode JSON-RPC request")?;
+        if text.len() > MAX_TEXT_FRAME_BYTES {
+            self.protocol.pending_requests.remove(&request_id);
+            self.queue.push_back(
+                AppUiEvent::Error(AppUiError {
+                    code: "frame_too_large".into(),
+                    message: format!(
+                        "encoded {method} request {request_id} is {} bytes; max is {MAX_TEXT_FRAME_BYTES}",
+                        text.len()
+                    ),
+                })
+                .into(),
+            );
+            return Ok(false);
+        }
+
+        if let Err(err) = self.send_text(text) {
+            self.mark_disconnected(format!(
+                "UI protocol disconnected; reconnect will retry on next send/read: {err:#}"
+            ));
+            self.protocol.pending_requests.remove(&request_id);
+            self.queue.push_back(
+                AppUiEvent::Error(AppUiError {
+                    code: "transport_send".into(),
+                    message: format!("failed to send {method} request {request_id}: {err:#}"),
+                })
+                .into(),
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
     fn read_next_transport_event(&mut self) -> Result<Option<TransportEvent>> {
         if let Err(err) = self.ensure_connected() {
             self.mark_disconnected(format!(
                 "UI protocol disconnected; reconnect will retry on next send/read: {err:#}"
             ));
+            return Ok(None);
+        }
+        if !self.ensure_client_hello_sent()? {
             return Ok(None);
         }
 
@@ -697,6 +749,9 @@ impl AppUiBackend for ProtocolAppUiBackend {
             }
             return Err(err);
         }
+        if !self.ensure_client_hello_sent()? {
+            return Ok(protocol_snapshot_from_launch(&self.launch, &endpoint));
+        }
 
         if let Some(session_id) = self.launch.session_id.clone() {
             self.send(AppUiCommand::OpenSession(
@@ -718,38 +773,11 @@ impl AppUiBackend for ProtocolAppUiBackend {
             return Ok(());
         }
 
-        let request = self.build_tracked_request(command)?;
-        let request_id = request.id.clone();
-        let method = request.method.clone();
-        let text = serde_json::to_string(&request).wrap_err("failed to encode JSON-RPC request")?;
-        if text.len() > MAX_TEXT_FRAME_BYTES {
-            self.protocol.pending_requests.remove(&request_id);
-            self.queue.push_back(
-                AppUiEvent::Error(AppUiError {
-                    code: "frame_too_large".into(),
-                    message: format!(
-                        "encoded {method} request {request_id} is {} bytes; max is {MAX_TEXT_FRAME_BYTES}",
-                        text.len()
-                    ),
-                })
-                .into(),
-            );
+        if !self.ensure_client_hello_sent()? {
             return Ok(());
         }
-
-        if let Err(err) = self.send_text(text) {
-            self.mark_disconnected(format!(
-                "UI protocol disconnected; reconnect will retry on next send/read: {err:#}"
-            ));
-            self.protocol.pending_requests.remove(&request_id);
-            self.queue.push_back(
-                AppUiEvent::Error(AppUiError {
-                    code: "transport_send".into(),
-                    message: format!("failed to send {method} request {request_id}: {err:#}"),
-                })
-                .into(),
-            );
-        }
+        let request = self.build_tracked_request(command)?;
+        self.send_rpc_request(request)?;
 
         Ok(())
     }
@@ -794,11 +822,10 @@ fn websocket_request(endpoint: &str, auth_token: Option<&str>) -> Result<WsReque
     }
     request.headers_mut().insert(
         "X-Octos-Ui-Features",
-        format!(
-            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}"
-        )
-        .parse()
-        .wrap_err("failed to build UI protocol feature header")?,
+        default_client_capabilities()
+            .join(", ")
+            .parse()
+            .wrap_err("failed to build UI protocol feature header")?,
     );
 
     Ok(request)
@@ -1362,9 +1389,10 @@ fn mock_diff_preview(session_id: SessionKey, preview_id: PreviewId) -> DiffPrevi
 mod tests {
     use super::*;
     use octos_core::ui_protocol::{
-        ApprovalDecision, ApprovalRespondParams, ApprovalScopesListParams, DiffPreviewGetParams,
-        InputItem, PreviewId, SessionOpenParams, TaskOutputReadParams, TurnInterruptParams,
-        TurnStartParams, methods,
+        ApprovalDecision, ApprovalRespondParams, ApprovalScopesListParams, ClientHelloResult,
+        DiffPreviewGetParams, InputItem, PreviewId, SessionOpenParams, TaskOutputReadParams,
+        TurnInterruptParams, TurnStartParams, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+        UiProtocolCapabilities, methods,
     };
     use serde_json::{Value, json};
     use std::{
@@ -1438,6 +1466,29 @@ mod tests {
                     frame_tx
                         .send(frame.clone())
                         .expect("capture protocol test request");
+
+                    if frame.get("method").and_then(Value::as_str) == Some(methods::CLIENT_HELLO) {
+                        let requested = frame["params"]["capabilities"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>();
+                        let capabilities =
+                            UiProtocolCapabilities::for_negotiated_features(requested);
+                        let result = ClientHelloResult::new(
+                            capabilities.supported_features.clone(),
+                            capabilities,
+                        );
+                        let response = json!({
+                            "jsonrpc": "2.0",
+                            "id": frame.get("id").cloned().expect("request id"),
+                            "result": serde_json::to_value(result).expect("client hello result"),
+                        });
+                        ws.send(WsMessage::Text(response.to_string().into()))
+                            .await
+                            .expect("send protocol test client_hello response");
+                    }
 
                     if respond_to_session_open
                         && frame.get("method").and_then(Value::as_str)
@@ -1678,9 +1729,7 @@ mod tests {
     fn websocket_request_includes_bearer_auth_header() {
         let request = websocket_request("wss://example.test/ui-protocol", Some(" secret-token "))
             .expect("request builds");
-        let expected_features = format!(
-            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}"
-        );
+        let expected_features = default_client_capabilities().join(", ");
 
         assert_eq!(
             request
@@ -1806,6 +1855,66 @@ mod tests {
             status.message,
             "No persisted approval scopes for this session"
         );
+        assert!(exchange.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn protocol_exchange_builds_client_hello_request() {
+        let mut exchange = ProtocolExchange::default();
+        let request = exchange
+            .build_client_hello_request()
+            .expect("client hello request builds");
+
+        assert_eq!(request.jsonrpc, "2.0");
+        assert_eq!(request.method, methods::CLIENT_HELLO);
+        assert_eq!(request.params["client_id"], "octos-tui");
+        assert_eq!(request.params["client_version"], env!("CARGO_PKG_VERSION"));
+        let requested = request.params["capabilities"]
+            .as_array()
+            .expect("client hello capabilities");
+        assert_eq!(
+            requested.len(),
+            octos_core::ui_protocol::UI_PROTOCOL_KNOWN_FEATURES.len()
+        );
+        assert_eq!(
+            exchange.pending_requests.get(&request.id),
+            Some(&PendingRequest {
+                method: methods::CLIENT_HELLO.into(),
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_backend_maps_client_hello_success_to_capability_event() {
+        let mut exchange = ProtocolExchange::default();
+        let request = exchange
+            .build_client_hello_request()
+            .expect("client hello request builds");
+        let capabilities =
+            UiProtocolCapabilities::new(&[methods::SESSION_OPEN], &[methods::SESSION_OPEN]);
+        let result = ClientHelloResult::new(vec![], capabilities);
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": serde_json::to_value(result).expect("client hello result"),
+        })
+        .to_string();
+
+        let event = exchange
+            .decode_rpc_text(&frame)
+            .expect("client hello response decodes")
+            .expect("capability event");
+
+        let ClientEvent::Capabilities(event) = event else {
+            panic!("expected capability client event");
+        };
+        assert!(
+            event
+                .server_capabilities
+                .supports_method(methods::SESSION_OPEN)
+        );
+        assert!(!event.accepted_capabilities.contains(&"unknown".into()));
+        assert!(event.message.contains("0 accepted"));
         assert!(exchange.pending_requests.is_empty());
     }
 
@@ -2035,6 +2144,11 @@ mod tests {
         assert_eq!(opened.session_id.0, "local:test");
         assert_eq!(opened.workspace_root.as_deref(), Some("/repo"));
         assert_eq!(opened.cursor.as_ref().map(|cursor| cursor.seq), Some(11));
+        assert!(
+            !opened
+                .capabilities
+                .supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1)
+        );
         assert!(backend.protocol.pending_requests.is_empty());
     }
 
@@ -2408,7 +2522,7 @@ mod tests {
 
     #[test]
     fn protocol_backend_readonly_bootstrap_connects_opens_and_reads_existing_session() {
-        let server = spawn_protocol_capture_server(2, true);
+        let server = spawn_protocol_capture_server(3, true);
         let session_id = SessionKey("session-123".into());
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
             base_url: Some(server.endpoint.clone()),
@@ -2432,10 +2546,24 @@ mod tests {
         assert!(backend.is_connected());
         assert_eq!(backend.connection_state, ProtocolConnectionState::Connected);
 
+        let hello_request = server.recv_json();
+        assert_eq!(hello_request["method"], methods::CLIENT_HELLO);
+        assert_eq!(hello_request["params"]["client_id"], "octos-tui");
+
         let open_request = server.recv_json();
         assert_eq!(open_request["method"], methods::SESSION_OPEN);
         assert_eq!(open_request["params"]["session_id"], json!("session-123"));
         assert_eq!(open_request["params"]["cwd"], json!("/repo"));
+
+        let event = next_event_until(&mut backend);
+        let ClientEvent::Capabilities(capabilities) = event else {
+            panic!("expected capabilities event");
+        };
+        assert!(
+            capabilities
+                .server_capabilities
+                .supports_method(methods::SESSION_OPEN)
+        );
 
         let event = next_event_until(&mut backend);
         let event = unwrap_app_event(event);
@@ -2444,6 +2572,11 @@ mod tests {
         };
         assert_eq!(opened.session_id, session_id);
         assert_eq!(opened.workspace_root.as_deref(), Some("/repo"));
+        assert!(
+            opened
+                .capabilities
+                .supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1)
+        );
 
         let preview_id = PreviewId::new();
         backend

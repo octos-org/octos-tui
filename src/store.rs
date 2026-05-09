@@ -10,7 +10,7 @@ use octos_core::{Message, TaskId};
 use serde_json::Value;
 
 use crate::{
-    client_event::{ClientEvent, PermissionProfileClientEvent},
+    client_event::{CapabilityClientEvent, ClientEvent, PermissionProfileClientEvent},
     menu::{
         CommandEntry, CommandRegistry, CommandResolution, LocalAction, MenuAction, MenuAppSnapshot,
         MenuBuildResult, MenuContext, MenuId, TerminalSize, providers::core_menu_registry,
@@ -717,6 +717,11 @@ impl Store {
     pub fn apply_client_event(&mut self, event: ClientEvent) -> Option<AppUiCommand> {
         match event {
             ClientEvent::App(event) => self.apply_event(*event),
+            ClientEvent::Capabilities(event) => {
+                self.apply_capability_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
             ClientEvent::DiffPreview(result) => {
                 self.apply_diff_preview_result(result);
                 None
@@ -727,6 +732,16 @@ impl Store {
                 None
             }
         }
+    }
+
+    fn apply_capability_event(&mut self, event: CapabilityClientEvent) {
+        self.state.set_capabilities(event.server_capabilities);
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "capabilities",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
     }
 
     pub fn apply_event(&mut self, event: AppUiEvent) -> Option<AppUiCommand> {
@@ -1738,8 +1753,9 @@ mod tests {
         ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalDecision,
         ApprovalDiffDetails, ApprovalId, ApprovalRequestedEvent, ApprovalTypedDetails,
         OutputCursor, PreviewId, ReplayLossyEvent, TaskRuntimeState, ToolCompletedEvent,
-        ToolStartedEvent, TurnId, UiCursor, UiFileMutationNotice, UiProgressMetadata,
-        UiTokenCostUpdate, approval_kinds, approval_scopes, methods, progress_kinds,
+        ToolStartedEvent, TurnId, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UiCursor,
+        UiFileMutationNotice, UiProgressMetadata, UiProtocolCapabilities, UiTokenCostUpdate,
+        approval_kinds, approval_scopes, methods, progress_kinds,
     };
 
     fn store_with_live_reply(turn_id: TurnId, text: impl Into<String>) -> Store {
@@ -1879,7 +1895,7 @@ mod tests {
             .map(|command| command.name)
             .collect::<Vec<_>>();
         assert!(no_capability_names.contains(&"/status".into()));
-        assert!(no_capability_names.contains(&"/permissions".into()));
+        assert!(!no_capability_names.contains(&"/permissions".into()));
         assert!(!no_capability_names.contains(&"/model".into()));
         assert!(!no_capability_names.contains(&"/mcp".into()));
 
@@ -1889,15 +1905,23 @@ mod tests {
             .into_iter()
             .map(|command| command.name)
             .collect::<Vec<_>>();
-        assert!(partial_names.contains(&"/permissions".into()));
+        assert!(!partial_names.contains(&"/permissions".into()));
         assert!(!partial_names.contains(&"/model".into()));
         assert!(!partial_names.contains(&"/mcp".into()));
 
-        let full = protocol_store_with_methods(&[
+        let mut full = protocol_store_with_methods(&[
             methods::APPROVAL_SCOPES_LIST,
             crate::menu::registry::APPUI_METHOD_MODEL_LIST,
             crate::menu::registry::APPUI_METHOD_MCP_STATUS_LIST,
         ]);
+        full.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [
+                methods::APPROVAL_SCOPES_LIST,
+                crate::menu::registry::APPUI_METHOD_MODEL_LIST,
+                crate::menu::registry::APPUI_METHOD_MCP_STATUS_LIST,
+            ],
+            [UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1],
+        ));
         let full_names = full
             .slash_command_matches("")
             .into_iter()
@@ -1906,6 +1930,72 @@ mod tests {
         assert!(full_names.contains(&"/model".into()));
         assert!(full_names.contains(&"/permissions".into()));
         assert!(full_names.contains(&"/mcp".into()));
+
+        let approval_feature = {
+            let mut store = protocol_store_with_methods(&[methods::APPROVAL_SCOPES_LIST]);
+            store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+                [methods::APPROVAL_SCOPES_LIST],
+                [UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1],
+            ));
+            store
+        };
+        let approval_names = approval_feature
+            .slash_command_matches("")
+            .into_iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+        assert!(approval_names.contains(&"/permissions".into()));
+    }
+
+    #[test]
+    fn client_capability_event_refreshes_active_command_menu() {
+        let mut store = store_with_empty_session();
+        store.state.target = Some("ws://example.test/ui-protocol".into());
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
+        assert!(!help_menu_labels(&store).contains(&"/model".to_string()));
+
+        store.apply_client_event(ClientEvent::Capabilities(CapabilityClientEvent {
+            accepted_capabilities: Vec::new(),
+            server_capabilities: UiProtocolCapabilities::new(&[methods::SESSION_OPEN], &[]),
+            message: "AppUI capabilities negotiated: 0 accepted".into(),
+        }));
+
+        assert!(store.state.capabilities.is_some());
+        assert!(!help_menu_labels(&store).contains(&"/permissions".to_string()));
+        assert!(!help_menu_labels(&store).contains(&"/model".to_string()));
+        assert_eq!(
+            store.state.status,
+            "AppUI capabilities negotiated: 0 accepted"
+        );
+
+        store.apply_client_event(ClientEvent::Capabilities(CapabilityClientEvent {
+            accepted_capabilities: Vec::new(),
+            server_capabilities: UiProtocolCapabilities::new(
+                &[
+                    methods::SESSION_OPEN,
+                    crate::menu::registry::APPUI_METHOD_MODEL_LIST,
+                ],
+                &[],
+            ),
+            message: "AppUI capabilities negotiated: model enabled".into(),
+        }));
+
+        assert!(help_menu_labels(&store).contains(&"/model".to_string()));
+        assert!(!help_menu_labels(&store).contains(&"/permissions".to_string()));
+        assert_eq!(
+            store.state.status,
+            "AppUI capabilities negotiated: model enabled"
+        );
+
+        store.apply_client_event(ClientEvent::Capabilities(CapabilityClientEvent {
+            accepted_capabilities: vec![UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1.into()],
+            server_capabilities: UiProtocolCapabilities::for_negotiated_features([
+                UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+            ]),
+            message: "AppUI capabilities negotiated: approval enabled".into(),
+        }));
+
+        assert!(help_menu_labels(&store).contains(&"/permissions".to_string()));
     }
 
     #[test]
@@ -1977,7 +2067,7 @@ mod tests {
         let mut store = protocol_store_with_methods(&[]);
         store.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
         assert!(help_menu_labels(&store).contains(&"/status".to_string()));
-        assert!(help_menu_labels(&store).contains(&"/permissions".to_string()));
+        assert!(!help_menu_labels(&store).contains(&"/permissions".to_string()));
         assert!(!help_menu_labels(&store).contains(&"/model".to_string()));
 
         let session = store.state.sessions[0].clone();
@@ -1985,9 +2075,13 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "session_id": session.id,
                 "capabilities": octos_core::ui_protocol::UiProtocolCapabilities::new(
-                    &[crate::menu::registry::APPUI_METHOD_MODEL_LIST],
+                    &[
+                        crate::menu::registry::APPUI_METHOD_MODEL_LIST,
+                        methods::APPROVAL_SCOPES_LIST,
+                    ],
                     &[],
-                ),
+                )
+                .with_supported_features([UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1]),
             }))
             .expect("session/opened fixture");
         store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));

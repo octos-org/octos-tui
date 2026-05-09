@@ -4,12 +4,16 @@ use eyre::{Result, WrapErr, eyre};
 use octos_core::SessionKey;
 use octos_core::app_ui::{AppUiCommand, AppUiError, AppUiEvent, AppUiStatus};
 use octos_core::ui_protocol::{
-    ApprovalScopesListResult, JSON_RPC_VERSION, RpcRequest, SessionOpenResult,
-    TaskOutputDeltaEvent, TaskOutputReadResult, UiCursor, UiNotification, methods, rpc_error_codes,
+    ApprovalScopesListResult, ClientHelloParams, ClientHelloResult, JSON_RPC_VERSION, RpcRequest,
+    SessionOpenResult, TaskOutputDeltaEvent, TaskOutputReadResult, UI_PROTOCOL_KNOWN_FEATURES,
+    UiCommand, UiCursor, UiNotification, UiProtocolCapabilities, methods, rpc_error_codes,
 };
 use serde_json::Value;
 
-use crate::{client_event::ClientEvent, model::DiffPreviewGetResult};
+use crate::{
+    client_event::{CapabilityClientEvent, ClientEvent},
+    model::DiffPreviewGetResult,
+};
 
 pub(crate) const MAX_TEXT_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
@@ -22,6 +26,7 @@ pub(crate) struct PendingRequest {
 pub(crate) struct ClientDriver {
     pub(crate) pending_requests: HashMap<String, PendingRequest>,
     pub(crate) session_cursors: HashMap<SessionKey, UiCursor>,
+    negotiated_server_capabilities: Option<UiProtocolCapabilities>,
     next_request_id: u64,
 }
 
@@ -46,6 +51,26 @@ impl ClientDriver {
         Ok(request)
     }
 
+    pub(crate) fn build_client_hello_request(&mut self) -> Result<RpcRequest<serde_json::Value>> {
+        let request_id = self.next_request_id();
+        let request = UiCommand::ClientHello(ClientHelloParams {
+            client_id: "octos-tui".into(),
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            capabilities: default_client_capabilities(),
+        })
+        .into_rpc_request(request_id.clone())
+        .wrap_err("failed to encode params for client_hello")?;
+
+        self.pending_requests.insert(
+            request_id,
+            PendingRequest {
+                method: methods::CLIENT_HELLO.into(),
+            },
+        );
+
+        Ok(request)
+    }
+
     fn command_with_resume_cursor(&self, command: AppUiCommand) -> AppUiCommand {
         let AppUiCommand::OpenSession(mut params) = command else {
             return command;
@@ -59,9 +84,17 @@ impl ClientDriver {
     }
 
     pub(crate) fn decode_rpc_text(&mut self, text: &str) -> Result<Option<ClientEvent>> {
-        let event = rpc_text_to_app_event_with_pending(text, &mut self.pending_requests)?;
-        if let Some(ClientEvent::App(event)) = &event {
-            self.record_event_state(event);
+        let event = rpc_text_to_app_event_with_pending(
+            text,
+            &mut self.pending_requests,
+            self.negotiated_server_capabilities.as_ref(),
+        )?;
+        match &event {
+            Some(ClientEvent::App(event)) => self.record_event_state(event),
+            Some(ClientEvent::Capabilities(event)) => {
+                self.negotiated_server_capabilities = Some(event.server_capabilities.clone());
+            }
+            Some(ClientEvent::DiffPreview(_)) | Some(ClientEvent::PermissionProfile(_)) | None => {}
         }
         Ok(event)
     }
@@ -102,6 +135,17 @@ impl ClientDriver {
             })
             .collect()
     }
+
+    pub(crate) fn reset_negotiation(&mut self) {
+        self.negotiated_server_capabilities = None;
+    }
+}
+
+pub(crate) fn default_client_capabilities() -> Vec<String> {
+    UI_PROTOCOL_KNOWN_FEATURES
+        .iter()
+        .map(|feature| (*feature).to_owned())
+        .collect()
 }
 
 #[allow(unreachable_patterns)]
@@ -137,12 +181,13 @@ pub(crate) fn rpc_request_from_command(
 #[cfg(test)]
 pub(crate) fn rpc_text_to_app_event(text: &str) -> Result<Option<ClientEvent>> {
     let mut pending_requests = HashMap::new();
-    rpc_text_to_app_event_with_pending(text, &mut pending_requests)
+    rpc_text_to_app_event_with_pending(text, &mut pending_requests, None)
 }
 
 fn rpc_text_to_app_event_with_pending(
     text: &str,
     pending_requests: &mut HashMap<String, PendingRequest>,
+    negotiated_server_capabilities: Option<&UiProtocolCapabilities>,
 ) -> Result<Option<ClientEvent>> {
     if text.len() > MAX_TEXT_FRAME_BYTES {
         return Ok(Some(
@@ -170,12 +215,13 @@ fn rpc_text_to_app_event_with_pending(
         }
     };
 
-    rpc_value_to_app_event(value, pending_requests)
+    rpc_value_to_app_event(value, pending_requests, negotiated_server_capabilities)
 }
 
 fn rpc_value_to_app_event(
     value: Value,
     pending_requests: &mut HashMap<String, PendingRequest>,
+    negotiated_server_capabilities: Option<&UiProtocolCapabilities>,
 ) -> Result<Option<ClientEvent>> {
     let Some(frame) = value.as_object() else {
         return Ok(Some(
@@ -238,7 +284,7 @@ fn rpc_value_to_app_event(
                 error_response_to_app_event(frame, pending_requests).into(),
             ))
         } else {
-            success_response_to_app_event(frame, pending_requests)
+            success_response_to_app_event(frame, pending_requests, negotiated_server_capabilities)
         };
     }
 
@@ -272,6 +318,7 @@ fn validate_jsonrpc_v2(frame: &serde_json::Map<String, Value>) -> Option<AppUiEv
 fn success_response_to_app_event(
     frame: &serde_json::Map<String, Value>,
     pending_requests: &mut HashMap<String, PendingRequest>,
+    negotiated_server_capabilities: Option<&UiProtocolCapabilities>,
 ) -> Result<Option<ClientEvent>> {
     let id = match response_id(frame) {
         Ok(Some(id)) => id,
@@ -303,21 +350,54 @@ fn success_response_to_app_event(
     };
 
     match pending_request.method.as_str() {
-        methods::SESSION_OPEN => match serde_json::from_value::<SessionOpenResult>(result) {
-            Ok(result) => Ok(Some(
-                AppUiEvent::Protocol(UiNotification::SessionOpened(result.opened)).into(),
-            )),
+        methods::CLIENT_HELLO => match serde_json::from_value::<ClientHelloResult>(result) {
+            Ok(result) => {
+                let accepted_count = result.accepted_capabilities.len();
+                Ok(Some(ClientEvent::Capabilities(CapabilityClientEvent {
+                    accepted_capabilities: result.accepted_capabilities,
+                    server_capabilities: result.server_capabilities,
+                    message: format!("AppUI capabilities negotiated: {accepted_count} accepted"),
+                })))
+            }
             Err(err) => Ok(Some(
                 app_error(
                     "invalid_result",
                     format!(
                         "failed to decode UI protocol result for {}: {err}",
-                        methods::SESSION_OPEN
+                        methods::CLIENT_HELLO
                     ),
                 )
                 .into(),
             )),
         },
+        methods::SESSION_OPEN => {
+            let has_capabilities = result
+                .get("opened")
+                .and_then(|opened| opened.get("capabilities"))
+                .is_some();
+            match serde_json::from_value::<SessionOpenResult>(result) {
+                Ok(mut result) => {
+                    if !has_capabilities {
+                        result.opened.capabilities = negotiated_server_capabilities
+                            .cloned()
+                            .unwrap_or_else(legacy_conservative_capabilities);
+                    }
+                    Ok(Some(
+                        AppUiEvent::Protocol(UiNotification::SessionOpened(result.opened)).into(),
+                    ))
+                }
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            methods::SESSION_OPEN
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
         methods::DIFF_PREVIEW_GET => match serde_json::from_value::<DiffPreviewGetResult>(result) {
             Ok(result) => Ok(Some(ClientEvent::DiffPreview(result))),
             Err(err) => Ok(Some(
@@ -389,6 +469,10 @@ fn success_response_to_app_event(
         }
         _ => Ok(None),
     }
+}
+
+fn legacy_conservative_capabilities() -> UiProtocolCapabilities {
+    UiProtocolCapabilities::for_negotiated_features(std::iter::empty::<&str>())
 }
 
 fn decode_task_output_read_result(mut result: Value) -> serde_json::Result<TaskOutputReadResult> {
