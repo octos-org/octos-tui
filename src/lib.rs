@@ -1,5 +1,6 @@
 pub mod app;
 pub mod cli;
+pub mod client_driver;
 pub mod client_event;
 pub mod event_loop;
 pub mod keymap;
