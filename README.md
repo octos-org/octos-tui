@@ -17,8 +17,8 @@ For source builds, keep `octos` and `octos-tui` as sibling directories:
 mkdir octos-m9-test
 cd octos-m9-test
 
-git clone -b coding-green-m9-test-20260428 https://github.com/octos-org/octos.git
-git clone -b coding-green-m9-test-20260428 https://github.com/octos-org/octos-tui.git
+git clone -b feat/m9-client-hello-capability-handshake https://github.com/octos-org/octos.git
+git clone -b feat/m9-tui-capability-menus https://github.com/octos-org/octos-tui.git
 ```
 
 The sibling layout is required while `octos-tui` depends on:
