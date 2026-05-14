@@ -35,17 +35,47 @@ pub(crate) struct SlashCommandMatch {
 
 pub struct Store {
     pub state: AppState,
+    /// Wave4-B2: outbound `router/set_mode` requests waiting for the
+    /// event loop to dispatch them via
+    /// [`crate::transport::AppUiBackend::send_router_set_mode`]. The
+    /// queue is drained FIFO so a back-to-back `/router lane` →
+    /// `/router hedge` toggle still hits the wire in user order.
+    pub(crate) pending_router_requests: Vec<octos_core::ui_protocol::RouterSetModeParams>,
 }
 
 impl Store {
     pub fn from_snapshot(snapshot: AppUiSnapshot) -> Self {
         Self {
             state: AppState::from_snapshot(snapshot),
+            pending_router_requests: Vec::new(),
+        }
+    }
+
+    /// Wave4-B2: trivial constructor that wraps an existing `AppState`
+    /// without re-running snapshot projection (used by tests and
+    /// integration harnesses). Always equivalent to
+    /// `Store { state, pending_router_requests: Vec::new() }`.
+    pub fn from_state(state: AppState) -> Self {
+        Self {
+            state,
+            pending_router_requests: Vec::new(),
         }
     }
 
     pub fn active_session(&self) -> Option<&SessionView> {
         self.state.active_session()
+    }
+
+    /// Wave4-B2: periodic UI tick — clears expired transient overlays
+    /// (today: the router failover banner). Called from the event loop
+    /// once per draw so the banner auto-dismisses without needing an
+    /// extra timer task.
+    pub fn tick(&mut self, now: std::time::Instant) {
+        if let Some(banner) = self.state.router_failover_banner.as_ref()
+            && banner.is_expired(now)
+        {
+            self.state.router_failover_banner = None;
+        }
     }
 
     pub fn compose_command(&mut self) -> Option<AppUiCommand> {
@@ -131,7 +161,7 @@ impl Store {
         match resolution {
             CommandResolution::Found {
                 command,
-                invocation: _,
+                invocation,
             } => {
                 let availability = registry.evaluate(command, &self.state.availability_context());
                 if !availability.is_available() {
@@ -145,7 +175,7 @@ impl Store {
                     );
                     return None;
                 }
-                self.dispatch_command_entry(&command.entry)
+                self.dispatch_command_entry(&command.entry, invocation.args)
             }
             CommandResolution::EmptyCommand => {
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
@@ -159,13 +189,15 @@ impl Store {
         }
     }
 
-    fn dispatch_command_entry(&mut self, entry: &CommandEntry) -> Option<AppUiCommand> {
+    fn dispatch_command_entry(&mut self, entry: &CommandEntry, args: &str) -> Option<AppUiCommand> {
         match entry {
             CommandEntry::OpenMenu(id) => {
                 self.open_menu(id.clone());
                 None
             }
-            CommandEntry::LocalAction(action) => self.dispatch_local_action(action.clone()),
+            CommandEntry::LocalAction(action) => {
+                self.dispatch_local_action_with_args(action.clone(), args)
+            }
             CommandEntry::AppUiAction(action) => {
                 self.state.status = format!(
                     "AppUI command `{}` is advertised but not wired yet",
@@ -180,6 +212,14 @@ impl Store {
     }
 
     fn dispatch_local_action(&mut self, action: LocalAction) -> Option<AppUiCommand> {
+        self.dispatch_local_action_with_args(action, "")
+    }
+
+    fn dispatch_local_action_with_args(
+        &mut self,
+        action: LocalAction,
+        args: &str,
+    ) -> Option<AppUiCommand> {
         match action {
             LocalAction::ShowProcessStatus => {
                 self.show_local_process_status();
@@ -222,11 +262,87 @@ impl Store {
                 self.open_menu(id);
                 None
             }
+            LocalAction::SetRouterMode => self.dispatch_router_set_mode(args),
             LocalAction::Custom(name) => {
                 self.state.status = format!("Local menu action `{name}` is not wired yet");
                 None
             }
         }
+    }
+
+    /// Wave4-B2: parse `/router off|lane|hedge` and stamp the optimistic
+    /// pending-mode label on `state.pending_router_mode`. The actual
+    /// outbound request is taken from
+    /// [`Store::take_pending_router_request`] by the event loop and sent
+    /// via the [`AppUiBackend::send_router_set_mode`] side channel
+    /// (the request shape lives in octos-core but isn't part of the
+    /// `AppUiCommand` enum yet, so the TUI carries its own queue
+    /// for the variant).
+    fn dispatch_router_set_mode(&mut self, args: &str) -> Option<AppUiCommand> {
+        let session_id = match self.state.active_session().map(|s| s.id.clone()) {
+            Some(id) => id,
+            None => {
+                self.state.status = "/router needs an open session — none observed yet".into();
+                return None;
+            }
+        };
+
+        let trimmed = args.trim();
+        if trimmed.is_empty() {
+            self.state.status = "/router requires an argument: off|lane|hedge".into();
+            return None;
+        }
+        let mode = crate::model::RouterMode::from_wire(trimmed);
+        if matches!(mode, crate::model::RouterMode::Unknown) {
+            self.state.status =
+                format!("/router: unknown mode `{trimmed}` (expected off|lane|hedge)");
+            return None;
+        }
+        let mode_wire = mode.as_wire().to_string();
+        self.state.pending_router_mode = Some(mode_wire.clone());
+        self.state.status = format!("/router → {mode_wire} (awaiting server confirmation)");
+        self.push_local_activity(
+            ActivityKind::Progress,
+            "router/set_mode",
+            mode_wire.clone(),
+            Some("optimistic pill update until next router/status"),
+        );
+        self.pending_router_requests
+            .push(octos_core::ui_protocol::RouterSetModeParams {
+                session_id,
+                mode: mode_wire,
+            });
+        None
+    }
+
+    /// Wave4-B2: pull the next queued `router/set_mode` request that the
+    /// event loop should dispatch to the backend. Returns `None` once the
+    /// queue is drained.
+    pub fn take_pending_router_request(
+        &mut self,
+    ) -> Option<octos_core::ui_protocol::RouterSetModeParams> {
+        if self.pending_router_requests.is_empty() {
+            None
+        } else {
+            Some(self.pending_router_requests.remove(0))
+        }
+    }
+
+    /// Wave4-B2: surface a server-side error (`runtime_unavailable`,
+    /// `invalid_request`, ...) raised by a `router/set_mode` round-trip.
+    /// Clears the optimistic pending-mode label so the pill returns to
+    /// the previous committed mode.
+    pub fn record_router_set_mode_error(&mut self, code: &str, message: &str) {
+        self.state.pending_router_mode = None;
+        self.state.push_activity(
+            ActivityItem::new(
+                ActivityKind::Error,
+                "router/set_mode",
+                format!("{code}: {message}"),
+            )
+            .with_detail("router mode change rejected"),
+        );
+        self.state.status = format!("router/set_mode failed [{code}]: {message}");
     }
 
     pub fn open_menu(&mut self, id: MenuId) {
@@ -490,6 +606,9 @@ impl Store {
             session_id,
             turn_id,
             input: vec![InputItem::Text { text: prompt }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
         }))
     }
 
@@ -770,6 +889,17 @@ impl Store {
                 None
             }
             AppUiEvent::Error(error) => {
+                // Wave4-B2: a failed `router/set_mode` round-trip — the
+                // transport layer encodes the method into the message
+                // prefix; clear the optimistic pill so it returns to the
+                // last server-confirmed mode.
+                if error
+                    .message
+                    .starts_with(octos_core::ui_protocol::methods::ROUTER_SET_MODE)
+                {
+                    self.record_router_set_mode_error(&error.code, &error.message);
+                    return None;
+                }
                 self.state.push_activity(
                     ActivityItem::new(
                         ActivityKind::Error,
@@ -1076,7 +1206,55 @@ impl Store {
             UiNotification::ReplayLossy(event) => self.apply_replay_lossy(event),
             UiNotification::MessagePersisted(event) => self.apply_message_persisted(event),
             UiNotification::TurnSpawnComplete(event) => self.apply_turn_spawn_complete(event),
+            UiNotification::FileAttached(_) | UiNotification::SessionEventBridged(_) => None,
+            UiNotification::RouterStatus(event) => self.apply_router_status(event),
+            UiNotification::RouterFailover(event) => self.apply_router_failover(event),
+            UiNotification::QueueState(event) => self.apply_queue_state(event),
         }
+    }
+
+    fn apply_router_status(
+        &mut self,
+        event: octos_core::ui_protocol::RouterStatusEvent,
+    ) -> Option<AppUiCommand> {
+        let router_state = crate::model::RouterState::from_event(&event);
+        if let Some(pending) = self.state.pending_router_mode.as_deref() {
+            if crate::model::RouterMode::from_wire(pending) == router_state.mode {
+                self.state.pending_router_mode = None;
+            }
+        }
+        self.state.router = Some(router_state);
+        None
+    }
+
+    fn apply_router_failover(
+        &mut self,
+        event: octos_core::ui_protocol::RouterFailoverEvent,
+    ) -> Option<AppUiCommand> {
+        self.state.router_failover_banner = Some(crate::model::RouterFailoverBanner::from_event(
+            &event,
+            std::time::Instant::now(),
+        ));
+        self.state.push_activity(
+            ActivityItem::new(
+                ActivityKind::Progress,
+                "router-failover",
+                format!(
+                    "{} -> {} ({}ms)",
+                    event.from_provider, event.to_provider, event.elapsed_ms
+                ),
+            )
+            .with_detail(event.reason.clone()),
+        );
+        None
+    }
+
+    fn apply_queue_state(
+        &mut self,
+        event: octos_core::ui_protocol::QueueStateEvent,
+    ) -> Option<AppUiCommand> {
+        self.state.queue_depth = event.pending_count;
+        None
     }
 
     fn apply_message_persisted(&mut self, event: MessagePersistedEvent) -> Option<AppUiCommand> {
@@ -1756,6 +1934,7 @@ mod tests {
         };
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
+            pending_router_requests: Vec::new(),
         }
     }
 
@@ -1776,6 +1955,7 @@ mod tests {
         };
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
+            pending_router_requests: Vec::new(),
         }
     }
 
@@ -1790,6 +1970,7 @@ mod tests {
         };
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
+            pending_router_requests: Vec::new(),
         }
     }
 
@@ -1936,6 +2117,7 @@ mod tests {
                 Some("ws://example.test/ui-protocol".into()),
                 false,
             ),
+            pending_router_requests: Vec::new(),
         };
         store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
             methods::APPROVAL_SCOPES_LIST,
@@ -2025,6 +2207,9 @@ mod tests {
                 session_id,
                 turn_id,
                 cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
             },
         )));
 
@@ -2044,6 +2229,9 @@ mod tests {
                 session_id,
                 turn_id: TurnId::new(),
                 cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
             },
         )));
 
@@ -2221,6 +2409,9 @@ mod tests {
                     session_id: session_id.clone(),
                     turn_id,
                     cursor: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    session_result: None,
                 },
             )))
             .expect("staged prompt submits after turn completion");
@@ -2298,6 +2489,9 @@ mod tests {
                     session_id: session_id.clone(),
                     turn_id,
                     cursor: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    session_result: None,
                 },
             )))
             .expect("queued prompt submits after active turn completes");
@@ -2619,6 +2813,9 @@ mod tests {
                 session_id,
                 turn_id,
                 cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
             },
         )));
 
@@ -3149,6 +3346,7 @@ mod tests {
         };
         let mut store = Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, true),
+            pending_router_requests: Vec::new(),
         };
         store.state.composer = "blocked prompt".into();
 
@@ -3179,5 +3377,344 @@ mod tests {
 
         assert_eq!(store.state.sessions[0].tasks[0].output_tail, retained_tail);
         assert!(store.state.sessions[0].tasks[0].output_tail.len() <= TASK_OUTPUT_TAIL_BYTES);
+    }
+
+    // ----- Wave4-B2: router/queue notification handlers -----
+
+    fn router_status_event_with(
+        provider: &str,
+        mode: &str,
+        breakers: &[(&str, &str)],
+    ) -> octos_core::ui_protocol::RouterStatusEvent {
+        let session_id = SessionKey("local:router".into());
+        let mut circuit_breakers = std::collections::BTreeMap::new();
+        for (lane, state) in breakers {
+            circuit_breakers.insert((*lane).to_string(), (*state).to_string());
+        }
+        let mut lane_scores = std::collections::BTreeMap::new();
+        for (lane, _) in breakers {
+            lane_scores.insert((*lane).to_string(), 1.0);
+        }
+        octos_core::ui_protocol::RouterStatusEvent {
+            session_id,
+            provider_name: provider.to_string(),
+            mode: mode.to_string(),
+            qos_ranking: true,
+            lane_scores,
+            circuit_breakers,
+        }
+    }
+
+    #[test]
+    fn router_status_notification_populates_router_state() {
+        let mut store = store_with_empty_session();
+        assert!(store.state.router.is_none());
+
+        let event = router_status_event_with(
+            "deepseek/v4-pro",
+            "lane",
+            &[
+                ("deepseek/v4-pro", "closed"),
+                ("anthropic/sonnet", "closed"),
+            ],
+        );
+        store.apply_event(AppUiEvent::Protocol(UiNotification::RouterStatus(
+            event.clone(),
+        )));
+
+        let router = store
+            .state
+            .router
+            .as_ref()
+            .expect("router state must be populated after router/status");
+        assert_eq!(router.provider_name, "deepseek/v4-pro");
+        assert_eq!(router.mode, crate::model::RouterMode::Lane);
+        assert!(router.qos_ranking);
+        assert_eq!(router.lane_scores.len(), 2);
+        assert_eq!(
+            router.breaker_summary(),
+            crate::model::CircuitBreakerSummary::AllClosed
+        );
+    }
+
+    #[test]
+    fn router_status_notification_recognises_known_modes() {
+        let mut store = store_with_empty_session();
+
+        for (wire, expected) in [
+            ("off", crate::model::RouterMode::Off),
+            ("lane", crate::model::RouterMode::Lane),
+            ("hedge", crate::model::RouterMode::Hedge),
+            ("Hedge", crate::model::RouterMode::Hedge),
+            ("future-mode", crate::model::RouterMode::Unknown),
+        ] {
+            let event = router_status_event_with("deepseek/v4-pro", wire, &[]);
+            store.apply_event(AppUiEvent::Protocol(UiNotification::RouterStatus(event)));
+            assert_eq!(
+                store.state.router.as_ref().expect("router populated").mode,
+                expected,
+                "mode {wire} should map to {expected:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn router_status_notification_summarises_circuit_breakers() {
+        let mut store = store_with_empty_session();
+
+        let cases = [
+            (vec![], crate::model::CircuitBreakerSummary::AllClosed),
+            (
+                vec![("a", "closed"), ("b", "closed")],
+                crate::model::CircuitBreakerSummary::AllClosed,
+            ),
+            (
+                vec![("a", "closed"), ("b", "half_open")],
+                crate::model::CircuitBreakerSummary::AnyHalfOpen,
+            ),
+            (
+                vec![("a", "open"), ("b", "half_open")],
+                crate::model::CircuitBreakerSummary::AnyOpen,
+            ),
+            (
+                vec![("a", "open"), ("b", "closed")],
+                crate::model::CircuitBreakerSummary::AnyOpen,
+            ),
+        ];
+
+        for (breakers, expected) in cases {
+            let event = router_status_event_with("openai/gpt-4", "off", &breakers);
+            store.apply_event(AppUiEvent::Protocol(UiNotification::RouterStatus(event)));
+            assert_eq!(
+                store
+                    .state
+                    .router
+                    .as_ref()
+                    .expect("router populated")
+                    .breaker_summary(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn router_status_notification_clears_pending_mode() {
+        let mut store = store_with_empty_session();
+        store.state.pending_router_mode = Some("hedge".into());
+
+        let event = router_status_event_with("deepseek/v4-pro", "hedge", &[]);
+        store.apply_event(AppUiEvent::Protocol(UiNotification::RouterStatus(event)));
+
+        assert!(
+            store.state.pending_router_mode.is_none(),
+            "pending mode label should clear once the server confirms",
+        );
+    }
+
+    #[test]
+    fn router_failover_notification_pushes_banner_and_activity() {
+        let mut store = store_with_empty_session();
+        assert!(store.state.router_failover_banner.is_none());
+        let activity_before = store.state.activity.len();
+
+        let event = octos_core::ui_protocol::RouterFailoverEvent {
+            session_id: SessionKey("local:test".into()),
+            from_provider: "deepseek/v4-pro".into(),
+            to_provider: "anthropic/sonnet".into(),
+            reason: "circuit_breaker_open".into(),
+            elapsed_ms: 8240,
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::RouterFailover(event)));
+
+        let banner = store
+            .state
+            .router_failover_banner
+            .as_ref()
+            .expect("failover banner must be populated");
+        assert_eq!(banner.from_provider, "deepseek/v4-pro");
+        assert_eq!(banner.to_provider, "anthropic/sonnet");
+        assert_eq!(banner.elapsed_ms, 8240);
+        assert!(banner.reason.contains("circuit_breaker_open"));
+        let rendered = banner.render();
+        assert!(rendered.contains("deepseek/v4-pro"));
+        assert!(rendered.contains("anthropic/sonnet"));
+        assert!(rendered.contains("8240ms"));
+        assert_eq!(store.state.activity.len(), activity_before + 1);
+    }
+
+    #[test]
+    fn router_failover_banner_expires_after_dismiss_window() {
+        let now = std::time::Instant::now();
+        let banner = crate::model::RouterFailoverBanner {
+            from_provider: "a".into(),
+            to_provider: "b".into(),
+            reason: "score_drop".into(),
+            elapsed_ms: 10,
+            created_at: now,
+        };
+        assert!(!banner.is_expired(now));
+        assert!(banner.is_expired(now + crate::model::RouterFailoverBanner::DISMISS));
+        assert!(banner.is_expired(
+            now + crate::model::RouterFailoverBanner::DISMISS + std::time::Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn tick_clears_expired_router_failover_banner() {
+        let mut store = store_with_empty_session();
+        let event = octos_core::ui_protocol::RouterFailoverEvent {
+            session_id: SessionKey("local:test".into()),
+            from_provider: "a".into(),
+            to_provider: "b".into(),
+            reason: "circuit_break".into(),
+            elapsed_ms: 12,
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::RouterFailover(event)));
+        assert!(store.state.router_failover_banner.is_some());
+
+        // Same instant — banner still active.
+        let now = std::time::Instant::now();
+        store.tick(now);
+        assert!(store.state.router_failover_banner.is_some());
+
+        // After dismiss window — banner cleared.
+        store.tick(
+            now + crate::model::RouterFailoverBanner::DISMISS + std::time::Duration::from_secs(1),
+        );
+        assert!(store.state.router_failover_banner.is_none());
+    }
+
+    // ----- Wave4-B2: `/router off|lane|hedge` slash command -----
+
+    #[test]
+    fn slash_router_queues_set_mode_request_with_active_session() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "/router hedge".into();
+
+        let command = store.compose_command();
+
+        assert!(
+            command.is_none(),
+            "/router uses the side-channel router queue, not AppUiCommand",
+        );
+        let pending = store
+            .take_pending_router_request()
+            .expect("router/set_mode request should be queued");
+        assert_eq!(pending.mode, "hedge");
+        assert_eq!(pending.session_id, store.state.sessions[0].id);
+        assert_eq!(
+            store.state.pending_router_mode.as_deref(),
+            Some("hedge"),
+            "optimistic pending-mode label should be stamped",
+        );
+    }
+
+    #[test]
+    fn slash_router_accepts_off_lane_hedge_modes() {
+        for mode in ["off", "lane", "hedge"] {
+            let mut store = store_with_empty_session();
+            store.state.composer = format!("/router {mode}");
+            let command = store.compose_command();
+            assert!(command.is_none(), "/router does not emit AppUiCommand");
+            let pending = store
+                .take_pending_router_request()
+                .expect("router/set_mode request should be queued");
+            assert_eq!(pending.mode, mode);
+        }
+    }
+
+    #[test]
+    fn slash_router_rejects_unknown_mode_without_queueing() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "/router supersonic".into();
+
+        let command = store.compose_command();
+
+        assert!(command.is_none());
+        assert!(store.take_pending_router_request().is_none());
+        assert!(
+            store.state.status.contains("unknown mode")
+                || store.state.status.contains("supersonic"),
+            "unknown mode should surface in status; got: {}",
+            store.state.status,
+        );
+    }
+
+    #[test]
+    fn slash_router_requires_an_argument() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "/router".into();
+
+        let command = store.compose_command();
+
+        assert!(command.is_none());
+        assert!(store.take_pending_router_request().is_none());
+        assert!(
+            store.state.status.contains("off|lane|hedge")
+                || store.state.status.contains("requires"),
+            "missing arg should surface help text; got: {}",
+            store.state.status,
+        );
+    }
+
+    #[test]
+    fn router_status_confirmation_clears_pending_after_set_mode() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "/router hedge".into();
+        store.compose_command();
+        assert_eq!(store.state.pending_router_mode.as_deref(), Some("hedge"));
+
+        let event = router_status_event_with("deepseek/v4-pro", "hedge", &[]);
+        store.apply_event(AppUiEvent::Protocol(UiNotification::RouterStatus(event)));
+
+        assert!(store.state.pending_router_mode.is_none());
+        assert_eq!(
+            store.state.router.as_ref().expect("router populated").mode,
+            crate::model::RouterMode::Hedge,
+        );
+    }
+
+    #[test]
+    fn router_set_mode_error_response_clears_pending_label() {
+        let mut store = store_with_empty_session();
+        store.state.pending_router_mode = Some("hedge".into());
+
+        let error = octos_core::app_ui::AppUiError {
+            code: "runtime_unavailable".into(),
+            message: format!(
+                "{} request tui-3 failed: adaptive router disabled for this profile",
+                octos_core::ui_protocol::methods::ROUTER_SET_MODE
+            ),
+        };
+        store.apply_event(AppUiEvent::Error(error));
+
+        assert!(store.state.pending_router_mode.is_none());
+        assert!(
+            store.state.status.contains("router/set_mode failed"),
+            "status should surface the router/set_mode failure; got: {}",
+            store.state.status,
+        );
+    }
+
+    #[test]
+    fn queue_state_notification_updates_depth() {
+        let mut store = store_with_empty_session();
+        assert_eq!(store.state.queue_depth, 0);
+
+        let active = octos_core::ui_protocol::QueueStateEvent {
+            session_id: SessionKey("local:test".into()),
+            pending_count: 3,
+            head_client_message_id: Some("msg-1".into()),
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::QueueState(active)));
+        assert_eq!(store.state.queue_depth, 3);
+
+        let empty = octos_core::ui_protocol::QueueStateEvent {
+            session_id: SessionKey("local:test".into()),
+            pending_count: 0,
+            head_client_message_id: None,
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::QueueState(empty)));
+        assert_eq!(store.state.queue_depth, 0);
     }
 }

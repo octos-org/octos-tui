@@ -43,6 +43,21 @@ const MAX_TEXT_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub trait AppUiBackend {
     fn bootstrap(&mut self) -> Result<AppUiSnapshot>;
     fn send(&mut self, command: AppUiCommand) -> Result<()>;
+    /// Wave4-B2 (`/router off|lane|hedge`): emit a `router/set_mode`
+    /// JSON-RPC request alongside the standard `AppUiCommand` channel.
+    /// The shape lives in `octos-core::ui_protocol::RouterSetModeParams`
+    /// but isn't part of the `AppUiCommand` enum yet, so the TUI carries
+    /// a dedicated trait method to avoid an octos-core schema change.
+    /// Default impl returns `runtime_unavailable` so legacy backends
+    /// (mock fixture) stay compatible without rewiring tests.
+    fn send_router_set_mode(
+        &mut self,
+        _params: octos_core::ui_protocol::RouterSetModeParams,
+    ) -> Result<()> {
+        Err(eyre!(
+            "router/set_mode is not supported by this backend (runtime_unavailable)"
+        ))
+    }
     fn next_event(&mut self) -> Result<Option<ClientEvent>>;
 }
 
@@ -622,6 +637,47 @@ impl ProtocolAppUiBackend {
         }
     }
 
+    /// Wave4-B2: shared dispatch path for both legacy `AppUiCommand`s and
+    /// the new `router/set_mode` request (which lives outside the
+    /// `AppUiCommand` enum until octos-core grows the variant). Encodes
+    /// the request as JSON, enforces the 4 MiB frame ceiling, writes the
+    /// frame, and demotes the pending entry on transport failure.
+    fn dispatch_tracked_request(&mut self, request: RpcRequest<serde_json::Value>) -> Result<()> {
+        let request_id = request.id.clone();
+        let method = request.method.clone();
+        let text = serde_json::to_string(&request).wrap_err("failed to encode JSON-RPC request")?;
+        if text.len() > MAX_TEXT_FRAME_BYTES {
+            self.protocol.pending_requests.remove(&request_id);
+            self.queue.push_back(
+                AppUiEvent::Error(AppUiError {
+                    code: "frame_too_large".into(),
+                    message: format!(
+                        "encoded {method} request {request_id} is {} bytes; max is {MAX_TEXT_FRAME_BYTES}",
+                        text.len()
+                    ),
+                })
+                .into(),
+            );
+            return Ok(());
+        }
+
+        if let Err(err) = self.send_text(text) {
+            self.mark_disconnected(format!(
+                "UI protocol disconnected; reconnect will retry on next send/read: {err:#}"
+            ));
+            self.protocol.pending_requests.remove(&request_id);
+            self.queue.push_back(
+                AppUiEvent::Error(AppUiError {
+                    code: "transport_send".into(),
+                    message: format!("failed to send {method} request {request_id}: {err:#}"),
+                })
+                .into(),
+            );
+        }
+
+        Ok(())
+    }
+
     fn read_next_transport_event(&mut self) -> Result<Option<TransportEvent>> {
         if let Err(err) = self.ensure_connected() {
             self.mark_disconnected(format!(
@@ -809,39 +865,37 @@ impl AppUiBackend for ProtocolAppUiBackend {
         }
 
         let request = self.build_tracked_request(command)?;
-        let request_id = request.id.clone();
-        let method = request.method.clone();
-        let text = serde_json::to_string(&request).wrap_err("failed to encode JSON-RPC request")?;
-        if text.len() > MAX_TEXT_FRAME_BYTES {
-            self.protocol.pending_requests.remove(&request_id);
+        self.dispatch_tracked_request(request)
+    }
+
+    fn send_router_set_mode(
+        &mut self,
+        params: octos_core::ui_protocol::RouterSetModeParams,
+    ) -> Result<()> {
+        if self.launch.readonly {
             self.queue.push_back(
                 AppUiEvent::Error(AppUiError {
-                    code: "frame_too_large".into(),
-                    message: format!(
-                        "encoded {method} request {request_id} is {} bytes; max is {MAX_TEXT_FRAME_BYTES}",
-                        text.len()
-                    ),
+                    code: "readonly_blocked".into(),
+                    message: "/router is mutating; the TUI was launched in read-only mode".into(),
                 })
                 .into(),
             );
             return Ok(());
         }
-
-        if let Err(err) = self.send_text(text) {
-            self.mark_disconnected(format!(
-                "UI protocol disconnected; reconnect will retry on next send/read: {err:#}"
-            ));
-            self.protocol.pending_requests.remove(&request_id);
-            self.queue.push_back(
-                AppUiEvent::Error(AppUiError {
-                    code: "transport_send".into(),
-                    message: format!("failed to send {method} request {request_id}: {err:#}"),
-                })
-                .into(),
-            );
-        }
-
-        Ok(())
+        let method = octos_core::ui_protocol::methods::ROUTER_SET_MODE.to_string();
+        let request_id = self.protocol.next_request_id();
+        let request_params =
+            serde_json::to_value(&params).wrap_err("failed to encode router/set_mode params")?;
+        let request = RpcRequest {
+            jsonrpc: JSON_RPC_VERSION.into(),
+            id: request_id.clone(),
+            method: method.clone(),
+            params: request_params,
+        };
+        self.protocol
+            .pending_requests
+            .insert(request_id, PendingRequest { method });
+        self.dispatch_tracked_request(request)
     }
 
     fn next_event(&mut self) -> Result<Option<ClientEvent>> {
@@ -1224,6 +1278,33 @@ fn success_response_to_app_event(
                 )),
             }
         }
+        methods::ROUTER_SET_MODE => {
+            // Wave4-B2: the round-trip ack carries the committed mode
+            // string; the canonical pill update arrives separately on
+            // the next `router/status` push. Treat the ack as a status
+            // message so it surfaces in the activity log.
+            match serde_json::from_value::<octos_core::ui_protocol::RouterSetModeResult>(result) {
+                Ok(result) => Ok(Some(
+                    AppUiEvent::Status(AppUiStatus {
+                        message: format!(
+                            "router/set_mode acknowledged → {} (awaiting router/status)",
+                            result.mode
+                        ),
+                    })
+                    .into(),
+                )),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            methods::ROUTER_SET_MODE
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
         _ => Ok(None),
     }
 }
@@ -1466,6 +1547,7 @@ impl MockAppUiBackend {
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             timestamp: Utc::now(),
+            topic: None,
         }));
         self.enqueue_protocol(UiNotification::ToolStarted(ToolStartedEvent {
             session_id: session_id.clone(),
@@ -1545,6 +1627,9 @@ impl MockAppUiBackend {
                 stream: "session_events".into(),
                 seq: 1,
             }),
+            tokens_in: None,
+            tokens_out: None,
+            session_result: None,
         }));
     }
 }
@@ -2044,6 +2129,9 @@ mod tests {
                 input: vec![InputItem::Text {
                     text: "hello".into(),
                 }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }),
         )
         .expect("request encodes");
@@ -2072,6 +2160,9 @@ mod tests {
                         text: "second paragraph".into(),
                     },
                 ],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }),
         )
         .expect("request encodes");
@@ -2140,6 +2231,9 @@ mod tests {
                 input: vec![InputItem::Text {
                     text: "hello".into(),
                 }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }),
             AppUiCommand::InterruptTurn(TurnInterruptParams {
                 session_id: session_id.clone(),
@@ -2454,6 +2548,9 @@ mod tests {
                 input: vec![InputItem::Text {
                     text: "hello".into(),
                 }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }))
             .expect("request builds");
 
@@ -3099,6 +3196,9 @@ mod tests {
                 input: vec![InputItem::Text {
                     text: "hello".into(),
                 }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }))
             .expect("readonly send is local");
         backend
@@ -3156,6 +3256,9 @@ mod tests {
                 input: vec![InputItem::Text {
                     text: "hello".into(),
                 }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }))
             .expect("send");
 
@@ -3184,6 +3287,9 @@ mod tests {
                 input: vec![InputItem::Text {
                     text: "complete m9 contract".into(),
                 }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }))
             .expect("submit prompt");
 
@@ -3329,6 +3435,9 @@ mod tests {
                 input: vec![InputItem::Text {
                     text: "hello".into(),
                 }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }))
             .expect("send");
 

@@ -34,6 +34,8 @@ pub fn run(cli: Cli) -> Result<()> {
     let mut store = Store::from_snapshot(snapshot);
 
     loop {
+        store.tick(std::time::Instant::now());
+        flush_pending_router_requests(backend.as_mut(), &mut store);
         terminal.draw(|frame| app::render(frame, &store.state, palette))?;
 
         if event::poll(Duration::from_millis(90))? {
@@ -62,6 +64,20 @@ pub fn run(cli: Cli) -> Result<()> {
 fn send_command(backend: &mut dyn AppUiBackend, store: &mut Store, command: AppUiCommand) {
     if let Err(err) = backend.send(command) {
         store.apply_event(AppUiEvent::error("send_failed", format!("{err:#}")));
+    }
+}
+
+/// Wave4-B2: drain the store's pending `router/set_mode` queue once per
+/// loop iteration and dispatch each request via
+/// [`AppUiBackend::send_router_set_mode`]. Failures (transport, readonly,
+/// unsupported by mock) surface back to the store via
+/// [`Store::record_router_set_mode_error`] so the optimistic pending-mode
+/// pill is rolled back.
+fn flush_pending_router_requests(backend: &mut dyn AppUiBackend, store: &mut Store) {
+    while let Some(params) = store.take_pending_router_request() {
+        if let Err(err) = backend.send_router_set_mode(params) {
+            store.record_router_set_mode_error("send_failed", &format!("{err:#}"));
+        }
     }
 }
 
@@ -399,6 +415,7 @@ fn is_alt_char(key: &KeyEvent, expected: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client_event::ClientEvent;
     use crate::model::{ActivityKind, AppState, LiveReply, SessionView, TaskView};
     use octos_core::{
         SessionKey, TaskId,
@@ -430,6 +447,7 @@ mod tests {
 
         Store {
             state: AppState::new(sessions, 0, "ready".into(), None, false),
+            pending_router_requests: Vec::new(),
         }
     }
 
@@ -1062,6 +1080,86 @@ mod tests {
         assert_eq!(
             params.approval_scope.as_deref(),
             Some(approval_scopes::REQUEST)
+        );
+    }
+
+    // ----- Wave4-B2: `flush_pending_router_requests` integration -----
+
+    #[derive(Default)]
+    struct RouterSinkBackend {
+        sent: Vec<octos_core::ui_protocol::RouterSetModeParams>,
+        next_event: std::cell::RefCell<Option<ClientEvent>>,
+        send_err: Option<String>,
+    }
+
+    impl AppUiBackend for RouterSinkBackend {
+        fn bootstrap(&mut self) -> eyre::Result<octos_core::app_ui::AppUiSnapshot> {
+            unreachable!("bootstrap unused in router flush integration test");
+        }
+        fn send(&mut self, _command: AppUiCommand) -> eyre::Result<()> {
+            Ok(())
+        }
+        fn send_router_set_mode(
+            &mut self,
+            params: octos_core::ui_protocol::RouterSetModeParams,
+        ) -> eyre::Result<()> {
+            if let Some(err) = self.send_err.as_ref() {
+                return Err(eyre::eyre!("{}", err));
+            }
+            self.sent.push(params);
+            Ok(())
+        }
+        fn next_event(&mut self) -> eyre::Result<Option<ClientEvent>> {
+            Ok(self.next_event.borrow_mut().take())
+        }
+    }
+
+    #[test]
+    fn flush_pending_router_requests_drains_store_and_forwards_to_backend() {
+        let mut store = store_with_sessions(1);
+        store.state.composer = "/router lane".into();
+        store.compose_command();
+
+        let mut backend = RouterSinkBackend::default();
+        flush_pending_router_requests(&mut backend, &mut store);
+
+        assert_eq!(
+            backend.sent.len(),
+            1,
+            "router/set_mode should reach backend"
+        );
+        assert_eq!(backend.sent[0].mode, "lane");
+        assert!(
+            store.take_pending_router_request().is_none(),
+            "queue should be drained after flush",
+        );
+    }
+
+    #[test]
+    fn flush_pending_router_requests_rolls_back_pending_label_on_transport_error() {
+        let mut store = store_with_sessions(1);
+        store.state.composer = "/router hedge".into();
+        store.compose_command();
+        assert_eq!(store.state.pending_router_mode.as_deref(), Some("hedge"));
+
+        let mut backend = RouterSinkBackend {
+            sent: Vec::new(),
+            next_event: std::cell::RefCell::new(None),
+            send_err: Some("WebSocket closed".into()),
+        };
+        flush_pending_router_requests(&mut backend, &mut store);
+
+        assert_eq!(
+            store.state.pending_router_mode, None,
+            "optimistic pill should roll back on transport error",
+        );
+        assert!(
+            store
+                .state
+                .activity
+                .iter()
+                .any(|item| matches!(item.kind, ActivityKind::Error)),
+            "transport-failure should surface as an Error activity entry",
         );
     }
 }

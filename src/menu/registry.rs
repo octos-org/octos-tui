@@ -383,6 +383,15 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             inline_args: InlineArgMode::None,
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_MCP)),
         },
+        CommandSpec {
+            name: "router",
+            aliases: &[],
+            description: "Switch the adaptive router mode: /router off|lane|hedge.",
+            category: CommandCategory::Session,
+            availability: CommandAvailability::always(),
+            inline_args: InlineArgMode::Required,
+            entry: CommandEntry::LocalAction(LocalAction::SetRouterMode),
+        },
     ]
 }
 

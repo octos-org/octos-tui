@@ -164,6 +164,12 @@ pub enum LocalAction {
     SaveTerminalTitle(Vec<String>),
     SaveKeymap,
     RefreshMenu(MenuId),
+    /// Wave4-B2: parses `/router off|lane|hedge` and queues a
+    /// `router/set_mode` request on the store's pending-router queue.
+    /// The store keeps the mode string in the inline-args field rather
+    /// than on the enum so the action stays trivially `Clone + Eq` and
+    /// future modes don't need a constructor change.
+    SetRouterMode,
     Custom(&'static str),
 }
 

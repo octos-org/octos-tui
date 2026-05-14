@@ -83,6 +83,173 @@ impl Default for SessionRunState {
     }
 }
 
+/// Wave4-B2: adaptive-router mode badge — `Off | Lane | Hedge | Unknown`.
+/// String round-trips through the protocol so the discriminator is the
+/// canonical wire form, not a numeric ordinal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterMode {
+    Off,
+    Lane,
+    Hedge,
+    /// Forward-compat fallback used when a server emits a mode string the TUI
+    /// doesn't recognise yet.
+    Unknown,
+}
+
+impl RouterMode {
+    /// Map the wire-form mode string (`off` / `lane` / `hedge`) onto the
+    /// typed badge. Trailing/leading whitespace and casing are tolerated so
+    /// the parser doesn't reject hand-typed `:router HEDGE`.
+    pub fn from_wire(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Self::Off,
+            "lane" => Self::Lane,
+            "hedge" => Self::Hedge,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Wire-form mode string suitable for `router/set_mode.mode`.
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Lane => "lane",
+            Self::Hedge => "hedge",
+            Self::Unknown => "off",
+        }
+    }
+
+    /// Compact badge label rendered in the status bar (`[Off]`, `[Lane]`,
+    /// `[Hedge]`, `[?]`).
+    pub fn badge(&self) -> &'static str {
+        match self {
+            Self::Off => "[Off]",
+            Self::Lane => "[Lane]",
+            Self::Hedge => "[Hedge]",
+            Self::Unknown => "[?]",
+        }
+    }
+
+    /// True when the mode is anything other than `Off` — the status bar
+    /// uses this to colour-highlight the badge.
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Lane | Self::Hedge)
+    }
+}
+
+/// Wave4-B2: aggregate per-lane circuit-breaker status. Folds the lane-keyed
+/// breaker map into a single state for the status-bar dot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitBreakerSummary {
+    /// All breakers `closed` (or none observed yet — the cold-start case).
+    AllClosed,
+    /// At least one breaker `half_open` and none `open`.
+    AnyHalfOpen,
+    /// At least one breaker `open`.
+    AnyOpen,
+}
+
+impl CircuitBreakerSummary {
+    fn from_map<S: AsRef<str>>(map: &std::collections::BTreeMap<String, S>) -> Self {
+        let mut any_half_open = false;
+        for value in map.values() {
+            match value.as_ref().trim().to_ascii_lowercase().as_str() {
+                "open" => return Self::AnyOpen,
+                "half_open" => any_half_open = true,
+                _ => {}
+            }
+        }
+        if any_half_open {
+            Self::AnyHalfOpen
+        } else {
+            Self::AllClosed
+        }
+    }
+
+    /// Render hint — `Some("•")` (red) when any breaker is open, `Some("•")`
+    /// (yellow) when half-open, `None` when all closed (no dot rendered).
+    pub fn dot(&self) -> Option<&'static str> {
+        match self {
+            Self::AllClosed => None,
+            Self::AnyHalfOpen | Self::AnyOpen => Some("•"),
+        }
+    }
+}
+
+/// Wave4-B2: snapshot of the adaptive router observed at the last
+/// `router/status` push. Stored on [`AppState`] and rendered into the status
+/// bar's routing pill.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouterState {
+    pub provider_name: String,
+    pub mode: RouterMode,
+    pub qos_ranking: bool,
+    pub lane_scores: std::collections::BTreeMap<String, f64>,
+    pub circuit_breakers: std::collections::BTreeMap<String, String>,
+}
+
+impl RouterState {
+    /// Project a wire-form [`RouterStatusEvent`] onto the TUI's typed
+    /// router state.
+    pub fn from_event(event: &octos_core::ui_protocol::RouterStatusEvent) -> Self {
+        Self {
+            provider_name: event.provider_name.clone(),
+            mode: RouterMode::from_wire(&event.mode),
+            qos_ranking: event.qos_ranking,
+            lane_scores: event.lane_scores.clone(),
+            circuit_breakers: event.circuit_breakers.clone(),
+        }
+    }
+
+    /// Aggregate the per-lane breaker map into a single status-bar dot.
+    pub fn breaker_summary(&self) -> CircuitBreakerSummary {
+        CircuitBreakerSummary::from_map(&self.circuit_breakers)
+    }
+}
+
+/// Wave4-B2: transient failover banner. Rendered as a one-line overlay
+/// inside the status surface and auto-dismissed after [`Self::DISMISS`].
+#[derive(Debug, Clone)]
+pub struct RouterFailoverBanner {
+    pub from_provider: String,
+    pub to_provider: String,
+    pub reason: String,
+    pub elapsed_ms: u64,
+    pub created_at: Instant,
+}
+
+impl RouterFailoverBanner {
+    /// Auto-dismiss delay — 5 seconds matches the M9 toast convention used
+    /// by the web bridge.
+    pub const DISMISS: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Build a banner from a wire-form `RouterFailoverEvent`.
+    pub fn from_event(event: &octos_core::ui_protocol::RouterFailoverEvent, now: Instant) -> Self {
+        Self {
+            from_provider: event.from_provider.clone(),
+            to_provider: event.to_provider.clone(),
+            reason: event.reason.clone(),
+            elapsed_ms: event.elapsed_ms,
+            created_at: now,
+        }
+    }
+
+    /// True when the banner has lived longer than [`Self::DISMISS`] and
+    /// should be cleared.
+    pub fn is_expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.created_at) >= Self::DISMISS
+    }
+
+    /// One-line rendered banner text. Uses an ASCII arrow (no emoji per
+    /// repo style) so the line stays renderable in any terminal.
+    pub fn render(&self) -> String {
+        format!(
+            "↺ {} → {} · {}ms · {}",
+            self.from_provider, self.to_provider, self.elapsed_ms, self.reason
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub sessions: Vec<SessionView>,
@@ -114,6 +281,19 @@ pub struct AppState {
     pub active_menu: Option<MenuBuildResult>,
     pub capabilities: Option<CapabilitySet>,
     pub permission_profiles: Vec<SessionPermissionProfile>,
+    /// Wave4-B2: latest `router/status` snapshot (provider, mode, lane scores,
+    /// circuit breakers). `None` until the first push from the server.
+    pub router: Option<RouterState>,
+    /// Wave4-B2: transient `router/failover` banner — set when the router
+    /// crosses a lane and cleared after [`RouterFailoverBanner::DISMISS`].
+    pub router_failover_banner: Option<RouterFailoverBanner>,
+    /// Wave4-B2: queue depth observed via `queue/state`. Zero when the
+    /// in-flight turn is the only one outstanding.
+    pub queue_depth: u32,
+    /// Wave4-B2: optimistic mode label rendered while the server confirms a
+    /// `router/set_mode` round-trip (cleared when the next `router/status`
+    /// lands).
+    pub pending_router_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1031,6 +1211,10 @@ impl AppState {
             active_menu: None,
             capabilities: None,
             permission_profiles: Vec::new(),
+            router: None,
+            router_failover_banner: None,
+            queue_depth: 0,
+            pending_router_mode: None,
         }
     }
 

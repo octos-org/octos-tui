@@ -46,16 +46,16 @@ fn inspector_visible(app: &AppState) -> bool {
 fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
     let composer_height = composer_height(app);
     let active_menu = active_menu_surface(app);
+    let banner_height = router_failover_banner_height(app);
     let desired_menu_height = menu_height_hint(
         active_menu.as_ref(),
         frame.area().width,
         frame.area().height,
     );
     let desired_work_height = sticky_work_height(app);
-    let mut surface_budget = frame
-        .area()
-        .height
-        .saturating_sub(min_transcript_height(frame.area().height) + composer_height + 1);
+    let mut surface_budget = frame.area().height.saturating_sub(
+        min_transcript_height(frame.area().height) + composer_height + banner_height + 1,
+    );
     let menu_height = desired_menu_height.min(surface_budget);
     surface_budget = surface_budget.saturating_sub(menu_height);
     let work_height = desired_work_height.min(surface_budget);
@@ -65,6 +65,7 @@ fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
             Constraint::Min(8),
             Constraint::Length(work_height),
             Constraint::Length(menu_height),
+            Constraint::Length(banner_height),
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
@@ -75,9 +76,44 @@ fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
     if let Some(menu) = active_menu.as_ref() {
         menu_render::render_menu_surface(frame, root[2], menu, palette);
     }
-    frame.render_widget(render_composer(app, palette), root[3]);
-    set_composer_cursor(frame, app, root[3]);
-    frame.render_widget(render_status(app, palette), root[4]);
+    if banner_height > 0 {
+        frame.render_widget(render_router_failover_banner(app, palette), root[3]);
+    }
+    frame.render_widget(render_composer(app, palette), root[4]);
+    set_composer_cursor(frame, app, root[4]);
+    frame.render_widget(render_status(app, palette), root[5]);
+}
+
+/// Wave4-B2: returns 1 when a transient failover banner is active (and not
+/// yet expired), 0 otherwise. The chat / inspector layouts use this to
+/// budget an extra row above the composer without disturbing the existing
+/// flow when no banner is showing.
+fn router_failover_banner_height(app: &AppState) -> u16 {
+    match &app.router_failover_banner {
+        Some(banner) if !banner.is_expired(std::time::Instant::now()) => 1,
+        _ => 0,
+    }
+}
+
+/// Wave4-B2: render the one-line failover banner using the existing
+/// status-bar surface conventions (muted bg, highlight foreground).
+fn render_router_failover_banner(app: &AppState, palette: Palette) -> Paragraph<'static> {
+    let text = app
+        .router_failover_banner
+        .as_ref()
+        .map(|banner| banner.render())
+        .unwrap_or_default();
+    Paragraph::new(Line::from(vec![Span::styled(
+        format!(" {text}"),
+        Style::default()
+            .fg(palette.highlight)
+            .bg(palette.surface_alt),
+    )]))
+    .style(
+        Style::default()
+            .fg(palette.highlight)
+            .bg(palette.surface_alt),
+    )
 }
 
 fn min_transcript_height(terminal_height: u16) -> u16 {
@@ -87,6 +123,7 @@ fn min_transcript_height(terminal_height: u16) -> u16 {
 fn render_inspector_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
     let composer_height = composer_height(app);
     let active_menu = active_menu_surface(app);
+    let banner_height = router_failover_banner_height(app);
     let menu_height = menu_height_hint(
         active_menu.as_ref(),
         frame.area().width,
@@ -97,6 +134,7 @@ fn render_inspector_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palet
         .constraints([
             Constraint::Min(12),
             Constraint::Length(menu_height),
+            Constraint::Length(banner_height),
             Constraint::Length(composer_height),
             Constraint::Length(4),
         ])
@@ -139,9 +177,12 @@ fn render_inspector_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palet
     if let Some(menu) = active_menu.as_ref() {
         menu_render::render_menu_surface(frame, root[1], menu, palette);
     }
-    frame.render_widget(render_composer(app, palette), root[2]);
-    set_composer_cursor(frame, app, root[2]);
-    frame.render_widget(render_status(app, palette), root[3]);
+    if banner_height > 0 {
+        frame.render_widget(render_router_failover_banner(app, palette), root[2]);
+    }
+    frame.render_widget(render_composer(app, palette), root[3]);
+    set_composer_cursor(frame, app, root[3]);
+    frame.render_widget(render_status(app, palette), root[4]);
 }
 
 fn active_menu_surface(app: &AppState) -> Option<menu_render::MenuSurface> {
@@ -2206,7 +2247,7 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
         .unwrap_or_else(|| "no session".into());
     let work = status_bar_work_text(app);
 
-    Paragraph::new(Line::from(vec![
+    let mut spans: Vec<Span<'static>> = vec![
         Span::styled(" state ", palette.title().bg(palette.surface_alt)),
         Span::styled(
             run_state_marker(&app.run_state).to_string(),
@@ -2220,6 +2261,9 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
         Span::styled(format!(" {work}"), palette.muted().bg(palette.surface_alt)),
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
         Span::styled(policy.to_string(), palette.text().bg(palette.surface_alt)),
+    ];
+    spans.extend(router_status_bar_spans(app, palette));
+    spans.extend(vec![
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
         Span::styled(profile.to_string(), palette.text().bg(palette.surface_alt)),
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
@@ -2238,8 +2282,67 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
             "Tab inspector | Ctrl+O expand",
             palette.selected().bg(palette.surface_alt),
         ),
-    ]))
-    .style(Style::default().fg(palette.text).bg(palette.surface_alt))
+    ]);
+
+    Paragraph::new(Line::from(spans))
+        .style(Style::default().fg(palette.text).bg(palette.surface_alt))
+}
+
+/// Wave4-B2: build the styled spans that render the router pill inside
+/// [`render_status`]. Returns an empty Vec when no router state is
+/// observed (cold start), so existing layouts stay byte-identical for
+/// non-router profiles.
+fn router_status_bar_spans(app: &AppState, palette: Palette) -> Vec<Span<'static>> {
+    let Some(router) = app.router.as_ref() else {
+        return Vec::new();
+    };
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(8);
+    spans.push(Span::styled(" | ", palette.muted().bg(palette.surface_alt)));
+    spans.push(Span::styled(
+        router.provider_name.clone(),
+        palette.text().bg(palette.surface_alt),
+    ));
+    spans.push(Span::styled(" ", palette.muted().bg(palette.surface_alt)));
+    let badge_style = if router.mode.is_active() {
+        palette.title().bg(palette.surface_alt)
+    } else {
+        palette.muted().bg(palette.surface_alt)
+    };
+    spans.push(Span::styled(router.mode.badge().to_string(), badge_style));
+    if let Some(pending) = app.pending_router_mode.as_deref() {
+        let pending_mode = crate::model::RouterMode::from_wire(pending);
+        if pending_mode != router.mode {
+            spans.push(Span::styled(" → ", palette.muted().bg(palette.surface_alt)));
+            spans.push(Span::styled(
+                pending_mode.badge().to_string(),
+                palette.selected().bg(palette.surface_alt),
+            ));
+        }
+    }
+    if app.queue_depth > 0 {
+        spans.push(Span::styled(" ", palette.muted().bg(palette.surface_alt)));
+        spans.push(Span::styled(
+            format!("↳{}", app.queue_depth),
+            palette.title().bg(palette.surface_alt),
+        ));
+    }
+    let breaker = router.breaker_summary();
+    if breaker.dot().is_some() {
+        spans.push(Span::styled(" ", palette.muted().bg(palette.surface_alt)));
+        let dot_style = match breaker {
+            crate::model::CircuitBreakerSummary::AnyOpen => {
+                Style::default().fg(palette.danger).bg(palette.surface_alt)
+            }
+            crate::model::CircuitBreakerSummary::AnyHalfOpen => Style::default()
+                .fg(palette.highlight)
+                .bg(palette.surface_alt),
+            crate::model::CircuitBreakerSummary::AllClosed => {
+                palette.muted().bg(palette.surface_alt)
+            }
+        };
+        spans.push(Span::styled("•".to_string(), dot_style));
+    }
+    spans
 }
 
 fn status_bar_work_text(app: &AppState) -> String {
@@ -2264,6 +2367,44 @@ fn status_bar_work_text(app: &AppState) -> String {
     } else {
         format!("({})", parts.join(" | "))
     }
+}
+
+/// Wave4-B2: compact status-bar segment for the adaptive router pill —
+/// `<provider> [Mode] [↳N] [•]`. Empty (zero-length) when no
+/// `router/status` has been observed yet.
+///
+/// Order is fixed left-to-right: provider name first, then the mode badge,
+/// then queue-depth (only when `pending_count > 0`), then a circuit-breaker
+/// dot (only when any lane is non-`closed`). Keeping the order stable lets
+/// the status bar diff cleanly across renders.
+///
+/// Used by tests to assert content independently of the styled
+/// `router_status_bar_spans` renderer.
+#[cfg(test)]
+fn status_bar_router_text(app: &AppState) -> String {
+    let Some(router) = app.router.as_ref() else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(router.provider_name.clone());
+    let badge = router.mode.badge();
+    if let Some(pending) = app.pending_router_mode.as_deref() {
+        let pending_mode = crate::model::RouterMode::from_wire(pending);
+        if pending_mode != router.mode {
+            parts.push(format!("{badge} → {}", pending_mode.badge()));
+        } else {
+            parts.push(badge.to_string());
+        }
+    } else {
+        parts.push(badge.to_string());
+    }
+    if app.queue_depth > 0 {
+        parts.push(format!("↳{}", app.queue_depth));
+    }
+    if router.breaker_summary().dot().is_some() {
+        parts.push("•".to_string());
+    }
+    parts.join(" ")
 }
 
 fn run_state_status_label(state: &SessionRunState) -> &'static str {
@@ -4118,5 +4259,210 @@ mod tests {
         assert!(text.contains("copied"));
         assert!(text.contains("src/old.rs -> src/lib.rs"));
         assert!(text.contains("mode change"));
+    }
+
+    // ----- Wave4-B2: status bar router + queue indicators -----
+
+    fn app_with_router(
+        provider: &str,
+        mode: crate::model::RouterMode,
+        breakers: &[(&str, &str)],
+    ) -> AppState {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let mut circuit_breakers = std::collections::BTreeMap::new();
+        for (lane, state) in breakers {
+            circuit_breakers.insert((*lane).to_string(), (*state).to_string());
+        }
+        app.router = Some(crate::model::RouterState {
+            provider_name: provider.into(),
+            mode,
+            qos_ranking: true,
+            lane_scores: std::collections::BTreeMap::new(),
+            circuit_breakers,
+        });
+        app
+    }
+
+    #[test]
+    fn status_bar_renders_provider_name_when_router_state_present() {
+        let app = app_with_router("deepseek/v4-pro", crate::model::RouterMode::Off, &[]);
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("deepseek/v4-pro"),
+            "status bar should surface router provider; got: {text}",
+        );
+    }
+
+    #[test]
+    fn status_bar_renders_mode_badge_for_each_mode() {
+        for (mode, badge) in [
+            (crate::model::RouterMode::Off, "[Off]"),
+            (crate::model::RouterMode::Lane, "[Lane]"),
+            (crate::model::RouterMode::Hedge, "[Hedge]"),
+        ] {
+            let app = app_with_router("deepseek/v4-pro", mode, &[]);
+            let text = rendered_text(&app);
+            assert!(
+                text.contains(badge),
+                "status bar should render badge {badge} for mode {mode:?}; got: {text}",
+            );
+        }
+    }
+
+    #[test]
+    fn status_bar_hides_router_segments_without_router_state() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let text = rendered_text(&app);
+        for forbidden in ["[Off]", "[Lane]", "[Hedge]"] {
+            assert!(
+                !text.contains(forbidden),
+                "status bar should hide mode badge before any router/status; got: {text}",
+            );
+        }
+    }
+
+    #[test]
+    fn status_bar_shows_queue_depth_indicator_when_pending() {
+        let mut app = app_with_router("deepseek/v4-pro", crate::model::RouterMode::Lane, &[]);
+        app.queue_depth = 2;
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("↳2"),
+            "queue depth indicator should appear as ↳N; got: {text}",
+        );
+    }
+
+    #[test]
+    fn status_bar_hides_queue_depth_indicator_when_empty() {
+        let app = app_with_router("deepseek/v4-pro", crate::model::RouterMode::Lane, &[]);
+        let text = rendered_text(&app);
+        assert!(
+            !text.contains("↳"),
+            "queue depth indicator should hide when zero; got: {text}",
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_circuit_breaker_dot_when_open() {
+        let app = app_with_router(
+            "deepseek/v4-pro",
+            crate::model::RouterMode::Lane,
+            &[("deepseek/v4-pro", "open"), ("anthropic/sonnet", "closed")],
+        );
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("•"),
+            "circuit-breaker dot should render when any lane is open; got: {text}",
+        );
+    }
+
+    #[test]
+    fn status_bar_hides_circuit_breaker_dot_when_all_closed() {
+        let app = app_with_router(
+            "deepseek/v4-pro",
+            crate::model::RouterMode::Lane,
+            &[
+                ("deepseek/v4-pro", "closed"),
+                ("anthropic/sonnet", "closed"),
+            ],
+        );
+        let text = rendered_text(&app);
+        assert!(
+            !text.contains("•"),
+            "circuit-breaker dot should hide when all closed; got: {text}",
+        );
+    }
+
+    #[test]
+    fn status_bar_router_segments_combines_provider_mode_queue_breaker() {
+        let mut app = app_with_router(
+            "deepseek/v4-pro",
+            crate::model::RouterMode::Hedge,
+            &[("deepseek/v4-pro", "open")],
+        );
+        app.queue_depth = 3;
+
+        let line = status_bar_router_text(&app);
+
+        assert!(line.contains("deepseek/v4-pro"));
+        assert!(line.contains("[Hedge]"));
+        assert!(line.contains("↳3"));
+        assert!(line.contains("•"));
+    }
+
+    #[test]
+    fn status_bar_router_text_renders_pending_mode_with_arrow_until_confirmed() {
+        let mut app = app_with_router("deepseek/v4-pro", crate::model::RouterMode::Off, &[]);
+        app.pending_router_mode = Some("hedge".into());
+
+        let line = status_bar_router_text(&app);
+
+        // Optimistic UX: render `[Off] → [Hedge]` to surface that the
+        // client has dispatched a `router/set_mode` but the server hasn't
+        // confirmed yet.
+        assert!(
+            line.contains("[Off]") && line.contains("[Hedge]") && line.contains("→"),
+            "pending-mode line should show both badges joined by →; got: {line}",
+        );
+    }
+
+    // ----- Wave4-B2: failover banner overlay -----
+
+    #[test]
+    fn failover_banner_is_rendered_above_status_when_active() {
+        let mut app = app_with_router("deepseek/v4-pro", crate::model::RouterMode::Lane, &[]);
+        app.router_failover_banner = Some(crate::model::RouterFailoverBanner {
+            from_provider: "deepseek/v4-pro".into(),
+            to_provider: "anthropic/sonnet".into(),
+            reason: "circuit_break".into(),
+            elapsed_ms: 8240,
+            created_at: std::time::Instant::now(),
+        });
+
+        let text = rendered_text(&app);
+
+        assert!(
+            text.contains("↺")
+                && text.contains("deepseek/v4-pro")
+                && text.contains("anthropic/sonnet")
+                && text.contains("8240ms"),
+            "failover banner content should be visible somewhere on screen; got: {text}",
+        );
+    }
+
+    #[test]
+    fn failover_banner_absent_when_no_active_banner() {
+        let app = app_with_router("deepseek/v4-pro", crate::model::RouterMode::Lane, &[]);
+        let text = rendered_text(&app);
+        assert!(
+            !text.contains("↺"),
+            "no failover banner glyph should render without a banner; got: {text}",
+        );
     }
 }
