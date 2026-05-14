@@ -6,7 +6,7 @@ use octos_core::ui_protocol::{
     TaskRuntimeState, TaskUpdatedEvent, TurnCompletedEvent, TurnErrorEvent, TurnInterruptParams,
     TurnSpawnCompleteEvent, TurnStartParams, UiNotification, UiProgressEvent,
 };
-use octos_core::{Message, TaskId};
+use octos_core::{Message, SessionKey, TaskId};
 use serde_json::Value;
 
 use crate::{
@@ -293,12 +293,11 @@ impl Store {
             return None;
         }
         let mode = crate::model::RouterMode::from_wire(trimmed);
-        if matches!(mode, crate::model::RouterMode::Unknown) {
+        let Some(mode_wire) = mode.as_wire().map(str::to_string) else {
             self.state.status =
                 format!("/router: unknown mode `{trimmed}` (expected off|lane|hedge)");
             return None;
-        }
-        let mode_wire = mode.as_wire().to_string();
+        };
         self.state.pending_router_mode = Some(mode_wire.clone());
         self.state.status = format!("/router → {mode_wire} (awaiting server confirmation)");
         self.push_local_activity(
@@ -307,6 +306,13 @@ impl Store {
             mode_wire.clone(),
             Some("optimistic pill update until next router/status"),
         );
+        // Coalesce: drop any earlier queued request for the same session
+        // before pushing the new one. Stops a `/router lane` →
+        // `/router hedge` toggle from sending two RPCs back-to-back and
+        // matches the codex review's "track latest mode per session"
+        // guidance without growing the data model.
+        self.pending_router_requests
+            .retain(|req| req.session_id != session_id);
         self.pending_router_requests
             .push(octos_core::ui_protocol::RouterSetModeParams {
                 session_id,
@@ -890,13 +896,12 @@ impl Store {
             }
             AppUiEvent::Error(error) => {
                 // Wave4-B2: a failed `router/set_mode` round-trip — the
-                // transport layer encodes the method into the message
-                // prefix; clear the optimistic pill so it returns to the
-                // last server-confirmed mode.
-                if error
-                    .message
-                    .starts_with(octos_core::ui_protocol::methods::ROUTER_SET_MODE)
-                {
+                // transport layer encodes the method into the error
+                // message (either as a prefix for server JSON-RPC
+                // errors or embedded for transport / frame / readonly
+                // failures). Clear the optimistic pill so it returns to
+                // the last server-confirmed mode.
+                if is_router_set_mode_error(&error) {
                     self.record_router_set_mode_error(&error.code, &error.message);
                     return None;
                 }
@@ -1213,15 +1218,28 @@ impl Store {
         }
     }
 
+    /// Wave4-B2: returns `true` when `event_session` matches the user's
+    /// currently focused session, so router/queue events emitted from a
+    /// background session don't trample the status bar.
+    fn is_active_session(&self, event_session: &SessionKey) -> bool {
+        self.state
+            .active_session()
+            .map(|session| &session.id == event_session)
+            .unwrap_or(false)
+    }
+
     fn apply_router_status(
         &mut self,
         event: octos_core::ui_protocol::RouterStatusEvent,
     ) -> Option<AppUiCommand> {
+        if !self.is_active_session(&event.session_id) {
+            return None;
+        }
         let router_state = crate::model::RouterState::from_event(&event);
-        if let Some(pending) = self.state.pending_router_mode.as_deref() {
-            if crate::model::RouterMode::from_wire(pending) == router_state.mode {
-                self.state.pending_router_mode = None;
-            }
+        if let Some(pending) = self.state.pending_router_mode.as_deref()
+            && crate::model::RouterMode::from_wire(pending) == router_state.mode
+        {
+            self.state.pending_router_mode = None;
         }
         self.state.router = Some(router_state);
         None
@@ -1231,6 +1249,9 @@ impl Store {
         &mut self,
         event: octos_core::ui_protocol::RouterFailoverEvent,
     ) -> Option<AppUiCommand> {
+        if !self.is_active_session(&event.session_id) {
+            return None;
+        }
         self.state.router_failover_banner = Some(crate::model::RouterFailoverBanner::from_event(
             &event,
             std::time::Instant::now(),
@@ -1253,6 +1274,9 @@ impl Store {
         &mut self,
         event: octos_core::ui_protocol::QueueStateEvent,
     ) -> Option<AppUiCommand> {
+        if !self.is_active_session(&event.session_id) {
+            return None;
+        }
         self.state.queue_depth = event.pending_count;
         None
     }
@@ -1906,6 +1930,27 @@ fn is_low_value_progress_name(value: &str) -> bool {
             | "tool_completed"
             | "turn_completed"
     )
+}
+
+/// Wave4-B2: detect every flavour of `router/set_mode` failure that the
+/// transport may enqueue as an `AppUiEvent::Error`. The transport layer
+/// encodes the request method in several different message shapes:
+///
+/// * `"router/set_mode request <id> failed: ..."` — server JSON-RPC error
+/// * `"failed to send router/set_mode request <id>: ..."` — transport error
+/// * `"encoded router/set_mode request <id> is ... bytes; max is ..."` —
+///   frame ceiling
+/// * `"/router is mutating; the TUI was launched in read-only mode"` —
+///   readonly guard rail
+///
+/// The first three all embed the canonical `router/set_mode` method
+/// string; the readonly variant uses the user-facing `/router` slash.
+/// Match both so the optimistic pill always rolls back.
+fn is_router_set_mode_error(error: &octos_core::app_ui::AppUiError) -> bool {
+    let method = octos_core::ui_protocol::methods::ROUTER_SET_MODE;
+    error.message.contains(method)
+        || error.message.starts_with("/router ")
+        || error.code == "readonly_blocked" && error.message.contains("/router")
 }
 
 #[cfg(test)]
@@ -3386,7 +3431,15 @@ mod tests {
         mode: &str,
         breakers: &[(&str, &str)],
     ) -> octos_core::ui_protocol::RouterStatusEvent {
-        let session_id = SessionKey("local:router".into());
+        router_status_event_for_session(SessionKey("local:test".into()), provider, mode, breakers)
+    }
+
+    fn router_status_event_for_session(
+        session_id: SessionKey,
+        provider: &str,
+        mode: &str,
+        breakers: &[(&str, &str)],
+    ) -> octos_core::ui_protocol::RouterStatusEvent {
         let mut circuit_breakers = std::collections::BTreeMap::new();
         for (lane, state) in breakers {
             circuit_breakers.insert((*lane).to_string(), (*state).to_string());
@@ -3658,6 +3711,23 @@ mod tests {
     }
 
     #[test]
+    fn slash_router_coalesces_repeat_requests_for_same_session_to_latest() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "/router lane".into();
+        store.compose_command();
+        store.state.composer = "/router hedge".into();
+        store.compose_command();
+
+        let drained: Vec<_> = std::iter::from_fn(|| store.take_pending_router_request()).collect();
+        assert_eq!(
+            drained.len(),
+            1,
+            "coalescing must collapse same-session requests to latest; got: {drained:?}",
+        );
+        assert_eq!(drained[0].mode, "hedge");
+    }
+
+    #[test]
     fn router_status_confirmation_clears_pending_after_set_mode() {
         let mut store = store_with_empty_session();
         store.state.composer = "/router hedge".into();
@@ -3697,6 +3767,56 @@ mod tests {
     }
 
     #[test]
+    fn router_set_mode_transport_send_error_clears_pending_label() {
+        let mut store = store_with_empty_session();
+        store.state.pending_router_mode = Some("hedge".into());
+
+        // Simulate the message produced by transport.rs `dispatch_tracked_request` send failure.
+        let error = octos_core::app_ui::AppUiError {
+            code: "transport_send".into(),
+            message: format!(
+                "failed to send {} request tui-9: WebSocket closed",
+                octos_core::ui_protocol::methods::ROUTER_SET_MODE
+            ),
+        };
+        store.apply_event(AppUiEvent::Error(error));
+
+        assert!(store.state.pending_router_mode.is_none());
+    }
+
+    #[test]
+    fn router_set_mode_frame_too_large_clears_pending_label() {
+        let mut store = store_with_empty_session();
+        store.state.pending_router_mode = Some("lane".into());
+
+        let error = octos_core::app_ui::AppUiError {
+            code: "frame_too_large".into(),
+            message: format!(
+                "encoded {} request tui-2 is 5000000 bytes; max is 4194304",
+                octos_core::ui_protocol::methods::ROUTER_SET_MODE
+            ),
+        };
+        store.apply_event(AppUiEvent::Error(error));
+
+        assert!(store.state.pending_router_mode.is_none());
+    }
+
+    #[test]
+    fn router_set_mode_readonly_blocked_clears_pending_label() {
+        let mut store = store_with_empty_session();
+        store.state.pending_router_mode = Some("hedge".into());
+
+        // Simulate the readonly-guard rail in ProtocolAppUiBackend::send_router_set_mode.
+        let error = octos_core::app_ui::AppUiError {
+            code: "readonly_blocked".into(),
+            message: "/router is mutating; the TUI was launched in read-only mode".into(),
+        };
+        store.apply_event(AppUiEvent::Error(error));
+
+        assert!(store.state.pending_router_mode.is_none());
+    }
+
+    #[test]
     fn queue_state_notification_updates_depth() {
         let mut store = store_with_empty_session();
         assert_eq!(store.state.queue_depth, 0);
@@ -3716,5 +3836,69 @@ mod tests {
         };
         store.apply_event(AppUiEvent::Protocol(UiNotification::QueueState(empty)));
         assert_eq!(store.state.queue_depth, 0);
+    }
+
+    // ----- Wave4-B2: session-scoped routing -----
+
+    #[test]
+    fn router_status_for_inactive_session_does_not_overwrite_pill() {
+        let mut store = store_with_empty_session();
+        // Seed with a router state for the active session.
+        let initial = router_status_event_for_session(
+            SessionKey("local:test".into()),
+            "anthropic/sonnet",
+            "off",
+            &[],
+        );
+        store.apply_event(AppUiEvent::Protocol(UiNotification::RouterStatus(initial)));
+        let before = store.state.router.clone();
+        assert!(before.is_some());
+
+        // Event from a *different* session must be ignored.
+        let other = router_status_event_for_session(
+            SessionKey("local:other-session".into()),
+            "deepseek/v4-pro",
+            "hedge",
+            &[],
+        );
+        store.apply_event(AppUiEvent::Protocol(UiNotification::RouterStatus(other)));
+
+        assert_eq!(
+            store.state.router, before,
+            "inactive-session router/status must not trample the active pill",
+        );
+    }
+
+    #[test]
+    fn router_failover_for_inactive_session_does_not_show_banner() {
+        let mut store = store_with_empty_session();
+        let event = octos_core::ui_protocol::RouterFailoverEvent {
+            session_id: SessionKey("local:other".into()),
+            from_provider: "a".into(),
+            to_provider: "b".into(),
+            reason: "circuit_break".into(),
+            elapsed_ms: 12,
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::RouterFailover(event)));
+        assert!(
+            store.state.router_failover_banner.is_none(),
+            "banners must be scoped to the active session",
+        );
+    }
+
+    #[test]
+    fn queue_state_for_inactive_session_does_not_update_depth() {
+        let mut store = store_with_empty_session();
+        store.state.queue_depth = 1;
+        let event = octos_core::ui_protocol::QueueStateEvent {
+            session_id: SessionKey("local:other".into()),
+            pending_count: 9,
+            head_client_message_id: None,
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::QueueState(event)));
+        assert_eq!(
+            store.state.queue_depth, 1,
+            "queue depth is per-session; inactive events must not overwrite",
+        );
     }
 }

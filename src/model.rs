@@ -110,12 +110,15 @@ impl RouterMode {
     }
 
     /// Wire-form mode string suitable for `router/set_mode.mode`.
-    pub fn as_wire(&self) -> &'static str {
+    /// Returns `None` for [`RouterMode::Unknown`] — we refuse to encode
+    /// a forward-compat fallback as a mutating command so a future
+    /// server mode can never round-trip back as a TUI-typed `off`.
+    pub fn as_wire(&self) -> Option<&'static str> {
         match self {
-            Self::Off => "off",
-            Self::Lane => "lane",
-            Self::Hedge => "hedge",
-            Self::Unknown => "off",
+            Self::Off => Some("off"),
+            Self::Lane => Some("lane"),
+            Self::Hedge => Some("hedge"),
+            Self::Unknown => None,
         }
     }
 
