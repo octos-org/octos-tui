@@ -314,6 +314,15 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_HELP)),
         },
         CommandSpec {
+            name: "q",
+            aliases: &["exit"],
+            description: "Quit octos-tui.",
+            category: CommandCategory::Runtime,
+            availability: CommandAvailability::always(),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::LocalAction(LocalAction::Custom("quit")),
+        },
+        CommandSpec {
             name: "model",
             aliases: &[],
             description: "Choose model and reasoning options.",
@@ -492,6 +501,7 @@ mod tests {
 
         assert!(available.contains(&"ps"));
         assert!(available.contains(&"stop"));
+        assert!(available.contains(&"q"));
         assert!(available.contains(&"theme"));
         assert!(available.contains(&"status"));
         assert!(!available.contains(&"permissions"));

@@ -220,9 +220,17 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
 }
 
 fn handle_composer_enter(store: &mut Store) -> KeyAction {
+    if is_quit_slash_command(store.state.composer.trim()) {
+        store.state.clear_current_composer_draft();
+        return KeyAction::Quit;
+    }
     store
         .compose_command()
         .map_or(KeyAction::Continue, KeyAction::Send)
+}
+
+fn is_quit_slash_command(input: &str) -> bool {
+    matches!(input, "/q" | "/exit")
 }
 
 fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
@@ -829,6 +837,34 @@ mod tests {
         let activity = store.state.activity.last().expect("local activity");
         assert_eq!(activity.kind, ActivityKind::Warning);
         assert_eq!(activity.title, "local /stop");
+    }
+
+    #[test]
+    fn slash_q_quits_tui() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.composer = "/q".into();
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Enter)),
+            KeyAction::Quit
+        ));
+
+        assert!(store.state.composer.is_empty());
+    }
+
+    #[test]
+    fn slash_exit_quits_tui() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.composer = "/exit".into();
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Enter)),
+            KeyAction::Quit
+        ));
+
+        assert!(store.state.composer.is_empty());
     }
 
     #[test]

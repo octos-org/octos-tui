@@ -171,6 +171,8 @@ Local composer slash commands:
 ```text
 /ps shows local task/process status and focuses the Tasks pane
 /stop interrupts the active turn, or reports locally when nothing is active
+/q exits octos-tui
+/exit exits octos-tui
 /help shows local slash-command help
 ```
 
