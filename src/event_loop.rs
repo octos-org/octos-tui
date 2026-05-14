@@ -230,6 +230,17 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::Esc => {
             store.close_menu();
         }
+        KeyCode::Backspace
+            if store
+                .state
+                .menu_stack
+                .active()
+                .is_some_and(|frame| frame.id.as_str() == crate::menu::registry::MENU_HELP)
+                && store.state.composer == "/" =>
+        {
+            store.state.composer.pop();
+            store.close_menu();
+        }
         KeyCode::Backspace if slash_help_query_active(store) => {
             store.state.composer.pop();
             sync_slash_help_search_query(store);
@@ -240,6 +251,13 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         }
         KeyCode::Enter => {
             if slash_help_query_active(store) {
+                if store.active_menu_has_selectable_item() {
+                    store.state.clear_current_composer_draft();
+                    if let Some(command) = store.accept_active_menu_item() {
+                        return KeyAction::Send(command);
+                    }
+                    return KeyAction::Continue;
+                }
                 return handle_composer_enter(store);
             }
             if let Some(command) = store.accept_active_menu_item() {
@@ -279,13 +297,22 @@ fn slash_help_should_capture_char(store: &Store, ch: char) -> bool {
 }
 
 fn sync_slash_help_search_query(store: &mut Store) {
+    let query = store
+        .state
+        .composer
+        .strip_prefix('/')
+        .unwrap_or(store.state.composer.as_str())
+        .to_string();
+    let mut should_refresh = false;
     if let Some(frame) = store.state.menu_stack.active_mut() {
-        frame.search_query = store
-            .state
-            .composer
-            .strip_prefix('/')
-            .unwrap_or(store.state.composer.as_str())
-            .to_string();
+        should_refresh = frame.search_query != query;
+        frame.search_query = query;
+        if should_refresh {
+            frame.selected_index = 0;
+        }
+    }
+    if should_refresh {
+        store.refresh_active_menu();
     }
 }
 
@@ -706,6 +733,90 @@ mod tests {
             .map(|item| item.label.clone())
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn typing_after_slash_live_filters_registry_help_menu() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('/'))),
+            KeyAction::Continue
+        ));
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('t'))),
+            KeyAction::Continue
+        ));
+
+        assert_eq!(store.state.composer, "/t");
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.search_query.as_str()),
+            Some("t")
+        );
+        let Some(crate::menu::MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref()
+        else {
+            panic!("expected filtered registry help menu");
+        };
+        let actual = spec
+            .items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, vec!["/theme".to_string(), "/title".to_string()]);
+    }
+
+    #[test]
+    fn slash_query_enter_accepts_selected_menu_item() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('/'))),
+            KeyAction::Continue
+        ));
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('t'))),
+            KeyAction::Continue
+        ));
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Enter)),
+            KeyAction::Continue
+        ));
+
+        assert!(store.state.composer.is_empty());
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_THEME)
+        );
+    }
+
+    #[test]
+    fn backspace_on_single_slash_closes_menu_and_clears_composer() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('/'))),
+            KeyAction::Continue
+        ));
+        assert_eq!(store.state.composer, "/");
+        assert!(store.state.menu_stack.is_active());
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Backspace)),
+            KeyAction::Continue
+        ));
+        assert!(store.state.composer.is_empty());
+        assert!(!store.state.menu_stack.is_active());
     }
 
     #[test]

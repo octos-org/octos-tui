@@ -109,18 +109,14 @@ fn help_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     let items = commands
         .visible_commands(&ctx.availability)
         .into_iter()
-        .enumerate()
-        .map(|(idx, visible)| {
+        .map(|visible| {
             let command = visible.command;
-            let mut item = MenuItem::new(
+            let item = MenuItem::new(
                 command.name,
                 command.slash_name(),
                 action_for_command_entry(&command.entry),
             )
             .with_description(command_description(command.description, command.aliases));
-            if let Some(shortcut) = numeric_shortcut(idx) {
-                item = item.with_shortcut(shortcut);
-            }
             match visible.availability {
                 AvailabilityStatus {
                     reason: Some(reason),

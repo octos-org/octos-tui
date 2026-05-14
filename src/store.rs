@@ -87,25 +87,35 @@ impl Store {
             .into_iter()
             .filter_map(|visible| {
                 let command = visible.command;
-                let names = std::iter::once(command.name).chain(command.aliases.iter().copied());
                 let rank = if query.is_empty() {
                     Some(0)
-                } else if names
-                    .clone()
-                    .any(|name| name.eq_ignore_ascii_case(query.as_str()))
+                } else if command.name.eq_ignore_ascii_case(query.as_str())
+                    || command
+                        .aliases
+                        .iter()
+                        .copied()
+                        .any(|alias| alias.eq_ignore_ascii_case(query.as_str()))
                 {
                     Some(0)
-                } else if names
-                    .clone()
-                    .any(|name| name.to_ascii_lowercase().starts_with(&query))
-                {
+                } else if command.name.to_ascii_lowercase().starts_with(&query) {
                     Some(1)
-                } else if names
-                    .clone()
-                    .any(|name| name.to_ascii_lowercase().contains(&query))
-                    || command.description.to_ascii_lowercase().contains(&query)
+                } else if command
+                    .aliases
+                    .iter()
+                    .copied()
+                    .any(|alias| alias.to_ascii_lowercase().starts_with(&query))
                 {
                     Some(2)
+                } else if command.name.to_ascii_lowercase().contains(&query) {
+                    Some(3)
+                } else if command
+                    .aliases
+                    .iter()
+                    .copied()
+                    .any(|alias| alias.to_ascii_lowercase().contains(&query))
+                    || command.description.to_ascii_lowercase().contains(&query)
+                {
+                    Some(4)
                 } else {
                     None
                 }?;
@@ -305,6 +315,20 @@ impl Store {
         self.dispatch_menu_action(action)
     }
 
+    pub fn active_menu_has_selectable_item(&self) -> bool {
+        let selected_index = self
+            .state
+            .menu_stack
+            .active()
+            .map(|frame| frame.selected_index)
+            .unwrap_or(0);
+        self.state
+            .active_menu
+            .as_ref()
+            .and_then(|menu| active_menu_selected_action(menu, selected_index))
+            .is_some()
+    }
+
     fn dispatch_menu_action(&mut self, action: MenuAction) -> Option<AppUiCommand> {
         match action {
             MenuAction::OpenMenu(id) => {
@@ -351,7 +375,8 @@ impl Store {
             theme_name: None,
             selected_path: &path,
         };
-        let result = core_menu_registry().build(&frame.id, &ctx);
+        let mut result = core_menu_registry().build(&frame.id, &ctx);
+        apply_active_menu_search_query(&mut result, &frame.id, &frame.search_query);
         let len = active_menu_item_len(Some(&result));
         if len > 0
             && let Some(frame) = self.state.menu_stack.active_mut()
@@ -1426,6 +1451,29 @@ fn active_menu_item_len(menu: Option<&MenuBuildResult>) -> usize {
         | Some(MenuBuildResult::Error(_))
         | None => 0,
     }
+}
+
+fn apply_active_menu_search_query(
+    result: &mut MenuBuildResult,
+    menu_id: &MenuId,
+    search_query: &str,
+) {
+    if search_query.trim().is_empty() || menu_id.as_str() != crate::menu::registry::MENU_HELP {
+        return;
+    }
+    let MenuBuildResult::Ready(spec) = result else {
+        return;
+    };
+    if !spec.searchable {
+        return;
+    }
+    let query = search_query.trim().to_ascii_lowercase();
+    spec.items.retain(|item| {
+        item.label
+            .trim_start_matches('/')
+            .to_ascii_lowercase()
+            .starts_with(&query)
+    });
 }
 
 fn active_menu_selected_action(
