@@ -24,6 +24,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 crossterm = "0.28"
 ratatui = "0.29"
+unicode-width = "0.2"
 
 [lints.rust]
 unsafe_code = "deny"

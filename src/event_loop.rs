@@ -176,10 +176,23 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::End => match store.state.focus {
             FocusPane::Workspace => store.state.workspace.scroll = 0,
             FocusPane::Git => store.state.git.scroll = 0,
+            FocusPane::Composer => store.state.composer_move_end(),
             _ => store.state.scroll_transcript_to_latest(),
         },
         KeyCode::Backspace if store.state.focus == FocusPane::Composer => {
-            store.state.composer.pop();
+            store.state.composer_backspace();
+        }
+        KeyCode::Delete if store.state.focus == FocusPane::Composer => {
+            store.state.composer_delete();
+        }
+        KeyCode::Left if store.state.focus == FocusPane::Composer => {
+            store.state.composer_move_left();
+        }
+        KeyCode::Right if store.state.focus == FocusPane::Composer => {
+            store.state.composer_move_right();
+        }
+        KeyCode::Home if store.state.focus == FocusPane::Composer => {
+            store.state.composer_move_home();
         }
         KeyCode::Enter if store.state.focus == FocusPane::Composer => {
             return handle_composer_enter(store);
@@ -207,7 +220,7 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         }
         KeyCode::Char(ch) => {
             let opens_slash_popup = ch == '/' && store.state.composer.is_empty();
-            store.state.composer.push(ch);
+            store.state.composer_insert_char(ch);
             store.state.focus = FocusPane::Composer;
             if opens_slash_popup {
                 store.open_menu(crate::menu::MenuId::from(crate::menu::registry::MENU_HELP));
@@ -230,12 +243,39 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::Esc => {
             store.close_menu();
         }
+        KeyCode::Backspace
+            if store
+                .state
+                .menu_stack
+                .active()
+                .is_some_and(|frame| frame.id.as_str() == crate::menu::registry::MENU_HELP)
+                && store.state.composer == "/" =>
+        {
+            store.state.composer_backspace();
+            store.close_menu();
+        }
         KeyCode::Backspace if slash_help_query_active(store) => {
-            store.state.composer.pop();
+            store.state.composer_backspace();
             sync_slash_help_search_query(store);
         }
         KeyCode::Char(ch) if slash_help_should_capture_char(store, ch) => {
-            store.state.composer.push(ch);
+            store.state.composer_insert_char(ch);
+            sync_slash_help_search_query(store);
+        }
+        KeyCode::Left if slash_help_query_active(store) => {
+            store.state.composer_move_left();
+            sync_slash_help_search_query(store);
+        }
+        KeyCode::Right if slash_help_query_active(store) => {
+            store.state.composer_move_right();
+            sync_slash_help_search_query(store);
+        }
+        KeyCode::Home if slash_help_query_active(store) => {
+            store.state.composer_move_home();
+            sync_slash_help_search_query(store);
+        }
+        KeyCode::End if slash_help_query_active(store) => {
+            store.state.composer_move_end();
             sync_slash_help_search_query(store);
         }
         KeyCode::Enter => {
@@ -588,6 +628,80 @@ mod tests {
             KeyAction::Continue
         ));
         assert_eq!(store.state.composer, "g");
+    }
+
+    #[test]
+    fn composer_supports_left_right_mid_insert_and_delete() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+
+        for ch in ['a', 'b', 'c'] {
+            assert!(matches!(
+                handle_key(&mut store, key(KeyCode::Char(ch))),
+                KeyAction::Continue
+            ));
+        }
+        assert_eq!(store.state.composer, "abc");
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Left)),
+            KeyAction::Continue
+        ));
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Left)),
+            KeyAction::Continue
+        ));
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('中'))),
+            KeyAction::Continue
+        ));
+        assert_eq!(store.state.composer, "a中bc");
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Backspace)),
+            KeyAction::Continue
+        ));
+        assert_eq!(store.state.composer, "abc");
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Delete)),
+            KeyAction::Continue
+        ));
+        assert_eq!(store.state.composer, "ac");
+    }
+
+    #[test]
+    fn composer_home_end_move_cursor_for_insertion() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+
+        for ch in "hello".chars() {
+            assert!(matches!(
+                handle_key(&mut store, key(KeyCode::Char(ch))),
+                KeyAction::Continue
+            ));
+        }
+        assert_eq!(store.state.composer, "hello");
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Home)),
+            KeyAction::Continue
+        ));
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('X'))),
+            KeyAction::Continue
+        ));
+        assert_eq!(store.state.composer, "Xhello");
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::End)),
+            KeyAction::Continue
+        ));
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('!'))),
+            KeyAction::Continue
+        ));
+        assert_eq!(store.state.composer, "Xhello!");
     }
 
     #[test]

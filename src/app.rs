@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use octos_core::ui_protocol::approval_kinds;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     menu::render as menu_render,
@@ -2168,7 +2169,8 @@ fn composer_cursor_position(app: &AppState, area: Rect) -> Option<Position> {
         return None;
     }
 
-    let text_width = app.composer.chars().count() as u16;
+    let text_width =
+        u16::try_from(UnicodeWidthStr::width(app.composer_cursor_prefix())).unwrap_or(u16::MAX);
     let inner_right = area.x + area.width.saturating_sub(2);
     let input_x = area.x + 4 + text_width;
     Some(Position::new(input_x.min(inner_right), input_y))
@@ -3375,6 +3377,60 @@ mod tests {
             cursor,
             composer_cursor_position(&app, Rect::new(0, 36, 120, 5)).expect("cursor")
         );
+    }
+
+    #[test]
+    fn composer_cursor_uses_terminal_display_width_for_cjk_text() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.composer = "今日天气如何".into();
+
+        let cursor =
+            composer_cursor_position(&app, Rect::new(0, 36, 120, 5)).expect("cursor position");
+
+        assert_eq!(cursor.x, 16);
+        assert_eq!(cursor.y, 39);
+    }
+
+    #[test]
+    fn composer_cursor_tracks_mid_text_position() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.composer = "ab中cd".into();
+        app.composer_move_home();
+        app.composer_move_right();
+        app.composer_move_right();
+        app.composer_move_right();
+
+        let cursor =
+            composer_cursor_position(&app, Rect::new(0, 36, 120, 5)).expect("cursor position");
+
+        assert_eq!(cursor.x, 8);
+        assert_eq!(cursor.y, 39);
     }
 
     #[test]

@@ -94,6 +94,7 @@ pub struct AppState {
     pub workspace: WorkspacePaneState,
     pub git: GitPaneState,
     pub composer: String,
+    pub composer_cursor: Option<usize>,
     pub composer_drafts: Vec<ComposerDraft>,
     pub pending_messages: Vec<String>,
     pub optimistic_user_messages: Vec<OptimisticUserMessage>,
@@ -1011,6 +1012,7 @@ impl AppState {
             workspace: panes.workspace,
             git: panes.git,
             composer: String::new(),
+            composer_cursor: None,
             composer_drafts: Vec::new(),
             pending_messages: Vec::new(),
             optimistic_user_messages: Vec::new(),
@@ -1511,6 +1513,7 @@ impl AppState {
     pub fn load_composer_draft_for_selected_session(&mut self) {
         let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
             self.composer.clear();
+            self.composer_cursor = None;
             return;
         };
         self.composer = self
@@ -1519,16 +1522,124 @@ impl AppState {
             .find(|draft| draft.session_id == session_id)
             .map(|draft| draft.text.clone())
             .unwrap_or_default();
+        self.composer_cursor = None;
     }
 
     pub fn clear_current_composer_draft(&mut self) {
         let session_id = self.active_session().map(|session| session.id.clone());
         self.composer.clear();
+        self.composer_cursor = None;
         if let Some(session_id) = session_id {
             self.composer_drafts
                 .retain(|draft| draft.session_id != session_id);
         }
     }
+
+    pub fn composer_cursor_byte_index(&self) -> usize {
+        match self.composer_cursor {
+            Some(cursor) => normalize_composer_cursor(self.composer.as_str(), cursor),
+            None => self.composer.len(),
+        }
+    }
+
+    pub fn composer_cursor_prefix(&self) -> &str {
+        &self.composer[..self.composer_cursor_byte_index()]
+    }
+
+    pub fn composer_insert_char(&mut self, ch: char) {
+        let cursor = self.composer_cursor_byte_index();
+        self.composer.insert(cursor, ch);
+        let next = cursor + ch.len_utf8();
+        self.composer_cursor = if next >= self.composer.len() {
+            None
+        } else {
+            Some(next)
+        };
+    }
+
+    pub fn composer_backspace(&mut self) {
+        let cursor = self.composer_cursor_byte_index();
+        if cursor == 0 {
+            return;
+        }
+        let prev = self.composer[..cursor]
+            .char_indices()
+            .next_back()
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        self.composer.drain(prev..cursor);
+        self.composer_cursor = if prev >= self.composer.len() {
+            None
+        } else {
+            Some(prev)
+        };
+    }
+
+    pub fn composer_delete(&mut self) {
+        let cursor = self.composer_cursor_byte_index();
+        if cursor >= self.composer.len() {
+            return;
+        }
+        let next = self.composer[cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(offset, _)| cursor + offset)
+            .unwrap_or(self.composer.len());
+        self.composer.drain(cursor..next);
+        self.composer_cursor = if cursor >= self.composer.len() {
+            None
+        } else {
+            Some(cursor)
+        };
+    }
+
+    pub fn composer_move_left(&mut self) {
+        let cursor = self.composer_cursor_byte_index();
+        if cursor == 0 {
+            self.composer_cursor = Some(0);
+            return;
+        }
+        let prev = self.composer[..cursor]
+            .char_indices()
+            .next_back()
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        self.composer_cursor = Some(prev);
+    }
+
+    pub fn composer_move_right(&mut self) {
+        let cursor = self.composer_cursor_byte_index();
+        if cursor >= self.composer.len() {
+            self.composer_cursor = None;
+            return;
+        }
+        let next = self.composer[cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(offset, _)| cursor + offset)
+            .unwrap_or(self.composer.len());
+        self.composer_cursor = if next >= self.composer.len() {
+            None
+        } else {
+            Some(next)
+        };
+    }
+
+    pub fn composer_move_home(&mut self) {
+        self.composer_cursor = Some(0);
+    }
+
+    pub fn composer_move_end(&mut self) {
+        self.composer_cursor = None;
+    }
+}
+
+fn normalize_composer_cursor(text: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor = cursor.saturating_sub(1);
+    }
+    cursor
 }
 
 pub fn extract_plan_steps(app: &AppState) -> Vec<PlanStep> {
