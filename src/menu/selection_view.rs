@@ -22,6 +22,8 @@ pub(crate) struct SelectionItem {
     pub current: bool,
     pub default: bool,
     pub toggle: Option<bool>,
+    pub loading: bool,
+    pub required_valid: Option<bool>,
 }
 
 impl SelectionItem {
@@ -35,6 +37,8 @@ impl SelectionItem {
             current: false,
             default: false,
             toggle: None,
+            loading: false,
+            required_valid: None,
         }
     }
 }
@@ -277,7 +281,21 @@ fn selection_row(
     palette: Palette,
 ) -> Line<'static> {
     let disabled = item.disabled_reason.is_some();
-    let base = if disabled {
+    let semantic = item.required_valid.map(|valid| {
+        if valid {
+            palette.success
+        } else {
+            palette.danger
+        }
+    });
+    let base = if let Some(color) = semantic {
+        let style = Style::default().fg(color);
+        if selected {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        }
+    } else if disabled {
         palette.muted()
     } else if selected {
         palette.selected().add_modifier(Modifier::BOLD)
@@ -308,6 +326,9 @@ fn selection_row(
     if let Some(shortcut) = &item.shortcut {
         text.push_str(shortcut);
         text.push(' ');
+    }
+    if item.loading {
+        text.push_str("[..] ");
     }
     text.push_str(&item.label);
     if let Some(description) = &item.description {
@@ -405,24 +426,43 @@ mod tests {
     use crate::cli::ThemeName;
     use ratatui::{Terminal, backend::TestBackend};
 
-    fn render_view(view: &SelectionView, width: u16, height: u16) -> String {
+    fn render_buffer(view: &SelectionView, width: u16, height: u16, palette: Palette) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| {
-                frame.render_widget(
-                    view.widget(Palette::for_theme(ThemeName::Slate)),
-                    frame.area(),
-                )
-            })
+            .draw(|frame| frame.render_widget(view.widget(palette), frame.area()))
             .expect("render succeeds");
-        terminal
-            .backend()
-            .buffer()
+        terminal.backend().buffer().clone()
+    }
+
+    fn render_view(view: &SelectionView, width: u16, height: u16) -> String {
+        render_buffer(view, width, height, Palette::for_theme(ThemeName::Slate))
             .content
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn style_for_text(buffer: &Buffer, needle: &str) -> Option<Style> {
+        let width = usize::from(buffer.area.width);
+        let height = usize::from(buffer.area.height);
+        for y in 0..height {
+            let row_start = y * width;
+            let row = buffer.content[row_start..row_start + width]
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            if let Some(x) = row.find(needle) {
+                let cell = &buffer.content[row_start + x];
+                return Some(
+                    Style::default()
+                        .fg(cell.fg)
+                        .bg(cell.bg)
+                        .add_modifier(cell.modifier),
+                );
+            }
+        }
+        None
     }
 
     #[test]
@@ -442,6 +482,23 @@ mod tests {
         assert!(text.contains("server unavailable"));
         assert!(text.contains("Current model current"));
         assert!(text.contains("Default model default"));
+    }
+
+    #[test]
+    fn renders_required_rows_with_success_and_danger_colors() {
+        let mut missing = SelectionItem::new("missing", "API key: not set");
+        missing.required_valid = Some(false);
+        let mut ready = SelectionItem::new("ready", "Model: deepseek-reasoner");
+        ready.required_valid = Some(true);
+        let view = SelectionView::new("Provider", vec![missing, ready]);
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let buffer = render_buffer(&view, 80, 8, palette);
+
+        let missing_style = style_for_text(&buffer, "API key").expect("missing row style");
+        let ready_style = style_for_text(&buffer, "Model").expect("ready row style");
+
+        assert_eq!(missing_style.fg, Some(palette.danger));
+        assert_eq!(ready_style.fg, Some(palette.success));
     }
 
     #[test]

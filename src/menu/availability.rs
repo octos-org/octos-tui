@@ -11,6 +11,8 @@ pub struct CommandAvailability {
     pub connection: ConnectionRequirement,
     pub session: SessionRequirement,
     pub required_methods: &'static [&'static str],
+    pub required_methods_when_capabilities: &'static [&'static str],
+    pub required_methods_any: &'static [&'static str],
     pub required_features: &'static [&'static str],
     pub required_feature_flags: &'static [&'static str],
     pub unavailable: UnavailablePolicy,
@@ -26,6 +28,8 @@ impl CommandAvailability {
             connection: ConnectionRequirement::Any,
             session: SessionRequirement::Any,
             required_methods: &[],
+            required_methods_when_capabilities: &[],
+            required_methods_any: &[],
             required_features: &[],
             required_feature_flags: &[],
             unavailable: UnavailablePolicy::Hide,
@@ -45,6 +49,7 @@ impl CommandAvailability {
             connection: ConnectionRequirement::Connected,
             session: SessionRequirement::Open,
             required_methods,
+            required_methods_when_capabilities: &[],
             ..Self::always()
         }
     }
@@ -56,6 +61,7 @@ impl CommandAvailability {
             connection: ConnectionRequirement::Connected,
             session: SessionRequirement::Open,
             required_methods,
+            required_methods_when_capabilities: &[],
             ..Self::always()
         }
     }
@@ -72,6 +78,22 @@ impl CommandAvailability {
 
     pub fn with_unavailable_policy(mut self, unavailable: UnavailablePolicy) -> Self {
         self.unavailable = unavailable;
+        self
+    }
+
+    pub fn with_required_methods_any(
+        mut self,
+        required_methods_any: &'static [&'static str],
+    ) -> Self {
+        self.required_methods_any = required_methods_any;
+        self
+    }
+
+    pub fn with_required_methods_when_capabilities(
+        mut self,
+        required_methods_when_capabilities: &'static [&'static str],
+    ) -> Self {
+        self.required_methods_when_capabilities = required_methods_when_capabilities;
         self
     }
 
@@ -158,6 +180,58 @@ impl CommandAvailability {
             return self
                 .unavailable
                 .status(format!("AppUI method `{method}` is not available"));
+        }
+
+        if let Some(capabilities) = ctx.capabilities
+            && let Some(method) = self
+                .required_methods_when_capabilities
+                .iter()
+                .find(|method| {
+                    ctx.unsupported_method_reason(method).is_some() || !ctx.supports_method(method)
+                })
+        {
+            let unavailable = if capabilities.methods().is_empty() {
+                UnavailablePolicy::Hide
+            } else {
+                UnavailablePolicy::Disable
+            };
+            if let Some(reason) = ctx.unsupported_method_reason(method) {
+                return unavailable
+                    .status(format!("AppUI method `{method}` is unsupported: {reason}"));
+            }
+            return unavailable.status(format!("AppUI method `{method}` is not available"));
+        }
+
+        if !self.required_methods_any.is_empty() && ctx.capabilities.is_none() {
+            return self
+                .unavailable
+                .status("AppUI capabilities are not available");
+        }
+
+        if !self.required_methods_any.is_empty()
+            && !self
+                .required_methods_any
+                .iter()
+                .any(|method| ctx.supports_method(method))
+        {
+            if let Some((method, reason)) = self.required_methods_any.iter().find_map(|method| {
+                ctx.unsupported_method_reason(method)
+                    .map(|reason| (*method, reason))
+            }) {
+                return self
+                    .unavailable
+                    .status(format!("AppUI method `{method}` is unsupported: {reason}"));
+            }
+
+            let methods = self
+                .required_methods_any
+                .iter()
+                .map(|method| format!("`{method}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return self
+                .unavailable
+                .status(format!("requires one of {methods}"));
         }
 
         if !self.required_features.is_empty() && ctx.capabilities.is_none() {
@@ -546,6 +620,23 @@ mod tests {
             status.reason.as_deref(),
             Some("AppUI method `turn/interrupt` is unsupported: disabled by policy")
         );
+    }
+
+    #[test]
+    fn any_of_methods_allows_command_when_one_capability_exists() {
+        let capabilities = CapabilitySet::from_methods([methods::APPROVAL_SCOPES_LIST]);
+        let ctx = AvailabilityContext::protocol(&capabilities);
+        let status = evaluate_command(
+            &command(
+                CommandAvailability::app_ui_read(&[]).with_required_methods_any(&[
+                    methods::APPROVAL_SCOPES_LIST,
+                    methods::PERMISSION_PROFILE_SET,
+                ]),
+            ),
+            &ctx,
+        );
+
+        assert!(status.is_available());
     }
 
     #[test]

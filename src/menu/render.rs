@@ -156,6 +156,8 @@ fn selection_item_from_spec(item: &MenuItem) -> SelectionItem {
         current: item.state.current,
         default: item.state.default,
         toggle: item.state.checked,
+        loading: item.state.loading,
+        required_valid: item.state.required_valid,
     }
 }
 
@@ -209,6 +211,7 @@ fn multi_select_item_from_spec(
         checked,
         current: item.state.current,
         default: item.state.default,
+        loading: item.state.loading,
         order,
     }
 }
@@ -402,5 +405,21 @@ mod tests {
         assert!(text.contains("> [ ] -- Working directory"));
         assert!(text.contains("not available"));
         assert!(text.contains("status: idle"));
+    }
+
+    #[test]
+    fn single_select_loading_state_is_rendered() {
+        let spec = MenuSpec::new("provider", "Provider", MenuMode::SingleSelect).with_items(vec![
+            MenuItem::new("provider.test", "Testing connection...", MenuAction::Noop).with_state(
+                MenuItemState {
+                    loading: true,
+                    ..MenuItemState::default()
+                },
+            ),
+        ]);
+        let menu = MenuSurface::from_spec(&spec, None, vec!["Provider".into()]);
+        let text = render_text(&menu, 80, 8);
+
+        assert!(text.contains("[..] Testing connection..."));
     }
 }

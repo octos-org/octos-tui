@@ -1,29 +1,136 @@
-use octos_core::app_ui::{AppUiCommand, AppUiEvent, AppUiSnapshot};
+use octos_core::app_ui::{AppUiEvent, AppUiSnapshot};
 use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
-    ApprovalRespondParams, DiffPreviewGetParams, InputItem, MessageDeltaEvent, ReplayLossyEvent,
-    TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState, TaskUpdatedEvent,
-    TurnCompletedEvent, TurnErrorEvent, TurnInterruptParams, TurnStartParams, UiNotification,
-    UiProgressEvent,
+    ApprovalRespondParams, DiffPreviewGetParams, InputItem, MessageDeltaEvent,
+    MessagePersistedEvent, ReplayLossyEvent, SessionOpenParams, TaskOutputDeltaEvent,
+    TaskOutputReadParams, TaskRuntimeState, TaskUpdatedEvent, TurnCompletedEvent, TurnErrorEvent,
+    TurnId, TurnInterruptParams, TurnStartParams, UiNotification, UiProgressEvent,
 };
 use octos_core::{Message, TaskId};
 use serde_json::Value;
 
 use crate::{
-    client_event::{ClientEvent, PermissionProfileClientEvent},
+    client_event::{
+        CapabilitiesClientEvent, ClientEvent, McpConfigListClientEvent,
+        McpConfigMutationClientEvent, McpStatusClientEvent, ModelListClientEvent,
+        ModelSelectClientEvent, PermissionProfileClientEvent, ProfileLlmCatalogClientEvent,
+        ProfileLlmListClientEvent, ProfileLlmMutationClientEvent, ProfileSkillsListClientEvent,
+        ProfileSkillsMutationClientEvent, ProfileSkillsRegistrySearchClientEvent,
+        SessionStatusClientEvent, ToolConfigListClientEvent, ToolConfigMutationClientEvent,
+        ToolStatusClientEvent,
+    },
     menu::{
         CommandEntry, CommandRegistry, CommandResolution, LocalAction, MenuAction, MenuAppSnapshot,
         MenuBuildResult, MenuContext, MenuId, TerminalSize, providers::core_menu_registry,
     },
     model::{
-        ActivityItem, ActivityKind, AppState, ApprovalModalAction, ApprovalModalState,
-        DiffHunkContext, DiffPreviewGetResult, FocusPane, LiveReply, SessionView, TaskView,
+        ActivityItem, ActivityKind, AppState, AppUiCommand, ApprovalModalAction,
+        ApprovalModalState, AuthSendCodeParams, AuthVerifyParams, DiffHunkContext,
+        DiffPreviewGetResult, FocusPane, LiveReply, LlmRouteConfig, LlmSelectionConfig,
+        McpConfigDeleteParams, McpConfigListParams, McpConfigSetEnabledParams, McpConfigTestParams,
+        McpConfigUpsertParams, OnboardingAction, OnboardingProviderPending,
+        OnboardingProviderSaveTarget, ProfileLlmCatalogParams, ProfileLlmListParams,
+        ProfileLlmListResult, ProfileLocalCreateParams, ProfileSkillsInstallParams,
+        ProfileSkillsListParams, ProfileSkillsRegistrySearchParams, ProfileSkillsRemoveParams,
+        SecretString, SessionMcpCatalog, SessionModelCatalog, SessionRuntimeStatus,
+        SessionToolCatalog, SessionView, TaskView, ToolConfigDeleteParams, ToolConfigListParams,
+        ToolConfigSetEnabledParams, ToolConfigTestParams, ToolConfigUpsertParams,
         complete_plan_steps_in_text, task_state_label,
     },
 };
 
 const TASK_OUTPUT_TAIL_BYTES: usize = 600;
 const TASK_OUTPUT_READ_LIMIT_BYTES: u64 = 4096;
+
+#[derive(Default)]
+struct TurnActivitySummary {
+    action_count: usize,
+    files_changed: Vec<String>,
+    validation: Vec<String>,
+    failures: Vec<String>,
+}
+
+fn looks_like_validation_activity(activity: &ActivityItem) -> bool {
+    let text = format!(
+        "{} {}",
+        activity.title,
+        activity.detail.as_deref().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    text.contains("test")
+        || text.contains("build")
+        || text.contains("check")
+        || text.contains("lint")
+        || text.contains("cargo ")
+        || text.contains("pytest")
+        || text.contains("npm run")
+        || text.contains("pnpm ")
+}
+
+fn looks_like_file_change_activity(activity: &ActivityItem) -> bool {
+    let text = format!(
+        "{} {} {}",
+        activity.title,
+        activity.status,
+        activity.detail.as_deref().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    text.contains("file mutation")
+        || text.contains("diff preview")
+        || text.contains(" modified")
+        || text.contains(" created")
+        || text.contains(" deleted")
+}
+
+fn compact_first_line(value: &str, max_chars: usize) -> String {
+    let line = value
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let mut out = String::new();
+    for ch in line.chars().take(max_chars) {
+        out.push(ch);
+    }
+    if line.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
+}
+
+fn push_unique_summary(values: &mut Vec<String>, value: String) {
+    if value.is_empty() || values.iter().any(|existing| existing == &value) {
+        return;
+    }
+    values.push(value);
+}
+
+fn format_limited_list(values: &[String], empty: &str) -> String {
+    if values.is_empty() {
+        return empty.to_string();
+    }
+    let mut rendered = values
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if values.len() > 3 {
+        rendered.push_str(&format!(", +{} more", values.len() - 3));
+    }
+    rendered
+}
+
+fn looks_like_partial_live_answer(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.lines().count() > 1 || trimmed.chars().count() < 32 {
+        return false;
+    }
+    !trimmed
+        .chars()
+        .next_back()
+        .is_some_and(|ch| matches!(ch, '.' | '!' | '?' | ':' | ')' | ']' | '`'))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -61,6 +168,13 @@ impl Store {
         }
 
         if prompt.is_empty() {
+            return None;
+        }
+
+        if self.active_session().is_none() {
+            self.state.status =
+                "No coding session open. Run /onboard open-session before sending a prompt.".into();
+            self.state.focus = FocusPane::Composer;
             return None;
         }
 
@@ -131,7 +245,7 @@ impl Store {
         match resolution {
             CommandResolution::Found {
                 command,
-                invocation: _,
+                invocation,
             } => {
                 let availability = registry.evaluate(command, &self.state.availability_context());
                 if !availability.is_available() {
@@ -145,7 +259,7 @@ impl Store {
                     );
                     return None;
                 }
-                self.dispatch_command_entry(&command.entry)
+                self.dispatch_command_entry(&command.entry, Some(invocation.args))
             }
             CommandResolution::EmptyCommand => {
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
@@ -159,13 +273,19 @@ impl Store {
         }
     }
 
-    fn dispatch_command_entry(&mut self, entry: &CommandEntry) -> Option<AppUiCommand> {
+    fn dispatch_command_entry(
+        &mut self,
+        entry: &CommandEntry,
+        inline_args: Option<&str>,
+    ) -> Option<AppUiCommand> {
         match entry {
             CommandEntry::OpenMenu(id) => {
                 self.open_menu(id.clone());
                 None
             }
-            CommandEntry::LocalAction(action) => self.dispatch_local_action(action.clone()),
+            CommandEntry::LocalAction(action) => {
+                self.dispatch_local_action(action.clone(), inline_args)
+            }
             CommandEntry::AppUiAction(action) => {
                 self.state.status = format!(
                     "AppUI command `{}` is advertised but not wired yet",
@@ -179,7 +299,11 @@ impl Store {
         }
     }
 
-    fn dispatch_local_action(&mut self, action: LocalAction) -> Option<AppUiCommand> {
+    fn dispatch_local_action(
+        &mut self,
+        action: LocalAction,
+        inline_args: Option<&str>,
+    ) -> Option<AppUiCommand> {
         match action {
             LocalAction::ShowProcessStatus => {
                 self.show_local_process_status();
@@ -197,6 +321,10 @@ impl Store {
                     );
                 }
                 command
+            }
+            LocalAction::Exit => {
+                self.state.exit_requested = true;
+                None
             }
             LocalAction::ShowHelp => {
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
@@ -222,11 +350,1159 @@ impl Store {
                 self.open_menu(id);
                 None
             }
+            LocalAction::EditComposer(draft) => {
+                self.state.set_composer_text(draft);
+                self.state.focus = FocusPane::Composer;
+                self.state.status = "Edit the field, then press Enter".into();
+                None
+            }
+            LocalAction::Onboarding(action) => self.dispatch_onboarding_action(action, inline_args),
+            LocalAction::Skills => self.dispatch_skills_inline(inline_args.unwrap_or_default()),
+            LocalAction::McpConfig => self.dispatch_mcp_inline(inline_args.unwrap_or_default()),
+            LocalAction::ToolConfig => self.dispatch_tools_inline(inline_args.unwrap_or_default()),
             LocalAction::Custom(name) => {
                 self.state.status = format!("Local menu action `{name}` is not wired yet");
                 None
             }
         }
+    }
+
+    fn dispatch_mcp_inline(&mut self, inline_args: &str) -> Option<AppUiCommand> {
+        let args = inline_args.trim();
+        if args.is_empty() {
+            self.open_menu(MenuId::from(crate::menu::registry::MENU_MCP));
+            return None;
+        }
+
+        let (verb, rest) = split_first_word(args);
+        match verb {
+            "list" | "refresh" | "config" => self.mcp_config_list_command(),
+            "status" => self.mcp_status_list_command(),
+            "enable" => self.mcp_config_set_enabled_command(rest, true),
+            "disable" => self.mcp_config_set_enabled_command(rest, false),
+            "test" => self.mcp_config_test_command(rest),
+            "delete" | "remove" | "rm" => self.mcp_config_delete_command(rest),
+            "upsert" | "add" | "set" => self.mcp_config_upsert_command(rest),
+            "help" => {
+                self.state.status = mcp_usage();
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_MCP));
+                None
+            }
+            _ => {
+                self.state.status = mcp_usage();
+                None
+            }
+        }
+    }
+
+    fn dispatch_tools_inline(&mut self, inline_args: &str) -> Option<AppUiCommand> {
+        let args = inline_args.trim();
+        if args.is_empty() {
+            self.open_menu(MenuId::from(crate::menu::registry::MENU_TOOL_SETTINGS));
+            return None;
+        }
+
+        let (verb, rest) = split_first_word(args);
+        match verb {
+            "list" | "refresh" | "config" => self.tool_config_list_command(),
+            "status" => self.tool_status_list_command(),
+            "enable" => self.tool_config_set_enabled_command(rest, true),
+            "disable" => self.tool_config_set_enabled_command(rest, false),
+            "test" => self.tool_config_test_command(rest),
+            "delete" | "remove" | "rm" => self.tool_config_delete_command(rest),
+            "upsert" | "add" | "set" => self.tool_config_upsert_command(rest),
+            "help" => {
+                self.state.status = tools_usage();
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_TOOL_SETTINGS));
+                None
+            }
+            _ => {
+                self.state.status = tools_usage();
+                None
+            }
+        }
+    }
+
+    fn dispatch_skills_inline(&mut self, inline_args: &str) -> Option<AppUiCommand> {
+        let args = inline_args.trim();
+        if args.is_empty() {
+            self.open_menu(MenuId::from(crate::menu::registry::MENU_SKILLS));
+            return None;
+        }
+
+        let (verb, rest) = split_first_word(args);
+        match verb {
+            "list" | "installed" | "refresh" => self.profile_skills_list_command(),
+            "search" | "registry" => {
+                let query = rest.trim();
+                if query.is_empty() {
+                    self.state.status = skills_usage();
+                    return None;
+                }
+                self.profile_skills_registry_search_command(query.to_owned())
+            }
+            "install" | "add" => match parse_skill_install_args(rest) {
+                Ok((repo, branch, force)) => {
+                    self.profile_skills_install_command(repo, branch, force)
+                }
+                Err(message) => {
+                    self.state.status = message;
+                    None
+                }
+            },
+            "remove" | "rm" | "uninstall" => {
+                let (name, trailing) = split_first_word(rest);
+                if name.is_empty() || !trailing.trim().is_empty() {
+                    self.state.status = "Usage: /skills remove <name>".into();
+                    return None;
+                }
+                self.profile_skills_remove_command(name.to_owned())
+            }
+            "help" => {
+                self.state.status = skills_usage();
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_SKILLS));
+                None
+            }
+            _ => {
+                self.state.status = skills_usage();
+                None
+            }
+        }
+    }
+
+    fn profile_skills_list_command(&mut self) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_SKILLS_LIST) {
+            return None;
+        }
+        self.state.status = "Refreshing profile skills".into();
+        Some(AppUiCommand::ProfileSkillsList(ProfileSkillsListParams {
+            profile_id: self.current_profile_for_onboarding(),
+        }))
+    }
+
+    fn profile_skills_registry_search_command(&mut self, query: String) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH) {
+            return None;
+        }
+        self.state.status = format!("Searching skill registry for `{query}`");
+        Some(AppUiCommand::ProfileSkillsRegistrySearch(
+            ProfileSkillsRegistrySearchParams {
+                profile_id: self.current_profile_for_onboarding(),
+                q: Some(query),
+            },
+        ))
+    }
+
+    fn profile_skills_install_command(
+        &mut self,
+        repo: String,
+        branch: Option<String>,
+        force: bool,
+    ) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_SKILLS_INSTALL) {
+            return None;
+        }
+        if self.state.readonly {
+            self.state.status = "Read-only mode: profile/skills/install disabled".into();
+            return None;
+        }
+        self.state.status = format!("Installing profile skill from `{repo}`");
+        Some(AppUiCommand::ProfileSkillsInstall(
+            ProfileSkillsInstallParams {
+                profile_id: self.current_profile_for_onboarding(),
+                repo,
+                branch,
+                force,
+            },
+        ))
+    }
+
+    fn profile_skills_remove_command(&mut self, name: String) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_SKILLS_REMOVE) {
+            return None;
+        }
+        if self.state.readonly {
+            self.state.status = "Read-only mode: profile/skills/remove disabled".into();
+            return None;
+        }
+        self.state.status = format!("Removing profile skill `{name}`");
+        Some(AppUiCommand::ProfileSkillsRemove(
+            ProfileSkillsRemoveParams {
+                profile_id: self.current_profile_for_onboarding(),
+                name,
+            },
+        ))
+    }
+
+    fn mcp_config_list_command(&mut self) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_MCP_CONFIG_LIST) {
+            return None;
+        }
+        self.state.status = "Refreshing MCP config".into();
+        Some(AppUiCommand::ListMcpConfig(McpConfigListParams {
+            session_id: self.active_session().map(|session| session.id.clone()),
+            profile_id: self.current_profile_for_onboarding(),
+            include_disabled: true,
+        }))
+    }
+
+    fn mcp_status_list_command(&mut self) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_MCP_STATUS_LIST) {
+            return None;
+        }
+        let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
+            self.state.status = "MCP status requires an open session".into();
+            return None;
+        };
+        self.state.status = "Refreshing MCP status".into();
+        Some(AppUiCommand::ListMcpStatus(
+            crate::model::McpStatusListParams {
+                session_id,
+                include_disabled: true,
+            },
+        ))
+    }
+
+    fn mcp_config_set_enabled_command(
+        &mut self,
+        rest: &str,
+        enabled: bool,
+    ) -> Option<AppUiCommand> {
+        if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_MCP_CONFIG_SET_ENABLED) {
+            return None;
+        }
+        let Some(server) = parse_single_name(rest, "Usage: /mcp enable <server>") else {
+            self.state.status = "Usage: /mcp enable <server>".into();
+            return None;
+        };
+        self.state.status = format!(
+            "{} MCP config `{server}`",
+            if enabled { "Enabling" } else { "Disabling" }
+        );
+        Some(AppUiCommand::SetMcpConfigEnabled(
+            McpConfigSetEnabledParams {
+                profile_id: self.current_profile_for_onboarding(),
+                server,
+                enabled,
+            },
+        ))
+    }
+
+    fn mcp_config_test_command(&mut self, rest: &str) -> Option<AppUiCommand> {
+        if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_MCP_CONFIG_TEST) {
+            return None;
+        }
+        let Some(server) = parse_single_name(rest, "Usage: /mcp test <server>") else {
+            self.state.status = "Usage: /mcp test <server>".into();
+            return None;
+        };
+        self.state.status = format!("Testing MCP config `{server}`");
+        Some(AppUiCommand::TestMcpConfig(McpConfigTestParams {
+            session_id: self.active_session().map(|session| session.id.clone()),
+            profile_id: self.current_profile_for_onboarding(),
+            server,
+        }))
+    }
+
+    fn mcp_config_delete_command(&mut self, rest: &str) -> Option<AppUiCommand> {
+        if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_MCP_CONFIG_DELETE) {
+            return None;
+        }
+        let Some(server) = parse_single_name(rest, "Usage: /mcp delete <server>") else {
+            self.state.status = "Usage: /mcp delete <server>".into();
+            return None;
+        };
+        self.state.status = format!("Deleting MCP config `{server}`");
+        Some(AppUiCommand::DeleteMcpConfig(McpConfigDeleteParams {
+            profile_id: self.current_profile_for_onboarding(),
+            server,
+        }))
+    }
+
+    fn mcp_config_upsert_command(&mut self, rest: &str) -> Option<AppUiCommand> {
+        if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_MCP_CONFIG_UPSERT) {
+            return None;
+        }
+        let Ok((server, config)) = parse_name_and_json(rest, mcp_usage()) else {
+            self.state.status = mcp_usage();
+            return None;
+        };
+        self.state.status = format!("Upserting MCP config `{server}`");
+        Some(AppUiCommand::UpsertMcpConfig(McpConfigUpsertParams {
+            profile_id: self.current_profile_for_onboarding(),
+            server,
+            config,
+            enabled: None,
+        }))
+    }
+
+    fn tool_config_list_command(&mut self) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_TOOL_CONFIG_LIST) {
+            return None;
+        }
+        self.state.status = "Refreshing tool config".into();
+        Some(AppUiCommand::ListToolConfig(ToolConfigListParams {
+            session_id: self.active_session().map(|session| session.id.clone()),
+            profile_id: self.current_profile_for_onboarding(),
+            include_disabled: true,
+        }))
+    }
+
+    fn tool_status_list_command(&mut self) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_TOOL_STATUS_LIST) {
+            return None;
+        }
+        let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
+            self.state.status = "Tool status requires an open session".into();
+            return None;
+        };
+        self.state.status = "Refreshing tool status".into();
+        Some(AppUiCommand::ListToolStatus(
+            crate::model::ToolStatusListParams {
+                session_id,
+                include_denied: true,
+            },
+        ))
+    }
+
+    fn tool_config_set_enabled_command(
+        &mut self,
+        rest: &str,
+        enabled: bool,
+    ) -> Option<AppUiCommand> {
+        if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_TOOL_CONFIG_SET_ENABLED) {
+            return None;
+        }
+        let Some(tool) = parse_single_name(rest, "Usage: /tools enable <tool>") else {
+            self.state.status = "Usage: /tools enable <tool>".into();
+            return None;
+        };
+        self.state.status = format!(
+            "{} tool config `{tool}`",
+            if enabled { "Enabling" } else { "Disabling" }
+        );
+        Some(AppUiCommand::SetToolConfigEnabled(
+            ToolConfigSetEnabledParams {
+                profile_id: self.current_profile_for_onboarding(),
+                tool,
+                enabled,
+            },
+        ))
+    }
+
+    fn tool_config_test_command(&mut self, rest: &str) -> Option<AppUiCommand> {
+        if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_TOOL_CONFIG_TEST) {
+            return None;
+        }
+        let Some(tool) = parse_single_name(rest, "Usage: /tools test <tool>") else {
+            self.state.status = "Usage: /tools test <tool>".into();
+            return None;
+        };
+        self.state.status = format!("Testing tool config `{tool}`");
+        Some(AppUiCommand::TestToolConfig(ToolConfigTestParams {
+            session_id: self.active_session().map(|session| session.id.clone()),
+            profile_id: self.current_profile_for_onboarding(),
+            tool,
+        }))
+    }
+
+    fn tool_config_delete_command(&mut self, rest: &str) -> Option<AppUiCommand> {
+        if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_TOOL_CONFIG_DELETE) {
+            return None;
+        }
+        let Some(tool) = parse_single_name(rest, "Usage: /tools delete <tool>") else {
+            self.state.status = "Usage: /tools delete <tool>".into();
+            return None;
+        };
+        self.state.status = format!("Deleting tool config `{tool}`");
+        Some(AppUiCommand::DeleteToolConfig(ToolConfigDeleteParams {
+            profile_id: self.current_profile_for_onboarding(),
+            tool,
+        }))
+    }
+
+    fn tool_config_upsert_command(&mut self, rest: &str) -> Option<AppUiCommand> {
+        if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_TOOL_CONFIG_UPSERT) {
+            return None;
+        }
+        let Ok((tool, config)) = parse_name_and_json(rest, tools_usage()) else {
+            self.state.status = tools_usage();
+            return None;
+        };
+        self.state.status = format!("Upserting tool config `{tool}`");
+        Some(AppUiCommand::UpsertToolConfig(ToolConfigUpsertParams {
+            profile_id: self.current_profile_for_onboarding(),
+            tool,
+            config,
+            enabled: None,
+        }))
+    }
+
+    fn dispatch_onboarding_action(
+        &mut self,
+        action: OnboardingAction,
+        inline_args: Option<&str>,
+    ) -> Option<AppUiCommand> {
+        if matches!(action, OnboardingAction::Open)
+            && inline_args.is_some_and(|args| !args.trim().is_empty())
+        {
+            return self.dispatch_onboarding_inline(inline_args.unwrap_or_default());
+        }
+
+        match action {
+            OnboardingAction::Open => {
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                None
+            }
+            OnboardingAction::OpenLogin => {
+                if inline_args.is_some_and(|args| !args.trim().is_empty()) {
+                    self.dispatch_login_inline(inline_args.unwrap_or_default())
+                } else {
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_LOGIN));
+                    None
+                }
+            }
+            OnboardingAction::OpenProvider => {
+                if inline_args.is_some_and(|args| !args.trim().is_empty()) {
+                    self.dispatch_provider_inline(inline_args.unwrap_or_default())
+                } else {
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_PROVIDER));
+                    None
+                }
+            }
+            OnboardingAction::SetName(name) => {
+                self.state.onboarding.name = name.trim().to_owned();
+                self.state.onboarding.local_profile_created = false;
+                self.state.onboarding.last_message = Some("Name updated".into());
+                self.state.status = "Onboarding name updated".into();
+                self.refresh_active_menu_and_advance();
+                None
+            }
+            OnboardingAction::SetUsername(username) => {
+                self.state.onboarding.username = username.trim().to_owned();
+                self.state.onboarding.local_profile_created = false;
+                self.state.onboarding.profile_id = None;
+                self.state.onboarding.last_message = Some("Username updated".into());
+                self.state.status = "Onboarding username updated".into();
+                self.refresh_active_menu_and_advance();
+                None
+            }
+            OnboardingAction::SetEmail(email) => {
+                self.state.onboarding.email = email.trim().to_owned();
+                self.state.onboarding.local_profile_created = false;
+                self.state.onboarding.auth_code_sent = false;
+                self.state.onboarding.auth_verified = false;
+                self.state.onboarding.last_message = Some("Email updated".into());
+                self.state.status = "Onboarding email updated".into();
+                self.refresh_active_menu_and_advance();
+                None
+            }
+            OnboardingAction::SetOtpCode(code) => {
+                self.state.onboarding.otp_code = code.trim().to_owned();
+                self.state.onboarding.last_message = Some("OTP code updated".into());
+                self.state.status = "Onboarding OTP code updated".into();
+                self.refresh_active_menu_and_advance();
+                None
+            }
+            OnboardingAction::SetProfileId(profile_id) => {
+                self.state.onboarding.profile_id = non_empty_string(profile_id);
+                self.state.onboarding.last_message = Some("Profile updated".into());
+                self.state.status = "Onboarding profile updated".into();
+                self.refresh_active_menu_and_advance();
+                None
+            }
+            OnboardingAction::SetProviderSelection(selection) => {
+                if self.block_onboarding_provider_edit_if_pending() {
+                    return None;
+                }
+                self.state.onboarding.apply_selection(selection);
+                self.state.status = "Provider route selected; enter API key".into();
+                if self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_ROUTE) {
+                    self.close_all_menus();
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                    self.focus_provider_api_key_row();
+                } else {
+                    self.refresh_active_menu_if_open();
+                    self.focus_provider_api_key_row();
+                }
+                None
+            }
+            OnboardingAction::SetFamilyId(value) => {
+                if self.block_onboarding_provider_edit_if_pending() {
+                    return None;
+                }
+                let from_family_menu =
+                    self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_FAMILY);
+                self.state.onboarding.provider.family_id = value.trim().to_owned();
+                self.state.onboarding.provider.model_id.clear();
+                self.state.onboarding.provider.route = LlmRouteConfig {
+                    api_type: Some("openai".into()),
+                    ..LlmRouteConfig::default()
+                };
+                self.mark_onboarding_provider_dirty("Provider family updated");
+                if from_family_menu {
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
+                }
+                None
+            }
+            OnboardingAction::SetModelId(value) => {
+                if self.block_onboarding_provider_edit_if_pending() {
+                    return None;
+                }
+                let from_model_menu =
+                    self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_MODEL);
+                self.state.onboarding.provider.model_id = value.trim().to_owned();
+                self.state.onboarding.provider.route = LlmRouteConfig {
+                    api_type: Some("openai".into()),
+                    ..LlmRouteConfig::default()
+                };
+                self.mark_onboarding_provider_dirty("Provider model updated");
+                if from_model_menu {
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE));
+                }
+                None
+            }
+            OnboardingAction::SetRouteId(value) => {
+                if self.block_onboarding_provider_edit_if_pending() {
+                    return None;
+                }
+                self.state.onboarding.provider.route.route_id = value.trim().to_owned();
+                self.mark_onboarding_provider_dirty("Provider route updated")
+            }
+            OnboardingAction::SetRouteLabel(value) => {
+                if self.block_onboarding_provider_edit_if_pending() {
+                    return None;
+                }
+                self.state.onboarding.provider.route.label = non_empty_string(value);
+                self.mark_onboarding_provider_dirty("Provider route label updated")
+            }
+            OnboardingAction::SetBaseUrl(value) => {
+                if self.block_onboarding_provider_edit_if_pending() {
+                    return None;
+                }
+                self.state.onboarding.provider.route.base_url = non_empty_string(value);
+                self.mark_onboarding_provider_dirty("Provider base URL updated")
+            }
+            OnboardingAction::SetApiKeyEnv(value) => {
+                if self.block_onboarding_provider_edit_if_pending() {
+                    return None;
+                }
+                self.state.onboarding.provider.route.api_key_env = non_empty_string(value);
+                self.mark_onboarding_provider_dirty("Provider API key env updated")
+            }
+            OnboardingAction::SetApiType(value) => {
+                if self.block_onboarding_provider_edit_if_pending() {
+                    return None;
+                }
+                self.state.onboarding.provider.route.api_type = non_empty_string(value);
+                self.mark_onboarding_provider_dirty("Provider API type updated")
+            }
+            OnboardingAction::SetApiKey(value) => {
+                if self.block_onboarding_provider_edit_if_pending() {
+                    return None;
+                }
+                self.state.onboarding.api_key = Some(value);
+                self.state.onboarding.provider_tested = false;
+                self.state.onboarding.provider_pending = None;
+                self.state.onboarding.provider_save_target = None;
+                self.state.onboarding.last_message = Some("API key updated".into());
+                self.state.status = "Onboarding API key updated".into();
+                self.refresh_active_menu_and_advance();
+                None
+            }
+            OnboardingAction::ClearApiKey => {
+                if self.block_onboarding_provider_edit_if_pending() {
+                    return None;
+                }
+                self.state.onboarding.api_key = None;
+                self.state.onboarding.provider_tested = false;
+                self.state.onboarding.provider_pending = None;
+                self.state.onboarding.provider_save_target = None;
+                self.state.onboarding.last_message = Some("API key cleared".into());
+                self.state.status = "Onboarding API key cleared".into();
+                self.refresh_active_menu_and_advance();
+                None
+            }
+            OnboardingAction::SendCode => self.onboarding_send_code_command(),
+            OnboardingAction::VerifyCode => self.onboarding_verify_code_command(),
+            OnboardingAction::CreateLocalProfile => {
+                self.onboarding_create_local_profile_command(false)
+            }
+            OnboardingAction::RefreshCatalog => self.onboarding_refresh_catalog_command(),
+            OnboardingAction::RefreshProviders => self.onboarding_refresh_providers_command(),
+            OnboardingAction::FetchModels => self.onboarding_fetch_models_command(),
+            OnboardingAction::SaveProvider => self.onboarding_save_provider_command(),
+            OnboardingAction::SaveProviderFallback => {
+                self.onboarding_save_provider_fallback_command()
+            }
+            OnboardingAction::TestProvider => self.onboarding_test_provider_command(),
+            OnboardingAction::Finish => self.onboarding_finish_command(),
+            OnboardingAction::Reset => {
+                self.state.onboarding = Default::default();
+                self.state.status = "Onboarding wizard reset".into();
+                self.refresh_active_menu_if_open();
+                None
+            }
+        }
+    }
+
+    fn dispatch_onboarding_inline(&mut self, args: &str) -> Option<AppUiCommand> {
+        let (verb, rest) = split_first_word(args);
+        let rest = rest.trim();
+        match verb {
+            "" | "open" | "status" => self.dispatch_onboarding_action(OnboardingAction::Open, None),
+            "name" | "display-name" => {
+                self.dispatch_onboarding_action(OnboardingAction::SetName(rest.to_owned()), None)
+            }
+            "username" | "user" => self
+                .dispatch_onboarding_action(OnboardingAction::SetUsername(rest.to_owned()), None),
+            "email" => {
+                self.dispatch_onboarding_action(OnboardingAction::SetEmail(rest.to_owned()), None)
+            }
+            "code" | "otp" => {
+                self.dispatch_onboarding_action(OnboardingAction::SetOtpCode(rest.to_owned()), None)
+            }
+            "profile" | "profile-id" => self
+                .dispatch_onboarding_action(OnboardingAction::SetProfileId(rest.to_owned()), None),
+            "family" | "family-id" => self
+                .dispatch_onboarding_action(OnboardingAction::SetFamilyId(rest.to_owned()), None),
+            "model" | "model-id" => {
+                self.dispatch_onboarding_action(OnboardingAction::SetModelId(rest.to_owned()), None)
+            }
+            "route" | "route-id" => {
+                self.dispatch_onboarding_action(OnboardingAction::SetRouteId(rest.to_owned()), None)
+            }
+            "label" | "route-label" => self
+                .dispatch_onboarding_action(OnboardingAction::SetRouteLabel(rest.to_owned()), None),
+            "base-url" | "url" => {
+                self.dispatch_onboarding_action(OnboardingAction::SetBaseUrl(rest.to_owned()), None)
+            }
+            "api-key-env" | "env" => self
+                .dispatch_onboarding_action(OnboardingAction::SetApiKeyEnv(rest.to_owned()), None),
+            "api-type" => {
+                self.dispatch_onboarding_action(OnboardingAction::SetApiType(rest.to_owned()), None)
+            }
+            "key" | "api-key" => self.dispatch_onboarding_action(
+                OnboardingAction::SetApiKey(SecretString::new(rest)),
+                None,
+            ),
+            "clear-key" => self.dispatch_onboarding_action(OnboardingAction::ClearApiKey, None),
+            "select" => self.onboarding_select_inline(rest),
+            "send-code" | "send" => {
+                self.dispatch_onboarding_action(OnboardingAction::SendCode, None)
+            }
+            "verify" => self.dispatch_onboarding_action(OnboardingAction::VerifyCode, None),
+            "create-profile" | "create-local" | "local-profile" => {
+                self.dispatch_onboarding_action(OnboardingAction::CreateLocalProfile, None)
+            }
+            "catalog" | "refresh-catalog" => {
+                self.dispatch_onboarding_action(OnboardingAction::RefreshCatalog, None)
+            }
+            "providers" | "list" => {
+                self.dispatch_onboarding_action(OnboardingAction::RefreshProviders, None)
+            }
+            "fetch-models" => self.dispatch_onboarding_action(OnboardingAction::FetchModels, None),
+            "save" => self.dispatch_onboarding_action(OnboardingAction::SaveProvider, None),
+            "test" => self.dispatch_onboarding_action(OnboardingAction::TestProvider, None),
+            "finish" | "open-session" => {
+                self.dispatch_onboarding_action(OnboardingAction::Finish, None)
+            }
+            "reset" => self.dispatch_onboarding_action(OnboardingAction::Reset, None),
+            _ => {
+                self.state.status = onboarding_usage();
+                self.push_local_activity(
+                    ActivityKind::Warning,
+                    "onboarding",
+                    "Unknown onboarding command",
+                    Some(onboarding_usage()),
+                );
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                None
+            }
+        }
+    }
+
+    fn dispatch_login_inline(&mut self, args: &str) -> Option<AppUiCommand> {
+        let (verb, rest) = split_first_word(args);
+        let rest = rest.trim();
+        match verb {
+            "" | "open" => {
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_LOGIN));
+                None
+            }
+            "status" => Some(AppUiCommand::AuthStatus(Default::default())),
+            "email" => {
+                self.dispatch_onboarding_action(OnboardingAction::SetEmail(rest.to_owned()), None)
+            }
+            "code" | "otp" => {
+                self.dispatch_onboarding_action(OnboardingAction::SetOtpCode(rest.to_owned()), None)
+            }
+            "send" | "send-code" => {
+                if !rest.is_empty() {
+                    self.dispatch_onboarding_action(
+                        OnboardingAction::SetEmail(rest.to_owned()),
+                        None,
+                    );
+                }
+                self.dispatch_onboarding_action(OnboardingAction::SendCode, None)
+            }
+            "verify" => {
+                if !rest.is_empty() {
+                    self.dispatch_onboarding_action(
+                        OnboardingAction::SetOtpCode(rest.to_owned()),
+                        None,
+                    );
+                }
+                self.dispatch_onboarding_action(OnboardingAction::VerifyCode, None)
+            }
+            "me" | "account" => Some(AppUiCommand::AuthMe(crate::model::AuthMeParams {
+                token: self.state.onboarding.auth_token.clone(),
+            })),
+            "logout" => Some(AppUiCommand::AuthLogout(crate::model::AuthLogoutParams {
+                token: self.state.onboarding.auth_token.clone(),
+            })),
+            _ => {
+                self.state.status = login_usage();
+                self.push_local_activity(
+                    ActivityKind::Warning,
+                    "login",
+                    "Unknown login command",
+                    Some(login_usage()),
+                );
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_LOGIN));
+                None
+            }
+        }
+    }
+
+    fn dispatch_provider_inline(&mut self, args: &str) -> Option<AppUiCommand> {
+        let (verb, rest) = split_first_word(args);
+        let rest = rest.trim();
+        match verb {
+            "" | "open" => {
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_PROVIDER));
+                None
+            }
+            "catalog" | "refresh-catalog" => {
+                self.dispatch_onboarding_action(OnboardingAction::RefreshCatalog, None)
+            }
+            "providers" | "list" => {
+                self.dispatch_onboarding_action(OnboardingAction::RefreshProviders, None)
+            }
+            "select" => self.onboarding_select_inline(rest),
+            "family" | "family-id" => self
+                .dispatch_onboarding_action(OnboardingAction::SetFamilyId(rest.to_owned()), None),
+            "model" | "model-id" => {
+                self.dispatch_onboarding_action(OnboardingAction::SetModelId(rest.to_owned()), None)
+            }
+            "route" | "route-id" => {
+                self.dispatch_onboarding_action(OnboardingAction::SetRouteId(rest.to_owned()), None)
+            }
+            "label" | "route-label" => self
+                .dispatch_onboarding_action(OnboardingAction::SetRouteLabel(rest.to_owned()), None),
+            "base-url" | "url" => {
+                self.dispatch_onboarding_action(OnboardingAction::SetBaseUrl(rest.to_owned()), None)
+            }
+            "api-key-env" | "env" => self
+                .dispatch_onboarding_action(OnboardingAction::SetApiKeyEnv(rest.to_owned()), None),
+            "api-type" => {
+                self.dispatch_onboarding_action(OnboardingAction::SetApiType(rest.to_owned()), None)
+            }
+            "key" | "api-key" => self.dispatch_onboarding_action(
+                OnboardingAction::SetApiKey(SecretString::new(rest)),
+                None,
+            ),
+            "clear-key" => self.dispatch_onboarding_action(OnboardingAction::ClearApiKey, None),
+            "fetch-models" => self.dispatch_onboarding_action(OnboardingAction::FetchModels, None),
+            "test" => self.dispatch_onboarding_action(OnboardingAction::TestProvider, None),
+            "save" => self.dispatch_onboarding_action(OnboardingAction::SaveProvider, None),
+            "fallback" | "save-fallback" | "add-fallback" => {
+                self.dispatch_onboarding_action(OnboardingAction::SaveProviderFallback, None)
+            }
+            _ => {
+                self.state.status = provider_usage();
+                self.push_local_activity(
+                    ActivityKind::Warning,
+                    "provider",
+                    "Unknown provider command",
+                    Some(provider_usage()),
+                );
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_PROVIDER));
+                None
+            }
+        }
+    }
+
+    fn onboarding_select_inline(&mut self, args: &str) -> Option<AppUiCommand> {
+        let parts = args.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 3 {
+            self.state.status =
+                "Usage: /onboard select <family_id> <model_id> <route_id> [base_url] [api_key_env]"
+                    .into();
+            return None;
+        }
+        let selection = LlmSelectionConfig {
+            family_id: parts[0].to_owned(),
+            model_id: parts[1].to_owned(),
+            route: LlmRouteConfig {
+                route_id: parts[2].to_owned(),
+                label: None,
+                base_url: parts.get(3).map(|value| (*value).to_owned()),
+                api_key_env: parts.get(4).map(|value| (*value).to_owned()),
+                api_type: Some("openai".into()),
+            },
+            ..LlmSelectionConfig::default()
+        };
+        self.dispatch_onboarding_action(OnboardingAction::SetProviderSelection(selection), None)
+    }
+
+    fn mark_onboarding_provider_dirty(&mut self, message: &'static str) -> Option<AppUiCommand> {
+        self.state.onboarding.provider_tested = false;
+        self.state.onboarding.provider_pending = None;
+        self.state.onboarding.provider_save_target = None;
+        self.state.onboarding.last_message = Some(message.into());
+        self.state.status = message.into();
+        self.refresh_active_menu_if_open();
+        None
+    }
+
+    fn block_onboarding_provider_edit_if_pending(&mut self) -> bool {
+        let Some(pending) = self.state.onboarding.provider_pending else {
+            return false;
+        };
+        self.state.status = onboarding_pending_status(pending);
+        self.refresh_active_menu_if_open();
+        true
+    }
+
+    fn onboarding_send_code_command(&mut self) -> Option<AppUiCommand> {
+        if self.local_profile_create_supported() {
+            self.state.status =
+                "Local solo onboarding uses profile/local/create; OTP send is hidden".into();
+            return None;
+        }
+        if !self.require_appui_method(crate::model::APPUI_METHOD_AUTH_SEND_CODE) {
+            return None;
+        }
+        if !self.state.onboarding.has_email() {
+            self.state.status = "Onboarding email is empty; use /onboard email <address>".into();
+            return None;
+        }
+        self.state.onboarding.last_message = Some("Sending OTP code".into());
+        Some(AppUiCommand::AuthSendCode(AuthSendCodeParams {
+            email: self.state.onboarding.email.clone(),
+        }))
+    }
+
+    fn onboarding_verify_code_command(&mut self) -> Option<AppUiCommand> {
+        if self.local_profile_create_supported() {
+            self.state.status =
+                "Local solo onboarding uses profile/local/create; OTP verify is hidden".into();
+            return None;
+        }
+        if !self.require_appui_method(crate::model::APPUI_METHOD_AUTH_VERIFY) {
+            return None;
+        }
+        if !self.state.onboarding.has_email() || !self.state.onboarding.has_otp_code() {
+            self.state.status =
+                "Onboarding email or OTP is empty; use /onboard email and /onboard code".into();
+            return None;
+        }
+        self.state.onboarding.last_message = Some("Verifying OTP code".into());
+        Some(AppUiCommand::AuthVerify(AuthVerifyParams {
+            email: self.state.onboarding.email.clone(),
+            code: self.state.onboarding.otp_code.clone(),
+        }))
+    }
+
+    fn onboarding_create_local_profile_command(
+        &mut self,
+        open_session_after_create: bool,
+    ) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE) {
+            return None;
+        }
+        if !self.state.onboarding.local_profile_ready() {
+            self.state.status =
+                "Local profile is incomplete; use /onboard name, /onboard username, and /onboard email"
+                    .into();
+            return None;
+        }
+        self.state.onboarding.open_session_after_profile_create = open_session_after_create;
+        self.state.onboarding.last_message = Some("Creating local solo profile".into());
+        Some(AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
+            name: self.state.onboarding.name.clone(),
+            username: self.state.onboarding.username.clone(),
+            email: self.state.onboarding.email.clone(),
+        }))
+    }
+
+    fn onboarding_refresh_catalog_command(&mut self) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG) {
+            return None;
+        }
+        Some(AppUiCommand::ProfileLlmCatalog(
+            ProfileLlmCatalogParams::default(),
+        ))
+    }
+
+    fn onboarding_refresh_providers_command(&mut self) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_MODEL_LIST) {
+            return None;
+        }
+        Some(AppUiCommand::ProfileLlmList(ProfileLlmListParams {
+            profile_id: self.current_profile_for_onboarding(),
+        }))
+    }
+
+    fn onboarding_fetch_models_command(&mut self) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_LLM_FETCH_MODELS) {
+            return None;
+        }
+        if let Some(pending) = self.state.onboarding.provider_pending {
+            self.state.status = onboarding_pending_status(pending);
+            self.refresh_active_menu_if_open();
+            return None;
+        }
+        let Some(params) = self
+            .state
+            .onboarding
+            .build_fetch_models_params(self.current_profile_for_onboarding().as_deref())
+        else {
+            self.state.status = "Onboarding provider route is incomplete".into();
+            return None;
+        };
+        Some(AppUiCommand::ProfileLlmFetchModels(params))
+    }
+
+    fn onboarding_save_provider_command(&mut self) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT) {
+            return None;
+        }
+        if let Some(pending) = self.state.onboarding.provider_pending {
+            self.state.status = onboarding_pending_status(pending);
+            self.refresh_active_menu_if_open();
+            return None;
+        }
+        let current_profile = self.current_profile_for_onboarding();
+        let Some(params) = self
+            .state
+            .onboarding
+            .build_upsert_params(current_profile.as_deref())
+        else {
+            self.state.status = "Onboarding provider selection is incomplete".into();
+            return None;
+        };
+        if !self.state.onboarding.has_api_key() {
+            self.state.status = "Onboarding API key is empty; use /onboard key <secret>".into();
+            return None;
+        }
+        self.state.onboarding.last_message = Some("Saving provider".into());
+        self.state.onboarding.provider_pending = Some(OnboardingProviderPending::Save);
+        self.state.onboarding.provider_save_target = Some(OnboardingProviderSaveTarget::Primary);
+        self.state.status = "Saving provider configuration".into();
+        self.refresh_active_menu_if_open();
+        Some(AppUiCommand::ProfileLlmUpsert(params))
+    }
+
+    fn onboarding_save_provider_fallback_command(&mut self) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT) {
+            return None;
+        }
+        if let Some(pending) = self.state.onboarding.provider_pending {
+            self.state.status = onboarding_pending_status(pending);
+            self.refresh_active_menu_if_open();
+            return None;
+        }
+        let current_profile = self.current_profile_for_onboarding();
+        let Some(params) = self
+            .state
+            .onboarding
+            .build_fallback_upsert_params(current_profile.as_deref())
+        else {
+            self.state.status = "Onboarding fallback provider selection is incomplete".into();
+            return None;
+        };
+        if !self.state.onboarding.has_api_key() {
+            self.state.status = "Onboarding API key is empty; use /provider key <secret>".into();
+            return None;
+        }
+        self.state.onboarding.last_message = Some("Saving fallback provider".into());
+        self.state.onboarding.provider_pending = Some(OnboardingProviderPending::Save);
+        self.state.onboarding.provider_save_target = Some(OnboardingProviderSaveTarget::Fallback);
+        self.state.status = "Saving fallback provider configuration".into();
+        self.refresh_active_menu_if_open();
+        Some(AppUiCommand::ProfileLlmUpsert(params))
+    }
+
+    fn onboarding_test_provider_command(&mut self) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_LLM_TEST) {
+            return None;
+        }
+        if let Some(pending) = self.state.onboarding.provider_pending {
+            self.state.status = onboarding_pending_status(pending);
+            self.refresh_active_menu_if_open();
+            return None;
+        }
+        let current_profile = self.current_profile_for_onboarding();
+        let Some(params) = self
+            .state
+            .onboarding
+            .build_test_params(current_profile.as_deref())
+        else {
+            self.state.status = "Onboarding provider selection is incomplete".into();
+            return None;
+        };
+        if !self.state.onboarding.has_api_key() {
+            self.state.status = "Onboarding API key is empty; use /onboard key <secret>".into();
+            return None;
+        }
+        self.state.onboarding.last_message = Some("Testing provider".into());
+        self.state.onboarding.provider_pending = Some(OnboardingProviderPending::Test);
+        self.state.status = "Testing provider connection".into();
+        self.refresh_active_menu_if_open();
+        Some(AppUiCommand::ProfileLlmTest(params))
+    }
+
+    fn onboarding_finish_command(&mut self) -> Option<AppUiCommand> {
+        if let Some(pending) = self.state.onboarding.provider_pending {
+            self.state.status = onboarding_pending_status(pending);
+            self.refresh_active_menu_if_open();
+            return None;
+        }
+        if self.local_profile_create_supported()
+            && self.state.onboarding.profile_id.is_none()
+            && !self.state.onboarding.local_profile_created
+            && self.state.onboarding.local_profile_ready()
+        {
+            return self.onboarding_create_local_profile_command(true);
+        }
+
+        let Some(profile_id) = self.current_profile_for_onboarding() else {
+            if self.local_profile_create_supported() {
+                return self.onboarding_create_local_profile_command(true);
+            }
+            self.state.status =
+                "Cannot open session: profile unresolved. Use /onboard profile <profile_id>."
+                    .into();
+            return None;
+        };
+        if let Some(reason) = self.open_session_provider_block_reason(&profile_id) {
+            self.state.status = reason;
+            self.refresh_active_menu_if_open();
+            return None;
+        }
+        let session_id =
+            octos_core::SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding");
+        self.state.status = format!("Opening coding session for profile {profile_id}");
+        Some(AppUiCommand::OpenSession(SessionOpenParams {
+            session_id,
+            profile_id: Some(profile_id),
+            cwd: onboarding_workspace_cwd(&self.state.workspace.root),
+            after: None,
+        }))
+    }
+
+    fn current_profile_for_onboarding(&self) -> Option<String> {
+        let runtime_profile = self.active_session().and_then(|session| {
+            self.state
+                .runtime_status_for(&session.id)
+                .and_then(|status| status.profile_id.as_deref())
+                .or(session.profile_id.as_deref())
+        });
+        self.state
+            .onboarding
+            .effective_profile_id(runtime_profile)
+            .or_else(|| {
+                self.state
+                    .profile_llm_state
+                    .as_ref()
+                    .and_then(|state| non_empty_string(state.profile_id.as_deref()?.to_owned()))
+            })
+            .or_else(|| {
+                self.state
+                    .profile_skills
+                    .as_ref()
+                    .and_then(|state| non_empty_string(state.profile_id.as_deref()?.to_owned()))
+            })
+            .or_else(|| {
+                self.state
+                    .profile_skill_registry
+                    .as_ref()
+                    .and_then(|state| non_empty_string(state.profile_id.as_deref()?.to_owned()))
+            })
+    }
+
+    fn open_session_provider_block_reason(&self, profile_id: &str) -> Option<String> {
+        if let Some(pending) = self.state.onboarding.provider_pending {
+            return Some(onboarding_pending_status(pending));
+        }
+        if self.profile_has_saved_primary_provider(profile_id) {
+            return None;
+        }
+        Some("Cannot open session: save a primary LLM provider first.".into())
+    }
+
+    fn profile_has_saved_primary_provider(&self, profile_id: &str) -> bool {
+        self.state.onboarding.provider_saved
+            || self
+                .state
+                .profile_llm_state
+                .as_ref()
+                .filter(|state| {
+                    state
+                        .profile_id
+                        .as_deref()
+                        .is_none_or(|state_profile| state_profile == profile_id)
+                })
+                .and_then(|state| state.primary_provider())
+                .is_some_and(|provider| provider.has_api_key)
+    }
+
+    fn local_profile_create_supported(&self) -> bool {
+        self.state
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                capabilities.supports_method(crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE)
+            })
+    }
+
+    fn profile_llm_catalog_supported(&self) -> bool {
+        self.state
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                capabilities.supports_method(crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG)
+            })
+    }
+
+    fn active_menu_id_is(&self, id: &str) -> bool {
+        self.state
+            .menu_stack
+            .active()
+            .is_some_and(|frame| frame.id.as_str() == id)
+    }
+
+    fn require_appui_method(&mut self, method: &'static str) -> bool {
+        if self
+            .state
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.supports_method(method))
+        {
+            return true;
+        }
+        self.state.status = format!("AppUI method `{method}` is not advertised");
+        false
+    }
+
+    fn require_mutating_appui_method(&mut self, method: &'static str) -> bool {
+        if self.state.readonly {
+            self.state.status = format!("Read-only mode: {method} disabled");
+            return false;
+        }
+        self.require_appui_method(method)
     }
 
     pub fn open_menu(&mut self, id: MenuId) {
@@ -287,6 +1563,50 @@ impl Store {
         true
     }
 
+    fn advance_active_menu_selection(&mut self) -> bool {
+        let len = active_menu_item_len(self.state.active_menu.as_ref());
+        let Some(frame) = self.state.menu_stack.active_mut() else {
+            return false;
+        };
+        if len == 0 {
+            return false;
+        }
+        let next_index = (frame.selected_index + 1).min(len.saturating_sub(1));
+        if next_index == frame.selected_index {
+            return false;
+        }
+        frame.selected_index = next_index;
+        self.refresh_active_menu();
+        true
+    }
+
+    fn select_active_menu_item_by_id(&mut self, item_id: &str) -> bool {
+        let Some(index) = self.state.active_menu.as_ref().and_then(|menu| match menu {
+            MenuBuildResult::Ready(spec) => spec.items.iter().position(|item| item.id == item_id),
+            MenuBuildResult::Loading(_)
+            | MenuBuildResult::Unavailable(_)
+            | MenuBuildResult::Error(_) => None,
+        }) else {
+            return false;
+        };
+        let Some(frame) = self.state.menu_stack.active_mut() else {
+            return false;
+        };
+        frame.selected_index = index;
+        self.refresh_active_menu();
+        true
+    }
+
+    fn focus_provider_api_key_row(&mut self) -> bool {
+        self.select_active_menu_item_by_id("onboard.provider.key")
+            || self.select_active_menu_item_by_id("provider.key")
+    }
+
+    fn focus_provider_start_row(&mut self) -> bool {
+        self.select_active_menu_item_by_id("onboard.provider.family")
+            || self.select_active_menu_item_by_id("provider.current")
+    }
+
     pub fn accept_active_menu_item(&mut self) -> Option<AppUiCommand> {
         let selected_index = self
             .state
@@ -327,7 +1647,7 @@ impl Store {
                 self.close_all_menus();
                 None
             }
-            MenuAction::Local(action) => self.dispatch_local_action(action),
+            MenuAction::Local(action) => self.dispatch_local_action(action, None),
             MenuAction::SendAppUi(command) => Some(command),
             MenuAction::SubmitPrompt(prompt) => {
                 self.start_prompt_turn(prompt, "Queued menu prompt")
@@ -351,7 +1671,10 @@ impl Store {
             theme_name: None,
             selected_path: &path,
         };
-        let result = core_menu_registry().build(&frame.id, &ctx);
+        let result = filter_menu_result_for_search(
+            core_menu_registry().build(&frame.id, &ctx),
+            &frame.search_query,
+        );
         let len = active_menu_item_len(Some(&result));
         if len > 0
             && let Some(frame) = self.state.menu_stack.active_mut()
@@ -367,17 +1690,81 @@ impl Store {
         }
     }
 
+    fn refresh_active_menu_and_advance(&mut self) {
+        if self.state.menu_stack.is_active() {
+            self.refresh_active_menu();
+            self.advance_active_menu_selection();
+        }
+    }
+
     fn menu_app_snapshot(&self) -> MenuAppSnapshot<'_> {
         let selected_session = self.state.active_session();
         let selected_task = self.state.active_task();
+        let runtime_status =
+            selected_session.and_then(|session| self.state.runtime_status_for(&session.id));
+        let model_catalog =
+            selected_session.and_then(|session| self.state.model_catalog_for(&session.id));
+        let mcp_catalog =
+            selected_session.and_then(|session| self.state.mcp_catalog_for(&session.id));
+        let tool_catalog =
+            selected_session.and_then(|session| self.state.tool_catalog_for(&session.id));
+        let current_model = runtime_status.and_then(|status| {
+            status
+                .model
+                .as_ref()
+                .map(|model| model.model.as_str())
+                .or_else(|| {
+                    status
+                        .runtime_policy_stamp
+                        .as_ref()
+                        .and_then(|stamp| stamp.model.as_deref())
+                })
+        });
+        let current_profile = runtime_status
+            .and_then(|status| {
+                status.profile_id.as_deref().or_else(|| {
+                    status
+                        .runtime_policy_stamp
+                        .as_ref()
+                        .and_then(|stamp| stamp.profile_id.as_deref())
+                })
+            })
+            .or_else(|| selected_session.and_then(|session| session.profile_id.as_deref()))
+            .or(self.state.onboarding.profile_id.as_deref())
+            .or_else(|| {
+                self.state
+                    .profile_llm_state
+                    .as_ref()
+                    .and_then(|state| state.profile_id.as_deref())
+            })
+            .or_else(|| {
+                self.state
+                    .profile_skills
+                    .as_ref()
+                    .and_then(|state| state.profile_id.as_deref())
+            });
+        let cwd = runtime_status
+            .and_then(|status| status.workspace_root.as_deref().or(status.cwd.as_deref()))
+            .or(Some(self.state.workspace.root.as_str()));
         MenuAppSnapshot {
             status: Some(self.state.status.as_str()),
             target: self.state.target.as_deref(),
-            cwd: Some(self.state.workspace.root.as_str()),
-            current_model: None,
-            current_profile: selected_session.and_then(|session| session.profile_id.as_deref()),
+            cwd,
+            current_model,
+            current_profile,
             permission_profile: selected_session
                 .and_then(|session| self.state.permission_profile_for(&session.id)),
+            runtime_status,
+            model_catalog,
+            profile_llm_catalog: self.state.profile_llm_catalog.as_ref(),
+            profile_llm_state: self.state.profile_llm_state.as_ref(),
+            profile_skills: self.state.profile_skills.as_ref(),
+            profile_skill_registry: self.state.profile_skill_registry.as_ref(),
+            mcp_catalog,
+            tool_catalog,
+            mcp_config_catalog: self.state.mcp_config_catalog.as_ref(),
+            tool_config_catalog: self.state.tool_config_catalog.as_ref(),
+            onboarding: Some(&self.state.onboarding),
             selected_session_id: selected_session.map(|session| &session.id),
             selected_session_title: selected_session.map(|session| session.title.as_str()),
             selected_task_title: selected_task.map(|task| task.title.as_str()),
@@ -490,6 +1877,9 @@ impl Store {
             session_id,
             turn_id,
             input: vec![InputItem::Text { text: prompt }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
         }))
     }
 
@@ -704,9 +2094,10 @@ impl Store {
             self.state.status = format!("Staged selected diff hunk context for next turn: {path}");
         } else {
             if !self.state.composer.trim().is_empty() {
-                self.state.composer.push_str("\n\n");
+                self.state.composer_cursor = None;
+                self.state.insert_composer_text("\n\n");
             }
-            self.state.composer.push_str(&prompt);
+            self.state.insert_composer_text(&prompt);
             self.state.status = format!("Added selected diff hunk context to composer: {path}");
         }
 
@@ -717,14 +2108,185 @@ impl Store {
     pub fn apply_client_event(&mut self, event: ClientEvent) -> Option<AppUiCommand> {
         match event {
             ClientEvent::App(event) => self.apply_event(*event),
+            ClientEvent::Capabilities(event) => {
+                self.apply_capabilities_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
             ClientEvent::DiffPreview(result) => {
                 self.apply_diff_preview_result(result);
                 None
+            }
+            ClientEvent::ModelList(event) => {
+                self.apply_model_list_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::ModelSelect(event) => {
+                self.apply_model_select_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::McpStatus(event) => {
+                self.apply_mcp_status_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::McpConfigList(event) => {
+                self.apply_mcp_config_list_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::McpConfigMutation(event) => {
+                self.apply_mcp_config_mutation_event(event);
+                self.refresh_active_menu_if_open();
+                self.mcp_config_list_command()
             }
             ClientEvent::PermissionProfile(event) => {
                 self.apply_permission_profile_event(event);
                 self.refresh_active_menu_if_open();
                 None
+            }
+            ClientEvent::AuthStatus(event) => {
+                self.state.onboarding.apply_auth_status(&event.result);
+                self.state.push_activity(ActivityItem::new(
+                    ActivityKind::Progress,
+                    "auth",
+                    event.message.clone(),
+                ));
+                self.state.onboarding.last_message = Some(event.message.clone());
+                self.state.status = event.message;
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::AuthSendCode(event) => {
+                self.state.onboarding.auth_code_sent = event.result.ok;
+                self.state.onboarding.last_message = Some(event.message.clone());
+                self.state.push_activity(ActivityItem::new(
+                    ActivityKind::Progress,
+                    "auth",
+                    event.message.clone(),
+                ));
+                self.state.status = event.message;
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::AuthVerify(event) => {
+                self.state.onboarding.apply_auth_verify(&event.result);
+                let follow_up = event.result.ok.then(|| {
+                    AppUiCommand::AuthMe(crate::model::AuthMeParams {
+                        token: self.state.onboarding.auth_token.clone(),
+                    })
+                });
+                self.state.onboarding.last_message = Some(event.message.clone());
+                self.state.push_activity(ActivityItem::new(
+                    ActivityKind::Progress,
+                    "auth",
+                    event.message.clone(),
+                ));
+                self.state.status = event.message;
+                self.refresh_active_menu_if_open();
+                follow_up
+            }
+            ClientEvent::AuthMe(event) => {
+                self.state.onboarding.apply_auth_me(&event.result);
+                self.state.onboarding.last_message = Some(event.message.clone());
+                self.state.push_activity(ActivityItem::new(
+                    ActivityKind::Progress,
+                    "auth",
+                    event.message.clone(),
+                ));
+                self.state.status = event.message;
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::AuthLogout(event) => {
+                if event.result.ok {
+                    self.state.onboarding.auth_verified = false;
+                    self.state.onboarding.auth_token = None;
+                }
+                self.state.onboarding.last_message = Some(event.message.clone());
+                self.state.push_activity(ActivityItem::new(
+                    ActivityKind::Progress,
+                    "auth",
+                    event.message.clone(),
+                ));
+                self.state.status = event.message;
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::ProfileLocalCreate(event) => {
+                self.state
+                    .onboarding
+                    .apply_profile_local_create(&event.result);
+                let open_session = self.state.onboarding.open_session_after_profile_create;
+                self.state.onboarding.open_session_after_profile_create = false;
+                self.state.onboarding.last_message = Some(event.message.clone());
+                self.state.push_activity(ActivityItem::new(
+                    ActivityKind::Progress,
+                    "local profile",
+                    event.message.clone(),
+                ));
+                self.state.status = event.message;
+                self.refresh_active_menu_if_open();
+                let follow_up = open_session
+                    .then(|| self.onboarding_finish_command())
+                    .flatten();
+                follow_up.or_else(|| {
+                    self.profile_llm_catalog_supported().then(|| {
+                        AppUiCommand::ProfileLlmCatalog(ProfileLlmCatalogParams::default())
+                    })
+                })
+            }
+            ClientEvent::ProfileLlmCatalog(event) => {
+                self.apply_profile_llm_catalog_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::ProfileLlmList(event) => {
+                self.apply_profile_llm_list_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::ProfileLlmMutation(event) => {
+                self.apply_profile_llm_mutation_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::ProfileSkillsList(event) => {
+                self.apply_profile_skills_list_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::ProfileSkillsRegistrySearch(event) => {
+                self.apply_profile_skills_registry_search_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::ProfileSkillsMutation(event) => {
+                self.apply_profile_skills_mutation_event(event);
+                self.refresh_active_menu_if_open();
+                self.profile_skills_list_command()
+            }
+            ClientEvent::SessionStatus(event) => {
+                self.apply_session_status_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::ToolStatus(event) => {
+                self.apply_tool_status_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::ToolConfigList(event) => {
+                self.apply_tool_config_list_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::ToolConfigMutation(event) => {
+                self.apply_tool_config_mutation_event(event);
+                self.refresh_active_menu_if_open();
+                self.tool_config_list_command()
             }
         }
     }
@@ -740,20 +2302,42 @@ impl Store {
                 let expanded_tool_outputs = self.state.expanded_tool_outputs;
                 let menu_stack = self.state.menu_stack.clone();
                 let previous_capabilities = self.state.capabilities.clone();
+                let onboarding = self.state.onboarding.clone();
                 let permission_profiles = self.state.permission_profiles.clone();
+                let session_runtime_statuses = self.state.session_runtime_statuses.clone();
+                let profile_llm_catalog = self.state.profile_llm_catalog.clone();
+                let profile_llm_state = self.state.profile_llm_state.clone();
+                let profile_skills = self.state.profile_skills.clone();
+                let profile_skill_registry = self.state.profile_skill_registry.clone();
+                let session_model_catalogs = self.state.session_model_catalogs.clone();
+                let session_mcp_catalogs = self.state.session_mcp_catalogs.clone();
+                let session_tool_catalogs = self.state.session_tool_catalogs.clone();
+                let mcp_config_catalog = self.state.mcp_config_catalog.clone();
+                let tool_config_catalog = self.state.tool_config_catalog.clone();
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
                     state.capabilities = previous_capabilities;
                 }
-                state.composer = composer;
+                state.set_composer_text(composer);
                 state.composer_drafts = composer_drafts;
                 state.pending_messages = pending_messages;
                 state.optimistic_user_messages = optimistic_user_messages;
                 state.approval_auto_open = approval_auto_open;
                 state.expanded_tool_outputs = expanded_tool_outputs;
                 state.menu_stack = menu_stack;
+                state.onboarding = onboarding;
                 state.permission_profiles = permission_profiles;
+                state.session_runtime_statuses = session_runtime_statuses;
+                state.profile_llm_catalog = profile_llm_catalog;
+                state.profile_llm_state = profile_llm_state;
+                state.profile_skills = profile_skills;
+                state.profile_skill_registry = profile_skill_registry;
+                state.session_model_catalogs = session_model_catalogs;
+                state.session_mcp_catalogs = session_mcp_catalogs;
+                state.session_tool_catalogs = session_tool_catalogs;
+                state.mcp_config_catalog = mcp_config_catalog;
+                state.tool_config_catalog = tool_config_catalog;
                 state.restore_optimistic_user_messages();
                 self.state = state;
                 None
@@ -799,12 +2383,343 @@ impl Store {
         self.state.status = format!("Diff preview {status}: {title} ({file_count} files)");
     }
 
+    fn apply_capabilities_event(&mut self, event: CapabilitiesClientEvent) {
+        self.state.set_capabilities(event.result.capabilities);
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "capabilities",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+        self.maybe_open_onboarding_on_first_launch();
+    }
+
+    fn maybe_open_onboarding_on_first_launch(&mut self) {
+        if !self.state.sessions.is_empty() || self.state.menu_stack.is_active() {
+            return;
+        }
+
+        let supports_onboarding = self
+            .state
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                crate::menu::registry::APPUI_ONBOARDING_METHODS_ANY
+                    .iter()
+                    .any(|method| capabilities.supports_method(method))
+            });
+        if supports_onboarding {
+            self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        }
+    }
+
+    fn apply_model_list_event(&mut self, event: ModelListClientEvent) {
+        let result = event.result;
+        self.state.set_model_catalog(SessionModelCatalog {
+            session_id: result.session_id,
+            models: result.models,
+        });
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "models",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
+    fn apply_model_select_event(&mut self, event: ModelSelectClientEvent) {
+        let result = event.result;
+        if let Some(status) = self
+            .state
+            .session_runtime_statuses
+            .iter_mut()
+            .find(|status| status.session_id == result.session_id)
+        {
+            status.model = Some(result.selected.clone());
+            if let Some(stamp) = result.runtime_policy_stamp.clone() {
+                status.runtime_policy_stamp = Some(stamp);
+            }
+        }
+        if let Some(catalog) = self
+            .state
+            .session_model_catalogs
+            .iter_mut()
+            .find(|catalog| catalog.session_id == result.session_id)
+        {
+            for model in &mut catalog.models {
+                model.selected = model.model == result.selected.model
+                    && model.provider == result.selected.provider;
+            }
+            if !catalog.models.iter().any(|model| {
+                model.model == result.selected.model && model.provider == result.selected.provider
+            }) {
+                catalog.models.push(result.selected);
+            }
+        }
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "model",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
+    fn apply_mcp_status_event(&mut self, event: McpStatusClientEvent) {
+        let result = event.result;
+        self.state.set_mcp_catalog(SessionMcpCatalog {
+            session_id: result.session_id,
+            servers: result.servers,
+        });
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "mcp",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
+    fn apply_mcp_config_list_event(&mut self, event: McpConfigListClientEvent) {
+        self.state.mcp_config_catalog = Some(event.result);
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "mcp config",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
+    fn apply_mcp_config_mutation_event(&mut self, event: McpConfigMutationClientEvent) {
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "mcp config",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
     fn apply_permission_profile_event(&mut self, event: PermissionProfileClientEvent) {
         self.state
             .set_permission_profile(event.session_id, event.current);
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
             "permissions",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
+    fn apply_profile_llm_catalog_event(&mut self, event: ProfileLlmCatalogClientEvent) {
+        self.state.profile_llm_catalog = Some(event.result);
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "provider catalog",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
+    fn apply_profile_llm_list_event(&mut self, event: ProfileLlmListClientEvent) {
+        if self.state.onboarding.profile_id.is_none() {
+            if let Some(profile_id) = event
+                .result
+                .profile_id
+                .as_deref()
+                .and_then(|profile_id| non_empty_string(profile_id.to_owned()))
+            {
+                self.state.onboarding.profile_id = Some(profile_id);
+            }
+        }
+        self.state.profile_llm_state = Some(event.result.clone());
+        if let Some(session_id) = self.active_session().map(|session| session.id.clone()) {
+            self.state.set_model_catalog(SessionModelCatalog {
+                session_id,
+                models: event.result.models(),
+            });
+        }
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "providers",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
+    fn apply_profile_llm_mutation_event(&mut self, event: ProfileLlmMutationClientEvent) {
+        let pending = self.state.onboarding.provider_pending.take();
+        let save_target = self.state.onboarding.provider_save_target.take();
+        let staged_provider_label = self.state.onboarding.provider_label();
+        let mut reset_staged_provider = false;
+        if event.result.applied {
+            if profile_llm_list_has_provider_state(&event.result.to_list_result()) {
+                self.state.profile_llm_state = Some(event.result.to_list_result());
+            }
+            match pending {
+                Some(OnboardingProviderPending::Test) => {
+                    self.state.onboarding.provider_tested = true;
+                }
+                Some(OnboardingProviderPending::Save) => {
+                    match save_target.unwrap_or(OnboardingProviderSaveTarget::Primary) {
+                        OnboardingProviderSaveTarget::Primary => {
+                            self.state.onboarding.provider_saved = true;
+                            self.state.onboarding.provider_tested = true;
+                            self.state.onboarding.saved_primary_provider_label =
+                                Some(staged_provider_label.clone());
+                        }
+                        OnboardingProviderSaveTarget::Fallback => {
+                            self.state.onboarding.provider_tested = false;
+                            reset_staged_provider = true;
+                        }
+                    }
+                    self.state.onboarding.last_saved_provider_label =
+                        Some(staged_provider_label.clone());
+                    self.state.onboarding.last_saved_provider_target =
+                        Some(save_target.unwrap_or(OnboardingProviderSaveTarget::Primary));
+                }
+                None => {
+                    self.state.onboarding.provider_saved = true;
+                    self.state.onboarding.provider_tested = true;
+                    self.state.onboarding.saved_primary_provider_label =
+                        Some(staged_provider_label.clone());
+                    self.state.onboarding.last_saved_provider_label =
+                        Some(staged_provider_label.clone());
+                    self.state.onboarding.last_saved_provider_target =
+                        Some(OnboardingProviderSaveTarget::Primary);
+                }
+            }
+            if reset_staged_provider {
+                self.state.onboarding.reset_staged_provider();
+            }
+            self.state.onboarding.last_message = Some(event.message.clone());
+        } else if pending.is_some() {
+            self.state.onboarding.last_message = Some(event.message.clone());
+        }
+        if let Some(session_id) = self.active_session().map(|session| session.id.clone()) {
+            let models = event.result.models();
+            self.state
+                .set_model_catalog(SessionModelCatalog { session_id, models });
+        }
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "providers",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+        if reset_staged_provider {
+            self.refresh_active_menu_if_open();
+            self.focus_provider_start_row();
+        } else if event.result.applied && pending.is_some() {
+            self.refresh_active_menu_and_advance();
+        } else {
+            self.refresh_active_menu_if_open();
+        }
+    }
+
+    fn apply_profile_skills_list_event(&mut self, event: ProfileSkillsListClientEvent) {
+        if self.state.onboarding.profile_id.is_none() {
+            if let Some(profile_id) = event
+                .result
+                .profile_id
+                .as_deref()
+                .and_then(|profile_id| non_empty_string(profile_id.to_owned()))
+            {
+                self.state.onboarding.profile_id = Some(profile_id);
+            }
+        }
+        self.state.profile_skills = Some(event.result);
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "skills",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
+    fn apply_profile_skills_registry_search_event(
+        &mut self,
+        event: ProfileSkillsRegistrySearchClientEvent,
+    ) {
+        if self.state.onboarding.profile_id.is_none() {
+            if let Some(profile_id) = event
+                .result
+                .profile_id
+                .as_deref()
+                .and_then(|profile_id| non_empty_string(profile_id.to_owned()))
+            {
+                self.state.onboarding.profile_id = Some(profile_id);
+            }
+        }
+        self.state.profile_skill_registry = Some(event.result);
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "skill registry",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
+    fn apply_profile_skills_mutation_event(&mut self, event: ProfileSkillsMutationClientEvent) {
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "skills",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
+    fn apply_session_status_event(&mut self, event: SessionStatusClientEvent) {
+        if let Some(capabilities) = event.result.capabilities.clone() {
+            self.state.set_capabilities(capabilities);
+        }
+        if let Some(profile_id) = event.result.profile_id.as_deref() {
+            if let Some(session) = self
+                .state
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == event.result.session_id)
+            {
+                session.profile_id = Some(profile_id.to_owned());
+            }
+        }
+        let message = event.message;
+        self.state
+            .set_runtime_status(SessionRuntimeStatus::from(event.result));
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "runtime status",
+            message.clone(),
+        ));
+        self.state.status = message;
+    }
+
+    fn apply_tool_status_event(&mut self, event: ToolStatusClientEvent) {
+        let result = event.result;
+        self.state.set_tool_catalog(SessionToolCatalog {
+            session_id: result.session_id,
+            policy_id: result.policy_id,
+            tools: result.tools,
+        });
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "tools",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
+    fn apply_tool_config_list_event(&mut self, event: ToolConfigListClientEvent) {
+        self.state.tool_config_catalog = Some(event.result);
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "tool config",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
+    fn apply_tool_config_mutation_event(&mut self, event: ToolConfigMutationClientEvent) {
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "tool config",
             event.message.clone(),
         ));
         self.state.status = event.message;
@@ -852,7 +2767,9 @@ impl Store {
         if let Some((operation, path, preview_id)) = diff_preview_request {
             let request_already_in_flight = self.state.diff_preview.loading
                 && self.state.diff_preview.requested_preview_id.as_ref() == Some(&preview_id);
-            self.state.diff_preview.open_loading(preview_id.clone());
+            self.state
+                .diff_preview
+                .open_loading_for_turn(preview_id.clone(), event.turn_id.clone());
             self.state.status = format!("Opening diff preview: {operation} {path}");
             if !request_already_in_flight {
                 return Some(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
@@ -921,6 +2838,7 @@ impl Store {
                 turn_id,
                 text,
             }) => {
+                let follow_tail = self.state.transcript_scroll == 0;
                 let mut reset_scroll = false;
                 if let Some(session) = self.find_session_mut(&session_id) {
                     if let Some(live_reply) = session.live_reply.as_mut() {
@@ -930,8 +2848,12 @@ impl Store {
                         }
                     }
                 }
-                if reset_scroll {
+                if reset_scroll && follow_tail {
                     self.state.scroll_transcript_to_latest();
+                } else if reset_scroll {
+                    self.state.preserve_transcript_position_after_append(
+                        text.lines().count().saturating_sub(1),
+                    );
                 }
                 None
             }
@@ -1027,6 +2949,7 @@ impl Store {
                 let mut approval = ApprovalModalState::from_event(event);
                 approval.visible = self.state.approval_auto_open;
                 let diff_preview_id = approval.diff_preview_id();
+                let diff_preview_turn_id = approval.turn_id.clone();
                 self.state.approval = Some(approval);
                 self.state.focus = FocusPane::Composer;
                 self.state.set_run_state_blocked(title.clone());
@@ -1035,7 +2958,9 @@ impl Store {
                     let request_already_in_flight = self.state.diff_preview.loading
                         && self.state.diff_preview.requested_preview_id.as_ref()
                             == Some(&preview_id);
-                    self.state.diff_preview.open_loading(preview_id.clone());
+                    self.state
+                        .diff_preview
+                        .open_loading_for_turn(preview_id.clone(), Some(diff_preview_turn_id));
                     self.state.status = format!("Opening inline diff preview: {title}");
                     if !request_already_in_flight {
                         return Some(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
@@ -1073,7 +2998,93 @@ impl Store {
             UiNotification::ApprovalCancelled(event) => self.apply_approval_cancelled(event),
             UiNotification::ProgressUpdated(event) => self.apply_progress(event),
             UiNotification::ReplayLossy(event) => self.apply_replay_lossy(event),
+            UiNotification::MessagePersisted(event) => self.apply_message_persisted(event),
+            UiNotification::TurnSpawnComplete(event) => self.apply_turn_spawn_complete(event),
+            UiNotification::FileAttached(event) => self.apply_file_attached(event),
+            UiNotification::SessionEventBridged(event) => self.apply_session_event_bridged(event),
+            UiNotification::RouterStatus(event) => {
+                self.state.status = format!(
+                    "Router {} using {} ({})",
+                    event.mode, event.provider_name, event.session_id.0
+                );
+                None
+            }
+            UiNotification::RouterFailover(event) => {
+                self.state.push_activity(
+                    ActivityItem::new(ActivityKind::Warning, "Router failover", event.reason)
+                        .with_detail(format!(
+                            "{} -> {} in {}ms",
+                            event.from_provider, event.to_provider, event.elapsed_ms
+                        )),
+                );
+                self.state.status = format!("Router failover to {}", event.to_provider);
+                None
+            }
+            UiNotification::QueueState(event) => {
+                self.state.status = if event.pending_count == 0 {
+                    "Queue empty".into()
+                } else {
+                    format!("Queue pending: {}", event.pending_count)
+                };
+                None
+            }
         }
+    }
+
+    fn apply_turn_spawn_complete(
+        &mut self,
+        event: octos_core::ui_protocol::TurnSpawnCompleteEvent,
+    ) -> Option<AppUiCommand> {
+        if let Some(session) = self.find_session_mut(&event.session_id) {
+            session
+                .messages
+                .push(Message::assistant(event.content.clone()));
+        }
+        self.state.push_activity(
+            ActivityItem::new(ActivityKind::Progress, event.task_id.clone(), "completed")
+                .with_detail(event.source),
+        );
+        self.state.status = format!("Background completion persisted: {}", event.message_id);
+        None
+    }
+
+    fn apply_file_attached(
+        &mut self,
+        event: octos_core::ui_protocol::FileAttachedEvent,
+    ) -> Option<AppUiCommand> {
+        self.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, event.path.clone(), "attached")
+                .with_turn(event.turn_id)
+                .with_detail(event.mime.unwrap_or_else(|| "artifact".into())),
+        );
+        self.state.status = format!("File attached: {}", event.path);
+        None
+    }
+
+    fn apply_session_event_bridged(
+        &mut self,
+        event: octos_core::ui_protocol::SessionEventBridgedEvent,
+    ) -> Option<AppUiCommand> {
+        self.state.push_activity(
+            ActivityItem::new(ActivityKind::Progress, event.kind.clone(), "bridged")
+                .with_detail("legacy session event"),
+        );
+        self.state.status = format!("Session event: {}", event.kind);
+        None
+    }
+
+    fn apply_message_persisted(&mut self, event: MessagePersistedEvent) -> Option<AppUiCommand> {
+        let attachment_count = event.media.len();
+        let attachment_hint = match attachment_count {
+            0 => String::new(),
+            1 => " with 1 attachment".into(),
+            count => format!(" with {count} attachments"),
+        };
+        self.state.status = format!(
+            "Persisted {} message seq {}{}",
+            event.role, event.seq, attachment_hint
+        );
+        None
     }
 
     fn apply_approval_auto_resolved(
@@ -1207,7 +3218,11 @@ impl Store {
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
         let seq = event.cursor.map(|cursor| cursor.seq).unwrap_or(0);
+        let follow_tail = self.state.transcript_scroll == 0;
         let complete_live_plan = self.turn_had_completion_activity(&event.turn_id);
+        let fallback_summary = self.turn_completion_fallback_message(&event.turn_id);
+        let partial_fallback_summary =
+            self.turn_partial_completion_fallback_message(&event.turn_id);
         let (status, reset_scroll, completed_current_turn) = {
             let Some(session) = self.find_session_mut(&event.session_id) else {
                 return None;
@@ -1215,7 +3230,16 @@ impl Store {
             let title = session.title.clone();
             match session.live_reply.take() {
                 Some(live_reply) if live_reply.turn_id == event.turn_id => {
-                    let text = if complete_live_plan {
+                    let text = if live_reply.text.trim().is_empty() {
+                        fallback_summary
+                    } else if complete_live_plan && looks_like_partial_live_answer(&live_reply.text)
+                    {
+                        format!(
+                            "{}\n\n{}",
+                            live_reply.text.trim_end(),
+                            partial_fallback_summary
+                        )
+                    } else if complete_live_plan {
                         complete_plan_steps_in_text(&live_reply.text)
                     } else {
                         live_reply.text
@@ -1236,32 +3260,53 @@ impl Store {
                     )
                 }
                 None => (
-                    format!("Turn completed in {title} at seq {seq}"),
-                    false,
+                    {
+                        session.messages.push(Message::assistant(fallback_summary));
+                        format!("Turn completed in {title} at seq {seq}")
+                    },
+                    true,
                     true,
                 ),
             }
         };
         if reset_scroll {
-            self.state.scroll_transcript_to_latest();
+            if follow_tail {
+                self.state.scroll_transcript_to_latest();
+            } else {
+                self.state.preserve_transcript_position_after_append(3);
+            }
         }
         self.state.status = status;
         if completed_current_turn {
+            self.state
+                .capture_completed_turn_activity(&event.session_id, &event.turn_id);
             self.state.set_run_state_success();
         }
         self.submit_next_pending_if_idle()
     }
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
+        let follow_tail = self.state.transcript_scroll == 0;
+        let fallback_summary =
+            self.turn_error_fallback_message(&event.turn_id, &event.code, &event.message);
         let Some(session) = self.find_session_mut(&event.session_id) else {
             return None;
         };
         let title = session.title.clone();
         let (status, failed_current_turn) = match session.live_reply.take() {
-            Some(live_reply) if live_reply.turn_id == event.turn_id => (
-                format!("Turn error {}: {}", event.code, event.message),
-                true,
-            ),
+            Some(live_reply) if live_reply.turn_id == event.turn_id => {
+                let partial = compact_first_line(&live_reply.text, 120);
+                let text = if partial.is_empty() {
+                    fallback_summary
+                } else {
+                    format!("{fallback_summary}\n- Partial response: {partial}")
+                };
+                session.messages.push(Message::assistant(text));
+                (
+                    format!("Turn error {}: {}", event.code, event.message),
+                    true,
+                )
+            }
             Some(live_reply) => {
                 session.live_reply = Some(live_reply);
                 (
@@ -1269,11 +3314,23 @@ impl Store {
                     false,
                 )
             }
-            None => (
-                format!("Turn error {}: {}", event.code, event.message),
-                true,
-            ),
+            None => {
+                session.messages.push(Message::assistant(fallback_summary));
+                (
+                    format!("Turn error {}: {}", event.code, event.message),
+                    true,
+                )
+            }
         };
+        if failed_current_turn {
+            if follow_tail {
+                self.state.scroll_transcript_to_latest();
+            } else {
+                self.state.preserve_transcript_position_after_append(3);
+            }
+            self.state
+                .capture_completed_turn_activity(&event.session_id, &event.turn_id);
+        }
         self.state.status = status;
         if failed_current_turn {
             self.state
@@ -1303,6 +3360,79 @@ impl Store {
             .sessions
             .iter_mut()
             .find(|session| &session.id == session_id)
+    }
+
+    fn turn_completion_fallback_message(&self, turn_id: &TurnId) -> String {
+        let summary = self.summarize_turn_activity(turn_id);
+        format!(
+            "Session Summary\n- Result: Turn completed, but the TUI did not receive a final assistant answer.\n- Activity: {} action(s) recorded.\n- Files changed: {}.\n- Validation: {}.\n- Risks / follow-up: Review the activity above and continue the turn if the requested answer is incomplete.",
+            summary.action_count,
+            format_limited_list(&summary.files_changed, "none observed"),
+            format_limited_list(&summary.validation, "not reported"),
+        )
+    }
+
+    fn turn_partial_completion_fallback_message(&self, turn_id: &TurnId) -> String {
+        let summary = self.summarize_turn_activity(turn_id);
+        format!(
+            "Session Summary\n- Result: Turn completed, but the TUI only received a partial live answer.\n- Activity: {} action(s) recorded.\n- Files changed: {}.\n- Validation: {}.\n- Risks / follow-up: The server may have persisted a fuller answer; continue if the visible answer is incomplete.",
+            summary.action_count,
+            format_limited_list(&summary.files_changed, "none observed"),
+            format_limited_list(&summary.validation, "not reported"),
+        )
+    }
+
+    fn turn_error_fallback_message(&self, turn_id: &TurnId, code: &str, message: &str) -> String {
+        let summary = self.summarize_turn_activity(turn_id);
+        let failed = format_limited_list(&summary.failures, "none recorded");
+        format!(
+            "Session Summary\n- Result: Turn failed before producing a final answer.\n- Error: {code}: {message}\n- Activity: {} action(s) recorded.\n- Failures: {failed}.\n- Risks / follow-up: Fix the error above or continue the turn with a more specific instruction.",
+            summary.action_count,
+        )
+    }
+
+    fn summarize_turn_activity(&self, turn_id: &TurnId) -> TurnActivitySummary {
+        let mut summary = TurnActivitySummary::default();
+        for activity in self
+            .state
+            .activity
+            .iter()
+            .filter(|activity| activity.turn_id.as_ref() == Some(turn_id))
+        {
+            match activity.kind {
+                ActivityKind::Tool => {
+                    summary.action_count += 1;
+                    let detail = activity
+                        .detail
+                        .as_deref()
+                        .filter(|detail| !detail.trim().is_empty())
+                        .unwrap_or(activity.title.as_str());
+                    if activity.success == Some(false) || activity.status == "failed" {
+                        push_unique_summary(&mut summary.failures, compact_first_line(detail, 96));
+                    } else if looks_like_validation_activity(activity) {
+                        push_unique_summary(
+                            &mut summary.validation,
+                            compact_first_line(detail, 96),
+                        );
+                    }
+                }
+                ActivityKind::Progress => {
+                    if looks_like_file_change_activity(activity) {
+                        let detail = activity
+                            .detail
+                            .as_deref()
+                            .or_else(|| Some(activity.status.as_str()))
+                            .unwrap_or_default();
+                        push_unique_summary(
+                            &mut summary.files_changed,
+                            compact_first_line(detail, 96),
+                        );
+                    }
+                }
+                ActivityKind::Approval | ActivityKind::Warning | ActivityKind::Error => {}
+            }
+        }
+        summary
     }
 
     fn turn_had_completion_activity(&self, turn_id: &octos_core::ui_protocol::TurnId) -> bool {
@@ -1367,6 +3497,156 @@ fn slash_command_try_hint(ctx: &crate::menu::AvailabilityContext<'_>) -> String 
     }
 }
 
+fn onboarding_pending_status(pending: OnboardingProviderPending) -> String {
+    match pending {
+        OnboardingProviderPending::Test => "Provider test already in progress".into(),
+        OnboardingProviderPending::Save => "Provider save already in progress".into(),
+    }
+}
+
+fn split_first_word(input: &str) -> (&str, &str) {
+    let input = input.trim();
+    let Some(split_at) = input.find(char::is_whitespace) else {
+        return (input, "");
+    };
+    let (head, rest) = input.split_at(split_at);
+    (head, rest.trim_start())
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    let value = value.trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+fn onboarding_workspace_cwd(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let Some(command) = value.strip_prefix("stdio:") {
+        return stdio_command_cwd(command);
+    }
+    if value.is_empty()
+        || value.starts_with("ws://")
+        || value.starts_with("wss://")
+        || value == "stdio"
+        || value == "unknown"
+        || value == "not supplied"
+    {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+fn stdio_command_cwd(command: &str) -> Option<String> {
+    let parsed_parts = shlex::split(command);
+    let fallback_parts;
+    let parts = if let Some(parts) = parsed_parts.as_ref() {
+        parts
+    } else {
+        fallback_parts = command
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        &fallback_parts
+    };
+    let mut parts = parts.iter().map(String::as_str);
+    while let Some(part) = parts.next() {
+        if part == "--cwd" {
+            return parts.next().and_then(|cwd| non_empty_string(cwd.into()));
+        }
+        if let Some(cwd) = part.strip_prefix("--cwd=") {
+            return non_empty_string(cwd.into());
+        }
+    }
+    None
+}
+
+fn onboarding_usage() -> String {
+    "Usage: /onboard [name|username|email|create-profile|profile|select|family|model|route|base-url|api-key-env|key|send-code|verify|catalog|save|test|finish|reset]".into()
+}
+
+fn login_usage() -> String {
+    "Usage: /login [email <address>|send-code [email]|code <otp>|verify [otp]|status|me|logout]"
+        .into()
+}
+
+fn provider_usage() -> String {
+    "Usage: /provider [catalog|list|select <family_id> <model_id> <route_id> [base_url] [api_key_env]|family|model|route|base-url|api-key-env|api-type|key|test|save|add-fallback]".into()
+}
+
+fn skills_usage() -> String {
+    "Usage: /skills [list|search <query>|install <repo> [--branch <branch>] [--force]|remove <name>]"
+        .into()
+}
+
+fn mcp_usage() -> String {
+    "Usage: /mcp [list|status|enable <server>|disable <server>|test <server>|upsert <server> {json}|delete <server>]"
+        .into()
+}
+
+fn tools_usage() -> String {
+    "Usage: /tools [list|status|enable <tool>|disable <tool>|test <tool>|upsert <tool> {json}|delete <tool>]"
+        .into()
+}
+
+fn parse_single_name(input: &str, _usage: &str) -> Option<String> {
+    let (name, trailing) = split_first_word(input);
+    if name.is_empty() || !trailing.trim().is_empty() {
+        return None;
+    }
+    non_empty_string(name.to_owned())
+}
+
+fn parse_name_and_json(input: &str, usage: String) -> Result<(String, Value), String> {
+    let (name, rest) = split_first_word(input);
+    let Some(name) = non_empty_string(name.to_owned()) else {
+        return Err(usage);
+    };
+    let rest = rest.trim();
+    let config = if rest.is_empty() {
+        Value::Object(Default::default())
+    } else {
+        serde_json::from_str(rest).map_err(|err| format!("{usage}; invalid JSON: {err}"))?
+    };
+    Ok((name, config))
+}
+
+fn parse_skill_install_args(input: &str) -> Result<(String, Option<String>, bool), String> {
+    let mut repo = None;
+    let mut branch = None;
+    let mut force = false;
+    let mut parts = input.split_whitespace();
+
+    while let Some(part) = parts.next() {
+        if part == "--force" || part == "-f" {
+            force = true;
+        } else if part == "--branch" || part == "-b" {
+            let Some(value) = parts
+                .next()
+                .and_then(|value| non_empty_string(value.to_owned()))
+            else {
+                return Err("Usage: /skills install <repo> [--branch <branch>] [--force]".into());
+            };
+            branch = Some(value);
+        } else if let Some(value) = part.strip_prefix("--branch=") {
+            let Some(value) = non_empty_string(value.to_owned()) else {
+                return Err("Usage: /skills install <repo> [--branch <branch>] [--force]".into());
+            };
+            branch = Some(value);
+        } else if part.starts_with('-') {
+            return Err(format!("Unknown /skills install flag: {part}"));
+        } else if repo.is_none() {
+            repo = Some(part.to_owned());
+        } else {
+            return Err("Usage: /skills install <repo> [--branch <branch>] [--force]".into());
+        }
+    }
+
+    let Some(repo) = repo.and_then(non_empty_string) else {
+        return Err("Usage: /skills install <repo> [--branch <branch>] [--force]".into());
+    };
+    Ok((repo, branch, force))
+}
+
 fn active_menu_item_len(menu: Option<&MenuBuildResult>) -> usize {
     match menu {
         Some(MenuBuildResult::Ready(spec)) => spec.items.len(),
@@ -1375,6 +3655,36 @@ fn active_menu_item_len(menu: Option<&MenuBuildResult>) -> usize {
         | Some(MenuBuildResult::Error(_))
         | None => 0,
     }
+}
+
+fn filter_menu_result_for_search(mut result: MenuBuildResult, query: &str) -> MenuBuildResult {
+    let tokens = query
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return result;
+    }
+
+    if let MenuBuildResult::Ready(spec) = &mut result
+        && spec.searchable
+    {
+        spec.items
+            .retain(|item| menu_item_matches_search_tokens(item, &tokens));
+    }
+    result
+}
+
+fn menu_item_matches_search_tokens(item: &crate::menu::MenuItem, tokens: &[String]) -> bool {
+    let haystack = format!(
+        "{} {} {}",
+        item.id,
+        item.label,
+        item.description.as_deref().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    tokens.iter().all(|token| haystack.contains(token))
 }
 
 fn active_menu_selected_action(
@@ -1391,6 +3701,10 @@ fn active_menu_selected_action(
         | MenuBuildResult::Unavailable(_)
         | MenuBuildResult::Error(_) => None,
     }
+}
+
+fn profile_llm_list_has_provider_state(result: &ProfileLlmListResult) -> bool {
+    result.primary_provider().is_some() || !result.fallback_providers().is_empty()
 }
 
 #[derive(Default)]
@@ -1697,6 +4011,12 @@ fn is_low_value_progress_name(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{
+        McpConfigMutationResult, McpStatusSummary, ModelStatus, OnboardingProviderPending,
+        OnboardingProviderSaveTarget, ProfileLlmMutationResult, ProfileLocalCreateResult,
+        RuntimeHealthStatus, RuntimePolicyStamp, SessionCursorStatus, SessionStatusReadResult,
+        SessionUsageStatus, ToolConfigMutationResult,
+    };
     use octos_core::SessionKey;
     use octos_core::ui_protocol::{
         ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalDecision,
@@ -1765,6 +4085,853 @@ mod tests {
             methods.iter().copied(),
         ));
         store
+    }
+
+    fn protocol_store_without_sessions() -> Store {
+        let mut store = Store {
+            state: AppState::new(
+                vec![],
+                0,
+                "AppUI connected".into(),
+                Some("stdio:octos serve --stdio".into()),
+                false,
+            ),
+        };
+        store.state.capabilities = None;
+        store
+    }
+
+    fn applied_profile_llm_result() -> ProfileLlmMutationResult {
+        ProfileLlmMutationResult {
+            profile_id: Some("coding".into()),
+            primary: None,
+            fallbacks: Vec::new(),
+            applied: true,
+            llm: None,
+            runtime_policy_stamp: None,
+            message: None,
+            error: None,
+        }
+    }
+
+    fn failed_profile_llm_result(message: &str, error: &str) -> ProfileLlmMutationResult {
+        ProfileLlmMutationResult {
+            profile_id: Some("coding".into()),
+            primary: None,
+            fallbacks: Vec::new(),
+            applied: false,
+            llm: None,
+            runtime_policy_stamp: None,
+            message: Some(message.into()),
+            error: Some(error.into()),
+        }
+    }
+
+    #[test]
+    fn onboarding_slash_flow_builds_profile_llm_upsert_and_masks_secret() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_AUTH_SEND_CODE,
+            crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
+        ]);
+
+        store.state.composer = "/onboard email user@example.com".into();
+        assert!(store.compose_command().is_none());
+        assert_eq!(store.state.onboarding.email, "user@example.com");
+
+        store.state.composer = "/onboard select moonshot kimi-k2.5 autodl https://www.autodl.art/api/v1 AUTODL_API_KEY".into();
+        assert!(store.compose_command().is_none());
+        assert_eq!(store.state.onboarding.provider.family_id, "moonshot");
+        assert_eq!(store.state.onboarding.provider.model_id, "kimi-k2.5");
+        assert_eq!(store.state.onboarding.provider.route.route_id, "autodl");
+
+        store.state.composer = "/onboard key sk-test-secret".into();
+        assert!(store.compose_command().is_none());
+        assert_eq!(store.state.onboarding.api_key_label(), "********");
+
+        store.state.composer = "/onboard save".into();
+        let command = store
+            .compose_command()
+            .expect("save emits profile/llm/upsert");
+        let AppUiCommand::ProfileLlmUpsert(params) = command else {
+            panic!("expected profile/llm/upsert");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+        assert_eq!(params.selection.family_id, "moonshot");
+        assert_eq!(params.selection.model_id, "kimi-k2.5");
+        assert_eq!(params.selection.route.route_id, "autodl");
+        assert_eq!(
+            params
+                .api_key
+                .as_ref()
+                .expect("api key is included for transport")
+                .expose_for_transport(),
+            "sk-test-secret"
+        );
+        assert!(!format!("{params:?}").contains("sk-test-secret"));
+        assert!(!format!("{:?}", store.state.onboarding).contains("sk-test-secret"));
+    }
+
+    #[test]
+    fn provider_slash_flow_builds_fallback_llm_upsert() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT]);
+
+        store.state.composer =
+            "/provider select minimax MiniMax-M2.5-highspeed wisemodel https://open.ospreyai.cn/v1 WISEMODEL_API_KEY".into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/provider key sk-fallback-secret".into();
+        assert!(store.compose_command().is_none());
+
+        store.state.composer = "/provider add-fallback".into();
+        let command = store
+            .compose_command()
+            .expect("fallback save emits profile/llm/upsert");
+        let AppUiCommand::ProfileLlmUpsert(params) = command else {
+            panic!("expected profile/llm/upsert");
+        };
+        assert!(!params.set_primary);
+        assert_eq!(params.selection.family_id, "minimax");
+        assert_eq!(params.selection.model_id, "MiniMax-M2.5-highspeed");
+        assert_eq!(params.selection.route.route_id, "wisemodel");
+        assert_eq!(
+            params
+                .api_key
+                .as_ref()
+                .expect("api key is included for transport")
+                .expose_for_transport(),
+            "sk-fallback-secret"
+        );
+    }
+
+    #[test]
+    fn onboarding_provider_test_shows_pending_until_result() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_TEST]);
+        store.state.composer =
+            "/onboard select moonshot kimi-k2.5 autodl https://www.autodl.art/api/v1 AUTODL_API_KEY"
+                .into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/onboard key sk-test-secret".into();
+        assert!(store.compose_command().is_none());
+
+        store.state.composer = "/onboard test".into();
+        let command = store
+            .compose_command()
+            .expect("test emits profile/llm/test");
+        assert!(matches!(command, AppUiCommand::ProfileLlmTest(_)));
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(OnboardingProviderPending::Test)
+        );
+        assert_eq!(store.state.status, "Testing provider connection");
+
+        store.apply_client_event(ClientEvent::ProfileLlmMutation(
+            ProfileLlmMutationClientEvent {
+                result: applied_profile_llm_result(),
+                message: "Provider connection verified".into(),
+            },
+        ));
+
+        assert_eq!(store.state.onboarding.provider_pending, None);
+        assert!(store.state.onboarding.provider_tested);
+        assert!(!store.state.onboarding.provider_saved);
+    }
+
+    #[test]
+    fn onboarding_provider_test_failure_clears_pending_without_marking_tested() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_TEST]);
+        store.state.composer =
+            "/onboard select moonshot kimi-k2.5 autodl https://www.autodl.art/api/v1 AUTODL_API_KEY"
+                .into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/onboard key sk-test-secret".into();
+        assert!(store.compose_command().is_none());
+
+        store.state.composer = "/onboard test".into();
+        assert!(matches!(
+            store.compose_command(),
+            Some(AppUiCommand::ProfileLlmTest(_))
+        ));
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(OnboardingProviderPending::Test)
+        );
+
+        store.apply_client_event(ClientEvent::ProfileLlmMutation(
+            ProfileLlmMutationClientEvent {
+                result: failed_profile_llm_result("Provider connection failed", "invalid API key"),
+                message: "Provider connection failed: invalid API key".into(),
+            },
+        ));
+
+        assert_eq!(store.state.onboarding.provider_pending, None);
+        assert!(!store.state.onboarding.provider_tested);
+        assert!(!store.state.onboarding.provider_saved);
+        assert_eq!(
+            store.state.status,
+            "Provider connection failed: invalid API key"
+        );
+    }
+
+    #[test]
+    fn onboarding_provider_save_shows_pending_until_result() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT]);
+        store.state.composer =
+            "/onboard select moonshot kimi-k2.5 autodl https://www.autodl.art/api/v1 AUTODL_API_KEY"
+                .into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/onboard key sk-test-secret".into();
+        assert!(store.compose_command().is_none());
+
+        store.state.composer = "/onboard save".into();
+        let command = store
+            .compose_command()
+            .expect("save emits profile/llm/upsert");
+        assert!(matches!(command, AppUiCommand::ProfileLlmUpsert(_)));
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(OnboardingProviderPending::Save)
+        );
+        assert_eq!(store.state.status, "Saving provider configuration");
+
+        store.apply_client_event(ClientEvent::ProfileLlmMutation(
+            ProfileLlmMutationClientEvent {
+                result: applied_profile_llm_result(),
+                message: "Provider profile updated".into(),
+            },
+        ));
+
+        assert_eq!(store.state.onboarding.provider_pending, None);
+        assert!(store.state.onboarding.provider_tested);
+        assert!(store.state.onboarding.provider_saved);
+    }
+
+    #[test]
+    fn fallback_save_resets_staged_provider_but_keeps_primary_saved_status() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT]);
+        store.state.composer =
+            "/provider select moonshot kimi-k2.5 autodl https://www.autodl.art/api/v1 AUTODL_API_KEY"
+                .into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/provider key sk-primary-secret".into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/provider save".into();
+        assert!(matches!(
+            store.compose_command(),
+            Some(AppUiCommand::ProfileLlmUpsert(_))
+        ));
+        assert_eq!(
+            store.state.onboarding.provider_save_target,
+            Some(OnboardingProviderSaveTarget::Primary)
+        );
+        store.apply_client_event(ClientEvent::ProfileLlmMutation(
+            ProfileLlmMutationClientEvent {
+                result: applied_profile_llm_result(),
+                message: "Primary provider saved".into(),
+            },
+        ));
+        assert!(store.state.onboarding.provider_saved);
+        assert_eq!(
+            store
+                .state
+                .onboarding
+                .saved_primary_provider_label
+                .as_deref(),
+            Some("moonshot / kimi-k2.5 via autodl")
+        );
+
+        store.state.composer =
+            "/provider select minimax MiniMax-M2.5-highspeed wisemodel https://open.ospreyai.cn/v1 WISEMODEL_API_KEY"
+                .into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/provider key sk-fallback-secret".into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/provider add-fallback".into();
+        assert!(matches!(
+            store.compose_command(),
+            Some(AppUiCommand::ProfileLlmUpsert(_))
+        ));
+        assert_eq!(
+            store.state.onboarding.provider_save_target,
+            Some(OnboardingProviderSaveTarget::Fallback)
+        );
+
+        store.apply_client_event(ClientEvent::ProfileLlmMutation(
+            ProfileLlmMutationClientEvent {
+                result: applied_profile_llm_result(),
+                message: "Fallback provider saved".into(),
+            },
+        ));
+
+        assert!(store.state.onboarding.provider_saved);
+        assert_eq!(store.state.onboarding.provider_pending, None);
+        assert_eq!(store.state.onboarding.provider_save_target, None);
+        assert!(!store.state.onboarding.provider_tested);
+        assert!(!store.state.onboarding.selection_ready());
+        assert!(store.state.onboarding.api_key.is_none());
+        assert_eq!(
+            store.state.onboarding.last_saved_provider_target,
+            Some(OnboardingProviderSaveTarget::Fallback)
+        );
+        assert_eq!(
+            store.state.onboarding.last_saved_provider_label.as_deref(),
+            Some("minimax / MiniMax-M2.5-highspeed via wisemodel")
+        );
+        assert_eq!(
+            store
+                .state
+                .onboarding
+                .saved_primary_provider_label
+                .as_deref(),
+            Some("moonshot / kimi-k2.5 via autodl")
+        );
+    }
+
+    #[test]
+    fn onboarding_finish_opens_profile_scoped_session() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_AUTH_STATUS]);
+        store.state.workspace.root = "/tmp/workspace".into();
+        store.state.onboarding.provider_saved = true;
+
+        store.state.composer = "/onboard profile alice".into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/onboard finish".into();
+        let command = store.compose_command().expect("finish emits session/open");
+        let AppUiCommand::OpenSession(params) = command else {
+            panic!("expected session/open");
+        };
+
+        assert_eq!(params.profile_id.as_deref(), Some("alice"));
+        assert_eq!(params.cwd.as_deref(), Some("/tmp/workspace"));
+        assert!(params.session_id.0.starts_with("alice:local:tui#coding"));
+    }
+
+    #[test]
+    fn onboarding_session_open_extracts_cwd_from_stdio_target_label() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_AUTH_STATUS]);
+        store.state.workspace.root =
+            "stdio:/opt/octos serve --stdio --data-dir /tmp/octos/data --cwd /tmp/octos/workspace"
+                .into();
+        store.state.onboarding.provider_saved = true;
+
+        store.state.composer = "/onboard profile alice".into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/onboard finish".into();
+        let command = store.compose_command().expect("finish emits session/open");
+        let AppUiCommand::OpenSession(params) = command else {
+            panic!("expected session/open");
+        };
+
+        assert_eq!(params.cwd.as_deref(), Some("/tmp/octos/workspace"));
+    }
+
+    #[test]
+    fn onboarding_session_open_unquotes_cwd_from_stdio_target_label() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_AUTH_STATUS]);
+        store.state.workspace.root =
+            "stdio:\"/opt/octos/bin/octos\" serve --stdio --data-dir \"/tmp/octos/data dir\" --cwd \"/tmp/octos/workspace dir\""
+                .into();
+        store.state.onboarding.provider_saved = true;
+
+        store.state.composer = "/onboard profile alice".into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/onboard finish".into();
+        let command = store.compose_command().expect("finish emits session/open");
+        let AppUiCommand::OpenSession(params) = command else {
+            panic!("expected session/open");
+        };
+
+        assert_eq!(params.cwd.as_deref(), Some("/tmp/octos/workspace dir"));
+    }
+
+    #[test]
+    fn normal_prompt_without_open_session_is_preserved() {
+        let mut store = protocol_store_without_sessions();
+        store.state.composer = "please edit src/main.rs".into();
+
+        let command = store.compose_command();
+
+        assert!(command.is_none());
+        assert_eq!(store.state.composer, "please edit src/main.rs");
+        assert_eq!(
+            store.state.status,
+            "No coding session open. Run /onboard open-session before sending a prompt."
+        );
+    }
+
+    #[test]
+    fn onboarding_open_session_requires_saved_primary_provider() {
+        let mut store = protocol_store_without_sessions();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+        ]));
+        store.state.onboarding.profile_id = Some("alice".into());
+        store.state.composer = "/onboard open-session".into();
+
+        let command = store.compose_command();
+
+        assert!(command.is_none());
+        assert_eq!(
+            store.state.status,
+            "Cannot open session: save a primary LLM provider first."
+        );
+    }
+
+    #[test]
+    fn onboarding_open_session_uses_profile_llm_primary_provider() {
+        let mut store = protocol_store_without_sessions();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+        ]));
+        store.state.profile_llm_state = Some(crate::model::ProfileLlmListResult {
+            profile_id: Some("alice".into()),
+            primary: Some(crate::model::LlmConfiguredProvider {
+                provider: "deepseek".into(),
+                model: "deepseek-reasoner".into(),
+                family_id: Some("deepseek".into()),
+                model_id: Some("deepseek-reasoner".into()),
+                route: None,
+                route_id: Some("deepseek".into()),
+                base_url: None,
+                api_key_env: None,
+                has_api_key: true,
+                selected: true,
+                available: Some(true),
+                model_hints: None,
+                cost_per_m: None,
+                strong: Some(true),
+            }),
+            fallbacks: Vec::new(),
+            llm: None,
+            runtime_policy_stamp: None,
+        });
+        store.state.composer = "/onboard open-session".into();
+
+        let command = store.compose_command().expect("session/open command");
+        let AppUiCommand::OpenSession(params) = command else {
+            panic!("expected session/open");
+        };
+
+        assert_eq!(params.profile_id.as_deref(), Some("alice"));
+        assert!(params.session_id.0.starts_with("alice:local:tui#coding"));
+    }
+
+    #[test]
+    fn solo_onboarding_finish_creates_local_profile_without_otp() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+            crate::model::APPUI_METHOD_AUTH_SEND_CODE,
+            crate::model::APPUI_METHOD_AUTH_VERIFY,
+        ]);
+        store.state.workspace.root = "/tmp/solo-project".into();
+
+        for command in [
+            "/onboard name Ada Lovelace",
+            "/onboard username ada",
+            "/onboard email ada@example.com",
+        ] {
+            store.state.composer = command.into();
+            assert!(store.compose_command().is_none());
+        }
+
+        store.state.composer = "/onboard finish".into();
+        let command = store
+            .compose_command()
+            .expect("finish emits profile/local/create");
+        let AppUiCommand::ProfileLocalCreate(params) = command else {
+            panic!("expected profile/local/create");
+        };
+        assert_eq!(params.name, "Ada Lovelace");
+        assert_eq!(params.username, "ada");
+        assert_eq!(params.email, "ada@example.com");
+
+        store.state.composer = "/onboard send-code".into();
+        assert!(store.compose_command().is_none());
+        assert!(store.state.status.contains("profile/local/create"));
+    }
+
+    #[test]
+    fn solo_profile_id_from_server_opens_session() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.workspace.root = "/tmp/solo-project".into();
+        store.state.onboarding.open_session_after_profile_create = true;
+        store.state.onboarding.provider_saved = true;
+
+        let follow_up = store.apply_client_event(ClientEvent::ProfileLocalCreate(
+            crate::client_event::ProfileLocalCreateClientEvent {
+                result: ProfileLocalCreateResult {
+                    profile_id: "ada-server".into(),
+                    user_id: "ada-user".into(),
+                    name: "Ada Lovelace".into(),
+                    username: "ada".into(),
+                    email: "ada@example.com".into(),
+                    created: true,
+                    runtime_mode: "solo".into(),
+                },
+                message: "Local solo profile created: ada-server".into(),
+            },
+        ));
+        let Some(AppUiCommand::OpenSession(params)) = follow_up else {
+            panic!("profile/local/create should be followed by session/open");
+        };
+
+        assert_eq!(
+            store.state.onboarding.profile_id.as_deref(),
+            Some("ada-server")
+        );
+        assert_eq!(params.profile_id.as_deref(), Some("ada-server"));
+        assert_eq!(params.cwd.as_deref(), Some("/tmp/solo-project"));
+        assert!(
+            params
+                .session_id
+                .0
+                .starts_with("ada-server:local:tui#coding")
+        );
+    }
+
+    #[test]
+    fn local_profile_create_auto_loads_provider_catalog_for_next_onboarding_step() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+            crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+        ]);
+
+        let follow_up = store.apply_client_event(ClientEvent::ProfileLocalCreate(
+            crate::client_event::ProfileLocalCreateClientEvent {
+                result: ProfileLocalCreateResult {
+                    profile_id: "ada-server".into(),
+                    user_id: "ada-user".into(),
+                    name: "Ada Lovelace".into(),
+                    username: "ada".into(),
+                    email: "ada@example.com".into(),
+                    created: true,
+                    runtime_mode: "solo".into(),
+                },
+                message: "Local solo profile created: ada-server".into(),
+            },
+        ));
+
+        assert!(matches!(
+            follow_up,
+            Some(AppUiCommand::ProfileLlmCatalog(_))
+        ));
+        assert_eq!(
+            store.state.onboarding.profile_id.as_deref(),
+            Some("ada-server")
+        );
+    }
+
+    #[test]
+    fn first_launch_opens_onboarding_menu_when_server_advertises_solo_profile_create() {
+        let mut store = protocol_store_without_sessions();
+
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+                    &[],
+                ),
+            },
+            message: "AppUI capabilities refreshed: 1 methods".into(),
+        }));
+
+        assert!(store.state.sessions.is_empty());
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected onboarding menu to open");
+        };
+        assert_eq!(spec.id, MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        assert!(
+            spec.items
+                .iter()
+                .any(|item| item.id == "onboard.local.create")
+        );
+    }
+
+    #[test]
+    fn searchable_menu_filters_items_and_dispatches_filtered_action() {
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("active menu")
+            .search_query = "keymap".into();
+        store.refresh_active_menu();
+
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected searchable menu");
+        };
+        let labels = spec
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["/keymap"]);
+
+        assert!(store.accept_active_menu_item().is_none());
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_KEYMAP)
+        );
+    }
+
+    #[test]
+    fn mcp_and_tool_config_mutations_refresh_server_truth() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_MCP_CONFIG_LIST,
+            crate::model::APPUI_METHOD_TOOL_CONFIG_LIST,
+        ]));
+
+        let mcp_follow_up = store.apply_client_event(ClientEvent::McpConfigMutation(
+            McpConfigMutationClientEvent {
+                result: McpConfigMutationResult {
+                    profile_id: Some("coding".into()),
+                    ok: true,
+                    applied: true,
+                    server: Some("github".into()),
+                    ..McpConfigMutationResult::default()
+                },
+                message: "MCP config applied: github".into(),
+            },
+        ));
+        let Some(AppUiCommand::ListMcpConfig(params)) = mcp_follow_up else {
+            panic!("expected MCP config refresh after mutation");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+
+        let tool_follow_up = store.apply_client_event(ClientEvent::ToolConfigMutation(
+            ToolConfigMutationClientEvent {
+                result: ToolConfigMutationResult {
+                    profile_id: Some("coding".into()),
+                    ok: true,
+                    applied: true,
+                    tool: Some("web_fetch".into()),
+                    ..ToolConfigMutationResult::default()
+                },
+                message: "Tool config applied: web_fetch".into(),
+            },
+        ));
+        assert!(matches!(
+            tool_follow_up,
+            Some(AppUiCommand::ListToolConfig(_))
+        ));
+    }
+
+    #[test]
+    fn onboarding_field_rows_prefill_composer_for_inline_editing() {
+        let mut store = protocol_store_without_sessions();
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+                    &[],
+                ),
+            },
+            message: "AppUI capabilities refreshed: 1 methods".into(),
+        }));
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected onboarding menu");
+        };
+        let name_index = spec
+            .items
+            .iter()
+            .position(|item| item.id == "onboard.local.name")
+            .expect("name row");
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("active menu")
+            .selected_index = name_index;
+
+        assert!(store.accept_active_menu_item().is_none());
+
+        assert_eq!(store.state.composer, "/onboard name ");
+        assert_eq!(store.state.focus, FocusPane::Composer);
+        assert_eq!(store.state.status, "Edit the field, then press Enter");
+    }
+
+    #[test]
+    fn onboarding_local_fields_advance_menu_selection_after_edit() {
+        let mut store = protocol_store_without_sessions();
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+                    &[],
+                ),
+            },
+            message: "AppUI capabilities refreshed: 1 methods".into(),
+        }));
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected onboarding menu");
+        };
+        let name_index = spec
+            .items
+            .iter()
+            .position(|item| item.id == "onboard.local.name")
+            .expect("name row");
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("active menu")
+            .selected_index = name_index;
+
+        store.state.composer = "/onboard name Ada Lovelace".into();
+        assert!(store.compose_command().is_none());
+
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected onboarding menu after edit");
+        };
+        let selected = store
+            .state
+            .menu_stack
+            .active()
+            .expect("active menu")
+            .selected_index;
+        assert_eq!(spec.items[selected].id, "onboard.local.username");
+    }
+
+    #[test]
+    fn onboarding_provider_selection_focuses_api_key_then_api_key_advances() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_TEST]);
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+
+        store.state.composer = "/onboard select deepseek deepseek-reasoner official".into();
+        assert!(store.compose_command().is_none());
+
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected provider setup menu");
+        };
+        let selected = store
+            .state
+            .menu_stack
+            .active()
+            .expect("active menu")
+            .selected_index;
+        assert_eq!(spec.items[selected].id, "onboard.provider.key");
+
+        store.state.composer = "/onboard key sk-test-secret".into();
+        assert!(store.compose_command().is_none());
+
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected provider setup menu after key");
+        };
+        let selected = store
+            .state
+            .menu_stack
+            .active()
+            .expect("active menu")
+            .selected_index;
+        assert_eq!(spec.items[selected].id, "onboard.provider.test");
+    }
+
+    #[test]
+    fn capabilities_do_not_steal_focus_from_existing_session() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        assert!(!store.state.menu_stack.is_active());
+
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+                    &[],
+                ),
+            },
+            message: "AppUI capabilities refreshed: 1 methods".into(),
+        }));
+
+        assert!(!store.state.menu_stack.is_active());
+        assert!(store.state.active_menu.is_none());
+    }
+
+    fn session_status_result(session_id: &SessionKey) -> SessionStatusReadResult {
+        SessionStatusReadResult {
+            session_id: session_id.clone(),
+            runtime_mode: Some("solo".into()),
+            profile_id: Some("coding".into()),
+            cwd: Some("/workspace/octos".into()),
+            workspace_root: Some("/workspace/octos".into()),
+            active_turn_id: Some(TurnId::new()),
+            runtime_policy_stamp: Some(RuntimePolicyStamp {
+                runtime_mode: Some("solo".into()),
+                profile_id: Some("coding".into()),
+                model: Some("deepseek-v4-pro".into()),
+                provider: Some("deepseek".into()),
+                approval_policy: Some("never".into()),
+                sandbox_mode: Some("workspace-write".into()),
+                sandbox: Some("workspace-write".into()),
+                permission_profile: Some("workspace-write-no-network".into()),
+                filesystem_scope: Some("workspace".into()),
+                network: Some("blocked".into()),
+                tool_policy_id: Some("coding-v3".into()),
+                mcp_servers: vec!["github".into(), "filesystem".into()],
+                memory_scope: Some("profile-session".into()),
+                qoe_policy: Some("balanced".into()),
+                queue_mode: Some("collect".into()),
+            }),
+            model: Some(ModelStatus {
+                model: "deepseek-v4-pro".into(),
+                provider: "deepseek".into(),
+                title: None,
+                family: None,
+                route: None,
+                selected: true,
+                available: Some(true),
+                queue_mode: Some("collect".into()),
+                qoe_policy: Some("balanced".into()),
+            }),
+            permission_profile: Some("workspace-write-no-network".into()),
+            approval_policy: Some("never".into()),
+            sandbox_mode: Some("workspace-write".into()),
+            sandbox: Some("workspace-write".into()),
+            filesystem_scope: Some("workspace".into()),
+            network: Some("blocked".into()),
+            tool_policy_id: Some("coding-v3".into()),
+            mcp_servers: vec!["github".into(), "filesystem".into()],
+            memory_scope: Some("profile-session".into()),
+            health: Some(RuntimeHealthStatus {
+                status: "healthy".into(),
+                message: Some("ws ok".into()),
+            }),
+            mcp_summary: Some(McpStatusSummary {
+                connected: 2,
+                connecting: 0,
+                failed: 0,
+                disabled: 1,
+            }),
+            tool_summary: None,
+            usage: Some(SessionUsageStatus {
+                input_tokens: Some(1200),
+                output_tokens: Some(340),
+                cached_input_tokens: None,
+                cached_output_tokens: None,
+                estimated_cost_micros_usd: Some(2500),
+            }),
+            cursor: Some(SessionCursorStatus {
+                cursor: Some(UiCursor {
+                    stream: "session".into(),
+                    seq: 42,
+                }),
+                replay_supported: true,
+                healthy: true,
+                detail: Some("caught up".into()),
+            }),
+            capabilities: Some(UiProtocolCapabilities::new(
+                &[crate::model::APPUI_METHOD_SESSION_STATUS_READ],
+                &[],
+            )),
+        }
     }
 
     fn help_menu_labels(store: &Store) -> Vec<String> {
@@ -1844,8 +5011,8 @@ mod tests {
             .map(|command| command.name)
             .collect::<Vec<_>>();
         assert!(no_capability_names.contains(&"/status".into()));
-        assert!(no_capability_names.contains(&"/permissions".into()));
-        assert!(!no_capability_names.contains(&"/model".into()));
+        assert!(!no_capability_names.contains(&"/permissions".into()));
+        assert!(no_capability_names.contains(&"/model".into()));
         assert!(!no_capability_names.contains(&"/mcp".into()));
 
         let partial = protocol_store_with_methods(&[methods::APPROVAL_SCOPES_LIST]);
@@ -1855,12 +5022,13 @@ mod tests {
             .map(|command| command.name)
             .collect::<Vec<_>>();
         assert!(partial_names.contains(&"/permissions".into()));
-        assert!(!partial_names.contains(&"/model".into()));
+        assert!(partial_names.contains(&"/model".into()));
         assert!(!partial_names.contains(&"/mcp".into()));
 
         let full = protocol_store_with_methods(&[
             methods::APPROVAL_SCOPES_LIST,
             crate::menu::registry::APPUI_METHOD_MODEL_LIST,
+            crate::menu::registry::APPUI_METHOD_MODEL_SELECT,
             crate::menu::registry::APPUI_METHOD_MCP_STATUS_LIST,
         ]);
         let full_names = full
@@ -1871,6 +5039,97 @@ mod tests {
         assert!(full_names.contains(&"/model".into()));
         assert!(full_names.contains(&"/permissions".into()));
         assert!(full_names.contains(&"/mcp".into()));
+    }
+
+    #[test]
+    fn skills_slash_commands_build_profile_skill_appui_commands() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_SKILLS_LIST,
+            crate::model::APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
+            crate::model::APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+            crate::model::APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+        ]);
+
+        store.state.composer =
+            "/skills install octos-org/skills/deep-search --branch dev --force".into();
+        let command = store.compose_command().expect("install command");
+        let AppUiCommand::ProfileSkillsInstall(params) = command else {
+            panic!("expected profile skills install command");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+        assert_eq!(params.repo, "octos-org/skills/deep-search");
+        assert_eq!(params.branch.as_deref(), Some("dev"));
+        assert!(params.force);
+
+        store.state.composer = "/skills search research".into();
+        let command = store.compose_command().expect("search command");
+        let AppUiCommand::ProfileSkillsRegistrySearch(params) = command else {
+            panic!("expected profile skills registry search command");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+        assert_eq!(params.q.as_deref(), Some("research"));
+
+        store.state.composer = "/skills remove deep-search".into();
+        let command = store.compose_command().expect("remove command");
+        let AppUiCommand::ProfileSkillsRemove(params) = command else {
+            panic!("expected profile skills remove command");
+        };
+        assert_eq!(params.name, "deep-search");
+    }
+
+    #[test]
+    fn profile_llm_list_seeds_pre_session_profile_for_skill_commands() {
+        let mut store = Store {
+            state: AppState::new(Vec::new(), 0, "ready".into(), Some("stdio".into()), false),
+        };
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SKILLS_LIST,
+        ]));
+
+        store.apply_client_event(ClientEvent::ProfileLlmList(ProfileLlmListClientEvent {
+            result: crate::model::ProfileLlmListResult {
+                profile_id: Some("dspfac".into()),
+                primary: None,
+                fallbacks: Vec::new(),
+                llm: None,
+                runtime_policy_stamp: None,
+            },
+            message: "Loaded profile LLM settings".into(),
+        }));
+
+        let command = store
+            .dispatch_skills_inline("list")
+            .expect("skills list command");
+        let AppUiCommand::ProfileSkillsList(params) = command else {
+            panic!("expected profile skills list command");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("dspfac"));
+    }
+
+    #[test]
+    fn skills_mutation_refreshes_installed_skill_list() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_SKILLS_LIST,
+            crate::model::APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+        ]);
+
+        let follow_up = store.apply_client_event(ClientEvent::ProfileSkillsMutation(
+            ProfileSkillsMutationClientEvent {
+                result: crate::model::ProfileSkillsMutationResult {
+                    profile_id: Some("coding".into()),
+                    ok: true,
+                    installed: vec!["deep-search".into()],
+                    ..crate::model::ProfileSkillsMutationResult::default()
+                },
+                message: "Installed skill(s): deep-search".into(),
+            },
+        ));
+
+        assert!(matches!(
+            follow_up,
+            Some(AppUiCommand::ProfileSkillsList(_))
+        ));
+        assert_eq!(store.state.status, "Refreshing profile skills");
     }
 
     #[test]
@@ -1931,10 +5190,7 @@ mod tests {
         assert!(store.state.composer.is_empty());
         assert!(store.state.pending_messages.is_empty());
         assert!(store.state.sessions[0].messages.is_empty());
-        assert_eq!(
-            store.state.status,
-            "/model is unavailable: AppUI capabilities are not available"
-        );
+        assert_eq!(store.state.status, "Menu: model");
     }
 
     #[test]
@@ -1942,7 +5198,7 @@ mod tests {
         let mut store = protocol_store_with_methods(&[]);
         store.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
         assert!(help_menu_labels(&store).contains(&"/status".to_string()));
-        assert!(help_menu_labels(&store).contains(&"/permissions".to_string()));
+        assert!(!help_menu_labels(&store).contains(&"/permissions".to_string()));
         assert!(!help_menu_labels(&store).contains(&"/model".to_string()));
 
         let session = store.state.sessions[0].clone();
@@ -1951,12 +5207,22 @@ mod tests {
             selected_session: 0,
             status: "snapshot replay".into(),
             target: Some("ws://example.test/ui-protocol".into()),
-            capabilities: Some(UiProtocolCapabilities::new(
-                &[crate::menu::registry::APPUI_METHOD_MODEL_LIST],
-                &[],
-            )),
             readonly: false,
         }));
+        store.apply_capabilities_event(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[
+                        crate::menu::registry::APPUI_METHOD_MODEL_LIST,
+                        crate::menu::registry::APPUI_METHOD_MODEL_SELECT,
+                        methods::APPROVAL_SCOPES_LIST,
+                    ],
+                    &[],
+                ),
+            },
+            message: "capabilities replay".into(),
+        });
+        store.refresh_active_menu();
 
         assert_eq!(
             store
@@ -1971,6 +5237,43 @@ mod tests {
     }
 
     #[test]
+    fn session_status_client_event_updates_cached_runtime_status() {
+        let mut store = protocol_store_with_methods(&[methods::APPROVAL_SCOPES_LIST]);
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_client_event(ClientEvent::SessionStatus(SessionStatusClientEvent {
+            result: session_status_result(&session_id),
+            message: "Runtime status refreshed".into(),
+        }));
+
+        let runtime_status = store
+            .state
+            .runtime_status_for(&session_id)
+            .expect("cached runtime status");
+        assert_eq!(
+            runtime_status
+                .runtime_policy_stamp
+                .as_ref()
+                .and_then(|stamp| stamp.tool_policy_id.as_deref()),
+            Some("coding-v3")
+        );
+        assert_eq!(
+            store.state.sessions[0].profile_id.as_deref(),
+            Some("coding")
+        );
+        assert!(
+            store
+                .state
+                .capabilities
+                .as_ref()
+                .is_some_and(|capabilities| {
+                    capabilities.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ)
+                })
+        );
+        assert_eq!(store.state.status, "Runtime status refreshed");
+    }
+
+    #[test]
     fn turn_completed_commits_live_reply_into_messages() {
         let turn_id = TurnId::new();
         let mut store = store_with_live_reply(turn_id.clone(), "hello");
@@ -1981,12 +5284,164 @@ mod tests {
                 session_id,
                 turn_id,
                 cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
             },
         )));
 
         assert_eq!(store.state.sessions[0].messages.len(), 1);
         assert!(store.state.sessions[0].live_reply.is_none());
         assert_eq!(store.state.run_state.label(), "done");
+    }
+
+    #[test]
+    fn turn_completed_captures_activity_log_for_transcript_and_clears_live_buffer() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "done");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            "build the site".into(),
+        );
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_turn(turn_id.clone())
+                .with_detail("cargo build")
+                .with_success(true),
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        assert!(
+            store
+                .state
+                .activity
+                .iter()
+                .all(|item| item.turn_id.as_ref() != Some(&turn_id))
+        );
+        let log = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_id)
+            .expect("turn activity log");
+        assert_eq!(log.request.as_deref(), Some("build the site"));
+        assert_eq!(log.items.len(), 1);
+    }
+
+    #[test]
+    fn turn_completed_without_model_answer_inserts_fallback_summary() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_turn(turn_id.clone())
+                .with_detail("cargo test")
+                .with_success(true),
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let message = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("fallback assistant message");
+        assert_eq!(message.role.as_str(), "assistant");
+        assert!(message.content.contains("Session Summary"));
+        assert!(
+            message
+                .content
+                .contains("TUI did not receive a final assistant answer")
+        );
+        assert!(message.content.contains("cargo test"));
+        assert_eq!(store.state.run_state.label(), "done");
+    }
+
+    #[test]
+    fn turn_completed_with_empty_live_reply_inserts_fallback_summary() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "");
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let message = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("fallback assistant message");
+        assert!(message.content.contains("Session Summary"));
+        assert!(
+            message
+                .content
+                .contains("TUI did not receive a final assistant answer")
+        );
+    }
+
+    #[test]
+    fn turn_completed_with_partial_live_reply_appends_fallback_summary() {
+        let turn_id = TurnId::new();
+        let mut store =
+            store_with_live_reply(turn_id.clone(), "The JWST site is complete and ready in");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "list_dir", "complete")
+                .with_turn(turn_id.clone())
+                .with_detail("jwst-site")
+                .with_success(true),
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let message = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("assistant message");
+        assert!(message.content.starts_with("The JWST site is complete"));
+        assert!(
+            message
+                .content
+                .contains("TUI only received a partial live answer")
+        );
+        assert!(message.content.contains("1 action(s) recorded"));
     }
 
     #[test]
@@ -2000,6 +5455,9 @@ mod tests {
                 session_id,
                 turn_id: TurnId::new(),
                 cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
             },
         )));
 
@@ -2143,9 +5601,6 @@ mod tests {
             selected_session: 0,
             status: "replayed snapshot".into(),
             target: None,
-            capabilities: Some(
-                octos_core::ui_protocol::UiProtocolCapabilities::first_server_slice(),
-            ),
             readonly: false,
         }));
 
@@ -2180,6 +5635,9 @@ mod tests {
                     session_id: session_id.clone(),
                     turn_id,
                     cursor: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    session_result: None,
                 },
             )))
             .expect("staged prompt submits after turn completion");
@@ -2240,9 +5698,6 @@ mod tests {
             selected_session: 0,
             status: "replayed snapshot".into(),
             target: None,
-            capabilities: Some(
-                octos_core::ui_protocol::UiProtocolCapabilities::first_server_slice(),
-            ),
             readonly: false,
         }));
 
@@ -2260,6 +5715,9 @@ mod tests {
                     session_id: session_id.clone(),
                     turn_id,
                     cursor: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    session_result: None,
                 },
             )))
             .expect("queued prompt submits after active turn completes");
@@ -2581,6 +6039,9 @@ mod tests {
                 session_id,
                 turn_id,
                 cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
             },
         )));
 
@@ -2940,6 +6401,17 @@ mod tests {
         )));
 
         assert!(store.state.sessions[0].live_reply.is_none());
+        let message = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("fallback assistant message");
+        assert!(message.content.contains("Session Summary"));
+        assert!(
+            message
+                .content
+                .contains("interrupted: turn interrupted by client")
+        );
+        assert!(message.content.contains("Partial response: streaming"));
         assert_eq!(
             store.state.status,
             "Turn error interrupted: turn interrupted by client"

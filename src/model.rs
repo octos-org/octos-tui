@@ -3,12 +3,17 @@ use std::time::Instant;
 use octos_core::app_ui::{APP_UI_API_V1, AppUiLiveReply, AppUiSession, AppUiSnapshot, AppUiTask};
 use octos_core::ui_protocol::{
     ApprovalDecision, ApprovalId, ApprovalRenderHints, ApprovalRequestedEvent,
-    ApprovalTypedDetails, OutputCursor, PermissionProfileSelection, PreviewId, TaskRuntimeState,
-    TurnId, UiPaneSnapshot, UiProtocolCapabilities, approval_scopes,
+    ApprovalScopesListParams, ApprovalTypedDetails, DiffPreviewGetParams, OutputCursor,
+    PermissionProfileListParams, PermissionProfileSelection, PermissionProfileSetParams, PreviewId,
+    TaskCancelParams, TaskListParams, TaskOutputReadParams, TaskRestartFromNodeParams,
+    TaskRuntimeState, TurnId, TurnInterruptParams, TurnStartParams, UiPaneSnapshot,
+    UiProtocolCapabilities, approval_scopes,
 };
 use octos_core::{Message, SessionKey, TaskId};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::fmt;
+use unicode_width::UnicodeWidthStr;
 
 use crate::menu::{
     AvailabilityContext, CapabilitySet, ConnectionState, MenuBuildResult, MenuStack, RuntimeMode,
@@ -18,6 +23,1526 @@ use crate::menu::{
 pub type LiveReply = AppUiLiveReply;
 pub type SessionView = AppUiSession;
 pub type TaskView = AppUiTask;
+
+pub const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str = "config/capabilities/list";
+pub const APPUI_METHOD_SESSION_STATUS_READ: &str = "session/status/read";
+pub const APPUI_METHOD_MODEL_LIST: &str = "profile/llm/list";
+pub const APPUI_METHOD_MODEL_SELECT: &str = "profile/llm/select";
+pub const APPUI_METHOD_MCP_STATUS_LIST: &str = "mcp/status/list";
+pub const APPUI_METHOD_TOOL_STATUS_LIST: &str = "tool/status/list";
+pub const APPUI_METHOD_MCP_CONFIG_LIST: &str = "mcp/config/list";
+pub const APPUI_METHOD_MCP_CONFIG_UPSERT: &str = "mcp/config/upsert";
+pub const APPUI_METHOD_MCP_CONFIG_DELETE: &str = "mcp/config/delete";
+pub const APPUI_METHOD_MCP_CONFIG_SET_ENABLED: &str = "mcp/config/set_enabled";
+pub const APPUI_METHOD_MCP_CONFIG_TEST: &str = "mcp/config/test";
+pub const APPUI_METHOD_TOOL_CONFIG_LIST: &str = "tool/config/list";
+pub const APPUI_METHOD_TOOL_CONFIG_SET_ENABLED: &str = "tool/config/set_enabled";
+pub const APPUI_METHOD_TOOL_CONFIG_UPSERT: &str = "tool/config/upsert";
+pub const APPUI_METHOD_TOOL_CONFIG_DELETE: &str = "tool/config/delete";
+pub const APPUI_METHOD_TOOL_CONFIG_TEST: &str = "tool/config/test";
+pub const APPUI_METHOD_AUTH_STATUS: &str = "auth/status";
+pub const APPUI_METHOD_AUTH_SEND_CODE: &str = "auth/send_code";
+pub const APPUI_METHOD_AUTH_VERIFY: &str = "auth/verify";
+pub const APPUI_METHOD_AUTH_ME: &str = "auth/me";
+pub const APPUI_METHOD_AUTH_LOGOUT: &str = "auth/logout";
+pub const APPUI_METHOD_PROFILE_LOCAL_CREATE: &str = "profile/local/create";
+pub const APPUI_METHOD_PROFILE_LLM_CATALOG: &str = "profile/llm/catalog";
+pub const APPUI_METHOD_PROFILE_LLM_UPSERT: &str = "profile/llm/upsert";
+pub const APPUI_METHOD_PROFILE_LLM_DELETE: &str = "profile/llm/delete";
+pub const APPUI_METHOD_PROFILE_LLM_TEST: &str = "profile/llm/test";
+pub const APPUI_METHOD_PROFILE_LLM_FETCH_MODELS: &str = "profile/llm/fetch_models";
+pub const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
+pub const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
+pub const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
+pub const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str = "profile/skills/remove";
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose_for_transport(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn masked(&self) -> &'static str {
+        if self.0.is_empty() { "" } else { "********" }
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("\"********\"")
+    }
+}
+
+fn string_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn is_empty_string(value: &str) -> bool {
+    value.trim().is_empty()
+}
+
+fn route_or_default<'de, D>(deserializer: D) -> Result<LlmRouteConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<LlmRouteConfig>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AppUiCommand {
+    OpenSession(octos_core::ui_protocol::SessionOpenParams),
+    SubmitPrompt(TurnStartParams),
+    InterruptTurn(TurnInterruptParams),
+    RespondApproval(octos_core::ui_protocol::ApprovalRespondParams),
+    ListApprovalScopes(ApprovalScopesListParams),
+    GetDiffPreview(DiffPreviewGetParams),
+    ListTasks(TaskListParams),
+    CancelTask(TaskCancelParams),
+    RestartTaskFromNode(TaskRestartFromNodeParams),
+    ReadTaskOutput(TaskOutputReadParams),
+    ListConfigCapabilities(ConfigCapabilitiesListParams),
+    ReadSessionStatus(SessionStatusReadParams),
+    ListModels(ModelListParams),
+    SelectModel(ModelSelectParams),
+    ListPermissionProfiles(PermissionProfileListParams),
+    SetPermissionProfile(PermissionProfileSetParams),
+    ListMcpStatus(McpStatusListParams),
+    ListToolStatus(ToolStatusListParams),
+    ListMcpConfig(McpConfigListParams),
+    UpsertMcpConfig(McpConfigUpsertParams),
+    DeleteMcpConfig(McpConfigDeleteParams),
+    SetMcpConfigEnabled(McpConfigSetEnabledParams),
+    TestMcpConfig(McpConfigTestParams),
+    ListToolConfig(ToolConfigListParams),
+    SetToolConfigEnabled(ToolConfigSetEnabledParams),
+    UpsertToolConfig(ToolConfigUpsertParams),
+    DeleteToolConfig(ToolConfigDeleteParams),
+    TestToolConfig(ToolConfigTestParams),
+    AuthStatus(AuthStatusParams),
+    AuthSendCode(AuthSendCodeParams),
+    AuthVerify(AuthVerifyParams),
+    AuthMe(AuthMeParams),
+    AuthLogout(AuthLogoutParams),
+    ProfileLocalCreate(ProfileLocalCreateParams),
+    ProfileLlmCatalog(ProfileLlmCatalogParams),
+    ProfileLlmList(ProfileLlmListParams),
+    ProfileLlmUpsert(ProfileLlmUpsertParams),
+    ProfileLlmDelete(ProfileLlmDeleteParams),
+    ProfileLlmSelect(ProfileLlmSelectParams),
+    ProfileLlmTest(ProfileLlmTestParams),
+    ProfileLlmFetchModels(ProfileLlmFetchModelsParams),
+    ProfileSkillsList(ProfileSkillsListParams),
+    ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchParams),
+    ProfileSkillsInstall(ProfileSkillsInstallParams),
+    ProfileSkillsRemove(ProfileSkillsRemoveParams),
+}
+
+impl AppUiCommand {
+    pub fn method(&self) -> &'static str {
+        match self {
+            Self::OpenSession(_) => octos_core::ui_protocol::methods::SESSION_OPEN,
+            Self::SubmitPrompt(_) => octos_core::ui_protocol::methods::TURN_START,
+            Self::InterruptTurn(_) => octos_core::ui_protocol::methods::TURN_INTERRUPT,
+            Self::RespondApproval(_) => octos_core::ui_protocol::methods::APPROVAL_RESPOND,
+            Self::ListApprovalScopes(_) => octos_core::ui_protocol::methods::APPROVAL_SCOPES_LIST,
+            Self::GetDiffPreview(_) => octos_core::ui_protocol::methods::DIFF_PREVIEW_GET,
+            Self::ListTasks(_) => octos_core::ui_protocol::methods::TASK_LIST,
+            Self::CancelTask(_) => octos_core::ui_protocol::methods::TASK_CANCEL,
+            Self::RestartTaskFromNode(_) => {
+                octos_core::ui_protocol::methods::TASK_RESTART_FROM_NODE
+            }
+            Self::ReadTaskOutput(_) => octos_core::ui_protocol::methods::TASK_OUTPUT_READ,
+            Self::ListConfigCapabilities(_) => APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
+            Self::ReadSessionStatus(_) => APPUI_METHOD_SESSION_STATUS_READ,
+            Self::ListModels(_) | Self::ProfileLlmList(_) => APPUI_METHOD_MODEL_LIST,
+            Self::SelectModel(_) | Self::ProfileLlmSelect(_) => APPUI_METHOD_MODEL_SELECT,
+            Self::ListPermissionProfiles(_) => {
+                octos_core::ui_protocol::methods::PERMISSION_PROFILE_LIST
+            }
+            Self::SetPermissionProfile(_) => {
+                octos_core::ui_protocol::methods::PERMISSION_PROFILE_SET
+            }
+            Self::ListMcpStatus(_) => APPUI_METHOD_MCP_STATUS_LIST,
+            Self::ListToolStatus(_) => APPUI_METHOD_TOOL_STATUS_LIST,
+            Self::ListMcpConfig(_) => APPUI_METHOD_MCP_CONFIG_LIST,
+            Self::UpsertMcpConfig(_) => APPUI_METHOD_MCP_CONFIG_UPSERT,
+            Self::DeleteMcpConfig(_) => APPUI_METHOD_MCP_CONFIG_DELETE,
+            Self::SetMcpConfigEnabled(_) => APPUI_METHOD_MCP_CONFIG_SET_ENABLED,
+            Self::TestMcpConfig(_) => APPUI_METHOD_MCP_CONFIG_TEST,
+            Self::ListToolConfig(_) => APPUI_METHOD_TOOL_CONFIG_LIST,
+            Self::SetToolConfigEnabled(_) => APPUI_METHOD_TOOL_CONFIG_SET_ENABLED,
+            Self::UpsertToolConfig(_) => APPUI_METHOD_TOOL_CONFIG_UPSERT,
+            Self::DeleteToolConfig(_) => APPUI_METHOD_TOOL_CONFIG_DELETE,
+            Self::TestToolConfig(_) => APPUI_METHOD_TOOL_CONFIG_TEST,
+            Self::AuthStatus(_) => APPUI_METHOD_AUTH_STATUS,
+            Self::AuthSendCode(_) => APPUI_METHOD_AUTH_SEND_CODE,
+            Self::AuthVerify(_) => APPUI_METHOD_AUTH_VERIFY,
+            Self::AuthMe(_) => APPUI_METHOD_AUTH_ME,
+            Self::AuthLogout(_) => APPUI_METHOD_AUTH_LOGOUT,
+            Self::ProfileLocalCreate(_) => APPUI_METHOD_PROFILE_LOCAL_CREATE,
+            Self::ProfileLlmCatalog(_) => APPUI_METHOD_PROFILE_LLM_CATALOG,
+            Self::ProfileLlmUpsert(_) => APPUI_METHOD_PROFILE_LLM_UPSERT,
+            Self::ProfileLlmDelete(_) => APPUI_METHOD_PROFILE_LLM_DELETE,
+            Self::ProfileLlmTest(_) => APPUI_METHOD_PROFILE_LLM_TEST,
+            Self::ProfileLlmFetchModels(_) => APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+            Self::ProfileSkillsList(_) => APPUI_METHOD_PROFILE_SKILLS_LIST,
+            Self::ProfileSkillsRegistrySearch(_) => APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
+            Self::ProfileSkillsInstall(_) => APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+            Self::ProfileSkillsRemove(_) => APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigCapabilitiesListParams {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigCapabilitiesListResult {
+    pub capabilities: UiProtocolCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStatusReadParams {
+    pub session_id: SessionKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelListParams {
+    pub session_id: SessionKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSelectParams {
+    pub session_id: SessionKey,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelStatus {
+    pub model: String,
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(default)]
+    pub selected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qoe_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelListResult {
+    pub session_id: SessionKey,
+    #[serde(default)]
+    pub models: Vec<ModelStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSelectResult {
+    pub session_id: SessionKey,
+    pub selected: ModelStatus,
+    #[serde(default)]
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStatusReadResult {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<RuntimeHealthStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_summary: Option<McpStatusSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_summary: Option<ToolStatusSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<SessionUsageStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<SessionCursorStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<UiProtocolCapabilities>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePolicyStamp {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy_id: Option<String>,
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qoe_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHealthStatus {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpStatusSummary {
+    pub connected: u32,
+    pub connecting: u32,
+    pub failed: u32,
+    pub disabled: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolStatusSummary {
+    pub visible: u32,
+    pub enabled: u32,
+    pub denied: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUsageStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_micros_usd: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCursorStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<octos_core::ui_protocol::UiCursor>,
+    #[serde(default)]
+    pub healthy: bool,
+    #[serde(default)]
+    pub replay_supported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpStatusListParams {
+    pub session_id: SessionKey,
+    #[serde(default)]
+    pub include_disabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpStatusListResult {
+    pub session_id: SessionKey,
+    #[serde(default)]
+    pub servers: Vec<McpStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpStatus {
+    pub server: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolStatusListParams {
+    pub session_id: SessionKey,
+    #[serde(default)]
+    pub include_denied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolStatusListResult {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_id: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<ToolStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolStatus {
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub visible: bool,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denial: Option<ToolPolicyDenial>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPolicyDenial {
+    pub code: String,
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    pub reason: String,
+    #[serde(default)]
+    pub recoverable: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpConfigListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub include_disabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpConfigUpsertParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub server: String,
+    #[serde(default)]
+    pub config: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpConfigDeleteParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub server: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpConfigSetEnabledParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub server: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpConfigTestParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub server: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpConfigListResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, alias = "mcp_servers", alias = "configs")]
+    pub servers: Vec<McpConfigEntry>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpConfigEntry {
+    #[serde(default, alias = "server", alias = "id")]
+    pub name: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(default, alias = "url", skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpConfigMutationResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub applied: bool,
+    #[serde(
+        default,
+        alias = "id",
+        alias = "deleted",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<McpConfigEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolConfigListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub include_disabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolConfigSetEnabledParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub tool: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolConfigUpsertParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub tool: String,
+    #[serde(default)]
+    pub config: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolConfigDeleteParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub tool: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolConfigTestParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub tool: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolConfigListResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_id: Option<String>,
+    #[serde(default, alias = "configs")]
+    pub tools: Vec<ToolConfigEntry>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolConfigEntry {
+    #[serde(default, alias = "name", alias = "id")]
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub visible: bool,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolConfigMutationResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub applied: bool,
+    #[serde(
+        default,
+        alias = "name",
+        alias = "deleted",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<ToolConfigEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthStatusParams {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthSendCodeParams {
+    pub email: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthVerifyParams {
+    pub email: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthMeParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<AppUiAuthToken>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthLogoutParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<AppUiAuthToken>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthStatusResult {
+    #[serde(default)]
+    pub bootstrap_mode: bool,
+    #[serde(default)]
+    pub email_login_enabled: bool,
+    #[serde(default)]
+    pub admin_token_login_enabled: bool,
+    #[serde(default)]
+    pub allow_self_registration: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped_profile: Option<AuthScopedProfile>,
+    #[serde(default)]
+    pub authenticated: bool,
+    #[serde(default)]
+    pub email_otp: bool,
+    #[serde(default)]
+    pub token_login: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthScopedProfile {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub email_login_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthSendCodeResult {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AppUiAuthToken(String);
+
+impl AppUiAuthToken {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose_for_transport(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for AppUiAuthToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("\"********\"")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthVerifyResult {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<AppUiAuthToken>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AuthMeResult {
+    Dashboard {
+        user: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<Value>,
+        portal: Value,
+    },
+    Legacy {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        email: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthLogoutResult {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileLocalCreateParams {
+    pub name: String,
+    pub username: String,
+    pub email: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileLocalCreateResult {
+    pub profile_id: String,
+    pub user_id: String,
+    pub name: String,
+    pub username: String,
+    pub email: String,
+    #[serde(default)]
+    pub created: bool,
+    pub runtime_mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnboardingAction {
+    Open,
+    OpenLogin,
+    OpenProvider,
+    SetName(String),
+    SetUsername(String),
+    SetEmail(String),
+    SetOtpCode(String),
+    SetProfileId(String),
+    SetProviderSelection(LlmSelectionConfig),
+    SetFamilyId(String),
+    SetModelId(String),
+    SetRouteId(String),
+    SetRouteLabel(String),
+    SetBaseUrl(String),
+    SetApiKeyEnv(String),
+    SetApiType(String),
+    SetApiKey(SecretString),
+    ClearApiKey,
+    SendCode,
+    VerifyCode,
+    CreateLocalProfile,
+    RefreshCatalog,
+    RefreshProviders,
+    FetchModels,
+    SaveProvider,
+    SaveProviderFallback,
+    TestProvider,
+    Finish,
+    Reset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingProviderPending {
+    Test,
+    Save,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingProviderSaveTarget {
+    Primary,
+    Fallback,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnboardingWizardState {
+    pub name: String,
+    pub username: String,
+    pub email: String,
+    pub otp_code: String,
+    pub profile_id: Option<String>,
+    pub local_profile_created: bool,
+    pub open_session_after_profile_create: bool,
+    pub auth_email_enabled: Option<bool>,
+    pub auth_code_sent: bool,
+    pub auth_verified: bool,
+    pub auth_token: Option<AppUiAuthToken>,
+    pub provider: LlmSelectionConfig,
+    pub api_key: Option<SecretString>,
+    pub provider_saved: bool,
+    pub provider_tested: bool,
+    pub provider_pending: Option<OnboardingProviderPending>,
+    pub provider_save_target: Option<OnboardingProviderSaveTarget>,
+    pub last_saved_provider_label: Option<String>,
+    pub last_saved_provider_target: Option<OnboardingProviderSaveTarget>,
+    pub saved_primary_provider_label: Option<String>,
+    pub last_message: Option<String>,
+}
+
+impl Default for OnboardingWizardState {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            username: String::new(),
+            email: String::new(),
+            otp_code: String::new(),
+            profile_id: None,
+            local_profile_created: false,
+            open_session_after_profile_create: false,
+            auth_email_enabled: None,
+            auth_code_sent: false,
+            auth_verified: false,
+            auth_token: None,
+            provider: empty_llm_selection_config(),
+            api_key: None,
+            provider_saved: false,
+            provider_tested: false,
+            provider_pending: None,
+            provider_save_target: None,
+            last_saved_provider_label: None,
+            last_saved_provider_target: None,
+            saved_primary_provider_label: None,
+            last_message: None,
+        }
+    }
+}
+
+fn empty_llm_selection_config() -> LlmSelectionConfig {
+    LlmSelectionConfig {
+        family_id: String::new(),
+        model_id: String::new(),
+        route: LlmRouteConfig {
+            route_id: String::new(),
+            label: None,
+            base_url: None,
+            api_key_env: None,
+            api_type: Some("openai".into()),
+        },
+        ..LlmSelectionConfig::default()
+    }
+}
+
+impl OnboardingWizardState {
+    pub fn effective_profile_id(&self, current_profile: Option<&str>) -> Option<String> {
+        self.profile_id
+            .as_deref()
+            .filter(|profile| !profile.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| current_profile.map(str::to_owned))
+    }
+
+    pub fn has_email(&self) -> bool {
+        !self.email.trim().is_empty()
+    }
+
+    pub fn has_name(&self) -> bool {
+        !self.name.trim().is_empty()
+    }
+
+    pub fn has_username(&self) -> bool {
+        !self.username.trim().is_empty()
+    }
+
+    pub fn local_profile_ready(&self) -> bool {
+        self.has_name() && self.has_username() && self.has_email()
+    }
+
+    pub fn has_otp_code(&self) -> bool {
+        !self.otp_code.trim().is_empty()
+    }
+
+    pub fn has_api_key(&self) -> bool {
+        self.api_key.as_ref().is_some_and(|key| !key.is_empty())
+    }
+
+    pub fn selection_ready(&self) -> bool {
+        !self.provider.family_id.trim().is_empty()
+            && !self.provider.model_id.trim().is_empty()
+            && (!self.provider.route.route_id.trim().is_empty()
+                || self
+                    .provider
+                    .route
+                    .base_url
+                    .as_deref()
+                    .is_some_and(|url| !url.trim().is_empty()))
+    }
+
+    pub fn profile_label(&self, current_profile: Option<&str>) -> String {
+        self.effective_profile_id(current_profile)
+            .unwrap_or_else(|| "<server authenticated profile>".into())
+    }
+
+    pub fn provider_label(&self) -> String {
+        if self.selection_ready() {
+            format!(
+                "{} / {} via {}",
+                self.provider.family_id, self.provider.model_id, self.provider.route.route_id
+            )
+        } else {
+            "not selected".into()
+        }
+    }
+
+    pub fn api_key_label(&self) -> &'static str {
+        self.api_key
+            .as_ref()
+            .map(SecretString::masked)
+            .unwrap_or("")
+    }
+
+    pub fn apply_selection(&mut self, selection: LlmSelectionConfig) {
+        self.provider = selection;
+        self.provider_tested = false;
+        self.provider_pending = None;
+        self.provider_save_target = None;
+        self.last_message = Some("Provider selection updated from AppUI catalog".into());
+    }
+
+    pub fn reset_staged_provider(&mut self) {
+        self.provider = empty_llm_selection_config();
+        self.api_key = None;
+        self.provider_tested = false;
+        self.provider_pending = None;
+        self.provider_save_target = None;
+    }
+
+    pub fn build_upsert_params(
+        &self,
+        current_profile: Option<&str>,
+    ) -> Option<ProfileLlmUpsertParams> {
+        self.build_upsert_params_with_primary(current_profile, true)
+    }
+
+    pub fn build_fallback_upsert_params(
+        &self,
+        current_profile: Option<&str>,
+    ) -> Option<ProfileLlmUpsertParams> {
+        self.build_upsert_params_with_primary(current_profile, false)
+    }
+
+    fn build_upsert_params_with_primary(
+        &self,
+        current_profile: Option<&str>,
+        set_primary: bool,
+    ) -> Option<ProfileLlmUpsertParams> {
+        self.selection_ready().then(|| ProfileLlmUpsertParams {
+            profile_id: self.effective_profile_id(current_profile),
+            selection: self.provider.clone(),
+            api_key: self.api_key.clone(),
+            set_primary,
+        })
+    }
+
+    pub fn build_test_params(&self, current_profile: Option<&str>) -> Option<ProfileLlmTestParams> {
+        self.selection_ready().then(|| ProfileLlmTestParams {
+            profile_id: self.effective_profile_id(current_profile),
+            selection: self.provider.clone(),
+            api_key: self.api_key.clone(),
+        })
+    }
+
+    pub fn build_fetch_models_params(
+        &self,
+        current_profile: Option<&str>,
+    ) -> Option<ProfileLlmFetchModelsParams> {
+        self.selection_ready().then(|| ProfileLlmFetchModelsParams {
+            profile_id: self.effective_profile_id(current_profile),
+            selection: self.provider.clone(),
+            api_key: self.api_key.clone(),
+        })
+    }
+
+    pub fn apply_auth_status(&mut self, result: &AuthStatusResult) {
+        self.auth_email_enabled = Some(result.email_login_enabled || result.email_otp);
+        self.auth_verified = result.authenticated || result.scoped_profile.is_some();
+        if let Some(profile) = result.scoped_profile.as_ref() {
+            self.profile_id = Some(profile.id.clone());
+        } else if let Some(profile_id) = result.profile_id.as_ref() {
+            self.profile_id = Some(profile_id.clone());
+        }
+    }
+
+    pub fn apply_auth_verify(&mut self, result: &AuthVerifyResult) {
+        self.auth_verified = result.ok;
+        if let Some(token) = result.token.clone() {
+            self.auth_token = Some(token);
+        }
+    }
+
+    pub fn apply_auth_me(&mut self, result: &AuthMeResult) {
+        if let Some(profile_id) = auth_me_profile_id(result) {
+            self.profile_id = Some(profile_id.to_owned());
+            self.auth_verified = true;
+        }
+    }
+
+    pub fn apply_profile_local_create(&mut self, result: &ProfileLocalCreateResult) {
+        self.profile_id = Some(result.profile_id.clone());
+        self.name = result.name.clone();
+        self.username = result.username.clone();
+        self.email = result.email.clone();
+        self.local_profile_created = true;
+        self.auth_verified = true;
+    }
+}
+
+pub fn auth_me_email(result: &AuthMeResult) -> Option<&str> {
+    match result {
+        AuthMeResult::Dashboard { user, .. } => user.get("email").and_then(Value::as_str),
+        AuthMeResult::Legacy { email, .. } => email.as_deref(),
+    }
+}
+
+pub fn auth_me_profile_id(result: &AuthMeResult) -> Option<&str> {
+    match result {
+        AuthMeResult::Dashboard { profile, user, .. } => profile
+            .as_ref()
+            .and_then(|profile| {
+                profile
+                    .get("profile")
+                    .and_then(|profile| profile.get("id"))
+                    .and_then(Value::as_str)
+                    .or_else(|| profile.get("id").and_then(Value::as_str))
+            })
+            .or_else(|| user.get("profile_id").and_then(Value::as_str)),
+        AuthMeResult::Legacy { profile_id, .. } => profile_id.as_deref(),
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileLlmCatalogParams {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileLlmListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmRouteConfig {
+    #[serde(
+        default,
+        deserialize_with = "string_or_default",
+        skip_serializing_if = "is_empty_string"
+    )]
+    pub route_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_type: Option<String>,
+}
+
+impl Default for LlmRouteConfig {
+    fn default() -> Self {
+        Self {
+            route_id: String::new(),
+            label: None,
+            base_url: None,
+            api_key_env: None,
+            api_type: None,
+        }
+    }
+}
+
+impl LlmRouteConfig {
+    pub fn is_empty(&self) -> bool {
+        self.route_id.trim().is_empty()
+            && self.label.as_deref().is_none_or(str::is_empty)
+            && self.base_url.as_deref().is_none_or(str::is_empty)
+            && self.api_key_env.as_deref().is_none_or(str::is_empty)
+            && self.api_type.as_deref().is_none_or(str::is_empty)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmSelectionConfig {
+    #[serde(
+        default,
+        deserialize_with = "string_or_default",
+        skip_serializing_if = "is_empty_string"
+    )]
+    pub family_id: String,
+    #[serde(
+        default,
+        deserialize_with = "string_or_default",
+        skip_serializing_if = "is_empty_string"
+    )]
+    pub model_id: String,
+    #[serde(
+        default,
+        deserialize_with = "route_or_default",
+        skip_serializing_if = "LlmRouteConfig::is_empty"
+    )]
+    pub route: LlmRouteConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_hints: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_per_m: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strong: Option<bool>,
+}
+
+impl Default for LlmSelectionConfig {
+    fn default() -> Self {
+        Self {
+            family_id: String::new(),
+            model_id: String::new(),
+            route: LlmRouteConfig::default(),
+            model_hints: None,
+            cost_per_m: None,
+            strong: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileLlmUpsertParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub selection: LlmSelectionConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretString>,
+    #[serde(default)]
+    pub set_primary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileLlmDeleteParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub family_id: String,
+    pub model_id: String,
+    pub route_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileLlmSelectParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub family_id: String,
+    pub model_id: String,
+    pub route_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileLlmTestParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub selection: LlmSelectionConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretString>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileLlmFetchModelsParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub selection: LlmSelectionConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretString>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProfileLlmCatalogResult {
+    #[serde(default)]
+    pub families: serde_json::Map<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for ProfileLlmCatalogResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let families = match value {
+            Value::Object(mut object) => object
+                .remove("families")
+                .and_then(|families| match families {
+                    Value::Object(families) => Some(families),
+                    _ => None,
+                })
+                .unwrap_or(object),
+            _ => serde_json::Map::new(),
+        };
+        Ok(Self { families })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmConfiguredProvider {
+    #[serde(default, skip_serializing)]
+    pub provider: String,
+    #[serde(default, skip_serializing)]
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<LlmRouteConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub has_api_key: bool,
+    #[serde(default)]
+    pub selected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_hints: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_per_m: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strong: Option<bool>,
+}
+
+impl LlmConfiguredProvider {
+    pub fn to_model_status(&self) -> ModelStatus {
+        let provider = non_empty(self.provider.clone())
+            .or_else(|| self.family_id.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let model = non_empty(self.model.clone())
+            .or_else(|| self.model_id.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let route = self.route_id.clone().or_else(|| {
+            self.route
+                .as_ref()
+                .and_then(|route| non_empty(route.route_id.clone()))
+        });
+        ModelStatus {
+            model: self.model_id.clone().unwrap_or_else(|| model.clone()),
+            provider: provider.clone(),
+            title: Some(format!("{provider} / {model}")),
+            family: self.family_id.clone(),
+            route,
+            selected: self.selected,
+            available: self.available,
+            queue_mode: None,
+            qoe_policy: None,
+        }
+    }
+}
+
+fn non_empty(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileLlmListResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<LlmConfiguredProvider>,
+    #[serde(default)]
+    pub fallbacks: Vec<LlmConfiguredProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm: Option<LlmProfileState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
+}
+
+impl ProfileLlmListResult {
+    pub fn primary_provider(&self) -> Option<&LlmConfiguredProvider> {
+        self.primary
+            .as_ref()
+            .or_else(|| self.llm.as_ref().and_then(|llm| llm.primary.as_ref()))
+    }
+
+    pub fn fallback_providers(&self) -> &[LlmConfiguredProvider] {
+        if self.fallbacks.is_empty() {
+            self.llm
+                .as_ref()
+                .map(|llm| llm.fallbacks.as_slice())
+                .unwrap_or_default()
+        } else {
+            self.fallbacks.as_slice()
+        }
+    }
+
+    pub fn models(&self) -> Vec<ModelStatus> {
+        self.primary_provider()
+            .into_iter()
+            .chain(self.fallback_providers().iter())
+            .map(LlmConfiguredProvider::to_model_status)
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmProfileState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<LlmConfiguredProvider>,
+    #[serde(default)]
+    pub fallbacks: Vec<LlmConfiguredProvider>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileLlmMutationResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<LlmConfiguredProvider>,
+    #[serde(default)]
+    pub fallbacks: Vec<LlmConfiguredProvider>,
+    #[serde(default)]
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm: Option<LlmProfileState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ProfileLlmMutationResult {
+    pub fn to_list_result(&self) -> ProfileLlmListResult {
+        ProfileLlmListResult {
+            profile_id: self.profile_id.clone(),
+            primary: self.primary.clone(),
+            fallbacks: self.fallbacks.clone(),
+            llm: self.llm.clone(),
+            runtime_policy_stamp: self.runtime_policy_stamp.clone(),
+        }
+    }
+
+    pub fn models(&self) -> Vec<ModelStatus> {
+        self.to_list_result().models()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSkillsListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSkillsRegistrySearchParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSkillsInstallParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSkillsRemoveParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSkillEntry {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub tool_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_repo: Option<String>,
+    #[serde(default)]
+    pub installed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSkillsListResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub count: usize,
+    #[serde(default)]
+    pub skills: Vec<ProfileSkillEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSkillRegistryPackage {
+    pub name: String,
+    pub description: String,
+    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub requires: Vec<String>,
+    #[serde(default)]
+    pub provides_tools: bool,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub installed: bool,
+    #[serde(default)]
+    pub installed_skills: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSkillsRegistrySearchResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub packages: Vec<ProfileSkillRegistryPackage>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSkillsMutationResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub installed: Vec<String>,
+    #[serde(default)]
+    pub skipped: Vec<String>,
+    #[serde(default)]
+    pub deps_installed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPane {
@@ -93,6 +1618,7 @@ pub struct AppState {
     pub workspace: WorkspacePaneState,
     pub git: GitPaneState,
     pub composer: String,
+    pub composer_cursor: Option<usize>,
     pub composer_drafts: Vec<ComposerDraft>,
     pub pending_messages: Vec<String>,
     pub optimistic_user_messages: Vec<OptimisticUserMessage>,
@@ -108,11 +1634,47 @@ pub struct AppState {
     pub task_output_cursors: Vec<TaskOutputCursor>,
     pub diff_preview: DiffPreviewPaneState,
     pub activity: Vec<ActivityItem>,
+    pub turn_activity_logs: Vec<TurnActivityLog>,
     pub expanded_tool_outputs: bool,
     pub menu_stack: MenuStack,
     pub active_menu: Option<MenuBuildResult>,
     pub capabilities: Option<CapabilitySet>,
+    pub onboarding: OnboardingWizardState,
     pub permission_profiles: Vec<SessionPermissionProfile>,
+    pub session_runtime_statuses: Vec<SessionRuntimeStatus>,
+    pub profile_llm_catalog: Option<ProfileLlmCatalogResult>,
+    pub profile_llm_state: Option<ProfileLlmListResult>,
+    pub profile_skills: Option<ProfileSkillsListResult>,
+    pub profile_skill_registry: Option<ProfileSkillsRegistrySearchResult>,
+    pub session_model_catalogs: Vec<SessionModelCatalog>,
+    pub session_mcp_catalogs: Vec<SessionMcpCatalog>,
+    pub session_tool_catalogs: Vec<SessionToolCatalog>,
+    pub mcp_config_catalog: Option<McpConfigListResult>,
+    pub tool_config_catalog: Option<ToolConfigListResult>,
+    pub exit_requested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposerPresentation {
+    Empty,
+    Inline(String),
+    Collapsed(ComposerCollapse),
+}
+
+impl ComposerPresentation {
+    pub fn cursor_width(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Inline(text) => text.rsplit('\n').next().unwrap_or("").width(),
+            Self::Collapsed(collapse) => "[paste] ".width() + collapse.summary.width(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerCollapse {
+    pub summary: String,
+    pub preview: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,9 +1693,92 @@ pub struct OptimisticUserMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnActivityLog {
+    pub session_id: SessionKey,
+    pub turn_id: TurnId,
+    pub request: Option<String>,
+    pub anchor_index: Option<usize>,
+    pub items: Vec<ActivityItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPermissionProfile {
     pub session_id: SessionKey,
     pub current: PermissionProfileSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRuntimeStatus {
+    pub session_id: SessionKey,
+    pub runtime_mode: Option<String>,
+    pub profile_id: Option<String>,
+    pub cwd: Option<String>,
+    pub workspace_root: Option<String>,
+    pub active_turn_id: Option<TurnId>,
+    pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
+    pub model: Option<ModelStatus>,
+    pub permission_profile: Option<String>,
+    pub approval_policy: Option<String>,
+    pub sandbox_mode: Option<String>,
+    pub sandbox: Option<String>,
+    pub filesystem_scope: Option<String>,
+    pub network: Option<String>,
+    pub tool_policy_id: Option<String>,
+    pub mcp_servers: Vec<String>,
+    pub memory_scope: Option<String>,
+    pub health: Option<RuntimeHealthStatus>,
+    pub mcp_summary: Option<McpStatusSummary>,
+    pub tool_summary: Option<ToolStatusSummary>,
+    pub usage: Option<SessionUsageStatus>,
+    pub cursor: Option<SessionCursorStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionModelCatalog {
+    pub session_id: SessionKey,
+    pub models: Vec<ModelStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMcpCatalog {
+    pub session_id: SessionKey,
+    pub servers: Vec<McpStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionToolCatalog {
+    pub session_id: SessionKey,
+    pub policy_id: Option<String>,
+    pub tools: Vec<ToolStatus>,
+}
+
+impl From<SessionStatusReadResult> for SessionRuntimeStatus {
+    fn from(value: SessionStatusReadResult) -> Self {
+        Self {
+            session_id: value.session_id,
+            runtime_mode: value.runtime_mode,
+            profile_id: value.profile_id,
+            cwd: value.cwd,
+            workspace_root: value.workspace_root,
+            active_turn_id: value.active_turn_id,
+            runtime_policy_stamp: value.runtime_policy_stamp,
+            model: value.model,
+            permission_profile: value.permission_profile,
+            approval_policy: value.approval_policy,
+            sandbox_mode: value.sandbox_mode,
+            sandbox: value.sandbox,
+            filesystem_scope: value.filesystem_scope,
+            network: value.network,
+            tool_policy_id: value.tool_policy_id,
+            mcp_servers: value.mcp_servers,
+            memory_scope: value.memory_scope,
+            health: value.health,
+            mcp_summary: value.mcp_summary,
+            tool_summary: value.tool_summary,
+            usage: value.usage,
+            cursor: value.cursor,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -504,6 +2149,7 @@ pub struct GitHistoryItem {
 pub struct DiffPreviewPaneState {
     pub active: bool,
     pub loading: bool,
+    pub turn_id: Option<TurnId>,
     pub requested_preview_id: Option<PreviewId>,
     pub status: Option<String>,
     pub source: Option<String>,
@@ -516,9 +2162,14 @@ pub struct DiffPreviewPaneState {
 
 impl DiffPreviewPaneState {
     pub fn open_loading(&mut self, preview_id: PreviewId) {
+        self.open_loading_for_turn(preview_id, None);
+    }
+
+    pub fn open_loading_for_turn(&mut self, preview_id: PreviewId, turn_id: Option<TurnId>) {
         *self = Self {
             active: true,
             loading: true,
+            turn_id,
             requested_preview_id: Some(preview_id),
             status: Some("loading".into()),
             source: None,
@@ -531,8 +2182,14 @@ impl DiffPreviewPaneState {
     }
 
     pub fn apply_result(&mut self, result: DiffPreviewGetResult) {
+        let turn_id = self
+            .requested_preview_id
+            .as_ref()
+            .filter(|preview_id| **preview_id == result.preview.preview_id)
+            .and_then(|_| self.turn_id.clone());
         self.active = true;
         self.loading = false;
+        self.turn_id = turn_id;
         self.requested_preview_id = Some(result.preview.preview_id.clone());
         self.status = Some(result.status);
         self.source = Some(result.source);
@@ -962,19 +2619,14 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 impl AppState {
     pub fn from_snapshot(snapshot: AppUiSnapshot) -> Self {
         let panes = SnapshotPaneSeed::from_snapshot(&snapshot);
-        let capabilities = snapshot.capabilities.clone();
-        let mut state = Self::new_with_panes(
+        Self::new_with_panes(
             snapshot.sessions,
             snapshot.selected_session,
             snapshot.status,
             snapshot.target,
             snapshot.readonly,
             panes,
-        );
-        if let Some(capabilities) = capabilities {
-            state.set_capabilities(capabilities);
-        }
-        state
+        )
     }
 
     pub fn new(
@@ -1015,6 +2667,7 @@ impl AppState {
             workspace: panes.workspace,
             git: panes.git,
             composer: String::new(),
+            composer_cursor: None,
             composer_drafts: Vec::new(),
             pending_messages: Vec::new(),
             optimistic_user_messages: Vec::new(),
@@ -1030,11 +2683,24 @@ impl AppState {
             task_output_cursors: Vec::new(),
             diff_preview: DiffPreviewPaneState::default(),
             activity: Vec::new(),
+            turn_activity_logs: Vec::new(),
             expanded_tool_outputs: false,
             menu_stack: MenuStack::new(),
             active_menu: None,
             capabilities: None,
+            onboarding: OnboardingWizardState::default(),
             permission_profiles: Vec::new(),
+            session_runtime_statuses: Vec::new(),
+            profile_llm_catalog: None,
+            profile_llm_state: None,
+            profile_skills: None,
+            profile_skill_registry: None,
+            session_model_catalogs: Vec::new(),
+            session_mcp_catalogs: Vec::new(),
+            session_tool_catalogs: Vec::new(),
+            mcp_config_catalog: None,
+            tool_config_catalog: None,
+            exit_requested: false,
         }
     }
 
@@ -1068,6 +2734,78 @@ impl AppState {
         }
     }
 
+    pub fn runtime_status_for(&self, session_id: &SessionKey) -> Option<&SessionRuntimeStatus> {
+        self.session_runtime_statuses
+            .iter()
+            .find(|status| &status.session_id == session_id)
+    }
+
+    pub fn set_runtime_status(&mut self, status: SessionRuntimeStatus) {
+        if let Some(existing) = self
+            .session_runtime_statuses
+            .iter_mut()
+            .find(|existing| existing.session_id == status.session_id)
+        {
+            *existing = status;
+        } else {
+            self.session_runtime_statuses.push(status);
+        }
+    }
+
+    pub fn model_catalog_for(&self, session_id: &SessionKey) -> Option<&SessionModelCatalog> {
+        self.session_model_catalogs
+            .iter()
+            .find(|catalog| &catalog.session_id == session_id)
+    }
+
+    pub fn set_model_catalog(&mut self, catalog: SessionModelCatalog) {
+        if let Some(existing) = self
+            .session_model_catalogs
+            .iter_mut()
+            .find(|existing| existing.session_id == catalog.session_id)
+        {
+            *existing = catalog;
+        } else {
+            self.session_model_catalogs.push(catalog);
+        }
+    }
+
+    pub fn mcp_catalog_for(&self, session_id: &SessionKey) -> Option<&SessionMcpCatalog> {
+        self.session_mcp_catalogs
+            .iter()
+            .find(|catalog| &catalog.session_id == session_id)
+    }
+
+    pub fn set_mcp_catalog(&mut self, catalog: SessionMcpCatalog) {
+        if let Some(existing) = self
+            .session_mcp_catalogs
+            .iter_mut()
+            .find(|existing| existing.session_id == catalog.session_id)
+        {
+            *existing = catalog;
+        } else {
+            self.session_mcp_catalogs.push(catalog);
+        }
+    }
+
+    pub fn tool_catalog_for(&self, session_id: &SessionKey) -> Option<&SessionToolCatalog> {
+        self.session_tool_catalogs
+            .iter()
+            .find(|catalog| &catalog.session_id == session_id)
+    }
+
+    pub fn set_tool_catalog(&mut self, catalog: SessionToolCatalog) {
+        if let Some(existing) = self
+            .session_tool_catalogs
+            .iter_mut()
+            .find(|existing| existing.session_id == catalog.session_id)
+        {
+            *existing = catalog;
+        } else {
+            self.session_tool_catalogs.push(catalog);
+        }
+    }
+
     pub fn availability_context(&self) -> AvailabilityContext<'_> {
         AvailabilityContext {
             task: if self.active_turn().is_some()
@@ -1086,20 +2824,12 @@ impl AppState {
                 .as_ref()
                 .is_some_and(|approval| approval.visible),
             readonly: self.readonly,
-            runtime: if self
-                .target
-                .as_deref()
-                .is_some_and(|target| target.starts_with("ws://") || target.starts_with("wss://"))
-            {
+            runtime: if self.target.as_deref().is_some_and(is_protocol_target) {
                 RuntimeMode::Protocol
             } else {
                 RuntimeMode::Mock
             },
-            connection: if self
-                .target
-                .as_deref()
-                .is_some_and(|target| target.starts_with("ws://") || target.starts_with("wss://"))
-            {
+            connection: if self.target.as_deref().is_some_and(is_protocol_target) {
                 ConnectionState::Connected
             } else {
                 ConnectionState::Disconnected
@@ -1253,6 +2983,59 @@ impl AppState {
         self.optimistic_user_messages = retained;
     }
 
+    pub fn capture_completed_turn_activity(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> bool {
+        let items = self
+            .activity
+            .iter()
+            .filter(|item| item.turn_id.as_ref() == Some(turn_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            return false;
+        }
+
+        let optimistic = self
+            .optimistic_user_messages
+            .iter()
+            .rev()
+            .find(|message| &message.session_id == session_id && &message.turn_id == turn_id);
+        let request = optimistic
+            .map(|message| message.content.clone())
+            .or_else(|| latest_user_content_for_session(&self.sessions, session_id));
+        let anchor_index = optimistic.map(|message| message.anchor_index);
+        let log = TurnActivityLog {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            request,
+            anchor_index,
+            items,
+        };
+
+        if let Some(existing) = self
+            .turn_activity_logs
+            .iter_mut()
+            .find(|existing| &existing.session_id == session_id && &existing.turn_id == turn_id)
+        {
+            *existing = log;
+        } else {
+            self.turn_activity_logs.push(log);
+        }
+
+        const MAX_TURN_ACTIVITY_LOGS: usize = 32;
+        if self.turn_activity_logs.len() > MAX_TURN_ACTIVITY_LOGS {
+            let excess = self.turn_activity_logs.len() - MAX_TURN_ACTIVITY_LOGS;
+            self.turn_activity_logs.drain(0..excess);
+        }
+
+        self.activity
+            .retain(|item| item.turn_id.as_ref() != Some(turn_id));
+        true
+    }
+
     pub fn has_pending_messages(&self) -> bool {
         !self.pending_messages.is_empty()
     }
@@ -1402,10 +3185,18 @@ impl AppState {
 
     pub fn push_activity(&mut self, item: ActivityItem) {
         const MAX_ACTIVITY_ITEMS: usize = 80;
+        let estimated_rows = estimated_activity_rows(&item);
         self.activity.push(item);
+        self.preserve_transcript_position_after_append(estimated_rows);
         if self.activity.len() > MAX_ACTIVITY_ITEMS {
             let excess = self.activity.len() - MAX_ACTIVITY_ITEMS;
             self.activity.drain(0..excess);
+        }
+    }
+
+    pub fn preserve_transcript_position_after_append(&mut self, estimated_rows: usize) {
+        if self.transcript_scroll > 0 && estimated_rows > 0 {
+            self.transcript_scroll = self.transcript_scroll.saturating_add(estimated_rows);
         }
     }
 
@@ -1419,6 +3210,7 @@ impl AppState {
         duration_ms: Option<u64>,
     ) {
         let status = status.into();
+        let mut updated = false;
         if let Some(item) = self
             .activity
             .iter_mut()
@@ -1438,6 +3230,10 @@ impl AppState {
             if duration_ms.is_some() {
                 item.duration_ms = duration_ms;
             }
+            updated = true;
+        }
+        if updated {
+            self.preserve_transcript_position_after_append(1);
         }
     }
 
@@ -1515,6 +3311,7 @@ impl AppState {
     pub fn load_composer_draft_for_selected_session(&mut self) {
         let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
             self.composer.clear();
+            self.composer_cursor = None;
             return;
         };
         self.composer = self
@@ -1523,16 +3320,255 @@ impl AppState {
             .find(|draft| draft.session_id == session_id)
             .map(|draft| draft.text.clone())
             .unwrap_or_default();
+        self.composer_cursor = None;
     }
 
     pub fn clear_current_composer_draft(&mut self) {
         let session_id = self.active_session().map(|session| session.id.clone());
         self.composer.clear();
+        self.composer_cursor = None;
         if let Some(session_id) = session_id {
             self.composer_drafts
                 .retain(|draft| draft.session_id != session_id);
         }
     }
+
+    pub fn set_composer_text(&mut self, text: impl Into<String>) {
+        self.composer = text.into();
+        self.composer_cursor = None;
+    }
+
+    pub fn composer_cursor_index(&self) -> usize {
+        self.clamp_composer_cursor(self.composer_cursor.unwrap_or(self.composer.len()))
+    }
+
+    pub fn insert_composer_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let cursor = self.composer_cursor_index();
+        self.composer.insert_str(cursor, text);
+        self.composer_cursor = Some(cursor + text.len());
+    }
+
+    pub fn insert_composer_char(&mut self, ch: char) {
+        let cursor = self.composer_cursor_index();
+        self.composer.insert(cursor, ch);
+        self.composer_cursor = Some(cursor + ch.len_utf8());
+    }
+
+    pub fn delete_composer_prev_char(&mut self) {
+        let cursor = self.composer_cursor_index();
+        let Some(prev) = prev_char_boundary(&self.composer, cursor) else {
+            self.composer_cursor = Some(0);
+            return;
+        };
+        self.composer.drain(prev..cursor);
+        self.composer_cursor = Some(prev);
+    }
+
+    pub fn delete_composer_next_char(&mut self) {
+        let cursor = self.composer_cursor_index();
+        let Some(next) = next_char_boundary(&self.composer, cursor) else {
+            self.composer_cursor = Some(self.composer.len());
+            return;
+        };
+        self.composer.drain(cursor..next);
+        self.composer_cursor = Some(cursor);
+    }
+
+    pub fn move_composer_cursor_left(&mut self) {
+        let cursor = self.composer_cursor_index();
+        self.composer_cursor = Some(prev_char_boundary(&self.composer, cursor).unwrap_or(0));
+    }
+
+    pub fn move_composer_cursor_right(&mut self) {
+        let cursor = self.composer_cursor_index();
+        self.composer_cursor =
+            Some(next_char_boundary(&self.composer, cursor).unwrap_or(self.composer.len()));
+    }
+
+    pub fn move_composer_cursor_line_start(&mut self) {
+        let cursor = self.composer_cursor_index();
+        let line_start = self.composer[..cursor]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        self.composer_cursor = Some(line_start);
+    }
+
+    pub fn move_composer_cursor_line_end(&mut self) {
+        let cursor = self.composer_cursor_index();
+        let line_end = self.composer[cursor..]
+            .find('\n')
+            .map(|offset| cursor + offset)
+            .unwrap_or(self.composer.len());
+        self.composer_cursor = Some(line_end);
+    }
+
+    pub fn move_composer_cursor_prev_word(&mut self) {
+        let cursor = self.composer_cursor_index();
+        self.composer_cursor = Some(prev_word_boundary(&self.composer, cursor));
+    }
+
+    pub fn move_composer_cursor_next_word(&mut self) {
+        let cursor = self.composer_cursor_index();
+        self.composer_cursor = Some(next_word_boundary(&self.composer, cursor));
+    }
+
+    pub fn delete_composer_prev_word(&mut self) {
+        let cursor = self.composer_cursor_index();
+        let start = prev_word_boundary(&self.composer, cursor);
+        self.composer.drain(start..cursor);
+        self.composer_cursor = Some(start);
+    }
+
+    pub fn delete_composer_next_word(&mut self) {
+        let cursor = self.composer_cursor_index();
+        let end = next_word_boundary(&self.composer, cursor);
+        self.composer.drain(cursor..end);
+        self.composer_cursor = Some(cursor);
+    }
+
+    pub fn kill_composer_to_line_end(&mut self) {
+        let cursor = self.composer_cursor_index();
+        let end = self.composer[cursor..]
+            .find('\n')
+            .map(|offset| cursor + offset)
+            .unwrap_or(self.composer.len());
+        self.composer.drain(cursor..end);
+        self.composer_cursor = Some(cursor);
+    }
+
+    pub fn composer_presentation(&self) -> ComposerPresentation {
+        composer_presentation_for_text(&self.composer)
+    }
+
+    fn clamp_composer_cursor(&self, cursor: usize) -> usize {
+        let cursor = cursor.min(self.composer.len());
+        if self.composer.is_char_boundary(cursor) {
+            return cursor;
+        }
+        prev_char_boundary(&self.composer, cursor).unwrap_or(0)
+    }
+}
+
+fn is_protocol_target(target: &str) -> bool {
+    let target = target.trim_start();
+    target
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ws://"))
+        || target
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("wss://"))
+        || target
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("stdio:"))
+}
+
+fn prev_char_boundary(text: &str, cursor: usize) -> Option<usize> {
+    let mut cursor = cursor.min(text.len());
+    while cursor > 0 && !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    text[..cursor].char_indices().last().map(|(idx, _)| idx)
+}
+
+fn next_char_boundary(text: &str, cursor: usize) -> Option<usize> {
+    let mut cursor = cursor.min(text.len());
+    while cursor < text.len() && !text.is_char_boundary(cursor) {
+        cursor += 1;
+    }
+    text[cursor..]
+        .char_indices()
+        .nth(1)
+        .map(|(idx, _)| cursor + idx)
+        .or_else(|| (cursor < text.len()).then_some(text.len()))
+}
+
+fn prev_word_boundary(text: &str, cursor: usize) -> usize {
+    let mut idx = cursor.min(text.len());
+    while let Some(prev) = prev_char_boundary(text, idx) {
+        let ch = text[prev..idx].chars().next().unwrap_or_default();
+        if !ch.is_whitespace() {
+            break;
+        }
+        idx = prev;
+    }
+    while let Some(prev) = prev_char_boundary(text, idx) {
+        let ch = text[prev..idx].chars().next().unwrap_or_default();
+        if ch.is_whitespace() {
+            break;
+        }
+        idx = prev;
+    }
+    idx
+}
+
+fn next_word_boundary(text: &str, cursor: usize) -> usize {
+    let mut idx = cursor.min(text.len());
+    while let Some(next) = next_char_boundary(text, idx) {
+        let ch = text[idx..next].chars().next().unwrap_or_default();
+        if !ch.is_whitespace() {
+            break;
+        }
+        idx = next;
+    }
+    while let Some(next) = next_char_boundary(text, idx) {
+        let ch = text[idx..next].chars().next().unwrap_or_default();
+        if ch.is_whitespace() {
+            break;
+        }
+        idx = next;
+    }
+    idx
+}
+
+fn composer_presentation_for_text(text: &str) -> ComposerPresentation {
+    const COLLAPSE_LINE_THRESHOLD: usize = 32;
+    const COLLAPSE_CHAR_THRESHOLD: usize = 4_000;
+    const PREVIEW_CHARS: usize = 88;
+
+    if text.is_empty() {
+        return ComposerPresentation::Empty;
+    }
+
+    let char_count = text.chars().count();
+    let line_count = text.lines().count().max(1);
+    let should_collapse =
+        line_count >= COLLAPSE_LINE_THRESHOLD || char_count >= COLLAPSE_CHAR_THRESHOLD;
+
+    if !should_collapse {
+        return ComposerPresentation::Inline(text.to_string());
+    }
+
+    let summary = if line_count >= COLLAPSE_LINE_THRESHOLD {
+        format!("Pasted block: {line_count} lines, {char_count} chars")
+    } else {
+        format!("Long prompt: {char_count} chars")
+    };
+    let preview_source = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("<blank paste>");
+
+    ComposerPresentation::Collapsed(ComposerCollapse {
+        summary,
+        preview: truncate_chars(preview_source, PREVIEW_CHARS),
+    })
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+
+    let keep = max_chars.saturating_sub(4);
+    let mut preview = text.chars().take(keep).collect::<String>();
+    preview.push_str(" ...");
+    preview
 }
 
 pub fn extract_plan_steps(app: &AppState) -> Vec<PlanStep> {
@@ -1639,7 +3675,12 @@ fn plan_steps_from_text(text: &str) -> Option<Vec<PlanStep>> {
             continue;
         }
 
-        if let Some(step) = plan_step_from_line(trimmed, in_plan) {
+        let has_checkbox_marker = line_has_checkbox_marker(trimmed);
+        if !in_plan && !has_checkbox_marker {
+            continue;
+        }
+
+        if let Some(step) = plan_step_from_line(trimmed, in_plan || has_checkbox_marker) {
             steps.push(step);
             in_plan = true;
             continue;
@@ -1651,6 +3692,26 @@ fn plan_steps_from_text(text: &str) -> Option<Vec<PlanStep>> {
     }
 
     (!steps.is_empty()).then_some(steps)
+}
+
+fn line_has_checkbox_marker(line: &str) -> bool {
+    let mut rest = line.trim();
+    for _ in 0..6 {
+        rest = rest.trim_start();
+        if strip_checkbox(rest).is_some() {
+            return true;
+        }
+        if let Some(next) = strip_bullet(rest) {
+            rest = next;
+            continue;
+        }
+        if let Some(next) = strip_number(rest) {
+            rest = next;
+            continue;
+        }
+        break;
+    }
+    false
 }
 
 fn merge_completed_plan_steps(plan: &mut [PlanStep], completed_source: &[PlanStep]) {
@@ -1787,6 +3848,44 @@ fn matching_user_message_count(session: &SessionView, content: &str) -> usize {
         .count()
 }
 
+fn latest_user_content_for_session(
+    sessions: &[SessionView],
+    session_id: &SessionKey,
+) -> Option<String> {
+    sessions
+        .iter()
+        .find(|session| &session.id == session_id)
+        .and_then(|session| {
+            session
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role.as_str() == "user")
+                .map(|message| message.content.clone())
+        })
+}
+
+fn estimated_activity_rows(item: &ActivityItem) -> usize {
+    match item.kind {
+        ActivityKind::Tool => {
+            let preview_rows = item
+                .output_preview
+                .as_deref()
+                .map(|output| output.lines().count().clamp(1, 4))
+                .unwrap_or(1);
+            4 + preview_rows
+        }
+        ActivityKind::Progress => {
+            if item.title == "file_mutation" || item.status.starts_with("File mutation: ") {
+                3
+            } else {
+                2
+            }
+        }
+        ActivityKind::Approval | ActivityKind::Warning | ActivityKind::Error => 2,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedTaskContext {
     pub session_id: SessionKey,
@@ -1874,7 +3973,6 @@ mod tests {
             selected_session: 0,
             status: "Mock backend ready".into(),
             target: Some("local mock snapshot".into()),
-            capabilities: Some(UiProtocolCapabilities::first_server_slice()),
             readonly: false,
         };
 
@@ -1925,7 +4023,6 @@ mod tests {
             selected_session: 0,
             status: "Protocol backend connected".into(),
             target: Some("wss://example.test/ui-protocol".into()),
-            capabilities: Some(UiProtocolCapabilities::first_server_slice()),
             readonly: true,
         };
 
@@ -1958,6 +4055,34 @@ mod tests {
                 .iter()
                 .any(|item| item.detail.contains("protocol snapshot"))
         );
+    }
+
+    #[test]
+    fn stdio_protocol_target_stays_available_after_status_changes() {
+        let mut state = AppState::new(
+            vec![SessionView {
+                id: SessionKey("coding:local:test".into()),
+                title: "stdio".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::system("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "AppUI capabilities refreshed: 24 methods".into(),
+            Some("stdio:octos serve --stdio".into()),
+            false,
+        );
+        state.set_capabilities(UiProtocolCapabilities::new(
+            &[APPUI_METHOD_PROFILE_LLM_CATALOG],
+            &[],
+        ));
+
+        let ctx = state.availability_context();
+
+        assert_eq!(ctx.runtime, RuntimeMode::Protocol);
+        assert_eq!(ctx.connection, ConnectionState::Connected);
+        assert!(ctx.supports_method(APPUI_METHOD_PROFILE_LLM_CATALOG));
     }
 
     #[test]
@@ -2172,6 +4297,28 @@ mod tests {
     }
 
     #[test]
+    fn plan_extraction_rejects_clarifying_question_lists() {
+        let state = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant(
+                    "Could you clarify?\n\n1. Is this a path within the current project/workspace?\n2. Or is it a system path outside the workspace?\n3. Did you mean a different directory?",
+                )],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+
+        assert!(extract_plan_steps(&state).is_empty());
+    }
+
+    #[test]
     fn completing_plan_steps_rewrites_only_real_plan_items() {
         let text = "Plan:\n1. [ ] Fix model\n2. Run tests\n\nReasoning stays unchecked.";
 
@@ -2183,6 +4330,73 @@ mod tests {
             complete_plan_steps_in_text("1. [ ] Fix model\n2. Run tests"),
             "- [x] Fix model\n- [x] Run tests"
         );
+    }
+
+    #[test]
+    fn composer_presentation_collapses_large_pastes_without_changing_text() {
+        let mut state = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let pasted_text = std::iter::once("first pasted line".to_string())
+            .chain((2..=40).map(|idx| format!("pasted line {idx}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.composer = pasted_text.clone();
+
+        let ComposerPresentation::Collapsed(collapse) = state.composer_presentation() else {
+            panic!("large paste should collapse");
+        };
+
+        assert_eq!(state.composer, pasted_text);
+        assert!(collapse.summary.contains("40 lines"));
+        assert_eq!(collapse.preview, "first pasted line");
+    }
+
+    #[test]
+    fn composer_presentation_keeps_short_prompts_inline() {
+        let mut state = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        state.composer = "fix failing tests".into();
+
+        assert_eq!(
+            state.composer_presentation(),
+            ComposerPresentation::Inline("fix failing tests".into())
+        );
+    }
+
+    #[test]
+    fn composer_inline_cursor_width_uses_last_line() {
+        let presentation = ComposerPresentation::Inline("first\nsecond line".into());
+        assert_eq!(presentation.cursor_width(), "second line".chars().count());
+    }
+
+    #[test]
+    fn composer_inline_cursor_width_uses_display_columns_for_chinese() {
+        let presentation = ComposerPresentation::Inline("first\n你好abc".into());
+        assert_eq!(presentation.cursor_width(), 7);
     }
 
     #[test]

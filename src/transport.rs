@@ -4,8 +4,7 @@ use chrono::Utc;
 use eyre::{Result, WrapErr, eyre};
 use futures::{SinkExt, StreamExt};
 use octos_core::app_ui::{
-    AppUiCommand, AppUiEndpoint, AppUiError, AppUiEvent, AppUiLaunch, AppUiSession, AppUiSnapshot,
-    AppUiStatus, AppUiTask,
+    AppUiError, AppUiEvent, AppUiSession, AppUiSnapshot, AppUiStatus, AppUiTask,
 };
 use octos_core::ui_protocol::{
     ApprovalCommandDetails, ApprovalDiffDetails, ApprovalFilesystemDetails, ApprovalNetworkDetails,
@@ -25,7 +24,13 @@ use octos_core::ui_protocol::{
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde_json::Value;
-use tokio::{runtime::Runtime, sync::mpsc};
+use std::process::Stdio;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::Command,
+    runtime::Runtime,
+    sync::mpsc,
+};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
@@ -35,9 +40,95 @@ use tokio_tungstenite::{
 
 use crate::{
     cli::{Cli, Mode},
-    client_event::{ClientEvent, PermissionProfileClientEvent},
-    model::{DiffPreview, DiffPreviewFile, DiffPreviewGetResult, DiffPreviewHunk, DiffPreviewLine},
+    client_event::{
+        AuthLogoutClientEvent, AuthMeClientEvent, AuthSendCodeClientEvent, AuthStatusClientEvent,
+        AuthVerifyClientEvent, CapabilitiesClientEvent, ClientEvent, McpConfigListClientEvent,
+        McpConfigMutationClientEvent, McpStatusClientEvent, ModelListClientEvent,
+        ModelSelectClientEvent, PermissionProfileClientEvent, ProfileLlmCatalogClientEvent,
+        ProfileLlmListClientEvent, ProfileLlmMutationClientEvent, ProfileLocalCreateClientEvent,
+        ProfileSkillsListClientEvent, ProfileSkillsMutationClientEvent,
+        ProfileSkillsRegistrySearchClientEvent, SessionStatusClientEvent,
+        ToolConfigListClientEvent, ToolConfigMutationClientEvent, ToolStatusClientEvent,
+    },
+    model::{
+        AppUiAuthToken, AppUiCommand, AuthLogoutResult, AuthMeResult, AuthSendCodeResult,
+        AuthStatusResult, AuthVerifyResult, ConfigCapabilitiesListParams,
+        ConfigCapabilitiesListResult, DiffPreview, DiffPreviewFile, DiffPreviewGetResult,
+        DiffPreviewHunk, DiffPreviewLine, McpConfigEntry, McpConfigListResult,
+        McpConfigMutationResult, McpStatus, McpStatusListResult, McpStatusSummary, ModelListResult,
+        ModelSelectResult, ModelStatus, ProfileLlmCatalogResult, ProfileLlmListParams,
+        ProfileLlmListResult, ProfileLlmMutationResult, ProfileLocalCreateResult,
+        ProfileSkillEntry, ProfileSkillRegistryPackage, ProfileSkillsListResult,
+        ProfileSkillsMutationResult, ProfileSkillsRegistrySearchResult, RuntimeHealthStatus,
+        RuntimePolicyStamp, SessionStatusReadResult, ToolConfigEntry, ToolConfigListResult,
+        ToolConfigMutationResult, ToolPolicyDenial, ToolStatus, ToolStatusListResult,
+        ToolStatusSummary, auth_me_email, auth_me_profile_id,
+    },
 };
+
+// AppUI can emit large terminal bursts (`message/persisted`, tool summaries,
+// replay/lifecycle frames) at turn completion. Keep the transport reader well
+// ahead of rendering so stdio stdout does not back up into the backend writer.
+const PROTOCOL_TRANSPORT_QUEUE_CAPACITY: usize = 4096;
+const MAX_PENDING_REQUESTS: usize = 256;
+
+#[derive(Debug, Clone, Default)]
+pub struct AppUiLaunch {
+    pub endpoint: Option<AppUiEndpoint>,
+    pub base_url: Option<String>,
+    pub session_id: Option<SessionKey>,
+    pub profile_id: Option<String>,
+    pub cwd: Option<String>,
+    pub auth_token: Option<String>,
+    pub readonly: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppUiEndpoint {
+    WebSocket {
+        url: String,
+        auth_token: Option<String>,
+        profile_id: Option<String>,
+    },
+    Stdio {
+        command: String,
+    },
+}
+
+impl AppUiEndpoint {
+    pub fn websocket(url: impl Into<String>, auth_token: Option<String>) -> Self {
+        Self::WebSocket {
+            url: url.into(),
+            auth_token,
+            profile_id: None,
+        }
+    }
+
+    pub fn websocket_with_profile(
+        url: impl Into<String>,
+        auth_token: Option<String>,
+        profile_id: Option<String>,
+    ) -> Self {
+        Self::WebSocket {
+            url: url.into(),
+            auth_token,
+            profile_id,
+        }
+    }
+
+    pub fn stdio(command: impl Into<String>) -> Self {
+        Self::Stdio {
+            command: command.into(),
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Self::WebSocket { url, .. } => url,
+            Self::Stdio { command } => command,
+        }
+    }
+}
 
 pub trait AppUiBackend {
     fn bootstrap(&mut self) -> Result<AppUiSnapshot>;
@@ -56,15 +147,24 @@ pub fn build_backend(cli: &Cli) -> Box<dyn AppUiBackend> {
 fn launch_from_cli(cli: &Cli) -> AppUiLaunch {
     let auth_token = auth_token_from_cli(cli);
     AppUiLaunch {
-        endpoint: cli
-            .base_url
-            .clone()
-            .map(|url| AppUiEndpoint::websocket(url, auth_token)),
+        endpoint: endpoint_from_cli(cli, auth_token.clone()),
+        base_url: cli.base_url.clone(),
         session_id: cli.session.clone().map(SessionKey),
         profile_id: cli.profile_id.clone(),
         cwd: launch_cwd_from_cli(cli),
+        auth_token,
         readonly: cli.readonly,
     }
+}
+
+fn endpoint_from_cli(cli: &Cli, auth_token: Option<String>) -> Option<AppUiEndpoint> {
+    if let Some(command) = &cli.stdio_command {
+        return Some(AppUiEndpoint::stdio(command.clone()));
+    }
+
+    cli.base_url
+        .clone()
+        .map(|url| AppUiEndpoint::websocket_with_profile(url, auth_token, cli.profile_id.clone()))
 }
 
 fn launch_cwd_from_cli(cli: &Cli) -> Option<String> {
@@ -121,6 +221,7 @@ struct ProtocolExchange {
 
 enum ProtocolTransportDriver {
     WebSocket(WebSocketTransportDriver),
+    Stdio(StdioTransportDriver),
 }
 
 enum TransportCommand {
@@ -151,8 +252,17 @@ enum TransportEvent {
 struct WebSocketTransportDriver {
     endpoint: String,
     auth_token: Option<String>,
-    command_tx: Option<mpsc::UnboundedSender<TransportCommand>>,
-    event_rx: Option<mpsc::UnboundedReceiver<TransportEvent>>,
+    profile_id: Option<String>,
+    command_tx: Option<mpsc::Sender<TransportCommand>>,
+    event_rx: Option<mpsc::Receiver<TransportEvent>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    connected: bool,
+}
+
+struct StdioTransportDriver {
+    command: String,
+    command_tx: Option<mpsc::Sender<TransportCommand>>,
+    event_rx: Option<mpsc::Receiver<TransportEvent>>,
     task: Option<tokio::task::JoinHandle<()>>,
     connected: bool,
 }
@@ -239,78 +349,80 @@ impl ProtocolExchange {
 impl ProtocolTransportDriver {
     fn from_endpoint(endpoint: &AppUiEndpoint) -> Result<Self> {
         match endpoint {
-            AppUiEndpoint::WebSocket { url, auth_token } if is_websocket_url(url) => {
-                Ok(Self::WebSocket(WebSocketTransportDriver::new(
-                    url.clone(),
-                    auth_token.clone(),
-                )))
-            }
+            AppUiEndpoint::WebSocket {
+                url,
+                auth_token,
+                profile_id,
+            } if is_websocket_url(url) => Ok(Self::WebSocket(WebSocketTransportDriver::new(
+                url.clone(),
+                auth_token.clone(),
+                profile_id.clone(),
+            ))),
             AppUiEndpoint::WebSocket { .. } => Err(eyre!(
                 "UI protocol endpoint must be a WebSocket URL starting with ws:// or wss://"
             )),
-            AppUiEndpoint::Stdio { command, .. } => Err(eyre!(
-                "UI protocol stdio transport for {command} is not implemented yet; add a channel-driven stdio adapter at the protocol driver boundary"
-            )),
-            AppUiEndpoint::UnixSocket { path, .. } => Err(eyre!(
-                "UI protocol Unix socket transport for {path} is not implemented yet; add a stream driver at the protocol driver boundary"
-            )),
-            AppUiEndpoint::Tcp { address, .. } => Err(eyre!(
-                "UI protocol TCP transport for {address} is not implemented yet; add a stream driver at the protocol driver boundary"
-            )),
-            AppUiEndpoint::InProcess { name } => Err(eyre!(
-                "UI protocol in-process transport {name} is not implemented yet; add a local driver at the protocol driver boundary"
-            )),
+            AppUiEndpoint::Stdio { command, .. } => {
+                Ok(Self::Stdio(StdioTransportDriver::new(command.clone())?))
+            }
         }
     }
 
     fn label(&self) -> &str {
         match self {
             Self::WebSocket(driver) => driver.label(),
+            Self::Stdio(driver) => driver.label(),
         }
     }
 
     fn is_connected(&self) -> bool {
         match self {
             Self::WebSocket(driver) => driver.is_connected(),
+            Self::Stdio(driver) => driver.is_connected(),
         }
     }
 
     fn connect(&mut self, runtime: &Runtime) -> Result<()> {
         match self {
             Self::WebSocket(driver) => driver.connect(runtime),
+            Self::Stdio(driver) => driver.connect(runtime),
         }
     }
 
     fn disconnect(&mut self) {
         match self {
             Self::WebSocket(driver) => driver.disconnect(),
+            Self::Stdio(driver) => driver.disconnect(),
         }
     }
 
     fn send_text(&mut self, text: String) -> Result<()> {
         match self {
             Self::WebSocket(driver) => driver.send_text(text),
+            Self::Stdio(driver) => driver.send_text(text),
         }
     }
 
     fn send_pong(&mut self, payload: Vec<u8>) -> Result<()> {
         match self {
             Self::WebSocket(driver) => driver.send_pong(payload),
+            Self::Stdio(driver) => driver.send_pong(payload),
         }
     }
 
     fn poll_event(&mut self) -> Result<Option<TransportEvent>> {
         match self {
             Self::WebSocket(driver) => driver.poll_event(),
+            Self::Stdio(driver) => driver.poll_event(),
         }
     }
 }
 
 impl WebSocketTransportDriver {
-    fn new(endpoint: String, auth_token: Option<String>) -> Self {
+    fn new(endpoint: String, auth_token: Option<String>, profile_id: Option<String>) -> Self {
         Self {
             endpoint,
             auth_token,
+            profile_id,
             command_tx: None,
             event_rx: None,
             task: None,
@@ -333,15 +445,19 @@ impl WebSocketTransportDriver {
 
         self.disconnect();
 
-        let request = websocket_request(&self.endpoint, self.auth_token.as_deref())?;
+        let request = websocket_request(
+            &self.endpoint,
+            self.auth_token.as_deref(),
+            self.profile_id.as_deref(),
+        )?;
         let (stream, _) = runtime
             .block_on(async { connect_async(request).await })
             .wrap_err_with(|| {
                 format!("failed to connect UI protocol endpoint {}", self.endpoint)
             })?;
         let (mut sink, mut stream) = stream.split();
-        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (command_tx, mut command_rx) = mpsc::channel(PROTOCOL_TRANSPORT_QUEUE_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel(PROTOCOL_TRANSPORT_QUEUE_CAPACITY);
 
         let task = runtime.spawn(async move {
             loop {
@@ -364,7 +480,7 @@ impl WebSocketTransportDriver {
                                 code: "transport_send".into(),
                                 message: format!("failed to send UI protocol WebSocket message: {err}"),
                                 disconnect: true,
-                            });
+                            }).await;
                             break;
                         }
                     }
@@ -372,7 +488,7 @@ impl WebSocketTransportDriver {
                         let Some(message) = message else {
                             let _ = event_tx.send(TransportEvent::Disconnected(
                                 "UI protocol WebSocket closed; reconnect will retry on next send/read.".into(),
-                            ));
+                            )).await;
                             break;
                         };
 
@@ -380,6 +496,7 @@ impl WebSocketTransportDriver {
                             Ok(WsMessage::Text(text)) => {
                                 if event_tx
                                     .send(TransportEvent::Frame(TransportFrame::Text(text.to_string())))
+                                    .await
                                     .is_err()
                                 {
                                     break;
@@ -388,6 +505,7 @@ impl WebSocketTransportDriver {
                             Ok(WsMessage::Binary(bytes)) => {
                                 if event_tx
                                     .send(TransportEvent::Frame(TransportFrame::Binary(bytes.to_vec())))
+                                    .await
                                     .is_err()
                                 {
                                     break;
@@ -396,6 +514,7 @@ impl WebSocketTransportDriver {
                             Ok(WsMessage::Ping(payload)) => {
                                 if event_tx
                                     .send(TransportEvent::Frame(TransportFrame::Ping(payload.to_vec())))
+                                    .await
                                     .is_err()
                                 {
                                     break;
@@ -404,13 +523,14 @@ impl WebSocketTransportDriver {
                             Ok(WsMessage::Pong(_)) => {
                                 if event_tx
                                     .send(TransportEvent::Frame(TransportFrame::Pong))
+                                    .await
                                     .is_err()
                                 {
                                     break;
                                 }
                             }
                             Ok(WsMessage::Close(_)) => {
-                                let _ = event_tx.send(TransportEvent::Frame(TransportFrame::Close));
+                                let _ = event_tx.send(TransportEvent::Frame(TransportFrame::Close)).await;
                                 break;
                             }
                             Ok(WsMessage::Frame(_)) => {}
@@ -419,7 +539,7 @@ impl WebSocketTransportDriver {
                                     code: "transport_read".into(),
                                     message: format!("failed to read UI protocol WebSocket message: {err}"),
                                     disconnect: true,
-                                });
+                                }).await;
                                 break;
                             }
                         }
@@ -449,8 +569,8 @@ impl WebSocketTransportDriver {
             .as_ref()
             .filter(|_| self.connected)
             .ok_or_else(|| eyre!("UI protocol WebSocket is not connected"))?
-            .send(TransportCommand::Text(text))
-            .map_err(|_| eyre!("UI protocol WebSocket writer is closed"))
+            .try_send(TransportCommand::Text(text))
+            .map_err(|err| bounded_send_error("UI protocol WebSocket writer", err))
     }
 
     fn send_pong(&mut self, payload: Vec<u8>) -> Result<()> {
@@ -458,8 +578,8 @@ impl WebSocketTransportDriver {
             .as_ref()
             .filter(|_| self.connected)
             .ok_or_else(|| eyre!("UI protocol WebSocket is not connected"))?
-            .send(TransportCommand::Pong(payload))
-            .map_err(|_| eyre!("UI protocol WebSocket writer is closed"))
+            .try_send(TransportCommand::Pong(payload))
+            .map_err(|err| bounded_send_error("UI protocol WebSocket writer", err))
     }
 
     fn poll_event(&mut self) -> Result<Option<TransportEvent>> {
@@ -494,6 +614,259 @@ impl WebSocketTransportDriver {
     }
 }
 
+impl StdioTransportDriver {
+    fn new(command: String) -> Result<Self> {
+        let command = command.trim().to_string();
+        if command.is_empty() {
+            return Err(eyre!("UI protocol stdio command must not be empty"));
+        }
+
+        Ok(Self {
+            command,
+            command_tx: None,
+            event_rx: None,
+            task: None,
+            connected: false,
+        })
+    }
+
+    fn label(&self) -> &str {
+        &self.command
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+
+    fn connect(&mut self, runtime: &Runtime) -> Result<()> {
+        if self.connected {
+            return Ok(());
+        }
+
+        self.disconnect();
+
+        let mut child = runtime
+            .block_on(async {
+                let mut command = shell_command(&self.command);
+                command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+            })
+            .wrap_err_with(|| {
+                format!(
+                    "failed to launch UI protocol stdio command {}",
+                    self.command
+                )
+            })?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| eyre!("UI protocol stdio child stdin was not piped"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| eyre!("UI protocol stdio child stdout was not piped"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| eyre!("UI protocol stdio child stderr was not piped"))?;
+        let mut stdin = stdin;
+        let mut lines = BufReader::new(stdout).lines();
+        let mut stderr_lines = BufReader::new(stderr).lines();
+        let mut stderr_open = true;
+        let (command_tx, mut command_rx) = mpsc::channel(PROTOCOL_TRANSPORT_QUEUE_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel(PROTOCOL_TRANSPORT_QUEUE_CAPACITY);
+
+        let task = runtime.spawn(async move {
+            loop {
+                tokio::select! {
+                    command = command_rx.recv() => {
+                        let Some(command) = command else {
+                            break;
+                        };
+                        let result: std::io::Result<()> = match command {
+                            TransportCommand::Text(text) => {
+                                async {
+                                    stdin.write_all(text.as_bytes()).await?;
+                                    stdin.write_all(b"\n").await?;
+                                    stdin.flush().await?;
+                                    Ok(())
+                                }
+                                .await
+                            }
+                            TransportCommand::Pong(_) => Ok(()),
+                        };
+
+                        if let Err(err) = result {
+                            let _ = event_tx.send(TransportEvent::Error {
+                                code: "transport_send".into(),
+                                message: format!("failed to write UI protocol stdio request: {err}"),
+                                disconnect: true,
+                            }).await;
+                            break;
+                        }
+                    }
+                    line = lines.next_line() => {
+                        match line {
+                            Ok(Some(text)) => {
+                                if event_tx.send(stdio_text_frame_event(text)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(None) => {
+                                let _ = event_tx.send(TransportEvent::Disconnected(
+                                    "UI protocol stdio stdout closed; reconnect will relaunch on next send/read.".into(),
+                                )).await;
+                                break;
+                            }
+                            Err(err) => {
+                                let _ = event_tx.send(TransportEvent::Error {
+                                    code: "transport_read".into(),
+                                    message: format!("failed to read UI protocol stdio response: {err}"),
+                                    disconnect: true,
+                                }).await;
+                                break;
+                            }
+                        }
+                    }
+                    line = stderr_lines.next_line(), if stderr_open => {
+                        match line {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                stderr_open = false;
+                            }
+                            Err(err) => {
+                                stderr_open = false;
+                                let _ = event_tx.send(TransportEvent::Error {
+                                    code: "transport_stderr".into(),
+                                    message: format!("failed to drain UI protocol stdio stderr: {err}"),
+                                    disconnect: false,
+                                }).await;
+                            }
+                        }
+                    }
+                    status = child.wait() => {
+                        let message = match status {
+                            Ok(status) => format!(
+                                "UI protocol stdio child exited with {status}; reconnect will relaunch on next send/read."
+                            ),
+                            Err(err) => format!(
+                                "failed to wait for UI protocol stdio child: {err}; reconnect will relaunch on next send/read."
+                            ),
+                        };
+                        let _ = event_tx.send(TransportEvent::Disconnected(message)).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        self.command_tx = Some(command_tx);
+        self.event_rx = Some(event_rx);
+        self.task = Some(task);
+        self.connected = true;
+        Ok(())
+    }
+
+    fn disconnect(&mut self) {
+        self.command_tx = None;
+        self.event_rx = None;
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.connected = false;
+    }
+
+    fn send_text(&mut self, text: String) -> Result<()> {
+        self.command_tx
+            .as_ref()
+            .filter(|_| self.connected)
+            .ok_or_else(|| eyre!("UI protocol stdio transport is not connected"))?
+            .try_send(TransportCommand::Text(text))
+            .map_err(|err| bounded_send_error("UI protocol stdio writer", err))
+    }
+
+    fn send_pong(&mut self, _payload: Vec<u8>) -> Result<()> {
+        Ok(())
+    }
+
+    fn poll_event(&mut self) -> Result<Option<TransportEvent>> {
+        let Some(event_rx) = self.event_rx.as_mut() else {
+            return Ok(None);
+        };
+
+        match event_rx.try_recv() {
+            Ok(event) => {
+                if matches!(
+                    event,
+                    TransportEvent::Disconnected(_)
+                        | TransportEvent::Error {
+                            disconnect: true,
+                            ..
+                        }
+                ) {
+                    self.connected = false;
+                }
+                Ok(Some(event))
+            }
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.connected = false;
+                Ok(Some(TransportEvent::Disconnected(
+                    "UI protocol stdio driver stopped; reconnect will relaunch on next send/read."
+                        .into(),
+                )))
+            }
+        }
+    }
+}
+
+fn stdio_text_frame_event(text: String) -> TransportEvent {
+    if text.len() > MAX_TEXT_FRAME_BYTES {
+        return TransportEvent::Error {
+            code: "frame_too_large".into(),
+            message: format!(
+                "UI protocol stdio frame is {} bytes; max is {MAX_TEXT_FRAME_BYTES}",
+                text.len()
+            ),
+            disconnect: true,
+        };
+    }
+    TransportEvent::Frame(TransportFrame::Text(text))
+}
+
+fn bounded_send_error(
+    label: &str,
+    err: mpsc::error::TrySendError<TransportCommand>,
+) -> eyre::Report {
+    match err {
+        mpsc::error::TrySendError::Full(_) => {
+            eyre!("{label} queue is full; reconnect will retry on next send/read")
+        }
+        mpsc::error::TrySendError::Closed(_) => eyre!("{label} is closed"),
+    }
+}
+
+fn shell_command(command: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let mut process = Command::new("cmd");
+        process.arg("/C").arg(command);
+        process
+    }
+
+    #[cfg(not(windows))]
+    {
+        let mut process = Command::new("sh");
+        process.arg("-c").arg(command);
+        process
+    }
+}
+
 impl ProtocolAppUiBackend {
     pub fn new(launch: AppUiLaunch) -> Self {
         let (runtime, runtime_error) = match Runtime::new() {
@@ -518,14 +891,14 @@ impl ProtocolAppUiBackend {
             .endpoint
             .as_ref()
             .map(|endpoint| endpoint.label().to_string())
-            .ok_or_else(|| eyre!("--mode protocol requires --endpoint <ws://...|wss://...>"))
+            .ok_or_else(|| eyre!("--mode protocol requires --endpoint <ws://...|wss://...> or --stdio-command <CMD>"))
     }
 
     fn ensure_driver(&mut self) -> Result<()> {
         if self.driver.is_none() {
             let endpoint =
                 self.launch.endpoint.as_ref().ok_or_else(|| {
-                    eyre!("--mode protocol requires --endpoint <ws://...|wss://...>")
+                    eyre!("--mode protocol requires --endpoint <ws://...|wss://...> or --stdio-command <CMD>")
                 })?;
             self.driver = Some(ProtocolTransportDriver::from_endpoint(endpoint)?);
         }
@@ -613,11 +986,25 @@ impl ProtocolAppUiBackend {
     fn readonly_allows_command(command: &AppUiCommand) -> bool {
         matches!(
             command,
-            AppUiCommand::OpenSession(_)
+            AppUiCommand::ListConfigCapabilities(_)
+                | AppUiCommand::OpenSession(_)
+                | AppUiCommand::ReadSessionStatus(_)
+                | AppUiCommand::ListModels(_)
                 | AppUiCommand::ListApprovalScopes(_)
                 | AppUiCommand::ListPermissionProfiles(_)
+                | AppUiCommand::ListMcpStatus(_)
+                | AppUiCommand::ListToolStatus(_)
+                | AppUiCommand::ListMcpConfig(_)
+                | AppUiCommand::ListToolConfig(_)
                 | AppUiCommand::GetDiffPreview(_)
                 | AppUiCommand::ReadTaskOutput(_)
+                | AppUiCommand::AuthStatus(_)
+                | AppUiCommand::AuthMe(_)
+                | AppUiCommand::ProfileLlmCatalog(_)
+                | AppUiCommand::ProfileLlmList(_)
+                | AppUiCommand::ProfileLlmFetchModels(_)
+                | AppUiCommand::ProfileSkillsList(_)
+                | AppUiCommand::ProfileSkillsRegistrySearch(_)
         )
     }
 
@@ -765,7 +1152,25 @@ impl ProtocolAppUiBackend {
             }
             AppUiCommand::InterruptTurn(_)
             | AppUiCommand::RespondApproval(_)
-            | AppUiCommand::SetPermissionProfile(_) => {
+            | AppUiCommand::SetPermissionProfile(_)
+            | AppUiCommand::AuthSendCode(_)
+            | AppUiCommand::AuthVerify(_)
+            | AppUiCommand::AuthLogout(_)
+            | AppUiCommand::ProfileLocalCreate(_)
+            | AppUiCommand::ProfileLlmUpsert(_)
+            | AppUiCommand::ProfileLlmDelete(_)
+            | AppUiCommand::ProfileLlmSelect(_)
+            | AppUiCommand::ProfileLlmTest(_)
+            | AppUiCommand::ProfileSkillsInstall(_)
+            | AppUiCommand::ProfileSkillsRemove(_)
+            | AppUiCommand::UpsertMcpConfig(_)
+            | AppUiCommand::DeleteMcpConfig(_)
+            | AppUiCommand::SetMcpConfigEnabled(_)
+            | AppUiCommand::TestMcpConfig(_)
+            | AppUiCommand::SetToolConfigEnabled(_)
+            | AppUiCommand::UpsertToolConfig(_)
+            | AppUiCommand::DeleteToolConfig(_)
+            | AppUiCommand::TestToolConfig(_) => {
                 self.queue.push_back(
                     AppUiEvent::Error(AppUiError {
                         code: "readonly".into(),
@@ -808,6 +1213,15 @@ impl AppUiBackend for ProtocolAppUiBackend {
             return Err(err);
         }
 
+        self.send(AppUiCommand::ListConfigCapabilities(
+            ConfigCapabilitiesListParams {},
+        ))?;
+        if let Some(profile_id) = self.launch.profile_id.clone() {
+            self.send(AppUiCommand::ProfileLlmList(ProfileLlmListParams {
+                profile_id: Some(profile_id),
+            }))?;
+        }
+
         if let Some(session_id) = self.launch.session_id.clone() {
             self.send(AppUiCommand::OpenSession(
                 octos_core::ui_protocol::SessionOpenParams {
@@ -825,6 +1239,20 @@ impl AppUiBackend for ProtocolAppUiBackend {
     fn send(&mut self, command: AppUiCommand) -> Result<()> {
         if self.launch.readonly && !Self::readonly_allows_command(&command) {
             self.enqueue_readonly_blocked_response(command);
+            return Ok(());
+        }
+
+        if self.protocol.pending_requests.len() >= MAX_PENDING_REQUESTS {
+            self.queue.push_back(
+                AppUiEvent::Error(AppUiError {
+                    code: "too_many_pending_requests".into(),
+                    message: format!(
+                        "UI protocol has {} pending request(s); refusing to enqueue another request",
+                        self.protocol.pending_requests.len()
+                    ),
+                })
+                .into(),
+            );
             return Ok(());
         }
 
@@ -891,7 +1319,11 @@ fn runtime_unavailable(error: Option<&str>) -> eyre::Report {
     )
 }
 
-fn websocket_request(endpoint: &str, auth_token: Option<&str>) -> Result<WsRequest> {
+fn websocket_request(
+    endpoint: &str,
+    auth_token: Option<&str>,
+    profile_id: Option<&str>,
+) -> Result<WsRequest> {
     let mut request = endpoint
         .into_client_request()
         .wrap_err("failed to build UI protocol WebSocket request")?;
@@ -901,6 +1333,15 @@ fn websocket_request(endpoint: &str, auth_token: Option<&str>) -> Result<WsReque
             .parse()
             .wrap_err("failed to build UI protocol Authorization header")?;
         request.headers_mut().insert("Authorization", value);
+    }
+    if let Some(profile_id) = profile_id
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+    {
+        let value = profile_id
+            .parse()
+            .wrap_err("failed to build UI protocol X-Profile-Id header")?;
+        request.headers_mut().insert("X-Profile-Id", value);
     }
     request.headers_mut().insert(
         "X-Octos-Ui-Features",
@@ -925,7 +1366,10 @@ fn protocol_snapshot_from_launch(launch: &AppUiLaunch, endpoint: &str) -> AppUiS
             messages: vec![Message::system(if launch.readonly {
                 format!("Read-only {UI_PROTOCOL_V1} session; mutating commands disabled")
             } else {
-                format!("Connected to {UI_PROTOCOL_V1} over WebSocket")
+                format!(
+                    "Connected to {UI_PROTOCOL_V1} over {}",
+                    protocol_transport_description(endpoint)
+                )
             })],
             tasks: vec![],
             live_reply: None,
@@ -946,10 +1390,61 @@ fn protocol_snapshot_from_launch(launch: &AppUiLaunch, endpoint: &str) -> AppUiS
         } else {
             "Protocol backend connected. Pass --session to open an interactive session.".into()
         },
-        target: Some(endpoint.into()),
-        capabilities: Some(UiProtocolCapabilities::first_server_slice()),
+        target: Some(protocol_target_label(endpoint)),
         readonly: launch.readonly,
     }
+}
+
+fn protocol_target_label(endpoint: &str) -> String {
+    if is_websocket_url(endpoint) {
+        endpoint.into()
+    } else {
+        format!("stdio:{endpoint}")
+    }
+}
+
+fn protocol_transport_description(endpoint: &str) -> &'static str {
+    if is_websocket_url(endpoint) {
+        "WebSocket"
+    } else {
+        "stdio"
+    }
+}
+
+fn tui_capabilities() -> UiProtocolCapabilities {
+    let mut capabilities = UiProtocolCapabilities::first_server_slice();
+    for method in [
+        crate::model::APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
+        crate::model::APPUI_METHOD_SESSION_STATUS_READ,
+        crate::model::APPUI_METHOD_MODEL_LIST,
+        crate::model::APPUI_METHOD_MODEL_SELECT,
+        crate::model::APPUI_METHOD_MCP_STATUS_LIST,
+        crate::model::APPUI_METHOD_TOOL_STATUS_LIST,
+        crate::model::APPUI_METHOD_AUTH_STATUS,
+        crate::model::APPUI_METHOD_AUTH_SEND_CODE,
+        crate::model::APPUI_METHOD_AUTH_VERIFY,
+        crate::model::APPUI_METHOD_AUTH_ME,
+        crate::model::APPUI_METHOD_AUTH_LOGOUT,
+        crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+        crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+        crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
+        crate::model::APPUI_METHOD_PROFILE_LLM_DELETE,
+        crate::model::APPUI_METHOD_PROFILE_LLM_TEST,
+        crate::model::APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        crate::model::APPUI_METHOD_PROFILE_SKILLS_LIST,
+        crate::model::APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
+        crate::model::APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+        crate::model::APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+    ] {
+        if !capabilities
+            .supported_methods
+            .iter()
+            .any(|existing| existing == method)
+        {
+            capabilities.supported_methods.push(method.into());
+        }
+    }
+    capabilities
 }
 
 fn protocol_readonly_offline_snapshot_from_launch(
@@ -970,14 +1465,47 @@ fn rpc_request_from_command(
     let method = command.method().to_string();
     let params = match command {
         AppUiCommand::OpenSession(params) => serde_json::to_value(params),
+        AppUiCommand::ListConfigCapabilities(params) => serde_json::to_value(params),
+        AppUiCommand::ReadSessionStatus(params) => serde_json::to_value(params),
         AppUiCommand::SubmitPrompt(params) => serde_json::to_value(params),
         AppUiCommand::InterruptTurn(params) => serde_json::to_value(params),
+        AppUiCommand::ListModels(params) => serde_json::to_value(params),
+        AppUiCommand::SelectModel(params) => serde_json::to_value(params),
         AppUiCommand::RespondApproval(params) => serde_json::to_value(params),
         AppUiCommand::ListApprovalScopes(params) => serde_json::to_value(params),
         AppUiCommand::ListPermissionProfiles(params) => serde_json::to_value(params),
         AppUiCommand::SetPermissionProfile(params) => serde_json::to_value(params),
+        AppUiCommand::ListMcpStatus(params) => serde_json::to_value(params),
+        AppUiCommand::ListToolStatus(params) => serde_json::to_value(params),
+        AppUiCommand::ListMcpConfig(params) => serde_json::to_value(params),
+        AppUiCommand::UpsertMcpConfig(params) => serde_json::to_value(params),
+        AppUiCommand::DeleteMcpConfig(params) => serde_json::to_value(params),
+        AppUiCommand::SetMcpConfigEnabled(params) => serde_json::to_value(params),
+        AppUiCommand::TestMcpConfig(params) => serde_json::to_value(params),
+        AppUiCommand::ListToolConfig(params) => serde_json::to_value(params),
+        AppUiCommand::SetToolConfigEnabled(params) => serde_json::to_value(params),
+        AppUiCommand::UpsertToolConfig(params) => serde_json::to_value(params),
+        AppUiCommand::DeleteToolConfig(params) => serde_json::to_value(params),
+        AppUiCommand::TestToolConfig(params) => serde_json::to_value(params),
         AppUiCommand::GetDiffPreview(params) => serde_json::to_value(params),
         AppUiCommand::ReadTaskOutput(params) => serde_json::to_value(params),
+        AppUiCommand::AuthStatus(params) => serde_json::to_value(params),
+        AppUiCommand::AuthSendCode(params) => serde_json::to_value(params),
+        AppUiCommand::AuthVerify(params) => serde_json::to_value(params),
+        AppUiCommand::AuthMe(params) => serde_json::to_value(params),
+        AppUiCommand::AuthLogout(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileLocalCreate(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileLlmCatalog(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileLlmList(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileLlmUpsert(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileLlmDelete(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileLlmSelect(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileLlmTest(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileLlmFetchModels(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileSkillsList(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileSkillsRegistrySearch(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileSkillsInstall(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileSkillsRemove(params) => serde_json::to_value(params),
         _ => {
             return Err(eyre!(
                 "unsupported AppUI command for first-server transport: {method}"
@@ -1020,10 +1548,11 @@ fn rpc_text_to_app_event_with_pending(
     let value = match serde_json::from_str(text) {
         Ok(value) => value,
         Err(err) => {
+            let preview: String = text.chars().take(80).collect();
             return Ok(Some(
                 app_error(
                     "malformed_json",
-                    format!("UI protocol frame is not JSON: {err}"),
+                    format!("UI protocol frame is not JSON: {err}; preview={preview:?}"),
                 )
                 .into(),
             ));
@@ -1074,6 +1603,9 @@ fn rpc_value_to_app_event(
         };
 
         let params = frame.get("params").cloned().unwrap_or(Value::Null);
+        if method == "server/heartbeat" {
+            return Ok(None);
+        }
         return Ok(Some(notification_to_app_event(method, params).into()));
     }
 
@@ -1163,6 +1695,21 @@ fn success_response_to_app_event(
     };
 
     match pending_request.method.as_str() {
+        crate::model::APPUI_METHOD_CONFIG_CAPABILITIES_LIST => {
+            match serde_json::from_value::<ConfigCapabilitiesListResult>(result) {
+                Ok(result) => Ok(Some(capabilities_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_CONFIG_CAPABILITIES_LIST
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
         methods::SESSION_OPEN => match serde_json::from_value::<SessionOpenResult>(result) {
             Ok(result) => Ok(Some(
                 AppUiEvent::Protocol(UiNotification::SessionOpened(result.opened)).into(),
@@ -1178,6 +1725,205 @@ fn success_response_to_app_event(
                 .into(),
             )),
         },
+        crate::model::APPUI_METHOD_SESSION_STATUS_READ => {
+            match serde_json::from_value::<SessionStatusReadResult>(result) {
+                Ok(result) => Ok(Some(session_status_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_SESSION_STATUS_READ
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_MODEL_LIST => {
+            if result.get("models").is_none()
+                && let Ok(result) = serde_json::from_value::<ProfileLlmListResult>(result.clone())
+            {
+                Ok(Some(profile_llm_list_event(result)))
+            } else {
+                match serde_json::from_value::<ModelListResult>(result) {
+                    Ok(result) => Ok(Some(model_list_event(result))),
+                    Err(err) => Ok(Some(
+                        app_error(
+                            "invalid_result",
+                            format!(
+                                "failed to decode UI protocol result for {}: {err}",
+                                crate::model::APPUI_METHOD_MODEL_LIST
+                            ),
+                        )
+                        .into(),
+                    )),
+                }
+            }
+        }
+        crate::model::APPUI_METHOD_MODEL_SELECT => {
+            match serde_json::from_value::<ModelSelectResult>(result) {
+                Ok(result) => Ok(Some(model_select_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_MODEL_SELECT
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_AUTH_STATUS => {
+            match serde_json::from_value::<AuthStatusResult>(result) {
+                Ok(result) => Ok(Some(auth_status_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!("failed to decode UI protocol result for auth/status: {err}"),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_AUTH_ME => {
+            match serde_json::from_value::<AuthMeResult>(result) {
+                Ok(result) => Ok(Some(auth_me_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!("failed to decode UI protocol result for auth/me: {err}"),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_AUTH_SEND_CODE => {
+            match serde_json::from_value::<AuthSendCodeResult>(result) {
+                Ok(result) => Ok(Some(auth_send_code_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!("failed to decode UI protocol result for auth/send_code: {err}"),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_AUTH_VERIFY => {
+            match serde_json::from_value::<AuthVerifyResult>(result) {
+                Ok(result) => Ok(Some(auth_verify_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!("failed to decode UI protocol result for auth/verify: {err}"),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_AUTH_LOGOUT => {
+            match serde_json::from_value::<AuthLogoutResult>(result) {
+                Ok(result) => Ok(Some(auth_logout_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!("failed to decode UI protocol result for auth/logout: {err}"),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE => {
+            match serde_json::from_value::<ProfileLocalCreateResult>(result) {
+                Ok(result) => Ok(Some(profile_local_create_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG => {
+            match serde_json::from_value::<ProfileLlmCatalogResult>(result) {
+                Ok(result) => Ok(Some(profile_llm_catalog_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for profile/llm/catalog: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT
+        | crate::model::APPUI_METHOD_PROFILE_LLM_DELETE
+        | crate::model::APPUI_METHOD_PROFILE_LLM_TEST => {
+            match serde_json::from_value::<ProfileLlmMutationResult>(result) {
+                Ok(result) => Ok(Some(profile_llm_mutation_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for profile/llm mutation: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PROFILE_SKILLS_LIST => {
+            match serde_json::from_value::<ProfileSkillsListResult>(result) {
+                Ok(result) => Ok(Some(profile_skills_list_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for profile/skills/list: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH => {
+            match serde_json::from_value::<ProfileSkillsRegistrySearchResult>(result) {
+                Ok(result) => Ok(Some(profile_skills_registry_search_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for profile/skills/registry/search: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PROFILE_SKILLS_INSTALL
+        | crate::model::APPUI_METHOD_PROFILE_SKILLS_REMOVE => {
+            match serde_json::from_value::<ProfileSkillsMutationResult>(result) {
+                Ok(result) => Ok(Some(profile_skills_mutation_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for profile/skills mutation: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
         methods::DIFF_PREVIEW_GET => match serde_json::from_value::<DiffPreviewGetResult>(result) {
             Ok(result) => Ok(Some(ClientEvent::DiffPreview(result))),
             Err(err) => Ok(Some(
@@ -1277,6 +2023,100 @@ fn success_response_to_app_event(
                 )),
             }
         }
+        crate::model::APPUI_METHOD_MCP_CONFIG_LIST => {
+            match serde_json::from_value::<McpConfigListResult>(result) {
+                Ok(result) => Ok(Some(mcp_config_list_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_MCP_CONFIG_LIST
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_MCP_CONFIG_UPSERT
+        | crate::model::APPUI_METHOD_MCP_CONFIG_DELETE
+        | crate::model::APPUI_METHOD_MCP_CONFIG_SET_ENABLED
+        | crate::model::APPUI_METHOD_MCP_CONFIG_TEST => {
+            match serde_json::from_value::<McpConfigMutationResult>(result) {
+                Ok(result) => Ok(Some(mcp_config_mutation_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for mcp/config mutation: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_MCP_STATUS_LIST => {
+            match serde_json::from_value::<McpStatusListResult>(result) {
+                Ok(result) => Ok(Some(mcp_status_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_MCP_STATUS_LIST
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_TOOL_CONFIG_LIST => {
+            match serde_json::from_value::<ToolConfigListResult>(result) {
+                Ok(result) => Ok(Some(tool_config_list_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_TOOL_CONFIG_LIST
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_TOOL_CONFIG_SET_ENABLED
+        | crate::model::APPUI_METHOD_TOOL_CONFIG_UPSERT
+        | crate::model::APPUI_METHOD_TOOL_CONFIG_DELETE
+        | crate::model::APPUI_METHOD_TOOL_CONFIG_TEST => {
+            match serde_json::from_value::<ToolConfigMutationResult>(result) {
+                Ok(result) => Ok(Some(tool_config_mutation_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for tool/config mutation: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_TOOL_STATUS_LIST => {
+            match serde_json::from_value::<ToolStatusListResult>(result) {
+                Ok(result) => Ok(Some(tool_status_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_TOOL_STATUS_LIST
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
         _ => Ok(None),
     }
 }
@@ -1288,6 +2128,314 @@ fn decode_task_output_read_result(mut result: Value) -> serde_json::Result<TaskO
             .or_insert(Value::Bool(false));
     }
     serde_json::from_value(result)
+}
+
+fn capabilities_event(result: ConfigCapabilitiesListResult) -> ClientEvent {
+    let message = format!(
+        "AppUI capabilities refreshed: {} methods",
+        result.capabilities.supported_methods.len()
+    );
+    ClientEvent::Capabilities(CapabilitiesClientEvent { result, message })
+}
+
+fn session_status_event(result: SessionStatusReadResult) -> ClientEvent {
+    let label = result
+        .runtime_policy_stamp
+        .as_ref()
+        .and_then(|stamp| stamp.model.as_deref())
+        .or_else(|| result.model.as_ref().map(|model| model.model.as_str()))
+        .unwrap_or("runtime");
+    ClientEvent::SessionStatus(SessionStatusClientEvent {
+        message: format!("Runtime status refreshed: {label}"),
+        result,
+    })
+}
+
+fn model_list_event(result: ModelListResult) -> ClientEvent {
+    let count = result.models.len();
+    ClientEvent::ModelList(ModelListClientEvent {
+        message: match count {
+            0 => "Model list refreshed: no models".into(),
+            1 => "Model list refreshed: 1 model".into(),
+            _ => format!("Model list refreshed: {count} models"),
+        },
+        result,
+    })
+}
+
+fn model_select_event(result: ModelSelectResult) -> ClientEvent {
+    let prefix = if result.applied {
+        "Model selected"
+    } else {
+        "Model unchanged"
+    };
+    ClientEvent::ModelSelect(ModelSelectClientEvent {
+        message: format!(
+            "{prefix}: {} / {}",
+            result.selected.provider, result.selected.model
+        ),
+        result,
+    })
+}
+
+fn profile_llm_catalog_event(result: ProfileLlmCatalogResult) -> ClientEvent {
+    let count = result.families.len();
+    ClientEvent::ProfileLlmCatalog(ProfileLlmCatalogClientEvent {
+        message: format!("Provider catalog refreshed: {count} family(s)"),
+        result,
+    })
+}
+
+fn profile_llm_list_event(result: ProfileLlmListResult) -> ClientEvent {
+    let count = result.primary.iter().count() + result.fallbacks.len();
+    ClientEvent::ProfileLlmList(ProfileLlmListClientEvent {
+        message: match count {
+            0 => "Configured providers refreshed: none".into(),
+            1 => "Configured providers refreshed: 1 provider".into(),
+            _ => format!("Configured providers refreshed: {count} providers"),
+        },
+        result,
+    })
+}
+
+fn profile_llm_mutation_event(result: ProfileLlmMutationResult) -> ClientEvent {
+    let count = result.models().len();
+    let message = match (
+        result.applied,
+        result.message.as_deref(),
+        result.error.as_deref(),
+    ) {
+        (false, Some(message), Some(error)) => format!("{message}: {error}"),
+        (_, Some(message), _) => message.to_owned(),
+        (false, None, Some(error)) => format!("Provider operation failed: {error}"),
+        _ => format!("Provider profile updated: {count} configured provider(s)"),
+    };
+    ClientEvent::ProfileLlmMutation(ProfileLlmMutationClientEvent { message, result })
+}
+
+fn profile_skills_list_event(result: ProfileSkillsListResult) -> ClientEvent {
+    let count = result.skills.len();
+    ClientEvent::ProfileSkillsList(ProfileSkillsListClientEvent {
+        message: match count {
+            0 => "Profile skills refreshed: none installed".into(),
+            1 => "Profile skills refreshed: 1 installed skill".into(),
+            _ => format!("Profile skills refreshed: {count} installed skills"),
+        },
+        result,
+    })
+}
+
+fn profile_skills_registry_search_event(result: ProfileSkillsRegistrySearchResult) -> ClientEvent {
+    let count = result.packages.len();
+    ClientEvent::ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchClientEvent {
+        message: match count {
+            0 => "Skill registry search returned no packages".into(),
+            1 => "Skill registry search returned 1 package".into(),
+            _ => format!("Skill registry search returned {count} packages"),
+        },
+        result,
+    })
+}
+
+fn profile_skills_mutation_event(result: ProfileSkillsMutationResult) -> ClientEvent {
+    let message = if !result.ok {
+        result
+            .message
+            .clone()
+            .unwrap_or_else(|| "Skill operation failed".into())
+    } else if let Some(removed) = &result.removed {
+        format!("Removed skill: {removed}")
+    } else if !result.installed.is_empty() {
+        format!("Installed skill(s): {}", result.installed.join(", "))
+    } else if !result.skipped.is_empty() {
+        format!("Skill install skipped: {}", result.skipped.join(", "))
+    } else {
+        result
+            .message
+            .clone()
+            .unwrap_or_else(|| "Skill operation completed".into())
+    };
+    ClientEvent::ProfileSkillsMutation(ProfileSkillsMutationClientEvent { message, result })
+}
+
+fn auth_status_event(result: AuthStatusResult) -> ClientEvent {
+    ClientEvent::AuthStatus(AuthStatusClientEvent {
+        message: auth_status_message(&result),
+        result,
+    })
+}
+
+fn auth_send_code_event(result: AuthSendCodeResult) -> ClientEvent {
+    let message = result
+        .message
+        .clone()
+        .unwrap_or_else(|| "OTP send acknowledged".into());
+    ClientEvent::AuthSendCode(AuthSendCodeClientEvent { result, message })
+}
+
+fn auth_verify_event(result: AuthVerifyResult) -> ClientEvent {
+    let message = result.message.clone().unwrap_or_else(|| {
+        if result.ok {
+            "OTP verified"
+        } else {
+            "OTP verify failed"
+        }
+        .into()
+    });
+    ClientEvent::AuthVerify(AuthVerifyClientEvent { result, message })
+}
+
+fn auth_me_event(result: AuthMeResult) -> ClientEvent {
+    ClientEvent::AuthMe(AuthMeClientEvent {
+        message: auth_me_message(&result),
+        result,
+    })
+}
+
+fn auth_logout_event(result: AuthLogoutResult) -> ClientEvent {
+    let message = result.message.clone().unwrap_or_else(|| {
+        if result.ok {
+            "Logged out"
+        } else {
+            "Logout failed"
+        }
+        .into()
+    });
+    ClientEvent::AuthLogout(AuthLogoutClientEvent { result, message })
+}
+
+fn profile_local_create_event(result: ProfileLocalCreateResult) -> ClientEvent {
+    let action = if result.created { "created" } else { "loaded" };
+    ClientEvent::ProfileLocalCreate(ProfileLocalCreateClientEvent {
+        message: format!(
+            "Local solo profile {action}: {} ({})",
+            result.profile_id, result.email
+        ),
+        result,
+    })
+}
+
+fn auth_status_message(result: &AuthStatusResult) -> String {
+    if let Some(profile) = result.scoped_profile.as_ref() {
+        format!("Authenticated for profile {}", profile.id)
+    } else if result.authenticated {
+        format!(
+            "Authenticated{}",
+            result
+                .profile_id
+                .as_deref()
+                .map(|profile| format!(" for profile {profile}"))
+                .unwrap_or_default()
+        )
+    } else if result.email_login_enabled || result.email_otp {
+        "Not authenticated; email OTP is available".into()
+    } else {
+        "Not authenticated".into()
+    }
+}
+
+fn auth_me_message(result: &AuthMeResult) -> String {
+    let email = auth_me_email(result).unwrap_or("unknown account");
+    let profile = auth_me_profile_id(result).unwrap_or("no profile");
+    format!("Authenticated account: {email} ({profile})")
+}
+
+fn mcp_status_event(result: McpStatusListResult) -> ClientEvent {
+    let connected = result
+        .servers
+        .iter()
+        .filter(|server| server.status == "connected")
+        .count();
+    let failed = result
+        .servers
+        .iter()
+        .filter(|server| server.status == "failed")
+        .count();
+    ClientEvent::McpStatus(McpStatusClientEvent {
+        message: format!(
+            "MCP status refreshed: {} server(s), {connected} connected, {failed} failed",
+            result.servers.len()
+        ),
+        result,
+    })
+}
+
+fn mcp_config_list_event(result: McpConfigListResult) -> ClientEvent {
+    let enabled = result
+        .servers
+        .iter()
+        .filter(|server| server.enabled)
+        .count();
+    ClientEvent::McpConfigList(McpConfigListClientEvent {
+        message: format!(
+            "MCP config refreshed: {} server(s), {enabled} enabled",
+            result.servers.len()
+        ),
+        result,
+    })
+}
+
+fn mcp_config_mutation_event(result: McpConfigMutationResult) -> ClientEvent {
+    let subject = result
+        .server
+        .as_deref()
+        .or_else(|| result.entry.as_ref().map(|entry| entry.name.as_str()))
+        .unwrap_or("server");
+    let status = if result.applied || result.ok {
+        "applied"
+    } else {
+        "completed"
+    };
+    let message = result
+        .message
+        .clone()
+        .unwrap_or_else(|| format!("MCP config {status}: {subject}"));
+    ClientEvent::McpConfigMutation(McpConfigMutationClientEvent { message, result })
+}
+
+fn tool_status_event(result: ToolStatusListResult) -> ClientEvent {
+    let visible = result.tools.iter().filter(|tool| tool.visible).count();
+    let denied = result
+        .tools
+        .iter()
+        .filter(|tool| tool.denial.is_some())
+        .count();
+    ClientEvent::ToolStatus(ToolStatusClientEvent {
+        message: format!(
+            "Tool status refreshed: {visible} visible, {denied} denied under {}",
+            result.policy_id.as_deref().unwrap_or("server policy")
+        ),
+        result,
+    })
+}
+
+fn tool_config_list_event(result: ToolConfigListResult) -> ClientEvent {
+    let enabled = result.tools.iter().filter(|tool| tool.enabled).count();
+    ClientEvent::ToolConfigList(ToolConfigListClientEvent {
+        message: format!(
+            "Tool config refreshed: {} tool(s), {enabled} enabled",
+            result.tools.len()
+        ),
+        result,
+    })
+}
+
+fn tool_config_mutation_event(result: ToolConfigMutationResult) -> ClientEvent {
+    let subject = result
+        .tool
+        .as_deref()
+        .or_else(|| result.entry.as_ref().map(|entry| entry.tool.as_str()))
+        .unwrap_or("tool");
+    let status = if result.applied || result.ok {
+        "applied"
+    } else {
+        "completed"
+    };
+    let message = result
+        .message
+        .clone()
+        .unwrap_or_else(|| format!("Tool config {status}: {subject}"));
+    ClientEvent::ToolConfigMutation(ToolConfigMutationClientEvent { message, result })
 }
 
 fn approval_scopes_status(result: &ApprovalScopesListResult) -> String {
@@ -1551,6 +2699,7 @@ impl MockAppUiBackend {
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             timestamp: Utc::now(),
+            topic: None,
         }));
         self.enqueue_protocol(UiNotification::ToolStarted(ToolStartedEvent {
             session_id: session_id.clone(),
@@ -1630,6 +2779,9 @@ impl MockAppUiBackend {
                 stream: "session_events".into(),
                 seq: 1,
             }),
+            tokens_in: None,
+            tokens_out: None,
+            session_result: None,
         }));
     }
 }
@@ -1704,7 +2856,6 @@ impl AppUiBackend for MockAppUiBackend {
                 "Mock backend ready. Start typing to exercise M9.1 app-ui events.".into()
             },
             target: self.target_label(),
-            capabilities: Some(UiProtocolCapabilities::first_server_slice()),
             readonly: self.launch.readonly,
         })
     }
@@ -1713,6 +2864,13 @@ impl AppUiBackend for MockAppUiBackend {
     fn send(&mut self, command: AppUiCommand) -> Result<()> {
         let method = command.method().to_string();
         match command {
+            AppUiCommand::ListConfigCapabilities(_) => {
+                self.queue
+                    .push_back(capabilities_event(ConfigCapabilitiesListResult {
+                        capabilities: tui_capabilities(),
+                    }));
+                Ok(())
+            }
             AppUiCommand::SubmitPrompt(params) => {
                 if self.launch.readonly {
                     self.enqueue_protocol(UiNotification::Warning(WarningEvent {
@@ -1736,6 +2894,15 @@ impl AppUiBackend for MockAppUiBackend {
                 )));
                 Ok(())
             }
+            AppUiCommand::ReadSessionStatus(params) => {
+                self.queue
+                    .push_back(session_status_event(mock_session_status(
+                        params.session_id,
+                        self.launch.cwd.clone(),
+                        self.launch.readonly,
+                    )));
+                Ok(())
+            }
             AppUiCommand::InterruptTurn(_) => {
                 self.enqueue_protocol(UiNotification::Warning(WarningEvent {
                     session_id: SessionKey("local:prototype#interrupt".into()),
@@ -1743,6 +2910,192 @@ impl AppUiBackend for MockAppUiBackend {
                     code: "mock_interrupt".into(),
                     message: "Interrupt is not yet wired in the mock backend.".into(),
                 }));
+                Ok(())
+            }
+            AppUiCommand::ListModels(params) => {
+                self.queue.push_back(model_list_event(ModelListResult {
+                    session_id: params.session_id,
+                    models: vec![mock_model_status(true), mock_alt_model_status()],
+                }));
+                Ok(())
+            }
+            AppUiCommand::ProfileLlmList(_) => {
+                self.queue
+                    .push_back(profile_llm_list_event(mock_profile_llm_list()));
+                Ok(())
+            }
+            AppUiCommand::SelectModel(params) => {
+                let selected = ModelStatus {
+                    model: params.model,
+                    provider: params.provider.unwrap_or_else(|| "mock".into()),
+                    title: None,
+                    family: None,
+                    route: params.route,
+                    selected: true,
+                    available: Some(true),
+                    queue_mode: Some("interactive".into()),
+                    qoe_policy: Some("mock".into()),
+                };
+                self.queue.push_back(model_select_event(ModelSelectResult {
+                    session_id: params.session_id,
+                    selected,
+                    applied: true,
+                    runtime_policy_stamp: None,
+                }));
+                Ok(())
+            }
+            AppUiCommand::ProfileLlmCatalog(_) => {
+                self.queue
+                    .push_back(profile_llm_catalog_event(mock_profile_llm_catalog()));
+                Ok(())
+            }
+            AppUiCommand::ProfileLlmSelect(params) => {
+                let selected = ModelStatus {
+                    model: params.model_id,
+                    provider: params.family_id,
+                    title: None,
+                    family: None,
+                    route: Some(params.route_id),
+                    selected: true,
+                    available: Some(true),
+                    queue_mode: None,
+                    qoe_policy: None,
+                };
+                self.queue.push_back(model_select_event(ModelSelectResult {
+                    session_id: Self::mock_session_key(&self.profile_id(), "m9"),
+                    selected,
+                    applied: true,
+                    runtime_policy_stamp: None,
+                }));
+                Ok(())
+            }
+            AppUiCommand::ProfileLlmUpsert(_)
+            | AppUiCommand::ProfileLlmDelete(_)
+            | AppUiCommand::ProfileLlmTest(_) => {
+                self.queue
+                    .push_back(profile_llm_mutation_event(ProfileLlmMutationResult {
+                        profile_id: Some(self.profile_id()),
+                        primary: mock_profile_llm_list().primary,
+                        fallbacks: mock_profile_llm_list().fallbacks,
+                        applied: true,
+                        llm: None,
+                        runtime_policy_stamp: None,
+                        message: None,
+                        error: None,
+                    }));
+                Ok(())
+            }
+            AppUiCommand::AuthStatus(_) => {
+                self.queue.push_back(auth_status_event(AuthStatusResult {
+                    bootstrap_mode: false,
+                    email_login_enabled: true,
+                    admin_token_login_enabled: false,
+                    allow_self_registration: true,
+                    scoped_profile: None,
+                    authenticated: false,
+                    email_otp: true,
+                    token_login: false,
+                    profile_id: None,
+                }));
+                Ok(())
+            }
+            AppUiCommand::AuthMe(_) => {
+                self.queue.push_back(auth_me_event(AuthMeResult::Legacy {
+                    email: Some("mock@example.com".into()),
+                    profile_id: Some(self.profile_id()),
+                }));
+                Ok(())
+            }
+            AppUiCommand::AuthSendCode(_) => {
+                self.queue
+                    .push_back(auth_send_code_event(AuthSendCodeResult {
+                        ok: true,
+                        message: Some("OTP send acknowledged".into()),
+                    }));
+                Ok(())
+            }
+            AppUiCommand::AuthVerify(_) => {
+                self.queue.push_back(auth_verify_event(AuthVerifyResult {
+                    ok: true,
+                    token: Some(AppUiAuthToken::new("mock-token")),
+                    user: Some(serde_json::json!({
+                        "id": self.profile_id(),
+                        "email": "mock@example.com"
+                    })),
+                    message: Some("OTP verify acknowledged".into()),
+                }));
+                Ok(())
+            }
+            AppUiCommand::AuthLogout(_) => {
+                self.queue.push_back(auth_logout_event(AuthLogoutResult {
+                    ok: true,
+                    message: Some("Logout acknowledged".into()),
+                }));
+                Ok(())
+            }
+            AppUiCommand::ProfileLocalCreate(params) => {
+                self.queue
+                    .push_back(profile_local_create_event(ProfileLocalCreateResult {
+                        profile_id: format!("local-{}", params.username),
+                        user_id: format!("local-{}", params.username),
+                        name: params.name,
+                        username: params.username,
+                        email: params.email,
+                        created: true,
+                        runtime_mode: "solo".into(),
+                    }));
+                Ok(())
+            }
+            AppUiCommand::ProfileLlmFetchModels(_) => {
+                self.queue.push_back(
+                    AppUiEvent::Status(AppUiStatus {
+                        message: "Mock fetch_models returned no additional models".into(),
+                    })
+                    .into(),
+                );
+                Ok(())
+            }
+            AppUiCommand::ProfileSkillsList(_) => {
+                self.queue
+                    .push_back(profile_skills_list_event(mock_profile_skills()));
+                Ok(())
+            }
+            AppUiCommand::ProfileSkillsRegistrySearch(_) => {
+                self.queue
+                    .push_back(profile_skills_registry_search_event(mock_skill_registry()));
+                Ok(())
+            }
+            AppUiCommand::ProfileSkillsInstall(params) => {
+                self.queue
+                    .push_back(profile_skills_mutation_event(ProfileSkillsMutationResult {
+                        profile_id: params.profile_id,
+                        ok: true,
+                        installed: vec![
+                            params
+                                .repo
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(params.repo.as_str())
+                                .to_owned(),
+                        ],
+                        skipped: Vec::new(),
+                        deps_installed: Vec::new(),
+                        removed: None,
+                        message: None,
+                    }));
+                Ok(())
+            }
+            AppUiCommand::ProfileSkillsRemove(params) => {
+                self.queue
+                    .push_back(profile_skills_mutation_event(ProfileSkillsMutationResult {
+                        profile_id: params.profile_id,
+                        ok: true,
+                        installed: Vec::new(),
+                        skipped: Vec::new(),
+                        deps_installed: Vec::new(),
+                        removed: Some(params.name),
+                        message: None,
+                    }));
                 Ok(())
             }
             AppUiCommand::RespondApproval(params) => {
@@ -1795,6 +3148,147 @@ impl AppUiBackend for MockAppUiBackend {
                     }));
                 Ok(())
             }
+            AppUiCommand::ListMcpStatus(params) => {
+                self.queue.push_back(mcp_status_event(McpStatusListResult {
+                    session_id: params.session_id,
+                    servers: mock_mcp_servers(),
+                }));
+                Ok(())
+            }
+            AppUiCommand::ListMcpConfig(params) => {
+                self.queue
+                    .push_back(mcp_config_list_event(McpConfigListResult {
+                        session_id: params.session_id,
+                        profile_id: params.profile_id,
+                        servers: mock_mcp_config_entries(),
+                    }));
+                Ok(())
+            }
+            AppUiCommand::UpsertMcpConfig(params) => {
+                self.queue
+                    .push_back(mcp_config_mutation_event(McpConfigMutationResult {
+                        profile_id: params.profile_id,
+                        ok: true,
+                        applied: true,
+                        server: Some(params.server),
+                        message: Some("Mock MCP config upserted".into()),
+                        ..McpConfigMutationResult::default()
+                    }));
+                Ok(())
+            }
+            AppUiCommand::DeleteMcpConfig(params) => {
+                self.queue
+                    .push_back(mcp_config_mutation_event(McpConfigMutationResult {
+                        profile_id: params.profile_id,
+                        ok: true,
+                        applied: true,
+                        server: Some(params.server),
+                        message: Some("Mock MCP config deleted".into()),
+                        ..McpConfigMutationResult::default()
+                    }));
+                Ok(())
+            }
+            AppUiCommand::SetMcpConfigEnabled(params) => {
+                self.queue
+                    .push_back(mcp_config_mutation_event(McpConfigMutationResult {
+                        profile_id: params.profile_id,
+                        ok: true,
+                        applied: true,
+                        server: Some(params.server),
+                        message: Some(if params.enabled {
+                            "Mock MCP config enabled".into()
+                        } else {
+                            "Mock MCP config disabled".into()
+                        }),
+                        ..McpConfigMutationResult::default()
+                    }));
+                Ok(())
+            }
+            AppUiCommand::TestMcpConfig(params) => {
+                self.queue
+                    .push_back(mcp_config_mutation_event(McpConfigMutationResult {
+                        session_id: params.session_id,
+                        profile_id: params.profile_id,
+                        ok: true,
+                        applied: false,
+                        server: Some(params.server),
+                        message: Some("Mock MCP config test passed".into()),
+                        ..McpConfigMutationResult::default()
+                    }));
+                Ok(())
+            }
+            AppUiCommand::ListToolStatus(params) => {
+                self.queue
+                    .push_back(tool_status_event(ToolStatusListResult {
+                        session_id: params.session_id,
+                        policy_id: Some("mock-coding".into()),
+                        tools: mock_tool_statuses(),
+                    }));
+                Ok(())
+            }
+            AppUiCommand::ListToolConfig(params) => {
+                self.queue
+                    .push_back(tool_config_list_event(ToolConfigListResult {
+                        session_id: params.session_id,
+                        profile_id: params.profile_id,
+                        policy_id: Some("mock-coding".into()),
+                        tools: mock_tool_config_entries(),
+                    }));
+                Ok(())
+            }
+            AppUiCommand::SetToolConfigEnabled(params) => {
+                self.queue
+                    .push_back(tool_config_mutation_event(ToolConfigMutationResult {
+                        profile_id: params.profile_id,
+                        ok: true,
+                        applied: true,
+                        tool: Some(params.tool),
+                        message: Some(if params.enabled {
+                            "Mock tool config enabled".into()
+                        } else {
+                            "Mock tool config disabled".into()
+                        }),
+                        ..ToolConfigMutationResult::default()
+                    }));
+                Ok(())
+            }
+            AppUiCommand::UpsertToolConfig(params) => {
+                self.queue
+                    .push_back(tool_config_mutation_event(ToolConfigMutationResult {
+                        profile_id: params.profile_id,
+                        ok: true,
+                        applied: true,
+                        tool: Some(params.tool),
+                        message: Some("Mock tool config upserted".into()),
+                        ..ToolConfigMutationResult::default()
+                    }));
+                Ok(())
+            }
+            AppUiCommand::DeleteToolConfig(params) => {
+                self.queue
+                    .push_back(tool_config_mutation_event(ToolConfigMutationResult {
+                        profile_id: params.profile_id,
+                        ok: true,
+                        applied: true,
+                        tool: Some(params.tool),
+                        message: Some("Mock tool config deleted".into()),
+                        ..ToolConfigMutationResult::default()
+                    }));
+                Ok(())
+            }
+            AppUiCommand::TestToolConfig(params) => {
+                self.queue
+                    .push_back(tool_config_mutation_event(ToolConfigMutationResult {
+                        session_id: params.session_id,
+                        profile_id: params.profile_id,
+                        ok: true,
+                        applied: false,
+                        tool: Some(params.tool),
+                        message: Some("Mock tool config test passed".into()),
+                        ..ToolConfigMutationResult::default()
+                    }));
+                Ok(())
+            }
             AppUiCommand::GetDiffPreview(params) => {
                 self.queue
                     .push_back(ClientEvent::DiffPreview(DiffPreviewGetResult {
@@ -1820,6 +3314,307 @@ impl AppUiBackend for MockAppUiBackend {
 
 fn mock_approval_kind() -> String {
     std::env::var("OCTOS_TUI_MOCK_APPROVAL_KIND").unwrap_or_else(|_| approval_kinds::COMMAND.into())
+}
+
+fn mock_model_status(selected: bool) -> ModelStatus {
+    ModelStatus {
+        model: "mock-coding".into(),
+        provider: "mock".into(),
+        title: Some("Mock Coding".into()),
+        family: Some("mock".into()),
+        route: None,
+        selected,
+        available: Some(true),
+        queue_mode: Some("interactive".into()),
+        qoe_policy: Some("mock".into()),
+    }
+}
+
+fn mock_alt_model_status() -> ModelStatus {
+    ModelStatus {
+        model: "mock-review".into(),
+        provider: "mock".into(),
+        title: Some("Mock Review".into()),
+        family: Some("mock".into()),
+        route: Some("review".into()),
+        selected: false,
+        available: Some(true),
+        queue_mode: Some("collect".into()),
+        qoe_policy: Some("mock".into()),
+    }
+}
+
+fn mock_profile_llm_catalog() -> ProfileLlmCatalogResult {
+    let mut families = serde_json::Map::new();
+    families.insert(
+        "moonshot".into(),
+        serde_json::json!({
+            "env": "MOONSHOT_API_KEY",
+            "models": [{
+                "id": "kimi-k2.5",
+                "endpoints": [
+                    {"id": "moonshot", "label": "Official API"},
+                    {
+                        "id": "autodl",
+                        "label": "AutoDL",
+                        "base_url": "https://www.autodl.art/api/v1",
+                        "api_key_env": "AUTODL_API_KEY"
+                    }
+                ]
+            }]
+        }),
+    );
+    families.insert(
+        "minimax".into(),
+        serde_json::json!({
+            "env": "MINIMAX_API_KEY",
+            "models": [{
+                "id": "MiniMax-M2.5-highspeed",
+                "endpoints": [{
+                    "id": "wisemodel",
+                    "label": "WiseModel",
+                    "base_url": "https://open.ospreyai.cn/v1",
+                    "api_key_env": "WISEMODEL_API_KEY"
+                }]
+            }]
+        }),
+    );
+    ProfileLlmCatalogResult { families }
+}
+
+fn mock_profile_llm_list() -> ProfileLlmListResult {
+    ProfileLlmListResult {
+        profile_id: Some("coding".into()),
+        primary: Some(crate::model::LlmConfiguredProvider {
+            provider: "moonshot".into(),
+            model: "kimi-k2.5".into(),
+            family_id: Some("moonshot".into()),
+            model_id: Some("kimi-k2.5".into()),
+            route: None,
+            route_id: Some("autodl".into()),
+            base_url: Some("https://www.autodl.art/api/v1".into()),
+            api_key_env: Some("AUTODL_API_KEY".into()),
+            has_api_key: true,
+            selected: true,
+            available: Some(true),
+            model_hints: None,
+            cost_per_m: None,
+            strong: None,
+        }),
+        fallbacks: Vec::new(),
+        llm: None,
+        runtime_policy_stamp: None,
+    }
+}
+
+fn mock_profile_skills() -> ProfileSkillsListResult {
+    ProfileSkillsListResult {
+        profile_id: Some("coding".into()),
+        count: 1,
+        skills: vec![ProfileSkillEntry {
+            name: "deep-search".into(),
+            version: Some("0.1.0".into()),
+            tool_count: 1,
+            source_repo: Some("octos-org/octos-hub/skills/deep-search".into()),
+            installed: true,
+            status: Some("installed".into()),
+        }],
+    }
+}
+
+fn mock_skill_registry() -> ProfileSkillsRegistrySearchResult {
+    ProfileSkillsRegistrySearchResult {
+        profile_id: Some("coding".into()),
+        packages: vec![ProfileSkillRegistryPackage {
+            name: "deep-search".into(),
+            description: "Mock registry package for deep research.".into(),
+            repo: "octos-org/octos-hub/skills/deep-search".into(),
+            version: Some("0.1.0".into()),
+            author: Some("Octos".into()),
+            license: Some("MIT".into()),
+            skills: vec!["deep-search".into()],
+            requires: Vec::new(),
+            provides_tools: true,
+            tags: vec!["research".into()],
+            installed: true,
+            installed_skills: vec!["deep-search".into()],
+        }],
+    }
+}
+
+fn mock_session_status(
+    session_id: SessionKey,
+    cwd: Option<String>,
+    readonly: bool,
+) -> SessionStatusReadResult {
+    let sandbox = if readonly {
+        "read-only"
+    } else {
+        "workspace-write"
+    };
+    SessionStatusReadResult {
+        session_id,
+        runtime_mode: Some("solo".into()),
+        profile_id: Some("coding".into()),
+        cwd: cwd.clone(),
+        workspace_root: cwd,
+        active_turn_id: None,
+        runtime_policy_stamp: Some(RuntimePolicyStamp {
+            runtime_mode: Some("solo".into()),
+            profile_id: Some("coding".into()),
+            model: Some("mock-coding".into()),
+            provider: Some("mock".into()),
+            approval_policy: Some(if readonly { "on-request" } else { "on-failure" }.into()),
+            sandbox_mode: Some(sandbox.into()),
+            sandbox: Some(sandbox.into()),
+            permission_profile: Some(sandbox.into()),
+            filesystem_scope: Some(if readonly { "read-only" } else { "workspace" }.into()),
+            network: Some("blocked".into()),
+            tool_policy_id: Some("mock-coding".into()),
+            mcp_servers: vec!["mock-filesystem".into()],
+            memory_scope: Some("mock-session".into()),
+            qoe_policy: Some("mock".into()),
+            queue_mode: Some("interactive".into()),
+        }),
+        model: Some(mock_model_status(true)),
+        permission_profile: Some(sandbox.into()),
+        approval_policy: Some(if readonly { "on-request" } else { "on-failure" }.into()),
+        sandbox_mode: Some(sandbox.into()),
+        sandbox: Some(sandbox.into()),
+        filesystem_scope: Some(if readonly { "read-only" } else { "workspace" }.into()),
+        network: Some("blocked".into()),
+        tool_policy_id: Some("mock-coding".into()),
+        mcp_servers: vec!["mock-filesystem".into()],
+        memory_scope: Some("mock-session".into()),
+        health: Some(RuntimeHealthStatus {
+            status: "healthy".into(),
+            message: Some("mock backend".into()),
+        }),
+        mcp_summary: Some(McpStatusSummary {
+            connected: 1,
+            connecting: 0,
+            failed: 1,
+            disabled: 0,
+        }),
+        tool_summary: Some(ToolStatusSummary {
+            visible: 2,
+            enabled: 1,
+            denied: 1,
+            policy_id: Some("mock-coding".into()),
+        }),
+        usage: None,
+        cursor: None,
+        capabilities: Some(tui_capabilities()),
+    }
+}
+
+fn mock_mcp_servers() -> Vec<McpStatus> {
+    vec![
+        McpStatus {
+            server: "mock-filesystem".into(),
+            status: "connected".into(),
+            transport: Some("stdio".into()),
+            endpoint: None,
+            tool_count: Some(2),
+            detail: Some("mock server".into()),
+            last_error: None,
+        },
+        McpStatus {
+            server: "mock-playwright".into(),
+            status: "failed".into(),
+            transport: Some("stdio".into()),
+            endpoint: None,
+            tool_count: Some(0),
+            detail: None,
+            last_error: Some("mock failure".into()),
+        },
+    ]
+}
+
+fn mock_mcp_config_entries() -> Vec<McpConfigEntry> {
+    vec![
+        McpConfigEntry {
+            name: "mock-filesystem".into(),
+            enabled: true,
+            transport: Some("stdio".into()),
+            command: Some("octos-mcp-filesystem".into()),
+            args: vec!["/tmp".into()],
+            env_keys: Vec::new(),
+            status: Some("connected".into()),
+            tool_count: Some(4),
+            detail: Some("mock server truth".into()),
+            ..McpConfigEntry::default()
+        },
+        McpConfigEntry {
+            name: "mock-playwright".into(),
+            enabled: false,
+            transport: Some("stdio".into()),
+            command: Some("octos-mcp-playwright".into()),
+            status: Some("disabled".into()),
+            last_error: Some("disabled by mock config".into()),
+            ..McpConfigEntry::default()
+        },
+    ]
+}
+
+fn mock_tool_statuses() -> Vec<ToolStatus> {
+    vec![
+        ToolStatus {
+            tool: "read_file".into(),
+            title: Some("Read File".into()),
+            source: Some("platform".into()),
+            enabled: true,
+            visible: true,
+            tags: vec!["filesystem".into(), "read".into()],
+            risk: Some("low".into()),
+            policy_id: Some("mock-coding".into()),
+            denial: None,
+        },
+        ToolStatus {
+            tool: "shell".into(),
+            title: Some("Shell".into()),
+            source: Some("platform".into()),
+            enabled: false,
+            visible: true,
+            tags: vec!["shell".into(), "write".into()],
+            risk: Some("high".into()),
+            policy_id: Some("mock-coding".into()),
+            denial: Some(ToolPolicyDenial {
+                code: "tool_denied".into(),
+                tool: "shell".into(),
+                policy: Some("mock-coding".into()),
+                reason: "shell disabled in mock read-only policy".into(),
+                recoverable: true,
+            }),
+        },
+    ]
+}
+
+fn mock_tool_config_entries() -> Vec<ToolConfigEntry> {
+    vec![
+        ToolConfigEntry {
+            tool: "search".into(),
+            title: Some("Search".into()),
+            source: Some("platform".into()),
+            enabled: true,
+            visible: true,
+            tags: vec!["search".into()],
+            risk: Some("low".into()),
+            status: Some("ready".into()),
+            detail: Some("mock server truth".into()),
+        },
+        ToolConfigEntry {
+            tool: "web_fetch".into(),
+            title: Some("Web Fetch".into()),
+            source: Some("platform".into()),
+            enabled: false,
+            visible: true,
+            tags: vec!["web".into()],
+            risk: Some("medium".into()),
+            status: Some("disabled".into()),
+            detail: Some("disabled by mock config".into()),
+        },
+    ]
 }
 
 fn mock_approval_event(
@@ -2023,6 +3818,15 @@ fn mock_diff_preview(session_id: SessionKey, preview_id: PreviewId) -> DiffPrevi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{
+        ConfigCapabilitiesListParams, McpConfigDeleteParams, McpConfigListParams,
+        McpConfigSetEnabledParams, McpConfigTestParams, McpConfigUpsertParams, McpStatusListParams,
+        ModelListParams, ModelSelectParams, ProfileLocalCreateParams, ProfileSkillsInstallParams,
+        ProfileSkillsListParams, ProfileSkillsRegistrySearchParams, ProfileSkillsRemoveParams,
+        SessionStatusReadParams, ToolConfigDeleteParams, ToolConfigListParams,
+        ToolConfigSetEnabledParams, ToolConfigTestParams, ToolConfigUpsertParams,
+        ToolStatusListParams,
+    };
     use octos_core::ui_protocol::{
         ApprovalDecision, ApprovalRespondParams, ApprovalScopesListParams, DiffPreviewGetParams,
         InputItem, PermissionNetworkPolicy, PermissionProfileListParams, PermissionProfileMode,
@@ -2102,25 +3906,36 @@ mod tests {
                         .send(frame.clone())
                         .expect("capture protocol test request");
 
-                    if respond_to_session_open
-                        && frame.get("method").and_then(Value::as_str)
-                            == Some(methods::SESSION_OPEN)
-                    {
-                        let response = json!({
-                            "jsonrpc": "2.0",
-                            "id": frame.get("id").cloned().expect("request id"),
-                            "result": {
-                                "opened": {
-                                    "session_id": frame["params"]["session_id"].clone(),
-                                    "active_profile_id": "coding",
-                                    "workspace_root": "/repo",
-                                    "cursor": {
-                                        "stream": "session_events",
-                                        "seq": 1
+                    let method = frame.get("method").and_then(Value::as_str);
+                    let response =
+                        if method == Some(crate::model::APPUI_METHOD_CONFIG_CAPABILITIES_LIST) {
+                            Some(json!({
+                                "jsonrpc": "2.0",
+                                "id": frame.get("id").cloned().expect("request id"),
+                                "result": {
+                                    "capabilities": tui_capabilities()
+                                }
+                            }))
+                        } else if respond_to_session_open && method == Some(methods::SESSION_OPEN) {
+                            Some(json!({
+                                "jsonrpc": "2.0",
+                                "id": frame.get("id").cloned().expect("request id"),
+                                "result": {
+                                    "opened": {
+                                        "session_id": frame["params"]["session_id"].clone(),
+                                        "active_profile_id": "coding",
+                                        "workspace_root": "/repo",
+                                        "cursor": {
+                                            "stream": "session_events",
+                                            "seq": 1
+                                        }
                                     }
                                 }
-                            }
-                        });
+                            }))
+                        } else {
+                            None
+                        };
+                    if let Some(response) = response {
                         ws.send(WsMessage::Text(response.to_string().into()))
                             .await
                             .expect("send protocol test response");
@@ -2163,6 +3978,9 @@ mod tests {
                 input: vec![InputItem::Text {
                     text: "hello".into(),
                 }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }),
         )
         .expect("request encodes");
@@ -2191,6 +4009,9 @@ mod tests {
                         text: "second paragraph".into(),
                     },
                 ],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }),
         )
         .expect("request encodes");
@@ -2240,6 +4061,7 @@ mod tests {
                 update: PermissionProfileUpdate {
                     mode: None,
                     network: Some(PermissionNetworkPolicy::Allow),
+                    approval_policy: None,
                 },
             }),
         )
@@ -2250,20 +4072,373 @@ mod tests {
     }
 
     #[test]
+    fn protocol_command_serializes_runtime_cockpit_commands() {
+        let session_id = SessionKey("local:test".into());
+        let capabilities = rpc_request_from_command(
+            "tui-11".into(),
+            AppUiCommand::ListConfigCapabilities(ConfigCapabilitiesListParams {}),
+        )
+        .expect("capabilities request encodes");
+        assert_eq!(
+            capabilities.method,
+            crate::model::APPUI_METHOD_CONFIG_CAPABILITIES_LIST
+        );
+        assert!(
+            capabilities
+                .params
+                .as_object()
+                .is_some_and(|object| object.is_empty())
+        );
+
+        let local_profile = rpc_request_from_command(
+            "tui-11b".into(),
+            AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
+                name: "Ada Lovelace".into(),
+                username: "ada".into(),
+                email: "ada@example.com".into(),
+            }),
+        )
+        .expect("local profile request encodes");
+        assert_eq!(
+            local_profile.method,
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE
+        );
+        assert_eq!(local_profile.params["name"], "Ada Lovelace");
+        assert_eq!(local_profile.params["username"], "ada");
+        assert_eq!(local_profile.params["email"], "ada@example.com");
+
+        let status = rpc_request_from_command(
+            "tui-12".into(),
+            AppUiCommand::ReadSessionStatus(SessionStatusReadParams {
+                session_id: session_id.clone(),
+            }),
+        )
+        .expect("status request encodes");
+        assert_eq!(
+            status.method,
+            crate::model::APPUI_METHOD_SESSION_STATUS_READ
+        );
+        assert_eq!(status.params["session_id"], "local:test");
+
+        let models = rpc_request_from_command(
+            "tui-13".into(),
+            AppUiCommand::ListModels(ModelListParams {
+                session_id: session_id.clone(),
+            }),
+        )
+        .expect("model list request encodes");
+        assert_eq!(models.method, crate::model::APPUI_METHOD_MODEL_LIST);
+
+        let select = rpc_request_from_command(
+            "tui-14".into(),
+            AppUiCommand::SelectModel(ModelSelectParams {
+                session_id: session_id.clone(),
+                model: "deepseek-v4-pro".into(),
+                provider: Some("deepseek".into()),
+                route: None,
+            }),
+        )
+        .expect("model select request encodes");
+        assert_eq!(select.method, crate::model::APPUI_METHOD_MODEL_SELECT);
+        assert_eq!(select.params["model"], "deepseek-v4-pro");
+        assert_eq!(select.params["provider"], "deepseek");
+
+        let mcp = rpc_request_from_command(
+            "tui-15".into(),
+            AppUiCommand::ListMcpStatus(McpStatusListParams {
+                session_id: session_id.clone(),
+                include_disabled: true,
+            }),
+        )
+        .expect("mcp status request encodes");
+        assert_eq!(mcp.method, crate::model::APPUI_METHOD_MCP_STATUS_LIST);
+        assert_eq!(mcp.params["include_disabled"], true);
+
+        let tools = rpc_request_from_command(
+            "tui-16".into(),
+            AppUiCommand::ListToolStatus(ToolStatusListParams {
+                session_id,
+                include_denied: true,
+            }),
+        )
+        .expect("tool status request encodes");
+        assert_eq!(tools.method, crate::model::APPUI_METHOD_TOOL_STATUS_LIST);
+        assert_eq!(tools.params["include_denied"], true);
+    }
+
+    #[test]
+    fn protocol_command_serializes_mcp_and_tool_config_commands() {
+        let mcp_list = rpc_request_from_command(
+            "mcp-config-1".into(),
+            AppUiCommand::ListMcpConfig(McpConfigListParams {
+                session_id: Some(SessionKey("local:test".into())),
+                profile_id: Some("coding".into()),
+                include_disabled: true,
+            }),
+        )
+        .expect("mcp config list encodes");
+        assert_eq!(mcp_list.method, crate::model::APPUI_METHOD_MCP_CONFIG_LIST);
+        assert_eq!(mcp_list.params["session_id"], "local:test");
+        assert_eq!(mcp_list.params["profile_id"], "coding");
+        assert_eq!(mcp_list.params["include_disabled"], true);
+
+        let mcp_upsert = rpc_request_from_command(
+            "mcp-config-2".into(),
+            AppUiCommand::UpsertMcpConfig(McpConfigUpsertParams {
+                profile_id: Some("coding".into()),
+                server: "github".into(),
+                config: json!({"transport": "stdio"}),
+                enabled: Some(true),
+            }),
+        )
+        .expect("mcp config upsert encodes");
+        assert_eq!(
+            mcp_upsert.method,
+            crate::model::APPUI_METHOD_MCP_CONFIG_UPSERT
+        );
+        assert_eq!(mcp_upsert.params["server"], "github");
+        assert_eq!(mcp_upsert.params["config"]["transport"], "stdio");
+
+        let mcp_delete = rpc_request_from_command(
+            "mcp-config-3".into(),
+            AppUiCommand::DeleteMcpConfig(McpConfigDeleteParams {
+                profile_id: Some("coding".into()),
+                server: "github".into(),
+            }),
+        )
+        .expect("mcp config delete encodes");
+        assert_eq!(
+            mcp_delete.method,
+            crate::model::APPUI_METHOD_MCP_CONFIG_DELETE
+        );
+
+        let mcp_toggle = rpc_request_from_command(
+            "mcp-config-4".into(),
+            AppUiCommand::SetMcpConfigEnabled(McpConfigSetEnabledParams {
+                profile_id: Some("coding".into()),
+                server: "github".into(),
+                enabled: false,
+            }),
+        )
+        .expect("mcp config toggle encodes");
+        assert_eq!(
+            mcp_toggle.method,
+            crate::model::APPUI_METHOD_MCP_CONFIG_SET_ENABLED
+        );
+        assert_eq!(mcp_toggle.params["enabled"], false);
+
+        let mcp_test = rpc_request_from_command(
+            "mcp-config-5".into(),
+            AppUiCommand::TestMcpConfig(McpConfigTestParams {
+                session_id: Some(SessionKey("local:test".into())),
+                profile_id: Some("coding".into()),
+                server: "github".into(),
+            }),
+        )
+        .expect("mcp config test encodes");
+        assert_eq!(mcp_test.method, crate::model::APPUI_METHOD_MCP_CONFIG_TEST);
+
+        let tool_list = rpc_request_from_command(
+            "tool-config-1".into(),
+            AppUiCommand::ListToolConfig(ToolConfigListParams {
+                session_id: Some(SessionKey("local:test".into())),
+                profile_id: Some("coding".into()),
+                include_disabled: true,
+            }),
+        )
+        .expect("tool config list encodes");
+        assert_eq!(
+            tool_list.method,
+            crate::model::APPUI_METHOD_TOOL_CONFIG_LIST
+        );
+
+        let tool_toggle = rpc_request_from_command(
+            "tool-config-2".into(),
+            AppUiCommand::SetToolConfigEnabled(ToolConfigSetEnabledParams {
+                profile_id: Some("coding".into()),
+                tool: "web_fetch".into(),
+                enabled: true,
+            }),
+        )
+        .expect("tool config toggle encodes");
+        assert_eq!(
+            tool_toggle.method,
+            crate::model::APPUI_METHOD_TOOL_CONFIG_SET_ENABLED
+        );
+
+        let tool_upsert = rpc_request_from_command(
+            "tool-config-3".into(),
+            AppUiCommand::UpsertToolConfig(ToolConfigUpsertParams {
+                profile_id: Some("coding".into()),
+                tool: "browser".into(),
+                config: json!({"mode": "restricted"}),
+                enabled: None,
+            }),
+        )
+        .expect("tool config upsert encodes");
+        assert_eq!(
+            tool_upsert.method,
+            crate::model::APPUI_METHOD_TOOL_CONFIG_UPSERT
+        );
+        assert_eq!(tool_upsert.params["config"]["mode"], "restricted");
+
+        let tool_delete = rpc_request_from_command(
+            "tool-config-4".into(),
+            AppUiCommand::DeleteToolConfig(ToolConfigDeleteParams {
+                profile_id: Some("coding".into()),
+                tool: "browser".into(),
+            }),
+        )
+        .expect("tool config delete encodes");
+        assert_eq!(
+            tool_delete.method,
+            crate::model::APPUI_METHOD_TOOL_CONFIG_DELETE
+        );
+
+        let tool_test = rpc_request_from_command(
+            "tool-config-5".into(),
+            AppUiCommand::TestToolConfig(ToolConfigTestParams {
+                session_id: Some(SessionKey("local:test".into())),
+                profile_id: Some("coding".into()),
+                tool: "browser".into(),
+            }),
+        )
+        .expect("tool config test encodes");
+        assert_eq!(
+            tool_test.method,
+            crate::model::APPUI_METHOD_TOOL_CONFIG_TEST
+        );
+    }
+
+    #[test]
+    fn protocol_command_serializes_profile_skill_commands() {
+        let list = rpc_request_from_command(
+            "skills-1".into(),
+            AppUiCommand::ProfileSkillsList(ProfileSkillsListParams {
+                profile_id: Some("coding".into()),
+            }),
+        )
+        .expect("list request encodes");
+        assert_eq!(list.method, crate::model::APPUI_METHOD_PROFILE_SKILLS_LIST);
+        assert_eq!(list.params["profile_id"], "coding");
+
+        let search = rpc_request_from_command(
+            "skills-2".into(),
+            AppUiCommand::ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchParams {
+                profile_id: Some("coding".into()),
+                q: Some("research".into()),
+            }),
+        )
+        .expect("search request encodes");
+        assert_eq!(
+            search.method,
+            crate::model::APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
+        );
+        assert_eq!(search.params["q"], "research");
+
+        let install = rpc_request_from_command(
+            "skills-3".into(),
+            AppUiCommand::ProfileSkillsInstall(ProfileSkillsInstallParams {
+                profile_id: Some("coding".into()),
+                repo: "octos-org/octos-hub/skills/deep-search".into(),
+                branch: Some("main".into()),
+                force: true,
+            }),
+        )
+        .expect("install request encodes");
+        assert_eq!(
+            install.method,
+            crate::model::APPUI_METHOD_PROFILE_SKILLS_INSTALL
+        );
+        assert_eq!(
+            install.params["repo"],
+            "octos-org/octos-hub/skills/deep-search"
+        );
+        assert_eq!(install.params["branch"], "main");
+        assert_eq!(install.params["force"], true);
+
+        let remove = rpc_request_from_command(
+            "skills-4".into(),
+            AppUiCommand::ProfileSkillsRemove(ProfileSkillsRemoveParams {
+                profile_id: Some("coding".into()),
+                name: "deep-search".into(),
+            }),
+        )
+        .expect("remove request encodes");
+        assert_eq!(
+            remove.method,
+            crate::model::APPUI_METHOD_PROFILE_SKILLS_REMOVE
+        );
+        assert_eq!(remove.params["name"], "deep-search");
+    }
+
+    #[test]
+    fn profile_skill_results_decode_to_client_events() {
+        let mut pending = HashMap::new();
+        pending.insert(
+            "skills-list".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_PROFILE_SKILLS_LIST.into(),
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "skills-list",
+            "result": {
+                "profile_id": "coding",
+                "count": 1,
+                "skills": [{
+                    "name": "deep-search",
+                    "version": "0.1.0",
+                    "tool_count": 1,
+                    "installed": true,
+                    "status": "installed"
+                }]
+            }
+        })
+        .to_string();
+
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::ProfileSkillsList(event) = event else {
+            panic!("expected profile skills list event");
+        };
+        assert_eq!(event.result.profile_id.as_deref(), Some("coding"));
+        assert_eq!(event.result.skills[0].name, "deep-search");
+        assert_eq!(event.result.skills[0].status.as_deref(), Some("installed"));
+    }
+
+    #[test]
     fn protocol_readonly_policy_allows_read_style_and_blocks_mutations() {
         let session_id = SessionKey("local:test".into());
         let read_style_commands = [
+            AppUiCommand::ListConfigCapabilities(ConfigCapabilitiesListParams {}),
             AppUiCommand::OpenSession(SessionOpenParams {
                 session_id: session_id.clone(),
                 profile_id: Some("coding".into()),
                 cwd: Some("/repo".into()),
                 after: None,
             }),
+            AppUiCommand::ReadSessionStatus(SessionStatusReadParams {
+                session_id: session_id.clone(),
+            }),
+            AppUiCommand::ListModels(ModelListParams {
+                session_id: session_id.clone(),
+            }),
             AppUiCommand::ListApprovalScopes(ApprovalScopesListParams {
                 session_id: session_id.clone(),
             }),
             AppUiCommand::ListPermissionProfiles(PermissionProfileListParams {
                 session_id: session_id.clone(),
+            }),
+            AppUiCommand::ListMcpStatus(McpStatusListParams {
+                session_id: session_id.clone(),
+                include_disabled: true,
+            }),
+            AppUiCommand::ListToolStatus(ToolStatusListParams {
+                session_id: session_id.clone(),
+                include_denied: true,
             }),
             AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
                 session_id: session_id.clone(),
@@ -2274,6 +4449,13 @@ mod tests {
                 task_id: TaskId::new(),
                 cursor: Some(OutputCursor { offset: 0 }),
                 limit_bytes: Some(4096),
+            }),
+            AppUiCommand::ProfileSkillsList(ProfileSkillsListParams {
+                profile_id: Some("coding".into()),
+            }),
+            AppUiCommand::ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchParams {
+                profile_id: Some("coding".into()),
+                q: Some("search".into()),
             }),
         ];
         for command in &read_style_commands {
@@ -2291,22 +4473,47 @@ mod tests {
                 input: vec![InputItem::Text {
                     text: "hello".into(),
                 }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }),
             AppUiCommand::InterruptTurn(TurnInterruptParams {
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
+            }),
+            AppUiCommand::SelectModel(ModelSelectParams {
+                session_id: session_id.clone(),
+                model: "deepseek-v4-pro".into(),
+                provider: Some("deepseek".into()),
+                route: None,
             }),
             AppUiCommand::RespondApproval(ApprovalRespondParams::new(
                 session_id.clone(),
                 octos_core::ui_protocol::ApprovalId::new(),
                 ApprovalDecision::Deny,
             )),
+            AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
+                name: "Ada Lovelace".into(),
+                username: "ada".into(),
+                email: "ada@example.com".into(),
+            }),
             AppUiCommand::SetPermissionProfile(PermissionProfileSetParams {
                 session_id,
                 update: PermissionProfileUpdate {
                     mode: None,
                     network: Some(PermissionNetworkPolicy::Allow),
+                    approval_policy: None,
                 },
+            }),
+            AppUiCommand::ProfileSkillsInstall(ProfileSkillsInstallParams {
+                profile_id: Some("coding".into()),
+                repo: "octos-org/octos-hub/skills/deep-search".into(),
+                branch: None,
+                force: false,
+            }),
+            AppUiCommand::ProfileSkillsRemove(ProfileSkillsRemoveParams {
+                profile_id: Some("coding".into()),
+                name: "deep-search".into(),
             }),
         ];
         for command in &mutating_commands {
@@ -2377,9 +4584,28 @@ mod tests {
     }
 
     #[test]
+    fn server_heartbeat_notification_is_ignored() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "server/heartbeat",
+            "params": {
+                "timestamp": "2026-05-13T17:17:00Z"
+            }
+        })
+        .to_string();
+
+        let event = rpc_text_to_app_event(&frame).expect("frame decodes");
+        assert!(event.is_none());
+    }
+
+    #[test]
     fn websocket_request_includes_bearer_auth_header() {
-        let request = websocket_request("wss://example.test/ui-protocol", Some(" secret-token "))
-            .expect("request builds");
+        let request = websocket_request(
+            "wss://example.test/ui-protocol",
+            Some(" secret-token "),
+            Some(" coding "),
+        )
+        .expect("request builds");
         let expected_features = format!(
             "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}"
         );
@@ -2397,6 +4623,78 @@ mod tests {
                 .get("X-Octos-Ui-Features")
                 .and_then(|value| value.to_str().ok()),
             Some(expected_features.as_str())
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("X-Profile-Id")
+                .and_then(|value| value.to_str().ok()),
+            Some("coding")
+        );
+    }
+
+    #[test]
+    fn stdio_transport_driver_rejects_empty_command() {
+        let err = match StdioTransportDriver::new("   ".into()) {
+            Ok(_) => panic!("empty command should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("UI protocol stdio command must not be empty")
+        );
+    }
+
+    #[test]
+    fn stdio_transport_driver_shape_is_line_oriented_text() {
+        let driver =
+            StdioTransportDriver::new("octos serve --stdio".into()).expect("driver builds");
+
+        assert_eq!(driver.label(), "octos serve --stdio");
+        assert!(!driver.is_connected());
+    }
+
+    #[test]
+    fn stdio_transport_rejects_oversized_text_frame_before_decode() {
+        let event = stdio_text_frame_event("x".repeat(MAX_TEXT_FRAME_BYTES + 1));
+
+        let TransportEvent::Error {
+            code,
+            message,
+            disconnect,
+        } = event
+        else {
+            panic!("expected oversized stdio frame error");
+        };
+        assert_eq!(code, "frame_too_large");
+        assert!(message.contains("UI protocol stdio frame"));
+        assert!(disconnect);
+    }
+
+    #[test]
+    fn launch_from_cli_uses_stdio_endpoint_when_requested() {
+        let cli = Cli {
+            config: None,
+            mode: crate::cli::Mode::Protocol,
+            base_url: None,
+            stdio_command: Some("octos serve --stdio".into()),
+            session: None,
+            profile_id: None,
+            cwd: None,
+            auth_token: Some("ignored-for-stdio".into()),
+            readonly: false,
+            theme: crate::cli::ThemeName::Codex,
+        };
+
+        let launch = launch_from_cli(&cli);
+
+        assert_eq!(
+            launch
+                .endpoint
+                .as_ref()
+                .map(|endpoint| endpoint.label().to_string()),
+            Some("octos serve --stdio".into())
         );
     }
 
@@ -2583,6 +4881,43 @@ mod tests {
     }
 
     #[test]
+    fn protocol_backend_bounds_pending_requests_before_transport_send() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        for index in 0..MAX_PENDING_REQUESTS {
+            backend.protocol.pending_requests.insert(
+                format!("existing-{index}"),
+                PendingRequest {
+                    method: methods::APPROVAL_SCOPES_LIST.into(),
+                },
+            );
+        }
+
+        backend
+            .send(AppUiCommand::ListApprovalScopes(ApprovalScopesListParams {
+                session_id: SessionKey("local:test".into()),
+            }))
+            .expect("pending saturation is reported as an app event");
+
+        assert_eq!(
+            backend.protocol.pending_requests.len(),
+            MAX_PENDING_REQUESTS
+        );
+        let event = backend.next_event().expect("poll").expect("queued error");
+        let event = unwrap_app_event(event);
+        let AppUiEvent::Error(error) = event else {
+            panic!("expected pending request limit error");
+        };
+        assert_eq!(error.code, "too_many_pending_requests");
+        assert!(error.message.contains("pending request"));
+    }
+
+    #[test]
     fn protocol_backend_maps_malformed_transport_frame_to_error() {
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch::default());
 
@@ -2616,6 +4951,9 @@ mod tests {
                 input: vec![InputItem::Text {
                     text: "hello".into(),
                 }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }))
             .expect("request builds");
 
@@ -2846,6 +5184,7 @@ mod tests {
                     update: PermissionProfileUpdate {
                         mode: Some(PermissionProfileMode::DangerFullAccess),
                         network: Some(PermissionNetworkPolicy::Allow),
+                        approval_policy: Some("never".into()),
                     },
                 },
             ))
@@ -2881,6 +5220,142 @@ mod tests {
                 mode: PermissionProfileMode::DangerFullAccess,
                 network: PermissionNetworkPolicy::Allow,
             }
+        );
+        assert!(backend.protocol.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn protocol_backend_maps_runtime_cockpit_success_to_client_state_events() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        let session_id = SessionKey("local:test".into());
+
+        let status_request = backend
+            .build_tracked_request(AppUiCommand::ReadSessionStatus(SessionStatusReadParams {
+                session_id: session_id.clone(),
+            }))
+            .expect("status request builds");
+        let status_frame = json!({
+            "jsonrpc": "2.0",
+            "id": status_request.id,
+            "result": {
+                "session_id": "local:test",
+                "profile_id": "coding",
+                "runtime_policy_stamp": {
+                    "model": "deepseek-v4-pro",
+                    "provider": "deepseek",
+                    "tool_policy_id": "coding-v3"
+                }
+            }
+        })
+        .to_string();
+        let event = backend
+            .decode_rpc_text(&status_frame)
+            .expect("session status response decodes")
+            .expect("session status event");
+        let ClientEvent::SessionStatus(status) = event else {
+            panic!("expected session status event");
+        };
+        assert_eq!(status.result.session_id, session_id);
+        assert_eq!(status.result.profile_id.as_deref(), Some("coding"));
+
+        let local_profile_request = backend
+            .build_tracked_request(AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
+                name: "Ada Lovelace".into(),
+                username: "ada".into(),
+                email: "ada@example.com".into(),
+            }))
+            .expect("local profile request builds");
+        let local_profile_frame = json!({
+            "jsonrpc": "2.0",
+            "id": local_profile_request.id,
+            "result": {
+                "profile_id": "ada-server",
+                "user_id": "ada-user",
+                "name": "Ada Lovelace",
+                "username": "ada",
+                "email": "ada@example.com",
+                "created": true,
+                "runtime_mode": "solo"
+            }
+        })
+        .to_string();
+        let event = backend
+            .decode_rpc_text(&local_profile_frame)
+            .expect("local profile response decodes")
+            .expect("local profile event");
+        let ClientEvent::ProfileLocalCreate(profile) = event else {
+            panic!("expected profile/local/create event");
+        };
+        assert_eq!(profile.result.profile_id, "ada-server");
+
+        let model_request = backend
+            .build_tracked_request(AppUiCommand::ListModels(ModelListParams {
+                session_id: SessionKey("local:test".into()),
+            }))
+            .expect("model list request builds");
+        let model_frame = json!({
+            "jsonrpc": "2.0",
+            "id": model_request.id,
+            "result": {
+                "session_id": "local:test",
+                "models": [{
+                    "model": "deepseek-v4-pro",
+                    "provider": "deepseek",
+                    "selected": true,
+                    "available": true
+                }]
+            }
+        })
+        .to_string();
+        let event = backend
+            .decode_rpc_text(&model_frame)
+            .expect("model list response decodes")
+            .expect("model list event");
+        let ClientEvent::ModelList(models) = event else {
+            panic!("expected model list event");
+        };
+        assert_eq!(models.result.models[0].model, "deepseek-v4-pro");
+
+        let mcp_request = backend
+            .build_tracked_request(AppUiCommand::ListMcpStatus(McpStatusListParams {
+                session_id: SessionKey("local:test".into()),
+                include_disabled: true,
+            }))
+            .expect("mcp status request builds");
+        let mcp_frame = json!({
+            "jsonrpc": "2.0",
+            "id": mcp_request.id,
+            "result": {
+                "session_id": "local:test",
+                "servers": [{
+                    "server": "github",
+                    "status": "connected",
+                    "tool_count": 8
+                }, {
+                    "server": "playwright",
+                    "status": "failed",
+                    "last_error": "not installed"
+                }]
+            }
+        })
+        .to_string();
+        let event = backend
+            .decode_rpc_text(&mcp_frame)
+            .expect("mcp status response decodes")
+            .expect("mcp status event");
+        let ClientEvent::McpStatus(mcp) = event else {
+            panic!("expected mcp status event");
+        };
+        assert_eq!(mcp.result.servers.len(), 2);
+        assert_eq!(
+            mcp.result.servers[1].last_error.as_deref(),
+            Some("not installed")
         );
         assert!(backend.protocol.pending_requests.is_empty());
     }
@@ -3097,8 +5572,10 @@ mod tests {
     #[test]
     fn launch_from_cli_defaults_cwd_to_process_current_dir() {
         let cli = Cli {
+            config: None,
             mode: crate::cli::Mode::Protocol,
             base_url: Some("wss://example.test/ui-protocol".into()),
+            stdio_command: None,
             session: Some("local:test".into()),
             profile_id: Some("coding".into()),
             cwd: None,
@@ -3223,7 +5700,7 @@ mod tests {
 
     #[test]
     fn protocol_backend_readonly_bootstrap_connects_opens_and_reads_existing_session() {
-        let server = spawn_protocol_capture_server(2, true);
+        let server = spawn_protocol_capture_server(4, true);
         let session_id = SessionKey("session-123".into());
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
             endpoint: Some(AppUiEndpoint::websocket(server.endpoint.clone(), None)),
@@ -3246,10 +5723,25 @@ mod tests {
         assert!(backend.is_connected());
         assert_eq!(backend.connection_state, ProtocolConnectionState::Connected);
 
+        let capabilities_request = server.recv_json();
+        assert_eq!(
+            capabilities_request["method"],
+            crate::model::APPUI_METHOD_CONFIG_CAPABILITIES_LIST
+        );
+
+        let llm_request = server.recv_json();
+        assert_eq!(llm_request["method"], crate::model::APPUI_METHOD_MODEL_LIST);
+        assert_eq!(llm_request["params"]["profile_id"], json!("coding"));
+
         let open_request = server.recv_json();
         assert_eq!(open_request["method"], methods::SESSION_OPEN);
         assert_eq!(open_request["params"]["session_id"], json!("session-123"));
         assert_eq!(open_request["params"]["cwd"], json!("/repo"));
+
+        let event = next_event_until(&mut backend);
+        let ClientEvent::Capabilities(_) = event else {
+            panic!("expected capabilities event");
+        };
 
         let event = next_event_until(&mut backend);
         let event = unwrap_app_event(event);
@@ -3377,6 +5869,9 @@ mod tests {
                 input: vec![InputItem::Text {
                     text: "hello".into(),
                 }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }))
             .expect("readonly send is local");
         backend
@@ -3434,6 +5929,9 @@ mod tests {
                 input: vec![InputItem::Text {
                     text: "hello".into(),
                 }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }))
             .expect("send");
 
@@ -3462,6 +5960,9 @@ mod tests {
                 input: vec![InputItem::Text {
                     text: "complete m9 contract".into(),
                 }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }))
             .expect("submit prompt");
 
@@ -3609,6 +6110,9 @@ mod tests {
                 input: vec![InputItem::Text {
                     text: "hello".into(),
                 }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
             }))
             .expect("send");
 

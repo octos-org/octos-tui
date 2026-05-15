@@ -81,8 +81,6 @@ cargo run -p octos-cli --features api --bin octos -- serve \
   --port 50080 \
   --cwd "$PWD/e2e/fixtures/coding-agent-compare-multifile" \
   --data-dir /tmp/octos-tui-dev-data \
-  --provider deepseek \
-  --model deepseek-v4-pro \
   --auth-token "$OCTOS_AUTH_TOKEN"
 ```
 
@@ -98,12 +96,12 @@ Important server settings:
 |---|---|
 | `--cwd` | Server-approved filesystem root for coding tools. TUI sessions can request this directory or an approved subdirectory as their session cwd. |
 | `--data-dir` | Runtime state, sessions, auth, logs, and config. |
-| `--provider` | LLM provider override. Example: `deepseek`. |
-| `--model` | Model override. Example: `deepseek-v4-pro`. |
 | `--auth-token` | Bearer token used by the dashboard and UI Protocol WebSocket. |
 
-If you omit `--provider` and `--model`, `octos serve` loads them from config
-under the selected `--data-dir` or workspace `.octos/config.json`.
+`octos-tui` does not own provider/model selection. `octos serve` loads the
+unified provider, model portfolio, memory, tool policy, and sandbox settings
+from the selected `--data-dir`, explicit server `--config`, or workspace
+`.octos/config.json`.
 
 ## Run octos-tui Against the Server
 
@@ -122,6 +120,20 @@ CARGO_TARGET_DIR=/tmp/octos-tui-target cargo run -- \
   --cwd "$PWD/../octos/e2e/fixtures/coding-agent-compare-multifile" \
   --theme codex
 ```
+
+For a local AppUI process that speaks newline-delimited JSON-RPC over stdio,
+use `--stdio-command` instead of `--endpoint`:
+
+```bash
+cargo run -- \
+  --mode protocol \
+  --stdio-command "octos serve --stdio --data-dir /tmp/octos-tui-dev-data --cwd $PWD/../octos/e2e/fixtures/coding-agent-compare-multifile" \
+  --session coding:local:readme-demo \
+  --profile-id coding
+```
+
+The stdio command intentionally omits `--provider` and `--model`. The child
+`octos serve --stdio` process uses Octos' unified server config instead.
 
 If `--cwd` is omitted, `octos-tui` requests the directory it was launched from,
 matching Codex-style project selection. The server still decides whether that
@@ -279,7 +291,8 @@ multi-file Rust coding fixture and the same model label:
 cd ../octos
 
 export DEEPSEEK_API_KEY=...
-export DEEPSEEK_MODEL=deepseek-v4-pro
+# Optional only for a live-comparison model override; otherwise Octos config wins.
+# export DEEPSEEK_MODEL=...
 export OCTOS_TUI_DIR="$PWD/../octos-tui"
 export OCTOS_TUI_UX_KEEP_SESSIONS=1
 export OCTOS_TMUX_KEEP=1
@@ -356,14 +369,35 @@ During live review, `octos-tui` should show:
 `octos-tui` flags:
 
 ```text
+--config <json-file>
 --mode mock|protocol
 --endpoint ws://127.0.0.1:50080/api/ui-protocol/ws
+--stdio-command "octos serve --stdio --data-dir ~/.octos --cwd /path/to/project"
 --session <session-id>
 --profile-id <profile-id>
+--cwd <workspace-dir>
 --auth-token <token>
 --readonly
+--no-readonly
 --theme codex|claude|slate|solarized|terminal
 ```
+
+`--config` reads a JSON launch config. CLI flags override JSON values:
+
+```json
+{
+  "mode": "protocol",
+  "stdio_command": "octos serve --stdio --data-dir ~/.octos --cwd /path/to/project",
+  "session": "coding:local:main",
+  "profile_id": "coding",
+  "cwd": "/path/to/project",
+  "readonly": false,
+  "theme": "codex"
+}
+```
+
+Do not put `provider` or `model` in the TUI config. Those are server-owned
+Octos runtime settings loaded by `octos serve`.
 
 Environment variables:
 
@@ -401,3 +435,9 @@ protocol tests, and TUI reducer/rendering tests.
 optional pane data from `session/open.panes` when the server supports it. When
 the field is absent, it falls back to session snapshots, task tails, launch
 target, and status.
+
+Auth, onboarding, and profile LLM provider setup are governed by
+`UPCR-2026-016` in the `octos` repo. The TUI must consume
+`auth/*`, `profile/llm/*`, and `config/capabilities/list` as server-owned
+AppUI methods over WebSocket or stdio; it must not hard-code provider/model
+truth or persist a parallel LLM registry.

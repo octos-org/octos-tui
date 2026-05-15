@@ -40,7 +40,7 @@ There is also no `AppUiCommand` variant for `config/capabilities/list`.
 | `/model` | None for menu data or mutation. Internal Octos model catalogs/tools exist outside AppUI and must not be used as TUI truth. | `model/list`, `model/select`, and result fields for provider id, display name, supported reasoning efforts, defaults, current selection, and unavailable reason. | Show capability-missing state. Do not build a model list locally. |
 | `/status` | `AppUiSnapshot`; `session/open` / `session/opened` expose session id, active profile id, workspace root, cursor, optional panes. TUI state also has readonly, target, run state, task counts, and `APP_UI_API_V1`. `progress/updated` can carry token/cost updates, but current TUI state only turns them into status/activity text. | `session/status/read` for refreshable authoritative status; `config/capabilities/list` for runtime capability display; explicit fields for current model/provider, usage totals, server version/build, connection state, and replay/cursor health. | Render snapshot-limited status only where data already exists; mark server-owned fields unavailable. |
 | `/permissions` | `approval/respond`; `approval/scopes/list`; typed approval notifications; `permission_denied` errors. These support active approval decisions and inspection of recorded approval scopes. | `permission/profile/list`, `permission/profile/set`, `approval/scopes/clear`, and read fields for approval policy, permission mode/profile, sandbox mode, supported scopes, persisted scopes, and readonly state. | Render Codex-style permission rows for Default, Read Only, Workspace Write, Full Access, network allow/block, and persisted approval scopes. Enable scope refresh when `approval/scopes/list` is advertised; keep profile/network mutations and scope clearing disabled with explicit missing-method reasons until typed AppUI commands exist. |
-| `/mcp` | None through AppUI. MCP clients, server configs, and tool registration exist in `octos-agent`, but are not exposed over `AppUiCommand`. | `mcp/status/list`; optional refresh/reload command if supported; result fields for configured servers, per-server state, tools/resources, and last error/status detail. | Show capability-missing state. Do not inspect agent internals from the TUI. |
+| `/mcp` | None through AppUI. MCP clients, server configs, and tool registration exist in `octos-agent`, but are not exposed over `AppUiCommand`. | `mcp/status/list`, `mcp/config/upsert`, `mcp/config/set_enabled`, `mcp/config/delete`, `mcp/config/test`, `tool/config/set_enabled`; result fields for configured servers, per-server state, tools/resources, and last error/status detail. | Show capability-missing state. Do not inspect agent internals or edit JSON from the TUI. |
 
 ## Concrete AppUI Follow-Ups
 
@@ -76,10 +76,17 @@ There is also no `AppUiCommand` variant for `config/capabilities/list`.
 
 5. Add MCP menu contract:
    - `mcp/status/list`
+   - `mcp/config/upsert`
+   - `mcp/config/set_enabled`
+   - `mcp/config/delete`
+   - `mcp/config/test`
+   - `tool/config/set_enabled`
    - Optional `mcp/status/refresh` or reload command only if the server can make
      refresh/reload safe and explicit.
    - Include configured MCP servers, transport/status per server, exposed
      tools/resources, and last error/status detail.
+   - Keep config profile-scoped and server-owned. The TUI must never edit MCP
+     or profile JSON directly.
 
 ## Current TUI State
 

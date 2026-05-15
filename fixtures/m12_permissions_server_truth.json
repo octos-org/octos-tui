@@ -1,0 +1,33 @@
+{
+  "name": "m12 permissions server truth",
+  "status_cases": [
+    {
+      "name": "approval-never-workspace-sandbox",
+      "status": {
+        "runtime_mode": "solo",
+        "profile_id": "ada-server",
+        "workspace_root": "/tmp/solo-project",
+        "approval_policy": "never",
+        "sandbox_mode": "workspace-write",
+        "permission_profile": "workspace_write",
+        "filesystem_scope": "workspace",
+        "network": "blocked"
+      },
+      "expect_dangerous_display": false
+    },
+    {
+      "name": "server-confirmed-dangerous",
+      "status": {
+        "runtime_mode": "solo",
+        "profile_id": "ada-server",
+        "workspace_root": "/tmp/solo-project",
+        "approval_policy": "never",
+        "sandbox_mode": "danger-full-access",
+        "permission_profile": "danger_full_access",
+        "filesystem_scope": "host",
+        "network": "allowed"
+      },
+      "expect_dangerous_display": true
+    }
+  ]
+}

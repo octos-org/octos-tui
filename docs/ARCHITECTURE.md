@@ -140,7 +140,7 @@ a visible warning or status item when possible.
 
 | File | Responsibility |
 |---|---|
-| `src/cli.rs` | Parses launch options such as `--mode`, `--endpoint`, `--session`, `--profile-id`, `--cwd`, `--auth-token`, `--readonly`, and `--theme`. |
+| `src/cli.rs` | Parses `--config` JSON launch defaults plus CLI overrides such as `--mode`, `--endpoint`, `--stdio-command`, `--session`, `--profile-id`, `--cwd`, `--auth-token`, `--readonly`, `--no-readonly`, and `--theme`. It must not own provider/model settings; those stay in Octos server config. |
 | `src/event_loop.rs` | Owns terminal raw mode, alternate screen, draw loop, keyboard dispatch, backend polling, and command send errors. |
 | `src/store.rs` | Reduces snapshots, RPC results, notifications, local commands, approvals, diff previews, task output, and queued prompts into `AppState`. |
 | `src/transport.rs` | Defines `AppUiBackend`, mock backend, protocol backend, WebSocket auth, JSON-RPC framing, reconnect status, in-memory cursors, and command/result routing. |

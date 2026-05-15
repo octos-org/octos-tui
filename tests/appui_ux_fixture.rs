@@ -37,6 +37,7 @@ struct UxAssertions {
     required_activity_labels: Vec<String>,
     sticky_placement: String,
     permission_focus: String,
+    narrow_layout_ok: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,10 +124,29 @@ fn fixture_covers_known_appui_ux_assertions() {
     let status = find_event(&events, "status.update");
     assert_eq!(status["placement"], json!(assertions.sticky_placement));
 
+    let turn_started = find_event(&events, "turn.started");
+    let policy_stamp = &turn_started["runtime_policy_stamp"];
+    assert_eq!(policy_stamp["profile_id"], json!("coding"));
+    assert_eq!(policy_stamp["model"], json!("deepseek-v4-pro"));
+    assert_eq!(policy_stamp["provider"], json!("deepseek"));
+    assert_eq!(policy_stamp["sandbox"], json!("workspace-write"));
+    assert_eq!(
+        policy_stamp["permission_profile"],
+        json!("workspace-write-no-network")
+    );
+    assert_eq!(policy_stamp["tool_policy_id"], json!("coding-v3"));
+    assert_eq!(policy_stamp["memory_scope"], json!("profile-session"));
+    assert_eq!(policy_stamp["mcp_servers"], json!(["github", "filesystem"]));
+
+    assert_tool_timeline(&events, "shell-1");
+
     let approval = find_event(&events, "approval.requested");
     assert_eq!(approval["blocks_turn"], json!(true));
     assert_eq!(approval["focus"], json!(assertions.permission_focus));
     assert_eq!(approval["placement"], json!(assertions.sticky_placement));
+    assert_eq!(approval["typed_kind"], json!("diff"));
+    assert_eq!(approval["primary_label"], json!("Approve once"));
+    assert_eq!(approval["default_decision"], json!("deny"));
 
     if assertions.approval_must_block_until_decision {
         assert_approval_blocks_mutating_tool_until_decided(&events);
@@ -149,6 +169,21 @@ fn fixture_covers_known_appui_ux_assertions() {
     let diff = find_event(&events, "diff.preview.ready");
     assert_eq!(diff["long_diff"], json!(true));
     assert_eq!(diff["collapsed_by_default"], json!(true));
+
+    assert_validator_fail_then_pass(&events);
+
+    let artifact = find_event(&events, "artifact.ready");
+    assert_eq!(artifact["artifact_id"], json!("artifact-fixture-summary"));
+    assert_eq!(artifact["title"], json!("AppUI UX marker summary"));
+    assert_eq!(artifact["status"], json!("ready"));
+    assert_eq!(artifact["placement"], json!("artifacts_pane"));
+
+    let denial = find_event(&events, "tool.denied");
+    assert_eq!(denial["tool_name"], json!("web_fetch"));
+    assert_eq!(denial["code"], json!("tool_denied"));
+    assert_eq!(denial["policy"], json!("profile_tool_policy"));
+    assert_eq!(denial["recoverable"], json!(true));
+    assert_eq!(denial["activity_label"], json!("Denied"));
 
     let labels = events
         .iter()
@@ -176,6 +211,22 @@ fn fixture_covers_known_appui_ux_assertions() {
             .iter()
             .any(|event| event_name(event) == Some("task.output.read_result"))
     );
+    assert_before(
+        &events,
+        |event| event_name(event) == Some("turn.interrupt.request"),
+        |event| event_name(event) == Some("turn.cancelled"),
+        "interrupt request should be recorded before the turn cancellation",
+    );
+    assert_before(
+        &events,
+        |event| event_name(event) == Some("replay.lossy"),
+        |event| {
+            event_name(event) == Some("session.open.request")
+                && event.get("cursor_after_seq") == Some(&json!(28))
+        },
+        "reconnect should include the durable replay cursor after replay loss",
+    );
+    assert!(assertions.narrow_layout_ok);
 }
 
 #[test]
@@ -252,6 +303,12 @@ fn normalize_record(record: &Record, transport: &str, thresholds: &Thresholds) -
             let mut event = event("turn.started");
             insert_str(&mut event, "session_id", &payload["session_id"]);
             insert_str(&mut event, "turn_id", &payload["turn_id"]);
+            if let Some(stamp) = payload
+                .get("runtime_policy_stamp")
+                .filter(|value| value.is_object())
+            {
+                event.insert("runtime_policy_stamp".into(), stamp.clone());
+            }
             Value::Object(event)
         }
         ("server_to_client", "notification", "message/delta") => {
@@ -393,6 +450,17 @@ fn normalize_record(record: &Record, transport: &str, thresholds: &Thresholds) -
                 "preview_id",
                 &payload["typed_details"]["diff"]["preview_id"],
             );
+            insert_str(&mut event, "typed_kind", &payload["typed_details"]["kind"]);
+            insert_str(
+                &mut event,
+                "primary_label",
+                &payload["render_hints"]["primary_label"],
+            );
+            insert_str(
+                &mut event,
+                "default_decision",
+                &payload["render_hints"]["default_decision"],
+            );
             event.insert(
                 "blocks_turn".into(),
                 json!(record.ui.blocks_turn.unwrap_or(false)),
@@ -456,6 +524,24 @@ fn normalize_record(record: &Record, transport: &str, thresholds: &Thresholds) -
             insert_str(&mut event, "message", &payload["message"]);
             Value::Object(event)
         }
+        ("server_to_client", "notification", "tool/denied") => {
+            let mut event = event("tool.denied");
+            insert_str(&mut event, "session_id", &payload["session_id"]);
+            insert_str(&mut event, "turn_id", &payload["turn_id"]);
+            insert_str(&mut event, "tool_call_id", &payload["tool_call_id"]);
+            insert_str(&mut event, "tool_name", &payload["tool_name"]);
+            insert_str(&mut event, "code", &payload["code"]);
+            insert_str(&mut event, "policy", &payload["policy"]);
+            insert_str(&mut event, "reason", &payload["reason"]);
+            insert_bool(&mut event, "recoverable", &payload["recoverable"]);
+            insert_optional_string(
+                &mut event,
+                "activity_label",
+                record.ui.activity_label.as_deref(),
+            );
+            insert_optional_string(&mut event, "placement", record.ui.placement.as_deref());
+            Value::Object(event)
+        }
         ("server_to_client", "notification", "protocol/replay_lossy") => {
             let mut event = event("replay.lossy");
             insert_str(&mut event, "session_id", &payload["session_id"]);
@@ -490,6 +576,37 @@ fn normalize_progress(record: &Record, payload: &Value) -> Value {
         insert_str(&mut event, "path", &file_mutation["path"]);
         insert_str(&mut event, "operation", &file_mutation["operation"]);
         insert_str(&mut event, "preview_id", &file_mutation["preview_id"]);
+        insert_str(&mut event, "message", &metadata["message"]);
+        insert_optional_string(&mut event, "placement", record.ui.placement.as_deref());
+        return Value::Object(event);
+    }
+
+    if kind == "validator" {
+        let validator = &metadata["validator"];
+        let status = validator["status"].as_str().expect("validator status");
+        let mut event = event(&format!("validator.{status}"));
+        insert_str(&mut event, "session_id", &payload["session_id"]);
+        insert_str(&mut event, "turn_id", &payload["turn_id"]);
+        insert_str(&mut event, "name", &validator["name"]);
+        insert_str(&mut event, "status", &validator["status"]);
+        insert_u64(&mut event, "attempt", &validator["attempt"]);
+        insert_u64(&mut event, "exit_code", &validator["exit_code"]);
+        insert_str(&mut event, "summary", &validator["summary"]);
+        insert_str(&mut event, "message", &metadata["message"]);
+        insert_optional_string(&mut event, "placement", record.ui.placement.as_deref());
+        return Value::Object(event);
+    }
+
+    if kind == "artifact" {
+        let artifact = &metadata["artifact"];
+        let mut event = event("artifact.ready");
+        insert_str(&mut event, "session_id", &payload["session_id"]);
+        insert_str(&mut event, "turn_id", &payload["turn_id"]);
+        insert_str(&mut event, "artifact_id", &artifact["artifact_id"]);
+        insert_str(&mut event, "title", &artifact["title"]);
+        insert_str(&mut event, "path", &artifact["path"]);
+        insert_str(&mut event, "status", &artifact["status"]);
+        insert_str(&mut event, "mime", &artifact["mime"]);
         insert_str(&mut event, "message", &metadata["message"]);
         insert_optional_string(&mut event, "placement", record.ui.placement.as_deref());
         return Value::Object(event);
@@ -593,6 +710,59 @@ fn find_event<'a>(events: &'a [Value], name: &str) -> &'a Value {
         .iter()
         .find(|event| event_name(event) == Some(name))
         .unwrap_or_else(|| panic!("missing event {name}"))
+}
+
+fn assert_tool_timeline(events: &[Value], tool_call_id: &str) {
+    let started = events
+        .iter()
+        .position(|event| {
+            event_name(event) == Some("activity.tool.started")
+                && event["tool_call_id"] == json!(tool_call_id)
+        })
+        .expect("tool started marker");
+    let progressed = events
+        .iter()
+        .position(|event| {
+            event_name(event) == Some("activity.tool.progress")
+                && event["tool_call_id"] == json!(tool_call_id)
+        })
+        .expect("tool progress marker");
+    let completed = events
+        .iter()
+        .position(|event| {
+            event_name(event) == Some("activity.tool.completed")
+                && event["tool_call_id"] == json!(tool_call_id)
+        })
+        .expect("tool completed marker");
+
+    assert!(
+        started < progressed && progressed < completed,
+        "tool timeline must move started -> progress -> completed for {tool_call_id}"
+    );
+}
+
+fn assert_validator_fail_then_pass(events: &[Value]) {
+    let failed = find_event(events, "validator.failed");
+    let passed = find_event(events, "validator.passed");
+
+    assert_eq!(failed["name"], json!("cargo fmt --check"));
+    assert_eq!(failed["status"], json!("failed"));
+    assert_eq!(failed["attempt"], json!(1));
+    assert_eq!(failed["exit_code"], json!(1));
+    assert_eq!(failed["placement"], json!("sticky_work_pane"));
+
+    assert_eq!(passed["name"], json!("cargo fmt --check"));
+    assert_eq!(passed["status"], json!("passed"));
+    assert_eq!(passed["attempt"], json!(2));
+    assert_eq!(passed["exit_code"], json!(0));
+    assert_eq!(passed["placement"], json!("sticky_work_pane"));
+
+    assert_before(
+        events,
+        |event| event_name(event) == Some("validator.failed"),
+        |event| event_name(event) == Some("validator.passed"),
+        "validator failure should be visible before the passing rerun",
+    );
 }
 
 fn assert_before<P, Q>(events: &[Value], first: P, second: Q, message: &str)

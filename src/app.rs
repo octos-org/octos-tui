@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Position, Rect},
@@ -7,15 +5,16 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use octos_core::ui_protocol::approval_kinds;
 
 use crate::{
     menu::render as menu_render,
     model::{
-        ActivityItem, ActivityKind, AppState, ApprovalModalState, DiffPreviewPaneState, FocusPane,
-        PlanStep as RenderedPlanStep, SessionRunState, SessionView, TaskOutputDetailState,
-        extract_plan_steps, task_state_label,
+        ActivityItem, ActivityKind, AppState, ApprovalModalState, ComposerPresentation,
+        DiffPreviewPaneState, FocusPane, PlanStep as RenderedPlanStep, SessionRunState,
+        SessionView, TaskOutputDetailState, TurnActivityLog, extract_plan_steps, task_state_label,
     },
     theme::Palette,
 };
@@ -44,40 +43,72 @@ fn inspector_visible(app: &AppState) -> bool {
 }
 
 fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
-    let composer_height = composer_height(app);
+    if onboarding_first_launch_active(app) {
+        render_onboarding_first_launch_layout(frame, app, palette);
+        return;
+    }
+
+    let composer_height = composer_height_for_size(app, frame.area().width, frame.area().height);
     let active_menu = active_menu_surface(app);
     let desired_menu_height = menu_height_hint(
         active_menu.as_ref(),
         frame.area().width,
         frame.area().height,
     );
-    let desired_work_height = sticky_work_height(app);
-    let mut surface_budget = frame
+    let surface_budget = frame
         .area()
         .height
         .saturating_sub(min_transcript_height(frame.area().height) + composer_height + 1);
     let menu_height = desired_menu_height.min(surface_budget);
-    surface_budget = surface_budget.saturating_sub(menu_height);
-    let work_height = desired_work_height.min(surface_budget);
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(8),
-            Constraint::Length(work_height),
             Constraint::Length(menu_height),
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
         .split(frame.area());
 
-    frame.render_widget(render_transcript(app, palette, root[0].height), root[0]);
-    frame.render_widget(render_work_pane(app, palette, root[1].height), root[1]);
+    frame.render_widget(render_transcript(app, palette, root[0]), root[0]);
     if let Some(menu) = active_menu.as_ref() {
-        menu_render::render_menu_surface(frame, root[2], menu, palette);
+        menu_render::render_menu_surface(frame, root[1], menu, palette);
     }
-    frame.render_widget(render_composer(app, palette), root[3]);
-    set_composer_cursor(frame, app, root[3]);
-    frame.render_widget(render_status(app, palette), root[4]);
+    frame.render_widget(render_composer(app, palette, root[2]), root[2]);
+    set_composer_cursor(frame, app, root[2]);
+    frame.render_widget(render_status(app, palette), root[3]);
+}
+
+fn render_onboarding_first_launch_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
+    let composer_height = composer_height_for_size(app, frame.area().width, frame.area().height);
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(8),
+            Constraint::Length(composer_height),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    if let Some(menu) = active_menu_surface(app).as_ref() {
+        menu_render::render_menu_surface(frame, root[0], menu, palette);
+    }
+    frame.render_widget(render_composer(app, palette, root[1]), root[1]);
+    set_composer_cursor(frame, app, root[1]);
+    frame.render_widget(render_status(app, palette), root[2]);
+}
+
+fn onboarding_first_launch_active(app: &AppState) -> bool {
+    app.sessions.is_empty()
+        && app.menu_stack.active().is_some_and(|frame| {
+            matches!(
+                frame.id.as_str(),
+                crate::menu::registry::MENU_ONBOARD
+                    | crate::menu::registry::MENU_ONBOARD_FAMILY
+                    | crate::menu::registry::MENU_ONBOARD_MODEL
+                    | crate::menu::registry::MENU_ONBOARD_ROUTE
+            )
+        })
 }
 
 fn min_transcript_height(terminal_height: u16) -> u16 {
@@ -85,7 +116,7 @@ fn min_transcript_height(terminal_height: u16) -> u16 {
 }
 
 fn render_inspector_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
-    let composer_height = composer_height(app);
+    let composer_height = composer_height_for_size(app, frame.area().width, frame.area().height);
     let active_menu = active_menu_surface(app);
     let menu_height = menu_height_hint(
         active_menu.as_ref(),
@@ -132,14 +163,14 @@ fn render_inspector_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palet
     frame.render_widget(render_sessions(app, palette), left[0]);
     frame.render_widget(render_tasks(app, palette), left[1]);
     frame.render_widget(render_artifacts(app, palette), left[2]);
-    frame.render_widget(render_transcript(app, palette, upper[1].height), upper[1]);
+    frame.render_widget(render_transcript(app, palette, upper[1]), upper[1]);
     frame.render_widget(render_plan(app, palette), right[0]);
     frame.render_widget(render_workspace(app, palette, right[1].height), right[1]);
     frame.render_widget(render_git(app, palette, right[2].height), right[2]);
     if let Some(menu) = active_menu.as_ref() {
         menu_render::render_menu_surface(frame, root[1], menu, palette);
     }
-    frame.render_widget(render_composer(app, palette), root[2]);
+    frame.render_widget(render_composer(app, palette, root[2]), root[2]);
     set_composer_cursor(frame, app, root[2]);
     frame.render_widget(render_status(app, palette), root[3]);
 }
@@ -181,34 +212,54 @@ fn menu_height_hint(
         .max(4.min(max_height))
 }
 
+const COMPOSER_CHROME_ROWS: u16 = 4;
+const COMPOSER_MIN_HEIGHT: u16 = 5;
+const COMPOSER_MAX_INPUT_ROWS: u16 = 12;
+const COMPOSER_SIDE_COLUMNS: u16 = 6;
+
+#[cfg(test)]
 fn composer_height(app: &AppState) -> u16 {
-    let _ = app;
-    5
+    composer_height_for_size(app, 120, 42)
 }
 
-fn sticky_work_height(app: &AppState) -> u16 {
-    let plan_len = extract_plan_lines(app).len();
-    let approval_rows = if app
-        .approval
-        .as_ref()
-        .is_some_and(|approval| approval.visible)
-    {
-        5 + u16::from(latest_user_prompt(app).is_some())
-    } else {
-        0
-    };
-    if approval_rows > 0 {
-        return (4 + approval_rows + u16::from(plan_len > 0)).min(9);
-    }
-
-    if plan_len == 0 {
-        if should_show_work_request(app) { 4 } else { 3 }
-    } else if app.run_state.is_active() {
-        if should_show_work_request(app) { 6 } else { 5 }
-    } else {
-        4
+fn composer_height_for_size(app: &AppState, terminal_width: u16, terminal_height: u16) -> u16 {
+    match app.composer_presentation() {
+        ComposerPresentation::Inline(text) => {
+            COMPOSER_CHROME_ROWS
+                + composer_visible_input_rows(&text, terminal_width, terminal_height)
+        }
+        ComposerPresentation::Empty | ComposerPresentation::Collapsed(_) => COMPOSER_MIN_HEIGHT,
     }
 }
+
+fn composer_input_row_cap(terminal_height: u16) -> u16 {
+    terminal_height
+        .saturating_sub(12)
+        .saturating_div(2)
+        .clamp(3, COMPOSER_MAX_INPUT_ROWS)
+}
+
+fn composer_text_width(terminal_width: u16) -> usize {
+    usize::from(terminal_width.saturating_sub(COMPOSER_SIDE_COLUMNS).max(1))
+}
+
+fn composer_visible_input_rows(text: &str, terminal_width: u16, terminal_height: u16) -> u16 {
+    let width = composer_text_width(terminal_width);
+    let rows = text
+        .split('\n')
+        .map(|line| visual_rows_for_text(line, width))
+        .sum::<usize>()
+        .max(1);
+    rows.min(usize::from(composer_input_row_cap(terminal_height))) as u16
+}
+
+fn visual_rows_for_text(text: &str, width: usize) -> usize {
+    text.width().max(1).div_ceil(width.max(1))
+}
+
+const CODE_BLOCK_LINE_LIMIT: usize = 120;
+const COLLAPSED_TOOL_PREVIEW_LINES: usize = 1;
+const EXPANDED_TOOL_PREVIEW_LINES: usize = 24;
 
 fn is_running_activity(item: &ActivityItem) -> bool {
     matches!(item.status.as_str(), "running" | "queued") || item.status.ends_with('%')
@@ -361,12 +412,25 @@ fn render_artifacts(app: &AppState, palette: Palette) -> Paragraph<'static> {
         .wrap(Wrap { trim: false })
 }
 
-fn render_transcript(app: &AppState, palette: Palette, area_height: u16) -> Paragraph<'static> {
+fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
     let mut lines = Vec::new();
     let mut approval_context_start = None;
 
     if let Some(session) = app.active_session() {
-        for message in &session.messages {
+        let approval_visible = app
+            .approval
+            .as_ref()
+            .is_some_and(|approval| approval.visible);
+        let turn_flow_visible = should_show_turn_flow(app, session);
+        let latest_user_index = session
+            .messages
+            .iter()
+            .rposition(|message| message.role.as_str() == "user");
+        let anchored_activity_logs = anchored_turn_activity_logs(app, session);
+        let mut turn_flow_rendered = false;
+
+        for (idx, message) in session.messages.iter().enumerate() {
+            let message_start = lines.len();
             push_message_block(&mut lines, palette, message.role.as_str(), &message.content);
             if let Some(reasoning) = message.reasoning_content.as_deref() {
                 push_message_block(&mut lines, palette, "reasoning", reasoning);
@@ -377,52 +441,30 @@ fn render_transcript(app: &AppState, palette: Palette, area_height: u16) -> Para
                     Span::styled(tool_call_id.to_string(), palette.text()),
                 ]));
             }
+
+            for (_, log) in anchored_activity_logs
+                .iter()
+                .filter(|(anchor_idx, _)| *anchor_idx == idx)
+            {
+                push_turn_activity_log_section(&mut lines, palette, log, app);
+            }
+
+            if turn_flow_visible && Some(idx) == latest_user_index {
+                approval_context_start = Some(message_start);
+                push_turn_flow(&mut lines, palette, app, session);
+                turn_flow_rendered = true;
+            }
         }
 
-        if !app.activity.is_empty() {
-            if !lines.is_empty() {
-                lines.push(Line::from(""));
-            }
-            lines.push(Line::from(Span::styled(
-                "Activity",
-                palette.title().add_modifier(Modifier::BOLD),
-            )));
-            for item in app.activity.iter().rev().take(8).rev() {
-                push_activity_row(&mut lines, palette, item, app.expanded_tool_outputs);
-            }
-        }
-
-        let approval_visible = app
-            .approval
-            .as_ref()
-            .is_some_and(|approval| approval.visible);
-        if approval_visible && let Some(prompt) = latest_user_message(session) {
-            approval_context_start = Some(lines.len());
-            push_recent_user_context(&mut lines, palette, prompt);
-        } else if should_pin_recent_user_context(app, session)
+        if !turn_flow_rendered
+            && approval_visible
             && let Some(prompt) = latest_user_message(session)
         {
             approval_context_start = Some(lines.len());
             push_recent_user_context(&mut lines, palette, prompt);
-        }
-
-        if let Some(approval) = app.approval.as_ref().filter(|approval| approval.visible) {
-            push_inline_approval_card(&mut lines, palette, approval);
-        }
-
-        push_inline_progress_card(&mut lines, palette, app);
-
-        let plan = extract_plan_lines(app);
-        if !plan.is_empty() {
-            push_inline_plan_card(&mut lines, palette, plan);
-        }
-
-        if app.diff_preview.active {
-            push_inline_diff_preview(&mut lines, palette, &app.diff_preview);
-        }
-
-        if let Some(live_reply) = &session.live_reply {
-            push_live_reply_block(&mut lines, palette, &live_reply.text);
+            push_turn_flow(&mut lines, palette, app, session);
+        } else if !turn_flow_rendered {
+            push_turn_flow(&mut lines, palette, app, session);
         }
 
         if !app.pending_messages.is_empty() {
@@ -435,14 +477,20 @@ fn render_transcript(app: &AppState, palette: Palette, area_height: u16) -> Para
         )));
     }
 
-    let visible_height = usize::from(area_height.saturating_sub(2)).max(1);
-    let max_scroll = lines.len().saturating_sub(visible_height);
+    let wrap_width = transcript_wrap_width(area);
+    let visible_height = transcript_visible_height(area);
+    let total_rows = transcript_visual_rows(&lines, wrap_width);
+    let max_scroll = total_rows.saturating_sub(visible_height);
     let scroll_from_bottom = app.transcript_scroll.min(max_scroll);
     let mut scroll_top = max_scroll.saturating_sub(scroll_from_bottom);
     if scroll_from_bottom == 0
         && let Some(context_start) = approval_context_start
     {
-        scroll_top = scroll_top.min(context_start);
+        let context_row = transcript_visual_rows(&lines[..context_start], wrap_width);
+        let context_tail_rows = total_rows.saturating_sub(context_row);
+        if context_tail_rows <= visible_height {
+            scroll_top = scroll_top.min(context_row);
+        }
     }
     let scroll_top = scroll_top as u16;
 
@@ -456,6 +504,30 @@ fn render_transcript(app: &AppState, palette: Palette, area_height: u16) -> Para
         .wrap(Wrap { trim: false })
 }
 
+fn transcript_visible_height(area: Rect) -> usize {
+    usize::from(area.height.saturating_sub(2)).max(1)
+}
+
+fn transcript_wrap_width(area: Rect) -> usize {
+    usize::from(area.width.saturating_sub(2)).max(1)
+}
+
+fn transcript_visual_rows(lines: &[Line<'static>], wrap_width: usize) -> usize {
+    lines
+        .iter()
+        .map(|line| transcript_line_visual_rows(line, wrap_width))
+        .sum()
+}
+
+fn transcript_line_visual_rows(line: &Line<'static>, wrap_width: usize) -> usize {
+    let width = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref().width())
+        .sum::<usize>();
+    width.max(1).div_ceil(wrap_width.max(1))
+}
+
 fn latest_user_message(session: &SessionView) -> Option<&str> {
     session
         .messages
@@ -466,16 +538,99 @@ fn latest_user_message(session: &SessionView) -> Option<&str> {
         .filter(|content| !content.trim().is_empty())
 }
 
-fn latest_user_prompt(app: &AppState) -> Option<&str> {
-    app.active_session().and_then(latest_user_message)
+fn anchored_turn_activity_logs<'a>(
+    app: &'a AppState,
+    session: &'a SessionView,
+) -> Vec<(usize, &'a TurnActivityLog)> {
+    app.turn_activity_logs
+        .iter()
+        .filter(|log| log.session_id == session.id)
+        .filter_map(|log| {
+            let anchor_index = log
+                .anchor_index
+                .filter(|idx| user_message_at(session, *idx))
+                .or_else(|| {
+                    log.request.as_ref().and_then(|request| {
+                        session.messages.iter().rposition(|message| {
+                            message.role.as_str() == "user" && message.content == *request
+                        })
+                    })
+                })
+                .or_else(|| {
+                    session
+                        .messages
+                        .iter()
+                        .rposition(|message| message.role.as_str() == "user")
+                })?;
+            Some((activity_log_render_index(session, anchor_index), log))
+        })
+        .collect()
+}
+
+fn activity_log_render_index(session: &SessionView, anchor_index: usize) -> usize {
+    session
+        .messages
+        .iter()
+        .enumerate()
+        .skip(anchor_index.saturating_add(1))
+        .take_while(|(_, message)| message.role.as_str() != "user")
+        .find(|(_, message)| message.role.as_str() == "assistant")
+        .map(|(idx, _)| idx)
+        .unwrap_or(anchor_index)
+}
+
+fn user_message_at(session: &SessionView, idx: usize) -> bool {
+    session
+        .messages
+        .get(idx)
+        .is_some_and(|message| message.role.as_str() == "user")
 }
 
 fn should_pin_recent_user_context(app: &AppState, session: &SessionView) -> bool {
     session.live_reply.is_some()
-        || app.diff_preview.active
+        || live_turn_diff_preview_visible(app)
         || app.active_turn().is_some()
         || app.run_state.is_active()
-        || !app.activity.is_empty()
+        || has_flow_activity(app)
+}
+
+fn should_show_turn_flow(app: &AppState, session: &SessionView) -> bool {
+    app.approval
+        .as_ref()
+        .is_some_and(|approval| approval.visible)
+        || should_pin_recent_user_context(app, session)
+}
+
+fn push_turn_flow(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    app: &AppState,
+    session: &SessionView,
+) {
+    if let Some(approval) = app.approval.as_ref().filter(|approval| approval.visible) {
+        push_inline_approval_card(lines, palette, approval);
+    }
+
+    if let Some(live_reply) = &session.live_reply {
+        push_live_reply_block(lines, palette, &live_reply.text);
+    }
+
+    push_activity_section(lines, palette, app);
+
+    if live_turn_diff_preview_visible(app) {
+        push_inline_diff_preview(lines, palette, &app.diff_preview);
+    }
+}
+
+fn live_turn_diff_preview_visible(app: &AppState) -> bool {
+    if !app.diff_preview.active {
+        return false;
+    }
+    let Some(diff_turn_id) = app.diff_preview.turn_id.as_ref() else {
+        return true;
+    };
+    app.active_turn()
+        .is_some_and(|(_, active_turn_id)| active_turn_id == diff_turn_id)
 }
 
 fn push_recent_user_context(lines: &mut Vec<Line<'static>>, palette: Palette, content: &str) {
@@ -502,6 +657,10 @@ fn push_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, role: &s
         "reasoning" => "· ",
         _ => "",
     };
+    let prose_marker = match role {
+        "assistant" => Some("• "),
+        _ => None,
+    };
 
     if content.is_empty() {
         lines.push(chat_line(
@@ -511,7 +670,7 @@ fn push_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, role: &s
         return;
     }
 
-    push_formatted_body(lines, palette, content, indent, Some(bg));
+    push_formatted_body_marked(lines, palette, content, indent, prose_marker, Some(bg));
 }
 
 fn push_live_reply_block(lines: &mut Vec<Line<'static>>, palette: Palette, content: &str) {
@@ -520,11 +679,7 @@ fn push_live_reply_block(lines: &mut Vec<Line<'static>>, palette: Palette, conte
     }
 
     let bg = chat_message_bg(palette, "assistant");
-    lines.push(chat_line(
-        vec![Span::styled(active_spinner(), palette.selected().bg(bg))],
-        Some(bg),
-    ));
-    push_formatted_body(lines, palette, content, "", Some(bg));
+    push_formatted_body_marked(lines, palette, content, "", Some("• "), Some(bg));
 }
 
 fn push_pending_messages_block(
@@ -587,13 +742,84 @@ fn push_formatted_body(
     indent: &'static str,
     bg: Option<Color>,
 ) {
+    push_formatted_body_marked(lines, palette, content, indent, None, bg);
+}
+
+fn push_formatted_body_marked(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    content: &str,
+    indent: &'static str,
+    prose_marker: Option<&'static str>,
+    bg: Option<Color>,
+) {
     let mut in_code = false;
+    let mut code_language: Option<String> = None;
     let mut last_blank = false;
+    let mut prose = Vec::new();
+    let mut table = Vec::new();
+    let mut checkbox_index = 1usize;
     let normalized = content.trim_matches(|ch: char| ch.is_whitespace() && ch != '\n');
 
-    for line in normalized.lines() {
-        let line = if in_code { line } else { line.trim() };
+    for raw_line in normalized.lines() {
+        let line = if in_code { raw_line } else { raw_line.trim() };
+        if let Some(rest) = line.trim_start().strip_prefix("```") {
+            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg);
+            let label = if in_code {
+                let language = code_language.take();
+                in_code = false;
+                language
+                    .map(|language| format!("end code {language}"))
+                    .unwrap_or_else(|| "end code".to_string())
+            } else {
+                let language = rest
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .filter(|language| !language.is_empty())
+                    .map(str::to_string);
+                code_language = language.clone();
+                in_code = true;
+                language
+                    .map(|language| format!("code {language}"))
+                    .unwrap_or_else(|| "code".to_string())
+            };
+            lines.push(chat_line(
+                vec![
+                    Span::styled(indent, style_bg(palette.border(), bg)),
+                    Span::styled(label, style_bg(palette.selected(), bg)),
+                    Span::styled(
+                        " ------------------------------------------------",
+                        style_bg(palette.border(), bg),
+                    ),
+                ],
+                bg,
+            ));
+            last_blank = false;
+            continue;
+        }
+
+        if in_code {
+            flush_markdown_table(lines, palette, &mut table, indent, bg);
+            lines.push(chat_line(
+                vec![
+                    Span::styled(indent, style_bg(palette.border(), bg)),
+                    Span::styled(
+                        truncate_terminal_line(line, CODE_BLOCK_LINE_LIMIT),
+                        style_bg(palette.muted(), bg),
+                    ),
+                ],
+                bg,
+            ));
+            last_blank = false;
+            continue;
+        }
+
         if line.is_empty() {
+            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg);
+            checkbox_index = 1;
             if !last_blank && !lines.is_empty() {
                 lines.push(chat_line(
                     vec![Span::styled(indent, style_bg(palette.border(), bg))],
@@ -605,80 +831,49 @@ fn push_formatted_body(
         }
         last_blank = false;
 
-        if line.trim_start().starts_with("```") {
-            in_code = !in_code;
-            lines.push(chat_line(
-                vec![
-                    Span::styled(indent, style_bg(palette.border(), bg)),
-                    Span::styled("code", style_bg(palette.selected(), bg)),
-                    Span::styled(
-                        " ------------------------------------------------",
-                        style_bg(palette.border(), bg),
-                    ),
-                ],
-                bg,
-            ));
-            continue;
-        }
-
         if let Some(command) = shell_command_from_line(line) {
+            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg);
             push_command_row(lines, palette, indent, command);
             continue;
         }
 
-        if in_code {
-            lines.push(chat_line(
-                vec![
-                    Span::styled(indent, style_bg(palette.border(), bg)),
-                    Span::styled(line.to_string(), style_bg(palette.muted(), bg)),
-                ],
-                bg,
-            ));
-            continue;
-        }
-
         if markdown_table_separator(line) {
+            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
             continue;
         }
 
         if let Some(cells) = markdown_table_cells(line) {
-            let mut spans = vec![Span::styled(indent, style_bg(palette.border(), bg))];
-            for (idx, cell) in cells.into_iter().enumerate() {
-                if idx > 0 {
-                    spans.push(Span::styled("  ", style_bg(palette.muted(), bg)));
-                }
-                spans.extend(inline_markdown_spans(
-                    cell,
-                    style_bg(palette.text(), bg),
-                    style_bg(palette.title().add_modifier(Modifier::BOLD), bg),
-                    style_bg(palette.selected(), bg),
-                ));
-            }
-            lines.push(chat_line(spans, bg));
+            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            table.push(cells.into_iter().map(str::to_owned).collect());
             continue;
         }
 
         if let Some(heading) = markdown_heading(line) {
-            lines.push(chat_line(
-                vec![
-                    Span::styled(indent, style_bg(palette.border(), bg)),
-                    Span::styled(
-                        heading.to_string(),
-                        style_bg(palette.title(), bg).add_modifier(Modifier::BOLD),
-                    ),
-                ],
-                bg,
+            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg);
+            let mut spans = vec![Span::styled(indent, style_bg(palette.border(), bg))];
+            spans.extend(inline_markdown_spans(
+                heading,
+                style_bg(palette.title().add_modifier(Modifier::BOLD), bg),
+                style_bg(palette.title().add_modifier(Modifier::BOLD), bg),
+                style_bg(palette.selected(), bg),
             ));
+            lines.push(chat_line(spans, bg));
             continue;
         }
 
-        if let Some((checked, text)) = markdown_checkbox(line) {
-            let marker = if checked { "[x]" } else { "[ ]" };
+        if let Some((_checked, text)) = markdown_checkbox(line) {
+            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg);
             let mut spans = vec![
                 Span::styled(indent, style_bg(palette.border(), bg)),
-                Span::styled(marker, style_bg(palette.selected(), bg)),
-                Span::styled(" ", style_bg(palette.muted(), bg)),
+                Span::styled(
+                    format!("{checkbox_index}. "),
+                    style_bg(palette.selected(), bg),
+                ),
             ];
+            checkbox_index += 1;
             spans.extend(inline_markdown_spans(
                 text,
                 style_bg(palette.text(), bg),
@@ -690,6 +885,8 @@ fn push_formatted_body(
         }
 
         if let Some(text) = markdown_bullet(line) {
+            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg);
             let mut spans = vec![
                 Span::styled(indent, style_bg(palette.border(), bg)),
                 Span::styled("- ", style_bg(palette.selected(), bg)),
@@ -705,6 +902,8 @@ fn push_formatted_body(
         }
 
         if let Some((number, text)) = markdown_numbered(line) {
+            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg);
             let mut spans = vec![
                 Span::styled(indent, style_bg(palette.border(), bg)),
                 Span::styled(format!("{number}. "), style_bg(palette.selected(), bg)),
@@ -719,15 +918,110 @@ fn push_formatted_body(
             continue;
         }
 
-        let mut spans = vec![Span::styled(indent, style_bg(palette.border(), bg))];
-        spans.extend(inline_markdown_spans(
-            line,
-            style_bg(palette.text(), bg),
-            style_bg(palette.title().add_modifier(Modifier::BOLD), bg),
-            style_bg(palette.selected(), bg),
-        ));
-        lines.push(chat_line(spans, bg));
+        flush_markdown_table(lines, palette, &mut table, indent, bg);
+        prose.push(line.to_string());
     }
+
+    flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+    flush_markdown_table(lines, palette, &mut table, indent, bg);
+}
+
+fn flush_prose_paragraph(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    prose: &mut Vec<String>,
+    indent: &'static str,
+    prose_marker: Option<&'static str>,
+    bg: Option<Color>,
+) {
+    if prose.is_empty() {
+        return;
+    }
+
+    let paragraph = prose.join(" ");
+    let mut spans = vec![Span::styled(indent, style_bg(palette.border(), bg))];
+    if let Some(marker) = prose_marker {
+        spans.push(Span::styled(marker, style_bg(palette.selected(), bg)));
+    }
+    spans.extend(inline_markdown_spans(
+        &paragraph,
+        style_bg(palette.text(), bg),
+        style_bg(palette.title().add_modifier(Modifier::BOLD), bg),
+        style_bg(palette.selected(), bg),
+    ));
+    lines.push(chat_line(spans, bg));
+    prose.clear();
+}
+
+fn flush_markdown_table(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    table: &mut Vec<Vec<String>>,
+    indent: &'static str,
+    bg: Option<Color>,
+) {
+    if table.is_empty() {
+        return;
+    }
+
+    let col_count = table.iter().map(Vec::len).max().unwrap_or(0);
+    let mut widths = vec![0; col_count];
+    for row in table.iter() {
+        for (idx, cell) in row.iter().enumerate() {
+            widths[idx] = widths[idx].max(table_cell_width(cell));
+        }
+    }
+
+    for (row_idx, row) in table.iter().enumerate() {
+        let header = row_idx == 0 && table.len() > 1;
+        let normal_style = if header {
+            style_bg(palette.title().add_modifier(Modifier::BOLD), bg)
+        } else {
+            style_bg(palette.text(), bg)
+        };
+        let mut spans = vec![Span::styled(indent, style_bg(palette.border(), bg))];
+        for (idx, width) in widths.iter().enumerate() {
+            if idx > 0 {
+                spans.push(Span::styled(" | ", style_bg(palette.muted(), bg)));
+            }
+            let cell = row.get(idx).map(String::as_str).unwrap_or("");
+            spans.extend(inline_markdown_spans(
+                cell,
+                normal_style,
+                style_bg(palette.title().add_modifier(Modifier::BOLD), bg),
+                style_bg(palette.selected(), bg),
+            ));
+            let padding = width.saturating_sub(table_cell_width(cell));
+            if padding > 0 {
+                spans.push(Span::styled(" ".repeat(padding), normal_style));
+            }
+        }
+        lines.push(chat_line(spans, bg));
+
+        if header {
+            let mut separator = String::new();
+            for (idx, width) in widths.iter().enumerate() {
+                if idx > 0 {
+                    separator.push_str("-+-");
+                }
+                separator.push_str(&"-".repeat((*width).max(3)));
+            }
+            lines.push(chat_line(
+                vec![
+                    Span::styled(indent, style_bg(palette.border(), bg)),
+                    Span::styled(separator, style_bg(palette.muted(), bg)),
+                ],
+                bg,
+            ));
+        }
+    }
+    table.clear();
+}
+
+fn table_cell_width(cell: &str) -> usize {
+    restore_streamed_sentence_spacing(&plain_inline_markdown(cell))
+        .chars()
+        .count()
 }
 
 fn chat_line(spans: Vec<Span<'static>>, bg: Option<Color>) -> Line<'static> {
@@ -745,6 +1039,18 @@ fn style_bg(style: Style, bg: Option<Color>) -> Style {
     }
 }
 
+fn truncate_terminal_line(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+
+    let keep = max_chars.saturating_sub(4);
+    let mut preview = text.chars().take(keep).collect::<String>();
+    preview.push_str(" ...");
+    preview
+}
+
 fn line_is_blank(line: Option<&Line<'static>>) -> bool {
     line.map(|line| line.spans.iter().all(|span| span.content.trim().is_empty()))
         .unwrap_or(false)
@@ -752,10 +1058,11 @@ fn line_is_blank(line: Option<&Line<'static>>) -> bool {
 
 fn markdown_heading(line: &str) -> Option<&str> {
     let trimmed = line.trim_start();
-    let heading = trimmed
-        .strip_prefix("### ")
-        .or_else(|| trimmed.strip_prefix("## "))
-        .or_else(|| trimmed.strip_prefix("# "))?;
+    let hash_count = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if !(1..=6).contains(&hash_count) {
+        return None;
+    }
+    let heading = trimmed.get(hash_count..)?.strip_prefix(' ')?;
     (!heading.trim().is_empty()).then_some(heading.trim())
 }
 
@@ -770,6 +1077,26 @@ fn markdown_checkbox(line: &str) -> Option<(bool, &str)> {
     trimmed
         .strip_prefix("- [ ] ")
         .map(|text| (false, text.trim()))
+}
+
+fn markdown_emphasis_segment(rest: &str) -> Option<(&str, usize)> {
+    let delimiter = rest.chars().next()?;
+    if !matches!(delimiter, '*' | '_') {
+        return None;
+    }
+    let after_open = &rest[delimiter.len_utf8()..];
+    if after_open.starts_with(delimiter) {
+        return None;
+    }
+    let close = after_open.find(delimiter)?;
+    let emphasized = &after_open[..close];
+    if emphasized.is_empty() || emphasized.chars().all(char::is_whitespace) {
+        return None;
+    }
+    Some((
+        emphasized,
+        delimiter.len_utf8() + close + delimiter.len_utf8(),
+    ))
 }
 
 fn markdown_bullet(line: &str) -> Option<&str> {
@@ -845,9 +1172,26 @@ fn inline_markdown_spans(
             continue;
         }
 
+        if let Some((emphasis, consumed)) = markdown_emphasis_segment(rest) {
+            spans.push(Span::styled(
+                emphasis.to_string(),
+                bold_style.add_modifier(Modifier::ITALIC),
+            ));
+            rest = &rest[consumed..];
+            continue;
+        }
+
         let next_bold = rest.find("**");
         let next_code = rest.find('`');
-        let next = [next_bold, next_code].into_iter().flatten().min();
+        let next_emphasis = rest
+            .char_indices()
+            .skip(1)
+            .find(|(_, ch)| matches!(ch, '*' | '_'))
+            .map(|(idx, _)| idx);
+        let next = [next_bold, next_code, next_emphasis]
+            .into_iter()
+            .flatten()
+            .min();
         let take = next.unwrap_or(rest.len());
         if take == 0 {
             let mut chars = rest.chars();
@@ -875,79 +1219,28 @@ fn restore_streamed_sentence_spacing(text: &str) -> String {
 
     while let Some(ch) = chars.next() {
         repaired.push(ch);
-        if matches!(ch, '.' | '!' | '?')
+        let needs_sentence_space = matches!(ch, '.' | '!' | '?')
             && chars.peek().is_some_and(|next| next.is_ascii_uppercase())
             && repaired
                 .chars()
                 .rev()
                 .nth(1)
-                .is_some_and(|prev| prev.is_ascii_lowercase() || prev == ')')
-        {
+                .is_some_and(|prev| prev.is_ascii_lowercase() || prev == ')');
+        let needs_colon_space = ch == ':'
+            && chars
+                .peek()
+                .is_some_and(|next| next.is_ascii_uppercase() || !next.is_ascii())
+            && repaired
+                .chars()
+                .rev()
+                .nth(1)
+                .is_some_and(|prev| prev.is_ascii_alphanumeric() || prev == ')');
+        if needs_sentence_space || needs_colon_space {
             repaired.push(' ');
         }
     }
 
     repaired
-}
-
-fn push_activity_row(
-    lines: &mut Vec<Line<'static>>,
-    palette: Palette,
-    item: &ActivityItem,
-    expanded: bool,
-) {
-    if item.kind == ActivityKind::Tool {
-        push_command_output_block(lines, palette, item, expanded);
-        return;
-    }
-    if let Some(mutation) = FileMutationActivity::from_item(item) {
-        push_file_mutation_block(lines, palette, item, mutation);
-        return;
-    }
-
-    let kind_style = match item.kind {
-        ActivityKind::Tool => palette.selected(),
-        ActivityKind::Progress => palette.title(),
-        ActivityKind::Approval => palette.selected(),
-        ActivityKind::Warning | ActivityKind::Error => Style::default().fg(palette.danger),
-    };
-    let running =
-        matches!(item.status.as_str(), "running" | "queued") || item.status.ends_with('%');
-    let marker = if running { active_spinner() } else { "▸" };
-    let detail = item
-        .detail
-        .as_deref()
-        .filter(|detail| !detail.is_empty())
-        .map(|detail| format!("  {detail}"))
-        .unwrap_or_default();
-
-    lines.push(Line::from(vec![
-        Span::styled(format!("  {marker} "), palette.selected()),
-        Span::styled(
-            format!("[{}] ", item.kind.label()),
-            kind_style.add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(item.title.clone(), palette.text()),
-        Span::styled(format!("  {}", item.status), palette.muted()),
-        Span::styled(detail, palette.muted()),
-    ]));
-
-    let mut metadata = Vec::new();
-    if let Some(tool_call_id) = item.tool_call_id.as_deref() {
-        metadata.push(format!("call {tool_call_id}"));
-    }
-    if let Some(turn_id) = item.turn_id.as_ref() {
-        metadata.push(format!("turn {}", turn_id.0));
-    }
-    if let Some(detail) = item.detail.as_deref() {
-        metadata.push(detail.to_string());
-    }
-    if !metadata.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("      ", palette.border()),
-            Span::styled(metadata.join(" | "), palette.muted()),
-        ]));
-    }
 }
 
 struct FileMutationActivity {
@@ -987,46 +1280,6 @@ impl FileMutationActivity {
     }
 }
 
-fn push_file_mutation_block(
-    lines: &mut Vec<Line<'static>>,
-    palette: Palette,
-    item: &ActivityItem,
-    mutation: FileMutationActivity,
-) {
-    let action = file_mutation_action_label(&mutation.operation);
-    let compact_path = compact_file_path(&mutation.path);
-    lines.push(Line::from(vec![
-        Span::styled("  ", palette.muted()),
-        Span::styled(action, palette.title().add_modifier(Modifier::BOLD)),
-        Span::styled("  ", palette.muted()),
-        Span::styled("▸", palette.selected()),
-        Span::styled(" ", palette.muted()),
-        Span::styled(compact_path, palette.text().add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  {}", mutation.operation), palette.muted()),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("    › ", palette.selected().bg(palette.surface)),
-        Span::styled(mutation.path, palette.text().bg(palette.surface)),
-    ]));
-    if mutation.preview_ready {
-        lines.push(Line::from(vec![
-            Span::styled("    diff ", palette.muted()),
-            Span::styled("preview ready", palette.selected()),
-        ]));
-    }
-
-    let mut metadata = Vec::new();
-    if let Some(turn_id) = item.turn_id.as_ref() {
-        metadata.push(format!("turn {}", turn_id.0));
-    }
-    if !metadata.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("    ", palette.border()),
-            Span::styled(metadata.join(" | "), palette.muted()),
-        ]));
-    }
-}
-
 fn file_mutation_action_label(operation: &str) -> &'static str {
     match operation {
         "add" | "added" | "create" | "created" => "Added",
@@ -1049,136 +1302,6 @@ fn compact_file_path(path: &str) -> String {
     format!(".../{}", components[components.len() - keep..].join("/"))
 }
 
-fn push_command_output_block(
-    lines: &mut Vec<Line<'static>>,
-    palette: Palette,
-    item: &ActivityItem,
-    expanded: bool,
-) {
-    let running = is_running_activity(item);
-    let marker = if running { active_spinner() } else { "▸" };
-    let state = tool_block_state_label(item, running);
-    let state_style = tool_block_state_style(item, running, palette);
-    let duration = item
-        .duration_ms
-        .map(format_duration_ms)
-        .map(|duration| format!("  {duration}"))
-        .unwrap_or_default();
-    let action_label = tool_action_label(item, running);
-    lines.push(Line::from(vec![
-        Span::styled("  ", palette.muted()),
-        Span::styled(action_label, palette.title().add_modifier(Modifier::BOLD)),
-        Span::styled("  ", palette.muted()),
-        Span::styled(marker, palette.selected()),
-        Span::styled(" ", palette.muted()),
-        Span::styled(
-            item.title.clone(),
-            palette.text().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ", palette.muted()),
-        Span::styled(state, state_style),
-        Span::styled(duration, palette.muted()),
-    ]));
-
-    if let Some(invocation) = tool_invocation_text(item) {
-        let prompt = if item.title == "shell" { "$ " } else { "› " };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("    {prompt}"),
-                palette.selected().bg(palette.surface),
-            ),
-            Span::styled(invocation, palette.text().bg(palette.surface)),
-        ]));
-    }
-
-    let exit_label = match (item.status.as_str(), item.success) {
-        (_, Some(true)) => "exit 0",
-        (_, Some(false)) => "failed",
-        ("complete" | "completed", _) => "exit 0",
-        ("failed" | "error", _) => "failed",
-        (status, _) => status,
-    };
-    lines.push(Line::from(vec![
-        Span::styled("    output ", palette.muted()),
-        Span::styled(
-            exit_label.to_string(),
-            command_status_style(item.status.as_str(), palette),
-        ),
-        Span::styled("  inline preview", palette.muted()),
-    ]));
-
-    if let Some(output_preview) = item
-        .output_preview
-        .as_deref()
-        .filter(|output| !output.trim().is_empty())
-    {
-        push_tool_output_preview(lines, palette, output_preview, expanded);
-    } else if !running {
-        let collapsed_detail = collapsed_tool_detail(item);
-        lines.push(Line::from(vec![
-            Span::styled("    │ ", palette.border()),
-            Span::styled(collapsed_detail, palette.muted()),
-        ]));
-    }
-
-    let mut metadata = Vec::new();
-    if let Some(tool_call_id) = item.tool_call_id.as_deref() {
-        metadata.push(format!("call {tool_call_id}"));
-    }
-    if let Some(turn_id) = item.turn_id.as_ref() {
-        metadata.push(format!("turn {}", turn_id.0));
-    }
-    if let Some(duration_ms) = item.duration_ms {
-        metadata.push(format!("elapsed {}", format_duration_ms(duration_ms)));
-    }
-    if !metadata.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("    ", palette.border()),
-            Span::styled(metadata.join(" | "), palette.muted()),
-        ]));
-    }
-}
-
-fn collapsed_tool_detail(item: &ActivityItem) -> String {
-    let hint = " (Ctrl+O expand | Tab inspector)";
-    if matches!(item.success, Some(false)) || matches!(item.status.as_str(), "failed" | "error") {
-        if let Some(detail) = item
-            .detail
-            .as_deref()
-            .filter(|detail| !detail.trim().is_empty())
-        {
-            return format!("failed: {}{hint}", first_meaningful_line(detail));
-        }
-    }
-    format!("details collapsed{hint}")
-}
-
-fn tool_block_state_label(item: &ActivityItem, running: bool) -> &'static str {
-    if running {
-        return "running";
-    }
-    if matches!(item.success, Some(false)) || matches!(item.status.as_str(), "failed" | "error") {
-        return "failed";
-    }
-    if item
-        .output_preview
-        .as_deref()
-        .is_some_and(|output| !output.trim().is_empty())
-    {
-        return "preview";
-    }
-    "collapsed"
-}
-
-fn tool_block_state_style(item: &ActivityItem, running: bool, palette: Palette) -> Style {
-    match tool_block_state_label(item, running) {
-        "running" => palette.selected(),
-        "failed" => Style::default().fg(palette.danger),
-        "preview" => Style::default().fg(palette.success),
-        _ => palette.muted(),
-    }
-}
-
 fn tool_invocation_text(item: &ActivityItem) -> Option<String> {
     if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
         return Some(detail.to_string());
@@ -1188,57 +1311,12 @@ fn tool_invocation_text(item: &ActivityItem) -> Option<String> {
         .and_then(|arguments| serde_json::to_string(arguments).ok())
 }
 
-fn push_tool_output_preview(
-    lines: &mut Vec<Line<'static>>,
-    palette: Palette,
-    output_preview: &str,
-    expanded: bool,
-) {
-    const MAX_PREVIEW_LINES: usize = 8;
-    let meaningful = meaningful_output_lines(output_preview);
-    let preview_lines = if meaningful.is_empty() {
-        output_preview.lines().collect::<Vec<_>>()
-    } else {
-        meaningful
-    };
-    let total = preview_lines.len();
-    let shown = if expanded { total } else { total.min(1) };
-    for line in preview_lines.iter().take(shown) {
-        lines.push(Line::from(vec![
-            Span::styled("    │ ", palette.border()),
-            Span::styled((*line).to_string(), palette.text()),
-        ]));
-    }
-    if total > shown {
-        lines.push(Line::from(vec![
-            Span::styled("    │ ", palette.border()),
-            Span::styled(
-                format!("... {} more line(s) hidden (Ctrl+O expand)", total - shown),
-                palette.muted(),
-            ),
-        ]));
-    } else if expanded && total > MAX_PREVIEW_LINES {
-        lines.push(Line::from(vec![
-            Span::styled("    │ ", palette.border()),
-            Span::styled("expanded (Ctrl+O collapse)", palette.muted()),
-        ]));
-    }
-}
-
 fn meaningful_output_lines(output: &str) -> Vec<&str> {
     output
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect()
-}
-
-fn first_meaningful_line(output: &str) -> &str {
-    output
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_else(|| output.trim())
 }
 
 fn tool_action_label(item: &ActivityItem, running: bool) -> &'static str {
@@ -1303,16 +1381,6 @@ fn shell_action_label(command: &str, running: bool) -> &'static str {
     };
 
     if running { label.0 } else { label.1 }
-}
-
-fn command_status_style(status: &str, palette: Palette) -> Style {
-    match status {
-        "complete" | "completed" => Style::default().fg(palette.success),
-        "failed" | "error" => Style::default().fg(palette.danger),
-        "running" | "queued" => palette.selected(),
-        _ if status.ends_with('%') => palette.selected(),
-        _ => palette.muted(),
-    }
 }
 
 fn format_duration_ms(duration_ms: u64) -> String {
@@ -1399,71 +1467,344 @@ fn push_prefixed_line(
     lines.push(Line::from(spans));
 }
 
-fn push_inline_progress_card(lines: &mut Vec<Line<'static>>, palette: Palette, app: &AppState) {
-    let running = app
-        .activity
-        .iter()
-        .rev()
-        .filter(|item| is_running_activity(item))
-        .take(3)
-        .collect::<Vec<_>>();
-    if running.is_empty() && app.active_turn().is_none() {
+fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: &AppState) {
+    let flow_activity = flow_activity_items(app);
+    if flow_activity.is_empty() {
         return;
     }
-    let status_text = if running.is_empty() {
-        "Thinking".to_string()
-    } else {
-        app.status.clone()
-    };
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  ", palette.muted()),
-        Span::styled("Progress", palette.title().add_modifier(Modifier::BOLD)),
-        Span::styled("  ", palette.muted()),
-        Span::styled(active_spinner(), palette.selected()),
-        Span::styled(" ", palette.muted()),
-        Span::styled(status_text, palette.text()),
-    ]));
-
-    for item in running.into_iter().rev() {
-        let detail = item
-            .detail
-            .as_deref()
-            .filter(|detail| !detail.is_empty())
-            .unwrap_or(item.status.as_str());
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    let shown_limit = if app.expanded_tool_outputs { 12 } else { 3 };
+    let recent = flow_activity
+        .iter()
+        .rev()
+        .take(shown_limit)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    let mut group: Vec<&ActivityItem> = Vec::new();
+    let mut last_turn: Option<&octos_core::ui_protocol::TurnId> = None;
+    for item in recent.iter().copied() {
+        let turn_id = item.turn_id.as_ref();
+        if last_turn != turn_id {
+            if !group.is_empty() {
+                push_agent_task_group(lines, palette, last_turn, &group, app.expanded_tool_outputs);
+                group.clear();
+            }
+            last_turn = turn_id;
+        }
+        group.push(item);
+    }
+    if !group.is_empty() {
+        push_agent_task_group(lines, palette, last_turn, &group, app.expanded_tool_outputs);
+    }
+    if flow_activity.len() > recent.len() {
         lines.push(Line::from(vec![
-            Span::styled("    ", palette.muted()),
+            Span::styled("     ", palette.muted()),
             Span::styled(
-                item.title.clone(),
-                palette.text().add_modifier(Modifier::BOLD),
+                format!(
+                    "... +{} older action(s)",
+                    flow_activity.len() - recent.len()
+                ),
+                palette.muted(),
             ),
-            Span::styled("  ", palette.muted()),
-            Span::styled(detail.to_string(), palette.muted()),
         ]));
     }
 }
 
-fn push_inline_plan_card(
+fn has_flow_activity(app: &AppState) -> bool {
+    !flow_activity_items(app).is_empty()
+}
+
+fn flow_activity_items(app: &AppState) -> Vec<&ActivityItem> {
+    let active_turn_id = app.active_turn().map(|(_, turn_id)| turn_id);
+    app.activity
+        .iter()
+        .filter(|item| match active_turn_id {
+            Some(turn_id) => item.turn_id.as_ref() == Some(turn_id),
+            None => item.turn_id.is_none(),
+        })
+        .collect()
+}
+
+fn push_turn_activity_log_section(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
-    plan: Vec<RenderedPlanStep>,
+    log: &TurnActivityLog,
+    app: &AppState,
 ) {
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  ", palette.muted()),
-        Span::styled("Plan", palette.title().add_modifier(Modifier::BOLD)),
-        Span::styled("  live", palette.muted()),
-    ]));
-    for (idx, step) in plan.into_iter().take(6).enumerate() {
-        let status = if step.completed { "[x]" } else { "[ ]" };
+    if log.items.is_empty() {
+        return;
+    }
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    let shown_limit = if app.expanded_tool_outputs { 12 } else { 3 };
+    let shown = log
+        .items
+        .iter()
+        .rev()
+        .take(shown_limit)
+        .rev()
+        .collect::<Vec<_>>();
+    push_agent_task_group(
+        lines,
+        palette,
+        Some(&log.turn_id),
+        &shown,
+        app.expanded_tool_outputs,
+    );
+    if log.items.len() > shown.len() {
+        let hidden = log.items.len() - shown.len();
+        let completed = log
+            .items
+            .iter()
+            .filter(|item| activity_is_completed(item))
+            .count();
+        let active = log
+            .items
+            .iter()
+            .filter(|item| is_running_activity(item))
+            .count();
         lines.push(Line::from(vec![
-            Span::styled("    ", palette.muted()),
-            Span::styled(status, palette.selected()),
-            Span::styled(format!(" {}. ", idx + 1), palette.muted()),
-            Span::styled(step.text, palette.text()),
+            Span::styled("     ", palette.muted()),
+            Span::styled(
+                format!("... +{hidden} more, {completed} completed, {active} active"),
+                palette.muted(),
+            ),
         ]));
     }
+    if app.diff_preview.active && app.diff_preview.turn_id.as_ref() == Some(&log.turn_id) {
+        push_inline_diff_preview(lines, palette, &app.diff_preview);
+    }
+}
+
+fn push_agent_task_group(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    turn_id: Option<&octos_core::ui_protocol::TurnId>,
+    items: &[&ActivityItem],
+    expanded: bool,
+) {
+    if items.is_empty() {
+        return;
+    }
+    let active = items
+        .iter()
+        .filter(|item| is_running_activity(item))
+        .count();
+    let completed = items
+        .iter()
+        .filter(|item| activity_is_completed(item))
+        .count();
+    let failed = items.iter().filter(|item| activity_is_failed(item)).count();
+    let title = if active > 0 {
+        "Orchestrating..."
+    } else if failed > 0 {
+        "Agent task finished with errors"
+    } else {
+        "Agent task completed"
+    };
+    let mut metadata = vec![format!("{} action(s)", items.len())];
+    if active > 0 {
+        metadata.push(format!("{active} active"));
+    }
+    if completed > 0 {
+        metadata.push(format!("{completed} completed"));
+    }
+    if failed > 0 {
+        metadata.push(format!("{failed} failed"));
+    }
+    if let Some(turn_id) = turn_id {
+        metadata.push(format!("turn {}", short_id(&turn_id.0.to_string())));
+    }
+
+    let spans = vec![
+        Span::styled("• ", palette.selected()),
+        Span::styled(title, palette.title().add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" ({})", metadata.join(" · ")), palette.muted()),
+    ];
+    lines.push(Line::from(spans));
+
+    for (idx, item) in items.iter().enumerate() {
+        push_agent_task_child(lines, palette, item, idx == 0, expanded);
+    }
+}
+
+fn push_agent_task_child(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    item: &ActivityItem,
+    first: bool,
+    expanded: bool,
+) {
+    let (icon, icon_style) = activity_status_icon(item, palette);
+    let prefix = if first { "  ⎿  " } else { "     " };
+    let mut spans = vec![
+        Span::styled(prefix, palette.border()),
+        Span::styled(icon, icon_style),
+        Span::styled(" ", palette.muted()),
+    ];
+    spans.extend(compact_activity_spans(item, palette));
+    lines.push(Line::from(spans));
+
+    if item.kind == ActivityKind::Tool {
+        push_compact_tool_preview(lines, palette, item, expanded);
+    }
+}
+
+fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'static>> {
+    if let Some(mutation) = FileMutationActivity::from_item(item) {
+        let mut spans = vec![
+            Span::styled(
+                file_mutation_action_label(&mutation.operation),
+                palette.text().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", palette.muted()),
+            Span::styled(compact_file_path(&mutation.path), palette.text()),
+            Span::styled(format!("  {}", mutation.operation), palette.muted()),
+        ];
+        if mutation.preview_ready {
+            spans.push(Span::styled("  preview ready", palette.selected()));
+        }
+        return spans;
+    }
+
+    if item.kind == ActivityKind::Tool {
+        let running = is_running_activity(item);
+        let mut spans = vec![
+            Span::styled(
+                tool_action_label(item, running),
+                palette.text().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", palette.muted()),
+            Span::styled(item.title.clone(), palette.text()),
+        ];
+        if let Some(invocation) = tool_invocation_text(item) {
+            let prompt = if item.title == "shell" { "$ " } else { "" };
+            spans.push(Span::styled(": ", palette.muted()));
+            spans.push(Span::styled(
+                format!("{prompt}{}", truncate_terminal_line(&invocation, 96)),
+                palette.text(),
+            ));
+        }
+        push_compact_metadata_spans(&mut spans, palette, item);
+        return spans;
+    }
+
+    let mut spans = vec![
+        Span::styled(
+            item.title.clone(),
+            palette.text().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {}", item.status), palette.muted()),
+    ];
+    if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
+        spans.push(Span::styled("  ", palette.muted()));
+        spans.push(Span::styled(
+            truncate_terminal_line(detail, 96),
+            palette.muted(),
+        ));
+    }
+    push_compact_metadata_spans(&mut spans, palette, item);
+    spans
+}
+
+fn push_compact_metadata_spans(
+    spans: &mut Vec<Span<'static>>,
+    palette: Palette,
+    item: &ActivityItem,
+) {
+    if let Some(duration_ms) = item.duration_ms {
+        spans.push(Span::styled(
+            format!("  {}", format_duration_ms(duration_ms)),
+            palette.muted(),
+        ));
+    }
+    if let Some(tool_call_id) = item.tool_call_id.as_deref() {
+        spans.push(Span::styled(
+            format!("  call {tool_call_id}"),
+            palette.muted(),
+        ));
+    }
+}
+
+fn push_compact_tool_preview(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    item: &ActivityItem,
+    expanded: bool,
+) {
+    let Some(output_preview) = item
+        .output_preview
+        .as_deref()
+        .filter(|output| !output.trim().is_empty())
+    else {
+        return;
+    };
+    let meaningful = meaningful_output_lines(output_preview);
+    let preview_lines = if meaningful.is_empty() {
+        output_preview.lines().collect::<Vec<_>>()
+    } else {
+        meaningful
+    };
+    let total = preview_lines.len();
+    let line_limit = if expanded {
+        EXPANDED_TOOL_PREVIEW_LINES
+    } else {
+        COLLAPSED_TOOL_PREVIEW_LINES
+    };
+    let shown = total.min(line_limit);
+    for line in preview_lines.iter().take(shown) {
+        lines.push(Line::from(vec![
+            Span::styled("     │ ", palette.border()),
+            Span::styled(truncate_terminal_line(line, 110), palette.text()),
+        ]));
+    }
+    if total > shown {
+        let action = if expanded {
+            "Ctrl+O collapse"
+        } else {
+            "Ctrl+O expand"
+        };
+        lines.push(Line::from(vec![
+            Span::styled("     │ ", palette.border()),
+            Span::styled(
+                format!("... {} more line(s) hidden ({action})", total - shown),
+                palette.muted(),
+            ),
+        ]));
+    } else if expanded && total > COLLAPSED_TOOL_PREVIEW_LINES {
+        lines.push(Line::from(vec![
+            Span::styled("     │ ", palette.border()),
+            Span::styled("expanded (Ctrl+O collapse)", palette.muted()),
+        ]));
+    }
+}
+
+fn activity_status_icon(item: &ActivityItem, palette: Palette) -> (&'static str, Style) {
+    if is_running_activity(item) {
+        ("◻", palette.selected())
+    } else if activity_is_failed(item) {
+        ("✗", Style::default().fg(palette.danger))
+    } else if activity_is_completed(item) {
+        ("✓", Style::default().fg(palette.success))
+    } else {
+        ("•", palette.muted())
+    }
+}
+
+fn activity_is_completed(item: &ActivityItem) -> bool {
+    matches!(item.success, Some(true))
+        || matches!(
+            item.status.as_str(),
+            "complete" | "completed" | "done" | "success"
+        )
+}
+
+fn activity_is_failed(item: &ActivityItem) -> bool {
+    matches!(item.success, Some(false)) || matches!(item.status.as_str(), "failed" | "error")
 }
 
 fn push_inline_diff_preview(
@@ -1649,164 +1990,6 @@ fn shell_command_from_line(line: &str) -> Option<&str> {
         .filter(|command| !command.trim().is_empty())
 }
 
-fn render_work_pane(app: &AppState, palette: Palette, area_height: u16) -> Paragraph<'static> {
-    let mut lines = vec![work_status_line(app, palette)];
-    let plan = extract_plan_lines(app);
-    let inner_height = usize::from(area_height.saturating_sub(2)).max(1);
-
-    if let Some(approval) = app.approval.as_ref().filter(|approval| approval.visible) {
-        if let Some(prompt) = latest_user_prompt(app) {
-            lines.push(Line::from(vec![
-                Span::styled("Request ", palette.title()),
-                Span::styled(compact_inline(prompt, 96), palette.text()),
-            ]));
-        }
-        lines.push(Line::from(vec![
-            Span::styled("Approval ", palette.title()),
-            Span::styled(approval.title.clone(), palette.text()),
-        ]));
-        for action in approval_action_labels(approval) {
-            lines.push(Line::from(vec![
-                Span::styled("  ", palette.muted()),
-                Span::styled(action, palette.selected()),
-            ]));
-        }
-    } else if should_show_work_request(app)
-        && let Some(prompt) = latest_user_prompt(app)
-    {
-        lines.push(Line::from(vec![
-            Span::styled("Request ", palette.title()),
-            Span::styled(compact_inline(prompt, 96), palette.text()),
-        ]));
-    }
-
-    if plan.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Plan ", palette.title()),
-            Span::styled("No active plan", palette.muted()),
-        ]));
-    } else if inner_height <= lines.len() + 2 {
-        let total = plan.len();
-        let (idx, step) = plan
-            .iter()
-            .enumerate()
-            .find(|(_, step)| !step.completed)
-            .unwrap_or((0, &plan[0]));
-        let status = if step.completed { "[x]" } else { "[ ]" };
-        let hidden = total.saturating_sub(1);
-        let suffix = if hidden > 0 {
-            format!(" | +{hidden} more plan item(s) | Ctrl+O expand")
-        } else {
-            String::new()
-        };
-        if lines.len() < inner_height {
-            lines.push(Line::from(vec![
-                Span::styled("Plan ", palette.title()),
-                Span::styled(status, palette.selected()),
-                Span::styled(format!(" {}. ", idx + 1), palette.muted()),
-                Span::styled(compact_inline(&step.text, 72), palette.text()),
-                Span::styled(suffix, palette.muted()),
-            ]));
-        }
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled("Plan ", palette.title()),
-            Span::styled("live", palette.muted()),
-        ]));
-        let reserved_for_hint = usize::from(plan.len() > 1);
-        let available_plan_rows = inner_height
-            .saturating_sub(lines.len())
-            .saturating_sub(reserved_for_hint)
-            .max(1);
-        let shown = plan.len().min(4).min(available_plan_rows);
-        let total = plan.len();
-        for (idx, step) in plan.into_iter().take(shown).enumerate() {
-            let status = if step.completed { "[x]" } else { "[ ]" };
-            lines.push(Line::from(vec![
-                Span::styled("  ", palette.muted()),
-                Span::styled(status, palette.selected()),
-                Span::styled(format!(" {}. ", idx + 1), palette.muted()),
-                Span::styled(step.text, palette.text()),
-            ]));
-        }
-        let hidden = total.saturating_sub(shown);
-        if hidden > 0 {
-            lines.push(Line::from(vec![
-                Span::styled("  ", palette.muted()),
-                Span::styled(
-                    format!("+{hidden} more plan item(s) | Ctrl+O expand | Tab inspector"),
-                    palette.muted(),
-                ),
-            ]));
-        }
-    }
-
-    Paragraph::new(Text::from(lines))
-        .block(titled_block("Work", palette, false, Some("sticky")).border_style(palette.border()))
-        .wrap(Wrap { trim: false })
-}
-
-fn work_status_line(app: &AppState, palette: Palette) -> Line<'static> {
-    let background_tasks = active_background_tasks(app);
-    let elapsed = app
-        .run_state_elapsed_secs()
-        .map(|secs| format!(" {} ", format_elapsed_secs(secs)))
-        .unwrap_or_else(|| " ".into());
-    let interrupt = if app.active_turn().is_some() {
-        " | Esc interrupt | /stop to close"
-    } else {
-        ""
-    };
-    let task_hint = if background_tasks == 0 {
-        String::new()
-    } else {
-        format!(" | {background_tasks} background task(s) | /ps to view")
-    };
-    let detail = current_goal_text(app);
-
-    Line::from(vec![
-        Span::styled("Task ", palette.title()),
-        Span::styled(
-            run_state_status_label(&app.run_state).to_string(),
-            run_state_style(&app.run_state, palette),
-        ),
-        Span::styled(elapsed, palette.muted()),
-        Span::styled(detail, palette.text()),
-        Span::styled(task_hint, palette.muted()),
-        Span::styled(interrupt.to_string(), palette.muted()),
-    ])
-}
-
-fn current_goal_text(app: &AppState) -> String {
-    if let Some(detail) = app.run_state.detail() {
-        return detail.to_string();
-    }
-    if let Some(item) = app
-        .activity
-        .iter()
-        .rev()
-        .find(|item| is_running_activity(item))
-    {
-        return item
-            .detail
-            .as_ref()
-            .filter(|detail| !detail.is_empty())
-            .cloned()
-            .unwrap_or_else(|| item.title.clone());
-    }
-    app.active_task()
-        .map(|task| task.title.clone())
-        .unwrap_or_else(|| app.status.clone())
-}
-
-fn should_show_work_request(app: &AppState) -> bool {
-    latest_user_prompt(app).is_some()
-        && (app.run_state.is_active()
-            || app.active_turn().is_some()
-            || app.diff_preview.active
-            || !app.activity.is_empty())
-}
-
 fn active_background_tasks(app: &AppState) -> usize {
     app.active_session()
         .map(|session| {
@@ -1833,12 +2016,12 @@ fn render_plan(app: &AppState, palette: Palette) -> Paragraph<'static> {
         plan.into_iter()
             .enumerate()
             .map(|(idx, step)| {
-                let status = if step.completed { "[x]" } else { "[ ]" };
-                Line::from(vec![
-                    Span::styled(format!("{status} "), palette.selected()),
+                let mut spans = vec![
                     Span::styled(format!("{}.", idx + 1), palette.muted()),
-                    Span::styled(format!(" {}", step.text), palette.text()),
-                ])
+                    Span::styled(" ", palette.muted()),
+                ];
+                spans.extend(plan_step_text_spans(&step.text, palette));
+                Line::from(spans)
             })
             .collect()
     };
@@ -1846,6 +2029,48 @@ fn render_plan(app: &AppState, palette: Palette) -> Paragraph<'static> {
     Paragraph::new(Text::from(lines))
         .block(titled_block("Plan", palette, false, Some("live")).border_style(palette.border()))
         .wrap(Wrap { trim: false })
+}
+
+fn plan_step_text_spans(text: &str, palette: Palette) -> Vec<Span<'static>> {
+    inline_markdown_spans(
+        text,
+        palette.text(),
+        palette.title().add_modifier(Modifier::BOLD),
+        palette.selected(),
+    )
+}
+
+fn plain_inline_markdown(text: &str) -> String {
+    let mut output = String::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(after_open) = rest.strip_prefix("**")
+            && let Some(close) = after_open.find("**")
+        {
+            output.push_str(&after_open[..close]);
+            rest = &after_open[close + 2..];
+            continue;
+        }
+        if let Some(after_open) = rest.strip_prefix('`')
+            && let Some(close) = after_open.find('`')
+        {
+            output.push_str(&after_open[..close]);
+            rest = &after_open[close + 1..];
+            continue;
+        }
+        if let Some((emphasis, consumed)) = markdown_emphasis_segment(rest) {
+            output.push_str(emphasis);
+            rest = &rest[consumed..];
+            continue;
+        }
+        if let Some(ch) = rest.chars().next() {
+            output.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        } else {
+            break;
+        }
+    }
+    output
 }
 
 fn extract_plan_lines(app: &AppState) -> Vec<RenderedPlanStep> {
@@ -2097,8 +2322,26 @@ fn render_git(app: &AppState, palette: Palette, area_height: u16) -> Paragraph<'
         .wrap(Wrap { trim: false })
 }
 
-fn render_composer(app: &AppState, palette: Palette) -> Paragraph<'static> {
+struct ComposerInputView {
+    lines: Vec<String>,
+    hidden_lines: usize,
+    hidden_prefix: bool,
+    cursor_row: u16,
+    cursor_width: usize,
+}
+
+fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
     let mut lines = Vec::new();
+    let composer = app.composer_presentation();
+    let input_view = match &composer {
+        ComposerPresentation::Inline(text) => Some(composer_input_view(
+            text,
+            app.composer_cursor_index(),
+            area.width,
+            area.height.saturating_sub(COMPOSER_CHROME_ROWS),
+        )),
+        ComposerPresentation::Empty | ComposerPresentation::Collapsed(_) => None,
+    };
     if !app.pending_messages.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             format!(
@@ -2107,28 +2350,80 @@ fn render_composer(app: &AppState, palette: Palette) -> Paragraph<'static> {
             ),
             palette.muted().bg(palette.surface),
         )]));
+    } else if matches!(&composer, ComposerPresentation::Collapsed(_)) {
+        lines.push(Line::from(vec![Span::styled(
+            "Large paste collapsed | Enter sends full text | Ctrl+U clear",
+            palette.muted().bg(palette.surface),
+        )]));
+    } else if let Some(view) = &input_view
+        && (view.hidden_lines > 0 || view.hidden_prefix)
+    {
+        let hidden = if view.hidden_lines > 0 {
+            format!("showing tail, {} earlier line(s) hidden", view.hidden_lines)
+        } else {
+            "showing tail of long line".to_string()
+        };
+        lines.push(Line::from(vec![Span::styled(
+            format!("Multiline input | {hidden} | Enter sends full text | Ctrl+U clear"),
+            palette.muted().bg(palette.surface),
+        )]));
     } else {
         lines.push(Line::from(Span::styled(
             " ",
             palette.text().bg(palette.surface),
         )));
     }
-    lines.push(Line::from(vec![
-        Span::styled(" › ", palette.selected().bg(palette.surface)),
-        Span::styled(app.composer.clone(), palette.text().bg(palette.surface)),
-        if app.composer.is_empty() {
+    match &composer {
+        ComposerPresentation::Empty if onboarding_first_launch_active(app) => {
+            lines.push(Line::from(vec![
+                Span::styled(" › ", palette.selected().bg(palette.surface)),
+                Span::styled(" Onboarding setup...", palette.muted().bg(palette.surface)),
+            ]))
+        }
+        ComposerPresentation::Empty => lines.push(Line::from(vec![
+            Span::styled(" › ", palette.selected().bg(palette.surface)),
             Span::styled(
                 " Ask Octos to change code...",
                 palette.muted().bg(palette.surface),
-            )
-        } else {
-            Span::styled("", palette.text().bg(palette.surface))
-        },
-    ]));
-    lines.push(Line::from(Span::styled(
-        " ",
-        palette.text().bg(palette.surface),
-    )));
+            ),
+        ])),
+        ComposerPresentation::Inline(_) => {
+            if let Some(view) = input_view.as_ref() {
+                for (index, line) in view.lines.iter().enumerate() {
+                    let prefix = if index == 0 { " › " } else { "   " };
+                    let prefix_style = if index == 0 {
+                        palette.selected().bg(palette.surface)
+                    } else {
+                        palette.muted().bg(palette.surface)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix, prefix_style),
+                        Span::styled(line.clone(), palette.text().bg(palette.surface)),
+                    ]));
+                }
+            }
+        }
+        ComposerPresentation::Collapsed(collapse) => lines.push(Line::from(vec![
+            Span::styled(" › ", palette.selected().bg(palette.surface)),
+            Span::styled("[paste] ", palette.selected().bg(palette.surface)),
+            Span::styled(collapse.summary.clone(), palette.text().bg(palette.surface)),
+        ])),
+    }
+
+    match composer {
+        ComposerPresentation::Collapsed(collapse) => {
+            lines.push(Line::from(vec![
+                Span::styled("   preview: ", palette.muted().bg(palette.surface)),
+                Span::styled(collapse.preview, palette.text().bg(palette.surface)),
+            ]));
+        }
+        ComposerPresentation::Empty | ComposerPresentation::Inline(_) => {
+            lines.push(Line::from(Span::styled(
+                " ",
+                palette.text().bg(palette.surface),
+            )));
+        }
+    }
 
     Paragraph::new(Text::from(lines))
         .style(Style::default().fg(palette.text).bg(palette.surface))
@@ -2141,7 +2436,6 @@ fn render_composer(app: &AppState, palette: Palette) -> Paragraph<'static> {
             )
             .border_style(palette.border()),
         )
-        .wrap(Wrap { trim: false })
 }
 
 fn set_composer_cursor(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -2158,20 +2452,216 @@ fn composer_cursor_position(app: &AppState, area: Rect) -> Option<Position> {
         return None;
     }
 
-    let input_y = area.y
-        + if app.pending_messages.is_empty() {
-            3
-        } else {
-            2
-        };
+    let (row_offset, text_width) = composer_cursor_row_and_width(
+        &app.composer_presentation(),
+        app.composer_cursor_index(),
+        area,
+    );
+    let input_y = area.y + 2 + row_offset;
     if input_y >= area.y + area.height.saturating_sub(1) {
         return None;
     }
 
-    let text_width = app.composer.chars().count() as u16;
+    let text_width = text_width as u16;
     let inner_right = area.x + area.width.saturating_sub(2);
     let input_x = area.x + 4 + text_width;
     Some(Position::new(input_x.min(inner_right), input_y))
+}
+
+fn composer_cursor_row_and_width(
+    composer: &ComposerPresentation,
+    cursor: usize,
+    area: Rect,
+) -> (u16, usize) {
+    match composer {
+        ComposerPresentation::Empty => (0, 0),
+        ComposerPresentation::Inline(text) => {
+            let view = composer_input_view(
+                text,
+                cursor,
+                area.width,
+                area.height.saturating_sub(COMPOSER_CHROME_ROWS),
+            );
+            (view.cursor_row, view.cursor_width)
+        }
+        ComposerPresentation::Collapsed(collapse) => {
+            (0, "[paste] ".width() + collapse.summary.width())
+        }
+    }
+}
+
+fn composer_input_view(
+    text: &str,
+    cursor: usize,
+    terminal_width: u16,
+    max_rows: u16,
+) -> ComposerInputView {
+    let width = composer_text_width(terminal_width);
+    let max_rows = usize::from(max_rows.max(1));
+    let logical_lines = composer_logical_lines(text);
+    let cursor = cursor.min(text.len());
+    let cursor_line_index = logical_lines
+        .iter()
+        .position(|line| cursor <= line.end)
+        .unwrap_or_else(|| logical_lines.len().saturating_sub(1));
+    let line_window_end = if cursor == text.len() {
+        logical_lines.len().saturating_sub(1)
+    } else {
+        cursor_line_index
+    };
+    let mut selected = Vec::new();
+    let mut used_rows = 0usize;
+    let mut hidden_prefix = false;
+    let mut selected_cursor_line = 0usize;
+    let mut cursor_width = 0usize;
+    let mut cursor_row = 0usize;
+
+    for index in (0..=line_window_end).rev() {
+        let line = &logical_lines[index];
+        let rows = visual_rows_for_text(line.text, width);
+        if used_rows == 0 && rows > max_rows {
+            let line_cursor = cursor.saturating_sub(line.start).min(line.text.len());
+            let visible = tail_around_cursor(line.text, line_cursor, width, max_rows);
+            cursor_row = cursor_row_for_text(&visible.before_cursor, width);
+            cursor_width = cursor_width_for_text(&visible.before_cursor, width);
+            selected_cursor_line = 0;
+            selected.push(visible.text);
+            hidden_prefix = true;
+            break;
+        }
+        if used_rows + rows > max_rows {
+            break;
+        }
+        if index == cursor_line_index {
+            let before_cursor =
+                &line.text[..cursor.saturating_sub(line.start).min(line.text.len())];
+            cursor_row = cursor_row_for_text(before_cursor, width);
+            cursor_width = cursor_width_for_text(before_cursor, width);
+            selected_cursor_line = selected.len();
+        }
+        selected.push(line.text.to_string());
+        used_rows += rows;
+    }
+
+    selected.reverse();
+    selected_cursor_line = selected
+        .len()
+        .saturating_sub(1)
+        .saturating_sub(selected_cursor_line);
+    if selected.is_empty() {
+        selected.push(String::new());
+    }
+
+    let hidden_lines = logical_lines.len().saturating_sub(selected.len());
+    let rows_before_cursor = selected
+        .iter()
+        .take(selected_cursor_line)
+        .map(|line| visual_rows_for_text(line, width))
+        .sum::<usize>();
+
+    ComposerInputView {
+        lines: selected,
+        hidden_lines,
+        hidden_prefix,
+        cursor_row: rows_before_cursor.saturating_add(cursor_row) as u16,
+        cursor_width,
+    }
+}
+
+struct ComposerLogicalLine<'a> {
+    text: &'a str,
+    start: usize,
+    end: usize,
+}
+
+fn composer_logical_lines(text: &str) -> Vec<ComposerLogicalLine<'_>> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for line in text.split('\n') {
+        let end = start + line.len();
+        lines.push(ComposerLogicalLine {
+            text: line,
+            start,
+            end,
+        });
+        start = end.saturating_add(1);
+    }
+    if lines.is_empty() {
+        lines.push(ComposerLogicalLine {
+            text: "",
+            start: 0,
+            end: 0,
+        });
+    }
+    lines
+}
+
+struct VisibleCursorLine {
+    text: String,
+    before_cursor: String,
+}
+
+fn tail_around_cursor(
+    text: &str,
+    cursor: usize,
+    width: usize,
+    max_rows: usize,
+) -> VisibleCursorLine {
+    let max_width = width.saturating_mul(max_rows).max(1);
+    let prefix = &text[..cursor.min(text.len())];
+    let prefix_width = prefix.width();
+    if text.width() <= max_width || prefix_width < max_width {
+        return VisibleCursorLine {
+            text: text.to_string(),
+            before_cursor: prefix.to_string(),
+        };
+    }
+
+    let suffix_width = max_width.saturating_sub(3).max(1);
+    let before_cursor = suffix_by_display_width(prefix, suffix_width);
+    let text = format!("...{before_cursor}");
+    VisibleCursorLine {
+        text: text.clone(),
+        before_cursor: text,
+    }
+}
+
+fn cursor_row_for_text(text: &str, width: usize) -> usize {
+    let display_width = text.width();
+    if display_width == 0 {
+        0
+    } else {
+        (display_width - 1) / width.max(1)
+    }
+}
+
+fn cursor_width_for_text(text: &str, width: usize) -> usize {
+    let display_width = text.width();
+    if display_width == 0 {
+        0
+    } else {
+        ((display_width - 1) % width.max(1)) + 1
+    }
+}
+
+fn suffix_by_display_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut width = 0usize;
+    let mut chars = Vec::new();
+    for ch in text.chars().rev() {
+        let ch_width = ch.width().unwrap_or(0);
+        if width > 0 && width.saturating_add(ch_width) > max_width {
+            break;
+        }
+        width = width.saturating_add(ch_width);
+        chars.push(ch);
+        if width >= max_width {
+            break;
+        }
+    }
+    chars.into_iter().rev().collect()
 }
 
 fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
@@ -2244,6 +2734,14 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
 
 fn status_bar_work_text(app: &AppState) -> String {
     let mut parts = Vec::new();
+    match &app.run_state {
+        SessionRunState::Blocked { message } | SessionRunState::Error { message }
+            if !message.trim().is_empty() =>
+        {
+            parts.push(truncate_terminal_line(message, 80));
+        }
+        _ => {}
+    }
     if let Some(seconds) = app.run_state_elapsed_secs() {
         parts.push(format_elapsed_secs(seconds));
     }
@@ -2276,19 +2774,6 @@ fn run_state_status_label(state: &SessionRunState) -> &'static str {
     }
 }
 
-fn compact_inline(text: &str, max_chars: usize) -> String {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let count = normalized.chars().count();
-    if count <= max_chars {
-        return normalized;
-    }
-    let prefix = normalized
-        .chars()
-        .take(max_chars.saturating_sub(3))
-        .collect::<String>();
-    format!("{prefix}...")
-}
-
 fn run_state_style(state: &SessionRunState, palette: Palette) -> Style {
     match state {
         SessionRunState::Idle => palette.muted(),
@@ -2307,21 +2792,12 @@ fn run_state_style(state: &SessionRunState, palette: Palette) -> Style {
 
 fn run_state_marker(state: &SessionRunState) -> &'static str {
     match state {
-        SessionRunState::InProgress => active_spinner(),
+        SessionRunState::InProgress => "•",
         SessionRunState::Blocked { .. } => "!",
         SessionRunState::Success => "✓",
         SessionRunState::Error { .. } => "x",
         SessionRunState::Idle => "·",
     }
-}
-
-fn active_spinner() -> &'static str {
-    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
-    let tick = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| (duration.as_millis() / 180) as usize)
-        .unwrap_or(0);
-    FRAMES[tick % FRAMES.len()]
 }
 
 fn short_id(id: &str) -> String {
@@ -2725,10 +3201,11 @@ mod tests {
             ApprovalModalState, DiffPreview, DiffPreviewFile, DiffPreviewGetResult,
             DiffPreviewHunk, DiffPreviewLine, SessionView,
         },
+        store::Store,
     };
     use octos_core::{
         Message, SessionKey,
-        ui_protocol::{ApprovalId, PreviewId, TaskRuntimeState, TurnId},
+        ui_protocol::{ApprovalId, PreviewId, TaskRuntimeState, TurnId, UiProtocolCapabilities},
     };
     use ratatui::{
         Terminal,
@@ -2981,7 +3458,7 @@ mod tests {
     }
 
     #[test]
-    fn render_default_view_keeps_work_plan_sticky_above_composer() {
+    fn render_default_view_keeps_turn_plan_in_chat_without_split_work_pane() {
         let app = AppState::new(
             vec![SessionView {
                 id: SessionKey("local:test".into()),
@@ -2999,13 +3476,77 @@ mod tests {
             false,
         );
 
+        let buffer = rendered_buffer(&app, Palette::for_theme(ThemeName::Codex));
+        let rows = rendered_rows(&buffer);
+        let text = rows.join("\n");
+
+        assert!(text.contains("Plan"));
+        assert!(text.contains("Inspect renderer"));
+        assert!(text.contains("Patch sticky plan"));
+        assert!(text.contains("Composer"));
+        assert!(!text.contains("Work  sticky"));
+        assert!(!text.contains("No active plan"));
+        assert!(
+            row_index_containing(&rows, "Plan") < row_index_containing(&rows, "Composer"),
+            "turn plan should stay in chat history above the composer"
+        );
+    }
+
+    #[test]
+    fn render_default_chat_hides_agent_round_plan() {
+        let session_id = SessionKey("local:test".into());
+        let completed_turn_id = TurnId::new();
+        let active_turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("review the project code by code"),
+                    Message::assistant("I inspected the first pass."),
+                    Message::user("continue the review"),
+                ],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: active_turn_id.clone(),
+                    text: "Continuing with deeper checks.".into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: completed_turn_id.clone(),
+            request: Some("review the project code by code".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "list_dir", "complete")
+                    .with_turn(completed_turn_id.clone())
+                    .with_success(true),
+                ActivityItem::new(ActivityKind::Tool, "read_file", "complete")
+                    .with_turn(completed_turn_id)
+                    .with_success(true),
+            ],
+        });
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "read_file", "complete")
+                .with_turn(active_turn_id)
+                .with_success(true),
+        );
+
         let text = rendered_text(&app);
 
-        assert!(text.contains("Work"));
-        assert!(text.contains("Plan"));
-        assert!(text.contains("[x] 1. Inspect renderer"));
-        assert!(text.contains("[ ] 2. Patch sticky plan"));
-        assert!(text.contains("Composer"));
+        assert!(text.contains("Continuing with deeper checks."));
+        assert!(text.contains("2 completed"));
+        assert!(!text.contains("Work  sticky"));
+        assert!(!text.contains("Plan rounds"));
+        assert!(!text.contains("Round 1: review the project code by code"));
+        assert!(!text.contains("Current round: continue the review"));
     }
 
     #[test]
@@ -3046,13 +3587,213 @@ mod tests {
         );
         let text = rendered_text(&app);
 
-        assert!(text.contains("[x] 1. Inspect renderer"));
-        assert!(text.contains("[ ] 2. Patch sticky plan"));
+        assert!(text.contains("Inspect renderer"));
+        assert!(text.contains("Patch sticky plan"));
         assert!(!text.contains("[ ] 1. [ ] Inspect renderer"));
     }
 
     #[test]
-    fn render_work_pane_shows_overflow_and_diff_approval_choices() {
+    fn render_plan_markdown_without_marker_leakage() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant(
+                    "Plan:\n- [x] **Hero** — build first viewport\n- [ ] `npm run build`",
+                )],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("Hero"));
+        assert!(text.contains("npm run build"));
+        assert!(!text.contains("**Hero**"));
+        assert!(!text.contains("`npm run build`"));
+    }
+
+    #[test]
+    fn render_markdown_headings_and_emphasis_without_marker_leakage() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant(
+                    "# What I *can* access:\n\n#### 3.2 *Code Quality* & Maintainability\n\nThis is *available* and `local`.",
+                )],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("What I can access:"));
+        assert!(text.contains("3.2 Code Quality & Maintainability"));
+        assert!(text.contains("This is available and local."));
+        assert!(!text.contains("*can*"));
+        assert!(!text.contains("#### 3.2"));
+        assert!(!text.contains("*available*"));
+        assert!(!text.contains("`local`"));
+    }
+
+    #[test]
+    fn render_markdown_checkboxes_as_numbered_choices() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant(
+                    "- [x] Point me to a project inside the workspace\n- [x] Share more about what you want reviewed",
+                )],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("1. Point me to a project inside the workspace"));
+        assert!(text.contains("2. Share more about what you want reviewed"));
+        assert!(!text.contains("[x]"));
+        assert!(!text.contains("[ ]"));
+    }
+
+    #[test]
+    fn render_diff_preview_stays_in_transcript_before_composer() {
+        let mut app = app_with_diff(DiffPreviewGetResult {
+            status: "ready".into(),
+            source: "pending_store".into(),
+            preview: DiffPreview {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+                title: Some("Styles patch".into()),
+                files: vec![DiffPreviewFile {
+                    path: "styles.css".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    hunks: Vec::new(),
+                }],
+            },
+        });
+        app.sessions[0].messages = vec![
+            Message::user("build the site"),
+            Message::assistant("Plan:\n- [x] **Hero**\n- [ ] Instruments"),
+        ];
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "read_file", "complete")
+                .with_detail("styles.css")
+                .with_success(true),
+        );
+
+        let buffer = rendered_buffer(&app, Palette::for_theme(ThemeName::Codex));
+        let rows = rendered_rows(&buffer);
+        let activity = row_index_containing(&rows, "Read");
+        let diff = row_index_containing(&rows, "Diff Preview");
+        let composer = row_index_containing(&rows, "Composer");
+
+        assert!(
+            activity < diff,
+            "activity should precede diff in transcript"
+        );
+        assert!(
+            diff < composer,
+            "diff preview should stay in transcript above composer"
+        );
+        assert!(!rows.join("\n").contains("Work  sticky"));
+        assert!(!rows.join("\n").contains("Activity"));
+        assert!(!rows.join("\n").contains("**Hero**"));
+    }
+
+    #[test]
+    fn render_turn_anchored_diff_preview_stays_with_original_turn() {
+        let session_id = SessionKey("local:test".into());
+        let turn_id = TurnId::new();
+        let preview_id = PreviewId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("build the site"),
+                    Message::assistant("Built the site."),
+                    Message::user("done?"),
+                ],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            request: Some("build the site".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(
+                    ActivityKind::Progress,
+                    "file_mutation",
+                    "File mutation: modify src/styles.css",
+                )
+                .with_detail("modify src/styles.css | diff preview ready")
+                .with_success(true)
+                .with_turn(turn_id.clone()),
+            ],
+        });
+        app.diff_preview
+            .open_loading_for_turn(preview_id.clone(), Some(turn_id));
+        app.diff_preview.apply_result(DiffPreviewGetResult {
+            status: "ready".into(),
+            source: "pending_store".into(),
+            preview: DiffPreview {
+                session_id,
+                preview_id,
+                title: Some("Styles patch".into()),
+                files: vec![DiffPreviewFile {
+                    path: "src/styles.css".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    hunks: Vec::new(),
+                }],
+            },
+        });
+
+        let buffer = rendered_buffer(&app, Palette::for_theme(ThemeName::Codex));
+        let rows = rendered_rows(&buffer);
+        let diff = row_index_containing(&rows, "Diff Preview");
+        let latest_prompt = row_index_containing(&rows, "› done?");
+        let composer = row_index_containing(&rows, "Composer");
+
+        assert!(
+            diff < latest_prompt,
+            "old diff preview should stay with its original turn, not jump to latest prompt"
+        );
+        assert!(latest_prompt < composer);
+    }
+
+    #[test]
+    fn render_inline_approval_shows_diff_choices_without_work_plan() {
         let mut app = AppState::new(
             vec![SessionView {
                 id: SessionKey("local:test".into()),
@@ -3085,11 +3826,48 @@ mod tests {
 
         let text = rendered_text(&app);
 
-        assert!(text.contains("Approval Apply patch"));
+        assert!(text.contains("Approval Requested"));
+        assert!(text.contains("Apply patch"));
         assert!(text.contains("y = approve this command once"));
         assert!(text.contains("s = approve this command/scope for the session"));
         assert!(text.contains("n = deny it"));
-        assert!(text.contains("more plan item(s) | Ctrl+O expand"));
+        assert!(!text.contains("Work  sticky"));
+        assert!(!text.contains("more plan item(s) | Ctrl+O expand"));
+    }
+
+    #[test]
+    fn render_default_chat_lists_queued_user_questions_without_work_pane() {
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("do a full code review pls")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id,
+                    text: "Plan:\n- Review renderer\n- Run tests".into(),
+                }),
+            }],
+            0,
+            "working".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+        app.pending_messages = vec![
+            "also list queued user questions".into(),
+            "check the sticky pane height".into(),
+        ];
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("do a full code review pls"));
+        assert!(text.contains("queued 2 messages after active turn"));
+        assert!(!text.contains("Work  sticky"));
+        assert!(text.contains("› also list queued user questions"));
+        assert!(text.contains("› check the sticky pane height"));
     }
 
     #[test]
@@ -3115,6 +3893,46 @@ mod tests {
         for frame in ["◐", "◓", "◑", "◒"] {
             assert!(!text.contains(frame), "idle render must not animate");
         }
+    }
+
+    #[test]
+    fn render_active_state_uses_bottom_status_without_split_progress_pane() {
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("build the site")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id,
+                    text: "Working on it.".into(),
+                }),
+            }],
+            0,
+            "thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+
+        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Codex), 100, 28);
+        let rows = rendered_rows(&buffer);
+        let text = rows.join("\n");
+        let spinner_count = ["◐", "◓", "◑", "◒"]
+            .into_iter()
+            .map(|frame| text.matches(frame).count())
+            .sum::<usize>();
+
+        assert!(text.contains("Working on it."));
+        assert!(text.contains("state • Working"));
+        assert!(!text.contains("Progress"));
+        assert!(!text.contains("Work  sticky"));
+        assert_eq!(
+            spinner_count, 0,
+            "normal chat layout should not animate a split progress pane:\n{text}"
+        );
     }
 
     #[test]
@@ -3171,7 +3989,7 @@ mod tests {
 
         let text = rendered_text(&app);
 
-        assert!(text.contains("Task Blocked"));
+        assert!(text.contains("state ! Blocked"));
         assert!(text.contains("approval required"));
         assert!(!text.contains("Blocked:"));
         assert!(!text.contains("y/s/n approval"));
@@ -3203,7 +4021,11 @@ mod tests {
         let table = row_containing(&rows, "Page");
         let text = rows.join("\n");
 
-        assert_eq!(prose.find("First paragraph"), Some(0));
+        assert!(
+            prose
+                .find("•")
+                .is_some_and(|idx| idx < prose.find("First paragraph").unwrap())
+        );
         assert_eq!(bullet.find("- "), Some(0));
         assert_eq!(table.find("Page"), Some(0));
         assert!(!text.contains("|---|---|"));
@@ -3219,7 +4041,7 @@ mod tests {
                 title: "test".into(),
                 profile_id: Some("coding".into()),
                 messages: vec![Message::assistant(
-                    "We can implement.Now run tests.All pass.",
+                    "We can implement.Now run tests.All pass. Build is ready:Next step. Rebuild:🎉 done.",
                 )],
                 tasks: vec![],
                 live_reply: None,
@@ -3234,8 +4056,37 @@ mod tests {
 
         assert!(text.contains("implement. Now"));
         assert!(text.contains("tests. All"));
+        assert!(text.contains("ready: Next"));
+        assert!(text.contains("Rebuild: "));
+        assert!(text.contains("🎉"));
         assert!(!text.contains("implement.Now"));
         assert!(!text.contains("tests.All"));
+    }
+
+    #[test]
+    fn render_soft_newlines_in_prose_as_spaces() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant(
+                    "🎉 Build succeeded! All 5 pages built cleanly\nin 291ms:",
+                )],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+
+        let buffer = rendered_buffer(&app, Palette::for_theme(ThemeName::Codex));
+        let rows = rendered_rows(&buffer);
+        let row = row_containing(&rows, "Build succeeded");
+
+        assert!(row.contains("Build succeeded! All 5 pages built cleanly in 291ms:"));
     }
 
     #[test]
@@ -3269,10 +4120,44 @@ mod tests {
         assert!(text.contains("Renderer"));
         assert!(text.contains("layout"));
         assert!(!text.contains("|---|---|"));
+        assert!(text.contains(" | "));
         let bold_style = style_for_text(&buffer, "Renderer").expect("bold cell style");
         let code_style = style_for_text(&buffer, "layout").expect("inline code style");
         assert!(bold_style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(code_style.fg, Some(palette.highlight));
+    }
+
+    #[test]
+    fn render_markdown_table_keeps_visible_columns() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant(
+                    "| File | Problem | Fix |\n|---|---|---|\n| Hero.astro | Orphan --- with no content or closing marker | Removed the --- line entirely |\n| Header.astro | Same — bare --- then HTML | Removed the --- line |",
+                )],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+
+        let buffer = rendered_buffer(&app, Palette::for_theme(ThemeName::Codex));
+        let rows = rendered_rows(&buffer);
+        let header = row_containing(&rows, "Problem");
+        let hero = row_containing(&rows, "Hero.astro");
+
+        assert!(header.contains("File"));
+        assert!(header.contains("Problem"));
+        assert!(header.contains("Fix"));
+        assert!(header.contains(" | "));
+        assert!(hero.contains("Hero.astro"));
+        assert!(hero.contains(" | "));
+        assert!(!rows.join("\n").contains("|---|---|---|"));
     }
 
     #[test]
@@ -3295,6 +4180,57 @@ mod tests {
         );
 
         assert!(rendered_text(&app).contains("find . | xargs rm"));
+    }
+
+    #[test]
+    fn render_first_launch_onboarding_is_not_mixed_with_empty_chat() {
+        let mut store = Store {
+            state: AppState::new(
+                vec![],
+                0,
+                "AppUI connected".into(),
+                Some("stdio:octos serve --stdio".into()),
+                false,
+            ),
+        };
+        store.state.set_capabilities(UiProtocolCapabilities::new(
+            &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            &[],
+        ));
+        store.open_menu(crate::menu::MenuId::from(
+            crate::menu::registry::MENU_ONBOARD,
+        ));
+
+        let text = rendered_text(&store.state);
+
+        assert!(text.contains("Welcome to Octos"));
+        assert!(text.contains("Create your local Octos profile"));
+        assert!(text.contains("Onboarding setup"));
+        assert!(!text.contains("No session selected"));
+        assert!(!text.contains("Work  sticky"));
+        assert!(!text.contains("Ask Octos to change code"));
+    }
+
+    #[test]
+    fn render_first_launch_onboarding_child_menu_stays_on_onboarding_surface() {
+        let mut store = Store {
+            state: AppState::new(
+                vec![],
+                0,
+                "AppUI connected".into(),
+                Some("stdio:octos serve --stdio".into()),
+                false,
+            ),
+        };
+        store.open_menu(crate::menu::MenuId::from(
+            crate::menu::registry::MENU_ONBOARD_FAMILY,
+        ));
+
+        let text = rendered_text(&store.state);
+
+        assert!(!text.contains("No session selected"));
+        assert!(!text.contains("Work  sticky"));
+        assert!(!text.contains("Ask Octos to change code"));
     }
 
     #[test]
@@ -3378,6 +4314,185 @@ mod tests {
     }
 
     #[test]
+    fn render_composer_places_cursor_after_chinese_display_width() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        for ch in "你好世界".chars() {
+            app.insert_composer_char(ch);
+        }
+
+        let rect = Rect::new(0, 36, 120, 5);
+        let cursor = composer_cursor_position(&app, rect).expect("cursor");
+
+        assert_eq!(app.composer, "你好世界");
+        assert_eq!(cursor.x, 12);
+        assert_eq!(cursor.y, 38);
+    }
+
+    #[test]
+    fn render_composer_places_cursor_after_mixed_cjk_and_ascii() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.insert_composer_text("abc你好");
+
+        let cursor = composer_cursor_position(&app, Rect::new(0, 36, 120, 5)).expect("cursor");
+
+        assert_eq!(cursor.x, 11);
+        assert_eq!(cursor.y, 38);
+    }
+
+    #[test]
+    fn render_composer_shows_short_multiline_prompt_rows() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.composer = "first instruction\nsecond instruction\nthird instruction".into();
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let (buffer, cursor) = rendered_buffer_and_cursor(&app, palette);
+        let rows = rendered_rows(&buffer);
+
+        assert_eq!(composer_height(&app), 7);
+        assert!(rows.iter().any(|row| row.contains("› first instruction")));
+        assert!(rows.iter().any(|row| row.contains("second instruction")));
+        assert!(rows.iter().any(|row| row.contains("third instruction")));
+        assert_eq!(
+            usize::from(cursor.y),
+            row_index_containing(&rows, "third instruction")
+        );
+        assert_eq!(
+            cursor,
+            composer_cursor_position(&app, Rect::new(0, 34, 120, 7)).expect("cursor")
+        );
+    }
+
+    #[test]
+    fn render_composer_keeps_common_paste_visible_and_resizes() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.composer = (1..=8)
+            .map(|idx| format!("pasted visible line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let (buffer, cursor) = rendered_buffer_and_cursor_with_size(
+            &app,
+            Palette::for_theme(ThemeName::Codex),
+            80,
+            42,
+        );
+        let rows = rendered_rows(&buffer);
+        let text = rows.join("\n");
+
+        assert_eq!(composer_height_for_size(&app, 80, 42), 12);
+        assert!(text.contains("pasted visible line 1"));
+        assert!(text.contains("pasted visible line 8"));
+        assert!(!text.contains("Large paste collapsed"));
+        assert_eq!(
+            row_index_containing(&rows, "pasted visible line 8"),
+            usize::from(cursor.y)
+        );
+    }
+
+    #[test]
+    fn render_composer_shows_tail_when_input_exceeds_visible_budget() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.composer = (1..=14)
+            .map(|idx| format!("budgeted line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Codex), 80, 42);
+        let text = rendered_rows(&buffer).join("\n");
+
+        assert_eq!(composer_height_for_size(&app, 80, 42), 16);
+        assert!(text.contains("showing tail"));
+        assert!(!text.contains("budgeted line 1 "));
+        assert!(text.contains("budgeted line 14"));
+    }
+
+    #[test]
+    fn render_composer_wraps_long_single_line_into_extra_rows() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.composer = "x".repeat(180);
+
+        assert_eq!(composer_height_for_size(&app, 80, 42), 7);
+    }
+
+    #[test]
     fn render_empty_composer_shows_cursor_before_hint() {
         let app = AppState::new(
             vec![SessionView {
@@ -3451,6 +4566,42 @@ mod tests {
     }
 
     #[test]
+    fn render_composer_collapses_large_paste_and_keeps_chrome_visible_when_narrow() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.composer = (1..=40)
+            .map(|idx| format!("paste-line-{idx:02}-with-some-extra-context"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Codex), 48, 18);
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("Large paste collapsed"));
+        assert!(text.contains("[paste] Pasted block"));
+        assert!(text.contains("preview: paste-line-01"));
+        assert!(!text.contains("paste-line-40"));
+        assert!(text.contains("Composer"));
+        assert!(text.contains("state"));
+    }
+
+    #[test]
     fn render_transcript_includes_activity_cards_and_dense_footer() {
         let turn_id = TurnId::new();
         let mut app = AppState::new(
@@ -3482,13 +4633,14 @@ mod tests {
 
         let text = rendered_text(&app);
 
-        assert!(text.contains("Activity"));
+        assert!(!text.contains("Activity"));
         assert!(text.contains("Tested"));
         assert!(text.contains("$ cargo test"));
         assert!(text.contains("running 6 tests"));
         assert!(text.contains("1 more line(s) hidden (Ctrl+O expand)"));
         assert!(text.contains("1.2s"));
-        assert!(text.contains("Progress"));
+        assert!(!text.contains("Progress"));
+        assert!(!text.contains("Work  sticky"));
         assert!(text.contains("call call-1"));
         assert!(text.contains("gpt-5-codex"));
         assert!(text.contains("state"));
@@ -3498,8 +4650,162 @@ mod tests {
     }
 
     #[test]
-    fn render_activity_uses_action_keywords_for_wait_and_file_tools() {
+    fn render_activity_is_anchored_after_latest_user_prompt() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("what is the status"),
+                    Message::user("are you working"),
+                ],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_detail("cargo test")
+                .with_success(true),
+        );
+
+        let text = rendered_text(&app);
+        let first_prompt = text.find("what is the status").expect("first prompt");
+        let latest_prompt = text.find("are you working").expect("latest prompt");
+        let command = text.find("$ cargo test").expect("activity command");
+
+        assert!(first_prompt < latest_prompt);
+        assert!(latest_prompt < command);
+        assert!(!text.contains("Activity"));
+    }
+
+    #[test]
+    fn render_completed_turn_activity_log_is_interleaved_with_chat_history() {
         let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("build the site"),
+                    Message::assistant("The site is built and ready."),
+                ],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_id.clone(),
+            request: Some("build the site".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_id)
+                    .with_detail("cargo build")
+                    .with_output_preview("Finished dev build")
+                    .with_success(true),
+            ],
+        });
+
+        let text = rendered_text(&app);
+        let prompt = text.find("build the site").expect("user prompt");
+        let work_log = text.find("Agent task completed").expect("agent task");
+        let command = text.find("$ cargo build").expect("tool command");
+        let answer = text
+            .find("The site is built and ready.")
+            .expect("assistant answer");
+
+        assert!(prompt < answer);
+        assert!(answer < work_log);
+        assert!(work_log < command);
+        assert!(!text.contains("Activity"));
+    }
+
+    #[test]
+    fn render_large_completed_turn_activity_log_is_compact_by_default() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let items = (1..=12)
+            .map(|idx| {
+                ActivityItem::new(ActivityKind::Tool, "read_file", "complete")
+                    .with_turn(turn_id.clone())
+                    .with_tool_call(format!("read-{idx}"))
+                    .with_detail(format!("src/file_{idx}.rs"))
+                    .with_success(true)
+            })
+            .collect::<Vec<_>>();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("review everything"),
+                    Message::assistant("Review complete."),
+                ],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id,
+            request: Some("review everything".into()),
+            anchor_index: Some(0),
+            items,
+        });
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("Agent task completed"));
+        assert!(text.contains("... +9 more"));
+        assert!(text.contains("12 completed"));
+        assert!(!text.contains("src/file_1.rs"));
+    }
+
+    #[test]
+    fn render_code_fences_show_language_and_bound_long_lines() {
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let long_code = format!(
+            "let value = \"{}TAIL_UNIQUE_SHOULD_NOT_RENDER\";",
+            "x".repeat(180)
+        );
+        let content = format!("```rust\n{long_code}\n```");
+        let mut lines = Vec::new();
+
+        push_formatted_body(&mut lines, palette, &content, "", Some(palette.surface));
+
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("code rust"));
+        assert!(text.contains("end code rust"));
+        assert!(text.contains("let value ="));
+        assert!(text.contains(" ..."));
+        assert!(!text.contains("TAIL_UNIQUE_SHOULD_NOT_RENDER"));
+    }
+
+    #[test]
+    fn render_activity_uses_action_keywords_for_wait_and_file_tools() {
         let mut app = AppState::new(
             vec![SessionView {
                 id: SessionKey("local:test".into()),
@@ -3516,7 +4822,6 @@ mod tests {
         );
         app.push_activity(
             ActivityItem::new(ActivityKind::Tool, "shell", "complete")
-                .with_turn(turn_id.clone())
                 .with_tool_call("wait-1")
                 .with_detail("sleep 20; tmux capture-pane")
                 .with_success(true)
@@ -3524,7 +4829,6 @@ mod tests {
         );
         app.push_activity(
             ActivityItem::new(ActivityKind::Tool, "write_file", "complete")
-                .with_turn(turn_id)
                 .with_tool_call("write-1")
                 .with_detail("src/lib.rs")
                 .with_success(true)
@@ -3543,7 +4847,6 @@ mod tests {
 
     #[test]
     fn render_file_mutation_progress_as_separate_activity_block() {
-        let turn_id = TurnId::new();
         let mut app = AppState::new(
             vec![SessionView {
                 id: SessionKey("local:test".into()),
@@ -3564,7 +4867,6 @@ mod tests {
                 "file_mutation",
                 "File mutation: modify /tmp/work/blue-origin/src/pages/index.astro",
             )
-            .with_turn(turn_id)
             .with_detail("modify /tmp/work/blue-origin/src/pages/index.astro | diff preview ready"),
         );
 
@@ -3615,8 +4917,202 @@ mod tests {
     }
 
     #[test]
-    fn render_tool_blocks_show_state_preview_failure_and_collapsed_detail() {
+    fn render_transcript_scroll_bottom_counts_wrapped_rows_above_composer() {
+        let long_body = (1..=18)
+            .map(|idx| {
+                format!(
+                    "wrapped paragraph {idx:02} {}",
+                    "中文内容 mixed ascii text ".repeat(5)
+                )
+            })
+            .chain(std::iter::once(
+                "final wrapped row should remain visible BOTTOM_VISIBLE_UNIQUE".to_string(),
+            ))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("show long answer"),
+                    Message::assistant(long_body),
+                ],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+
+        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Codex), 56, 20);
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let rows = rendered_rows(&buffer);
+        assert!(text.contains("BOTTOMVISIBLEUNIQUE"));
+        assert!(text.contains("Composer"));
+        assert!(!text.contains("Work  sticky"));
+        let final_row = row_index_containing(&rows, "BOTTOMVISIBLEUNIQUE");
+        let composer_row = row_index_containing(&rows, "Composer");
+        assert!(
+            final_row < composer_row,
+            "final transcript row must stay above composer: final={final_row}, composer={composer_row}"
+        );
+    }
+
+    #[test]
+    fn render_long_active_turn_follows_tail_when_prompt_block_overflows() {
         let turn_id = TurnId::new();
+        let live_reply = (1..=16)
+            .map(|idx| format!("live answer row {idx:02} {}", "wrapped content ".repeat(4)))
+            .chain(std::iter::once(
+                "LIVETAILVISIBLEUNIQUE should stay visible above composer".to_string(),
+            ))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("done?")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id,
+                    text: live_reply,
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+
+        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Codex), 80, 24);
+        let rows = rendered_rows(&buffer);
+        let text = rows.join("\n");
+
+        assert!(text.contains("LIVETAILVISIBLEUNIQUE"));
+        assert!(text.contains("Composer"));
+        let tail_row = row_index_containing(&rows, "LIVETAILVISIBLEUNIQUE");
+        let composer_row = row_index_containing(&rows, "Composer");
+        assert!(
+            tail_row < composer_row,
+            "active turn tail must stay above composer: tail={tail_row}, composer={composer_row}"
+        );
+    }
+
+    #[test]
+    fn render_active_turn_answer_precedes_progress_and_hides_stale_activity() {
+        let old_turn_id = TurnId::new();
+        let current_turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("build the site"),
+                    Message::assistant("Started the site build."),
+                    Message::user("done?"),
+                ],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: current_turn_id,
+                    text: "Not yet - the build is still running.".into(),
+                }),
+            }],
+            0,
+            "thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_turn(old_turn_id)
+                .with_detail("cargo build from prior turn")
+                .with_success(true),
+        );
+
+        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Codex), 80, 24);
+        let rows = rendered_rows(&buffer);
+        let text = rows.join("\n");
+
+        assert!(text.contains("done?"));
+        assert!(text.contains("Not yet - the build is still running."));
+        assert!(
+            !text.contains("cargo build from prior turn"),
+            "prior-turn activity must not render under the latest user prompt"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row.trim(), "◐" | "◓" | "◑" | "◒")),
+            "live assistant text must not render a second standalone spinner row"
+        );
+        let prompt_row = row_index_containing(&rows, "done?");
+        let answer_row = row_index_containing(&rows, "Not yet - the build is still running.");
+        let composer_row = row_index_containing(&rows, "Composer");
+        assert!(
+            prompt_row < answer_row && answer_row < composer_row,
+            "latest prompt should be followed by live answer before composer: prompt={prompt_row}, answer={answer_row}, composer={composer_row}"
+        );
+    }
+
+    #[test]
+    fn render_live_answer_activity_without_sticky_round_plan() {
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("review the project")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: "The project review found two issues.".into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "read_file", "complete")
+                .with_turn(turn_id)
+                .with_tool_call("read-1")
+                .with_detail("src/main.rs")
+                .with_success(true),
+        );
+
+        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Codex), 96, 28);
+        let rows = rendered_rows(&buffer);
+        let answer_row = row_index_containing(&rows, "The project review found two issues.");
+        let activity_row = row_index_containing(&rows, "Agent task completed");
+
+        assert!(
+            answer_row < activity_row,
+            "live answer should be followed by its activity log: answer={answer_row}, activity={activity_row}"
+        );
+        let text = rows.join("\n");
+        assert!(!text.contains("Plan rounds"));
+        assert!(!text.contains("Current round: review the project"));
+        assert!(!text.contains("Work  sticky"));
+    }
+
+    #[test]
+    fn render_tool_blocks_show_state_preview_failure_and_collapsed_detail() {
         let mut app = AppState::new(
             vec![SessionView {
                 id: SessionKey("local:test".into()),
@@ -3633,7 +5129,6 @@ mod tests {
         );
         app.push_activity(
             ActivityItem::new(ActivityKind::Tool, "shell", "complete")
-                .with_turn(turn_id.clone())
                 .with_tool_call("preview-1")
                 .with_detail("cargo test")
                 .with_output_preview("6 passed")
@@ -3642,7 +5137,6 @@ mod tests {
         );
         app.push_activity(
             ActivityItem::new(ActivityKind::Tool, "shell", "failed")
-                .with_turn(turn_id.clone())
                 .with_tool_call("fail-1")
                 .with_detail("npm install")
                 .with_success(false)
@@ -3650,7 +5144,6 @@ mod tests {
         );
         app.push_activity(
             ActivityItem::new(ActivityKind::Tool, "read_file", "complete")
-                .with_turn(turn_id)
                 .with_tool_call("collapsed-1")
                 .with_detail("src/lib.rs")
                 .with_success(true),
@@ -3658,17 +5151,15 @@ mod tests {
 
         let text = rendered_text(&app);
 
-        assert!(text.contains("preview"));
         assert!(text.contains("failed"));
-        assert!(text.contains("details collapsed"));
-        assert!(text.contains("Ctrl+O expand | Tab inspector"));
-        assert!(text.contains("elapsed 70s"));
+        assert!(text.contains("✗"));
+        assert!(text.contains("✓"));
+        assert!(text.contains("70s"));
         assert!(text.contains("6 passed"));
     }
 
     #[test]
     fn render_tool_output_expands_with_global_toggle_state() {
-        let turn_id = TurnId::new();
         let output = (1..=10)
             .map(|line| format!("line{line}"))
             .collect::<Vec<_>>()
@@ -3689,7 +5180,6 @@ mod tests {
         );
         app.push_activity(
             ActivityItem::new(ActivityKind::Tool, "shell", "complete")
-                .with_turn(turn_id)
                 .with_tool_call("preview-1")
                 .with_detail("cargo test")
                 .with_output_preview(output)
@@ -3704,6 +5194,41 @@ mod tests {
         let expanded = rendered_text(&app);
         assert!(expanded.contains("line10"));
         assert!(expanded.contains("expanded (Ctrl+O collapse)"));
+    }
+
+    #[test]
+    fn render_expanded_tool_output_remains_bounded() {
+        let output = (1..=40)
+            .map(|line| format!("output-line-{line:02}-unique"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("show bounded output")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.expanded_tool_outputs = true;
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_detail("cargo test -- --nocapture")
+                .with_output_preview(output)
+                .with_success(true),
+        );
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("output-line-24-unique"));
+        assert!(!text.contains("output-line-40-unique"));
+        assert!(text.contains("16 more line(s) hidden (Ctrl+O collapse)"));
     }
 
     #[test]
@@ -3728,8 +5253,8 @@ mod tests {
 
         let text = rendered_text(&app);
 
-        assert!(text.contains("Progress"));
-        assert!(text.contains("Thinking"));
+        assert!(!text.contains("Progress"));
+        assert!(!text.contains("Work  sticky"));
         assert!(!text.contains("INFO "));
         assert!(!text.contains("2026-"));
         assert!(!text.contains("tool_ids="));

@@ -1,0 +1,41 @@
+{
+  "name": "m12 solo onboarding local profile create",
+  "client_requests": [
+    {
+      "method": "config/capabilities/list"
+    },
+    {
+      "method": "profile/local/create",
+      "params": {
+        "name": "Ada Lovelace",
+        "username": "ada",
+        "email": "ada@example.com"
+      }
+    },
+    {
+      "method": "session/open",
+      "params": {
+        "profile_id": "ada-server",
+        "cwd": "/tmp/solo-project"
+      }
+    }
+  ],
+  "server_results": [
+    {
+      "method": "profile/local/create",
+      "result": {
+        "profile_id": "ada-server",
+        "user_id": "ada-user",
+        "name": "Ada Lovelace",
+        "username": "ada",
+        "email": "ada@example.com",
+        "created": true,
+        "runtime_mode": "solo"
+      }
+    }
+  ],
+  "forbidden_methods": [
+    "auth/send_code",
+    "auth/verify"
+  ]
+}

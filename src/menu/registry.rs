@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use octos_core::ui_protocol::methods;
+
 use crate::menu::availability::{
-    AvailabilityContext, AvailabilityStatus, CommandAvailability, evaluate_command,
+    AvailabilityContext, AvailabilityStatus, CommandAvailability, SessionRequirement,
+    evaluate_command,
 };
 use crate::menu::types::{
     CommandCategory, CommandEntry, CommandSpec, InlineArgMode, LocalAction, MenuBuildResult,
@@ -10,7 +13,14 @@ use crate::menu::types::{
 };
 
 pub const MENU_HELP: &str = "help";
+pub const MENU_ONBOARD: &str = "onboard";
+pub const MENU_ONBOARD_FAMILY: &str = "onboard-family";
+pub const MENU_ONBOARD_MODEL: &str = "onboard-model";
+pub const MENU_ONBOARD_ROUTE: &str = "onboard-route";
+pub const MENU_LOGIN: &str = "login";
+pub const MENU_PROVIDER: &str = "provider";
 pub const MENU_MODEL: &str = "model";
+pub const MENU_COST: &str = "cost";
 pub const MENU_STATUS: &str = "status";
 pub const MENU_THEME: &str = "theme";
 pub const MENU_STATUS_LINE: &str = "statusline";
@@ -18,13 +28,103 @@ pub const MENU_TITLE: &str = "title";
 pub const MENU_KEYMAP: &str = "keymap";
 pub const MENU_PERMISSIONS: &str = "permissions";
 pub const MENU_MCP: &str = "mcp";
+pub const MENU_TOOL_SETTINGS: &str = "tool-settings";
+pub const MENU_SKILLS: &str = "skills";
 
-pub const APPUI_METHOD_MODEL_LIST: &str = "model/list";
-pub const APPUI_METHOD_SESSION_STATUS_READ: &str = "session/status/read";
+pub const APPUI_METHOD_MODEL_LIST: &str = crate::model::APPUI_METHOD_MODEL_LIST;
+pub const APPUI_METHOD_MODEL_SELECT: &str = crate::model::APPUI_METHOD_MODEL_SELECT;
+pub const APPUI_METHOD_SESSION_STATUS_READ: &str = crate::model::APPUI_METHOD_SESSION_STATUS_READ;
 pub const APPUI_METHOD_PERMISSION_PROFILE_LIST: &str = "permission/profile/list";
 pub const APPUI_METHOD_PERMISSION_PROFILE_SET: &str = "permission/profile/set";
 pub const APPUI_METHOD_APPROVAL_SCOPES_CLEAR: &str = "approval/scopes/clear";
-pub const APPUI_METHOD_MCP_STATUS_LIST: &str = "mcp/status/list";
+pub const APPUI_METHOD_MCP_STATUS_LIST: &str = crate::model::APPUI_METHOD_MCP_STATUS_LIST;
+pub const APPUI_METHOD_TOOL_STATUS_LIST: &str = crate::model::APPUI_METHOD_TOOL_STATUS_LIST;
+pub const APPUI_METHOD_MCP_CONFIG_LIST: &str = crate::model::APPUI_METHOD_MCP_CONFIG_LIST;
+pub const APPUI_METHOD_MCP_CONFIG_UPSERT: &str = crate::model::APPUI_METHOD_MCP_CONFIG_UPSERT;
+pub const APPUI_METHOD_MCP_CONFIG_DELETE: &str = crate::model::APPUI_METHOD_MCP_CONFIG_DELETE;
+pub const APPUI_METHOD_MCP_CONFIG_SET_ENABLED: &str =
+    crate::model::APPUI_METHOD_MCP_CONFIG_SET_ENABLED;
+pub const APPUI_METHOD_MCP_CONFIG_TEST: &str = crate::model::APPUI_METHOD_MCP_CONFIG_TEST;
+pub const APPUI_METHOD_TOOL_CONFIG_LIST: &str = crate::model::APPUI_METHOD_TOOL_CONFIG_LIST;
+pub const APPUI_METHOD_TOOL_CONFIG_SET_ENABLED: &str =
+    crate::model::APPUI_METHOD_TOOL_CONFIG_SET_ENABLED;
+pub const APPUI_METHOD_TOOL_CONFIG_UPSERT: &str = crate::model::APPUI_METHOD_TOOL_CONFIG_UPSERT;
+pub const APPUI_METHOD_TOOL_CONFIG_DELETE: &str = crate::model::APPUI_METHOD_TOOL_CONFIG_DELETE;
+pub const APPUI_METHOD_TOOL_CONFIG_TEST: &str = crate::model::APPUI_METHOD_TOOL_CONFIG_TEST;
+pub const APPUI_METHOD_AUTH_STATUS: &str = crate::model::APPUI_METHOD_AUTH_STATUS;
+pub const APPUI_METHOD_AUTH_SEND_CODE: &str = crate::model::APPUI_METHOD_AUTH_SEND_CODE;
+pub const APPUI_METHOD_AUTH_VERIFY: &str = crate::model::APPUI_METHOD_AUTH_VERIFY;
+pub const APPUI_METHOD_AUTH_ME: &str = crate::model::APPUI_METHOD_AUTH_ME;
+pub const APPUI_METHOD_AUTH_LOGOUT: &str = crate::model::APPUI_METHOD_AUTH_LOGOUT;
+pub const APPUI_METHOD_PROFILE_LOCAL_CREATE: &str = crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE;
+pub const APPUI_METHOD_PROFILE_LLM_CATALOG: &str = crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG;
+pub const APPUI_METHOD_PROFILE_LLM_UPSERT: &str = crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT;
+pub const APPUI_METHOD_PROFILE_LLM_DELETE: &str = crate::model::APPUI_METHOD_PROFILE_LLM_DELETE;
+pub const APPUI_METHOD_PROFILE_LLM_TEST: &str = crate::model::APPUI_METHOD_PROFILE_LLM_TEST;
+pub const APPUI_METHOD_PROFILE_LLM_FETCH_MODELS: &str =
+    crate::model::APPUI_METHOD_PROFILE_LLM_FETCH_MODELS;
+pub const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = crate::model::APPUI_METHOD_PROFILE_SKILLS_LIST;
+pub const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str =
+    crate::model::APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH;
+pub const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str =
+    crate::model::APPUI_METHOD_PROFILE_SKILLS_INSTALL;
+pub const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str =
+    crate::model::APPUI_METHOD_PROFILE_SKILLS_REMOVE;
+pub const APPUI_LOGIN_MENU_METHODS_ANY: &[&str] = &[
+    APPUI_METHOD_AUTH_STATUS,
+    APPUI_METHOD_AUTH_SEND_CODE,
+    APPUI_METHOD_AUTH_VERIFY,
+    APPUI_METHOD_AUTH_ME,
+    APPUI_METHOD_AUTH_LOGOUT,
+];
+pub const APPUI_PROVIDER_MENU_METHODS_ANY: &[&str] = &[
+    APPUI_METHOD_PROFILE_LLM_CATALOG,
+    APPUI_METHOD_MODEL_LIST,
+    APPUI_METHOD_PROFILE_LLM_UPSERT,
+    APPUI_METHOD_PROFILE_LLM_DELETE,
+    APPUI_METHOD_MODEL_SELECT,
+    APPUI_METHOD_PROFILE_LLM_TEST,
+];
+pub const APPUI_ONBOARDING_METHODS_ANY: &[&str] = &[
+    APPUI_METHOD_PROFILE_LOCAL_CREATE,
+    APPUI_METHOD_AUTH_STATUS,
+    APPUI_METHOD_AUTH_SEND_CODE,
+    APPUI_METHOD_AUTH_VERIFY,
+    APPUI_METHOD_AUTH_ME,
+    APPUI_METHOD_PROFILE_LLM_CATALOG,
+    APPUI_METHOD_MODEL_LIST,
+    APPUI_METHOD_PROFILE_LLM_UPSERT,
+    APPUI_METHOD_PROFILE_LLM_TEST,
+    APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+];
+pub const APPUI_PERMISSION_MENU_METHODS_ANY: &[&str] = &[
+    methods::APPROVAL_SCOPES_LIST,
+    APPUI_METHOD_PERMISSION_PROFILE_LIST,
+    APPUI_METHOD_PERMISSION_PROFILE_SET,
+    APPUI_METHOD_APPROVAL_SCOPES_CLEAR,
+];
+pub const APPUI_MCP_MENU_METHODS_ANY: &[&str] = &[
+    APPUI_METHOD_MCP_CONFIG_LIST,
+    APPUI_METHOD_MCP_CONFIG_UPSERT,
+    APPUI_METHOD_MCP_CONFIG_DELETE,
+    APPUI_METHOD_MCP_CONFIG_SET_ENABLED,
+    APPUI_METHOD_MCP_CONFIG_TEST,
+    APPUI_METHOD_MCP_STATUS_LIST,
+];
+pub const APPUI_TOOL_SETTINGS_MENU_METHODS_ANY: &[&str] = &[
+    APPUI_METHOD_TOOL_CONFIG_LIST,
+    APPUI_METHOD_TOOL_CONFIG_SET_ENABLED,
+    APPUI_METHOD_TOOL_CONFIG_UPSERT,
+    APPUI_METHOD_TOOL_CONFIG_DELETE,
+    APPUI_METHOD_TOOL_CONFIG_TEST,
+    APPUI_METHOD_TOOL_STATUS_LIST,
+];
+pub const APPUI_SKILLS_MENU_METHODS_ANY: &[&str] = &[
+    APPUI_METHOD_PROFILE_SKILLS_LIST,
+    APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
+    APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+    APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+];
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandRegistry {
@@ -158,7 +258,7 @@ impl<'a> CommandInvocation<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CommandResolution<'registry, 'input> {
     NotCommand,
     EmptyCommand,
@@ -171,7 +271,7 @@ pub enum CommandResolution<'registry, 'input> {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VisibleCommand<'a> {
     pub command: &'a CommandSpec,
     pub availability: AvailabilityStatus,
@@ -312,11 +412,61 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_HELP)),
         },
         CommandSpec {
+            name: "exit",
+            aliases: &["quit"],
+            description: "Quit the TUI.",
+            category: CommandCategory::Runtime,
+            availability: CommandAvailability::always(),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::LocalAction(LocalAction::Exit),
+        },
+        CommandSpec {
+            name: "onboard",
+            aliases: &["setup"],
+            description: "Run the guided login and LLM provider setup wizard.",
+            category: CommandCategory::Settings,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_any(APPUI_ONBOARDING_METHODS_ANY),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::Onboarding(
+                crate::model::OnboardingAction::Open,
+            )),
+        },
+        CommandSpec {
+            name: "login",
+            aliases: &["auth"],
+            description: "Sign in with email OTP or inspect current auth state.",
+            category: CommandCategory::Session,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_any(APPUI_LOGIN_MENU_METHODS_ANY),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::Onboarding(
+                crate::model::OnboardingAction::OpenLogin,
+            )),
+        },
+        CommandSpec {
+            name: "provider",
+            aliases: &["providers"],
+            description: "Configure profile-owned LLM providers and routes.",
+            category: CommandCategory::Settings,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_any(APPUI_PROVIDER_MENU_METHODS_ANY),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::Onboarding(
+                crate::model::OnboardingAction::OpenProvider,
+            )),
+        },
+        CommandSpec {
             name: "model",
             aliases: &[],
-            description: "Choose model and reasoning options.",
+            description: "Choose a server-returned profile LLM model.",
             category: CommandCategory::Session,
-            availability: CommandAvailability::app_ui_read(&[APPUI_METHOD_MODEL_LIST]),
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_when_capabilities(&[APPUI_METHOD_MODEL_LIST]),
             inline_args: InlineArgMode::None,
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_MODEL)),
         },
@@ -328,6 +478,15 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             availability: CommandAvailability::always(),
             inline_args: InlineArgMode::None,
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_STATUS)),
+        },
+        CommandSpec {
+            name: "cost",
+            aliases: &["usage"],
+            description: "Show server-reported token and cost usage.",
+            category: CommandCategory::Runtime,
+            availability: CommandAvailability::app_ui_read(&[APPUI_METHOD_SESSION_STATUS_READ]),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::OpenMenu(MenuId::from(MENU_COST)),
         },
         CommandSpec {
             name: "theme",
@@ -370,18 +529,42 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             aliases: &["permission"],
             description: "Review or change approval, filesystem, and network permissions.",
             category: CommandCategory::Session,
-            availability: CommandAvailability::app_ui_read(&[]),
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_required_methods_any(APPUI_PERMISSION_MENU_METHODS_ANY),
             inline_args: InlineArgMode::None,
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_PERMISSIONS)),
         },
         CommandSpec {
             name: "mcp",
             aliases: &[],
-            description: "List MCP servers, tools, and status when supported.",
+            description: "List or configure server-owned MCP entries when supported.",
             category: CommandCategory::Runtime,
-            availability: CommandAvailability::app_ui_read(&[APPUI_METHOD_MCP_STATUS_LIST]),
-            inline_args: InlineArgMode::None,
-            entry: CommandEntry::OpenMenu(MenuId::from(MENU_MCP)),
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_required_methods_any(APPUI_MCP_MENU_METHODS_ANY),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::McpConfig),
+        },
+        CommandSpec {
+            name: "tools",
+            aliases: &["tool-settings"],
+            description: "List or configure server-owned tool settings when supported.",
+            category: CommandCategory::Settings,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_any(APPUI_TOOL_SETTINGS_MENU_METHODS_ANY),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::ToolConfig),
+        },
+        CommandSpec {
+            name: "skills",
+            aliases: &["skill"],
+            description: "List, search, install, or remove profile skills.",
+            category: CommandCategory::Settings,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_any(APPUI_SKILLS_MENU_METHODS_ANY),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::Skills),
         },
     ]
 }
@@ -419,6 +602,10 @@ mod tests {
         assert_eq!(
             registry.find("/?").map(|command| command.name),
             Some("help")
+        );
+        assert_eq!(
+            registry.find("/quit").map(|command| command.name),
+            Some("exit")
         );
 
         let CommandResolution::Found {
@@ -469,7 +656,8 @@ mod tests {
     #[test]
     fn default_registry_shows_permissions_entry_without_permission_methods() {
         let registry = CommandRegistry::with_core_commands();
-        let capabilities = CapabilitySet::from_methods([methods::TURN_INTERRUPT]);
+        let capabilities =
+            CapabilitySet::from_methods([methods::TURN_INTERRUPT, methods::APPROVAL_SCOPES_LIST]);
         let ctx = AvailabilityContext {
             task: TaskActivity::Running,
             approval_modal_visible: false,
@@ -516,8 +704,8 @@ mod tests {
             .map(|visible| visible.command.name)
             .collect();
         assert!(no_capability.contains(&"status"));
-        assert!(no_capability.contains(&"permissions"));
-        assert!(!no_capability.contains(&"model"));
+        assert!(!no_capability.contains(&"permissions"));
+        assert!(no_capability.contains(&"model"));
         assert!(!no_capability.contains(&"mcp"));
 
         let partial_capabilities = CapabilitySet::from_methods([methods::APPROVAL_SCOPES_LIST]);
@@ -531,13 +719,15 @@ mod tests {
             .map(|visible| visible.command.name)
             .collect();
         assert!(partial.contains(&"permissions"));
-        assert!(!partial.contains(&"model"));
+        assert!(partial.contains(&"model"));
         assert!(!partial.contains(&"mcp"));
 
         let full_capabilities = CapabilitySet::from_methods([
             methods::APPROVAL_SCOPES_LIST,
             APPUI_METHOD_MODEL_LIST,
+            APPUI_METHOD_MODEL_SELECT,
             APPUI_METHOD_MCP_STATUS_LIST,
+            APPUI_METHOD_PROFILE_SKILLS_LIST,
         ]);
         let full_ctx = AvailabilityContext {
             capabilities: Some(&full_capabilities),
@@ -551,15 +741,20 @@ mod tests {
         assert!(full.contains(&"model"));
         assert!(full.contains(&"permissions"));
         assert!(full.contains(&"mcp"));
+        assert!(full.contains(&"skills"));
     }
 
     #[test]
-    fn registry_hides_session_bound_commands_without_open_session() {
+    fn registry_keeps_onboarding_commands_available_without_open_session() {
         let registry = CommandRegistry::with_core_commands();
         let capabilities = CapabilitySet::from_methods([
+            APPUI_METHOD_AUTH_STATUS,
+            APPUI_METHOD_PROFILE_LLM_CATALOG,
             methods::APPROVAL_SCOPES_LIST,
             APPUI_METHOD_MODEL_LIST,
+            APPUI_METHOD_MODEL_SELECT,
             APPUI_METHOD_MCP_STATUS_LIST,
+            APPUI_METHOD_PROFILE_SKILLS_LIST,
         ]);
         let ctx = AvailabilityContext {
             task: TaskActivity::Idle,
@@ -579,9 +774,36 @@ mod tests {
             .collect();
 
         assert!(visible.contains(&"status"));
-        assert!(!visible.contains(&"model"));
+        assert!(visible.contains(&"login"));
+        assert!(visible.contains(&"provider"));
+        assert!(visible.contains(&"model"));
+        assert!(visible.contains(&"skills"));
         assert!(!visible.contains(&"permissions"));
         assert!(!visible.contains(&"mcp"));
+    }
+
+    #[test]
+    fn registry_accepts_any_supported_permission_method() {
+        let registry = CommandRegistry::with_core_commands();
+        let capabilities = CapabilitySet::from_methods([APPUI_METHOD_PERMISSION_PROFILE_SET]);
+        let ctx = AvailabilityContext {
+            task: TaskActivity::Idle,
+            approval_modal_visible: false,
+            readonly: false,
+            runtime: RuntimeMode::Protocol,
+            connection: ConnectionState::Connected,
+            capabilities: Some(&capabilities),
+            feature_flags: &[],
+            session_open: true,
+        };
+
+        let visible: Vec<_> = registry
+            .visible_commands(&ctx)
+            .into_iter()
+            .map(|visible| visible.command.name)
+            .collect();
+
+        assert!(visible.contains(&"permissions"));
     }
 
     struct TestProvider;

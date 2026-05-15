@@ -1,13 +1,20 @@
 use clap::{Parser, ValueEnum};
-use std::path::PathBuf;
+use eyre::{Result, WrapErr, eyre};
+use serde::Deserialize;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Mode {
     Mock,
     Protocol,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ThemeName {
     Terminal,
     Slate,
@@ -16,15 +23,43 @@ pub enum ThemeName {
     Solarized,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cli {
+    /// JSON config file used as launch defaults.
+    pub config: Option<PathBuf>,
+    /// Backend mode.
+    pub mode: Mode,
+    /// UI Protocol v1 WebSocket endpoint.
+    pub base_url: Option<String>,
+    /// UI Protocol v1 stdio child command.
+    pub stdio_command: Option<String>,
+    /// Session id to open first.
+    pub session: Option<String>,
+    /// Profile id to use for the session.
+    pub profile_id: Option<String>,
+    /// Workspace cwd to request for this AppUi session. Defaults to the launch directory.
+    pub cwd: Option<PathBuf>,
+    /// Bearer token for UI Protocol authentication. Falls back to OCTOS_AUTH_TOKEN.
+    pub auth_token: Option<String>,
+    /// Disable turn/start sends and use the client as a read-only viewer.
+    pub readonly: bool,
+    /// Color palette.
+    pub theme: ThemeName,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "octos-tui",
     about = "Mock-backed Octos TUI prototype on the AppUi/UI Protocol boundary"
 )]
-pub struct Cli {
+struct CliArgs {
+    /// JSON config file used as launch defaults. CLI flags override config values.
+    #[arg(long = "config", value_name = "FILE")]
+    pub config: Option<PathBuf>,
+
     /// Backend mode.
-    #[arg(long, value_enum, default_value_t = Mode::Mock)]
-    pub mode: Mode,
+    #[arg(long, value_enum)]
+    pub mode: Option<Mode>,
 
     /// UI Protocol v1 WebSocket endpoint.
     #[arg(
@@ -32,8 +67,18 @@ pub struct Cli {
         alias = "protocol-endpoint",
         value_name = "WS_URL",
         value_parser = parse_websocket_url,
+        conflicts_with = "stdio_command",
     )]
     pub base_url: Option<String>,
+
+    /// UI Protocol v1 stdio child command.
+    #[arg(
+        long = "stdio-command",
+        value_name = "CMD",
+        value_parser = parse_stdio_command,
+        conflicts_with = "base_url",
+    )]
+    pub stdio_command: Option<String>,
 
     /// Session id to open first.
     #[arg(long)]
@@ -52,12 +97,116 @@ pub struct Cli {
     pub auth_token: Option<String>,
 
     /// Disable turn/start sends and use the client as a read-only viewer.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_readonly")]
     pub readonly: bool,
 
+    /// Force read-write mode when the config file sets readonly=true.
+    #[arg(long = "no-readonly", conflicts_with = "readonly")]
+    pub no_readonly: bool,
+
     /// Color palette.
-    #[arg(long, value_enum, default_value_t = ThemeName::Codex)]
-    pub theme: ThemeName,
+    #[arg(long, value_enum)]
+    pub theme: Option<ThemeName>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct CliFileConfig {
+    pub mode: Option<Mode>,
+
+    #[serde(
+        rename = "endpoint",
+        alias = "base-url",
+        alias = "base_url",
+        alias = "protocol-endpoint",
+        alias = "protocol_endpoint"
+    )]
+    pub base_url: Option<String>,
+
+    #[serde(alias = "stdio_command")]
+    pub stdio_command: Option<String>,
+    pub session: Option<String>,
+
+    #[serde(alias = "profile_id", alias = "profile")]
+    pub profile_id: Option<String>,
+
+    pub cwd: Option<PathBuf>,
+
+    #[serde(alias = "auth_token")]
+    pub auth_token: Option<String>,
+
+    pub readonly: Option<bool>,
+    pub theme: Option<ThemeName>,
+}
+
+impl Cli {
+    pub fn parse() -> Result<Self> {
+        let args = CliArgs::parse();
+        Self::from_args(args)
+    }
+
+    #[cfg(test)]
+    pub fn try_parse_from<I, T>(itr: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let args = CliArgs::try_parse_from(itr)?;
+        Self::from_args(args)
+    }
+
+    fn from_args(args: CliArgs) -> Result<Self> {
+        let file_config = match args.config.as_ref() {
+            Some(path) => Some(load_config_file(path)?),
+            None => None,
+        };
+        let file_config = file_config.unwrap_or_default();
+
+        let base_url = args.base_url.or(file_config.base_url);
+        let stdio_command = args.stdio_command.or(file_config.stdio_command);
+        if base_url.is_some() && stdio_command.is_some() {
+            return Err(eyre!(
+                "endpoint and stdio-command cannot both be configured; choose one AppUI transport"
+            ));
+        }
+
+        let base_url = match base_url {
+            Some(value) => Some(parse_websocket_url(&value).map_err(|message| eyre!(message))?),
+            None => None,
+        };
+        let stdio_command = match stdio_command {
+            Some(value) => Some(parse_stdio_command(&value).map_err(|message| eyre!(message))?),
+            None => None,
+        };
+
+        let readonly = if args.no_readonly {
+            false
+        } else if args.readonly {
+            true
+        } else {
+            file_config.readonly.unwrap_or(false)
+        };
+
+        Ok(Self {
+            config: args.config,
+            mode: args.mode.or(file_config.mode).unwrap_or(Mode::Mock),
+            base_url,
+            stdio_command,
+            session: args.session.or(file_config.session),
+            profile_id: args.profile_id.or(file_config.profile_id),
+            cwd: args.cwd.or(file_config.cwd),
+            auth_token: args.auth_token.or(file_config.auth_token),
+            readonly,
+            theme: args.theme.or(file_config.theme).unwrap_or(ThemeName::Codex),
+        })
+    }
+}
+
+pub fn load_config_file(path: &Path) -> Result<CliFileConfig> {
+    let contents = fs::read_to_string(path)
+        .wrap_err_with(|| format!("failed to read TUI config {}", path.display()))?;
+    serde_json::from_str(&contents)
+        .wrap_err_with(|| format!("failed to parse TUI config {}", path.display()))
 }
 
 pub fn parse_websocket_url(value: &str) -> std::result::Result<String, String> {
@@ -65,6 +214,15 @@ pub fn parse_websocket_url(value: &str) -> std::result::Result<String, String> {
         Ok(value.to_string())
     } else {
         Err("endpoint must be a WebSocket URL starting with ws:// or wss://".into())
+    }
+}
+
+pub fn parse_stdio_command(value: &str) -> std::result::Result<String, String> {
+    let command = value.trim();
+    if command.is_empty() {
+        Err("stdio command must not be empty".into())
+    } else {
+        Ok(command.to_string())
     }
 }
 
@@ -80,9 +238,23 @@ fn is_websocket_url(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
-    use super::{Cli, Mode};
+    use super::{Cli, Mode, ThemeName};
+
+    fn write_config(name: &str, contents: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is valid")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("octos-tui-{name}-{nonce}.json"));
+        fs::write(&path, contents).expect("config writes");
+        path
+    }
 
     #[test]
     fn parses_snapshot_launch_flags() {
@@ -109,6 +281,7 @@ mod tests {
             cli.base_url.as_deref(),
             Some("wss://example.test/ui-protocol")
         );
+        assert!(cli.stdio_command.is_none());
         assert_eq!(cli.session.as_deref(), Some("session-123"));
         assert_eq!(cli.profile_id.as_deref(), Some("coding"));
         assert_eq!(
@@ -125,21 +298,60 @@ mod tests {
 
         assert_eq!(cli.mode, Mode::Mock);
         assert!(cli.base_url.is_none());
-        assert_eq!(cli.theme, super::ThemeName::Codex);
+        assert!(cli.stdio_command.is_none());
+        assert_eq!(cli.theme, ThemeName::Codex);
+    }
+
+    #[test]
+    fn parses_stdio_command() {
+        let cli = Cli::try_parse_from([
+            "octos-tui",
+            "--mode",
+            "protocol",
+            "--stdio-command",
+            "octos serve --stdio",
+        ])
+        .expect("cli parses");
+
+        assert_eq!(cli.mode, Mode::Protocol);
+        assert_eq!(cli.stdio_command.as_deref(), Some("octos serve --stdio"));
+        assert!(cli.base_url.is_none());
+    }
+
+    #[test]
+    fn rejects_empty_stdio_command() {
+        let err = Cli::try_parse_from(["octos-tui", "--stdio-command", "   "])
+            .expect_err("empty stdio command should be rejected");
+
+        assert!(err.to_string().contains("stdio command must not be empty"));
+    }
+
+    #[test]
+    fn rejects_endpoint_and_stdio_command_together() {
+        let err = Cli::try_parse_from([
+            "octos-tui",
+            "--endpoint",
+            "wss://example.test/ui-protocol",
+            "--stdio-command",
+            "octos serve --stdio",
+        ])
+        .expect_err("endpoint and stdio command should conflict");
+
+        assert!(err.to_string().contains("cannot be used with"));
     }
 
     #[test]
     fn parses_theme_choice() {
         let cli = Cli::try_parse_from(["octos-tui", "--theme", "claude"]).expect("cli parses");
 
-        assert_eq!(cli.theme, super::ThemeName::Claude);
+        assert_eq!(cli.theme, ThemeName::Claude);
     }
 
     #[test]
     fn parses_terminal_theme_choice() {
         let cli = Cli::try_parse_from(["octos-tui", "--theme", "terminal"]).expect("cli parses");
 
-        assert_eq!(cli.theme, super::ThemeName::Terminal);
+        assert_eq!(cli.theme, ThemeName::Terminal);
     }
 
     #[test]
@@ -154,5 +366,118 @@ mod tests {
         .expect_err("http endpoint should be rejected");
 
         assert!(err.to_string().contains("endpoint must be a WebSocket URL"));
+    }
+
+    #[test]
+    fn loads_json_config_file() {
+        let path = write_config(
+            "launch",
+            r#"{
+                "mode": "protocol",
+                "stdio_command": "octos serve --stdio --data-dir ~/.octos",
+                "session": "coding:local:config",
+                "profile_id": "coding",
+                "cwd": "/tmp/config-project",
+                "auth_token": "config-token",
+                "readonly": true,
+                "theme": "solarized"
+            }"#,
+        );
+
+        let cli =
+            Cli::try_parse_from(["octos-tui", "--config", path.to_str().unwrap()]).expect("parses");
+
+        assert_eq!(cli.config.as_deref(), Some(path.as_path()));
+        assert_eq!(cli.mode, Mode::Protocol);
+        assert_eq!(
+            cli.stdio_command.as_deref(),
+            Some("octos serve --stdio --data-dir ~/.octos")
+        );
+        assert_eq!(cli.session.as_deref(), Some("coding:local:config"));
+        assert_eq!(cli.profile_id.as_deref(), Some("coding"));
+        assert_eq!(cli.cwd.as_deref(), Some(Path::new("/tmp/config-project")));
+        assert_eq!(cli.auth_token.as_deref(), Some("config-token"));
+        assert!(cli.readonly);
+        assert_eq!(cli.theme, ThemeName::Solarized);
+    }
+
+    #[test]
+    fn cli_flags_override_json_config_file() {
+        let path = write_config(
+            "override",
+            r#"{
+                "mode": "mock",
+                "endpoint": "wss://config.example.test/ui-protocol",
+                "session": "coding:local:config",
+                "profile_id": "coding",
+                "readonly": true,
+                "theme": "slate"
+            }"#,
+        );
+
+        let cli = Cli::try_parse_from([
+            "octos-tui",
+            "--config",
+            path.to_str().unwrap(),
+            "--mode",
+            "protocol",
+            "--endpoint",
+            "wss://cli.example.test/ui-protocol",
+            "--session",
+            "coding:local:cli",
+            "--profile-id",
+            "review",
+            "--no-readonly",
+            "--theme",
+            "codex",
+        ])
+        .expect("parses");
+
+        assert_eq!(cli.mode, Mode::Protocol);
+        assert_eq!(
+            cli.base_url.as_deref(),
+            Some("wss://cli.example.test/ui-protocol")
+        );
+        assert_eq!(cli.session.as_deref(), Some("coding:local:cli"));
+        assert_eq!(cli.profile_id.as_deref(), Some("review"));
+        assert!(!cli.readonly);
+        assert_eq!(cli.theme, ThemeName::Codex);
+    }
+
+    #[test]
+    fn rejects_endpoint_and_stdio_command_from_config() {
+        let path = write_config(
+            "conflict",
+            r#"{
+                "mode": "protocol",
+                "endpoint": "wss://example.test/ui-protocol",
+                "stdio_command": "octos serve --stdio"
+            }"#,
+        );
+
+        let err = Cli::try_parse_from(["octos-tui", "--config", path.to_str().unwrap()])
+            .expect_err("conflicting config should fail");
+
+        assert!(err.to_string().contains("choose one AppUI transport"));
+    }
+
+    #[test]
+    fn rejects_model_provider_fields_in_tui_config() {
+        let path = write_config(
+            "provider-owned-by-octos",
+            r#"{
+                "mode": "protocol",
+                "stdio_command": "octos serve --stdio",
+                "provider": "deepseek",
+                "model": "deepseek-v4-pro"
+            }"#,
+        );
+
+        let err = Cli::try_parse_from(["octos-tui", "--config", path.to_str().unwrap()])
+            .expect_err("model/provider should not be accepted by TUI config");
+        let error = format!("{err:?}");
+
+        assert!(error.contains("unknown field"));
+        assert!(error.contains("provider"));
     }
 }

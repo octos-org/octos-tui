@@ -144,7 +144,20 @@
           "params": {
             "session_id": "octos-tui:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
-            "timestamp": "2026-05-02T00:00:01Z"
+            "timestamp": "2026-05-02T00:00:01Z",
+            "runtime_policy_stamp": {
+              "profile_id": "coding",
+              "model": "deepseek-v4-pro",
+              "provider": "deepseek",
+              "sandbox": "workspace-write",
+              "permission_profile": "workspace-write-no-network",
+              "tool_policy_id": "coding-v3",
+              "mcp_servers": [
+                "github",
+                "filesystem"
+              ],
+              "memory_scope": "profile-session"
+            }
           }
         }
       },
@@ -158,7 +171,20 @@
           "params": {
             "session_id": "octos-tui:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
-            "timestamp": "2026-05-02T00:00:01Z"
+            "timestamp": "2026-05-02T00:00:01Z",
+            "runtime_policy_stamp": {
+              "profile_id": "coding",
+              "model": "deepseek-v4-pro",
+              "provider": "deepseek",
+              "sandbox": "workspace-write",
+              "permission_profile": "workspace-write-no-network",
+              "tool_policy_id": "coding-v3",
+              "mcp_servers": [
+                "github",
+                "filesystem"
+              ],
+              "memory_scope": "profile-session"
+            }
           }
         }
       }
@@ -1265,7 +1291,20 @@
           "params": {
             "session_id": "octos-tui:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000002",
-            "timestamp": "2026-05-02T00:00:12Z"
+            "timestamp": "2026-05-02T00:00:12Z",
+            "runtime_policy_stamp": {
+              "profile_id": "coding",
+              "model": "deepseek-v4-pro",
+              "provider": "deepseek",
+              "sandbox": "workspace-write",
+              "permission_profile": "workspace-write-no-network",
+              "tool_policy_id": "coding-v3",
+              "mcp_servers": [
+                "github",
+                "filesystem"
+              ],
+              "memory_scope": "profile-session"
+            }
           }
         }
       },
@@ -1279,7 +1318,20 @@
           "params": {
             "session_id": "octos-tui:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000002",
-            "timestamp": "2026-05-02T00:00:12Z"
+            "timestamp": "2026-05-02T00:00:12Z",
+            "runtime_policy_stamp": {
+              "profile_id": "coding",
+              "model": "deepseek-v4-pro",
+              "provider": "deepseek",
+              "sandbox": "workspace-write",
+              "permission_profile": "workspace-write-no-network",
+              "tool_policy_id": "coding-v3",
+              "mcp_servers": [
+                "github",
+                "filesystem"
+              ],
+              "memory_scope": "profile-session"
+            }
           }
         }
       }
@@ -1548,6 +1600,221 @@
           }
         }
       }
+    },
+    {
+      "seq": 33,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "progress/updated",
+      "ui": {
+        "placement": "sticky_work_pane"
+      },
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7-reconnect",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "progress/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "metadata": {
+              "kind": "validator",
+              "validator": {
+                "name": "cargo fmt --check",
+                "status": "failed",
+                "attempt": 1,
+                "exit_code": 1,
+                "summary": "format drift detected"
+              },
+              "message": "validator cargo fmt --check failed on attempt 1"
+            }
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 33,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "progress/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "metadata": {
+              "kind": "validator",
+              "validator": {
+                "name": "cargo fmt --check",
+                "status": "failed",
+                "attempt": 1,
+                "exit_code": 1,
+                "summary": "format drift detected"
+              },
+              "message": "validator cargo fmt --check failed on attempt 1"
+            }
+          }
+        }
+      }
+    },
+    {
+      "seq": 34,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "progress/updated",
+      "ui": {
+        "placement": "sticky_work_pane"
+      },
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7-reconnect",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "progress/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "metadata": {
+              "kind": "validator",
+              "validator": {
+                "name": "cargo fmt --check",
+                "status": "passed",
+                "attempt": 2,
+                "exit_code": 0,
+                "summary": "format clean"
+              },
+              "message": "validator cargo fmt --check passed on attempt 2"
+            }
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 34,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "progress/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "metadata": {
+              "kind": "validator",
+              "validator": {
+                "name": "cargo fmt --check",
+                "status": "passed",
+                "attempt": 2,
+                "exit_code": 0,
+                "summary": "format clean"
+              },
+              "message": "validator cargo fmt --check passed on attempt 2"
+            }
+          }
+        }
+      }
+    },
+    {
+      "seq": 35,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "progress/updated",
+      "ui": {
+        "placement": "artifacts_pane"
+      },
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7-reconnect",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "progress/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "metadata": {
+              "kind": "artifact",
+              "artifact": {
+                "artifact_id": "artifact-fixture-summary",
+                "title": "AppUI UX marker summary",
+                "path": "e2e/test-results-tui-coding-ux/<run-id>/summary.env",
+                "status": "ready",
+                "mime": "text/plain"
+              },
+              "message": "artifact ready: summary.env"
+            }
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 35,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "progress/updated",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "metadata": {
+              "kind": "artifact",
+              "artifact": {
+                "artifact_id": "artifact-fixture-summary",
+                "title": "AppUI UX marker summary",
+                "path": "e2e/test-results-tui-coding-ux/<run-id>/summary.env",
+                "status": "ready",
+                "mime": "text/plain"
+              },
+              "message": "artifact ready: summary.env"
+            }
+          }
+        }
+      }
+    },
+    {
+      "seq": 36,
+      "direction": "server_to_client",
+      "kind": "notification",
+      "method": "tool/denied",
+      "ui": {
+        "activity_label": "Denied",
+        "placement": "sticky_work_pane"
+      },
+      "websocket": {
+        "frame": "websocket_text",
+        "connection_id": "ws-fixture-issue-7-reconnect",
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "tool/denied",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "tool_call_id": "web-fetch-1",
+            "tool_name": "web_fetch",
+            "code": "tool_denied",
+            "policy": "profile_tool_policy",
+            "reason": "network disabled for workspace-write-no-network profile",
+            "recoverable": true
+          }
+        }
+      },
+      "stdio": {
+        "frame": "jsonl",
+        "stream": "stdout",
+        "line": 36,
+        "wire": {
+          "jsonrpc": "2.0",
+          "method": "tool/denied",
+          "params": {
+            "session_id": "octos-tui:e2e-issue-7",
+            "turn_id": "00000000-0000-4000-8000-000000000001",
+            "tool_call_id": "web-fetch-1",
+            "tool_name": "web_fetch",
+            "code": "tool_denied",
+            "policy": "profile_tool_policy",
+            "reason": "network disabled for workspace-write-no-network profile",
+            "recoverable": true
+          }
+        }
+      }
     }
   ],
   "expected": {
@@ -1575,7 +1842,20 @@
       {
         "event": "turn.started",
         "session_id": "octos-tui:e2e-issue-7",
-        "turn_id": "00000000-0000-4000-8000-000000000001"
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "runtime_policy_stamp": {
+          "profile_id": "coding",
+          "model": "deepseek-v4-pro",
+          "provider": "deepseek",
+          "sandbox": "workspace-write",
+          "permission_profile": "workspace-write-no-network",
+          "tool_policy_id": "coding-v3",
+          "mcp_servers": [
+            "github",
+            "filesystem"
+          ],
+          "memory_scope": "profile-session"
+        }
       },
       {
         "event": "message.assistant_delta",
@@ -1681,6 +1961,9 @@
         "approval_kind": "diff",
         "risk": "medium",
         "preview_id": "00000000-0000-4000-8000-000000000003",
+        "typed_kind": "diff",
+        "primary_label": "Approve once",
+        "default_decision": "deny",
         "blocks_turn": true,
         "focus": "composer",
         "placement": "sticky_work_pane"
@@ -1753,7 +2036,20 @@
       {
         "event": "turn.started",
         "session_id": "octos-tui:e2e-issue-7",
-        "turn_id": "00000000-0000-4000-8000-000000000002"
+        "turn_id": "00000000-0000-4000-8000-000000000002",
+        "runtime_policy_stamp": {
+          "profile_id": "coding",
+          "model": "deepseek-v4-pro",
+          "provider": "deepseek",
+          "sandbox": "workspace-write",
+          "permission_profile": "workspace-write-no-network",
+          "tool_policy_id": "coding-v3",
+          "mcp_servers": [
+            "github",
+            "filesystem"
+          ],
+          "memory_scope": "profile-session"
+        }
       },
       {
         "event": "task.running",
@@ -1802,6 +2098,55 @@
         "cwd": "/tmp/octos-tui-fixture",
         "profile_id": "coding",
         "cursor_seq": 29
+      },
+      {
+        "event": "validator.failed",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "name": "cargo fmt --check",
+        "status": "failed",
+        "attempt": 1,
+        "exit_code": 1,
+        "summary": "format drift detected",
+        "message": "validator cargo fmt --check failed on attempt 1",
+        "placement": "sticky_work_pane"
+      },
+      {
+        "event": "validator.passed",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "name": "cargo fmt --check",
+        "status": "passed",
+        "attempt": 2,
+        "exit_code": 0,
+        "summary": "format clean",
+        "message": "validator cargo fmt --check passed on attempt 2",
+        "placement": "sticky_work_pane"
+      },
+      {
+        "event": "artifact.ready",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "artifact_id": "artifact-fixture-summary",
+        "title": "AppUI UX marker summary",
+        "path": "e2e/test-results-tui-coding-ux/<run-id>/summary.env",
+        "status": "ready",
+        "mime": "text/plain",
+        "message": "artifact ready: summary.env",
+        "placement": "artifacts_pane"
+      },
+      {
+        "event": "tool.denied",
+        "session_id": "octos-tui:e2e-issue-7",
+        "turn_id": "00000000-0000-4000-8000-000000000001",
+        "tool_call_id": "web-fetch-1",
+        "tool_name": "web_fetch",
+        "code": "tool_denied",
+        "policy": "profile_tool_policy",
+        "reason": "network disabled for workspace-write-no-network profile",
+        "recoverable": true,
+        "activity_label": "Denied",
+        "placement": "sticky_work_pane"
       }
     ],
     "ux_assertions": {
@@ -1814,7 +2159,8 @@
         "Editing"
       ],
       "sticky_placement": "sticky_work_pane",
-      "permission_focus": "composer"
+      "permission_focus": "composer",
+      "narrow_layout_ok": true
     },
     "live_soak": {
       "manual_only": true,

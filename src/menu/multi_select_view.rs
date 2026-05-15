@@ -22,6 +22,7 @@ pub(crate) struct MultiSelectItem {
     pub checked: bool,
     pub current: bool,
     pub default: bool,
+    pub loading: bool,
     pub order: Option<usize>,
 }
 
@@ -36,6 +37,7 @@ impl MultiSelectItem {
             checked: false,
             current: false,
             default: false,
+            loading: false,
             order: None,
         }
     }
@@ -314,6 +316,9 @@ fn item_row(
     if let Some(shortcut) = &item.shortcut {
         text.push_str(shortcut);
         text.push(' ');
+    }
+    if item.loading {
+        text.push_str("[..] ");
     }
     text.push_str(&item.label);
     if let Some(description) = &item.description {

@@ -1,9 +1,12 @@
 use std::fmt;
 
-use crossterm::event::{KeyCode, KeyModifiers};
-use octos_core::app_ui::AppUiCommand;
-
 use crate::menu::availability::{AvailabilityContext, CommandAvailability};
+use crate::model::{
+    AppUiCommand, OnboardingAction, OnboardingWizardState, ProfileLlmCatalogResult,
+    ProfileLlmListResult, ProfileSkillsListResult, ProfileSkillsRegistrySearchResult,
+    SessionMcpCatalog, SessionModelCatalog, SessionRuntimeStatus,
+};
+use crossterm::event::{KeyCode, KeyModifiers};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MenuId(String);
@@ -79,7 +82,7 @@ impl InlineArgMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CommandEntry {
     OpenMenu(MenuId),
     LocalAction(LocalAction),
@@ -87,7 +90,7 @@ pub enum CommandEntry {
     PromptTemplate(&'static str),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CommandSpec {
     pub name: &'static str,
     pub aliases: &'static [&'static str],
@@ -113,11 +116,36 @@ pub enum AppUiActionKind {
     InterruptTurn,
     ApprovalScopesList,
     ModelList,
+    ModelSelect,
+    AuthStatus,
+    AuthSendCode,
+    AuthVerify,
+    AuthMe,
+    AuthLogout,
+    ProfileLocalCreate,
+    ProfileLlmCatalog,
+    ProfileLlmList,
+    ProfileLlmUpsert,
+    ProfileLlmDelete,
+    ProfileLlmSelect,
+    ProfileLlmTest,
+    ProfileLlmFetchModels,
     SessionStatusRead,
     PermissionProfileList,
     PermissionProfileSet,
     ApprovalScopesClear,
     McpStatusList,
+    McpConfigList,
+    McpConfigUpsert,
+    McpConfigDelete,
+    McpConfigSetEnabled,
+    McpConfigTest,
+    ToolStatusList,
+    ToolConfigList,
+    ToolConfigSetEnabled,
+    ToolConfigUpsert,
+    ToolConfigDelete,
+    ToolConfigTest,
     Custom {
         method: &'static str,
         mutating: bool,
@@ -129,14 +157,39 @@ impl AppUiActionKind {
         match self {
             Self::InterruptTurn => octos_core::ui_protocol::methods::TURN_INTERRUPT,
             Self::ApprovalScopesList => octos_core::ui_protocol::methods::APPROVAL_SCOPES_LIST,
-            Self::ModelList => "model/list",
-            Self::SessionStatusRead => "session/status/read",
+            Self::ModelList => crate::model::APPUI_METHOD_MODEL_LIST,
+            Self::ModelSelect => crate::model::APPUI_METHOD_MODEL_SELECT,
+            Self::AuthStatus => crate::model::APPUI_METHOD_AUTH_STATUS,
+            Self::AuthSendCode => crate::model::APPUI_METHOD_AUTH_SEND_CODE,
+            Self::AuthVerify => crate::model::APPUI_METHOD_AUTH_VERIFY,
+            Self::AuthMe => crate::model::APPUI_METHOD_AUTH_ME,
+            Self::AuthLogout => crate::model::APPUI_METHOD_AUTH_LOGOUT,
+            Self::ProfileLocalCreate => crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+            Self::ProfileLlmCatalog => crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+            Self::ProfileLlmList => crate::model::APPUI_METHOD_MODEL_LIST,
+            Self::ProfileLlmUpsert => crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
+            Self::ProfileLlmDelete => crate::model::APPUI_METHOD_PROFILE_LLM_DELETE,
+            Self::ProfileLlmSelect => crate::model::APPUI_METHOD_MODEL_SELECT,
+            Self::ProfileLlmTest => crate::model::APPUI_METHOD_PROFILE_LLM_TEST,
+            Self::ProfileLlmFetchModels => crate::model::APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+            Self::SessionStatusRead => crate::model::APPUI_METHOD_SESSION_STATUS_READ,
             Self::PermissionProfileList => {
                 octos_core::ui_protocol::methods::PERMISSION_PROFILE_LIST
             }
             Self::PermissionProfileSet => octos_core::ui_protocol::methods::PERMISSION_PROFILE_SET,
             Self::ApprovalScopesClear => "approval/scopes/clear",
-            Self::McpStatusList => "mcp/status/list",
+            Self::McpStatusList => crate::model::APPUI_METHOD_MCP_STATUS_LIST,
+            Self::McpConfigList => crate::model::APPUI_METHOD_MCP_CONFIG_LIST,
+            Self::McpConfigUpsert => crate::model::APPUI_METHOD_MCP_CONFIG_UPSERT,
+            Self::McpConfigDelete => crate::model::APPUI_METHOD_MCP_CONFIG_DELETE,
+            Self::McpConfigSetEnabled => crate::model::APPUI_METHOD_MCP_CONFIG_SET_ENABLED,
+            Self::McpConfigTest => crate::model::APPUI_METHOD_MCP_CONFIG_TEST,
+            Self::ToolStatusList => crate::model::APPUI_METHOD_TOOL_STATUS_LIST,
+            Self::ToolConfigList => crate::model::APPUI_METHOD_TOOL_CONFIG_LIST,
+            Self::ToolConfigSetEnabled => crate::model::APPUI_METHOD_TOOL_CONFIG_SET_ENABLED,
+            Self::ToolConfigUpsert => crate::model::APPUI_METHOD_TOOL_CONFIG_UPSERT,
+            Self::ToolConfigDelete => crate::model::APPUI_METHOD_TOOL_CONFIG_DELETE,
+            Self::ToolConfigTest => crate::model::APPUI_METHOD_TOOL_CONFIG_TEST,
             Self::Custom { method, .. } => method,
         }
     }
@@ -147,24 +200,56 @@ impl AppUiActionKind {
             Self::ApprovalScopesList
             | Self::ModelList
             | Self::SessionStatusRead
-            | Self::McpStatusList => false,
+            | Self::McpStatusList
+            | Self::McpConfigList
+            | Self::ToolStatusList
+            | Self::ToolConfigList => false,
+            Self::ModelSelect => true,
             Self::PermissionProfileList => false,
-            Self::PermissionProfileSet | Self::ApprovalScopesClear => true,
+            Self::PermissionProfileSet
+            | Self::ApprovalScopesClear
+            | Self::AuthSendCode
+            | Self::AuthVerify
+            | Self::AuthLogout
+            | Self::ProfileLocalCreate
+            | Self::ProfileLlmUpsert
+            | Self::ProfileLlmDelete
+            | Self::ProfileLlmSelect
+            | Self::ProfileLlmTest
+            | Self::McpConfigUpsert
+            | Self::McpConfigDelete
+            | Self::McpConfigSetEnabled
+            | Self::McpConfigTest
+            | Self::ToolConfigSetEnabled
+            | Self::ToolConfigUpsert
+            | Self::ToolConfigDelete
+            | Self::ToolConfigTest => true,
+            Self::AuthStatus
+            | Self::AuthMe
+            | Self::ProfileLlmCatalog
+            | Self::ProfileLlmList
+            | Self::ProfileLlmFetchModels => false,
             Self::Custom { mutating, .. } => mutating,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LocalAction {
     ShowProcessStatus,
     StopActiveTurn,
+    Exit,
     ShowHelp,
     SetTheme(String),
     SaveStatusLine(Vec<String>),
     SaveTerminalTitle(Vec<String>),
     SaveKeymap,
     RefreshMenu(MenuId),
+    EditComposer(String),
+    Onboarding(OnboardingAction),
+    Skills,
+    McpConfig,
+    ToolConfig,
     Custom(&'static str),
 }
 
@@ -273,6 +358,7 @@ pub struct MenuItemState {
     pub checked: Option<bool>,
     pub loading: bool,
     pub destructive: bool,
+    pub required_valid: Option<bool>,
 }
 
 impl MenuItemState {
@@ -286,6 +372,13 @@ impl MenuItemState {
     pub fn checked(checked: bool) -> Self {
         Self {
             checked: Some(checked),
+            ..Self::default()
+        }
+    }
+
+    pub fn required(valid: bool) -> Self {
+        Self {
+            required_valid: Some(valid),
             ..Self::default()
         }
     }
@@ -433,6 +526,17 @@ pub struct MenuAppSnapshot<'a> {
     pub current_model: Option<&'a str>,
     pub current_profile: Option<&'a str>,
     pub permission_profile: Option<octos_core::ui_protocol::PermissionProfileSelection>,
+    pub runtime_status: Option<&'a SessionRuntimeStatus>,
+    pub model_catalog: Option<&'a SessionModelCatalog>,
+    pub profile_llm_catalog: Option<&'a ProfileLlmCatalogResult>,
+    pub profile_llm_state: Option<&'a ProfileLlmListResult>,
+    pub profile_skills: Option<&'a ProfileSkillsListResult>,
+    pub profile_skill_registry: Option<&'a ProfileSkillsRegistrySearchResult>,
+    pub mcp_catalog: Option<&'a SessionMcpCatalog>,
+    pub tool_catalog: Option<&'a crate::model::SessionToolCatalog>,
+    pub mcp_config_catalog: Option<&'a crate::model::McpConfigListResult>,
+    pub tool_config_catalog: Option<&'a crate::model::ToolConfigListResult>,
+    pub onboarding: Option<&'a OnboardingWizardState>,
     pub selected_session_id: Option<&'a octos_core::SessionKey>,
     pub selected_session_title: Option<&'a str>,
     pub selected_task_title: Option<&'a str>,
