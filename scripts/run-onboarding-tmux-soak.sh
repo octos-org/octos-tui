@@ -42,7 +42,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|capture|send-turn|verify|verify-solo|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|capture|send-turn|verify|verify-solo|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -291,6 +291,21 @@ secret_leak_check() {
   done
 }
 
+runtime_env_prefix() {
+  local api_key_env="${OCTOS_TUI_SOAK_EXPECT_API_KEY_ENV:-AUTODL_API_KEY}"
+  local api_key="${OCTOS_TUI_SOAK_API_KEY:-}"
+  local prefix=""
+  if [ -n "$api_key" ]; then
+    prefix="$prefix $(shell_quote "$api_key_env=$api_key")"
+  fi
+  if [ -n "${OCTOS_M9_PROTOCOL_FIXTURES:-}" ]; then
+    prefix="$prefix $(shell_quote "OCTOS_M9_PROTOCOL_FIXTURES=$OCTOS_M9_PROTOCOL_FIXTURES")"
+  fi
+  if [ -n "$prefix" ]; then
+    printf 'env%s ' "$prefix"
+  fi
+}
+
 write_summary() {
   mkdir -p "$artifact_dir"
   {
@@ -460,16 +475,12 @@ start() {
     sleep "${OCTOS_TUI_SOAK_FAKE_OPENAI_WAIT_SECS:-1}"
   fi
 
-  local api_key_env="${OCTOS_TUI_SOAK_EXPECT_API_KEY_ENV:-AUTODL_API_KEY}"
-  local api_key="${OCTOS_TUI_SOAK_API_KEY:-}"
-  local secret_env_prefix=""
-  if [ -n "$api_key" ]; then
-    secret_env_prefix="env $(shell_quote "$api_key_env=$api_key") "
-  fi
+  local env_prefix
+  env_prefix="$(runtime_env_prefix)"
 
   if [ "$transport" = "ws" ]; then
     local server_cmd
-    server_cmd="cd $(shell_quote "$workspace") && ${secret_env_prefix}$(shell_quote "$octos_bin") serve --host $(shell_quote "$host") --port $(shell_quote "$port") --data-dir $(shell_quote "$data_dir") --auth-token $(shell_quote "$auth_token")"
+    server_cmd="cd $(shell_quote "$workspace") && ${env_prefix}$(shell_quote "$octos_bin") serve --host $(shell_quote "$host") --port $(shell_quote "$port") --data-dir $(shell_quote "$data_dir") --auth-token $(shell_quote "$auth_token")"
     if [ -n "$serve_args" ]; then
       server_cmd="$server_cmd $serve_args"
     fi
@@ -484,15 +495,13 @@ start() {
 
   local tui_cmd
   tui_cmd="cd $(shell_quote "$workspace") && "
-  if [ -n "$api_key" ]; then
-    tui_cmd="${tui_cmd}${secret_env_prefix}"
-  fi
+  tui_cmd="${tui_cmd}${env_prefix}"
   tui_cmd="${tui_cmd}$(shell_quote "$octos_tui_bin") --mode protocol"
   if [ "$transport" = "ws" ]; then
     tui_cmd="$tui_cmd --endpoint $(shell_quote "$endpoint") --auth-token $(shell_quote "$auth_token")"
   else
     local stdio_cmd
-    stdio_cmd="cd $(shell_quote "$workspace") && $(shell_quote "$octos_bin") serve --stdio --data-dir $(shell_quote "$data_dir")"
+    stdio_cmd="cd $(shell_quote "$workspace") && ${env_prefix}$(shell_quote "$octos_bin") serve --stdio --data-dir $(shell_quote "$data_dir")"
     if [ -n "$serve_args" ]; then
       stdio_cmd="$stdio_cmd $serve_args"
     fi
@@ -721,12 +730,8 @@ drive_solo() {
 
   local probe_transport="$transport"
   local stdio_command=""
-  local api_key_env="${OCTOS_TUI_SOAK_EXPECT_API_KEY_ENV:-AUTODL_API_KEY}"
-  local api_key="${OCTOS_TUI_SOAK_API_KEY:-}"
-  local secret_env_prefix=""
-  if [ -n "$api_key" ]; then
-    secret_env_prefix="env $(shell_quote "$api_key_env=$api_key") "
-  fi
+  local env_prefix
+  env_prefix="$(runtime_env_prefix)"
   if [ "$probe_transport" = "ws" ]; then
     if have_tmux && ! tmux has-session -t "$server_session" 2>/dev/null; then
       die "WS solo probe expects the server tmux session to be running; run start first or use OCTOS_TUI_SOAK_TRANSPORT=stdio"
@@ -735,7 +740,7 @@ drive_solo() {
     # TODO(M12-A/C): once `octos serve` grows explicit solo/dangerous flags,
     # append them via OCTOS_TUI_SOAK_SERVE_ARGS instead of relying only on
     # AppUI capability negotiation.
-    stdio_command="${secret_env_prefix}$(shell_quote "$octos_bin") serve --stdio --data-dir $(shell_quote "$solo_probe_data_dir") --cwd $(shell_quote "$workspace")"
+    stdio_command="${env_prefix}$(shell_quote "$octos_bin") serve --stdio --data-dir $(shell_quote "$solo_probe_data_dir") --cwd $(shell_quote "$workspace")"
     if [ -n "$serve_args" ]; then
       stdio_command="$stdio_command $serve_args"
     fi
@@ -787,6 +792,28 @@ drive_provider_missing() {
   capture_pane "$tui_session" "$artifact_dir/tui-capture-provider-missing.txt"
   capture
   echo "Drove missing-provider recovery capture in $tui_session"
+}
+
+drive_approval_denial() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-approval-denial"
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  local prompt="${OCTOS_TUI_SOAK_APPROVAL_PROMPT:-M9 approval fixture: request approval for printf m19-approval-denial}"
+  wait_for_tui_text "Ask Octos to change code" "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI composer before driving approval denial"
+  send_tui_line "$prompt"
+  wait_for_tui_text "Approval Requested" "${OCTOS_TUI_SOAK_APPROVAL_WAIT_SECS:-40}" || \
+    die "Timed out waiting for approval request in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-approval-request.txt"
+
+  tmux send-keys -t "$tui_session" n
+  wait_for_tui_text "Approval denied" "${OCTOS_TUI_SOAK_APPROVAL_DENIAL_WAIT_SECS:-40}" || \
+    die "Timed out waiting for approval denial acknowledgement in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-approval-denied.txt"
+  capture
+  echo "Drove approval denial in $tui_session"
 }
 
 verify_solo() {
@@ -932,6 +959,7 @@ case "${1:-help}" in
   drive-solo) drive_solo ;;
   drive-permissions) drive_permissions ;;
   drive-provider-missing) drive_provider_missing ;;
+  drive-approval-denial) drive_approval_denial ;;
   capture) capture ;;
   send-turn) send_turn ;;
   verify) verify ;;
