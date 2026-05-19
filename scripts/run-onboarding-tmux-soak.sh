@@ -156,6 +156,9 @@ wait_for_tui_text() {
   local deadline=$((SECONDS + timeout_secs))
   local snapshot="$artifact_dir/tui-capture.txt"
   while [ "$SECONDS" -le "$deadline" ]; do
+    if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+      die "TUI tmux session exited while waiting for: $pattern"
+    fi
     capture_pane "$tui_session" "$snapshot"
     if grep --fixed-strings -- "$pattern" "$snapshot" >/dev/null 2>&1; then
       return 0
@@ -165,13 +168,28 @@ wait_for_tui_text() {
   return 1
 }
 
+server_socket_ready() {
+  (exec 3<>"/dev/tcp/$host/$port") >/dev/null 2>&1
+}
+
 wait_for_server_ready() {
   local timeout_secs="${1:-20}"
   local deadline=$((SECONDS + timeout_secs))
   local ready_line="Listening: http://$host:$port"
   while [ "$SECONDS" -le "$deadline" ]; do
-    if grep --fixed-strings -- "$ready_line" "$logs_dir/server.log" >/dev/null 2>&1; then
+    if grep --fixed-strings -- "$ready_line" "$logs_dir/server.log" >/dev/null 2>&1 \
+      && server_socket_ready; then
+      sleep 0.2
+      if ! tmux has-session -t "$server_session" 2>/dev/null; then
+        capture_pane "$server_session" "$artifact_dir/server-pane.txt"
+        die "Backend tmux session exited after reporting readiness: $server_session"
+      fi
       return 0
+    fi
+    if grep -E 'Address already in use|bind error|panicked at|error binding|failed to bind' \
+      "$logs_dir/server.log" >/dev/null 2>&1; then
+      capture_pane "$server_session" "$artifact_dir/server-pane.txt"
+      die "Backend server failed before readiness; see $logs_dir/server.log"
     fi
     if ! tmux has-session -t "$server_session" 2>/dev/null; then
       capture_pane "$server_session" "$artifact_dir/server-pane.txt"
@@ -263,32 +281,14 @@ secret_leak_check() {
   if [ -z "$secret" ]; then
     return 0
   fi
-  for file in \
-    "$artifact_dir/summary.env" \
-    "$artifact_dir/server.log" \
-    "$artifact_dir/appui-transcript.jsonl" \
-    "$artifact_dir/server-pane.txt" \
-    "$artifact_dir/fake-openai.log" \
-    "$artifact_dir/fake-openai-pane.txt" \
-    "$artifact_dir/tui-capture.txt" \
-    "$artifact_dir/profile-json-before.json" \
-    "$artifact_dir/profile-json-after.json" \
-    "$artifact_dir/runtime-policy-stamp.txt" \
-    "$artifact_dir/runtime-policy-stamp.json" \
-    "$artifact_dir/tool-registry-snapshot.json" \
-    "$artifact_dir/mcp-config-before.redacted.json" \
-    "$artifact_dir/mcp-config-after.redacted.json" \
-    "$artifact_dir/mcp-status-list.json" \
-    "$artifact_dir/mcp-connection-test-result.json" \
-    "$artifact_dir/approval-events.jsonl" \
-    "$artifact_dir/filesystem-probe.json" \
-    "$artifact_dir/soak-summary.json" \
-    "$artifact_dir/api-parity-checklist.json"
-  do
+  if [ ! -d "$artifact_dir" ]; then
+    return 0
+  fi
+  while IFS= read -r -d '' file; do
     if [ -f "$file" ] && grep --fixed-strings -- "$secret" "$file" >/dev/null 2>&1; then
       die "Secret leaked into soak artifact: $file"
     fi
-  done
+  done < <(find "$artifact_dir" -type f -print0)
 }
 
 runtime_env_prefix() {
@@ -552,12 +552,25 @@ restart_server() {
   if [ "$transport" != "ws" ]; then
     die "restart-server is only supported for WebSocket transport"
   fi
+  if ! tmux has-session -t "$server_session" 2>/dev/null; then
+    die "Backend tmux session is not running before restart: $server_session"
+  fi
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running before backend restart: $tui_session"
+  fi
 
   mkdir -p "$workspace" "$data_dir" "$logs_dir" "$artifact_dir"
+  tmux kill-session -t "$server_session" 2>/dev/null || true
+  local shutdown_deadline=$((SECONDS + ${OCTOS_TUI_SOAK_SERVER_SHUTDOWN_WAIT_SECS:-10}))
+  while tmux has-session -t "$server_session" 2>/dev/null && [ "$SECONDS" -le "$shutdown_deadline" ]; do
+    sleep 0.2
+  done
+  if tmux has-session -t "$server_session" 2>/dev/null; then
+    die "Backend tmux session did not exit after restart kill: $server_session"
+  fi
   if [ -f "$logs_dir/server.log" ]; then
     cp "$logs_dir/server.log" "$artifact_dir/server-before-restart.log"
   fi
-  tmux kill-session -t "$server_session" 2>/dev/null || true
   sleep "${OCTOS_TUI_SOAK_SERVER_RESTART_DOWN_SECS:-1}"
   : > "$logs_dir/server.log"
 
@@ -814,10 +827,15 @@ drive_permissions() {
   capture_pane "$tui_session" "$artifact_dir/tui-capture-permissions-open.txt"
 
   tmux send-keys -t "$tui_session" j
+  sleep 0.1
   tmux send-keys -t "$tui_session" j
+  sleep 0.1
   tmux send-keys -t "$tui_session" j
+  sleep 0.1
   tmux send-keys -t "$tui_session" Enter
-  sleep "${OCTOS_TUI_SOAK_PERMISSIONS_APPLY_WAIT_SECS:-2}"
+  wait_for_tui_text "Permissions updated: Workspace Write" \
+    "${OCTOS_TUI_SOAK_PERMISSIONS_APPLY_WAIT_SECS:-5}" || \
+    die "Timed out waiting for workspace-write permission update"
   capture_pane "$tui_session" "$artifact_dir/tui-capture-permissions-applied.txt"
   capture
   echo "Drove /permissions selection in $tui_session"
@@ -868,15 +886,25 @@ drive_task_subagent_tree() {
   wait_for_tui_text "Ask Octos to change code" "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
     die "Timed out waiting for TUI composer before driving task/subagent tree"
   send_tui_line "$prompt"
-  wait_for_tui_text "Agent task" "${OCTOS_TUI_SOAK_TASK_SUBAGENT_RUNNING_WAIT_SECS:-10}" || true
+  wait_for_tui_text "Agent task" "${OCTOS_TUI_SOAK_TASK_SUBAGENT_RUNNING_WAIT_SECS:-10}" || \
+    die "Timed out waiting for visible agent task tree"
   capture_pane "$tui_session" "$artifact_dir/tui-capture-task-subagent-tree-running.txt"
 
   wait_for_tui_text "M15CODEREVIEWFINALLINE" "${OCTOS_TUI_SOAK_TASK_SUBAGENT_DONE_WAIT_SECS:-80}" || \
     die "Timed out waiting for M15 final marker in TUI"
   capture_pane "$tui_session" "$artifact_dir/tui-capture-task-subagent-tree-final.txt"
   if [ -n "${OCTOS_TUI_M15_UX_OUTPUT_DIR:-}" ] && [ -d "$OCTOS_TUI_M15_UX_OUTPUT_DIR" ]; then
+    local m15_source_abs
+    local m15_dest_abs
+    m15_source_abs="$(cd "$OCTOS_TUI_M15_UX_OUTPUT_DIR" && pwd -P)"
     mkdir -p "$artifact_dir/m15-evidence"
-    cp -R "$OCTOS_TUI_M15_UX_OUTPUT_DIR"/. "$artifact_dir/m15-evidence"/
+    m15_dest_abs="$(cd "$artifact_dir/m15-evidence" && pwd -P)"
+    case "$m15_dest_abs/" in
+      "$m15_source_abs"/*|"$m15_source_abs/")
+        die "Refusing recursive M15 evidence copy from $m15_source_abs to $m15_dest_abs"
+        ;;
+    esac
+    cp -R "$m15_source_abs"/. "$m15_dest_abs"/
   fi
   capture
   echo "Drove task/subagent tree in $tui_session"
@@ -990,17 +1018,11 @@ JSON
   [ -f "$tmp_root/artifacts/runtime-policy-stamp.json" ] || die "self-test missing runtime-policy-stamp.json"
   [ -f "$tmp_root/artifacts/soak-summary.json" ] || die "self-test missing soak-summary.json"
   [ -f "$tmp_root/artifacts/api-parity-checklist.json" ] || die "self-test missing api-parity-checklist.json"
-  if grep --fixed-strings -- "selftest-secret" "$tmp_root/artifacts/summary.env" \
-    "$tmp_root/artifacts/server.log" \
-    "$tmp_root/artifacts/server-pane.txt" \
-    "$tmp_root/artifacts/tui-capture.txt" \
-    "$tmp_root/artifacts/profile-json-after.json" \
-    "$tmp_root/artifacts/runtime-policy-stamp.txt" \
-    "$tmp_root/artifacts/runtime-policy-stamp.json" \
-    "$tmp_root/artifacts/soak-summary.json" \
-    "$tmp_root/artifacts/api-parity-checklist.json" >/dev/null 2>&1; then
-    die "self-test secret leaked into artifacts"
-  fi
+  while IFS= read -r -d '' file; do
+    if grep --fixed-strings -- "selftest-secret" "$file" >/dev/null 2>&1; then
+      die "self-test secret leaked into artifacts: $file"
+    fi
+  done < <(find "$tmp_root/artifacts" -type f -print0)
 
   printf 'leaked selftest-secret\n' > "$tmp_root/artifacts/profile-json-before.json"
   if env "${child_env[@]}" "$0" verify >/dev/null 2>&1; then
