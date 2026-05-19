@@ -910,6 +910,30 @@ drive_task_subagent_tree() {
   echo "Drove task/subagent tree in $tui_session"
 }
 
+drive_dropped_completion_backpressure() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-dropped-completion-backpressure"
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  local prompt="${OCTOS_TUI_SOAK_BACKPRESSURE_PROMPT:-M9 replay-lossy fixture for M18 reconnect-style replay.}"
+  wait_for_tui_text "Ask Octos to change code" "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI composer before driving replay-lossy backpressure"
+  tmux send-keys -t "$tui_session" Escape
+  sleep 0.2
+  tmux send-keys -t "$tui_session" -l "$prompt"
+  sleep 0.1
+  tmux send-keys -t "$tui_session" Enter
+  wait_for_tui_text "Replay lossy" "${OCTOS_TUI_SOAK_BACKPRESSURE_WAIT_SECS:-30}" || \
+    die "Timed out waiting for replay-lossy status in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-replay-lossy.txt"
+  wait_for_tui_text "Done" "${OCTOS_TUI_SOAK_BACKPRESSURE_DONE_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI to settle after replay-lossy fixture"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-backpressure-final.txt"
+  capture
+  echo "Drove replay-lossy backpressure recovery in $tui_session"
+}
+
 verify_solo() {
   capture
   local required=(
@@ -1050,6 +1074,7 @@ case "${1:-help}" in
   drive-provider-missing) drive_provider_missing ;;
   drive-approval-denial) drive_approval_denial ;;
   drive-task-subagent-tree) drive_task_subagent_tree ;;
+  drive-dropped-completion-backpressure) drive_dropped_completion_backpressure ;;
   capture) capture ;;
   send-turn) send_turn ;;
   verify) verify ;;
