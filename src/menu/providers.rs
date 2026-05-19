@@ -45,9 +45,9 @@ use crate::model::{
     OnboardingAction, OnboardingProviderPending, OnboardingProviderSaveTarget,
     OnboardingWizardState, ProfileLlmCatalogParams, ProfileLlmListParams, ProfileLlmSelectParams,
     ProfileLlmTestParams, ProfileSkillsInstallParams, ProfileSkillsListParams,
-    ProfileSkillsRemoveParams, SessionStatusReadParams, ToolConfigDeleteParams, ToolConfigEntry,
-    ToolConfigListParams, ToolConfigSetEnabledParams, ToolConfigTestParams, ToolStatus,
-    ToolStatusListParams,
+    ProfileSkillsRemoveParams, RuntimePolicyMcpServer, SessionStatusReadParams,
+    ToolConfigDeleteParams, ToolConfigEntry, ToolConfigListParams, ToolConfigSetEnabledParams,
+    ToolConfigTestParams, ToolStatus, ToolStatusListParams,
 };
 
 pub fn core_menu_registry() -> MenuRegistry {
@@ -2525,6 +2525,40 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         )),
     );
 
+    if let Some(contract) = ctx
+        .app
+        .tool_catalog
+        .and_then(|catalog| catalog.coding_tool_contract.as_ref())
+    {
+        let ready = coding_contract_is_ready(contract);
+        items.push(
+            MenuItem::new("tools.contract", "Coding tool contract", MenuAction::Noop)
+                .with_description(coding_contract_description(contract))
+                .with_state(MenuItemState {
+                    required_valid: Some(ready),
+                    ..MenuItemState::default()
+                }),
+        );
+        for tool_name in &contract.missing_required_tools {
+            let state = MenuItemState {
+                required_valid: Some(false),
+                destructive: true,
+                ..MenuItemState::default()
+            };
+            items.push(
+                MenuItem::new(
+                    format!("tools.contract.missing.{tool_name}"),
+                    format!("Missing P0 tool: {tool_name}"),
+                    MenuAction::Noop,
+                )
+                .with_description(coding_contract_missing_tool_description(
+                    contract, tool_name,
+                ))
+                .with_state(state),
+            );
+        }
+    }
+
     if let Some(config) = ctx.app.tool_config_catalog {
         if config.tools.is_empty() {
             items.push(
@@ -3498,6 +3532,83 @@ fn tool_status_description(tool: &ToolStatus) -> String {
     }
 }
 
+fn coding_contract_is_ready(contract: &crate::model::CodingToolContract) -> bool {
+    contract.status == "ready" && contract.missing_required_tools.is_empty()
+}
+
+fn coding_contract_description(contract: &crate::model::CodingToolContract) -> String {
+    let mut parts = Vec::new();
+    if !contract.id.is_empty() {
+        parts.push(match contract.version.as_str() {
+            "" => contract.id.clone(),
+            version => format!("{} v{version}", contract.id),
+        });
+    }
+    if !contract.feature.is_empty() {
+        parts.push(contract.feature.clone());
+    }
+    if !contract.status.is_empty() {
+        parts.push(format!("status {}", contract.status));
+    }
+    if let Some(policy) = &contract.policy {
+        if let Some(policy_id) = &policy.tool_policy_id {
+            parts.push(format!("policy {policy_id}"));
+        }
+        if let Some(sandbox) = &policy.sandbox_mode {
+            parts.push(format!("sandbox {sandbox}"));
+        }
+        if let Some(approval) = &policy.approval_policy {
+            parts.push(format!("approval {approval}"));
+        }
+    }
+    if !contract.missing_required_tools.is_empty() {
+        parts.push(format!(
+            "missing {}",
+            contract.missing_required_tools.join(", ")
+        ));
+    }
+    if parts.is_empty() {
+        "Server-returned coding tool contract.".into()
+    } else {
+        parts.join(" | ")
+    }
+}
+
+fn coding_contract_missing_tool_description(
+    contract: &crate::model::CodingToolContract,
+    tool_name: &str,
+) -> String {
+    let Some(tool) = contract
+        .required_tools
+        .iter()
+        .find(|tool| tool.name == tool_name)
+    else {
+        return "Backend marked this required P0 tool missing.".into();
+    };
+
+    let mut parts = Vec::new();
+    if !tool.status.is_empty() {
+        parts.push(format!("status {}", tool.status));
+    }
+    if !tool.capability.is_empty() {
+        parts.push(format!("capability {}", tool.capability));
+    }
+    if !tool.policy.is_empty() {
+        parts.push(format!("policy {}", tool.policy));
+    }
+    if let Some(backend_tool) = &tool.backend_tool {
+        parts.push(format!("backend {backend_tool}"));
+    }
+    if let Some(detail) = &tool.detail {
+        parts.push(detail.clone());
+    }
+    if parts.is_empty() {
+        "Backend marked this required P0 tool missing.".into()
+    } else {
+        parts.join(" | ")
+    }
+}
+
 fn mcp_preview_rows(ctx: &MenuContext<'_>) -> Vec<MenuPreviewRow> {
     let mut rows = app_snapshot_rows(ctx.app.clone());
     rows.push(permission_method_row(ctx, APPUI_METHOD_MCP_CONFIG_LIST));
@@ -3570,6 +3681,44 @@ fn tool_settings_preview_rows(ctx: &MenuContext<'_>) -> Vec<MenuPreviewRow> {
                 .clone()
                 .unwrap_or_else(|| "server policy".into()),
         });
+        if let Some(contract) = &catalog.coding_tool_contract {
+            rows.push(MenuPreviewRow {
+                label: "coding contract".into(),
+                value: if contract.status.is_empty() {
+                    contract.id.clone()
+                } else if contract.id.is_empty() {
+                    contract.status.clone()
+                } else {
+                    format!("{} ({})", contract.id, contract.status)
+                },
+            });
+            if let Some(policy) = &contract.policy {
+                let mut policy_parts = Vec::new();
+                if let Some(policy_id) = &policy.tool_policy_id {
+                    policy_parts.push(policy_id.clone());
+                }
+                if let Some(sandbox) = &policy.sandbox_mode {
+                    policy_parts.push(format!("sandbox {sandbox}"));
+                }
+                if let Some(approval) = &policy.approval_policy {
+                    policy_parts.push(format!("approval {approval}"));
+                }
+                if !policy_parts.is_empty() {
+                    rows.push(MenuPreviewRow {
+                        label: "contract policy".into(),
+                        value: policy_parts.join(", "),
+                    });
+                }
+            }
+            rows.push(MenuPreviewRow {
+                label: "missing P0".into(),
+                value: if contract.missing_required_tools.is_empty() {
+                    "none".into()
+                } else {
+                    contract.missing_required_tools.join(", ")
+                },
+            });
+        }
         rows.push(MenuPreviewRow {
             label: "status tools".into(),
             value: catalog.tools.len().to_string(),
@@ -3661,6 +3810,21 @@ fn runtime_policy_items(status: &crate::model::SessionRuntimeStatus) -> Vec<Menu
             "Tool Policy",
             status_tool_policy_value(status),
         ),
+        (
+            "status.tool_contract",
+            "Tool Contract",
+            status_tool_contract_value(status),
+        ),
+        (
+            "status.model_toolset",
+            "Model Toolset",
+            status_model_toolset_value(status),
+        ),
+        (
+            "status.tool_discovery",
+            "Tool Discovery",
+            status_tool_discovery_value(status),
+        ),
         ("status.mcp", "MCP", status_mcp_value(status)),
         ("status.memory", "Memory", status_memory_value(status)),
         ("status.qoe", "QoE", status_qoe_value(status)),
@@ -3712,6 +3876,9 @@ fn runtime_policy_rows(status: &crate::model::SessionRuntimeStatus) -> Vec<MenuP
         ("permissions", status_permission_value(status)),
         ("dangerous", status_dangerous_access_value(status)),
         ("tool_policy", status_tool_policy_value(status)),
+        ("tool_contract", status_tool_contract_value(status)),
+        ("model_toolset", status_model_toolset_value(status)),
+        ("tool_discovery", status_tool_discovery_value(status)),
         ("mcp", status_mcp_value(status)),
         ("memory", status_memory_value(status)),
         ("qoe", status_qoe_value(status)),
@@ -3851,6 +4018,29 @@ fn status_tool_policy_value(status: &crate::model::SessionRuntimeStatus) -> Opti
         })
 }
 
+fn status_tool_contract_value(status: &crate::model::SessionRuntimeStatus) -> Option<String> {
+    let stamp = status.runtime_policy_stamp.as_ref()?;
+    let id = stamp.tool_contract_id.as_ref()?;
+    Some(match stamp.tool_contract_version.as_deref() {
+        Some(version) if !version.is_empty() => format!("{id} v{version}"),
+        _ => id.clone(),
+    })
+}
+
+fn status_model_toolset_value(status: &crate::model::SessionRuntimeStatus) -> Option<String> {
+    status
+        .runtime_policy_stamp
+        .as_ref()
+        .and_then(|stamp| stamp.model_toolset.clone())
+}
+
+fn status_tool_discovery_value(status: &crate::model::SessionRuntimeStatus) -> Option<String> {
+    status
+        .runtime_policy_stamp
+        .as_ref()
+        .and_then(|stamp| stamp.dynamic_tool_discovery.clone())
+}
+
 fn status_mcp_value(status: &crate::model::SessionRuntimeStatus) -> Option<String> {
     if !status.mcp_servers.is_empty() {
         return Some(status.mcp_servers.join(", "));
@@ -3858,7 +4048,14 @@ fn status_mcp_value(status: &crate::model::SessionRuntimeStatus) -> Option<Strin
 
     if let Some(stamp) = status.runtime_policy_stamp.as_ref() {
         if !stamp.mcp_servers.is_empty() {
-            return Some(stamp.mcp_servers.join(", "));
+            return Some(
+                stamp
+                    .mcp_servers
+                    .iter()
+                    .map(RuntimePolicyMcpServer::label)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
         }
     }
 
@@ -4109,10 +4306,11 @@ mod tests {
     use super::*;
     use crate::menu::{AvailabilityContext, CapabilitySet, TerminalSize};
     use crate::model::{
-        McpConfigEntry, McpConfigListResult, McpStatus, McpStatusSummary, ModelStatus,
-        RuntimeHealthStatus, RuntimePolicyStamp, SessionCursorStatus, SessionMcpCatalog,
-        SessionModelCatalog, SessionRuntimeStatus, SessionUsageStatus, ToolConfigEntry,
-        ToolConfigListResult,
+        CodingToolContract, CodingToolContractPolicy, CodingToolContractTool, McpConfigEntry,
+        McpConfigListResult, McpStatus, McpStatusSummary, ModelStatus, RuntimeHealthStatus,
+        RuntimePolicyStamp, SessionCursorStatus, SessionMcpCatalog, SessionModelCatalog,
+        SessionRuntimeStatus, SessionToolCatalog, SessionUsageStatus, ToolConfigEntry,
+        ToolConfigListResult, ToolStatus,
     };
     use octos_core::SessionKey;
     use octos_core::ui_protocol::{TurnId, UiCursor};
@@ -4137,10 +4335,17 @@ mod tests {
                 filesystem_scope: Some("workspace".into()),
                 network: Some("blocked".into()),
                 tool_policy_id: Some("coding-v3".into()),
-                mcp_servers: vec!["github".into(), "filesystem".into()],
+                mcp_servers: vec![
+                    RuntimePolicyMcpServer::name("github"),
+                    RuntimePolicyMcpServer::name("filesystem"),
+                ],
                 memory_scope: Some("profile-session".into()),
                 qoe_policy: Some("balanced".into()),
                 queue_mode: Some("collect".into()),
+                tool_contract_id: Some("codex-compatible-coding-v1".into()),
+                tool_contract_version: Some("1".into()),
+                model_toolset: Some("coding".into()),
+                dynamic_tool_discovery: Some("enabled".into()),
             }),
             model: Some(ModelStatus {
                 model: "deepseek-v4-pro".into(),
@@ -4813,6 +5018,16 @@ mod tests {
             .expect("tool policy row");
         assert_eq!(tool_policy.description.as_deref(), Some("coding-v3"));
 
+        let tool_contract = spec
+            .items
+            .iter()
+            .find(|item| item.label == "Tool Contract")
+            .expect("tool contract row");
+        assert_eq!(
+            tool_contract.description.as_deref(),
+            Some("codex-compatible-coding-v1 v1")
+        );
+
         let preview = spec.preview.expect("status preview");
         let MenuPreview::KeyValues { rows, .. } = preview else {
             panic!("expected key/value preview");
@@ -4828,6 +5043,14 @@ mod tests {
         assert!(
             rows.iter()
                 .any(|row| row.label == "mcp" && row.value == "github, filesystem")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "model_toolset" && row.value == "coding")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "tool_discovery" && row.value == "enabled")
         );
     }
 
@@ -5592,6 +5815,103 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("tool/config/delete"))
         );
+    }
+
+    #[test]
+    fn tool_settings_menu_surfaces_coding_tool_contract_gaps() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([APPUI_METHOD_TOOL_STATUS_LIST]);
+        let session_id = SessionKey("local:test".into());
+        let catalog = SessionToolCatalog {
+            session_id: session_id.clone(),
+            policy_id: Some("coding-v3".into()),
+            coding_tool_contract: Some(CodingToolContract {
+                id: "codex-compatible-coding-v1".into(),
+                version: "1".into(),
+                feature: "coding.tool_contract.v1".into(),
+                status: "incomplete".into(),
+                required_tool_names: vec!["apply_patch".into(), "exec_command".into()],
+                required_tools: vec![CodingToolContractTool {
+                    name: "exec_command".into(),
+                    category: "runtime".into(),
+                    aliases: vec!["shell".into()],
+                    capability: "coding.exec_session.v1".into(),
+                    policy: "approval_gated".into(),
+                    status: "missing".into(),
+                    backend_tool: None,
+                    detail: Some("exec sessions are backend blocked".into()),
+                }],
+                missing_required_tools: vec!["exec_command".into()],
+                policy: Some(CodingToolContractPolicy {
+                    tool_policy_id: Some("coding-v3".into()),
+                    sandbox_mode: Some("workspace-write".into()),
+                    approval_policy: Some("on-request".into()),
+                }),
+            }),
+            tools: vec![ToolStatus {
+                tool: "apply_patch".into(),
+                title: Some("Apply Patch".into()),
+                source: Some("platform".into()),
+                enabled: true,
+                visible: true,
+                tags: vec!["edit".into()],
+                risk: Some("medium".into()),
+                policy_id: Some("coding-v3".into()),
+                denial: None,
+            }],
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                selected_session_id: Some(&session_id),
+                tool_catalog: Some(&catalog),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_TOOL_SETTINGS), &ctx)
+        else {
+            panic!("expected tool settings menu");
+        };
+
+        let contract = spec
+            .items
+            .iter()
+            .find(|item| item.id == "tools.contract")
+            .expect("contract item");
+        assert_eq!(contract.state.required_valid, Some(false));
+        assert!(
+            contract
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("coding.tool_contract.v1"))
+        );
+
+        let missing = spec
+            .items
+            .iter()
+            .find(|item| item.id == "tools.contract.missing.exec_command")
+            .expect("missing P0 item");
+        assert!(missing.state.destructive);
+        assert!(
+            missing.description.as_deref().is_some_and(
+                |description| description.contains("exec sessions are backend blocked")
+            )
+        );
+
+        let MenuPreview::KeyValues { rows, .. } = spec.preview.expect("tool preview") else {
+            panic!("expected key/value preview");
+        };
+        assert!(
+            rows.iter()
+                .any(|row| row.label == "missing P0" && row.value == "exec_command")
+        );
+        assert!(rows.iter().any(|row| {
+            row.label == "contract policy" && row.value.contains("sandbox workspace-write")
+        }));
     }
 
     #[test]

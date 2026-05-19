@@ -60,9 +60,9 @@ use crate::{
         ProfileLlmListResult, ProfileLlmMutationResult, ProfileLocalCreateResult,
         ProfileSkillEntry, ProfileSkillRegistryPackage, ProfileSkillsListResult,
         ProfileSkillsMutationResult, ProfileSkillsRegistrySearchResult, RuntimeHealthStatus,
-        RuntimePolicyStamp, SessionStatusReadResult, ToolConfigEntry, ToolConfigListResult,
-        ToolConfigMutationResult, ToolPolicyDenial, ToolStatus, ToolStatusListResult,
-        ToolStatusSummary, auth_me_email, auth_me_profile_id,
+        RuntimePolicyMcpServer, RuntimePolicyStamp, SessionStatusReadResult, ToolConfigEntry,
+        ToolConfigListResult, ToolConfigMutationResult, ToolPolicyDenial, ToolStatus,
+        ToolStatusListResult, ToolStatusSummary, auth_me_email, auth_me_profile_id,
     },
 };
 
@@ -3224,6 +3224,7 @@ impl AppUiBackend for MockAppUiBackend {
                     .push_back(tool_status_event(ToolStatusListResult {
                         session_id: params.session_id,
                         policy_id: Some("mock-coding".into()),
+                        coding_tool_contract: None,
                         tools: mock_tool_statuses(),
                     }));
                 Ok(())
@@ -3473,10 +3474,14 @@ fn mock_session_status(
             filesystem_scope: Some(if readonly { "read-only" } else { "workspace" }.into()),
             network: Some("blocked".into()),
             tool_policy_id: Some("mock-coding".into()),
-            mcp_servers: vec!["mock-filesystem".into()],
+            mcp_servers: vec![RuntimePolicyMcpServer::name("mock-filesystem")],
             memory_scope: Some("mock-session".into()),
             qoe_policy: Some("mock".into()),
             queue_mode: Some("interactive".into()),
+            tool_contract_id: Some("codex-compatible-coding-v1".into()),
+            tool_contract_version: Some("1".into()),
+            model_toolset: Some("coding".into()),
+            dynamic_tool_discovery: Some("enabled".into()),
         }),
         model: Some(mock_model_status(true)),
         permission_profile: Some(sandbox.into()),
@@ -5251,7 +5256,17 @@ mod tests {
                 "runtime_policy_stamp": {
                     "model": "deepseek-v4-pro",
                     "provider": "deepseek",
-                    "tool_policy_id": "coding-v3"
+                    "tool_policy_id": "coding-v3",
+                    "tool_contract_id": "codex-compatible-coding-v1",
+                    "tool_contract_version": "1",
+                    "model_toolset": "coding",
+                    "dynamic_tool_discovery": "enabled",
+                    "mcp_servers": [{
+                        "id": "github",
+                        "display_name": "GitHub",
+                        "status": "connected",
+                        "tool_count": 4
+                    }]
                 }
             }
         })
@@ -5265,6 +5280,16 @@ mod tests {
         };
         assert_eq!(status.result.session_id, session_id);
         assert_eq!(status.result.profile_id.as_deref(), Some("coding"));
+        let stamp = status
+            .result
+            .runtime_policy_stamp
+            .as_ref()
+            .expect("runtime policy stamp");
+        assert_eq!(
+            stamp.tool_contract_id.as_deref(),
+            Some("codex-compatible-coding-v1")
+        );
+        assert_eq!(stamp.mcp_servers[0].label(), "GitHub (connected, 4 tools)");
 
         let local_profile_request = backend
             .build_tracked_request(AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
@@ -5358,6 +5383,62 @@ mod tests {
         assert_eq!(
             mcp.result.servers[1].last_error.as_deref(),
             Some("not installed")
+        );
+
+        let tool_request = backend
+            .build_tracked_request(AppUiCommand::ListToolStatus(ToolStatusListParams {
+                session_id: SessionKey("local:test".into()),
+                include_denied: true,
+            }))
+            .expect("tool status request builds");
+        let tool_frame = json!({
+            "jsonrpc": "2.0",
+            "id": tool_request.id,
+            "result": {
+                "session_id": "local:test",
+                "policy_id": "coding-v3",
+                "coding_tool_contract": {
+                    "id": "codex-compatible-coding-v1",
+                    "version": "1",
+                    "feature": "coding.tool_contract.v1",
+                    "status": "incomplete",
+                    "required_tool_names": ["apply_patch", "exec_command"],
+                    "missing_required_tools": ["exec_command"],
+                    "policy": {
+                        "tool_policy_id": "coding-v3",
+                        "sandbox_mode": "workspace-write",
+                        "approval_policy": "on-request"
+                    },
+                    "required_tools": [{
+                        "name": "exec_command",
+                        "category": "runtime",
+                        "aliases": ["shell"],
+                        "capability": "coding.exec_session.v1",
+                        "policy": "approval_gated",
+                        "status": "missing",
+                        "backend_tool": null
+                    }]
+                },
+                "tools": []
+            }
+        })
+        .to_string();
+        let event = backend
+            .decode_rpc_text(&tool_frame)
+            .expect("tool status response decodes")
+            .expect("tool status event");
+        let ClientEvent::ToolStatus(tools) = event else {
+            panic!("expected tool status event");
+        };
+        let contract = tools
+            .result
+            .coding_tool_contract
+            .as_ref()
+            .expect("coding tool contract");
+        assert_eq!(contract.status, "incomplete");
+        assert_eq!(
+            contract.missing_required_tools,
+            vec!["exec_command".to_string()]
         );
         assert!(backend.protocol.pending_requests.is_empty());
     }

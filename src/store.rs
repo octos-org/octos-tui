@@ -2696,6 +2696,7 @@ impl Store {
         self.state.set_tool_catalog(SessionToolCatalog {
             session_id: result.session_id,
             policy_id: result.policy_id,
+            coding_tool_contract: result.coding_tool_contract,
             tools: result.tools,
         });
         self.state.push_activity(ActivityItem::new(
@@ -4122,8 +4123,8 @@ mod tests {
     use crate::model::{
         McpConfigMutationResult, McpStatusSummary, ModelStatus, OnboardingProviderPending,
         OnboardingProviderSaveTarget, ProfileLlmMutationResult, ProfileLocalCreateResult,
-        RuntimeHealthStatus, RuntimePolicyStamp, SessionCursorStatus, SessionStatusReadResult,
-        SessionUsageStatus, ToolConfigMutationResult,
+        RuntimeHealthStatus, RuntimePolicyMcpServer, RuntimePolicyStamp, SessionCursorStatus,
+        SessionStatusReadResult, SessionUsageStatus, ToolConfigMutationResult,
     };
     use octos_core::SessionKey;
     use octos_core::ui_protocol::{
@@ -4983,10 +4984,17 @@ mod tests {
                 filesystem_scope: Some("workspace".into()),
                 network: Some("blocked".into()),
                 tool_policy_id: Some("coding-v3".into()),
-                mcp_servers: vec!["github".into(), "filesystem".into()],
+                mcp_servers: vec![
+                    RuntimePolicyMcpServer::name("github"),
+                    RuntimePolicyMcpServer::name("filesystem"),
+                ],
                 memory_scope: Some("profile-session".into()),
                 qoe_policy: Some("balanced".into()),
                 queue_mode: Some("collect".into()),
+                tool_contract_id: Some("codex-compatible-coding-v1".into()),
+                tool_contract_version: Some("1".into()),
+                model_toolset: Some("coding".into()),
+                dynamic_tool_discovery: Some("enabled".into()),
             }),
             model: Some(ModelStatus {
                 model: "deepseek-v4-pro".into(),

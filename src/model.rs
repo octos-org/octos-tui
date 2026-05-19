@@ -345,13 +345,64 @@ pub struct RuntimePolicyStamp {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_policy_id: Option<String>,
     #[serde(default)]
-    pub mcp_servers: Vec<String>,
+    pub mcp_servers: Vec<RuntimePolicyMcpServer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qoe_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_contract_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_contract_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_toolset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_tool_discovery: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RuntimePolicyMcpServer {
+    Name(String),
+    Detail {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_count: Option<u32>,
+    },
+}
+
+impl RuntimePolicyMcpServer {
+    pub fn name(name: impl Into<String>) -> Self {
+        Self::Name(name.into())
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Name(name) => name.clone(),
+            Self::Detail {
+                id,
+                display_name,
+                status,
+                tool_count,
+            } => {
+                let name = display_name.as_deref().unwrap_or(id);
+                match (status.as_deref(), tool_count) {
+                    (Some(status), Some(tool_count)) => {
+                        format!("{name} ({status}, {tool_count} tools)")
+                    }
+                    (Some(status), None) => format!("{name} ({status})"),
+                    (None, Some(tool_count)) => format!("{name} ({tool_count} tools)"),
+                    (None, None) => name.to_owned(),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,8 +497,60 @@ pub struct ToolStatusListResult {
     pub session_id: SessionKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_tool_contract: Option<CodingToolContract>,
     #[serde(default)]
     pub tools: Vec<ToolStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodingToolContract {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub feature: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub required_tool_names: Vec<String>,
+    #[serde(default)]
+    pub required_tools: Vec<CodingToolContractTool>,
+    #[serde(default)]
+    pub missing_required_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<CodingToolContractPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodingToolContractPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodingToolContractTool {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub capability: String,
+    #[serde(default)]
+    pub policy: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1749,6 +1852,7 @@ pub struct SessionMcpCatalog {
 pub struct SessionToolCatalog {
     pub session_id: SessionKey,
     pub policy_id: Option<String>,
+    pub coding_tool_contract: Option<CodingToolContract>,
     pub tools: Vec<ToolStatus>,
 }
 
@@ -4231,6 +4335,88 @@ mod tests {
         assert_eq!(result.source, "future_cache");
         assert_eq!(result.preview.files[0].status, "copied");
         assert_eq!(result.preview.files[0].hunks[0].lines[0].kind, "metadata");
+    }
+
+    #[test]
+    fn runtime_policy_stamp_accepts_coding_contract_extensions() {
+        let json = serde_json::json!({
+            "tool_policy_id": "coding-v3",
+            "tool_contract_id": "codex-compatible-coding-v1",
+            "tool_contract_version": "1",
+            "model_toolset": "coding",
+            "dynamic_tool_discovery": "enabled",
+            "mcp_servers": [{
+                "id": "github",
+                "display_name": "GitHub",
+                "status": "connected",
+                "tool_count": 4
+            }]
+        });
+
+        let stamp: RuntimePolicyStamp =
+            serde_json::from_value(json).expect("runtime policy stamp decodes");
+
+        assert_eq!(stamp.tool_policy_id.as_deref(), Some("coding-v3"));
+        assert_eq!(
+            stamp.tool_contract_id.as_deref(),
+            Some("codex-compatible-coding-v1")
+        );
+        assert_eq!(stamp.model_toolset.as_deref(), Some("coding"));
+        assert_eq!(stamp.dynamic_tool_discovery.as_deref(), Some("enabled"));
+        assert_eq!(stamp.mcp_servers[0].label(), "GitHub (connected, 4 tools)");
+    }
+
+    #[test]
+    fn tool_status_list_result_keeps_coding_tool_contract() {
+        let json = serde_json::json!({
+            "session_id": "local:test",
+            "policy_id": "coding-v3",
+            "coding_tool_contract": {
+                "id": "codex-compatible-coding-v1",
+                "version": "1",
+                "feature": "coding.tool_contract.v1",
+                "status": "incomplete",
+                "required_tool_names": ["apply_patch", "exec_command"],
+                "missing_required_tools": ["exec_command"],
+                "policy": {
+                    "tool_policy_id": "coding-v3",
+                    "sandbox_mode": "workspace-write",
+                    "approval_policy": "on-request"
+                },
+                "required_tools": [{
+                    "name": "exec_command",
+                    "category": "runtime",
+                    "aliases": ["shell"],
+                    "capability": "coding.exec_session.v1",
+                    "policy": "approval_gated",
+                    "status": "missing",
+                    "backend_tool": null,
+                    "detail": "backend has no exec session"
+                }]
+            },
+            "tools": []
+        });
+
+        let result: ToolStatusListResult =
+            serde_json::from_value(json).expect("tool status list decodes");
+        let contract = result
+            .coding_tool_contract
+            .expect("coding tool contract retained");
+
+        assert_eq!(contract.status, "incomplete");
+        assert_eq!(
+            contract.missing_required_tools,
+            vec!["exec_command".to_string()]
+        );
+        assert_eq!(
+            contract.policy.and_then(|policy| policy.tool_policy_id),
+            Some("coding-v3".into())
+        );
+        assert_eq!(contract.required_tools[0].status, "missing");
+        assert_eq!(
+            contract.required_tools[0].detail.as_deref(),
+            Some("backend has no exec session")
+        );
     }
 
     #[test]
