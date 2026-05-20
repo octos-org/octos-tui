@@ -2600,6 +2600,22 @@ fn notification_to_app_event(method: &str, params: Value) -> AppUiEvent {
 }
 
 fn rpc_error_code(error: &Value) -> String {
+    // Prefer the structured `data.kind` discriminator the M12-F /
+    // mcp/profile/tool error families publish (`policy_rejected`,
+    // `tenant_restriction`, `cloud_restriction`, `mcp_invalid_config`,
+    // `tool_not_found`, `profile_not_found`, `readonly_profile`, …).
+    // The numeric JSON-RPC `code` is the fallback because it collapses
+    // every server-side rejection into the same generic
+    // `application_error` integer and would otherwise hide the policy
+    // reason from the structured error renderer.
+    if let Some(kind) = error
+        .get("data")
+        .and_then(|data| data.get("kind"))
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.trim().is_empty())
+    {
+        return kind.to_owned();
+    }
     error
         .get("code")
         .map(|code| {
@@ -2611,6 +2627,17 @@ fn rpc_error_code(error: &Value) -> String {
 }
 
 fn rpc_error_message(error: &Value) -> String {
+    // Prefer `data.message` when present (the structured-error family
+    // uses it for the human-readable variant of `data.kind`). Fall
+    // back to the top-level JSON-RPC `message`.
+    if let Some(message) = error
+        .get("data")
+        .and_then(|data| data.get("message"))
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+    {
+        return message.to_owned();
+    }
     error
         .get("message")
         .and_then(Value::as_str)
@@ -4729,6 +4756,74 @@ mod tests {
         };
         assert_eq!(error.code, "unknown_session");
         assert_eq!(error.message, "request tui-1 failed: missing session");
+    }
+
+    /// M12-F structured policy error: when the server attaches
+    /// `data.kind` + `data.message` to a JSON-RPC error response, the
+    /// TUI must surface those rather than the numeric JSON-RPC `code`
+    /// + the top-level `message`. Otherwise tenant/cloud rejection
+    /// renders as a generic "application_error" line, which violates
+    /// the M12-F acceptance bar.
+    #[test]
+    fn rpc_error_prefers_structured_data_kind_over_numeric_code() {
+        let event = rpc_text_to_app_event(
+            r#"{"jsonrpc":"2.0","id":"tui-set-perms","error":{"code":-32603,"message":"application error","data":{"kind":"policy_rejected","message":"tenant policy forbids danger-full-access"}}}"#,
+        )
+        .expect("response decodes")
+        .expect("error yields event");
+        let event = unwrap_app_event(event);
+        let AppUiEvent::Error(error) = event else {
+            panic!("expected app error");
+        };
+        // `data.kind` wins for both renderer code (so "policy_rejected"
+        // shows up structured) and message (so the tenant-specific
+        // detail surfaces).
+        assert_eq!(error.code, "policy_rejected");
+        assert!(
+            error.message.contains("tenant policy forbids"),
+            "structured detail must reach the user: {}",
+            error.message
+        );
+    }
+
+    /// Guard: when `data` is absent the legacy fallback still kicks
+    /// in. Existing AppUI callers that do not emit structured errors
+    /// keep working.
+    #[test]
+    fn rpc_error_falls_back_to_top_level_code_when_data_kind_absent() {
+        let event = rpc_text_to_app_event(
+            r#"{"jsonrpc":"2.0","id":"tui-1","error":{"code":"unknown_session","message":"missing session","data":{"hint":"check the session id"}}}"#,
+        )
+        .expect("response decodes")
+        .expect("error yields event");
+        let event = unwrap_app_event(event);
+        let AppUiEvent::Error(error) = event else {
+            panic!("expected app error");
+        };
+        // No `data.kind` -> top-level code/message win.
+        assert_eq!(error.code, "unknown_session");
+        assert!(
+            error.message.contains("missing session"),
+            "{}",
+            error.message
+        );
+    }
+
+    /// Guard: empty / whitespace `data.kind` does NOT win over the
+    /// numeric code. The TUI cannot surface an empty discriminator as
+    /// "the policy reason."
+    #[test]
+    fn rpc_error_ignores_blank_data_kind() {
+        let event = rpc_text_to_app_event(
+            r#"{"jsonrpc":"2.0","id":"tui-1","error":{"code":"unknown_session","message":"missing session","data":{"kind":"   "}}}"#,
+        )
+        .expect("response decodes")
+        .expect("error yields event");
+        let event = unwrap_app_event(event);
+        let AppUiEvent::Error(error) = event else {
+            panic!("expected app error");
+        };
+        assert_eq!(error.code, "unknown_session");
     }
 
     #[test]
