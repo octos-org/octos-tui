@@ -3178,7 +3178,11 @@ fn permission_set_action(
     update: PermissionProfileUpdate,
 ) -> MenuAction {
     MenuAction::SendAppUi(AppUiCommand::SetPermissionProfile(
-        PermissionProfileSetParams { session_id, update },
+        PermissionProfileSetParams {
+            session_id,
+            update,
+            runtime_mode: None,
+        },
     ))
 }
 
