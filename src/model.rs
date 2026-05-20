@@ -56,6 +56,57 @@ pub const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/re
 pub const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
 pub const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str = "profile/skills/remove";
 
+/// M12-E feature flag for per-session workspace cwd requests
+/// (`session.workspace_cwd.v1`, UPCR-2026-003). The TUI must NOT
+/// include `cwd` in `session/open` until the server advertises this
+/// feature — otherwise compatible-but-old servers reject the request
+/// or worse, ignore the cwd silently and run against the wrong root.
+pub const APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1: &str = "session.workspace_cwd.v1";
+
+/// Returns `true` when the negotiated capabilities permit attaching
+/// a `cwd` to `session/open`. Per UPCR-2026-003, the client must NOT
+/// emit `cwd` until the server advertises
+/// [`APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1`]. Callers pass the
+/// `supported_features` slice from
+/// [`octos_core::ui_protocol::UiProtocolCapabilities`] (or the
+/// equivalent slice the TUI's `CapabilitySet` tracks).
+pub fn session_open_may_include_cwd<S: AsRef<str>>(supported_features: &[S]) -> bool {
+    supported_features
+        .iter()
+        .any(|feature| feature.as_ref() == APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1)
+}
+
+/// Returns the displayable workspace root for a session: the
+/// server-confirmed `workspace_root` from `session/status/read`
+/// wins. Only when the server omits it does the TUI fall back to the
+/// `cwd` it requested. The TUI must NOT silently substitute the
+/// requested cwd for the server truth in any other case — it can
+/// only render what the server said. This helper is the canonical
+/// "what cwd should we show" decision the TUI must use.
+pub fn effective_workspace_root_for_display<'a>(
+    server_workspace_root: Option<&'a str>,
+    requested_cwd: Option<&'a str>,
+) -> Option<&'a str> {
+    server_workspace_root.or(requested_cwd)
+}
+
+/// Scrub `cwd` from a [`octos_core::ui_protocol::SessionOpenParams`]
+/// when the negotiated capabilities do not advertise
+/// [`APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1`]. Returns the params
+/// unchanged when the feature is present (or when `cwd` was already
+/// `None`). The TUI uses this immediately before serializing
+/// `session/open` so that compatible-but-old servers do not silently
+/// ignore the requested cwd.
+pub fn scrub_session_open_cwd_for_capabilities<S: AsRef<str>>(
+    mut params: octos_core::ui_protocol::SessionOpenParams,
+    supported_features: &[S],
+) -> octos_core::ui_protocol::SessionOpenParams {
+    if params.cwd.is_some() && !session_open_may_include_cwd(supported_features) {
+        params.cwd = None;
+    }
+    params
+}
+
 /// M13-D backend-owned supervised task inspection methods. The TUI calls the
 /// `task/artifact/*` aliases per UPCR-2026-019 §4 (servers dispatch both
 /// `task/artifact/list` and `agent/artifact/list` into the same handler).
