@@ -88,6 +88,37 @@ pub const APPUI_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
 pub const APPUI_METHOD_CONTEXT_COMPACTION_COMPLETED: &str = "context/compaction_completed";
 pub const APPUI_METHOD_CONTEXT_NORMALIZATION_REPORTED: &str = "context/normalization_reported";
 
+/// M15-E required capability flag for backend-owned agent inspection /
+/// goal / loop UX (`coding.autonomy.v1`). When absent, the TUI must
+/// hide M15 controls instead of probing unsupported methods.
+pub const APPUI_FEATURE_CODING_AUTONOMY_V1: &str = "coding.autonomy.v1";
+
+/// M15-E optional capability flags. Each gates one slice of UX:
+/// `agent_control_v1` -> `/agents interrupt`, `/agents close`.
+/// `goal_runtime_v1`  -> `/goal` family.
+/// `loop_runtime_v1`  -> `/loop` family.
+pub const APPUI_FEATURE_CODING_AGENT_CONTROL_V1: &str = "coding.agent_control.v1";
+pub const APPUI_FEATURE_CODING_GOAL_RUNTIME_V1: &str = "coding.goal_runtime.v1";
+pub const APPUI_FEATURE_CODING_LOOP_RUNTIME_V1: &str = "coding.loop_runtime.v1";
+
+/// M15-E backend-owned agent inspection methods (UPCR-2026-021).
+pub const APPUI_METHOD_AGENT_LIST: &str = "agent/list";
+pub const APPUI_METHOD_AGENT_STATUS_READ: &str = "agent/status/read";
+pub const APPUI_METHOD_AGENT_OUTPUT_READ: &str = "agent/output/read";
+pub const APPUI_METHOD_AGENT_ARTIFACT_LIST: &str = "agent/artifact/list";
+pub const APPUI_METHOD_AGENT_ARTIFACT_READ: &str = "agent/artifact/read";
+
+/// M15-E notification methods the TUI listens for to update agent /
+/// goal / loop state. It must not call these as RPC.
+pub const APPUI_METHOD_AGENT_UPDATED: &str = "agent/updated";
+pub const APPUI_METHOD_AGENT_OUTPUT_DELTA: &str = "agent/output/delta";
+pub const APPUI_METHOD_AGENT_ARTIFACT_UPDATED: &str = "agent/artifact/updated";
+pub const APPUI_METHOD_SESSION_GOAL_UPDATED: &str = "session/goal/updated";
+pub const APPUI_METHOD_SESSION_GOAL_CLEARED: &str = "session/goal/cleared";
+pub const APPUI_METHOD_LOOP_UPDATED: &str = "loop/updated";
+pub const APPUI_METHOD_LOOP_FIRED: &str = "loop/fired";
+pub const APPUI_METHOD_LOOP_COMPLETED: &str = "loop/completed";
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretString(String);
 

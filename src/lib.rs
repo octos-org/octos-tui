@@ -1,4 +1,5 @@
 pub mod app;
+pub mod autonomy;
 pub mod cli;
 pub mod client_event;
 pub mod event_loop;
