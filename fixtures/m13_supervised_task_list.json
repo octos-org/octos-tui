@@ -1,0 +1,62 @@
+{
+  "name": "m13 supervised task list inspection",
+  "tasks": [
+    {
+      "id": "01950000-0000-7000-8000-0000000000a1",
+      "tool_name": "spawn_agent",
+      "tool_call_id": "call-1",
+      "state": "running",
+      "status": "running",
+      "lifecycle_state": "in_progress",
+      "runtime_state": "running",
+      "source": "model",
+      "role": "implementer",
+      "summary": null,
+      "artifact_count": 0,
+      "runtime_policy_stamp": {
+        "profile_id": "ada-server",
+        "sandbox": "workspace-write",
+        "approval_policy": "never",
+        "tool_policy_id": "coding-default"
+      },
+      "started_at": "2026-05-19T20:00:00Z",
+      "updated_at": "2026-05-19T20:00:01Z"
+    },
+    {
+      "id": "01950000-0000-7000-8000-0000000000a2",
+      "tool_name": "review",
+      "tool_call_id": "call-2",
+      "state": "completed",
+      "status": "completed",
+      "lifecycle_state": "succeeded",
+      "runtime_state": "completed",
+      "source": "supervisor",
+      "role": "reviewer",
+      "summary": "Reviewer flagged 2 concerns and approved 3 hunks.",
+      "artifact_count": 2,
+      "runtime_policy_stamp": null,
+      "started_at": "2026-05-19T20:01:00Z",
+      "updated_at": "2026-05-19T20:01:45Z",
+      "completed_at": "2026-05-19T20:01:45Z"
+    },
+    {
+      "id": "01950000-0000-7000-8000-0000000000a3",
+      "tool_name": "octos_user_task",
+      "tool_call_id": "call-3",
+      "state": "completed",
+      "status": "completed",
+      "lifecycle_state": "succeeded",
+      "runtime_state": "completed",
+      "source": "user",
+      "started_at": "2026-05-19T19:00:00Z",
+      "updated_at": "2026-05-19T19:00:30Z"
+    }
+  ],
+  "expected": {
+    "backend_supervised_count": 2,
+    "user_originated_count": 1,
+    "first_model_role": "implementer",
+    "first_supervisor_summary": "Reviewer flagged 2 concerns and approved 3 hunks.",
+    "first_supervisor_artifact_count": 2
+  }
+}

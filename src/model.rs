@@ -56,6 +56,26 @@ pub const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/re
 pub const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
 pub const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str = "profile/skills/remove";
 
+/// M13-D backend-owned supervised task inspection methods. The TUI calls the
+/// `task/artifact/*` aliases per UPCR-2026-019 §4 (servers dispatch both
+/// `task/artifact/list` and `agent/artifact/list` into the same handler).
+pub const APPUI_METHOD_TASK_ARTIFACT_LIST: &str = "task/artifact/list";
+pub const APPUI_METHOD_TASK_ARTIFACT_READ: &str = "task/artifact/read";
+/// Optional M13-D review entrypoint (`review.start.v1` capability-gated).
+pub const APPUI_METHOD_REVIEW_START: &str = "review/start";
+
+/// M13-D capability flag for backend-owned supervised task list/status
+/// inspection (`harness.task_supervision_inspection.v1`). When absent, the
+/// TUI must hide M13 inspection controls and never invent local supervisor
+/// state.
+pub const APPUI_FEATURE_TASK_SUPERVISION_INSPECTION_V1: &str =
+    "harness.task_supervision_inspection.v1";
+
+/// M13-D capability flag for `task/artifact/list` and `task/artifact/read`
+/// (`harness.task_artifacts.v1`). When absent, the TUI must hide the
+/// artifact browser entry points.
+pub const APPUI_FEATURE_TASK_ARTIFACTS_V1: &str = "harness.task_artifacts.v1";
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretString(String);
 
@@ -551,6 +571,100 @@ pub struct CodingToolContractTool {
     pub backend_tool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+/// M13-D supervised task list entry shape. This mirrors the server-emitted
+/// `TaskListResult.tasks[*]` envelope so the TUI can deserialize the new
+/// `source` / `role` / `summary` / `artifact_count` / `runtime_policy_stamp`
+/// fields backend sibling shipped on `task/list` and `task/updated` payloads
+/// without taking a hard dependency on the protocol type. The struct is
+/// permissive (`#[serde(default)]` on optionals, unknown fields tolerated)
+/// so the TUI never crashes when the server adds more inspection metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SupervisedTaskEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_state: Option<String>,
+    /// `"model"` (LLM-scheduled child), `"supervisor"` (backend-scheduled,
+    /// e.g. review/start), or `"user"` (explicit user-driven). Used to
+    /// indent / badge children under the parent request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Role label assigned at spawn time (e.g. `"reviewer"`,
+    /// `"implementer"`). Pairs with M14-C role templates so the TUI can
+    /// render "Reviewer running" instead of `task-xxx running`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Bounded summary capsule for the task (mirrors
+    /// `ChildResultSummary.summary` for terminal children). Short text
+    /// that clients render inline without fetching the full artifact list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Number of artifacts the child has emitted. Lets the UX badge tasks
+    /// without resolving `task/artifact/list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_count: Option<u32>,
+    /// Runtime policy stamp captured at spawn time. Reconnect hydration
+    /// surfaces the same effective state the original `task/updated`
+    /// notifications announced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_key: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_session_key: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_terminal_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_join_state: Option<String>,
+}
+
+impl SupervisedTaskEntry {
+    /// Returns `true` when this entry was scheduled by the LLM (model) or by
+    /// a backend supervisor (review/start). User-scheduled tasks are not
+    /// supervised children in the M13 sense.
+    pub fn is_backend_supervised(&self) -> bool {
+        matches!(self.source.as_deref(), Some("model") | Some("supervisor"))
+    }
+
+    /// Display label preferring role over tool name. Falls back to the
+    /// tool name, then `"task"`. Never invents text that is not on the
+    /// wire.
+    pub fn display_label(&self) -> String {
+        if let Some(role) = self.role.as_deref().filter(|r| !r.trim().is_empty()) {
+            return role.to_string();
+        }
+        if let Some(tool) = self.tool_name.as_deref().filter(|t| !t.trim().is_empty()) {
+            return tool.to_string();
+        }
+        "task".to_string()
+    }
+}
+
+/// M13-D artifact summary returned by `task/artifact/list`. Permissive
+/// (`Value` for `extra`-style fields) so the TUI keeps deserializing as the
+/// backend adds richer metadata in later M13 milestones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisedTaskArtifact {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
