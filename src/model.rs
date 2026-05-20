@@ -2096,7 +2096,24 @@ pub struct AppState {
     pub session_tool_catalogs: Vec<SessionToolCatalog>,
     pub mcp_config_catalog: Option<McpConfigListResult>,
     pub tool_config_catalog: Option<ToolConfigListResult>,
+    /// M16-G2 per-session compact-context lifecycle ledger. Keyed by
+    /// session id. Empty when the server has not advertised
+    /// [`APPUI_FEATURE_CONTEXT_LIFECYCLE_V1`] or sent any
+    /// `context/compaction_completed` / `context/normalization_reported`
+    /// notification yet — the TUI hides the status surface in that case
+    /// instead of rendering zeroes.
+    pub context_lifecycle: Vec<SessionContextLifecycleEntry>,
     pub exit_requested: bool,
+}
+
+/// M16-G2 per-session lifecycle ledger entry. The TUI keeps these in
+/// a flat `Vec` (consistent with `permission_profiles` /
+/// `session_runtime_statuses` neighbours) so the renderer can iterate
+/// without HashMap lookups in hot paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionContextLifecycleEntry {
+    pub session_id: SessionKey,
+    pub ledger: SessionContextLifecycle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3146,8 +3163,47 @@ impl AppState {
             session_tool_catalogs: Vec::new(),
             mcp_config_catalog: None,
             tool_config_catalog: None,
+            context_lifecycle: Vec::new(),
             exit_requested: false,
         }
+    }
+
+    /// M16-G2 helper: returns the context-lifecycle ledger for a
+    /// session, or `None` if the server has not yet emitted any
+    /// `context/compaction_completed` / `context/normalization_reported`
+    /// notifications.
+    pub fn context_lifecycle_for(
+        &self,
+        session_id: &SessionKey,
+    ) -> Option<&SessionContextLifecycle> {
+        self.context_lifecycle
+            .iter()
+            .find(|entry| entry.session_id == *session_id)
+            .map(|entry| &entry.ledger)
+    }
+
+    /// M16-G2 helper: mutably accesses (creating if necessary) the
+    /// lifecycle ledger for a session.
+    pub fn context_lifecycle_mut(
+        &mut self,
+        session_id: &SessionKey,
+    ) -> &mut SessionContextLifecycle {
+        if let Some(pos) = self
+            .context_lifecycle
+            .iter()
+            .position(|entry| entry.session_id == *session_id)
+        {
+            return &mut self.context_lifecycle[pos].ledger;
+        }
+        self.context_lifecycle.push(SessionContextLifecycleEntry {
+            session_id: session_id.clone(),
+            ledger: SessionContextLifecycle::default(),
+        });
+        &mut self
+            .context_lifecycle
+            .last_mut()
+            .expect("just pushed")
+            .ledger
     }
 
     pub fn permission_profile_for(

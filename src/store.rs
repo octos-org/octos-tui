@@ -3124,17 +3124,67 @@ impl Store {
                 None
             }
             UiNotification::ContextCompactionCompleted(event) => {
-                self.state.status = format!(
-                    "Context compaction {}: {}",
-                    event.compaction.compaction_id, event.compaction.status
-                );
+                let session_id = event.session_id.clone();
+                let state = crate::model::ContextLifecycleState {
+                    session_id: event.context_state.session_id.clone(),
+                    thread_id: event.context_state.thread_id.clone(),
+                    generation: event.context_state.generation,
+                    transcript_hash: event.context_state.transcript_hash.clone(),
+                    item_count: event.context_state.item_count,
+                    token_estimate: event.context_state.token_estimate,
+                    recovery_state: event.context_state.recovery_state.clone(),
+                    last_checkpoint_id: event.context_state.last_checkpoint_id.clone(),
+                    last_compaction_id: event.context_state.last_compaction_id.clone(),
+                };
+                let compaction = crate::model::ContextCompactionSummary {
+                    compaction_id: event.compaction.compaction_id.clone(),
+                    status: event.compaction.status.clone(),
+                    trigger: event.compaction.trigger.clone(),
+                    input_generation: event.compaction.input_generation,
+                    output_generation: event.compaction.output_generation,
+                    retained_count: event.compaction.retained_count,
+                    dropped_count: event.compaction.dropped_count,
+                    token_estimate_before: event.compaction.token_estimate_before,
+                    token_estimate_after: event.compaction.token_estimate_after,
+                    error: event.compaction.error.clone(),
+                };
+                let compaction_id = event.compaction.compaction_id.clone();
+                let compaction_status = event.compaction.status.clone();
+                self.state
+                    .context_lifecycle_mut(&session_id)
+                    .apply_compaction(state, compaction);
+                self.state.status =
+                    format!("Context compaction {compaction_id}: {compaction_status}");
                 None
             }
             UiNotification::ContextNormalizationReported(event) => {
-                self.state.status = format!(
-                    "Context normalized: {} prompt messages",
-                    event.normalization.prompt_message_count
-                );
+                let session_id = event.session_id.clone();
+                let state = crate::model::ContextLifecycleState {
+                    session_id: event.context_state.session_id.clone(),
+                    thread_id: event.context_state.thread_id.clone(),
+                    generation: event.context_state.generation,
+                    transcript_hash: event.context_state.transcript_hash.clone(),
+                    item_count: event.context_state.item_count,
+                    token_estimate: event.context_state.token_estimate,
+                    recovery_state: event.context_state.recovery_state.clone(),
+                    last_checkpoint_id: event.context_state.last_checkpoint_id.clone(),
+                    last_compaction_id: event.context_state.last_compaction_id.clone(),
+                };
+                let normalization = crate::model::ContextNormalizationSummary {
+                    generation: event.normalization.generation,
+                    model_capability_id: event.normalization.model_capability_id.clone(),
+                    prompt_message_count: event.normalization.prompt_message_count,
+                    token_estimate: event.normalization.token_estimate,
+                    repaired_count: event.normalization.repaired_count,
+                    dropped_count: event.normalization.dropped_count,
+                    synthetic_count: event.normalization.synthetic_count,
+                    truncated_count: event.normalization.truncated_count,
+                };
+                let prompt_count = event.normalization.prompt_message_count;
+                self.state
+                    .context_lifecycle_mut(&session_id)
+                    .apply_normalization(state, normalization);
+                self.state.status = format!("Context normalized: {prompt_count} prompt messages");
                 None
             }
         }
@@ -6729,5 +6779,182 @@ mod tests {
 
         assert_eq!(store.state.sessions[0].tasks[0].output_tail, retained_tail);
         assert!(store.state.sessions[0].tasks[0].output_tail.len() <= TASK_OUTPUT_TAIL_BYTES);
+    }
+
+    /// M16-G2 wiring guard: `context/compaction_completed` events must
+    /// land on the per-session lifecycle ledger so the bounded status
+    /// surface can render the active generation and last compaction
+    /// summary without poking back into the raw event stream.
+    #[test]
+    fn context_compaction_event_writes_lifecycle_ledger_entry() {
+        use octos_core::ui_protocol::{
+            ContextCompactionCompletedEvent, UiContextCompactionRecord, UiContextState,
+        };
+
+        let session_id = SessionKey("local:test".into());
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "test".into(),
+            profile_id: None,
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        };
+
+        // Before the event the ledger is empty (TUI hides the surface).
+        assert!(store.state.context_lifecycle_for(&session_id).is_none());
+
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
+                session_id: session_id.clone(),
+                context_state: UiContextState {
+                    session_id: session_id.clone(),
+                    thread_id: Some("thread-1".into()),
+                    generation: 4,
+                    transcript_hash: "abc123".into(),
+                    item_count: 42,
+                    token_estimate: 9100,
+                    recovery_state: "healthy".into(),
+                    last_checkpoint_id: Some("chk-001".into()),
+                    last_compaction_id: Some("comp-001".into()),
+                },
+                compaction: UiContextCompactionRecord {
+                    compaction_id: "comp-001".into(),
+                    checkpoint_id: "chk-001".into(),
+                    status: "applied".into(),
+                    policy_id: "default".into(),
+                    trigger: "token_budget".into(),
+                    input_generation: 3,
+                    output_generation: Some(4),
+                    input_transcript_hash: "input-h".into(),
+                    replacement_transcript_hash: Some("abc123".into()),
+                    installed_transcript_hash: Some("abc123".into()),
+                    input_item_count: 130,
+                    retained_count: 42,
+                    dropped_count: 88,
+                    summary_item_id: Some("sum-1".into()),
+                    token_estimate_before: 31200,
+                    token_estimate_after: Some(9100),
+                    error: None,
+                },
+            }),
+        ));
+
+        let ledger = store
+            .state
+            .context_lifecycle_for(&session_id)
+            .expect("ledger created");
+        assert_eq!(ledger.state.as_ref().unwrap().generation, 4);
+        assert_eq!(ledger.last_compaction.as_ref().unwrap().retained_count, 42);
+        assert_eq!(ledger.last_compaction.as_ref().unwrap().dropped_count, 88);
+        // The bounded status string the user sees must NOT include raw
+        // transcript hashes or summary item ids.
+        assert!(
+            !store.state.status.contains("abc123"),
+            "{}",
+            store.state.status
+        );
+        assert!(
+            !store.state.status.contains("sum-1"),
+            "{}",
+            store.state.status
+        );
+    }
+
+    /// M16-G2 wiring guard: `context/normalization_reported` events
+    /// must update the same per-session ledger without trashing prior
+    /// compaction state (so the status surface can render both at once).
+    #[test]
+    fn context_normalization_event_preserves_prior_compaction_entry() {
+        use octos_core::ui_protocol::{
+            ContextCompactionCompletedEvent, ContextNormalizationReportedEvent,
+            UiContextCompactionRecord, UiContextNormalizationReport, UiContextState,
+        };
+
+        let session_id = SessionKey("local:test".into());
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "test".into(),
+            profile_id: None,
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        };
+
+        let base_state = UiContextState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 5,
+            transcript_hash: "h".into(),
+            item_count: 10,
+            token_estimate: 4000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        };
+        // Compact first.
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
+                session_id: session_id.clone(),
+                context_state: base_state.clone(),
+                compaction: UiContextCompactionRecord {
+                    compaction_id: "c-1".into(),
+                    checkpoint_id: "chk-1".into(),
+                    status: "applied".into(),
+                    policy_id: "p".into(),
+                    trigger: "token_budget".into(),
+                    input_generation: 4,
+                    output_generation: Some(5),
+                    input_transcript_hash: "in".into(),
+                    replacement_transcript_hash: None,
+                    installed_transcript_hash: None,
+                    input_item_count: 30,
+                    retained_count: 10,
+                    dropped_count: 20,
+                    summary_item_id: None,
+                    token_estimate_before: 12000,
+                    token_estimate_after: Some(4000),
+                    error: None,
+                },
+            }),
+        ));
+        // Then normalize.
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextNormalizationReported(ContextNormalizationReportedEvent {
+                session_id: session_id.clone(),
+                context_state: base_state.clone(),
+                normalization: UiContextNormalizationReport {
+                    generation: 5,
+                    input_transcript_hash: "h".into(),
+                    output_prompt_hash: "out".into(),
+                    model_capability_id: "anthropic/sonnet-4.7".into(),
+                    prompt_message_count: 10,
+                    token_estimate: 4000,
+                    repaired_count: 1,
+                    dropped_count: 0,
+                    synthetic_count: 0,
+                    truncated_count: 0,
+                },
+            }),
+        ));
+
+        let ledger = store
+            .state
+            .context_lifecycle_for(&session_id)
+            .expect("ledger created");
+        // Both records survive — the renderer can show both at once.
+        assert!(ledger.last_compaction.is_some(), "compaction retained");
+        assert!(ledger.last_normalization.is_some(), "normalization stored");
+        assert_eq!(ledger.last_compaction.as_ref().unwrap().retained_count, 10);
+        assert_eq!(
+            ledger.last_normalization.as_ref().unwrap().repaired_count,
+            1
+        );
     }
 }
