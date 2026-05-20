@@ -4070,6 +4070,7 @@ mod tests {
                     network: Some(PermissionNetworkPolicy::Allow),
                     approval_policy: None,
                 },
+                runtime_mode: None,
             }),
         )
         .expect("set request encodes");
@@ -4511,6 +4512,7 @@ mod tests {
                     network: Some(PermissionNetworkPolicy::Allow),
                     approval_policy: None,
                 },
+                runtime_mode: None,
             }),
             AppUiCommand::ProfileSkillsInstall(ProfileSkillsInstallParams {
                 profile_id: Some("coding".into()),
@@ -5193,6 +5195,7 @@ mod tests {
                         network: Some(PermissionNetworkPolicy::Allow),
                         approval_policy: Some("never".into()),
                     },
+                    runtime_mode: None,
                 },
             ))
             .expect("set request builds");
