@@ -76,6 +76,18 @@ pub const APPUI_FEATURE_TASK_SUPERVISION_INSPECTION_V1: &str =
 /// artifact browser entry points.
 pub const APPUI_FEATURE_TASK_ARTIFACTS_V1: &str = "harness.task_artifacts.v1";
 
+/// M16-G2 capability flag for backend-owned context generation,
+/// checkpoint, and compaction lifecycle inspection
+/// (`context.lifecycle.v1`). When absent, the TUI must hide the
+/// compact-context status surface and never invent a generation number
+/// from local heuristics.
+pub const APPUI_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
+
+/// M16-G2 notification methods. The TUI listens for these to bump the
+/// compact-context status surface; it must not call them as RPC.
+pub const APPUI_METHOD_CONTEXT_COMPACTION_COMPLETED: &str = "context/compaction_completed";
+pub const APPUI_METHOD_CONTEXT_NORMALIZATION_REPORTED: &str = "context/normalization_reported";
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretString(String);
 
@@ -653,6 +665,140 @@ impl SupervisedTaskEntry {
 /// M13-D artifact summary returned by `task/artifact/list`. Permissive
 /// (`Value` for `extra`-style fields) so the TUI keeps deserializing as the
 /// backend adds richer metadata in later M13 milestones.
+/// M16-G2 active context state snapshot. Carries hashes and counts
+/// only — never raw transcript content, per spec §16. The TUI keeps
+/// this in a bounded status surface; it is NOT appended to chat
+/// history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextLifecycleState {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub generation: u64,
+    #[serde(default)]
+    pub transcript_hash: String,
+    #[serde(default)]
+    pub item_count: usize,
+    #[serde(default)]
+    pub token_estimate: usize,
+    /// `"healthy"`, `"recovering"`, `"degraded"` etc. — the backend is
+    /// authoritative; the TUI just labels it.
+    #[serde(default)]
+    pub recovery_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_compaction_id: Option<String>,
+}
+
+/// M16-G2 last-compaction record summary (truncated). The full record
+/// carries hashes and counts the TUI never renders to chat — only the
+/// bounded labels reach the status surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionSummary {
+    #[serde(default)]
+    pub compaction_id: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub trigger: String,
+    #[serde(default)]
+    pub input_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_generation: Option<u64>,
+    #[serde(default)]
+    pub retained_count: usize,
+    #[serde(default)]
+    pub dropped_count: usize,
+    #[serde(default)]
+    pub token_estimate_before: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_estimate_after: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// M16-G2 normalization report summary. Same containment policy as
+/// compaction: counts only, never raw items.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextNormalizationSummary {
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default)]
+    pub model_capability_id: String,
+    #[serde(default)]
+    pub prompt_message_count: usize,
+    #[serde(default)]
+    pub token_estimate: usize,
+    #[serde(default)]
+    pub repaired_count: usize,
+    #[serde(default)]
+    pub dropped_count: usize,
+    #[serde(default)]
+    pub synthetic_count: usize,
+    #[serde(default)]
+    pub truncated_count: usize,
+}
+
+/// M16-G2 per-session lifecycle ledger. Holds the latest context
+/// state plus the most recent compaction/normalization summaries. The
+/// TUI renders these in a bounded status surface (NOT chat history).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionContextLifecycle {
+    pub state: Option<ContextLifecycleState>,
+    pub last_compaction: Option<ContextCompactionSummary>,
+    pub last_normalization: Option<ContextNormalizationSummary>,
+}
+
+impl SessionContextLifecycle {
+    /// Apply a `context/compaction_completed` notification.
+    pub fn apply_compaction(
+        &mut self,
+        state: ContextLifecycleState,
+        compaction: ContextCompactionSummary,
+    ) {
+        self.state = Some(state);
+        self.last_compaction = Some(compaction);
+    }
+
+    /// Apply a `context/normalization_reported` notification.
+    pub fn apply_normalization(
+        &mut self,
+        state: ContextLifecycleState,
+        normalization: ContextNormalizationSummary,
+    ) {
+        self.state = Some(state);
+        self.last_normalization = Some(normalization);
+    }
+
+    /// Bounded one-line summary suitable for the status surface. Empty
+    /// when the server has not advertised lifecycle state yet (the TUI
+    /// must hide the surface in that case rather than render zeros).
+    pub fn summary_line(&self) -> Option<String> {
+        let state = self.state.as_ref()?;
+        let mut line = format!(
+            "context gen={} items={} ~{} tok",
+            state.generation, state.item_count, state.token_estimate
+        );
+        if !state.recovery_state.is_empty() && state.recovery_state != "healthy" {
+            line.push_str(&format!(" ({})", state.recovery_state));
+        }
+        if let Some(compaction) = &self.last_compaction {
+            line.push_str(&format!(
+                " | compacted {}->{} retained={} dropped={}",
+                compaction.input_generation,
+                compaction
+                    .output_generation
+                    .map(|g| g.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                compaction.retained_count,
+                compaction.dropped_count,
+            ));
+        }
+        Some(line)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupervisedTaskArtifact {
     #[serde(default, skip_serializing_if = "Option::is_none")]

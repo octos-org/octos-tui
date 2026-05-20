@@ -1,0 +1,78 @@
+{
+  "name": "m16 compact-context lifecycle",
+  "events": [
+    {
+      "method": "context/compaction_completed",
+      "params": {
+        "session_id": "local:test",
+        "context_state": {
+          "session_id": "local:test",
+          "thread_id": "thread-1",
+          "generation": 4,
+          "transcript_hash": "abc123",
+          "item_count": 42,
+          "token_estimate": 9100,
+          "recovery_state": "healthy",
+          "last_checkpoint_id": "chk-001",
+          "last_compaction_id": "comp-001"
+        },
+        "compaction": {
+          "compaction_id": "comp-001",
+          "checkpoint_id": "chk-001",
+          "status": "applied",
+          "policy_id": "default-compaction",
+          "trigger": "token_budget",
+          "input_generation": 3,
+          "output_generation": 4,
+          "input_transcript_hash": "input-hash",
+          "replacement_transcript_hash": "abc123",
+          "installed_transcript_hash": "abc123",
+          "input_item_count": 130,
+          "retained_count": 42,
+          "dropped_count": 88,
+          "summary_item_id": "sum-1",
+          "token_estimate_before": 31200,
+          "token_estimate_after": 9100,
+          "error": null
+        }
+      }
+    },
+    {
+      "method": "context/normalization_reported",
+      "params": {
+        "session_id": "local:test",
+        "context_state": {
+          "session_id": "local:test",
+          "thread_id": "thread-1",
+          "generation": 4,
+          "transcript_hash": "abc123",
+          "item_count": 42,
+          "token_estimate": 9100,
+          "recovery_state": "healthy",
+          "last_checkpoint_id": "chk-001",
+          "last_compaction_id": "comp-001"
+        },
+        "normalization": {
+          "generation": 4,
+          "input_transcript_hash": "abc123",
+          "output_prompt_hash": "norm-hash",
+          "model_capability_id": "anthropic/sonnet-4.7",
+          "prompt_message_count": 42,
+          "token_estimate": 9100,
+          "repaired_count": 2,
+          "dropped_count": 0,
+          "synthetic_count": 1,
+          "truncated_count": 0
+        }
+      }
+    }
+  ],
+  "expected_summary_after_compaction": "context gen=4 items=42 ~9100 tok | compacted 3->4 retained=42 dropped=88",
+  "expected_no_raw_record_text": [
+    "input-hash",
+    "abc123",
+    "norm-hash",
+    "input_item_count",
+    "summary_item_id"
+  ]
+}
