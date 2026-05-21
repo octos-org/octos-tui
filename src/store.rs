@@ -936,6 +936,33 @@ impl Store {
                 self.onboarding_save_provider_fallback_command()
             }
             OnboardingAction::TestProvider => self.onboarding_test_provider_command(),
+            OnboardingAction::SetWorkspace(path) => {
+                let path = path.trim().to_owned();
+                if path.is_empty() {
+                    self.state.onboarding.workspace_candidate = None;
+                    self.state.status = "Workspace candidate cleared".into();
+                } else {
+                    self.state.onboarding.workspace_candidate = Some(path);
+                    self.state.status =
+                        "Workspace candidate staged; use /onboard workspace-validate".into();
+                }
+                self.state.onboarding.workspace_validation =
+                    crate::model::OnboardingWorkspaceValidation::Unvalidated;
+                self.refresh_active_menu_if_open();
+                None
+            }
+            OnboardingAction::ValidateWorkspace => {
+                self.onboarding_validate_workspace();
+                None
+            }
+            OnboardingAction::ResetWorkspace => {
+                self.state.onboarding.workspace_candidate = None;
+                self.state.onboarding.workspace_validation =
+                    crate::model::OnboardingWorkspaceValidation::Unvalidated;
+                self.state.status = "Workspace selection reset".into();
+                self.refresh_active_menu_if_open();
+                None
+            }
             OnboardingAction::Finish => self.onboarding_finish_command(),
             OnboardingAction::Reset => {
                 self.state.onboarding = Default::default();
@@ -1004,6 +1031,14 @@ impl Store {
             "fetch-models" => self.dispatch_onboarding_action(OnboardingAction::FetchModels, None),
             "save" => self.dispatch_onboarding_action(OnboardingAction::SaveProvider, None),
             "test" => self.dispatch_onboarding_action(OnboardingAction::TestProvider, None),
+            "workspace" | "cwd" | "dir" => self
+                .dispatch_onboarding_action(OnboardingAction::SetWorkspace(rest.to_owned()), None),
+            "workspace-validate" | "validate-workspace" => {
+                self.dispatch_onboarding_action(OnboardingAction::ValidateWorkspace, None)
+            }
+            "workspace-reset" | "reset-workspace" => {
+                self.dispatch_onboarding_action(OnboardingAction::ResetWorkspace, None)
+            }
             "finish" | "open-session" => {
                 self.dispatch_onboarding_action(OnboardingAction::Finish, None)
             }
@@ -1392,6 +1427,41 @@ impl Store {
             self.refresh_active_menu_if_open();
             return None;
         }
+        // M22-C: refuse `session/open` unless the workspace is
+        // validated. If the user has not yet pressed
+        // `/onboard workspace-validate`, kick off the probe here so
+        // pressing finish is enough — otherwise the user would have
+        // to type two commands for the happy path.
+        if self.state.onboarding.workspace_validation.is_unvalidated() {
+            self.onboarding_validate_workspace();
+        }
+        if !self.state.onboarding.workspace_ready_for_finish() {
+            let reason = match &self.state.onboarding.workspace_validation {
+                crate::model::OnboardingWorkspaceValidation::Invalid { reason } => {
+                    format!("Cannot open session: workspace invalid — {reason}.")
+                }
+                crate::model::OnboardingWorkspaceValidation::Validating => {
+                    "Workspace validation in progress; try /onboard finish again in a moment."
+                        .to_owned()
+                }
+                _ => "Cannot open session: workspace not validated. Use /onboard workspace <path> then /onboard workspace-validate."
+                    .to_owned(),
+            };
+            self.state.status = reason;
+            self.refresh_active_menu_if_open();
+            return None;
+        }
+        // M22-C: promote the validated CANONICAL path (not the raw
+        // candidate) so `session/open` sends exactly what the probe
+        // verified. A user typing `/onboard workspace .` would
+        // otherwise have the raw "." reach the server even though
+        // the probe canonicalised it — breaking the validation
+        // boundary.
+        if let crate::model::OnboardingWorkspaceValidation::Valid { canonical, .. } =
+            &self.state.onboarding.workspace_validation
+        {
+            self.state.workspace.root = canonical.clone();
+        }
         let session_id =
             octos_core::SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding");
         self.state.status = format!("Opening coding session for profile {profile_id}");
@@ -1401,6 +1471,139 @@ impl Store {
             cwd: onboarding_workspace_cwd(&self.state.workspace.root),
             after: None,
         }))
+    }
+
+    /// M22-C: true when the AppUI target is a non-local network
+    /// transport (e.g. `wss://remote.example/...`). Local stdio
+    /// and `ws://localhost` are treated as same-host, so the
+    /// filesystem probe is meaningful.
+    fn is_remote_transport_target(&self) -> bool {
+        let target = match self.state.target.as_deref() {
+            Some(value) => value,
+            None => return false,
+        };
+        if target.starts_with("stdio:") || target == "stdio" {
+            return false;
+        }
+        if let Some(rest) = target
+            .strip_prefix("ws://")
+            .or_else(|| target.strip_prefix("wss://"))
+        {
+            // host:port/... — extract the host part.
+            let host = rest.split([':', '/']).next().unwrap_or("");
+            return !matches!(host, "" | "localhost" | "127.0.0.1" | "::1" | "[::1]");
+        }
+        false
+    }
+
+    /// M22-C: workspace probe used when the TUI is transport-local
+    /// (stdio or local `ws://localhost`). Remote-only transports
+    /// put the workspace on the SERVER host, so the client cannot
+    /// stat it; in that case the probe falls back to a shape-only
+    /// `Valid` status and trusts the server to validate on
+    /// `session/open`. When the backend gains a `workspace/probe`
+    /// RPC (out of scope per slice-0), the caller can swap this
+    /// for an outbound command and keep the same
+    /// `OnboardingWorkspaceValidation` consumer.
+    fn onboarding_validate_workspace(&mut self) {
+        let active = self.state.workspace.root.clone();
+        let raw_target = self.state.onboarding.workspace_target(&active).to_owned();
+        // M22-C: a stdio launch label like
+        // `stdio:octos serve --stdio --cwd /tmp/project` carries
+        // the cwd inside the command string. Run the existing
+        // extractor first so the user does not have to retype.
+        let target = onboarding_workspace_cwd(&raw_target).unwrap_or_else(|| raw_target.clone());
+        if target.is_empty()
+            || target == "unknown"
+            || target == "not supplied"
+            || target == "stdio"
+            || target.starts_with("ws://")
+            || target.starts_with("wss://")
+        {
+            self.state.onboarding.workspace_validation =
+                crate::model::OnboardingWorkspaceValidation::Invalid {
+                    reason: format!(
+                        "no usable workspace cwd resolved from `{raw_target}`. Use /onboard workspace <path>."
+                    ),
+                };
+            self.state.status =
+                "Workspace cwd invalid; stage a path with /onboard workspace <path>".into();
+            self.refresh_active_menu_if_open();
+            return;
+        }
+        // M22-C: remote-only transports (non-local WebSocket) put
+        // the workspace on the SERVER host. Skip the client
+        // filesystem probe and trust that the server will validate
+        // on `session/open` — but still record a typed `Valid`
+        // status with the staged path so finish is unblocked and
+        // the user can see what cwd will be sent.
+        if self.is_remote_transport_target() {
+            self.state.onboarding.workspace_validation =
+                crate::model::OnboardingWorkspaceValidation::Valid {
+                    canonical: target.clone(),
+                    writable: true,
+                    has_workspace_toml: false,
+                };
+            self.state.status = format!(
+                "Workspace staged at {target} — remote transport, server will validate on session/open"
+            );
+            self.refresh_active_menu_if_open();
+            return;
+        }
+        let path = std::path::PathBuf::from(&target);
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                self.state.onboarding.workspace_validation =
+                    crate::model::OnboardingWorkspaceValidation::Invalid {
+                        reason: format!("path '{target}' is not accessible: {err}"),
+                    };
+                self.state.status = format!("Workspace '{target}' is not accessible");
+                self.refresh_active_menu_if_open();
+                return;
+            }
+        };
+        if !metadata.is_dir() {
+            self.state.onboarding.workspace_validation =
+                crate::model::OnboardingWorkspaceValidation::Invalid {
+                    reason: format!("path '{target}' is not a directory"),
+                };
+            self.state.status = format!("Workspace '{target}' is not a directory");
+            self.refresh_active_menu_if_open();
+            return;
+        }
+        let canonical = std::fs::canonicalize(&path)
+            .map(|canonical| canonical.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| target.clone());
+        // Reject obvious root-escape attempts: a workspace MUST NOT
+        // be `/`, the user's home root, or contain `..` after
+        // canonicalisation. The backend will re-validate but the
+        // TUI should reject the worst cases up front.
+        if canonical == "/" || canonical.is_empty() {
+            self.state.onboarding.workspace_validation =
+                crate::model::OnboardingWorkspaceValidation::Invalid {
+                    reason: "workspace cannot be the filesystem root".into(),
+                };
+            self.state.status = "Workspace cannot be /; stage a project directory".into();
+            self.refresh_active_menu_if_open();
+            return;
+        }
+        let writable = !metadata.permissions().readonly();
+        let has_workspace_toml = path.join(".octos-workspace.toml").is_file();
+        self.state.onboarding.workspace_validation =
+            crate::model::OnboardingWorkspaceValidation::Valid {
+                canonical: canonical.clone(),
+                writable,
+                has_workspace_toml,
+            };
+        let writable_label = if writable { "writable" } else { "read-only" };
+        let toml_label = if has_workspace_toml {
+            " (has .octos-workspace.toml)"
+        } else {
+            ""
+        };
+        self.state.status = format!("Workspace OK at {canonical} — {writable_label}{toml_label}");
+        self.refresh_active_menu_if_open();
     }
 
     fn current_profile_for_onboarding(&self) -> Option<String> {
@@ -4556,6 +4759,14 @@ mod tests {
         let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_AUTH_STATUS]);
         store.state.workspace.root = "/tmp/workspace".into();
         store.state.onboarding.provider_saved = true;
+        // M22-C: pre-set workspace validation so the legacy test
+        // does not exercise the new filesystem probe.
+        store.state.onboarding.workspace_validation =
+            crate::model::OnboardingWorkspaceValidation::Valid {
+                canonical: "/tmp/workspace".into(),
+                writable: true,
+                has_workspace_toml: false,
+            };
 
         store.state.composer = "/onboard profile alice".into();
         assert!(store.compose_command().is_none());
@@ -4577,6 +4788,15 @@ mod tests {
             "stdio:/opt/octos serve --stdio --data-dir /tmp/octos/data --cwd /tmp/octos/workspace"
                 .into();
         store.state.onboarding.provider_saved = true;
+        // M22-C: pre-set workspace validation; this test focuses on
+        // cwd extraction from a stdio target string and not on the
+        // new filesystem probe.
+        store.state.onboarding.workspace_validation =
+            crate::model::OnboardingWorkspaceValidation::Valid {
+                canonical: "/tmp/octos/workspace".into(),
+                writable: true,
+                has_workspace_toml: false,
+            };
 
         store.state.composer = "/onboard profile alice".into();
         assert!(store.compose_command().is_none());
@@ -4596,6 +4816,14 @@ mod tests {
             "stdio:\"/opt/octos/bin/octos\" serve --stdio --data-dir \"/tmp/octos/data dir\" --cwd \"/tmp/octos/workspace dir\""
                 .into();
         store.state.onboarding.provider_saved = true;
+        // M22-C: same as above — pre-set validation so the existing
+        // cwd extraction coverage stays focused.
+        store.state.onboarding.workspace_validation =
+            crate::model::OnboardingWorkspaceValidation::Valid {
+                canonical: "/tmp/octos/workspace dir".into(),
+                writable: true,
+                has_workspace_toml: false,
+            };
 
         store.state.composer = "/onboard profile alice".into();
         assert!(store.compose_command().is_none());
@@ -4647,6 +4875,15 @@ mod tests {
         store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
             crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
         ]));
+        // M22-C: pre-validated workspace so the open-session path
+        // can proceed; this test predates the workspace probe.
+        store.state.onboarding.workspace_validation =
+            crate::model::OnboardingWorkspaceValidation::Valid {
+                canonical: "/tmp/alice-workspace".into(),
+                writable: true,
+                has_workspace_toml: false,
+            };
+        store.state.workspace.root = "/tmp/alice-workspace".into();
         store.state.profile_llm_state = Some(crate::model::ProfileLlmListResult {
             profile_id: Some("alice".into()),
             primary: Some(crate::model::LlmConfiguredProvider {
@@ -4721,6 +4958,15 @@ mod tests {
         store.state.workspace.root = "/tmp/solo-project".into();
         store.state.onboarding.open_session_after_profile_create = true;
         store.state.onboarding.provider_saved = true;
+        // M22-C: pre-validated workspace lets the auto-finish path
+        // after profile/local/create proceed without exercising the
+        // new filesystem probe in this regression test.
+        store.state.onboarding.workspace_validation =
+            crate::model::OnboardingWorkspaceValidation::Valid {
+                canonical: "/tmp/solo-project".into(),
+                writable: true,
+                has_workspace_toml: false,
+            };
 
         let follow_up = store.apply_client_event(ClientEvent::ProfileLocalCreate(
             crate::client_event::ProfileLocalCreateClientEvent {
@@ -4961,6 +5207,275 @@ mod tests {
             .map(|frame| frame.id.as_str().to_owned())
             .expect("/setup must open the onboarding menu");
         assert_eq!(active_id, crate::menu::registry::MENU_ONBOARD);
+    }
+
+    /// M22-C: `/onboard workspace <path>` stages the candidate
+    /// without mutating the active workspace pane, and resets any
+    /// prior validation so the user must re-validate before finish.
+    #[test]
+    fn onboard_workspace_command_stages_candidate_and_resets_validation() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        // Pre-existing validation must be cleared by staging a new
+        // candidate.
+        store.state.onboarding.workspace_validation =
+            crate::model::OnboardingWorkspaceValidation::Valid {
+                canonical: "/tmp/old".into(),
+                writable: true,
+                has_workspace_toml: false,
+            };
+
+        store.state.composer = "/onboard workspace /some/new/path".into();
+        assert!(store.compose_command().is_none());
+
+        assert_eq!(
+            store.state.onboarding.workspace_candidate.as_deref(),
+            Some("/some/new/path")
+        );
+        assert!(store.state.onboarding.workspace_validation.is_unvalidated());
+    }
+
+    /// M22-C: validating a candidate that does NOT exist yields
+    /// `Invalid` and does not crash. `onboarding_finish_command`
+    /// then refuses to emit `session/open` until the user fixes it.
+    #[test]
+    fn validate_workspace_missing_path_marks_invalid() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_AUTH_STATUS]);
+        // Use a local stdio target so the client filesystem probe
+        // runs (remote transports defer validation to the server).
+        store.state.target = Some("stdio:octos serve --stdio".into());
+        store.state.onboarding.provider_saved = true;
+        store.state.composer = "/onboard workspace /tmp/this/path/does/not/exist".into();
+        let _ = store.compose_command();
+        store.state.composer = "/onboard workspace-validate".into();
+        assert!(store.compose_command().is_none());
+
+        let validation = &store.state.onboarding.workspace_validation;
+        match validation {
+            crate::model::OnboardingWorkspaceValidation::Invalid { reason } => {
+                assert!(
+                    reason.contains("not accessible"),
+                    "expected access error, got: {reason}"
+                );
+            }
+            other => panic!("expected Invalid validation, got: {other:?}"),
+        }
+
+        // Finish must NOT emit session/open while invalid.
+        store.state.composer = "/onboard profile alice".into();
+        let _ = store.compose_command();
+        store.state.composer = "/onboard finish".into();
+        let result = store.compose_command();
+        assert!(
+            result.is_none(),
+            "session/open must not fire while workspace validation is Invalid"
+        );
+        assert!(
+            store.state.status.contains("workspace invalid"),
+            "expected blocked-status message, got: {}",
+            store.state.status
+        );
+    }
+
+    /// M22-C: validating a candidate that exists and is writable
+    /// marks it `Valid`, and `/onboard finish` then emits
+    /// `session/open` with the validated canonical cwd. Paths with
+    /// spaces are supported.
+    #[test]
+    fn validate_workspace_with_existing_temp_dir_unlocks_finish() {
+        // Use the system temp dir which is guaranteed to exist and
+        // (almost always) writable.
+        let temp_dir = std::env::temp_dir();
+        let temp_str = temp_dir.to_string_lossy().into_owned();
+        if temp_str.is_empty() {
+            // Skip on a hypothetical platform where temp_dir is empty.
+            return;
+        }
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_AUTH_STATUS]);
+        store.state.target = Some("stdio:octos serve --stdio".into());
+        store.state.onboarding.provider_saved = true;
+
+        store.state.composer = format!("/onboard workspace {temp_str}");
+        let _ = store.compose_command();
+        store.state.composer = "/onboard workspace-validate".into();
+        let _ = store.compose_command();
+
+        assert!(
+            store.state.onboarding.workspace_validation.is_valid(),
+            "expected Valid validation, got: {:?}",
+            store.state.onboarding.workspace_validation
+        );
+
+        store.state.composer = "/onboard profile alice".into();
+        let _ = store.compose_command();
+        store.state.composer = "/onboard finish".into();
+        let command = store
+            .compose_command()
+            .expect("finish emits session/open after workspace validation");
+        let AppUiCommand::OpenSession(params) = command else {
+            panic!("expected session/open, got: {command:?}");
+        };
+        // Promoted candidate is now the cwd.
+        assert!(params.cwd.is_some());
+    }
+
+    /// M22-C: filesystem root `/` is rejected as a workspace
+    /// (root-escape protection).
+    #[test]
+    fn validate_workspace_rejects_filesystem_root() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_AUTH_STATUS]);
+        store.state.target = Some("stdio:octos serve --stdio".into());
+        store.state.composer = "/onboard workspace /".into();
+        let _ = store.compose_command();
+        store.state.composer = "/onboard workspace-validate".into();
+        let _ = store.compose_command();
+
+        match &store.state.onboarding.workspace_validation {
+            crate::model::OnboardingWorkspaceValidation::Invalid { reason } => {
+                assert!(
+                    reason.contains("filesystem root") || reason.contains("/"),
+                    "expected root-escape reason, got: {reason}"
+                );
+            }
+            other => panic!("expected Invalid, got: {other:?}"),
+        }
+    }
+
+    /// M22-C: a stdio launch label like
+    /// `stdio:octos serve --stdio --cwd <path>` carries the cwd in
+    /// the command string. The probe must extract the embedded cwd
+    /// before validating so the user does not have to retype it.
+    #[test]
+    fn validate_workspace_extracts_cwd_from_stdio_target_label() {
+        let temp = std::env::temp_dir();
+        let temp_str = temp.to_string_lossy().into_owned();
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_AUTH_STATUS]);
+        store.state.target = Some("stdio:octos serve --stdio".into());
+        store.state.workspace.root = format!("stdio:/opt/octos serve --stdio --cwd {temp_str}");
+        store.state.composer = "/onboard workspace-validate".into();
+        let _ = store.compose_command();
+
+        assert!(
+            store.state.onboarding.workspace_validation.is_valid(),
+            "expected Valid after extracting cwd from stdio label, got: {:?}",
+            store.state.onboarding.workspace_validation
+        );
+    }
+
+    /// M22-C: a remote `wss://` transport target means the workspace
+    /// is on the SERVER host, not the client. The probe must skip
+    /// the local filesystem stat and trust the server to validate
+    /// on `session/open`, otherwise valid remote workflows are
+    /// blocked.
+    #[test]
+    fn validate_workspace_skips_local_probe_on_remote_transport() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_AUTH_STATUS]);
+        store.state.target = Some("wss://remote.example/ui-protocol".into());
+        store.state.composer = "/onboard workspace /srv/project".into();
+        let _ = store.compose_command();
+        store.state.composer = "/onboard workspace-validate".into();
+        let _ = store.compose_command();
+
+        let validation = &store.state.onboarding.workspace_validation;
+        assert!(
+            validation.is_valid(),
+            "remote workspaces must be marked Valid without a local stat, got: {validation:?}"
+        );
+        match validation {
+            crate::model::OnboardingWorkspaceValidation::Valid { canonical, .. } => {
+                assert_eq!(canonical, "/srv/project");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// M22-C: a stdio-target workspace.root (e.g. raw `stdio:`
+    /// command line without an embedded cwd) is unusable as a cwd.
+    /// Validation must mark it Invalid so finish is blocked,
+    /// prompting the user to stage a real path with
+    /// `/onboard workspace <path>`.
+    #[test]
+    fn validate_workspace_rejects_stdio_target_workspace_root() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_AUTH_STATUS]);
+        store.state.target = Some("stdio:octos serve --stdio".into());
+        store.state.workspace.root = "stdio".into();
+        store.state.composer = "/onboard workspace-validate".into();
+        let _ = store.compose_command();
+
+        match &store.state.onboarding.workspace_validation {
+            crate::model::OnboardingWorkspaceValidation::Invalid { reason } => {
+                assert!(reason.contains("no usable workspace cwd"));
+            }
+            other => panic!("expected Invalid, got: {other:?}"),
+        }
+    }
+
+    /// M22-C: a relative-path candidate (`/onboard workspace .`) is
+    /// canonicalised by the probe; finish must promote the
+    /// CANONICAL value into `state.workspace.root` so `session/open`
+    /// sends exactly what the user validated, not the raw candidate.
+    #[test]
+    fn finish_promotes_canonical_workspace_path_not_raw_candidate() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_AUTH_STATUS]);
+        store.state.target = Some("stdio:octos serve --stdio".into());
+        store.state.onboarding.provider_saved = true;
+        // Stage a relative path that the canonicaliser will expand.
+        store.state.composer = "/onboard workspace .".into();
+        let _ = store.compose_command();
+        store.state.composer = "/onboard workspace-validate".into();
+        let _ = store.compose_command();
+        // Probe should succeed against the current cwd, producing
+        // a canonical absolute path.
+        let canonical = match &store.state.onboarding.workspace_validation {
+            crate::model::OnboardingWorkspaceValidation::Valid { canonical, .. } => {
+                canonical.clone()
+            }
+            other => panic!("expected Valid validation for '.', got: {other:?}"),
+        };
+        assert!(
+            canonical.starts_with('/'),
+            "canonical path must be absolute, got: {canonical}"
+        );
+
+        store.state.composer = "/onboard profile alice".into();
+        let _ = store.compose_command();
+        store.state.composer = "/onboard finish".into();
+        let command = store
+            .compose_command()
+            .expect("finish emits session/open with canonical cwd");
+        let AppUiCommand::OpenSession(params) = command else {
+            panic!("expected session/open, got: {command:?}");
+        };
+        assert_eq!(
+            params.cwd.as_deref(),
+            Some(canonical.as_str()),
+            "session/open must receive the canonical path, not the raw '.' candidate"
+        );
+        assert_eq!(store.state.workspace.root, canonical);
+    }
+
+    /// M22-C: pressing `/onboard finish` without manual validation
+    /// auto-runs the probe and reports the result. The user is
+    /// dropped on the workspace-blocked status if invalid, without
+    /// needing to know about the workspace-validate sub-command.
+    #[test]
+    fn onboarding_finish_auto_validates_workspace_when_unvalidated() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_AUTH_STATUS]);
+        store.state.target = Some("stdio:octos serve --stdio".into());
+        store.state.onboarding.provider_saved = true;
+        store.state.workspace.root = "/tmp/this/path/does/not/exist".into();
+        store.state.composer = "/onboard profile alice".into();
+        let _ = store.compose_command();
+
+        store.state.composer = "/onboard finish".into();
+        let result = store.compose_command();
+
+        assert!(result.is_none(), "finish must block on Invalid workspace");
+        // The validation state is now Invalid (auto-probed).
+        assert!(matches!(
+            store.state.onboarding.workspace_validation,
+            crate::model::OnboardingWorkspaceValidation::Invalid { .. }
+        ));
     }
 
     #[test]

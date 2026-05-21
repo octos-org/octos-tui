@@ -869,6 +869,34 @@ fn onboarding_provider_setup_menu(
             state,
             APPUI_METHOD_PROFILE_LLM_UPSERT,
         )),
+        // M22-C: workspace step. Surfaces the staged candidate (or
+        // the active workspace root), its validation status, and
+        // gives the user an explicit re-validate row. Finish is
+        // disabled until validation reports `Valid`.
+        MenuItem::new(
+            "onboard.workspace.current",
+            format!(
+                "Workspace: {}",
+                onboarding_workspace_display(state, ctx.app.cwd.unwrap_or(""))
+            ),
+            MenuAction::Noop,
+        )
+        .with_description("Stage with /onboard workspace <path>; default is the active workspace root.")
+        .with_state(MenuItemState::required(
+            state.workspace_validation.is_valid(),
+        )),
+        MenuItem::new(
+            "onboard.workspace.status",
+            onboarding_workspace_status_label(state),
+            MenuAction::Noop,
+        )
+        .with_description("Validation status from the local probe (replaceable with backend workspace/probe when added)."),
+        MenuItem::new(
+            "onboard.workspace.validate",
+            "Validate workspace",
+            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::ValidateWorkspace)),
+        )
+        .with_description("Probe the staged path; required before /onboard finish."),
         MenuItem::new(
             "onboard.finish",
             "Open coding session",
@@ -1312,10 +1340,71 @@ fn onboarding_open_session_disabled_reason(
     state: &OnboardingWizardState,
     current_profile: Option<&str>,
 ) -> Option<String> {
-    onboarding_finish_disabled_reason(ctx, state, current_profile).or_else(|| {
-        (!onboarding_has_saved_primary_provider(ctx, state, current_profile))
-            .then_some("save provider first".into())
-    })
+    onboarding_finish_disabled_reason(ctx, state, current_profile)
+        .or_else(|| {
+            (!onboarding_has_saved_primary_provider(ctx, state, current_profile))
+                .then_some("save provider first".into())
+        })
+        // M22-C: finish is disabled until workspace validation
+        // reports `Valid` so `session/open` never fires against an
+        // unverified cwd.
+        .or_else(|| onboarding_workspace_disabled_reason(state))
+}
+
+fn onboarding_workspace_disabled_reason(state: &OnboardingWizardState) -> Option<String> {
+    match &state.workspace_validation {
+        crate::model::OnboardingWorkspaceValidation::Valid { .. } => None,
+        crate::model::OnboardingWorkspaceValidation::Unvalidated => {
+            Some("validate workspace first".into())
+        }
+        crate::model::OnboardingWorkspaceValidation::Validating => {
+            Some("workspace validation in progress".into())
+        }
+        crate::model::OnboardingWorkspaceValidation::Invalid { reason } => {
+            Some(format!("workspace invalid: {reason}"))
+        }
+    }
+}
+
+fn onboarding_workspace_display(state: &OnboardingWizardState, active_workspace: &str) -> String {
+    match &state.workspace_validation {
+        crate::model::OnboardingWorkspaceValidation::Valid { canonical, .. } => canonical.clone(),
+        _ => state
+            .workspace_candidate
+            .clone()
+            .or_else(|| {
+                let trimmed = active_workspace.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(format!("{trimmed} (active)"))
+                }
+            })
+            .unwrap_or_else(|| "(use /onboard workspace <path>)".into()),
+    }
+}
+
+fn onboarding_workspace_status_label(state: &OnboardingWizardState) -> String {
+    match &state.workspace_validation {
+        crate::model::OnboardingWorkspaceValidation::Unvalidated => "Status: not validated".into(),
+        crate::model::OnboardingWorkspaceValidation::Validating => "Status: validating...".into(),
+        crate::model::OnboardingWorkspaceValidation::Valid {
+            writable,
+            has_workspace_toml,
+            ..
+        } => {
+            let writable_label = if *writable { "writable" } else { "read-only" };
+            let toml_label = if *has_workspace_toml {
+                " · .octos-workspace.toml"
+            } else {
+                ""
+            };
+            format!("Status: OK ({writable_label}{toml_label})")
+        }
+        crate::model::OnboardingWorkspaceValidation::Invalid { reason } => {
+            format!("Status: INVALID — {reason}")
+        }
+    }
 }
 
 fn onboarding_has_saved_primary_provider(

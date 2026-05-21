@@ -2764,6 +2764,11 @@ impl MockAppUiBackend {
             title: "mock background synthesis".into(),
             state: TaskRuntimeState::Running,
             runtime_detail: Some("Synthesizing task output stream".into()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         }));
         self.enqueue_protocol(UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
             session_id: session_id.clone(),
@@ -2792,6 +2797,11 @@ impl MockAppUiBackend {
             title: "mock background synthesis".into(),
             state: TaskRuntimeState::Completed,
             runtime_detail: Some("Summary ready in runtime_detail".into()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         }));
         self.enqueue_protocol(UiNotification::Warning(WarningEvent {
             session_id: session_id.clone(),

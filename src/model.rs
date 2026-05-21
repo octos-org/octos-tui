@@ -1299,6 +1299,14 @@ pub enum OnboardingAction {
     SaveProvider,
     SaveProviderFallback,
     TestProvider,
+    /// M22-C: stage a candidate workspace path.
+    SetWorkspace(String),
+    /// M22-C: probe the staged candidate (or the active
+    /// `state.workspace.root` if no candidate) and update
+    /// `workspace_validation`.
+    ValidateWorkspace,
+    /// M22-C: clear staged candidate and reset validation status.
+    ResetWorkspace,
     Finish,
     Reset,
 }
@@ -1315,6 +1323,39 @@ pub enum OnboardingProviderSaveTarget {
     Fallback,
 }
 
+/// M22-C: workspace validation status for the onboarding step.
+/// Backend-owned workspace/probe methods are not yet wired (see
+/// the contract slice-0 note), so the TUI does its own client-side
+/// probe and flags the result so `session/open` is only invoked
+/// once we have a `Valid` status. When the backend adds a workspace-
+/// probe RPC this enum stays the same — only the producer of the
+/// status changes from client-side to RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnboardingWorkspaceValidation {
+    /// No candidate has been staged or validated yet.
+    Unvalidated,
+    /// Probe is in flight (reserved for the future RPC path).
+    Validating,
+    /// Path exists, is a directory, and meets the policy preview.
+    Valid {
+        canonical: String,
+        writable: bool,
+        has_workspace_toml: bool,
+    },
+    /// Probe failed. The user must address `reason` before finish.
+    Invalid { reason: String },
+}
+
+impl OnboardingWorkspaceValidation {
+    pub fn is_valid(&self) -> bool {
+        matches!(self, Self::Valid { .. })
+    }
+
+    pub fn is_unvalidated(&self) -> bool {
+        matches!(self, Self::Unvalidated)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnboardingWizardState {
     pub name: String,
@@ -1324,6 +1365,17 @@ pub struct OnboardingWizardState {
     pub profile_id: Option<String>,
     pub local_profile_created: bool,
     pub open_session_after_profile_create: bool,
+    /// M22-C: workspace candidate the user has staged via
+    /// `/onboard workspace <path>`. `None` means the active
+    /// `state.workspace.root` is used. Held separately from
+    /// `state.workspace` so the candidate can be probed and either
+    /// accepted (replacing `workspace.root`) or rejected without
+    /// mutating the active workspace pane.
+    pub workspace_candidate: Option<String>,
+    /// M22-C: result of the most recent workspace probe. Defaults
+    /// to `Unvalidated`. `onboarding_finish_command` refuses to
+    /// emit `session/open` unless this is `Valid`.
+    pub workspace_validation: OnboardingWorkspaceValidation,
     pub auth_email_enabled: Option<bool>,
     pub auth_code_sent: bool,
     pub auth_verified: bool,
@@ -1350,6 +1402,8 @@ impl Default for OnboardingWizardState {
             profile_id: None,
             local_profile_created: false,
             open_session_after_profile_create: false,
+            workspace_candidate: None,
+            workspace_validation: OnboardingWorkspaceValidation::Unvalidated,
             auth_email_enabled: None,
             auth_code_sent: false,
             auth_verified: false,
@@ -1406,6 +1460,25 @@ impl OnboardingWizardState {
 
     pub fn local_profile_ready(&self) -> bool {
         self.has_name() && self.has_username() && self.has_email()
+    }
+
+    /// M22-C: the path the user wants to use for the session. Falls
+    /// back to the active workspace root when no candidate has been
+    /// staged so the wizard can re-validate a previously-accepted
+    /// workspace.
+    pub fn workspace_target<'a>(&'a self, active_workspace: &'a str) -> &'a str {
+        self.workspace_candidate
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| active_workspace.trim())
+    }
+
+    /// M22-C: only valid workspaces unlock `session/open`. Pre-
+    /// flight validation produces this status; the contract slice
+    /// 7 requires it.
+    pub fn workspace_ready_for_finish(&self) -> bool {
+        self.workspace_validation.is_valid()
     }
 
     pub fn has_otp_code(&self) -> bool {
