@@ -869,6 +869,20 @@ fn onboarding_provider_setup_menu(
             state,
             APPUI_METHOD_PROFILE_LLM_UPSERT,
         )),
+        // M22-D: permission profile staging row. The wizard only
+        // displays the staged choice — the server confirms it via
+        // the runtime policy stamp after `session/open`.
+        MenuItem::new(
+            "onboard.permissions.staged",
+            onboarding_permission_profile_label(state),
+            MenuAction::Noop,
+        )
+        .with_description(
+            "Stage with /onboard permissions <default|read-only|workspace-write|workspace-write-never|full-access|clear>.",
+        )
+        .with_state(MenuItemState::required(
+            state.staged_permission_profile.is_some(),
+        )),
         MenuItem::new(
             "onboard.finish",
             "Open coding session",
@@ -1237,6 +1251,40 @@ fn onboarding_local_profile_label(state: &OnboardingWizardState) -> String {
         format!("Local profile: ready for {}", state.username)
     } else {
         "Local profile: name, username, and email required".into()
+    }
+}
+
+/// M22-D: human label for the staged permission profile in the
+/// onboarding menu. Mirrors `permission_profile_items` mode labels
+/// so the onboarding step and the `/permissions` menu use the same
+/// vocabulary; when a mismatch has been observed the label calls
+/// it out so the user knows the server clamped the choice.
+fn onboarding_permission_profile_label(state: &OnboardingWizardState) -> String {
+    use octos_core::ui_protocol::PermissionProfileMode;
+    let staged = match state.staged_permission_profile.as_ref() {
+        Some(update) => update,
+        None => return "Permissions: (default — use /onboard permissions <mode>)".into(),
+    };
+    let mode = staged
+        .mode
+        .map(|m| match m {
+            PermissionProfileMode::ReadOnly => "Read Only",
+            PermissionProfileMode::WorkspaceWrite => "Workspace Write",
+            PermissionProfileMode::DangerFullAccess => "Full Access",
+        })
+        .unwrap_or("(mode unchanged)");
+    let approval = staged.approval_policy.as_deref().unwrap_or("(unchanged)");
+    let network = staged
+        .network
+        .map(|n| match n {
+            octos_core::ui_protocol::PermissionNetworkPolicy::Allow => "network allowed",
+            octos_core::ui_protocol::PermissionNetworkPolicy::Deny => "network blocked",
+        })
+        .unwrap_or("(network unchanged)");
+    if let Some(mismatch) = state.permission_profile_mismatch.as_deref() {
+        format!("Permissions: staged {mode} · {approval} · {network} — server CLAMPED: {mismatch}")
+    } else {
+        format!("Permissions: staged {mode} · {approval} · {network}")
     }
 }
 

@@ -434,7 +434,7 @@ pub struct SessionStatusReadResult {
     pub capabilities: Option<UiProtocolCapabilities>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimePolicyStamp {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_mode: Option<String>,
@@ -1299,6 +1299,9 @@ pub enum OnboardingAction {
     SaveProvider,
     SaveProviderFallback,
     TestProvider,
+    /// M22-D: stage a permission-profile update to apply after the
+    /// first session opens. `None` clears the staged choice.
+    StagePermissionProfile(Option<octos_core::ui_protocol::PermissionProfileUpdate>),
     Finish,
     Reset,
 }
@@ -1324,6 +1327,18 @@ pub struct OnboardingWizardState {
     pub profile_id: Option<String>,
     pub local_profile_created: bool,
     pub open_session_after_profile_create: bool,
+    /// M22-D: permission profile the user has staged for the first
+    /// session. Held in the wizard so the choice renders before the
+    /// session opens, without claiming the policy is yet effective.
+    /// After `session/open` succeeds and `permission/profile/set`
+    /// is supported, the store sends the staged update; the
+    /// server's runtime policy stamp is the final authority.
+    pub staged_permission_profile: Option<octos_core::ui_protocol::PermissionProfileUpdate>,
+    /// M22-D: human-readable mismatch reason when the runtime
+    /// policy stamp diverges from the staged permission profile
+    /// (server clamped or rejected the user's choice). `None`
+    /// while no mismatch has been observed.
+    pub permission_profile_mismatch: Option<String>,
     pub auth_email_enabled: Option<bool>,
     pub auth_code_sent: bool,
     pub auth_verified: bool,
@@ -1350,6 +1365,8 @@ impl Default for OnboardingWizardState {
             profile_id: None,
             local_profile_created: false,
             open_session_after_profile_create: false,
+            staged_permission_profile: None,
+            permission_profile_mismatch: None,
             auth_email_enabled: None,
             auth_code_sent: false,
             auth_verified: false,
