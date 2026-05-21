@@ -905,6 +905,9 @@ impl Store {
                 self.state.onboarding.provider_tested = false;
                 self.state.onboarding.provider_pending = None;
                 self.state.onboarding.provider_save_target = None;
+                // M22-E: a new key invalidates the prior test
+                // failure — the user is implicitly retrying.
+                self.state.onboarding.provider_test_failure_reason = None;
                 self.state.onboarding.last_message = Some("API key updated".into());
                 self.state.status = "Onboarding API key updated".into();
                 self.refresh_active_menu_and_advance();
@@ -918,6 +921,7 @@ impl Store {
                 self.state.onboarding.provider_tested = false;
                 self.state.onboarding.provider_pending = None;
                 self.state.onboarding.provider_save_target = None;
+                self.state.onboarding.provider_test_failure_reason = None;
                 self.state.onboarding.last_message = Some("API key cleared".into());
                 self.state.status = "Onboarding API key cleared".into();
                 self.refresh_active_menu_and_advance();
@@ -1160,6 +1164,9 @@ impl Store {
         self.state.onboarding.provider_tested = false;
         self.state.onboarding.provider_pending = None;
         self.state.onboarding.provider_save_target = None;
+        // M22-E: any staged-input edit invalidates the last test
+        // failure — the reason was tied to the old selection/key.
+        self.state.onboarding.provider_test_failure_reason = None;
         self.state.onboarding.last_message = Some(message.into());
         self.state.status = message.into();
         self.refresh_active_menu_if_open();
@@ -2560,6 +2567,10 @@ impl Store {
             match pending {
                 Some(OnboardingProviderPending::Test) => {
                     self.state.onboarding.provider_tested = true;
+                    // M22-E: a successful test clears any prior
+                    // failure reason so the menu does not surface
+                    // a stale "test failed" recovery line.
+                    self.state.onboarding.provider_test_failure_reason = None;
                 }
                 Some(OnboardingProviderPending::Save) => {
                     match save_target.unwrap_or(OnboardingProviderSaveTarget::Primary) {
@@ -2578,6 +2589,7 @@ impl Store {
                         Some(staged_provider_label.clone());
                     self.state.onboarding.last_saved_provider_target =
                         Some(save_target.unwrap_or(OnboardingProviderSaveTarget::Primary));
+                    self.state.onboarding.provider_test_failure_reason = None;
                 }
                 None => {
                     self.state.onboarding.provider_saved = true;
@@ -2588,6 +2600,7 @@ impl Store {
                         Some(staged_provider_label.clone());
                     self.state.onboarding.last_saved_provider_target =
                         Some(OnboardingProviderSaveTarget::Primary);
+                    self.state.onboarding.provider_test_failure_reason = None;
                 }
             }
             if reset_staged_provider {
@@ -2595,6 +2608,17 @@ impl Store {
             }
             self.state.onboarding.last_message = Some(event.message.clone());
         } else if pending.is_some() {
+            // M22-E: a failed `profile/llm/test` (or save) must
+            // NOT mark the provider as ready. Record the typed
+            // failure reason from the server so the menu shows a
+            // recovery line — `provider_tested` stays false and
+            // `provider_status()` reports `TestFailed`.
+            if matches!(pending, Some(OnboardingProviderPending::Test)) {
+                self.state.onboarding.provider_tested = false;
+                let staged_secret = self.state.onboarding.api_key.clone();
+                self.state.onboarding.provider_test_failure_reason =
+                    Some(provider_failure_reason(&event, staged_secret.as_ref()));
+            }
             self.state.onboarding.last_message = Some(event.message.clone());
         }
         if let Some(session_id) = self.active_session().map(|session| session.id.clone()) {
@@ -3657,6 +3681,51 @@ fn slash_command_try_hint(ctx: &crate::menu::AvailabilityContext<'_>) -> String 
             let last = names.last().expect("non-empty command names");
             format!("{}, or {last}", names[..names.len() - 1].join(", "))
         }
+    }
+}
+
+/// M22-E: extract a user-facing failure reason from a failed
+/// provider mutation event (test or save). Prefers
+/// `result.error.message` when the server provides structured
+/// detail; falls back to the bare message otherwise. The reason
+/// MUST NOT include the raw API key — `ProfileLlmMutationResult`
+/// is already redacted by the server but we double-check here by
+/// stripping any value that matches the staged secret.
+fn provider_failure_reason(
+    event: &ProfileLlmMutationClientEvent,
+    staged_secret: Option<&crate::model::SecretString>,
+) -> String {
+    let raw = event
+        .result
+        .error
+        .as_deref()
+        .map(str::trim)
+        .filter(|err| !err.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            event
+                .result
+                .message
+                .as_deref()
+                .map(str::trim)
+                .filter(|msg| !msg.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| event.message.clone());
+    // M22-E: belt-and-suspenders for the redaction contract.
+    // Even though `ProfileLlmMutationResult` is server-redacted,
+    // a misbehaving or future-regressing backend could echo the
+    // staged key. Strip any literal match before storing.
+    match staged_secret {
+        Some(secret) if !secret.is_empty() => {
+            let exposed = secret.expose_for_transport();
+            if raw.contains(exposed) {
+                raw.replace(exposed, "********")
+            } else {
+                raw
+            }
+        }
+        _ => raw,
     }
 }
 
@@ -4961,6 +5030,234 @@ mod tests {
             .map(|frame| frame.id.as_str().to_owned())
             .expect("/setup must open the onboarding menu");
         assert_eq!(active_id, crate::menu::registry::MENU_ONBOARD);
+    }
+
+    /// M22-E: `provider_status()` reports `NotSelected` when no
+    /// family/model/route has been picked yet.
+    #[test]
+    fn provider_status_not_selected_for_blank_wizard() {
+        let store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG]);
+        assert_eq!(
+            store.state.onboarding.provider_status(),
+            crate::model::OnboardingProviderStatus::NotSelected
+        );
+    }
+
+    /// M22-E: `provider_status()` reports `KeyMissing` once a
+    /// selection is ready but no API key is staged.
+    #[test]
+    fn provider_status_key_missing_after_selection() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG]);
+        store.state.onboarding.provider.family_id = "deepseek".into();
+        store.state.onboarding.provider.model_id = "deepseek-reasoner".into();
+        store.state.onboarding.provider.route.route_id = "deepseek".into();
+        assert_eq!(
+            store.state.onboarding.provider_status(),
+            crate::model::OnboardingProviderStatus::KeyMissing
+        );
+    }
+
+    /// M22-E: a failed `profile/llm/test` does NOT mark the
+    /// provider as ready. `provider_status()` reports
+    /// `TestFailed` with the server reason, and the saved-primary
+    /// state stays false so finish is blocked.
+    #[test]
+    fn provider_status_test_failed_keeps_provider_unready() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+            crate::model::APPUI_METHOD_PROFILE_LLM_TEST,
+        ]);
+        // Pretend the wizard already issued a test (pending=Test).
+        store.state.onboarding.provider.family_id = "openai".into();
+        store.state.onboarding.provider.model_id = "gpt-test".into();
+        store.state.onboarding.provider.route.route_id = "openai".into();
+        store.state.onboarding.api_key = Some(crate::model::SecretString::new("redacted"));
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Test);
+
+        store.apply_client_event(ClientEvent::ProfileLlmMutation(
+            ProfileLlmMutationClientEvent {
+                result: crate::model::ProfileLlmMutationResult {
+                    profile_id: Some("alice".into()),
+                    primary: None,
+                    fallbacks: Vec::new(),
+                    applied: false,
+                    llm: None,
+                    runtime_policy_stamp: None,
+                    message: Some("invalid API key for openai route".into()),
+                    error: Some("invalid_api_key".into()),
+                },
+                message: "profile/llm/test failed: invalid API key".into(),
+            },
+        ));
+
+        // Provider NOT marked tested/saved.
+        assert!(!store.state.onboarding.provider_tested);
+        assert!(!store.state.onboarding.provider_saved);
+        let status = store.state.onboarding.provider_status();
+        match status {
+            crate::model::OnboardingProviderStatus::TestFailed { reason } => {
+                assert!(
+                    reason.contains("invalid_api_key") || reason.contains("invalid API key"),
+                    "expected server reason in test failure, got: {reason}"
+                );
+            }
+            other => panic!("expected TestFailed, got: {other:?}"),
+        }
+    }
+
+    /// M22-E: saving the provider as PRIMARY puts the wizard in
+    /// `SavedPrimary`, which is the only status that lets finish
+    /// proceed.
+    #[test]
+    fn provider_status_saved_primary_unlocks_finish() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+            crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
+        ]);
+        store.state.onboarding.provider.family_id = "openai".into();
+        store.state.onboarding.provider.model_id = "gpt-test".into();
+        store.state.onboarding.provider.route.route_id = "openai".into();
+        store.state.onboarding.api_key = Some(crate::model::SecretString::new("redacted"));
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Save);
+        store.state.onboarding.provider_save_target =
+            Some(crate::model::OnboardingProviderSaveTarget::Primary);
+
+        store.apply_client_event(ClientEvent::ProfileLlmMutation(
+            ProfileLlmMutationClientEvent {
+                result: applied_profile_llm_result(),
+                message: "profile/llm/upsert saved".into(),
+            },
+        ));
+
+        assert!(store.state.onboarding.provider_saved);
+        assert_eq!(
+            store.state.onboarding.provider_status(),
+            crate::model::OnboardingProviderStatus::SavedPrimary
+        );
+    }
+
+    /// M22-E: saving as FALLBACK is visually distinct — the
+    /// wizard reports `SavedFallback`, not `SavedPrimary`, so the
+    /// menu can label the row "fallback only".
+    #[test]
+    fn provider_status_saved_fallback_is_distinct_from_primary() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+            crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
+        ]);
+        // After a fallback save, the staged provider is reset
+        // but `last_saved_provider_target` is Fallback and
+        // `provider_saved` is NOT set (per the existing handler).
+        // To exercise the SavedFallback status path we have to
+        // emulate the post-save state where primary is also set
+        // (so provider_saved is true and target is Fallback) —
+        // that maps to a scenario where the user pinned a
+        // primary and then added a fallback. Set both:
+        store.state.onboarding.provider_saved = true;
+        store.state.onboarding.last_saved_provider_target =
+            Some(crate::model::OnboardingProviderSaveTarget::Fallback);
+        store.state.onboarding.provider.family_id = "openai".into();
+        store.state.onboarding.provider.model_id = "gpt-test".into();
+        store.state.onboarding.provider.route.route_id = "openai".into();
+        store.state.onboarding.api_key = Some(crate::model::SecretString::new("redacted"));
+
+        assert_eq!(
+            store.state.onboarding.provider_status(),
+            crate::model::OnboardingProviderStatus::SavedFallback
+        );
+    }
+
+    /// M22-E: a server-echoed API key in a test-failure reason
+    /// MUST be redacted before being stored, even though the
+    /// backend normally redacts. Belt-and-suspenders contract.
+    #[test]
+    fn provider_failure_reason_strips_echoed_api_key() {
+        let staged = crate::model::SecretString::new("sk-leaked-12345");
+        let event = ProfileLlmMutationClientEvent {
+            result: crate::model::ProfileLlmMutationResult {
+                profile_id: Some("alice".into()),
+                primary: None,
+                fallbacks: Vec::new(),
+                applied: false,
+                llm: None,
+                runtime_policy_stamp: None,
+                message: Some("server rejected key sk-leaked-12345".into()),
+                error: Some("auth_invalid: key sk-leaked-12345 was not accepted".into()),
+            },
+            message: "profile/llm/test failed".into(),
+        };
+        let reason = provider_failure_reason(&event, Some(&staged));
+        assert!(
+            !reason.contains("sk-leaked-12345"),
+            "raw API key must be stripped, got: {reason}"
+        );
+        assert!(reason.contains("********"));
+    }
+
+    /// M22-E: a `SavedFallback` save resets staged input via
+    /// `reset_staged_provider()`. After the reset
+    /// `provider_status()` must still report `SavedFallback`,
+    /// NOT `NotSelected` — otherwise the menu can't tell
+    /// "fallback only" from "nothing chosen".
+    #[test]
+    fn provider_status_reports_saved_fallback_even_after_staged_reset() {
+        let mut state = crate::model::OnboardingWizardState::default();
+        // Simulate the post-fallback-save state directly: reset
+        // staged provider AND set last_saved_provider_target to
+        // Fallback.
+        state.reset_staged_provider();
+        state.last_saved_provider_target =
+            Some(crate::model::OnboardingProviderSaveTarget::Fallback);
+        assert_eq!(
+            state.provider_status(),
+            crate::model::OnboardingProviderStatus::SavedFallback
+        );
+    }
+
+    /// M22-E: editing the API key (or any staged input) after a
+    /// failed test must clear `provider_test_failure_reason`
+    /// so the menu does not keep showing the stale "Test
+    /// failed — ..." label.
+    #[test]
+    fn editing_api_key_clears_stale_test_failure_reason() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+            crate::model::APPUI_METHOD_PROFILE_LLM_TEST,
+        ]);
+        store.state.onboarding.provider.family_id = "openai".into();
+        store.state.onboarding.provider.model_id = "gpt-test".into();
+        store.state.onboarding.provider.route.route_id = "openai".into();
+        store.state.onboarding.api_key = Some(crate::model::SecretString::new("old-key"));
+        store.state.onboarding.provider_test_failure_reason = Some("invalid key".into());
+
+        store.state.composer = "/onboard key new-key".into();
+        let _ = store.compose_command();
+
+        assert!(
+            store
+                .state
+                .onboarding
+                .provider_test_failure_reason
+                .is_none(),
+            "editing the key must clear stale test-failure recovery"
+        );
+    }
+
+    /// M22-E: the wizard's debug/state snapshot never contains
+    /// the raw API key — `SecretString::Debug` masks it. This
+    /// regression test pins the redaction contract.
+    #[test]
+    fn provider_api_key_is_redacted_in_debug_output() {
+        let mut state = crate::model::OnboardingWizardState::default();
+        state.api_key = Some(crate::model::SecretString::new("sk-very-secret-value-xyz"));
+        let formatted = format!("{state:?}");
+        assert!(
+            !formatted.contains("sk-very-secret-value-xyz"),
+            "debug output must not contain the raw API key: {formatted}"
+        );
     }
 
     #[test]

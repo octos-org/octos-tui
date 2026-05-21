@@ -1338,12 +1338,22 @@ fn onboarding_has_saved_primary_provider(
             .is_some_and(|provider| provider.has_api_key)
 }
 
-fn onboarding_provider_test_label(state: &OnboardingWizardState) -> &'static str {
+fn onboarding_provider_test_label(state: &OnboardingWizardState) -> String {
     match state.provider_pending {
-        Some(OnboardingProviderPending::Test) => "Testing connection...",
-        Some(OnboardingProviderPending::Save) => "Test unavailable while saving",
-        None if state.provider_tested => "Connection tested",
-        None => "Test connection",
+        Some(OnboardingProviderPending::Test) => "Testing connection...".into(),
+        Some(OnboardingProviderPending::Save) => "Test unavailable while saving".into(),
+        None if state.provider_tested => "Connection tested".into(),
+        None if state.provider_test_failure_reason.is_some() => {
+            // M22-E: surface the typed test failure so the user
+            // sees what went wrong and knows to edit the key or
+            // pick a different route.
+            let reason = state
+                .provider_test_failure_reason
+                .as_deref()
+                .unwrap_or_default();
+            format!("Test failed — {reason}")
+        }
+        None => "Test connection".into(),
     }
 }
 

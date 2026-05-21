@@ -1315,6 +1315,33 @@ pub enum OnboardingProviderSaveTarget {
     Fallback,
 }
 
+/// M22-E: product-grade lifecycle status for the provider setup
+/// step. Computed from existing fields (`selection_ready`,
+/// `has_api_key`, `provider_pending`, `provider_tested`,
+/// `provider_saved`, `last_saved_provider_target`) so we do NOT
+/// introduce a separate state machine. The variants map directly
+/// to the menu rows and status-bar copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnboardingProviderStatus {
+    /// No family/model/route selected yet.
+    NotSelected,
+    /// Family/model/route chosen but no API key staged.
+    KeyMissing,
+    /// `profile/llm/test` in flight.
+    Testing,
+    /// Last test failed; reason is the server message.
+    TestFailed { reason: String },
+    /// `profile/llm/upsert` in flight (primary or fallback).
+    Saving(OnboardingProviderSaveTarget),
+    /// Saved primary provider — finish is unlocked.
+    SavedPrimary,
+    /// Saved as a fallback only — primary save is still needed
+    /// before finish.
+    SavedFallback,
+    /// Selection + key staged, ready to test/save.
+    Ready,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnboardingWizardState {
     pub name: String,
@@ -1337,6 +1364,13 @@ pub struct OnboardingWizardState {
     pub last_saved_provider_label: Option<String>,
     pub last_saved_provider_target: Option<OnboardingProviderSaveTarget>,
     pub saved_primary_provider_label: Option<String>,
+    /// M22-E: typed failure reason for the most recent
+    /// `profile/llm/test`. Populated when the test resolves with
+    /// `ok = false`; cleared on a successful test, re-selection,
+    /// or save. Used by `provider_status` to render the
+    /// `TestFailed` variant with the server reason and by the menu
+    /// to surface a recovery message.
+    pub provider_test_failure_reason: Option<String>,
     pub last_message: Option<String>,
 }
 
@@ -1363,6 +1397,7 @@ impl Default for OnboardingWizardState {
             last_saved_provider_label: None,
             last_saved_provider_target: None,
             saved_primary_provider_label: None,
+            provider_test_failure_reason: None,
             last_message: None,
         }
     }
@@ -1451,11 +1486,69 @@ impl OnboardingWizardState {
             .unwrap_or("")
     }
 
+    /// M22-E: compute the product-grade provider lifecycle status
+    /// from the existing wizard fields. Order of checks is
+    /// deliberate:
+    ///
+    /// 1. Pending operations win (Testing/Saving).
+    /// 2. Test failures win over post-save states — the user must
+    ///    react before continuing.
+    /// 3. Post-save states win over pre-save selection checks
+    ///    because a successful fallback save resets the staged
+    ///    selection. Without this order a fallback save would
+    ///    report `NotSelected` and the menu could not
+    ///    distinguish fallback-only state from "nothing chosen".
+    /// 4. Pre-save selection/key checks for the unsaved path.
+    pub fn provider_status(&self) -> OnboardingProviderStatus {
+        if let Some(pending) = self.provider_pending {
+            return match pending {
+                OnboardingProviderPending::Test => OnboardingProviderStatus::Testing,
+                OnboardingProviderPending::Save => OnboardingProviderStatus::Saving(
+                    self.provider_save_target
+                        .unwrap_or(OnboardingProviderSaveTarget::Primary),
+                ),
+            };
+        }
+        if let Some(reason) = self.provider_test_failure_reason.as_deref() {
+            return OnboardingProviderStatus::TestFailed {
+                reason: reason.to_owned(),
+            };
+        }
+        // Saved-state check must run BEFORE selection/key checks
+        // because a successful fallback save resets staged input
+        // (see `apply_profile_llm_mutation_event` in store.rs).
+        if self.provider_saved
+            || matches!(
+                self.last_saved_provider_target,
+                Some(OnboardingProviderSaveTarget::Fallback)
+            )
+        {
+            return match self.last_saved_provider_target {
+                Some(OnboardingProviderSaveTarget::Fallback) => {
+                    OnboardingProviderStatus::SavedFallback
+                }
+                Some(OnboardingProviderSaveTarget::Primary) | None => {
+                    OnboardingProviderStatus::SavedPrimary
+                }
+            };
+        }
+        if !self.selection_ready() {
+            return OnboardingProviderStatus::NotSelected;
+        }
+        if !self.has_api_key() {
+            return OnboardingProviderStatus::KeyMissing;
+        }
+        OnboardingProviderStatus::Ready
+    }
+
     pub fn apply_selection(&mut self, selection: LlmSelectionConfig) {
         self.provider = selection;
         self.provider_tested = false;
         self.provider_pending = None;
         self.provider_save_target = None;
+        // M22-E: a fresh selection invalidates the last test
+        // failure — the user is implicitly retrying.
+        self.provider_test_failure_reason = None;
         self.last_message = Some("Provider selection updated from AppUI catalog".into());
     }
 
