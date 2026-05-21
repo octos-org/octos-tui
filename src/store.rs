@@ -2399,16 +2399,20 @@ impl Store {
             return;
         }
 
-        let supports_onboarding = self
-            .state
-            .capabilities
-            .as_ref()
-            .is_some_and(|capabilities| {
-                crate::menu::registry::APPUI_ONBOARDING_METHODS_ANY
-                    .iter()
-                    .any(|method| capabilities.supports_method(method))
-            });
-        if supports_onboarding {
+        // M22-A: only auto-open onboarding when the backend advertises a
+        // *profile-creation* surface (local solo no-OTP, or legacy email
+        // OTP). Provider/model-only catalogs do NOT trigger onboarding
+        // on first launch because there is nothing to onboard into.
+        let Some(capabilities) = self.state.capabilities.as_ref() else {
+            return;
+        };
+        let supports_local_solo = crate::menu::registry::APPUI_FIRST_LAUNCH_LOCAL_SOLO_METHODS
+            .iter()
+            .any(|method| capabilities.supports_method(method));
+        let supports_legacy_auth = crate::menu::registry::APPUI_FIRST_LAUNCH_LEGACY_AUTH_METHODS
+            .iter()
+            .all(|method| capabilities.supports_method(method));
+        if supports_local_solo || supports_legacy_auth {
             self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
         }
     }
@@ -4806,6 +4810,157 @@ mod tests {
                 .iter()
                 .any(|item| item.id == "onboard.local.create")
         );
+    }
+
+    /// M22-A: provider-only capabilities (e.g. `profile/llm/catalog`)
+    /// must NOT auto-open onboarding on first launch — without any
+    /// profile creation method, there is no onboarding to drive.
+    #[test]
+    fn first_launch_does_not_open_onboarding_when_only_provider_methods_advertised() {
+        let mut store = protocol_store_without_sessions();
+
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[
+                        crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+                        crate::model::APPUI_METHOD_MODEL_LIST,
+                        crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
+                    ],
+                    &[],
+                ),
+            },
+            message: "AppUI capabilities refreshed: 3 methods".into(),
+        }));
+
+        assert!(store.state.sessions.is_empty());
+        assert!(
+            store.state.active_menu.is_none(),
+            "onboarding must not auto-open without a profile-creation method"
+        );
+    }
+
+    /// M22-A: legacy email-OTP onboarding triggers first-launch flow
+    /// only when `auth/send_code`, `auth/verify`, AND `auth/me` are
+    /// advertised. `auth/me` is required because the wizard auto-issues
+    /// it after a successful `auth/verify` to resolve the profile id.
+    #[test]
+    fn first_launch_opens_onboarding_when_legacy_auth_advertised() {
+        let mut store = protocol_store_without_sessions();
+
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[
+                        crate::model::APPUI_METHOD_AUTH_SEND_CODE,
+                        crate::model::APPUI_METHOD_AUTH_VERIFY,
+                        crate::model::APPUI_METHOD_AUTH_ME,
+                    ],
+                    &[],
+                ),
+            },
+            message: "AppUI capabilities refreshed: 3 methods".into(),
+        }));
+
+        let Some(menu) = store.state.active_menu.as_ref() else {
+            panic!("legacy auth must open onboarding on first launch");
+        };
+        let active_id = match menu {
+            MenuBuildResult::Ready(spec) => spec.id.as_str().to_owned(),
+            MenuBuildResult::Loading(status)
+            | MenuBuildResult::Unavailable(status)
+            | MenuBuildResult::Error(status) => status.id.as_str().to_owned(),
+        };
+        assert_eq!(active_id, crate::menu::registry::MENU_ONBOARD);
+    }
+
+    /// M22-A: a backend that advertises only `auth/send_code` (missing
+    /// `auth/verify` or `auth/me`) is mid-implementation and must not
+    /// auto-open; the registry constant requires all three legs of the
+    /// OTP flow.
+    #[test]
+    fn first_launch_does_not_open_onboarding_when_legacy_auth_is_partial() {
+        let mut store = protocol_store_without_sessions();
+
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[crate::model::APPUI_METHOD_AUTH_SEND_CODE],
+                    &[],
+                ),
+            },
+            message: "AppUI capabilities refreshed: 1 method".into(),
+        }));
+
+        assert!(
+            store.state.active_menu.is_none(),
+            "partial legacy auth must not auto-open onboarding"
+        );
+    }
+
+    /// M22-A: `auth/send_code` + `auth/verify` without `auth/me` is
+    /// still partial — the wizard would strand the user after OTP
+    /// verification with no profile id resolved, which is exactly the
+    /// non-completable state this gate must prevent.
+    #[test]
+    fn first_launch_does_not_open_onboarding_when_legacy_auth_lacks_auth_me() {
+        let mut store = protocol_store_without_sessions();
+
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[
+                        crate::model::APPUI_METHOD_AUTH_SEND_CODE,
+                        crate::model::APPUI_METHOD_AUTH_VERIFY,
+                    ],
+                    &[],
+                ),
+            },
+            message: "AppUI capabilities refreshed: 2 methods".into(),
+        }));
+
+        assert!(
+            store.state.active_menu.is_none(),
+            "legacy auth without auth/me cannot complete; must not auto-open"
+        );
+    }
+
+    /// M22-A: with zero capabilities the TUI cannot decide whether
+    /// onboarding is supported, so it must leave the first-launch
+    /// surface alone instead of opening a broken onboarding menu.
+    #[test]
+    fn first_launch_does_not_open_onboarding_without_capabilities() {
+        let store = protocol_store_without_sessions();
+
+        assert!(store.state.capabilities.is_none());
+        assert!(
+            store.state.active_menu.is_none(),
+            "no capabilities means no auto-open of onboarding"
+        );
+    }
+
+    /// M22-A: `/setup` is an alias of `/onboard`, so typing either
+    /// must open the same onboarding surface — there is exactly one
+    /// `OnboardingWizardState`-backed menu.
+    #[test]
+    fn setup_alias_opens_same_onboarding_surface_as_onboard() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        // Clear any auto-opened menu so the slash command itself drives
+        // the surface deterministically.
+        store.close_all_menus();
+
+        store.state.composer = "/setup".into();
+        let command = store.compose_command();
+        assert!(command.is_none());
+
+        let active_id = store
+            .state
+            .menu_stack
+            .active()
+            .map(|frame| frame.id.as_str().to_owned())
+            .expect("/setup must open the onboarding menu");
+        assert_eq!(active_id, crate::menu::registry::MENU_ONBOARD);
     }
 
     #[test]
