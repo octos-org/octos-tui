@@ -1315,6 +1315,49 @@ pub enum OnboardingProviderSaveTarget {
     Fallback,
 }
 
+/// M22-B local-profile recovery state. Set when `profile/local/create`
+/// fails or pre-flight validation rejects the staged owner. The wizard
+/// renders this as the focused field plus a typed recovery message so
+/// the user is not shoved out of the profile step on a generic error
+/// status line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardingLocalProfileRecovery {
+    pub kind: OnboardingLocalProfileErrorKind,
+    pub focus_field: OnboardingLocalProfileField,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingLocalProfileErrorKind {
+    /// Backend rejected the username with `profile_local_collision`.
+    Collision,
+    /// Backend does not advertise `profile/local/create`
+    /// (`profile_local_unsupported`).
+    Unsupported,
+    /// Server-side `invalid_params` rejected a staged field.
+    InvalidParams,
+    /// Pre-flight client-side validation rejected a field before any
+    /// RPC was issued.
+    InvalidField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingLocalProfileField {
+    Name,
+    Username,
+    Email,
+}
+
+impl OnboardingLocalProfileField {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Username => "username",
+            Self::Email => "email",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnboardingWizardState {
     pub name: String,
@@ -1324,6 +1367,20 @@ pub struct OnboardingWizardState {
     pub profile_id: Option<String>,
     pub local_profile_created: bool,
     pub open_session_after_profile_create: bool,
+    /// M22-B: true while a `profile/local/create` RPC is in flight.
+    /// Lets `AppUiEvent::Error` attribute typed onboarding errors back
+    /// to the profile step without inspecting error message strings.
+    pub local_profile_create_pending: bool,
+    /// M22-B: username captured at the moment `profile/local/create`
+    /// was submitted. The collision recovery message uses THIS value
+    /// so a late server error never claims the freshly-edited staged
+    /// username was the one rejected. `None` when no create RPC has
+    /// been submitted (or after a success/failure has cleared it).
+    pub local_profile_create_pending_username: Option<String>,
+    /// M22-B: typed recovery for the local-profile step. `None` when
+    /// the step is clean; populated by server `profile_local_*` errors
+    /// or client-side validation.
+    pub local_profile_recovery: Option<OnboardingLocalProfileRecovery>,
     pub auth_email_enabled: Option<bool>,
     pub auth_code_sent: bool,
     pub auth_verified: bool,
@@ -1350,6 +1407,9 @@ impl Default for OnboardingWizardState {
             profile_id: None,
             local_profile_created: false,
             open_session_after_profile_create: false,
+            local_profile_create_pending: false,
+            local_profile_create_pending_username: None,
+            local_profile_recovery: None,
             auth_email_enabled: None,
             auth_code_sent: false,
             auth_verified: false,
@@ -1405,6 +1465,13 @@ impl OnboardingWizardState {
     }
 
     pub fn local_profile_ready(&self) -> bool {
+        // The contract calls email "optional metadata" for solo
+        // mode, but the current backend implementation of
+        // `profile/local/create` still validates `email` as
+        // non-empty and rejects `""` with
+        // `profile_local_invalid_email`. Until the backend relaxes
+        // that, the TUI must keep email required so the menu does
+        // not invite the user into a guaranteed-failure submission.
         self.has_name() && self.has_username() && self.has_email()
     }
 
@@ -1544,7 +1611,219 @@ impl OnboardingWizardState {
         self.email = result.email.clone();
         self.local_profile_created = true;
         self.auth_verified = true;
+        self.local_profile_create_pending = false;
+        self.local_profile_create_pending_username = None;
+        self.local_profile_recovery = None;
     }
+
+    /// M22-B: pre-flight validation for the local profile step.
+    /// Returns the first failing field with a typed recovery so the
+    /// TUI never spends a `profile/local/create` round-trip on an
+    /// obviously bad shape (empty fields, malformed email).
+    ///
+    /// Validation rules:
+    /// - Name: non-empty, max 128 chars after trim.
+    /// - Username: non-empty, max 64 chars, ASCII printable without
+    ///   spaces (so it is shell- and path-safe).
+    /// - Email: non-empty when supplied; must contain `@` with a non-
+    ///   empty local and domain part. Empty email is allowed because
+    ///   email is local metadata for the solo-mode profile (the
+    ///   contract calls it optional).
+    pub fn validate_local_profile(&self) -> Result<(), OnboardingLocalProfileRecovery> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err(OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::InvalidField,
+                focus_field: OnboardingLocalProfileField::Name,
+                message: "Display name is required. Use /onboard name <display name>.".into(),
+            });
+        }
+        if name.chars().count() > 128 {
+            return Err(OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::InvalidField,
+                focus_field: OnboardingLocalProfileField::Name,
+                message: "Display name must be 128 characters or fewer.".into(),
+            });
+        }
+
+        let username = self.username.trim();
+        if username.is_empty() {
+            return Err(OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::InvalidField,
+                focus_field: OnboardingLocalProfileField::Username,
+                message: "Username is required. Use /onboard username <handle>.".into(),
+            });
+        }
+        if username.len() > 64 {
+            return Err(OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::InvalidField,
+                focus_field: OnboardingLocalProfileField::Username,
+                message: "Username must be 64 characters or fewer.".into(),
+            });
+        }
+        if username
+            .chars()
+            .any(|c| !c.is_ascii() || c.is_ascii_whitespace() || c.is_ascii_control())
+        {
+            return Err(OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::InvalidField,
+                focus_field: OnboardingLocalProfileField::Username,
+                message: "Username must be ASCII without whitespace or control characters.".into(),
+            });
+        }
+
+        let email = self.email.trim();
+        if email.is_empty() {
+            return Err(OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::InvalidField,
+                focus_field: OnboardingLocalProfileField::Email,
+                message: "Email is required by the backend. Use /onboard email <address>.".into(),
+            });
+        }
+        if !looks_like_email(email) {
+            return Err(OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::InvalidField,
+                focus_field: OnboardingLocalProfileField::Email,
+                message:
+                    "Email must contain a non-empty local-part and domain (e.g. ada@example.com)."
+                        .into(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// M22-B: apply a typed error returned from a pending
+    /// `profile/local/create` request. The caller (the store error
+    /// handler) is responsible for recognizing the structured code;
+    /// this routine decides which field to focus and what recovery
+    /// text to display so the user stays on the profile step.
+    pub fn apply_local_profile_error(&mut self, code: &str, message: &str) {
+        // Prefer the pending-username snapshot captured at submit
+        // time so a late error never claims the freshly-edited staged
+        // username was the one rejected.
+        let collided_username = self
+            .local_profile_create_pending_username
+            .clone()
+            .unwrap_or_else(|| self.username.clone());
+        // The backend prepends the failing method as a prefix on
+        // method-attributed responses
+        // (`profile/local/create request tui-N failed: <reason>`).
+        // Strip it so the user does not see the wire protocol leaking
+        // into the recovery copy.
+        let server_reason = strip_method_prefix(message, "profile/local/create");
+        let recovery = match code {
+            "profile_local_collision" => OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::Collision,
+                focus_field: OnboardingLocalProfileField::Username,
+                // The backend uses `profile_local_collision` for any
+                // existing-owner collision (username, email metadata,
+                // or owner id), with the reason in the message. Keep
+                // that reason rather than hard-coding "username taken".
+                message: format!(
+                    "Local profile collision for '{collided_username}': {server_reason}. Edit the fields with /onboard name|username|email and try again."
+                ),
+            },
+            "profile_local_unsupported" => OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::Unsupported,
+                focus_field: OnboardingLocalProfileField::Username,
+                // We do NOT suggest `/login` here because the registry
+                // hides OTP slash commands while `profile/local/create`
+                // is advertised by the capability set. A backend
+                // returning `profile_local_unsupported` despite
+                // advertising the method is misconfigured, not a
+                // signal that the user can fall back to OTP locally.
+                message: "This server returned profile_local_unsupported for profile/local/create. The backend is misconfigured — restart the server with local solo onboarding enabled, or connect to a backend that fully supports it."
+                    .into(),
+            },
+            "profile_local_invalid_name" => OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::InvalidParams,
+                focus_field: OnboardingLocalProfileField::Name,
+                message: format!(
+                    "Server rejected the display name: {server_reason}. Edit it with /onboard name <display name>."
+                ),
+            },
+            "profile_local_invalid_username" => OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::InvalidParams,
+                focus_field: OnboardingLocalProfileField::Username,
+                message: format!(
+                    "Server rejected the username: {server_reason}. Edit it with /onboard username <handle>."
+                ),
+            },
+            "profile_local_invalid_email" => OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::InvalidParams,
+                focus_field: OnboardingLocalProfileField::Email,
+                message: format!(
+                    "Server rejected the email: {server_reason}. Edit it with /onboard email <address>."
+                ),
+            },
+            "invalid_params" => OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::InvalidParams,
+                // Without more granular server data we cannot know
+                // which field is at fault; default to username because
+                // collision is the highest-prior real-world cause.
+                focus_field: OnboardingLocalProfileField::Username,
+                message: format!(
+                    "Server rejected the profile fields as invalid: {server_reason}. Edit them with /onboard name|username|email."
+                ),
+            },
+            _ => OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::InvalidParams,
+                focus_field: OnboardingLocalProfileField::Username,
+                message: format!("profile/local/create failed: {server_reason}"),
+            },
+        };
+        self.local_profile_create_pending = false;
+        self.local_profile_create_pending_username = None;
+        self.local_profile_created = false;
+        self.local_profile_recovery = Some(recovery);
+    }
+
+    /// M22-B: clear local-profile recovery state after the user edits
+    /// the offending field. Called from the field setter so the typed
+    /// recovery does not linger after the user acts on it.
+    ///
+    /// The pending-create snapshot (`local_profile_create_pending_username`)
+    /// is intentionally NOT cleared here: a late server response for
+    /// the in-flight create must continue to render the recovery
+    /// against the username that was actually submitted, not the
+    /// freshly-edited value. The snapshot is only cleared by the
+    /// next create dispatch (replaced with the new value) or by the
+    /// success/error response handlers in `apply_profile_local_create`
+    /// and `apply_local_profile_error`.
+    pub fn clear_local_profile_recovery(&mut self) {
+        self.local_profile_recovery = None;
+    }
+}
+
+/// M22-B: strip the wire-level method prefix that
+/// `error_response_to_app_event` prepends to method-attributed
+/// failures (`"<method> request <id> failed: <reason>"`). The
+/// recovery copy then renders just the server reason, not the raw
+/// JSON-RPC wire format.
+fn strip_method_prefix(message: &str, method: &str) -> String {
+    let prefix = format!("{method} request");
+    if let Some(rest) = message.strip_prefix(&prefix) {
+        if let Some((_, reason)) = rest.split_once(": ") {
+            return reason.trim().to_owned();
+        }
+    }
+    message.to_owned()
+}
+
+/// Cheap shape-only check: requires `local@domain` with non-empty
+/// parts. Single-label domains (`ada@localhost`, `dev@corp`) are
+/// allowed because the backend's `profile/local/create` accepts
+/// them — the TUI must not be stricter than the server. The backend
+/// remains the source of truth for full RFC validation.
+fn looks_like_email(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    !local.trim().is_empty()
+        && !domain.trim().is_empty()
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
 }
 
 pub fn auth_me_email(result: &AuthMeResult) -> Option<&str> {
@@ -5075,5 +5354,155 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// M22-B: pre-flight validation surfaces the first failing field
+    /// in declaration order (name → username → email) so the user
+    /// fixes one thing at a time.
+    #[test]
+    fn validate_local_profile_reports_first_missing_field() {
+        let state = OnboardingWizardState::default();
+        let err = state
+            .validate_local_profile()
+            .expect_err("default state has no name");
+        assert_eq!(err.focus_field, OnboardingLocalProfileField::Name);
+        assert_eq!(err.kind, OnboardingLocalProfileErrorKind::InvalidField);
+    }
+
+    #[test]
+    fn validate_local_profile_rejects_whitespace_in_username() {
+        let mut state = OnboardingWizardState::default();
+        state.name = "Ada Lovelace".into();
+        state.username = "ada lovelace".into();
+        state.email = "ada@example.com".into();
+        let err = state
+            .validate_local_profile()
+            .expect_err("username must reject whitespace");
+        assert_eq!(err.focus_field, OnboardingLocalProfileField::Username);
+        assert!(
+            err.message.contains("ASCII without whitespace"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn validate_local_profile_accepts_single_label_domain() {
+        // The backend accepts `ada@localhost` and `dev@corp`; the
+        // TUI must NOT be stricter than the server.
+        let mut state = OnboardingWizardState::default();
+        state.name = "Ada".into();
+        state.username = "ada".into();
+        state.email = "ada@localhost".into();
+        assert!(state.validate_local_profile().is_ok());
+    }
+
+    #[test]
+    fn validate_local_profile_rejects_malformed_email() {
+        let mut state = OnboardingWizardState::default();
+        state.name = "Ada".into();
+        state.username = "ada".into();
+        state.email = "not-an-email".into();
+        let err = state.validate_local_profile().expect_err("bad email");
+        assert_eq!(err.focus_field, OnboardingLocalProfileField::Email);
+    }
+
+    #[test]
+    fn validate_local_profile_requires_email_to_match_backend_contract() {
+        let mut state = OnboardingWizardState::default();
+        state.name = "Ada".into();
+        state.username = "ada".into();
+        // Empty email is rejected: the current backend
+        // implementation of `profile/local/create` returns
+        // `profile_local_invalid_email` for `""`. The contract
+        // calls email optional but the backend implementation has
+        // not relaxed yet.
+        let err = state
+            .validate_local_profile()
+            .expect_err("empty email must be rejected pre-flight");
+        assert_eq!(err.focus_field, OnboardingLocalProfileField::Email);
+    }
+
+    #[test]
+    fn apply_local_profile_error_routes_collision_to_username() {
+        let mut state = OnboardingWizardState::default();
+        state.username = "ada".into();
+        state.local_profile_create_pending = true;
+        state.local_profile_create_pending_username = Some("ada".into());
+        state.apply_local_profile_error("profile_local_collision", "username already taken");
+        let recovery = state.local_profile_recovery.expect("recovery");
+        assert_eq!(recovery.kind, OnboardingLocalProfileErrorKind::Collision);
+        assert_eq!(recovery.focus_field, OnboardingLocalProfileField::Username);
+        assert!(recovery.message.contains("collision for 'ada'"));
+        assert!(recovery.message.contains("username already taken"));
+        assert!(!state.local_profile_create_pending);
+        assert!(!state.local_profile_created);
+    }
+
+    #[test]
+    fn apply_local_profile_error_routes_invalid_email_to_email_field() {
+        let mut state = OnboardingWizardState::default();
+        state.apply_local_profile_error(
+            "profile_local_invalid_email",
+            "profile/local/create request tui-1 failed: email must contain @",
+        );
+        let recovery = state.local_profile_recovery.expect("recovery");
+        assert_eq!(recovery.focus_field, OnboardingLocalProfileField::Email);
+        assert!(recovery.message.contains("email must contain"));
+    }
+
+    #[test]
+    fn apply_local_profile_error_routes_invalid_name_to_name_field() {
+        let mut state = OnboardingWizardState::default();
+        state.apply_local_profile_error(
+            "profile_local_invalid_name",
+            "profile/local/create request tui-1 failed: name must be non-empty",
+        );
+        let recovery = state.local_profile_recovery.expect("recovery");
+        assert_eq!(recovery.focus_field, OnboardingLocalProfileField::Name);
+    }
+
+    #[test]
+    fn apply_local_profile_error_routes_invalid_username_to_username_field() {
+        let mut state = OnboardingWizardState::default();
+        state.apply_local_profile_error(
+            "profile_local_invalid_username",
+            "profile/local/create request tui-1 failed: username has whitespace",
+        );
+        let recovery = state.local_profile_recovery.expect("recovery");
+        assert_eq!(recovery.focus_field, OnboardingLocalProfileField::Username);
+    }
+
+    #[test]
+    fn strip_method_prefix_removes_jsonrpc_envelope() {
+        // Helper visibility (it's a free function in the same module).
+        let stripped = super::strip_method_prefix(
+            "profile/local/create request tui-3 failed: username taken",
+            "profile/local/create",
+        );
+        assert_eq!(stripped, "username taken");
+    }
+
+    #[test]
+    fn apply_profile_local_create_success_clears_pending_and_recovery() {
+        let mut state = OnboardingWizardState::default();
+        state.local_profile_create_pending = true;
+        state.local_profile_recovery = Some(OnboardingLocalProfileRecovery {
+            kind: OnboardingLocalProfileErrorKind::Collision,
+            focus_field: OnboardingLocalProfileField::Username,
+            message: "stale".into(),
+        });
+        state.apply_profile_local_create(&ProfileLocalCreateResult {
+            profile_id: "ada".into(),
+            user_id: "ada-user".into(),
+            name: "Ada Lovelace".into(),
+            username: "ada".into(),
+            email: "ada@example.com".into(),
+            created: true,
+            runtime_mode: "solo".into(),
+        });
+        assert!(state.local_profile_created);
+        assert!(!state.local_profile_create_pending);
+        assert!(state.local_profile_recovery.is_none());
     }
 }

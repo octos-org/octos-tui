@@ -1241,6 +1241,12 @@ fn onboarding_local_profile_label(state: &OnboardingWizardState) -> String {
 }
 
 fn onboarding_local_profile_disabled_reason(state: &OnboardingWizardState) -> Option<String> {
+    // M22-B: email stays required to match the current backend
+    // contract for `profile/local/create` (it rejects `""` with
+    // `profile_local_invalid_email`). The contract's "optional
+    // email metadata" wording is aspirational until the backend
+    // accepts empty email; flipping the TUI now would invite the
+    // user into a guaranteed-failure submission.
     if !state.has_name() {
         Some("name is empty".into())
     } else if !state.has_username() {

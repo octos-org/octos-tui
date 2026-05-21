@@ -1243,11 +1243,17 @@ impl AppUiBackend for ProtocolAppUiBackend {
         }
 
         if self.protocol.pending_requests.len() >= MAX_PENDING_REQUESTS {
+            // M22-B: include the rejected method in the error
+            // message so onboarding (and any future callers) can
+            // attribute pre-send rejections back to the command
+            // that was just blocked. Without this the store cannot
+            // tell which command lost its slot in the queue.
+            let method = command.method();
             self.queue.push_back(
                 AppUiEvent::Error(AppUiError {
                     code: "too_many_pending_requests".into(),
                     message: format!(
-                        "UI protocol has {} pending request(s); refusing to enqueue another request",
+                        "UI protocol has {} pending request(s); refusing to enqueue {method} request",
                         self.protocol.pending_requests.len()
                     ),
                 })
@@ -2764,6 +2770,11 @@ impl MockAppUiBackend {
             title: "mock background synthesis".into(),
             state: TaskRuntimeState::Running,
             runtime_detail: Some("Synthesizing task output stream".into()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         }));
         self.enqueue_protocol(UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
             session_id: session_id.clone(),
@@ -2792,6 +2803,11 @@ impl MockAppUiBackend {
             title: "mock background synthesis".into(),
             state: TaskRuntimeState::Completed,
             runtime_detail: Some("Summary ready in runtime_detail".into()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         }));
         self.enqueue_protocol(UiNotification::Warning(WarningEvent {
             session_id: session_id.clone(),
@@ -5019,6 +5035,14 @@ mod tests {
         };
         assert_eq!(error.code, "too_many_pending_requests");
         assert!(error.message.contains("pending request"));
+        // M22-B: the message must include the rejected method name
+        // so onboarding (and other callers) can attribute pre-send
+        // rejections to the command that lost its slot.
+        assert!(
+            error.message.contains(methods::APPROVAL_SCOPES_LIST),
+            "expected method name in too_many_pending_requests message, got: {}",
+            error.message
+        );
     }
 
     #[test]
