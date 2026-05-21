@@ -1299,8 +1299,71 @@ pub enum OnboardingAction {
     SaveProvider,
     SaveProviderFallback,
     TestProvider,
+    /// M22-F: render the doctor report (pass/warn/fail/skip per
+    /// onboarding category) in the status line and as an
+    /// activity entry.
+    Doctor,
     Finish,
     Reset,
+}
+
+/// M22-F: outcome of a single doctor check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnboardingDoctorOutcome {
+    /// Check passed; `detail` carries a short summary.
+    Pass { detail: String },
+    /// Check is recoverable; `recovery` names the user action.
+    Warn { reason: String, recovery: String },
+    /// Check failed; `recovery` names the user action.
+    Fail { reason: String, recovery: String },
+    /// Check could not run (capability missing); `detail` names
+    /// the unsupported method.
+    Skipped { detail: String },
+}
+
+impl OnboardingDoctorOutcome {
+    pub fn is_pass(&self) -> bool {
+        matches!(self, Self::Pass { .. })
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Pass { .. } => "PASS",
+            Self::Warn { .. } => "WARN",
+            Self::Fail { .. } => "FAIL",
+            Self::Skipped { .. } => "SKIP",
+        }
+    }
+}
+
+/// M22-F: a single doctor check row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardingDoctorCheck {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub outcome: OnboardingDoctorOutcome,
+}
+
+/// M22-F: aggregated doctor report. The wizard owns the
+/// aggregation so the doctor surface is just a typed projection
+/// of existing state — there is no new mutable repair step,
+/// only typed recovery copy that points at the existing
+/// `/onboard <step>` actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardingDoctorReport {
+    pub checks: Vec<OnboardingDoctorCheck>,
+}
+
+impl OnboardingDoctorReport {
+    pub fn any_failures(&self) -> bool {
+        self.checks
+            .iter()
+            .any(|check| matches!(check.outcome, OnboardingDoctorOutcome::Fail { .. }))
+    }
+    pub fn any_warnings(&self) -> bool {
+        self.checks
+            .iter()
+            .any(|check| matches!(check.outcome, OnboardingDoctorOutcome::Warn { .. }))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
