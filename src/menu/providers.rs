@@ -953,10 +953,44 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
         footer_hint: Some(
             "Up/Down choose | Enter edit or continue | type value, Enter save".into(),
         ),
-        preview: None,
+        // M22 (#58): ASCII splash. The preview pane carries the
+        // `OCTOS` wordmark and a stylised logo so the first-run
+        // screen has a memorable identity. Keep the art tight so
+        // it fits in the preview column at 80x24.
+        preview: Some(MenuPreview::Text {
+            title: Some("OCTOS".into()),
+            body: ONBOARDING_SPLASH_ASCII.into(),
+        }),
         mode: MenuMode::SingleSelect,
     })
 }
+
+/// M22 (#58): first-run ASCII splash. The narrow preview pane
+/// (80x24 layout) gives us only ~3 body rows after the title bar,
+/// so the splash body prioritises:
+///   line 1: tagline / call to action (always visible),
+///   line 2: a compact one-line OCTOS wordmark,
+///   line 3+: extended wordmark + stylised logo (visible when the
+///           preview row budget grows on a wider terminal).
+/// The title line "OCTOS" is rendered separately by the preview
+/// frame, so this body intentionally repeats the wordmark in
+/// ASCII below the tagline for users on wide terminals while
+/// keeping the most important content in the first row.
+const ONBOARDING_SPLASH_ASCII: &str = "\
+  Welcome to Octos — local solo onboarding
+  [ O ][ C ][ T ][ O ][ S ]
+   ____   ____ _____ ___  ____
+  / __ \\ / ___|_   _/ _ \\/ ___|
+ | |  | | |     | || | | \\___ \\
+ | |__| | |___  | || |_| |___) |
+  \\____/ \\____| |_| \\___/|____/
+
+       .-''''-.
+    .-'  o  o  '-.
+   /      __      \\
+   \\   .-'  '-.   /
+ ~~~\\_/  /\\/\\  \\_/~~~
+      \\_/ /\\ \\_/";
 
 fn onboarding_family_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let Some(catalog) = ctx.app.profile_llm_catalog else {
@@ -4897,7 +4931,18 @@ mod tests {
                 .any(|item| item.id == "onboard.auth.verify")
         );
         assert_eq!(spec.title, "Welcome to Octos");
-        assert!(spec.preview.is_none());
+        // M22 (#58): splash now carries an ASCII preview pane.
+        match spec.preview.as_ref().expect("splash preview present") {
+            MenuPreview::Text { title, body } => {
+                assert_eq!(title.as_deref(), Some("OCTOS"));
+                assert!(body.contains("Welcome to Octos"));
+                assert!(
+                    body.contains("____") || body.contains("OCTOS"),
+                    "expected ASCII wordmark in splash body, got:\n{body}"
+                );
+            }
+            other => panic!("expected Text preview, got: {other:?}"),
+        }
         assert!(
             !spec
                 .items

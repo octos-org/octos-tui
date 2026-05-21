@@ -4211,6 +4211,40 @@ mod tests {
         assert!(!text.contains("Ask Octos to change code"));
     }
 
+    /// M22 (#58): the first-run onboarding surface renders an
+    /// ASCII OCTOS wordmark in the preview pane. This pins the
+    /// splash so a future refactor cannot quietly drop the
+    /// distinctive identity.
+    #[test]
+    fn render_first_launch_onboarding_includes_ascii_octos_splash() {
+        let mut store = Store {
+            state: AppState::new(
+                vec![],
+                0,
+                "AppUI connected".into(),
+                Some("stdio:octos serve --stdio".into()),
+                false,
+            ),
+        };
+        store.state.set_capabilities(UiProtocolCapabilities::new(
+            &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            &[],
+        ));
+        store.open_menu(crate::menu::MenuId::from(
+            crate::menu::registry::MENU_ONBOARD,
+        ));
+
+        let text = rendered_text(&store.state);
+
+        // ASCII wordmark — at least one characteristic letterform
+        // line plus the human-readable label live in the preview.
+        assert!(
+            text.contains("OCTOS"),
+            "expected OCTOS label/wordmark in splash, got:\n{text}"
+        );
+        assert!(text.contains("Welcome to Octos"));
+    }
+
     #[test]
     fn render_first_launch_onboarding_child_menu_stays_on_onboarding_surface() {
         let mut store = Store {
