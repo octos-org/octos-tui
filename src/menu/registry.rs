@@ -97,6 +97,26 @@ pub const APPUI_ONBOARDING_METHODS_ANY: &[&str] = &[
     APPUI_METHOD_PROFILE_LLM_TEST,
     APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
 ];
+/// M22-A first-launch trigger: methods that, when advertised, mean the
+/// backend can drive a local solo profile creation flow without OTP.
+/// Auto-open of onboarding on first launch requires advertising at
+/// least one of these (i.e. `profile/local/create`).
+pub const APPUI_FIRST_LAUNCH_LOCAL_SOLO_METHODS: &[&str] = &[APPUI_METHOD_PROFILE_LOCAL_CREATE];
+/// M22-A first-launch trigger: methods that, when ALL advertised,
+/// mean the backend can drive legacy email-OTP onboarding. Provider-
+/// only capability (e.g. `profile/llm/catalog`) MUST NOT trigger
+/// onboarding on first launch — without a profile-creation method the
+/// user has nothing to onboard into.
+///
+/// `auth/me` is required: after `auth/verify` succeeds, the wizard
+/// follow-up unconditionally calls `auth/me` to resolve the profile id
+/// (see `Store::apply_client_event` for the `AuthVerify` branch). Without
+/// it the user would be stranded post-OTP with no profile binding.
+pub const APPUI_FIRST_LAUNCH_LEGACY_AUTH_METHODS: &[&str] = &[
+    APPUI_METHOD_AUTH_SEND_CODE,
+    APPUI_METHOD_AUTH_VERIFY,
+    APPUI_METHOD_AUTH_ME,
+];
 pub const APPUI_PERMISSION_MENU_METHODS_ANY: &[&str] = &[
     methods::APPROVAL_SCOPES_LIST,
     APPUI_METHOD_PERMISSION_PROFILE_LIST,

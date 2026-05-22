@@ -4233,6 +4233,42 @@ mod tests {
         assert!(!text.contains("Ask Octos to change code"));
     }
 
+    /// M22-A: when the backend advertises no onboarding methods,
+    /// opening the onboarding menu must render a disabled-reason
+    /// status surface — never a blank pane that swallows the
+    /// first-launch flow.
+    #[test]
+    fn render_onboarding_without_capabilities_shows_disabled_reason_not_blank() {
+        let mut store = Store {
+            state: AppState::new(
+                vec![],
+                0,
+                "AppUI connected".into(),
+                Some("stdio:octos serve --stdio".into()),
+                false,
+            ),
+        };
+        store
+            .state
+            .set_capabilities(UiProtocolCapabilities::new(&[], &[]));
+        store.open_menu(crate::menu::MenuId::from(
+            crate::menu::registry::MENU_ONBOARD,
+        ));
+
+        let text = rendered_text(&store.state);
+
+        // The status surface MUST surface a typed disabled reason.
+        assert!(
+            text.contains("Onboarding unavailable"),
+            "expected disabled-reason title in rendered text:\n{text}"
+        );
+        // And it MUST NOT render the empty-chat scaffold under
+        // first-launch (no sessions) — that would be the "blank pane"
+        // regression the acceptance bullet bans.
+        assert!(!text.contains("No session selected"));
+        assert!(!text.contains("Ask Octos to change code"));
+    }
+
     #[test]
     fn render_composer_shows_staged_messages() {
         let mut app = AppState::new(
