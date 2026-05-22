@@ -13,8 +13,9 @@ use crate::{
     menu::render as menu_render,
     model::{
         ActivityItem, ActivityKind, AppState, ApprovalModalState, ComposerPresentation,
-        DiffPreviewPaneState, FocusPane, PlanStep as RenderedPlanStep, SessionRunState,
-        SessionView, TaskOutputDetailState, TurnActivityLog, extract_plan_steps, task_state_label,
+        DiffPreviewPaneState, FocusPane, PlanStep as RenderedPlanStep, SessionAutonomyState,
+        SessionRunState, SessionView, TaskOutputDetailState, TurnActivityLog, extract_plan_steps,
+        task_state_label,
     },
     theme::Palette,
 };
@@ -55,16 +56,17 @@ fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
         frame.area().width,
         frame.area().height,
     );
-    let surface_budget = frame
-        .area()
-        .height
-        .saturating_sub(min_transcript_height(frame.area().height) + composer_height + 1);
+    let autonomy_height = autonomy_indicator_height(app);
+    let surface_budget = frame.area().height.saturating_sub(
+        min_transcript_height(frame.area().height) + composer_height + autonomy_height + 1,
+    );
     let menu_height = desired_menu_height.min(surface_budget);
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(8),
             Constraint::Length(menu_height),
+            Constraint::Length(autonomy_height),
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
@@ -74,9 +76,12 @@ fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
     if let Some(menu) = active_menu.as_ref() {
         menu_render::render_menu_surface(frame, root[1], menu, palette);
     }
-    frame.render_widget(render_composer(app, palette, root[2]), root[2]);
-    set_composer_cursor(frame, app, root[2]);
-    frame.render_widget(render_status(app, palette), root[3]);
+    if autonomy_height > 0 {
+        frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
+    }
+    frame.render_widget(render_composer(app, palette, root[3]), root[3]);
+    set_composer_cursor(frame, app, root[3]);
+    frame.render_widget(render_status(app, palette), root[4]);
 }
 
 fn render_onboarding_first_launch_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
@@ -123,11 +128,13 @@ fn render_inspector_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palet
         frame.area().width,
         frame.area().height,
     );
+    let autonomy_height = autonomy_indicator_height(app);
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(12),
             Constraint::Length(menu_height),
+            Constraint::Length(autonomy_height),
             Constraint::Length(composer_height),
             Constraint::Length(4),
         ])
@@ -170,9 +177,12 @@ fn render_inspector_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palet
     if let Some(menu) = active_menu.as_ref() {
         menu_render::render_menu_surface(frame, root[1], menu, palette);
     }
-    frame.render_widget(render_composer(app, palette, root[2]), root[2]);
-    set_composer_cursor(frame, app, root[2]);
-    frame.render_widget(render_status(app, palette), root[3]);
+    if autonomy_height > 0 {
+        frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
+    }
+    frame.render_widget(render_composer(app, palette, root[3]), root[3]);
+    set_composer_cursor(frame, app, root[3]);
+    frame.render_widget(render_status(app, palette), root[4]);
 }
 
 fn active_menu_surface(app: &AppState) -> Option<menu_render::MenuSurface> {
@@ -2328,6 +2338,157 @@ struct ComposerInputView {
     hidden_prefix: bool,
     cursor_row: u16,
     cursor_width: usize,
+}
+
+/// Max width of a per-loop chip label before truncation. Keeps the
+/// indicator row compact when several loops are running concurrently.
+const AUTONOMY_LOOP_LABEL_MAX: usize = 20;
+
+/// Returns the active session's autonomy mirror, or `None` if either no
+/// session is selected or the backend has not yet populated the mirror.
+fn active_session_autonomy(app: &AppState) -> Option<&SessionAutonomyState> {
+    let session = app.active_session()?;
+    app.session_autonomy_for(&session.id)
+}
+
+/// Number of rows the sticky autonomy indicator needs: 0 when both goal
+/// and loops are absent, 1 when only one is present, 2 when both are.
+fn autonomy_indicator_height(app: &AppState) -> u16 {
+    match active_session_autonomy(app) {
+        Some(state) => {
+            let mut rows = 0u16;
+            if state.goal.is_some() {
+                rows += 1;
+            }
+            if !state.loops.is_empty() {
+                rows += 1;
+            }
+            rows
+        }
+        None => 0,
+    }
+}
+
+/// Trim a loop's prompt down to a chip-sized label. Prefers the first
+/// line for legibility; falls back to a UTF-8 safe char-boundary cut at
+/// [`AUTONOMY_LOOP_LABEL_MAX`].
+fn autonomy_loop_label(record: &octos_core::ui_protocol::UiLoopRecord) -> String {
+    let prompt = record.prompt.trim();
+    if prompt.is_empty() {
+        return record
+            .loop_id
+            .chars()
+            .take(AUTONOMY_LOOP_LABEL_MAX)
+            .collect();
+    }
+    let first_line = prompt.lines().next().unwrap_or(prompt).trim();
+    if first_line.chars().count() <= AUTONOMY_LOOP_LABEL_MAX {
+        first_line.to_string()
+    } else {
+        let mut truncated: String = first_line
+            .chars()
+            .take(AUTONOMY_LOOP_LABEL_MAX.saturating_sub(1))
+            .collect();
+        truncated.push('…');
+        truncated
+    }
+}
+
+/// Format the cadence prefix for a loop chip (e.g. `5m`, `2h`,
+/// `self-paced`, `maintenance`). Unknown modes pass through verbatim.
+fn autonomy_loop_cadence(record: &octos_core::ui_protocol::UiLoopRecord) -> String {
+    match record.mode.as_str() {
+        "fixed_interval" => match record.interval_seconds {
+            Some(secs) if secs >= 3600 && secs % 3600 == 0 => format!("{}h", secs / 3600),
+            Some(secs) if secs >= 60 && secs % 60 == 0 => format!("{}m", secs / 60),
+            Some(secs) => format!("{secs}s"),
+            None => "interval".to_string(),
+        },
+        "self_paced" => "self-paced".to_string(),
+        "maintenance" => "maintenance".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// True when a loop is in the runnable `"active"` state. Paused / deleted
+/// loops still appear in the chip row but are dimmed.
+fn autonomy_loop_is_active(record: &octos_core::ui_protocol::UiLoopRecord) -> bool {
+    record.status == "active"
+}
+
+/// Build the line set for the sticky autonomy indicator. Returns 0, 1,
+/// or 2 lines (goal first, then loops).
+fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> {
+    let Some(state) = active_session_autonomy(app) else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    if let Some(goal) = state.goal.as_ref() {
+        let objective = if goal.objective.trim().is_empty() {
+            goal.goal_id.clone()
+        } else {
+            goal.objective.clone()
+        };
+        let parenthetical = format!(
+            " ({} · {}/{} tokens)",
+            goal.status, goal.tokens_used, goal.token_budget
+        );
+        lines.push(Line::from(vec![
+            Span::styled(
+                "◆ ",
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(palette.surface),
+            ),
+            Span::styled("Goal: ", palette.title().bg(palette.surface)),
+            Span::styled(objective, palette.text().bg(palette.surface)),
+            Span::styled(parenthetical, palette.muted().bg(palette.surface)),
+        ]));
+    }
+    if !state.loops.is_empty() {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let running = state
+            .loops
+            .iter()
+            .filter(|l| autonomy_loop_is_active(l))
+            .count();
+        spans.push(Span::styled(
+            "↻ ",
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+                .bg(palette.surface),
+        ));
+        spans.push(Span::styled(
+            format!("Loops: {running} running"),
+            palette.title().bg(palette.surface),
+        ));
+        spans.push(Span::styled("   ", palette.text().bg(palette.surface)));
+        for record in &state.loops {
+            let label = autonomy_loop_label(record);
+            let cadence = autonomy_loop_cadence(record);
+            let chip = format!("[{cadence} {label}]");
+            let chip_style = if autonomy_loop_is_active(record) {
+                palette.text().bg(palette.surface)
+            } else {
+                palette.muted().bg(palette.surface)
+            };
+            spans.push(Span::styled(chip, chip_style));
+            spans.push(Span::styled(" ", palette.text().bg(palette.surface)));
+        }
+        // Drop the trailing space for tidiness.
+        if matches!(spans.last(), Some(s) if s.content == " ") {
+            spans.pop();
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn render_autonomy_indicator(app: &AppState, palette: Palette) -> Paragraph<'static> {
+    let lines = autonomy_indicator_lines(app, palette);
+    Paragraph::new(Text::from(lines)).style(Style::default().fg(palette.text).bg(palette.surface))
 }
 
 fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
@@ -5713,5 +5874,168 @@ mod tests {
         assert!(text.contains("copied"));
         assert!(text.contains("src/old.rs -> src/lib.rs"));
         assert!(text.contains("mode change"));
+    }
+
+    // M15-E follow-up: sticky goal/loop indicator above the composer.
+    // See the M9/M15 audit gap — `SessionAutonomyState` was populated
+    // by notification mirrors but never surfaced unless the user typed
+    // `/goal` or `/loop list`.
+
+    fn autonomy_app_state() -> AppState {
+        AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::system("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        )
+    }
+
+    fn sample_loop(
+        loop_id: &str,
+        prompt: &str,
+        mode: &str,
+        secs: Option<u64>,
+    ) -> octos_core::ui_protocol::UiLoopRecord {
+        octos_core::ui_protocol::UiLoopRecord {
+            loop_id: loop_id.into(),
+            session_id: SessionKey("local:test".into()),
+            profile_id: None,
+            prompt: prompt.into(),
+            mode: mode.into(),
+            interval_seconds: secs,
+            status: "active".into(),
+            next_run_at_ms: None,
+            last_run_at_ms: None,
+            expires_at_ms: 999,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    #[test]
+    fn render_autonomy_indicator_idle_reserves_no_rows() {
+        let app = autonomy_app_state();
+        assert_eq!(autonomy_indicator_height(&app), 0);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        assert!(
+            lines.is_empty(),
+            "idle state should produce no indicator rows"
+        );
+
+        let text = rendered_text(&app);
+        assert!(
+            !text.contains("Goal:"),
+            "idle render must not surface a goal label",
+        );
+        assert!(
+            !text.contains("Loops:"),
+            "idle render must not surface a loop label",
+        );
+    }
+
+    #[test]
+    fn render_autonomy_indicator_goal_only_renders_one_row() {
+        let mut app = autonomy_app_state();
+        let session_id = SessionKey("local:test".into());
+        app.set_session_goal(
+            &session_id,
+            Some(octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some("coding".into()),
+                goal_id: "goal_01".into(),
+                objective: "finish the OAuth refactor".into(),
+                status: "active".into(),
+                token_budget: 50_000,
+                tokens_used: 12_000,
+                time_used_seconds: 0,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }),
+            Some("user".into()),
+        );
+
+        assert_eq!(autonomy_indicator_height(&app), 1);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        assert_eq!(lines.len(), 1);
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Goal:"),
+            "goal row must surface 'Goal:' label"
+        );
+        assert!(text.contains("finish the OAuth refactor"));
+        assert!(text.contains("active"));
+        assert!(text.contains("12000/50000"));
+        assert!(!text.contains("Loops:"), "loops row must be hidden");
+    }
+
+    #[test]
+    fn render_autonomy_indicator_goal_and_loops_render_two_rows() {
+        let mut app = autonomy_app_state();
+        let session_id = SessionKey("local:test".into());
+        app.set_session_goal(
+            &session_id,
+            Some(octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some("coding".into()),
+                goal_id: "goal_01".into(),
+                objective: "finish OAuth refactor".into(),
+                status: "active".into(),
+                token_budget: 50_000,
+                tokens_used: 12_000,
+                time_used_seconds: 0,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }),
+            Some("user".into()),
+        );
+        app.set_session_loops(
+            &session_id,
+            vec![
+                sample_loop("l1", "deploy-check", "fixed_interval", Some(300)),
+                sample_loop("l2", "PR-watch", "self_paced", None),
+            ],
+        );
+
+        assert_eq!(autonomy_indicator_height(&app), 2);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        assert_eq!(lines.len(), 2);
+
+        let text = rendered_text(&app);
+        assert!(text.contains("Goal:"));
+        assert!(text.contains("finish OAuth refactor"));
+        assert!(text.contains("Loops: 2 running"));
+        assert!(text.contains("5m deploy-check"));
+        assert!(text.contains("self-paced PR-watch"));
+    }
+
+    #[test]
+    fn autonomy_loop_label_truncates_long_prompt_with_ellipsis() {
+        let long = octos_core::ui_protocol::UiLoopRecord {
+            loop_id: "l1".into(),
+            session_id: SessionKey("local:test".into()),
+            profile_id: None,
+            prompt: "this prompt is intentionally far too long to fit in a chip".into(),
+            mode: "self_paced".into(),
+            interval_seconds: None,
+            status: "active".into(),
+            next_run_at_ms: None,
+            last_run_at_ms: None,
+            expires_at_ms: 999,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        let label = autonomy_loop_label(&long);
+        assert!(
+            label.chars().count() <= AUTONOMY_LOOP_LABEL_MAX,
+            "label {label:?} should respect AUTONOMY_LOOP_LABEL_MAX",
+        );
+        assert!(label.ends_with('…'));
     }
 }
