@@ -6,8 +6,13 @@
 //! `session/goal/set`, `loop/create`, …) is wired in a later PR once
 //! the backend exposes those AppUI methods.
 //!
-//! Contract reference: octos-tui#47 (M15-E) and
-//! `docs/M15_AGENT_GOAL_LOOP_TUI_CONTRACT.md`. The TUI must never:
+//! Contract reference: octos-tui#47 (M15-E) and upstream
+//! `UPCR-2026-021` (Agent / Goal / Loop autonomy). The canonical spec
+//! lives at
+//! `octos/docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_021_AGENT_GOAL_LOOP_AUTONOMY.md`
+//! in the upstream octos repo. The earlier
+//! `docs/M15_AGENT_GOAL_LOOP_TUI_CONTRACT.md` working title was never
+//! landed — reference UPCR-2026-021 directly instead. The TUI must never:
 //!
 //! - Probe these methods on servers that did not advertise
 //!   [`super::model::APPUI_FEATURE_CODING_AUTONOMY_V1`].
