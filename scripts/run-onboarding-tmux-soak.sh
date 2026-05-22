@@ -676,8 +676,22 @@ drive_onboard() {
   local api_key_env="${OCTOS_TUI_SOAK_EXPECT_API_KEY_ENV:-AUTODL_API_KEY}"
   local api_key="${OCTOS_TUI_SOAK_API_KEY:-octos-tui-soak-placeholder-key}"
 
-  wait_for_tui_text "AppUI capabilities refreshed" "${OCTOS_TUI_SOAK_CAPABILITIES_WAIT_SECS:-20}" || \
-    die "Timed out waiting for AppUI capabilities before driving onboarding commands"
+  # M22-A polished onboarding (post-#67 / commit f142a86) auto-opens the
+  # onboarding picker on first launch when profile/local/create is advertised.
+  # The legacy "AppUI capabilities refreshed: N methods" status line still
+  # fires but the picker overlay redraws on top of it, so tmux capture-pane
+  # only reliably catches the splash text "Welcome to Octos" instead. The
+  # picker's presence ALSO confirms capabilities loaded — without them the
+  # auto-open wouldn't happen. So the splash is a stronger gate than the
+  # raw banner. See octos-tui#27 mini5 sweep finding.
+  #
+  # Operators driving the legacy OTP path (auth/send_code + auth/verify +
+  # auth/me, NOT profile/local/create) can override via
+  # OCTOS_TUI_SOAK_READY_TEXT — the legacy flow keeps emitting the banner
+  # because it doesn't trigger the polished picker overlay.
+  local ready_text="${OCTOS_TUI_SOAK_READY_TEXT:-Welcome to Octos}"
+  wait_for_tui_text "$ready_text" "${OCTOS_TUI_SOAK_CAPABILITIES_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI ready signal ('$ready_text') before driving onboarding commands"
   send_tui_line "/login status"
   send_tui_line "/login me"
   send_tui_line "/provider catalog"
