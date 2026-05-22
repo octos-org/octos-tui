@@ -446,17 +446,25 @@ impl Store {
                 {
                     return None;
                 }
-                let Some(objective) = self.current_goal_objective(&session_id) else {
-                    self.state.status =
-                        "Cannot pause: no active goal cached. Run /goal to refresh first.".into();
-                    return None;
+                let goal = match self.cached_goal_for_transition(&session_id) {
+                    Ok(goal) => goal,
+                    Err(None) => {
+                        self.state.status =
+                            "Cannot pause: no goal cached. Run /goal to refresh first.".into();
+                        return None;
+                    }
+                    Err(Some(status)) => {
+                        self.state.status =
+                            format!("Cannot pause goal in `{status}` state (model-owned).");
+                        return None;
+                    }
                 };
                 self.state.status = "Pausing goal".into();
                 Some(AppUiCommand::SetSessionGoal(
                     crate::model::SessionGoalSetParams {
                         session_id,
                         profile_id,
-                        objective,
+                        objective: goal.objective,
                         status: Some("paused".into()),
                         token_budget: None,
                         transition_actor: Some("user".into()),
@@ -469,17 +477,25 @@ impl Store {
                 {
                     return None;
                 }
-                let Some(objective) = self.current_goal_objective(&session_id) else {
-                    self.state.status =
-                        "Cannot resume: no goal cached. Run /goal to refresh first.".into();
-                    return None;
+                let goal = match self.cached_goal_for_transition(&session_id) {
+                    Ok(goal) => goal,
+                    Err(None) => {
+                        self.state.status =
+                            "Cannot resume: no goal cached. Run /goal to refresh first.".into();
+                        return None;
+                    }
+                    Err(Some(status)) => {
+                        self.state.status =
+                            format!("Cannot resume goal in `{status}` state (model-owned).");
+                        return None;
+                    }
                 };
                 self.state.status = "Resuming goal".into();
                 Some(AppUiCommand::SetSessionGoal(
                     crate::model::SessionGoalSetParams {
                         session_id,
                         profile_id,
-                        objective,
+                        objective: goal.objective,
                         status: Some("active".into()),
                         token_budget: None,
                         transition_actor: Some("user".into()),
@@ -617,6 +633,28 @@ impl Store {
             .session_autonomy_for(session_id)
             .and_then(|entry| entry.goal.as_ref())
             .map(|goal| goal.objective.clone())
+    }
+
+    /// Returns the cached goal record IFF the goal is in a state the
+    /// TUI is allowed to transition. Per UPCR-2026-021 the model owns
+    /// the `complete` transition — the TUI must not reactivate a
+    /// completed goal via pause/resume. Returns `Err(status)` when a
+    /// goal is cached but not in a TUI-transitionable state, so the
+    /// caller can surface a precise message.
+    fn cached_goal_for_transition(
+        &self,
+        session_id: &SessionKey,
+    ) -> Result<octos_core::ui_protocol::UiGoalRecord, Option<String>> {
+        let goal = self
+            .state
+            .session_autonomy_for(session_id)
+            .and_then(|entry| entry.goal.as_ref())
+            .ok_or(None)?
+            .clone();
+        match goal.status.as_str() {
+            "active" | "paused" | "budget_limited" => Ok(goal),
+            other => Err(Some(other.to_string())),
+        }
     }
 
     fn dispatch_command_entry(
@@ -10598,8 +10636,66 @@ mod tests {
         store.state.composer = "/goal pause".into();
         assert!(store.compose_command().is_none());
         assert!(
-            store.state.status.to_lowercase().contains("no active goal"),
+            store.state.status.to_lowercase().contains("no goal cached"),
             "expected guidance, got: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn goal_pause_rejects_completed_goal_without_dispatch() {
+        // The model owns the `complete` transition; the TUI must NEVER
+        // pause or resume a completed goal back into an active state.
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.state.set_session_goal(
+            &session_id,
+            Some(octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some("coding".into()),
+                goal_id: "g1".into(),
+                objective: "done work".into(),
+                status: "complete".into(),
+                token_budget: 1,
+                tokens_used: 1,
+                time_used_seconds: 1,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }),
+            Some("model".into()),
+        );
+        store.state.composer = "/goal pause".into();
+        assert!(store.compose_command().is_none());
+        assert!(
+            store.state.status.to_lowercase().contains("complete"),
+            "expected complete-state message, got: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn goal_resume_rejects_completed_goal_without_dispatch() {
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.state.set_session_goal(
+            &session_id,
+            Some(octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some("coding".into()),
+                goal_id: "g1".into(),
+                objective: "done work".into(),
+                status: "complete".into(),
+                token_budget: 1,
+                tokens_used: 1,
+                time_used_seconds: 1,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }),
+            Some("model".into()),
+        );
+        store.state.composer = "/goal resume".into();
+        assert!(store.compose_command().is_none());
+        assert!(
+            store.state.status.to_lowercase().contains("complete"),
+            "expected complete-state message, got: {}",
             store.state.status
         );
     }
