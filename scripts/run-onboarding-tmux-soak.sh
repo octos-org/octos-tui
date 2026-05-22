@@ -155,12 +155,20 @@ wait_for_tui_text() {
   local timeout_secs="${2:-20}"
   local deadline=$((SECONDS + timeout_secs))
   local snapshot="$artifact_dir/tui-capture.txt"
+  # The pattern may be a single fixed string OR a `|`-separated alternation
+  # like "Welcome to Octos|Set Up LLM Provider|AppUI capabilities refreshed"
+  # — this matters for ratatui alt-screen apps where the picker overlay can
+  # transition between states before tmux capture-pane catches any single
+  # one. `grep --fixed-strings -F` treats EACH line of the pattern as its
+  # own literal needle, so we feed the alternation in line-separated form.
+  local pattern_lines
+  pattern_lines="$(printf '%s\n' "$pattern" | tr '|' '\n')"
   while [ "$SECONDS" -le "$deadline" ]; do
     if ! tmux has-session -t "$tui_session" 2>/dev/null; then
       die "TUI tmux session exited while waiting for: $pattern"
     fi
     capture_pane "$tui_session" "$snapshot"
-    if grep --fixed-strings -- "$pattern" "$snapshot" >/dev/null 2>&1; then
+    if printf '%s\n' "$pattern_lines" | grep --fixed-strings --file=- "$snapshot" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -678,18 +686,30 @@ drive_onboard() {
 
   # M22-A polished onboarding (post-#67 / commit f142a86) auto-opens the
   # onboarding picker on first launch when profile/local/create is advertised.
-  # The legacy "AppUI capabilities refreshed: N methods" status line still
-  # fires but the picker overlay redraws on top of it, so tmux capture-pane
-  # only reliably catches the splash text "Welcome to Octos" instead. The
-  # picker's presence ALSO confirms capabilities loaded — without them the
-  # auto-open wouldn't happen. So the splash is a stronger gate than the
-  # raw banner. See octos-tui#27 mini5 sweep finding.
+  # The picker overlay redraws over the status line, so tmux capture-pane
+  # can't reliably catch the legacy "AppUI capabilities refreshed: N methods"
+  # banner. See octos-tui#27 mini5 sweep finding.
   #
-  # Operators driving the legacy OTP path (auth/send_code + auth/verify +
-  # auth/me, NOT profile/local/create) can override via
-  # OCTOS_TUI_SOAK_READY_TEXT — the legacy flow keeps emitting the banner
-  # because it doesn't trigger the polished picker overlay.
-  local ready_text="${OCTOS_TUI_SOAK_READY_TEXT:-Welcome to Octos}"
+  # Wait for ANY of three signals (`|`-separated alternation per the
+  # extended wait_for_tui_text):
+  #
+  #   * "Welcome to Octos"          — fresh first-launch splash (no profile)
+  #   * "Set Up LLM Provider"       — picker after profile/llm/list resolves
+  #                                   (when a profile_id was passed to start
+  #                                   and the picker auto-advances to the
+  #                                   provider step). Codex P2 follow-up:
+  #                                   if profile/llm/list returns before
+  #                                   drive-onboard runs, the splash text
+  #                                   has already been replaced — without
+  #                                   this alternative the wait times out.
+  #   * "AppUI capabilities refreshed" — legacy OTP path (auth/send_code +
+  #                                   verify + me) which doesn't trigger
+  #                                   the polished picker overlay, so the
+  #                                   status banner remains visible.
+  #
+  # Operators driving a custom flow can override via OCTOS_TUI_SOAK_READY_TEXT
+  # — values are also treated as `|`-separated alternations.
+  local ready_text="${OCTOS_TUI_SOAK_READY_TEXT:-Welcome to Octos|Set Up LLM Provider|AppUI capabilities refreshed}"
   wait_for_tui_text "$ready_text" "${OCTOS_TUI_SOAK_CAPABILITIES_WAIT_SECS:-20}" || \
     die "Timed out waiting for TUI ready signal ('$ready_text') before driving onboarding commands"
   send_tui_line "/login status"
