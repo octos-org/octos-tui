@@ -313,13 +313,16 @@ pub struct SessionGoalGetResult {
     pub goal: Option<octos_core::ui_protocol::UiGoalRecord>,
 }
 
-/// `session/goal/set` action verb. The TUI may set an objective, or
-/// transition an existing goal between `pause`/`resume`. Completion is
-/// model-owned and never set by the TUI.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Logical action a `/goal` subcommand performed. This is a TUI-side
+/// classifier; the wire shape itself is the `(objective, status)`
+/// pair the backend expects. We keep `SessionGoalSetAction` around for
+/// the dispatch tests so they can assert the intended verb without
+/// re-parsing the serialized params.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionGoalSetAction {
     /// `/goal <objective>` — establish a new active goal.
+    #[default]
     Set,
     /// `/goal pause` — pause an active goal.
     Pause,
@@ -327,14 +330,29 @@ pub enum SessionGoalSetAction {
     Resume,
 }
 
+/// `session/goal/set` wire shape (UPCR-2026-021 §"Goal Runtime Surface").
+/// Matches the backend `RawGoalSetParams` exactly: `objective` is
+/// REQUIRED, and `status` ("active"/"paused") is what drives
+/// pause/resume transitions. `transition_actor` is always `"user"`
+/// from the TUI — the backend marks model-completed goals with
+/// `"model"` itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionGoalSetParams {
     pub session_id: SessionKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
-    pub action: SessionGoalSetAction,
+    pub objective: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub objective: Option<String>,
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_actor: Option<String>,
+    /// Non-wire classifier used by the dispatch tests. `#[serde(skip)]`
+    /// keeps it out of the JSON-RPC payload while still letting tests
+    /// assert which subcommand produced this params instance.
+    #[serde(skip)]
+    pub action: SessionGoalSetAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

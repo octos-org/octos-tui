@@ -433,8 +433,11 @@ impl Store {
                     crate::model::SessionGoalSetParams {
                         session_id,
                         profile_id,
+                        objective,
+                        status: Some("active".into()),
+                        token_budget: None,
+                        transition_actor: Some("user".into()),
                         action: crate::model::SessionGoalSetAction::Set,
-                        objective: Some(objective),
                     },
                 ))
             }
@@ -443,13 +446,21 @@ impl Store {
                 {
                     return None;
                 }
+                let Some(objective) = self.current_goal_objective(&session_id) else {
+                    self.state.status =
+                        "Cannot pause: no active goal cached. Run /goal to refresh first.".into();
+                    return None;
+                };
                 self.state.status = "Pausing goal".into();
                 Some(AppUiCommand::SetSessionGoal(
                     crate::model::SessionGoalSetParams {
                         session_id,
                         profile_id,
+                        objective,
+                        status: Some("paused".into()),
+                        token_budget: None,
+                        transition_actor: Some("user".into()),
                         action: crate::model::SessionGoalSetAction::Pause,
-                        objective: None,
                     },
                 ))
             }
@@ -458,13 +469,21 @@ impl Store {
                 {
                     return None;
                 }
+                let Some(objective) = self.current_goal_objective(&session_id) else {
+                    self.state.status =
+                        "Cannot resume: no goal cached. Run /goal to refresh first.".into();
+                    return None;
+                };
                 self.state.status = "Resuming goal".into();
                 Some(AppUiCommand::SetSessionGoal(
                     crate::model::SessionGoalSetParams {
                         session_id,
                         profile_id,
+                        objective,
+                        status: Some("active".into()),
+                        token_budget: None,
+                        transition_actor: Some("user".into()),
                         action: crate::model::SessionGoalSetAction::Resume,
-                        objective: None,
                     },
                 ))
             }
@@ -587,6 +606,17 @@ impl Store {
     fn active_session_profile_id(&self) -> Option<String> {
         self.active_session()
             .and_then(|session| session.profile_id.clone())
+    }
+
+    /// Returns the objective of the currently cached goal for a
+    /// session, or `None` when no goal has been observed yet. Used to
+    /// satisfy the backend's `session/goal/set` contract, which
+    /// requires the objective on every call (including pause/resume).
+    fn current_goal_objective(&self, session_id: &SessionKey) -> Option<String> {
+        self.state
+            .session_autonomy_for(session_id)
+            .and_then(|entry| entry.goal.as_ref())
+            .map(|goal| goal.objective.clone())
     }
 
     fn dispatch_command_entry(
@@ -3241,9 +3271,21 @@ impl Store {
             AutonomyResult::LoopMutation { method, result } => {
                 let loop_id = result.loop_id.clone();
                 let session_id = result.session_id.clone();
-                if method == crate::model::APPUI_METHOD_LOOP_DELETE {
-                    self.state.remove_session_loop(&session_id, &loop_id);
+                // Only mutate the mirror when the backend accepted the
+                // request. A rejected `loop/delete` (policy denial,
+                // backend pause-and-deny, etc.) must NOT remove a still
+                // active loop from local state — that would hide it
+                // until the next full hydration.
+                if result.ok {
+                    if method == crate::model::APPUI_METHOD_LOOP_DELETE {
+                        self.state.remove_session_loop(&session_id, &loop_id);
+                    } else if let Some(loop_state) = result.loop_state {
+                        self.state.upsert_session_loop(&session_id, loop_state);
+                    }
                 } else if let Some(loop_state) = result.loop_state {
+                    // Even on rejection, the backend may echo the
+                    // current loop record (status="paused" etc.) — keep
+                    // the mirror consistent without dropping the entry.
                     self.state.upsert_session_loop(&session_id, loop_state);
                 }
                 let verb = match method.as_str() {
@@ -10510,35 +10552,83 @@ mod tests {
         match store.compose_command().expect("dispatch") {
             AppUiCommand::SetSessionGoal(params) => {
                 assert_eq!(params.action, crate::model::SessionGoalSetAction::Set);
-                assert_eq!(
-                    params.objective.as_deref(),
-                    Some("finish the review by Friday")
-                );
+                assert_eq!(params.objective, "finish the review by Friday");
+                assert_eq!(params.status.as_deref(), Some("active"));
+                assert_eq!(params.transition_actor.as_deref(), Some("user"));
             }
             other => panic!("expected SetSessionGoal, got {other:?}"),
         }
     }
 
     #[test]
-    fn goal_pause_dispatches_goal_set_pause() {
+    fn goal_pause_with_cached_goal_emits_paused_status() {
         let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        // Seed the mirror so pause has an objective to forward.
+        store.state.set_session_goal(
+            &session_id,
+            Some(octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some("coding".into()),
+                goal_id: "goal_01".into(),
+                objective: "ongoing work".into(),
+                status: "active".into(),
+                token_budget: 1000,
+                tokens_used: 0,
+                time_used_seconds: 0,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }),
+            Some("user".into()),
+        );
         store.state.composer = "/goal pause".into();
         match store.compose_command().expect("dispatch") {
             AppUiCommand::SetSessionGoal(params) => {
                 assert_eq!(params.action, crate::model::SessionGoalSetAction::Pause);
-                assert!(params.objective.is_none());
+                assert_eq!(params.status.as_deref(), Some("paused"));
+                assert_eq!(params.objective, "ongoing work");
             }
             other => panic!("expected SetSessionGoal Pause, got {other:?}"),
         }
     }
 
     #[test]
-    fn goal_resume_dispatches_goal_set_resume() {
+    fn goal_pause_without_cached_goal_records_status_and_returns_none() {
         let mut store = protocol_store_with_autonomy();
+        // No goal cached.
+        store.state.composer = "/goal pause".into();
+        assert!(store.compose_command().is_none());
+        assert!(
+            store.state.status.to_lowercase().contains("no active goal"),
+            "expected guidance, got: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn goal_resume_with_cached_goal_emits_active_status() {
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.state.set_session_goal(
+            &session_id,
+            Some(octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some("coding".into()),
+                goal_id: "goal_01".into(),
+                objective: "ongoing work".into(),
+                status: "paused".into(),
+                token_budget: 1000,
+                tokens_used: 0,
+                time_used_seconds: 0,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }),
+            Some("user".into()),
+        );
         store.state.composer = "/goal resume".into();
         match store.compose_command().expect("dispatch") {
             AppUiCommand::SetSessionGoal(params) => {
                 assert_eq!(params.action, crate::model::SessionGoalSetAction::Resume);
+                assert_eq!(params.status.as_deref(), Some("active"));
+                assert_eq!(params.objective, "ongoing work");
             }
             other => panic!("expected SetSessionGoal Resume, got {other:?}"),
         }
@@ -11121,9 +11211,34 @@ mod tests {
         let cmd = AppUiCommand::SetSessionGoal(crate::model::SessionGoalSetParams {
             session_id,
             profile_id: None,
+            objective: "foo".into(),
+            status: Some("active".into()),
+            token_budget: None,
+            transition_actor: Some("user".into()),
             action: crate::model::SessionGoalSetAction::Set,
-            objective: Some("foo".into()),
         });
         assert_eq!(cmd.method(), crate::model::APPUI_METHOD_SESSION_GOAL_SET);
+    }
+
+    #[test]
+    fn goal_set_params_serializes_without_action_field() {
+        // The `action` classifier is `#[serde(skip)]` — it stays
+        // local. The wire shape carries `objective` + `status`.
+        let params = crate::model::SessionGoalSetParams {
+            session_id: SessionKey("local:test".into()),
+            profile_id: Some("coding".into()),
+            objective: "ship it".into(),
+            status: Some("active".into()),
+            token_budget: None,
+            transition_actor: Some("user".into()),
+            action: crate::model::SessionGoalSetAction::Set,
+        };
+        let json = serde_json::to_value(&params).expect("serialize");
+        assert!(json.get("objective").is_some());
+        assert!(json.get("status").is_some());
+        assert!(
+            json.get("action").is_none(),
+            "action must NOT appear on the wire: {json}"
+        );
     }
 }
