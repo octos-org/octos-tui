@@ -6,7 +6,7 @@ use octos_core::ui_protocol::{
     TaskOutputReadParams, TaskRuntimeState, TaskUpdatedEvent, TurnCompletedEvent, TurnErrorEvent,
     TurnId, TurnInterruptParams, TurnStartParams, UiNotification, UiProgressEvent,
 };
-use octos_core::{Message, TaskId};
+use octos_core::{Message, SessionKey, TaskId};
 use serde_json::Value;
 
 use crate::{
@@ -259,6 +259,18 @@ impl Store {
                     );
                     return None;
                 }
+                // M15-E autonomy commands need richer-than-verb parsing
+                // (intervals, multi-word objectives). The registry's
+                // job here is purely capability gating + menu visibility;
+                // the parser owns syntax.
+                if matches!(
+                    &command.entry,
+                    crate::menu::types::CommandEntry::LocalAction(
+                        crate::menu::types::LocalAction::Custom("autonomy"),
+                    )
+                ) {
+                    return self.dispatch_autonomy_slash(draft);
+                }
                 self.dispatch_command_entry(&command.entry, Some(invocation.args))
             }
             CommandResolution::EmptyCommand => {
@@ -271,6 +283,310 @@ impl Store {
             }
             CommandResolution::NotCommand => None,
         }
+    }
+
+    /// M15-E: parse `/agents`, `/goal`, `/loop` through
+    /// [`crate::autonomy::parse_autonomy_slash`] and dispatch one
+    /// AppUI command per parsed intent. Capability checks are enforced
+    /// at the dispatch site (and via the registry's
+    /// `coding.autonomy.v1` gate), so old servers see the slash
+    /// command rendered as `Unsupported` rather than getting probed.
+    pub(crate) fn dispatch_autonomy_slash(&mut self, draft: &str) -> Option<AppUiCommand> {
+        match crate::autonomy::parse_autonomy_slash(draft) {
+            Ok(Some(crate::autonomy::AutonomyCommand::Agents(cmd))) => {
+                self.dispatch_agents_command(cmd)
+            }
+            Ok(Some(crate::autonomy::AutonomyCommand::Goal(cmd))) => {
+                self.dispatch_goal_command(cmd)
+            }
+            Ok(Some(crate::autonomy::AutonomyCommand::Loop(cmd))) => {
+                self.dispatch_loop_command(cmd)
+            }
+            Ok(None) => None,
+            Err(err) => {
+                self.state.status = err.to_string();
+                None
+            }
+        }
+    }
+
+    fn dispatch_agents_command(
+        &mut self,
+        cmd: crate::autonomy::AgentsCommand,
+    ) -> Option<AppUiCommand> {
+        use crate::autonomy::AgentsCommand;
+        let session_id = self.active_autonomy_session_id()?;
+        match cmd {
+            AgentsCommand::List => {
+                if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_LIST) {
+                    return None;
+                }
+                self.state.status = "Refreshing agent list".into();
+                Some(AppUiCommand::ListAgents(crate::model::AgentListParams {
+                    session_id,
+                    parent_agent_id: None,
+                }))
+            }
+            AgentsCommand::Status(maybe_id) => match maybe_id {
+                Some(agent_id) => {
+                    if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_STATUS_READ) {
+                        return None;
+                    }
+                    self.state.status = format!("Reading status for {agent_id}");
+                    Some(AppUiCommand::ReadAgentStatus(
+                        crate::model::AgentStatusReadParams {
+                            session_id,
+                            agent_id,
+                        },
+                    ))
+                }
+                None => {
+                    if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_LIST) {
+                        return None;
+                    }
+                    self.state.status = "Refreshing agent list".into();
+                    Some(AppUiCommand::ListAgents(crate::model::AgentListParams {
+                        session_id,
+                        parent_agent_id: None,
+                    }))
+                }
+            },
+            AgentsCommand::Output(agent_id) => {
+                if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_OUTPUT_READ) {
+                    return None;
+                }
+                self.state.status = format!("Reading output for {agent_id}");
+                Some(AppUiCommand::ReadAgentOutput(
+                    crate::model::AgentOutputReadParams {
+                        session_id,
+                        agent_id,
+                        cursor: None,
+                    },
+                ))
+            }
+            AgentsCommand::Artifacts(agent_id) => {
+                if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_ARTIFACT_LIST) {
+                    return None;
+                }
+                self.state.status = format!("Listing artifacts for {agent_id}");
+                Some(AppUiCommand::ListAgentArtifacts(
+                    crate::model::AgentArtifactListParams {
+                        session_id,
+                        agent_id,
+                    },
+                ))
+            }
+            AgentsCommand::Interrupt(agent_id) => {
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_AGENT_INTERRUPT) {
+                    return None;
+                }
+                self.state.status = format!("Interrupt requested for {agent_id}");
+                Some(AppUiCommand::InterruptAgent(
+                    crate::model::AgentInterruptParams {
+                        session_id,
+                        agent_id,
+                    },
+                ))
+            }
+            AgentsCommand::Close(agent_id) => {
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_AGENT_CLOSE) {
+                    return None;
+                }
+                self.state.status = format!("Close requested for {agent_id}");
+                Some(AppUiCommand::CloseAgent(crate::model::AgentCloseParams {
+                    session_id,
+                    agent_id,
+                }))
+            }
+        }
+    }
+
+    fn dispatch_goal_command(&mut self, cmd: crate::autonomy::GoalCommand) -> Option<AppUiCommand> {
+        use crate::autonomy::GoalCommand;
+        let session_id = self.active_autonomy_session_id()?;
+        let profile_id = self.active_session_profile_id();
+        match cmd {
+            GoalCommand::Show => {
+                if !self.require_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_GET) {
+                    return None;
+                }
+                self.state.status = "Refreshing goal".into();
+                Some(AppUiCommand::GetSessionGoal(
+                    crate::model::SessionGoalGetParams {
+                        session_id,
+                        profile_id,
+                    },
+                ))
+            }
+            GoalCommand::Set(objective) => {
+                let objective = objective.trim().to_string();
+                if objective.is_empty() {
+                    self.state.status = "Goal objective cannot be empty".into();
+                    return None;
+                }
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_SET)
+                {
+                    return None;
+                }
+                self.state.status = format!("Setting goal: {objective}");
+                Some(AppUiCommand::SetSessionGoal(
+                    crate::model::SessionGoalSetParams {
+                        session_id,
+                        profile_id,
+                        action: crate::model::SessionGoalSetAction::Set,
+                        objective: Some(objective),
+                    },
+                ))
+            }
+            GoalCommand::Pause => {
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_SET)
+                {
+                    return None;
+                }
+                self.state.status = "Pausing goal".into();
+                Some(AppUiCommand::SetSessionGoal(
+                    crate::model::SessionGoalSetParams {
+                        session_id,
+                        profile_id,
+                        action: crate::model::SessionGoalSetAction::Pause,
+                        objective: None,
+                    },
+                ))
+            }
+            GoalCommand::Resume => {
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_SET)
+                {
+                    return None;
+                }
+                self.state.status = "Resuming goal".into();
+                Some(AppUiCommand::SetSessionGoal(
+                    crate::model::SessionGoalSetParams {
+                        session_id,
+                        profile_id,
+                        action: crate::model::SessionGoalSetAction::Resume,
+                        objective: None,
+                    },
+                ))
+            }
+            GoalCommand::Clear => {
+                if !self
+                    .require_mutating_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_CLEAR)
+                {
+                    return None;
+                }
+                self.state.status = "Clearing goal".into();
+                Some(AppUiCommand::ClearSessionGoal(
+                    crate::model::SessionGoalClearParams {
+                        session_id,
+                        profile_id,
+                    },
+                ))
+            }
+        }
+    }
+
+    fn dispatch_loop_command(&mut self, cmd: crate::autonomy::LoopCommand) -> Option<AppUiCommand> {
+        use crate::autonomy::{LoopCadence, LoopCommand};
+        let session_id = self.active_autonomy_session_id()?;
+        let profile_id = self.active_session_profile_id();
+        match cmd {
+            LoopCommand::Show | LoopCommand::List => {
+                if !self.require_appui_method(crate::model::APPUI_METHOD_LOOP_LIST) {
+                    return None;
+                }
+                self.state.status = "Listing loops".into();
+                Some(AppUiCommand::ListLoops(crate::model::LoopListParams {
+                    session_id,
+                    profile_id,
+                }))
+            }
+            LoopCommand::Create { prompt, cadence } => {
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_LOOP_CREATE) {
+                    return None;
+                }
+                let (mode, interval_seconds) = match cadence {
+                    LoopCadence::SelfPaced => (crate::model::LoopMode::SelfPaced, None),
+                    LoopCadence::Every(duration) => {
+                        let secs = duration.as_secs();
+                        if secs == 0 {
+                            self.state.status = "Loop interval must be at least 1 second".into();
+                            return None;
+                        }
+                        (crate::model::LoopMode::FixedInterval, Some(secs))
+                    }
+                    LoopCadence::Maintenance => (crate::model::LoopMode::Maintenance, None),
+                };
+                self.state.status = "Creating loop".into();
+                Some(AppUiCommand::CreateLoop(crate::model::LoopCreateParams {
+                    session_id,
+                    profile_id,
+                    prompt,
+                    mode,
+                    interval_seconds,
+                }))
+            }
+            LoopCommand::Delete(loop_id) => {
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_LOOP_DELETE) {
+                    return None;
+                }
+                self.state.status = format!("Deleting loop {loop_id}");
+                Some(AppUiCommand::DeleteLoop(crate::model::LoopIdParams {
+                    session_id,
+                    loop_id,
+                }))
+            }
+            LoopCommand::Pause(loop_id) => {
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_LOOP_PAUSE) {
+                    return None;
+                }
+                self.state.status = format!("Pausing loop {loop_id}");
+                Some(AppUiCommand::PauseLoop(crate::model::LoopIdParams {
+                    session_id,
+                    loop_id,
+                }))
+            }
+            LoopCommand::Resume(loop_id) => {
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_LOOP_RESUME) {
+                    return None;
+                }
+                self.state.status = format!("Resuming loop {loop_id}");
+                Some(AppUiCommand::ResumeLoop(crate::model::LoopIdParams {
+                    session_id,
+                    loop_id,
+                }))
+            }
+            LoopCommand::FireNow(loop_id) => {
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_LOOP_FIRE_NOW) {
+                    return None;
+                }
+                self.state.status = format!("Firing loop {loop_id}");
+                Some(AppUiCommand::FireLoopNow(crate::model::LoopIdParams {
+                    session_id,
+                    loop_id,
+                }))
+            }
+        }
+    }
+
+    /// Returns the session id every autonomy command targets — the
+    /// currently selected session. None when no session is open; the
+    /// caller updates `status` and bails.
+    fn active_autonomy_session_id(&mut self) -> Option<SessionKey> {
+        match self.active_session() {
+            Some(session) => Some(session.id.clone()),
+            None => {
+                self.state.status =
+                    "No coding session open. Run /onboard open-session before /agents, /goal, or /loop."
+                        .into();
+                self.state.focus = FocusPane::Composer;
+                None
+            }
+        }
+    }
+
+    fn active_session_profile_id(&self) -> Option<String> {
+        self.active_session()
+            .and_then(|session| session.profile_id.clone())
     }
 
     fn dispatch_command_entry(
@@ -2816,7 +3132,180 @@ impl Store {
                 self.refresh_active_menu_if_open();
                 self.tool_config_list_command()
             }
+            ClientEvent::Autonomy(event) => {
+                self.apply_autonomy_result(event);
+                None
+            }
         }
+    }
+
+    /// M15-E: fold an autonomy RPC result into the per-session mirror
+    /// and emit a status line. This is the dual of the matching
+    /// notification handler in [`Self::apply_notification`]; the
+    /// mirror stays consistent whether updates arrive as a response
+    /// or as a server-pushed notification.
+    fn apply_autonomy_result(&mut self, event: crate::client_event::AutonomyClientEvent) {
+        use crate::client_event::AutonomyResult;
+        match event.result {
+            AutonomyResult::AgentList(result) => {
+                let count = result.agents.len();
+                self.state
+                    .set_session_agents(&result.session_id, result.agents);
+                self.state.status = format!("Agent list refreshed: {count} agent(s)");
+            }
+            AutonomyResult::AgentStatus(result) => {
+                let agent_id = result.agent.agent_id.clone();
+                self.state
+                    .upsert_session_agent(&result.session_id, result.agent);
+                self.state.status = format!("Agent {agent_id} status updated");
+            }
+            AutonomyResult::AgentOutput(result) => {
+                let bytes = result.text.len();
+                self.state.set_agent_output(
+                    &result.session_id,
+                    &result.agent_id,
+                    result.text.clone(),
+                    result.cursor,
+                );
+                self.state.status = format!("Agent {} output: {bytes} bytes", result.agent_id);
+            }
+            AutonomyResult::AgentArtifacts(result) => {
+                let count = result.artifacts.len();
+                let agent_id = result.agent_id.clone();
+                self.state
+                    .set_agent_artifacts(&result.session_id, &agent_id, result.artifacts);
+                self.state.status = format!("Agent {agent_id} artifacts: {count} item(s)");
+            }
+            AutonomyResult::AgentInterrupt(result) => {
+                if let Some(agent) = result.agent.clone() {
+                    self.state.upsert_session_agent(&result.session_id, agent);
+                }
+                self.state.status = format!(
+                    "Agent {} interrupt {}",
+                    result.agent_id,
+                    if result.ok { "accepted" } else { "rejected" }
+                );
+            }
+            AutonomyResult::AgentClose(result) => {
+                if let Some(agent) = result.agent.clone() {
+                    self.state.upsert_session_agent(&result.session_id, agent);
+                }
+                self.state.status = format!(
+                    "Agent {} close {}",
+                    result.agent_id,
+                    if result.ok { "accepted" } else { "rejected" }
+                );
+            }
+            AutonomyResult::GoalGet(result) => {
+                let session_id = result.session_id.clone();
+                let summary = match result.goal.as_ref() {
+                    Some(goal) => format!("Goal {}: {}", goal.status, goal.objective),
+                    None => "No active goal".into(),
+                };
+                self.state.set_session_goal(&session_id, result.goal, None);
+                self.state.status = summary;
+            }
+            AutonomyResult::GoalSet(result) => {
+                let session_id = result.session_id.clone();
+                let summary = match result.goal.as_ref() {
+                    Some(goal) => format!("Goal {}: {}", goal.status, goal.objective),
+                    None if result.ok => "Goal accepted (no record returned)".into(),
+                    None => "Goal set rejected".into(),
+                };
+                self.state
+                    .set_session_goal(&session_id, result.goal, result.transition_actor);
+                self.state.status = summary;
+            }
+            AutonomyResult::GoalClear(result) => {
+                if result.cleared {
+                    self.state
+                        .set_session_goal(&result.session_id, None, result.transition_actor);
+                    self.state.status = "Goal cleared".into();
+                } else {
+                    self.state.status = "Goal clear rejected".into();
+                }
+            }
+            AutonomyResult::LoopCreate(result) => {
+                let loop_id = result.loop_state.loop_id.clone();
+                let mode = result.loop_state.mode.clone();
+                self.state
+                    .upsert_session_loop(&result.session_id, result.loop_state);
+                self.state.status = format!("Loop {loop_id} created ({mode})");
+            }
+            AutonomyResult::LoopList(result) => {
+                let count = result.loops.len();
+                self.state
+                    .set_session_loops(&result.session_id, result.loops);
+                self.state.status = format!("Loop list refreshed: {count} loop(s)");
+            }
+            AutonomyResult::LoopMutation { method, result } => {
+                let loop_id = result.loop_id.clone();
+                let session_id = result.session_id.clone();
+                if method == crate::model::APPUI_METHOD_LOOP_DELETE {
+                    self.state.remove_session_loop(&session_id, &loop_id);
+                } else if let Some(loop_state) = result.loop_state {
+                    self.state.upsert_session_loop(&session_id, loop_state);
+                }
+                let verb = match method.as_str() {
+                    "loop/delete" => "delete",
+                    "loop/pause" => "pause",
+                    "loop/resume" => "resume",
+                    "loop/fire_now" => "fire_now",
+                    _ => "mutation",
+                };
+                self.state.status = format!(
+                    "Loop {loop_id} {verb} {}",
+                    if result.ok { "accepted" } else { "rejected" }
+                );
+            }
+        }
+    }
+
+    /// M15-E reconnect-hydration: re-request the autonomy mirror from
+    /// the backend after a session opens (or reopens). The TUI must
+    /// never construct agent/goal/loop state from local config — this
+    /// is the canonical "ask the server" hook. Each follow-up is
+    /// gated on the matching method advertisement so old servers see
+    /// nothing.
+    ///
+    /// The current public surface only emits ONE command per call
+    /// (matching the rest of `apply_event`/`apply_client_event`); the
+    /// caller can chain `hydrate_autonomy_state_next()` to walk all
+    /// three. The lowest-priority follow-up (loops) is dispatched last.
+    pub fn hydrate_autonomy_state_commands(&self, session_id: &SessionKey) -> Vec<AppUiCommand> {
+        let mut commands = Vec::new();
+        let capabilities = match self.state.capabilities.as_ref() {
+            Some(caps) => caps,
+            None => return commands,
+        };
+        if !capabilities.supports_feature(crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1) {
+            return commands;
+        }
+        let profile_id = self
+            .state
+            .active_session()
+            .and_then(|session| session.profile_id.clone());
+        if capabilities.supports_method(crate::model::APPUI_METHOD_AGENT_LIST) {
+            commands.push(AppUiCommand::ListAgents(crate::model::AgentListParams {
+                session_id: session_id.clone(),
+                parent_agent_id: None,
+            }));
+        }
+        if capabilities.supports_method(crate::model::APPUI_METHOD_SESSION_GOAL_GET) {
+            commands.push(AppUiCommand::GetSessionGoal(
+                crate::model::SessionGoalGetParams {
+                    session_id: session_id.clone(),
+                    profile_id: profile_id.clone(),
+                },
+            ));
+        }
+        if capabilities.supports_method(crate::model::APPUI_METHOD_LOOP_LIST) {
+            commands.push(AppUiCommand::ListLoops(crate::model::LoopListParams {
+                session_id: session_id.clone(),
+                profile_id,
+            }));
+        }
+        commands
     }
 
     pub fn apply_event(&mut self, event: AppUiEvent) -> Option<AppUiCommand> {
@@ -3514,6 +4003,14 @@ impl Store {
                 }
                 self.state.status =
                     format!("Opened {} on {}", session_id.0, self.state.protocol_version);
+                // M15-E: queue autonomy hydration follow-ups so the
+                // local mirror reflects backend truth on session open
+                // and after reconnect. Gated on
+                // `coding.autonomy.v1` — old servers receive no probe.
+                let hydration = self.hydrate_autonomy_state_commands(&session_id);
+                for command in hydration {
+                    self.state.enqueue_autonomy_hydration(command);
+                }
                 // M22-D: if the user staged a permission profile in
                 // onboarding, apply it now that we have a session id.
                 // Server authority is preserved — the follow-up RPC
@@ -3755,8 +4252,11 @@ impl Store {
                     .clone()
                     .or_else(|| event.agent.last_task.clone())
                     .unwrap_or_else(|| event.agent.role.clone());
+                let status_label = event.agent.status.clone();
+                self.state
+                    .upsert_session_agent(&event.session_id, event.agent.clone());
                 self.state.push_activity(
-                    ActivityItem::new(ActivityKind::Progress, title.clone(), event.agent.status)
+                    ActivityItem::new(ActivityKind::Progress, title.clone(), status_label)
                         .with_detail(detail),
                 );
                 self.state.status = format!("Agent status refreshed: {title}");
@@ -3764,6 +4264,12 @@ impl Store {
             }
             UiNotification::AgentOutputDelta(event) => {
                 let bytes = event.text.len();
+                self.state.append_agent_output(
+                    &event.session_id,
+                    &event.agent_id,
+                    event.cursor,
+                    &event.text,
+                );
                 self.state.push_activity(
                     ActivityItem::new(
                         ActivityKind::Progress,
@@ -3776,23 +4282,40 @@ impl Store {
             }
             UiNotification::AgentArtifactUpdated(event) => {
                 let count = event.artifacts.len();
+                self.state.set_agent_artifacts(
+                    &event.session_id,
+                    &event.agent_id,
+                    event.artifacts.clone(),
+                );
                 self.state.push_activity(ActivityItem::new(
                     ActivityKind::Tool,
                     "agent artifacts",
-                    format!("{} artifact(s) refreshed for {}", count, event.agent_id),
+                    format!("{count} artifact(s) refreshed for {}", event.agent_id),
                 ));
                 None
             }
             UiNotification::SessionGoalUpdated(event) => {
+                let objective = event.goal.objective.clone();
+                let status_label = event.goal.status.clone();
+                self.state.set_session_goal(
+                    &event.session_id,
+                    Some(event.goal.clone()),
+                    Some(event.transition_actor.clone()),
+                );
                 self.state.push_activity(ActivityItem::new(
                     ActivityKind::Progress,
                     "session goal",
-                    event.goal.status.clone(),
+                    status_label,
                 ));
-                self.state.status = format!("Goal updated: {}", event.goal.objective);
+                self.state.status = format!("Goal updated: {objective}");
                 None
             }
             UiNotification::SessionGoalCleared(event) => {
+                let actor = event.transition_actor.clone();
+                if event.cleared {
+                    self.state
+                        .set_session_goal(&event.session_id, None, Some(actor));
+                }
                 self.state.status = if event.cleared {
                     "Goal cleared".into()
                 } else {
@@ -3805,15 +4328,22 @@ impl Store {
                     .status
                     .clone()
                     .unwrap_or_else(|| event.loop_state.status.clone());
+                let loop_id = event.loop_state.loop_id.clone();
+                if event.deleted == Some(true) || event.loop_state.status == "deleted" {
+                    self.state.remove_session_loop(&event.session_id, &loop_id);
+                } else {
+                    self.state
+                        .upsert_session_loop(&event.session_id, event.loop_state.clone());
+                }
                 self.state.push_activity(ActivityItem::new(
                     ActivityKind::Progress,
-                    event.loop_state.loop_id,
+                    loop_id,
                     status,
                 ));
                 None
             }
             UiNotification::LoopFired(event) => {
-                let status = event.status.unwrap_or_else(|| {
+                let status = event.status.clone().unwrap_or_else(|| {
                     event
                         .fire
                         .as_ref()
@@ -3821,6 +4351,10 @@ impl Store {
                         .unwrap_or("fired")
                         .into()
                 });
+                if let Some(loop_state) = event.loop_state.clone() {
+                    self.state
+                        .upsert_session_loop(&event.session_id, loop_state);
+                }
                 self.state.push_activity(ActivityItem::new(
                     ActivityKind::Progress,
                     event.loop_id,
@@ -3829,7 +4363,11 @@ impl Store {
                 None
             }
             UiNotification::LoopCompleted(event) => {
-                let status = event.status.unwrap_or_else(|| "completed".into());
+                let status = event.status.clone().unwrap_or_else(|| "completed".into());
+                if let Some(loop_state) = event.loop_state.clone() {
+                    self.state
+                        .upsert_session_loop(&event.session_id, loop_state);
+                }
                 self.state.push_activity(ActivityItem::new(
                     ActivityKind::Progress,
                     event.loop_id,
@@ -9804,5 +10342,788 @@ mod tests {
             ledger.last_normalization.as_ref().unwrap().repaired_count,
             1
         );
+    }
+
+    // ---------- M15-E autonomy dispatch + hydration tests ----------
+
+    fn protocol_store_with_autonomy() -> Store {
+        let session = SessionView {
+            id: SessionKey("local:test".into()),
+            title: "test".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: AppState::new(
+                vec![session],
+                0,
+                "ready".into(),
+                Some("ws://example.test/ui-protocol".into()),
+                false,
+            ),
+        };
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [
+                crate::model::APPUI_METHOD_AGENT_LIST,
+                crate::model::APPUI_METHOD_AGENT_STATUS_READ,
+                crate::model::APPUI_METHOD_AGENT_OUTPUT_READ,
+                crate::model::APPUI_METHOD_AGENT_ARTIFACT_LIST,
+                crate::model::APPUI_METHOD_AGENT_INTERRUPT,
+                crate::model::APPUI_METHOD_AGENT_CLOSE,
+                crate::model::APPUI_METHOD_SESSION_GOAL_GET,
+                crate::model::APPUI_METHOD_SESSION_GOAL_SET,
+                crate::model::APPUI_METHOD_SESSION_GOAL_CLEAR,
+                crate::model::APPUI_METHOD_LOOP_CREATE,
+                crate::model::APPUI_METHOD_LOOP_LIST,
+                crate::model::APPUI_METHOD_LOOP_DELETE,
+                crate::model::APPUI_METHOD_LOOP_PAUSE,
+                crate::model::APPUI_METHOD_LOOP_RESUME,
+                crate::model::APPUI_METHOD_LOOP_FIRE_NOW,
+            ],
+            [crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1],
+        ));
+        store
+    }
+
+    #[test]
+    fn agents_list_dispatches_agent_list_rpc() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/agents".into();
+        let command = store.compose_command().expect("dispatch returns command");
+        match command {
+            AppUiCommand::ListAgents(params) => {
+                assert_eq!(params.session_id, SessionKey("local:test".into()));
+            }
+            other => panic!("expected ListAgents, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agents_list_subcommand_also_dispatches() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/agents list".into();
+        assert!(matches!(
+            store.compose_command(),
+            Some(AppUiCommand::ListAgents(_))
+        ));
+    }
+
+    #[test]
+    fn agents_status_without_id_falls_back_to_list() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/agents status".into();
+        assert!(matches!(
+            store.compose_command(),
+            Some(AppUiCommand::ListAgents(_))
+        ));
+    }
+
+    #[test]
+    fn agents_status_with_id_dispatches_status_read() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/agents status reviewer-1".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::ReadAgentStatus(params) => {
+                assert_eq!(params.agent_id, "reviewer-1");
+            }
+            other => panic!("expected ReadAgentStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agents_output_dispatches_output_read() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/agents output ag-7".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::ReadAgentOutput(params) => {
+                assert_eq!(params.agent_id, "ag-7");
+                assert!(params.cursor.is_none());
+            }
+            other => panic!("expected ReadAgentOutput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agents_artifacts_dispatches_artifact_list() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/agents artifacts ag-7".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::ListAgentArtifacts(params) => {
+                assert_eq!(params.agent_id, "ag-7");
+            }
+            other => panic!("expected ListAgentArtifacts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agents_interrupt_dispatches_agent_interrupt() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/agents interrupt ag-7".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::InterruptAgent(params) => {
+                assert_eq!(params.agent_id, "ag-7");
+            }
+            other => panic!("expected InterruptAgent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agents_close_dispatches_agent_close() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/agents close ag-7".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::CloseAgent(params) => {
+                assert_eq!(params.agent_id, "ag-7");
+            }
+            other => panic!("expected CloseAgent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agents_missing_id_records_parse_error_status() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/agents output".into();
+        assert!(store.compose_command().is_none());
+        // Registry hides the command on the missing-id error first; the
+        // composer is cleared either way.
+        assert!(store.state.composer.is_empty());
+    }
+
+    #[test]
+    fn goal_bare_dispatches_goal_get() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/goal".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::GetSessionGoal(params) => {
+                assert_eq!(params.profile_id.as_deref(), Some("coding"));
+            }
+            other => panic!("expected GetSessionGoal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn goal_set_dispatches_goal_set_with_objective() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/goal finish the review by Friday".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::SetSessionGoal(params) => {
+                assert_eq!(params.action, crate::model::SessionGoalSetAction::Set);
+                assert_eq!(
+                    params.objective.as_deref(),
+                    Some("finish the review by Friday")
+                );
+            }
+            other => panic!("expected SetSessionGoal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn goal_pause_dispatches_goal_set_pause() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/goal pause".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::SetSessionGoal(params) => {
+                assert_eq!(params.action, crate::model::SessionGoalSetAction::Pause);
+                assert!(params.objective.is_none());
+            }
+            other => panic!("expected SetSessionGoal Pause, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn goal_resume_dispatches_goal_set_resume() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/goal resume".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::SetSessionGoal(params) => {
+                assert_eq!(params.action, crate::model::SessionGoalSetAction::Resume);
+            }
+            other => panic!("expected SetSessionGoal Resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn goal_clear_dispatches_goal_clear() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/goal clear".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::ClearSessionGoal(params) => {
+                assert_eq!(params.session_id, SessionKey("local:test".into()));
+            }
+            other => panic!("expected ClearSessionGoal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_bare_lists_loops() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/loop".into();
+        assert!(matches!(
+            store.compose_command(),
+            Some(AppUiCommand::ListLoops(_))
+        ));
+    }
+
+    #[test]
+    fn loop_list_lists_loops() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/loop list".into();
+        assert!(matches!(
+            store.compose_command(),
+            Some(AppUiCommand::ListLoops(_))
+        ));
+    }
+
+    #[test]
+    fn loop_with_self_paced_prompt_dispatches_create_self_paced() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/loop check the deploy".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::CreateLoop(params) => {
+                assert_eq!(params.prompt, "check the deploy");
+                assert_eq!(params.mode, crate::model::LoopMode::SelfPaced);
+                assert!(params.interval_seconds.is_none());
+            }
+            other => panic!("expected CreateLoop self-paced, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_with_leading_interval_dispatches_fixed_interval() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/loop 5m run tests".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::CreateLoop(params) => {
+                assert_eq!(params.prompt, "run tests");
+                assert_eq!(params.mode, crate::model::LoopMode::FixedInterval);
+                assert_eq!(params.interval_seconds, Some(300));
+            }
+            other => panic!("expected CreateLoop fixed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_with_suffix_every_dispatches_fixed_interval() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/loop check queue every 2h".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::CreateLoop(params) => {
+                assert_eq!(params.prompt, "check queue");
+                assert_eq!(params.mode, crate::model::LoopMode::FixedInterval);
+                assert_eq!(params.interval_seconds, Some(7200));
+            }
+            other => panic!("expected CreateLoop suffix fixed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_with_maintenance_cadence_dispatches_maintenance() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/loop maintenance prune old artifacts".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::CreateLoop(params) => {
+                assert_eq!(params.prompt, "prune old artifacts");
+                assert_eq!(params.mode, crate::model::LoopMode::Maintenance);
+                assert!(params.interval_seconds.is_none());
+            }
+            other => panic!("expected CreateLoop maintenance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_delete_dispatches_delete_with_id() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/loop delete loop-7".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::DeleteLoop(params) => {
+                assert_eq!(params.loop_id, "loop-7");
+            }
+            other => panic!("expected DeleteLoop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_pause_dispatches_pause_with_id() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/loop pause loop-7".into();
+        assert!(matches!(
+            store.compose_command(),
+            Some(AppUiCommand::PauseLoop(_))
+        ));
+    }
+
+    #[test]
+    fn loop_resume_dispatches_resume_with_id() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/loop resume loop-7".into();
+        assert!(matches!(
+            store.compose_command(),
+            Some(AppUiCommand::ResumeLoop(_))
+        ));
+    }
+
+    #[test]
+    fn loop_fire_now_dispatches_fire_with_id() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/loop fire-now loop-7".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::FireLoopNow(params) => {
+                assert_eq!(params.loop_id, "loop-7");
+            }
+            other => panic!("expected FireLoopNow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn autonomy_dispatch_without_session_records_status_and_returns_none() {
+        // Empty session list — the dispatcher must NOT emit an RPC.
+        let mut store = Store {
+            state: AppState::new(vec![], 0, "ready".into(), None, false),
+        };
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [crate::model::APPUI_METHOD_AGENT_LIST],
+            [crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1],
+        ));
+        store.state.composer = "/agents list".into();
+        assert!(store.compose_command().is_none());
+    }
+
+    #[test]
+    fn autonomy_commands_hidden_without_capability() {
+        // Capability set has methods but NOT the feature; the registry
+        // gate must hide `/agents`, `/goal`, `/loop`.
+        let mut store = store_with_empty_session();
+        store.state.target = Some("ws://example.test/ui-protocol".into());
+        // Methods are present, but `coding.autonomy.v1` is NOT.
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_AGENT_LIST,
+            crate::model::APPUI_METHOD_SESSION_GOAL_GET,
+            crate::model::APPUI_METHOD_LOOP_LIST,
+        ]));
+
+        for cmd in ["/agents", "/goal", "/loop"] {
+            store.state.composer = cmd.into();
+            assert!(
+                store.compose_command().is_none(),
+                "{cmd} must be hidden without coding.autonomy.v1"
+            );
+        }
+    }
+
+    #[test]
+    fn autonomy_interrupt_blocked_in_readonly_mode() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.readonly = true;
+        store.state.composer = "/agents interrupt ag-7".into();
+        assert!(store.compose_command().is_none());
+        assert!(
+            store.state.status.to_lowercase().contains("read-only")
+                || store.state.status.contains("disabled"),
+            "expected readonly status, got: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn autonomy_hydration_enqueues_three_commands_on_supported_caps() {
+        let store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        let commands = store.hydrate_autonomy_state_commands(&session_id);
+        assert_eq!(commands.len(), 3);
+        assert!(matches!(commands[0], AppUiCommand::ListAgents(_)));
+        assert!(matches!(commands[1], AppUiCommand::GetSessionGoal(_)));
+        assert!(matches!(commands[2], AppUiCommand::ListLoops(_)));
+    }
+
+    #[test]
+    fn autonomy_hydration_skipped_without_autonomy_feature() {
+        let mut store = protocol_store_with_autonomy();
+        // Strip the feature.
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_AGENT_LIST,
+            crate::model::APPUI_METHOD_SESSION_GOAL_GET,
+            crate::model::APPUI_METHOD_LOOP_LIST,
+        ]));
+        let commands = store.hydrate_autonomy_state_commands(&SessionKey("local:test".into()));
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn autonomy_hydration_only_enqueues_supported_subset() {
+        let mut store = protocol_store_with_autonomy();
+        // Only `agent/list` advertised (plus the feature).
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [crate::model::APPUI_METHOD_AGENT_LIST],
+            [crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1],
+        ));
+        let commands = store.hydrate_autonomy_state_commands(&SessionKey("local:test".into()));
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0], AppUiCommand::ListAgents(_)));
+    }
+
+    #[test]
+    fn agent_updated_notification_upserts_session_mirror() {
+        use octos_core::ui_protocol::{AgentUpdatedEvent, UiAgentRecord};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        let agent = UiAgentRecord {
+            agent_id: "ag-1".into(),
+            parent_agent_id: None,
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "/root".into(),
+            role: "reviewer".into(),
+            nickname: "rev".into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: "running".into(),
+            last_task: None,
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::AgentUpdated(
+            AgentUpdatedEvent {
+                session_id: session_id.clone(),
+                agent: agent.clone(),
+            },
+        )));
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror created");
+        assert_eq!(mirror.agents.len(), 1);
+        assert_eq!(mirror.agents[0].agent_id, "ag-1");
+        assert_eq!(mirror.agents[0].status, "running");
+    }
+
+    #[test]
+    fn agent_output_delta_appends_to_session_mirror() {
+        use octos_core::ui_protocol::AgentOutputDeltaEvent;
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.apply_event(AppUiEvent::Protocol(UiNotification::AgentOutputDelta(
+            AgentOutputDeltaEvent {
+                session_id: session_id.clone(),
+                agent_id: "ag-1".into(),
+                cursor: OutputCursor { offset: 5 },
+                text: "hello".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::AgentOutputDelta(
+            AgentOutputDeltaEvent {
+                session_id: session_id.clone(),
+                agent_id: "ag-1".into(),
+                cursor: OutputCursor { offset: 11 },
+                text: " world".into(),
+            },
+        )));
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror");
+        assert_eq!(mirror.agent_outputs.len(), 1);
+        assert_eq!(mirror.agent_outputs[0].text, "hello world");
+        assert_eq!(mirror.agent_outputs[0].cursor.offset, 11);
+    }
+
+    #[test]
+    fn session_goal_updated_notification_replaces_mirror_goal() {
+        use octos_core::ui_protocol::{SessionGoalUpdatedEvent, UiGoalRecord};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        let goal = UiGoalRecord {
+            profile_id: Some("coding".into()),
+            goal_id: "goal_01".into(),
+            objective: "finish review".into(),
+            status: "active".into(),
+            token_budget: 50000,
+            tokens_used: 100,
+            time_used_seconds: 10,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionGoalUpdated(
+            SessionGoalUpdatedEvent {
+                session_id: session_id.clone(),
+                profile_id: Some("coding".into()),
+                goal: goal.clone(),
+                transition_actor: "user".into(),
+            },
+        )));
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror");
+        let stored_goal = mirror.goal.as_ref().expect("goal cached");
+        assert_eq!(stored_goal.objective, "finish review");
+        assert_eq!(stored_goal.status, "active");
+        assert_eq!(mirror.goal_transition_actor.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn session_goal_cleared_notification_clears_mirror_goal() {
+        use octos_core::ui_protocol::{
+            SessionGoalClearedEvent, SessionGoalUpdatedEvent, UiGoalRecord,
+        };
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        // Seed.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionGoalUpdated(
+            SessionGoalUpdatedEvent {
+                session_id: session_id.clone(),
+                profile_id: None,
+                goal: UiGoalRecord {
+                    profile_id: None,
+                    goal_id: "g1".into(),
+                    objective: "foo".into(),
+                    status: "active".into(),
+                    token_budget: 1000,
+                    tokens_used: 0,
+                    time_used_seconds: 0,
+                    created_at_ms: 1,
+                    updated_at_ms: 2,
+                },
+                transition_actor: "user".into(),
+            },
+        )));
+        // Now clear with cleared=true.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionGoalCleared(
+            SessionGoalClearedEvent {
+                session_id: session_id.clone(),
+                profile_id: None,
+                cleared: true,
+                goal: None,
+                transition_actor: "user".into(),
+            },
+        )));
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror");
+        assert!(mirror.goal.is_none());
+    }
+
+    #[test]
+    fn loop_updated_notification_upserts_mirror_loop() {
+        use octos_core::ui_protocol::{LoopUpdatedEvent, UiLoopRecord};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        let loop_record = UiLoopRecord {
+            loop_id: "loop_01".into(),
+            session_id: session_id.clone(),
+            profile_id: None,
+            prompt: "check deploy".into(),
+            mode: "self_paced".into(),
+            interval_seconds: None,
+            status: "active".into(),
+            next_run_at_ms: None,
+            last_run_at_ms: None,
+            expires_at_ms: 999,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::LoopUpdated(
+            LoopUpdatedEvent {
+                session_id: session_id.clone(),
+                profile_id: None,
+                loop_id: Some("loop_01".into()),
+                loop_state: loop_record.clone(),
+                ok: Some(true),
+                status: Some("active".into()),
+                deleted: None,
+            },
+        )));
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror");
+        assert_eq!(mirror.loops.len(), 1);
+        assert_eq!(mirror.loops[0].loop_id, "loop_01");
+    }
+
+    #[test]
+    fn loop_updated_with_deleted_flag_removes_mirror_loop() {
+        use octos_core::ui_protocol::{LoopUpdatedEvent, UiLoopRecord};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        // Seed first.
+        let loop_record = UiLoopRecord {
+            loop_id: "loop_01".into(),
+            session_id: session_id.clone(),
+            profile_id: None,
+            prompt: "check".into(),
+            mode: "self_paced".into(),
+            interval_seconds: None,
+            status: "active".into(),
+            next_run_at_ms: None,
+            last_run_at_ms: None,
+            expires_at_ms: 999,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        store
+            .state
+            .upsert_session_loop(&session_id, loop_record.clone());
+        // Now notify deleted=true.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::LoopUpdated(
+            LoopUpdatedEvent {
+                session_id: session_id.clone(),
+                profile_id: None,
+                loop_id: Some("loop_01".into()),
+                loop_state: loop_record,
+                ok: Some(true),
+                status: Some("deleted".into()),
+                deleted: Some(true),
+            },
+        )));
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror");
+        assert!(mirror.loops.is_empty());
+    }
+
+    #[test]
+    fn autonomy_agent_list_result_replaces_mirror_agents() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        use octos_core::ui_protocol::UiAgentRecord;
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        let agent = UiAgentRecord {
+            agent_id: "ag-1".into(),
+            parent_agent_id: None,
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "/root".into(),
+            role: "reviewer".into(),
+            nickname: "rev".into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: "running".into(),
+            last_task: None,
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::AgentList(crate::model::AgentListResult {
+                session_id: session_id.clone(),
+                agents: vec![agent],
+            }),
+        }));
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror");
+        assert_eq!(mirror.agents.len(), 1);
+        assert!(store.state.status.contains("1 agent"));
+    }
+
+    #[test]
+    fn autonomy_loop_list_result_replaces_mirror_loops() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        use octos_core::ui_protocol::UiLoopRecord;
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::LoopList(crate::model::LoopListResult {
+                session_id: session_id.clone(),
+                loops: vec![UiLoopRecord {
+                    loop_id: "loop_a".into(),
+                    session_id: session_id.clone(),
+                    profile_id: None,
+                    prompt: "p".into(),
+                    mode: "fixed_interval".into(),
+                    interval_seconds: Some(60),
+                    status: "active".into(),
+                    next_run_at_ms: None,
+                    last_run_at_ms: None,
+                    expires_at_ms: 1,
+                    created_at_ms: 1,
+                    updated_at_ms: 2,
+                }],
+            }),
+        }));
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror");
+        assert_eq!(mirror.loops.len(), 1);
+        assert!(store.state.status.contains("1 loop"));
+    }
+
+    #[test]
+    fn session_open_enqueues_autonomy_hydration_when_advertised() {
+        use octos_core::ui_protocol::SessionOpened;
+        let mut store = protocol_store_with_autonomy();
+        // Drop the live session so SessionOpened pushes a new one.
+        store.state.sessions.clear();
+        let session_id = SessionKey("local:fresh".into());
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": session_id,
+            "active_profile_id": "coding",
+            "workspace_root": null,
+            "cursor": null,
+            "panes": null,
+        }))
+        .expect("session_opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+        // Three commands queued: agent/list, session/goal/get, loop/list.
+        assert_eq!(store.state.pending_autonomy_hydration.len(), 3);
+        let drained: Vec<_> =
+            std::iter::from_fn(|| store.state.dequeue_autonomy_hydration()).collect();
+        assert!(matches!(drained[0], AppUiCommand::ListAgents(_)));
+        assert!(matches!(drained[1], AppUiCommand::GetSessionGoal(_)));
+        assert!(matches!(drained[2], AppUiCommand::ListLoops(_)));
+    }
+
+    #[test]
+    fn agent_list_command_method_matches_constant() {
+        let session_id = SessionKey("local:test".into());
+        let cmd = AppUiCommand::ListAgents(crate::model::AgentListParams {
+            session_id,
+            parent_agent_id: None,
+        });
+        assert_eq!(cmd.method(), crate::model::APPUI_METHOD_AGENT_LIST);
+    }
+
+    #[test]
+    fn loop_create_command_method_matches_constant() {
+        let session_id = SessionKey("local:test".into());
+        let cmd = AppUiCommand::CreateLoop(crate::model::LoopCreateParams {
+            session_id,
+            profile_id: None,
+            prompt: "p".into(),
+            mode: crate::model::LoopMode::SelfPaced,
+            interval_seconds: None,
+        });
+        assert_eq!(cmd.method(), crate::model::APPUI_METHOD_LOOP_CREATE);
+    }
+
+    #[test]
+    fn goal_set_command_method_matches_constant() {
+        let session_id = SessionKey("local:test".into());
+        let cmd = AppUiCommand::SetSessionGoal(crate::model::SessionGoalSetParams {
+            session_id,
+            profile_id: None,
+            action: crate::model::SessionGoalSetAction::Set,
+            objective: Some("foo".into()),
+        });
+        assert_eq!(cmd.method(), crate::model::APPUI_METHOD_SESSION_GOAL_SET);
     }
 }

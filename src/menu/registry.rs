@@ -146,6 +146,35 @@ pub const APPUI_SKILLS_MENU_METHODS_ANY: &[&str] = &[
     APPUI_METHOD_PROFILE_SKILLS_REMOVE,
 ];
 
+/// M15-E (UPCR-2026-021) required capability feature for the
+/// combined `/agents` `/goal` `/loop` surface. Clients MUST gate
+/// every menu entry, slash command, and dispatch on
+/// `coding.autonomy.v1`; old servers must hide the controls instead
+/// of being probed for unsupported methods.
+pub const APPUI_FEATURE_CODING_AUTONOMY_V1: &str = crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1;
+pub const APPUI_AGENTS_MENU_METHODS_ANY: &[&str] = &[
+    crate::model::APPUI_METHOD_AGENT_LIST,
+    crate::model::APPUI_METHOD_AGENT_STATUS_READ,
+    crate::model::APPUI_METHOD_AGENT_OUTPUT_READ,
+    crate::model::APPUI_METHOD_AGENT_ARTIFACT_LIST,
+    crate::model::APPUI_METHOD_AGENT_INTERRUPT,
+    crate::model::APPUI_METHOD_AGENT_CLOSE,
+];
+pub const APPUI_GOAL_MENU_METHODS_ANY: &[&str] = &[
+    crate::model::APPUI_METHOD_SESSION_GOAL_GET,
+    crate::model::APPUI_METHOD_SESSION_GOAL_SET,
+    crate::model::APPUI_METHOD_SESSION_GOAL_CLEAR,
+];
+pub const APPUI_LOOP_MENU_METHODS_ANY: &[&str] = &[
+    crate::model::APPUI_METHOD_LOOP_CREATE,
+    crate::model::APPUI_METHOD_LOOP_LIST,
+    crate::model::APPUI_METHOD_LOOP_DELETE,
+    crate::model::APPUI_METHOD_LOOP_PAUSE,
+    crate::model::APPUI_METHOD_LOOP_RESUME,
+    crate::model::APPUI_METHOD_LOOP_FIRE_NOW,
+];
+const AUTONOMY_FEATURES: &[&str] = &[APPUI_FEATURE_CODING_AUTONOMY_V1];
+
 #[derive(Debug, Clone, Default)]
 pub struct CommandRegistry {
     commands: Vec<CommandSpec>,
@@ -585,6 +614,43 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
                 .with_required_methods_any(APPUI_SKILLS_MENU_METHODS_ANY),
             inline_args: InlineArgMode::Optional,
             entry: CommandEntry::LocalAction(LocalAction::Skills),
+        },
+        // M15-E autonomy entry points. Each command is hidden unless
+        // the server advertises `coding.autonomy.v1`. The actual RPC
+        // dispatch happens in `Store::dispatch_autonomy_slash`, which
+        // parses the full slash syntax via `crate::autonomy::parse_autonomy_slash`.
+        CommandSpec {
+            name: "agents",
+            aliases: &["agent"],
+            description: "Inspect or interrupt backend-owned subagents.",
+            category: CommandCategory::Runtime,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_required_methods_any(APPUI_AGENTS_MENU_METHODS_ANY)
+                .with_required_features(AUTONOMY_FEATURES),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::Custom("autonomy")),
+        },
+        CommandSpec {
+            name: "goal",
+            aliases: &[],
+            description: "View, set, pause, resume, or clear the persisted session goal.",
+            category: CommandCategory::Runtime,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_required_methods_any(APPUI_GOAL_MENU_METHODS_ANY)
+                .with_required_features(AUTONOMY_FEATURES),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::Custom("autonomy")),
+        },
+        CommandSpec {
+            name: "loop",
+            aliases: &[],
+            description: "Create, list, pause, resume, fire-now, or delete backend loops.",
+            category: CommandCategory::Runtime,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_required_methods_any(APPUI_LOOP_MENU_METHODS_ANY)
+                .with_required_features(AUTONOMY_FEATURES),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::Custom("autonomy")),
         },
     ]
 }

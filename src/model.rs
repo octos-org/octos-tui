@@ -159,6 +159,27 @@ pub const APPUI_METHOD_AGENT_OUTPUT_READ: &str = "agent/output/read";
 pub const APPUI_METHOD_AGENT_ARTIFACT_LIST: &str = "agent/artifact/list";
 pub const APPUI_METHOD_AGENT_ARTIFACT_READ: &str = "agent/artifact/read";
 
+/// M15-E backend-owned agent control methods (UPCR-2026-021 §"Agent
+/// Lifecycle Surface"). These are gated on
+/// `coding.agent_control.v1`.
+pub const APPUI_METHOD_AGENT_INTERRUPT: &str = "agent/interrupt";
+pub const APPUI_METHOD_AGENT_CLOSE: &str = "agent/close";
+
+/// M15-E backend-owned goal runtime methods (UPCR-2026-021 §"Goal
+/// Runtime Surface"). These are gated on `coding.goal_runtime.v1`.
+pub const APPUI_METHOD_SESSION_GOAL_GET: &str = "session/goal/get";
+pub const APPUI_METHOD_SESSION_GOAL_SET: &str = "session/goal/set";
+pub const APPUI_METHOD_SESSION_GOAL_CLEAR: &str = "session/goal/clear";
+
+/// M15-E backend-owned loop runtime methods (UPCR-2026-021 §"Loop
+/// Runtime Surface"). These are gated on `coding.loop_runtime.v1`.
+pub const APPUI_METHOD_LOOP_CREATE: &str = "loop/create";
+pub const APPUI_METHOD_LOOP_LIST: &str = "loop/list";
+pub const APPUI_METHOD_LOOP_DELETE: &str = "loop/delete";
+pub const APPUI_METHOD_LOOP_PAUSE: &str = "loop/pause";
+pub const APPUI_METHOD_LOOP_RESUME: &str = "loop/resume";
+pub const APPUI_METHOD_LOOP_FIRE_NOW: &str = "loop/fire_now";
+
 /// M15-E notification methods the TUI listens for to update agent /
 /// goal / loop state. It must not call these as RPC.
 pub const APPUI_METHOD_AGENT_UPDATED: &str = "agent/updated";
@@ -169,6 +190,286 @@ pub const APPUI_METHOD_SESSION_GOAL_CLEARED: &str = "session/goal/cleared";
 pub const APPUI_METHOD_LOOP_UPDATED: &str = "loop/updated";
 pub const APPUI_METHOD_LOOP_FIRED: &str = "loop/fired";
 pub const APPUI_METHOD_LOOP_COMPLETED: &str = "loop/completed";
+
+// ---------- M15-E AppUI param + result types ----------
+//
+// These params types model the request side of the autonomy surface
+// (`/agents`, `/goal`, `/loop`). Upstream `octos-core` already owns
+// the wire shape for notifications (`UiAgentRecord`, `UiGoalRecord`,
+// `UiLoopRecord`, etc.) — we re-use those for results so the
+// rendered state stays in lockstep with what the backend stamps.
+//
+// All TUI-side mutating dispatch goes through `require_appui_method`
+// in `store.rs`. Servers that do not advertise the methods will see
+// the slash command rendered as `Unsupported` instead of being
+// probed.
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentListParams {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentListResult {
+    pub session_id: SessionKey,
+    #[serde(default)]
+    pub agents: Vec<octos_core::ui_protocol::UiAgentRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStatusReadParams {
+    pub session_id: SessionKey,
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentStatusReadResult {
+    pub session_id: SessionKey,
+    pub agent: octos_core::ui_protocol::UiAgentRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOutputReadParams {
+    pub session_id: SessionKey,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<OutputCursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOutputReadResult {
+    pub session_id: SessionKey,
+    pub agent_id: String,
+    pub cursor: OutputCursor,
+    #[serde(default)]
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentArtifactListParams {
+    pub session_id: SessionKey,
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentArtifactListResult {
+    pub session_id: SessionKey,
+    pub agent_id: String,
+    #[serde(default)]
+    pub artifacts: Vec<octos_core::ui_protocol::UiAgentArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInterruptParams {
+    pub session_id: SessionKey,
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentInterruptResult {
+    pub session_id: SessionKey,
+    pub agent_id: String,
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<octos_core::ui_protocol::UiAgentRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCloseParams {
+    pub session_id: SessionKey,
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentCloseResult {
+    pub session_id: SessionKey,
+    pub agent_id: String,
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<octos_core::ui_protocol::UiAgentRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGoalGetParams {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionGoalGetResult {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<octos_core::ui_protocol::UiGoalRecord>,
+}
+
+/// `session/goal/set` action verb. The TUI may set an objective, or
+/// transition an existing goal between `pause`/`resume`. Completion is
+/// model-owned and never set by the TUI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionGoalSetAction {
+    /// `/goal <objective>` — establish a new active goal.
+    Set,
+    /// `/goal pause` — pause an active goal.
+    Pause,
+    /// `/goal resume` — resume a paused goal.
+    Resume,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGoalSetParams {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub action: SessionGoalSetAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionGoalSetResult {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<octos_core::ui_protocol::UiGoalRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_actor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGoalClearParams {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionGoalClearResult {
+    pub session_id: SessionKey,
+    #[serde(default)]
+    pub cleared: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_actor: Option<String>,
+}
+
+/// Loop cadence parsed from `/loop`. `interval_seconds` is `None` for
+/// self-paced loops and for maintenance loops. The backend decides
+/// the cadence for those two modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopMode {
+    FixedInterval,
+    SelfPaced,
+    Maintenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopCreateParams {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub prompt: String,
+    pub mode: LoopMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoopCreateResult {
+    pub session_id: SessionKey,
+    #[serde(rename = "loop")]
+    pub loop_state: octos_core::ui_protocol::UiLoopRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopListParams {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoopListResult {
+    pub session_id: SessionKey,
+    #[serde(default)]
+    pub loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopIdParams {
+    pub session_id: SessionKey,
+    pub loop_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoopMutationResult {
+    pub session_id: SessionKey,
+    pub loop_id: String,
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub loop_state: Option<octos_core::ui_protocol::UiLoopRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fire: Option<octos_core::ui_protocol::UiLoopFire>,
+}
+
+/// Per-session autonomy mirror state. Populated by `agent/list`,
+/// `session/goal/get`, `loop/list` responses and by the matching
+/// notifications. The TUI re-fetches this on session open and on
+/// reconnect — local config is never used to fill it in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionAutonomyState {
+    pub session_id: SessionKey,
+    pub agents: Vec<octos_core::ui_protocol::UiAgentRecord>,
+    pub agent_outputs: Vec<AutonomyAgentOutputCache>,
+    pub agent_artifacts: Vec<AutonomyAgentArtifactCache>,
+    pub goal: Option<octos_core::ui_protocol::UiGoalRecord>,
+    pub goal_transition_actor: Option<String>,
+    pub loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
+}
+
+impl SessionAutonomyState {
+    pub fn new(session_id: SessionKey) -> Self {
+        Self {
+            session_id,
+            agents: Vec::new(),
+            agent_outputs: Vec::new(),
+            agent_artifacts: Vec::new(),
+            goal: None,
+            goal_transition_actor: None,
+            loops: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutonomyAgentOutputCache {
+    pub agent_id: String,
+    pub text: String,
+    pub cursor: OutputCursor,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutonomyAgentArtifactCache {
+    pub agent_id: String,
+    pub artifacts: Vec<octos_core::ui_protocol::UiAgentArtifact>,
+}
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretString(String);
@@ -262,6 +563,22 @@ pub enum AppUiCommand {
     ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchParams),
     ProfileSkillsInstall(ProfileSkillsInstallParams),
     ProfileSkillsRemove(ProfileSkillsRemoveParams),
+    // M15-E backend-owned autonomy surface (UPCR-2026-021).
+    ListAgents(AgentListParams),
+    ReadAgentStatus(AgentStatusReadParams),
+    ReadAgentOutput(AgentOutputReadParams),
+    ListAgentArtifacts(AgentArtifactListParams),
+    InterruptAgent(AgentInterruptParams),
+    CloseAgent(AgentCloseParams),
+    GetSessionGoal(SessionGoalGetParams),
+    SetSessionGoal(SessionGoalSetParams),
+    ClearSessionGoal(SessionGoalClearParams),
+    CreateLoop(LoopCreateParams),
+    ListLoops(LoopListParams),
+    DeleteLoop(LoopIdParams),
+    PauseLoop(LoopIdParams),
+    ResumeLoop(LoopIdParams),
+    FireLoopNow(LoopIdParams),
 }
 
 impl AppUiCommand {
@@ -316,6 +633,21 @@ impl AppUiCommand {
             Self::ProfileSkillsRegistrySearch(_) => APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
             Self::ProfileSkillsInstall(_) => APPUI_METHOD_PROFILE_SKILLS_INSTALL,
             Self::ProfileSkillsRemove(_) => APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+            Self::ListAgents(_) => APPUI_METHOD_AGENT_LIST,
+            Self::ReadAgentStatus(_) => APPUI_METHOD_AGENT_STATUS_READ,
+            Self::ReadAgentOutput(_) => APPUI_METHOD_AGENT_OUTPUT_READ,
+            Self::ListAgentArtifacts(_) => APPUI_METHOD_AGENT_ARTIFACT_LIST,
+            Self::InterruptAgent(_) => APPUI_METHOD_AGENT_INTERRUPT,
+            Self::CloseAgent(_) => APPUI_METHOD_AGENT_CLOSE,
+            Self::GetSessionGoal(_) => APPUI_METHOD_SESSION_GOAL_GET,
+            Self::SetSessionGoal(_) => APPUI_METHOD_SESSION_GOAL_SET,
+            Self::ClearSessionGoal(_) => APPUI_METHOD_SESSION_GOAL_CLEAR,
+            Self::CreateLoop(_) => APPUI_METHOD_LOOP_CREATE,
+            Self::ListLoops(_) => APPUI_METHOD_LOOP_LIST,
+            Self::DeleteLoop(_) => APPUI_METHOD_LOOP_DELETE,
+            Self::PauseLoop(_) => APPUI_METHOD_LOOP_PAUSE,
+            Self::ResumeLoop(_) => APPUI_METHOD_LOOP_RESUME,
+            Self::FireLoopNow(_) => APPUI_METHOD_LOOP_FIRE_NOW,
         }
     }
 }
@@ -2628,6 +2960,18 @@ pub struct AppState {
     /// notification yet — the TUI hides the status surface in that case
     /// instead of rendering zeroes.
     pub context_lifecycle: Vec<SessionContextLifecycleEntry>,
+    /// M15-E per-session autonomy mirror. Populated by `agent/list`,
+    /// `session/goal/get`, `loop/list` results and by the matching
+    /// notifications. Hydration on reconnect re-requests these and
+    /// REPLACES the local mirror — local config never fills this in.
+    pub session_autonomy: Vec<SessionAutonomyState>,
+    /// M15-E reconnect hydration queue. The store enqueues
+    /// follow-up AppUI commands (e.g. `agent/list`,
+    /// `session/goal/get`, `loop/list`) when a session opens or after
+    /// reconnect, and the event loop drains them one per tick. The
+    /// queue is bounded so a misbehaving server cannot cause it to
+    /// grow without bound.
+    pub pending_autonomy_hydration: std::collections::VecDeque<AppUiCommand>,
     pub exit_requested: bool,
 }
 
@@ -3689,6 +4033,8 @@ impl AppState {
             mcp_config_catalog: None,
             tool_config_catalog: None,
             context_lifecycle: Vec::new(),
+            session_autonomy: Vec::new(),
+            pending_autonomy_hydration: std::collections::VecDeque::new(),
             exit_requested: false,
         }
     }
@@ -3729,6 +4075,226 @@ impl AppState {
             .last_mut()
             .expect("just pushed")
             .ledger
+    }
+
+    /// M15-E: read-only access to the autonomy mirror for a session,
+    /// or `None` if the backend has not yet emitted any agent / goal
+    /// / loop state for it.
+    pub fn session_autonomy_for(&self, session_id: &SessionKey) -> Option<&SessionAutonomyState> {
+        self.session_autonomy
+            .iter()
+            .find(|entry| &entry.session_id == session_id)
+    }
+
+    /// M15-E: mutable access to the autonomy mirror for a session.
+    /// Creates a fresh entry on first access — the mirror is empty
+    /// until the backend confirms state.
+    pub fn session_autonomy_mut(&mut self, session_id: &SessionKey) -> &mut SessionAutonomyState {
+        if let Some(pos) = self
+            .session_autonomy
+            .iter()
+            .position(|entry| &entry.session_id == session_id)
+        {
+            return &mut self.session_autonomy[pos];
+        }
+        self.session_autonomy
+            .push(SessionAutonomyState::new(session_id.clone()));
+        self.session_autonomy
+            .last_mut()
+            .expect("just pushed autonomy entry")
+    }
+
+    /// Replace the entire agent list for a session. Used by the
+    /// `agent/list` response and after reconnect-hydration.
+    pub fn set_session_agents(
+        &mut self,
+        session_id: &SessionKey,
+        agents: Vec<octos_core::ui_protocol::UiAgentRecord>,
+    ) {
+        let entry = self.session_autonomy_mut(session_id);
+        entry.agents = agents;
+    }
+
+    /// Upsert one agent record by `agent_id`. The wire schema may
+    /// arrive via `agent/updated` or as part of an `agent/list`
+    /// response.
+    pub fn upsert_session_agent(
+        &mut self,
+        session_id: &SessionKey,
+        agent: octos_core::ui_protocol::UiAgentRecord,
+    ) {
+        let entry = self.session_autonomy_mut(session_id);
+        if let Some(pos) = entry
+            .agents
+            .iter()
+            .position(|a| a.agent_id == agent.agent_id)
+        {
+            entry.agents[pos] = agent;
+        } else {
+            entry.agents.push(agent);
+        }
+    }
+
+    /// Replace the loop list for a session.
+    pub fn set_session_loops(
+        &mut self,
+        session_id: &SessionKey,
+        loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
+    ) {
+        let entry = self.session_autonomy_mut(session_id);
+        entry.loops = loops;
+    }
+
+    /// Upsert one loop record by `loop_id`. Removes the loop when its
+    /// status becomes `deleted` so reconnect doesn't surface tombstones.
+    pub fn upsert_session_loop(
+        &mut self,
+        session_id: &SessionKey,
+        loop_state: octos_core::ui_protocol::UiLoopRecord,
+    ) {
+        let entry = self.session_autonomy_mut(session_id);
+        if loop_state.status == "deleted" {
+            entry.loops.retain(|l| l.loop_id != loop_state.loop_id);
+            return;
+        }
+        if let Some(pos) = entry
+            .loops
+            .iter()
+            .position(|l| l.loop_id == loop_state.loop_id)
+        {
+            entry.loops[pos] = loop_state;
+        } else {
+            entry.loops.push(loop_state);
+        }
+    }
+
+    /// Remove a loop entry by id (used for explicit `loop/delete`
+    /// responses where the backend doesn't echo a deleted-status loop
+    /// record).
+    pub fn remove_session_loop(&mut self, session_id: &SessionKey, loop_id: &str) {
+        if let Some(entry) = self
+            .session_autonomy
+            .iter_mut()
+            .find(|entry| &entry.session_id == session_id)
+        {
+            entry.loops.retain(|l| l.loop_id != loop_id);
+        }
+    }
+
+    /// Set the current goal for a session. `goal = None` clears it.
+    pub fn set_session_goal(
+        &mut self,
+        session_id: &SessionKey,
+        goal: Option<octos_core::ui_protocol::UiGoalRecord>,
+        transition_actor: Option<String>,
+    ) {
+        let entry = self.session_autonomy_mut(session_id);
+        entry.goal = goal;
+        entry.goal_transition_actor = transition_actor;
+    }
+
+    /// Replace the cached output tail for an agent. The backend is
+    /// authoritative; deltas are appended via [`append_agent_output`].
+    pub fn set_agent_output(
+        &mut self,
+        session_id: &SessionKey,
+        agent_id: &str,
+        text: String,
+        cursor: OutputCursor,
+    ) {
+        let entry = self.session_autonomy_mut(session_id);
+        if let Some(pos) = entry
+            .agent_outputs
+            .iter()
+            .position(|cache| cache.agent_id == agent_id)
+        {
+            entry.agent_outputs[pos] = AutonomyAgentOutputCache {
+                agent_id: agent_id.to_string(),
+                text,
+                cursor,
+            };
+        } else {
+            entry.agent_outputs.push(AutonomyAgentOutputCache {
+                agent_id: agent_id.to_string(),
+                text,
+                cursor,
+            });
+        }
+    }
+
+    /// Append output deltas from `agent/output/delta`. If the cursor
+    /// has rolled past the cached one the entry is overwritten so
+    /// stale text never lingers in the mirror.
+    pub fn append_agent_output(
+        &mut self,
+        session_id: &SessionKey,
+        agent_id: &str,
+        cursor: OutputCursor,
+        text: &str,
+    ) {
+        let entry = self.session_autonomy_mut(session_id);
+        if let Some(pos) = entry
+            .agent_outputs
+            .iter()
+            .position(|cache| cache.agent_id == agent_id)
+        {
+            let cache = &mut entry.agent_outputs[pos];
+            if cursor.offset < cache.cursor.offset {
+                // Backend rewound; replace.
+                cache.text = text.to_string();
+            } else {
+                cache.text.push_str(text);
+            }
+            cache.cursor = cursor;
+        } else {
+            entry.agent_outputs.push(AutonomyAgentOutputCache {
+                agent_id: agent_id.to_string(),
+                text: text.to_string(),
+                cursor,
+            });
+        }
+    }
+
+    /// Enqueue a pending autonomy hydration command. Bounded — extra
+    /// commands beyond a small cap are dropped to keep the queue
+    /// O(1) — fresh hydration on the next reconnect is cheap.
+    pub fn enqueue_autonomy_hydration(&mut self, command: AppUiCommand) {
+        const MAX_PENDING_HYDRATION: usize = 16;
+        if self.pending_autonomy_hydration.len() >= MAX_PENDING_HYDRATION {
+            self.pending_autonomy_hydration.pop_front();
+        }
+        self.pending_autonomy_hydration.push_back(command);
+    }
+
+    /// Dequeue the next pending hydration command. Returns `None` when
+    /// the queue is empty.
+    pub fn dequeue_autonomy_hydration(&mut self) -> Option<AppUiCommand> {
+        self.pending_autonomy_hydration.pop_front()
+    }
+
+    /// Replace the artifact cache for a single agent.
+    pub fn set_agent_artifacts(
+        &mut self,
+        session_id: &SessionKey,
+        agent_id: &str,
+        artifacts: Vec<octos_core::ui_protocol::UiAgentArtifact>,
+    ) {
+        let entry = self.session_autonomy_mut(session_id);
+        if let Some(pos) = entry
+            .agent_artifacts
+            .iter()
+            .position(|cache| cache.agent_id == agent_id)
+        {
+            entry.agent_artifacts[pos] = AutonomyAgentArtifactCache {
+                agent_id: agent_id.to_string(),
+                artifacts,
+            };
+        } else {
+            entry.agent_artifacts.push(AutonomyAgentArtifactCache {
+                agent_id: agent_id.to_string(),
+                artifacts,
+            });
+        }
     }
 
     pub fn permission_profile_for(

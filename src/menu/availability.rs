@@ -97,6 +97,14 @@ impl CommandAvailability {
         self
     }
 
+    /// Require ALL of the listed capability features (e.g.
+    /// `coding.autonomy.v1`). When any feature is missing the command
+    /// is hidden by default (or disabled when the policy is `Disable`).
+    pub fn with_required_features(mut self, required_features: &'static [&'static str]) -> Self {
+        self.required_features = required_features;
+        self
+    }
+
     pub fn evaluate(&self, ctx: &AvailabilityContext<'_>) -> AvailabilityStatus {
         if self.session == SessionRequirement::Open && !ctx.session_open {
             return self.unavailable.status("requires an open session");

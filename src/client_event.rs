@@ -1,13 +1,16 @@
 use octos_core::{SessionKey, app_ui::AppUiEvent, ui_protocol::PermissionProfileSelection};
 
 use crate::model::{
-    AuthLogoutResult, AuthMeResult, AuthSendCodeResult, AuthStatusResult, AuthVerifyResult,
-    ConfigCapabilitiesListResult, DiffPreviewGetResult, McpConfigListResult,
-    McpConfigMutationResult, McpStatusListResult, ModelListResult, ModelSelectResult,
-    ProfileLlmCatalogResult, ProfileLlmListResult, ProfileLlmMutationResult,
+    AgentArtifactListResult, AgentCloseResult, AgentInterruptResult, AgentListResult,
+    AgentOutputReadResult, AgentStatusReadResult, AuthLogoutResult, AuthMeResult,
+    AuthSendCodeResult, AuthStatusResult, AuthVerifyResult, ConfigCapabilitiesListResult,
+    DiffPreviewGetResult, LoopCreateResult, LoopListResult, LoopMutationResult,
+    McpConfigListResult, McpConfigMutationResult, McpStatusListResult, ModelListResult,
+    ModelSelectResult, ProfileLlmCatalogResult, ProfileLlmListResult, ProfileLlmMutationResult,
     ProfileLocalCreateResult, ProfileSkillsListResult, ProfileSkillsMutationResult,
-    ProfileSkillsRegistrySearchResult, SessionStatusReadResult, ToolConfigListResult,
-    ToolConfigMutationResult, ToolStatusListResult,
+    ProfileSkillsRegistrySearchResult, SessionGoalClearResult, SessionGoalGetResult,
+    SessionGoalSetResult, SessionStatusReadResult, ToolConfigListResult, ToolConfigMutationResult,
+    ToolStatusListResult,
 };
 
 #[derive(Debug, Clone)]
@@ -37,6 +40,10 @@ pub enum ClientEvent {
     ToolStatus(ToolStatusClientEvent),
     ToolConfigList(ToolConfigListClientEvent),
     ToolConfigMutation(ToolConfigMutationClientEvent),
+    /// M15-E backend-owned autonomy result event. Carries the raw
+    /// typed result from one of the `/agents`, `/goal`, or `/loop`
+    /// RPCs so the store can update its per-session autonomy mirror.
+    Autonomy(AutonomyClientEvent),
 }
 
 impl From<AppUiEvent> for ClientEvent {
@@ -182,4 +189,34 @@ pub struct ToolConfigListClientEvent {
 pub struct ToolConfigMutationClientEvent {
     pub result: ToolConfigMutationResult,
     pub message: String,
+}
+
+/// M15-E typed autonomy result. We keep one variant per RPC so the
+/// store can pattern-match on the precise wire shape rather than
+/// reparsing a generic JSON blob.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AutonomyResult {
+    AgentList(AgentListResult),
+    AgentStatus(AgentStatusReadResult),
+    AgentOutput(AgentOutputReadResult),
+    AgentArtifacts(AgentArtifactListResult),
+    AgentInterrupt(AgentInterruptResult),
+    AgentClose(AgentCloseResult),
+    GoalGet(SessionGoalGetResult),
+    GoalSet(SessionGoalSetResult),
+    GoalClear(SessionGoalClearResult),
+    LoopCreate(LoopCreateResult),
+    LoopList(LoopListResult),
+    /// `loop/delete`, `loop/pause`, `loop/resume`, `loop/fire_now`
+    /// share one wire shape; we keep the method around so the store
+    /// can emit a precise status line.
+    LoopMutation {
+        method: String,
+        result: LoopMutationResult,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutonomyClientEvent {
+    pub result: AutonomyResult,
 }

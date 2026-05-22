@@ -79,11 +79,13 @@ pub fn run(cli: Cli) -> Result<()> {
 fn drain_backend_events(backend: &mut dyn AppUiBackend, store: &mut Store) -> Result<()> {
     for _ in 0..MAX_BACKEND_EVENTS_PER_TICK {
         let Some(event) = backend.next_event()? else {
+            drain_pending_autonomy_hydration(backend, store);
             return Ok(());
         };
         apply_client_event_and_send_followup(backend, store, event);
     }
 
+    drain_pending_autonomy_hydration(backend, store);
     Ok(())
 }
 
@@ -93,6 +95,15 @@ fn apply_client_event_and_send_followup(
     event: ClientEvent,
 ) {
     if let Some(command) = store.apply_client_event(event) {
+        send_command(backend, store, command);
+    }
+}
+
+/// M15-E: send any queued autonomy hydration commands the store has
+/// staged (e.g. on `session/opened` after reconnect). Bounded by the
+/// queue cap inside `AppState` itself.
+fn drain_pending_autonomy_hydration(backend: &mut dyn AppUiBackend, store: &mut Store) {
+    while let Some(command) = store.state.dequeue_autonomy_hydration() {
         send_command(backend, store, command);
     }
 }
