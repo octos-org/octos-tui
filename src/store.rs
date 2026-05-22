@@ -773,6 +773,7 @@ impl Store {
             OnboardingAction::SetName(name) => {
                 self.state.onboarding.name = name.trim().to_owned();
                 self.state.onboarding.local_profile_created = false;
+                self.state.onboarding.clear_local_profile_recovery();
                 self.state.onboarding.last_message = Some("Name updated".into());
                 self.state.status = "Onboarding name updated".into();
                 self.refresh_active_menu_and_advance();
@@ -782,6 +783,7 @@ impl Store {
                 self.state.onboarding.username = username.trim().to_owned();
                 self.state.onboarding.local_profile_created = false;
                 self.state.onboarding.profile_id = None;
+                self.state.onboarding.clear_local_profile_recovery();
                 self.state.onboarding.last_message = Some("Username updated".into());
                 self.state.status = "Onboarding username updated".into();
                 self.refresh_active_menu_and_advance();
@@ -792,6 +794,7 @@ impl Store {
                 self.state.onboarding.local_profile_created = false;
                 self.state.onboarding.auth_code_sent = false;
                 self.state.onboarding.auth_verified = false;
+                self.state.onboarding.clear_local_profile_recovery();
                 self.state.onboarding.last_message = Some("Email updated".into());
                 self.state.status = "Onboarding email updated".into();
                 self.refresh_active_menu_and_advance();
@@ -963,6 +966,33 @@ impl Store {
                 self.refresh_active_menu_if_open();
                 None
             }
+            OnboardingAction::StagePermissionProfile(update) => {
+                self.state.onboarding.staged_permission_profile = update.clone();
+                self.state.onboarding.permission_profile_mismatch = None;
+                self.state.status = match update {
+                    Some(update) => {
+                        let mode = update.mode.map(|m| m.label()).unwrap_or("(unchanged mode)");
+                        let approval = update
+                            .approval_policy
+                            .as_deref()
+                            .unwrap_or("(unchanged approval)");
+                        let network = update
+                            .network
+                            .map(|n| n.label())
+                            .unwrap_or("(unchanged network)");
+                        format!(
+                            "Permission profile staged: {mode} · {approval} · {network} (server confirms on session open)"
+                        )
+                    }
+                    None => "Permission profile staging cleared".into(),
+                };
+                self.refresh_active_menu_if_open();
+                None
+            }
+            OnboardingAction::Doctor => {
+                self.run_onboarding_doctor();
+                None
+            }
             OnboardingAction::Finish => self.onboarding_finish_command(),
             OnboardingAction::Reset => {
                 self.state.onboarding = Default::default();
@@ -1039,6 +1069,21 @@ impl Store {
             "workspace-reset" | "reset-workspace" => {
                 self.dispatch_onboarding_action(OnboardingAction::ResetWorkspace, None)
             }
+            "permissions" | "permission" => {
+                let update = match parse_onboarding_permission_mode(rest) {
+                    Ok(update) => update,
+                    Err(reason) => {
+                        self.state.status = reason;
+                        self.refresh_active_menu_if_open();
+                        return None;
+                    }
+                };
+                self.dispatch_onboarding_action(
+                    OnboardingAction::StagePermissionProfile(update),
+                    None,
+                )
+            }
+            "doctor" | "check" => self.dispatch_onboarding_action(OnboardingAction::Doctor, None),
             "finish" | "open-session" => {
                 self.dispatch_onboarding_action(OnboardingAction::Finish, None)
             }
@@ -1257,13 +1302,37 @@ impl Store {
         if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE) {
             return None;
         }
-        if !self.state.onboarding.local_profile_ready() {
+        // M22-B: block overlapping local-profile creates. If a
+        // create is already in flight, do NOT overwrite the
+        // pending-username snapshot or fire another RPC — the late
+        // response from the first request would otherwise be
+        // attributed to the new snapshot, blaming the wrong
+        // username, and the backend would receive a duplicate.
+        if self.state.onboarding.local_profile_create_pending {
             self.state.status =
-                "Local profile is incomplete; use /onboard name, /onboard username, and /onboard email"
-                    .into();
+                "Local profile creation already in progress; wait for the server response".into();
+            return None;
+        }
+        // M22-B: client-side pre-flight validation catches obvious
+        // bad fields before a backend round-trip; surfaces typed
+        // recovery instead of a generic "incomplete" status.
+        if let Err(recovery) = self.state.onboarding.validate_local_profile() {
+            self.state.status = recovery.message.clone();
+            self.state.onboarding.last_message = Some(recovery.message.clone());
+            let focus_field = recovery.focus_field;
+            self.state.onboarding.local_profile_recovery = Some(recovery);
+            self.refresh_active_menu_if_open();
+            // M22-B: drop the keyboard user onto the offending row so
+            // they can edit it immediately — applies to both pre-flight
+            // validation and server-side typed errors.
+            self.focus_local_profile_field(focus_field);
             return None;
         }
         self.state.onboarding.open_session_after_profile_create = open_session_after_create;
+        self.state.onboarding.local_profile_create_pending = true;
+        self.state.onboarding.local_profile_create_pending_username =
+            Some(self.state.onboarding.username.clone());
+        self.state.onboarding.local_profile_recovery = None;
         self.state.onboarding.last_message = Some("Creating local solo profile".into());
         Some(AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
             name: self.state.onboarding.name.clone(),
@@ -1800,9 +1869,241 @@ impl Store {
         true
     }
 
+    /// M22-F: produce the onboarding doctor report. Each check is
+    /// a typed projection of existing wizard / app state, so the
+    /// doctor surface itself is read-only — recovery is delegated
+    /// back to the existing `/onboard <step>` actions via the
+    /// per-check `recovery` strings.
+    pub fn onboarding_doctor_report(&self) -> crate::model::OnboardingDoctorReport {
+        use crate::model::{
+            OnboardingDoctorCheck, OnboardingDoctorOutcome, OnboardingDoctorReport,
+        };
+        let onboarding = &self.state.onboarding;
+        let capabilities = self.state.capabilities.as_ref();
+        let supports = |method: &str| -> bool {
+            capabilities.is_some_and(|caps| caps.supports_method(method))
+        };
+        let local_create_supported = supports(crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE);
+
+        // M22-F: use the same resolved-profile source as
+        // `onboarding_finish_command` so the doctor recognises a
+        // profile that the server has already published (active
+        // session, runtime status, profile_llm_state, …) even
+        // when the local `onboarding.profile_id` is still blank.
+        let resolved_profile = self.current_profile_for_onboarding();
+        let profile_check = if onboarding.local_profile_created || resolved_profile.is_some() {
+            let label = resolved_profile
+                .clone()
+                .or_else(|| onboarding.profile_id.clone())
+                .unwrap_or_else(|| onboarding.username.clone());
+            OnboardingDoctorOutcome::Pass {
+                detail: format!("profile id: {label}"),
+            }
+        } else if local_create_supported {
+            OnboardingDoctorOutcome::Fail {
+                reason: "no local profile yet".into(),
+                recovery: "Use /onboard name / username / email, then /onboard finish.".into(),
+            }
+        } else {
+            OnboardingDoctorOutcome::Skipped {
+                detail: "profile/local/create not advertised by server".into(),
+            }
+        };
+
+        // M22-F: accept a server-published primary provider — the
+        // `/onboard finish` open-session path already trusts
+        // `profile_llm_state.primary_provider().has_api_key`, so
+        // the doctor must too. Falls back to the local wizard
+        // checks (selection + key staged, etc.) when the server
+        // has not yet published a primary.
+        let published_primary = self
+            .state
+            .profile_llm_state
+            .as_ref()
+            .and_then(|llm| llm.primary_provider())
+            .filter(|provider| provider.has_api_key);
+        let provider_check = if let Some(provider) = published_primary {
+            OnboardingDoctorOutcome::Pass {
+                detail: format!(
+                    "server published primary provider: {} / {}",
+                    provider
+                        .family_id
+                        .clone()
+                        .unwrap_or_else(|| provider.provider.clone()),
+                    provider
+                        .model_id
+                        .clone()
+                        .unwrap_or_else(|| provider.model.clone())
+                ),
+            }
+        } else if onboarding.provider_saved {
+            OnboardingDoctorOutcome::Pass {
+                detail: format!(
+                    "saved primary provider: {}",
+                    onboarding
+                        .saved_primary_provider_label
+                        .clone()
+                        .unwrap_or_else(|| onboarding.provider_label())
+                ),
+            }
+        } else if onboarding.selection_ready() && onboarding.has_api_key() {
+            OnboardingDoctorOutcome::Warn {
+                reason: "provider selected with API key but not saved as primary".into(),
+                recovery: "Use /onboard save to persist; /onboard test to verify first.".into(),
+            }
+        } else if onboarding.selection_ready() {
+            OnboardingDoctorOutcome::Warn {
+                reason: "provider selected but API key missing".into(),
+                recovery: "Use /onboard key <secret>.".into(),
+            }
+        } else {
+            OnboardingDoctorOutcome::Fail {
+                reason: "no provider selected".into(),
+                recovery: "Use /onboard family / model / route, /onboard key, /onboard save."
+                    .into(),
+            }
+        };
+
+        // Workspace check.
+        let workspace_check = if onboarding_workspace_cwd(&self.state.workspace.root).is_some() {
+            OnboardingDoctorOutcome::Pass {
+                detail: format!(
+                    "workspace cwd resolvable from `{}`",
+                    self.state.workspace.root
+                ),
+            }
+        } else {
+            OnboardingDoctorOutcome::Fail {
+                reason: format!(
+                    "workspace cwd is `{}` (not a usable path)",
+                    self.state.workspace.root
+                ),
+                recovery:
+                    "Restart Octos with `--cwd <path>` or set workspace.root via the transport launch."
+                        .into(),
+            }
+        };
+
+        // Capability check.
+        let capability_check = if let Some(caps) = capabilities {
+            // Probe known onboarding-relevant methods to summarize.
+            let known = [
+                crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+                crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+                crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
+                crate::model::APPUI_METHOD_PROFILE_LLM_TEST,
+                crate::model::APPUI_METHOD_MODEL_LIST,
+                crate::model::APPUI_METHOD_SESSION_STATUS_READ,
+                crate::menu::registry::APPUI_METHOD_PERMISSION_PROFILE_SET,
+            ];
+            let advertised = known
+                .iter()
+                .filter(|method| caps.supports_method(method))
+                .count();
+            OnboardingDoctorOutcome::Pass {
+                detail: format!("{advertised}/{} onboarding methods advertised", known.len()),
+            }
+        } else {
+            OnboardingDoctorOutcome::Fail {
+                reason: "AppUI capabilities not yet received".into(),
+                recovery: "Wait for `config/capabilities/list` or reconnect the transport.".into(),
+            }
+        };
+
+        // Transport check.
+        let transport_check = match self.state.target.as_deref() {
+            Some(target) if !target.is_empty() => OnboardingDoctorOutcome::Pass {
+                detail: format!("AppUI target: {target}"),
+            },
+            _ => OnboardingDoctorOutcome::Fail {
+                reason: "no AppUI transport configured".into(),
+                recovery: "Start the TUI with `octos tui --target <stdio:...|ws://...>`.".into(),
+            },
+        };
+
+        OnboardingDoctorReport {
+            checks: vec![
+                OnboardingDoctorCheck {
+                    id: "transport",
+                    title: "AppUI transport",
+                    outcome: transport_check,
+                },
+                OnboardingDoctorCheck {
+                    id: "capabilities",
+                    title: "Server capabilities",
+                    outcome: capability_check,
+                },
+                OnboardingDoctorCheck {
+                    id: "profile",
+                    title: "Local profile",
+                    outcome: profile_check,
+                },
+                OnboardingDoctorCheck {
+                    id: "workspace",
+                    title: "Workspace cwd",
+                    outcome: workspace_check,
+                },
+                OnboardingDoctorCheck {
+                    id: "provider",
+                    title: "LLM provider",
+                    outcome: provider_check,
+                },
+            ],
+        }
+    }
+
+    fn run_onboarding_doctor(&mut self) {
+        let report = self.onboarding_doctor_report();
+        let summary_line = report
+            .checks
+            .iter()
+            .map(|check| format!("{}: {}", check.id, check.outcome.label()))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        self.state.status = format!("Onboarding doctor — {summary_line}");
+        for check in &report.checks {
+            let detail = match &check.outcome {
+                crate::model::OnboardingDoctorOutcome::Pass { detail }
+                | crate::model::OnboardingDoctorOutcome::Skipped { detail } => detail.clone(),
+                crate::model::OnboardingDoctorOutcome::Warn { reason, recovery } => {
+                    format!("{reason} → {recovery}")
+                }
+                crate::model::OnboardingDoctorOutcome::Fail { reason, recovery } => {
+                    format!("{reason} → {recovery}")
+                }
+            };
+            let kind = match check.outcome {
+                crate::model::OnboardingDoctorOutcome::Pass { .. }
+                | crate::model::OnboardingDoctorOutcome::Skipped { .. } => ActivityKind::Progress,
+                crate::model::OnboardingDoctorOutcome::Warn { .. } => ActivityKind::Warning,
+                crate::model::OnboardingDoctorOutcome::Fail { .. } => ActivityKind::Error,
+            };
+            self.state.push_activity(
+                ActivityItem::new(kind, check.id, check.outcome.label()).with_detail(detail),
+            );
+        }
+        self.refresh_active_menu_if_open();
+    }
+
     fn focus_provider_api_key_row(&mut self) -> bool {
         self.select_active_menu_item_by_id("onboard.provider.key")
             || self.select_active_menu_item_by_id("provider.key")
+    }
+
+    /// M22-B: focus the local-profile field row identified by the
+    /// recovery state so the user is dropped on the offending field
+    /// after a typed `profile/local/create` error or pre-flight
+    /// validation rejection.
+    fn focus_local_profile_field(
+        &mut self,
+        field: crate::model::OnboardingLocalProfileField,
+    ) -> bool {
+        let row_id = match field {
+            crate::model::OnboardingLocalProfileField::Name => "onboard.local.name",
+            crate::model::OnboardingLocalProfileField::Username => "onboard.local.username",
+            crate::model::OnboardingLocalProfileField::Email => "onboard.local.email",
+        };
+        self.select_active_menu_item_by_id(row_id)
     }
 
     fn focus_provider_start_row(&mut self) -> bool {
@@ -2346,8 +2647,25 @@ impl Store {
                 self.mcp_config_list_command()
             }
             ClientEvent::PermissionProfile(event) => {
+                // M22-D: if we just applied a staged onboarding
+                // permission profile and `session/status/read` is
+                // advertised, refresh status so the runtime policy
+                // stamp arrives and the mismatch validator runs.
+                // `PermissionProfileSetResult` itself does not carry
+                // the stamp, so without this refresh the user would
+                // never see a clamp warning.
+                let session_id = event.session_id.clone();
                 self.apply_permission_profile_event(event);
                 self.refresh_active_menu_if_open();
+                if self.state.onboarding.staged_permission_profile.is_some()
+                    && self.state.capabilities.as_ref().is_some_and(|caps| {
+                        caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ)
+                    })
+                {
+                    return Some(AppUiCommand::ReadSessionStatus(
+                        crate::model::SessionStatusReadParams { session_id },
+                    ));
+                }
                 None
             }
             ClientEvent::AuthStatus(event) => {
@@ -2557,6 +2875,131 @@ impl Store {
                 None
             }
             AppUiEvent::Error(error) => {
+                // M22-B: route `profile/local/create` failures back
+                // into the onboarding step so the user lands on a
+                // typed recovery instead of a generic status line.
+                //
+                // Order matters here:
+                //
+                // 1. Transport-level codes (`transport_read`,
+                //    `transport_send`, `malformed_frame`) take
+                //    PRECEDENCE: even if the message text mentions
+                //    `profile/local/create`, the failure is a wire-
+                //    level event, not a profile rejection. Clear the
+                //    pending flag so the user can retry without
+                //    pretending the username was at fault.
+                // 2. Otherwise attribution requires a POSITIVE
+                //    signal — a known local-create error code or an
+                //    explicit method-prefixed error message
+                //    (`profile/local/create request tui-N failed: …`,
+                //    see `error_response_to_app_event`). The bare
+                //    `local_profile_create_pending` boolean is NOT
+                //    enough on its own because an unrelated RPC
+                //    failing during the pending window would
+                //    otherwise be misclassified.
+                // Codes the client raises that are NOT profile-
+                // level rejections. The substring check below MUST
+                // NOT route these through profile recovery even
+                // when the message names `profile/local/create` —
+                // the wire/policy/cancellation failure is not a
+                // field problem.
+                let is_client_synth_error = matches!(
+                    error.code.as_str(),
+                    "transport_read"
+                        | "transport_send"
+                        | "malformed_frame"
+                        | "malformed_json"
+                        | "frame_too_large"
+                        | "readonly"
+                        | "too_many_pending_requests"
+                        | "request_cancelled"
+                );
+                let attribute_to_local_create = !is_client_synth_error
+                    && (is_local_create_error_code(&error.code)
+                        || error.message.contains("profile/local/create"));
+
+                // Of those, only the codes that DEFINITIVELY end the
+                // in-flight local-create request should clear the
+                // pending snapshot. Generic `too_many_pending_requests`,
+                // `frame_too_large`, and `malformed_json` can fire
+                // on OTHER commands while the local-create response
+                // is still on its way; clearing the snapshot in
+                // that case would let a second create dispatch
+                // (the overlapping-create finding) and could
+                // misattribute the eventual response to a stale
+                // pending tracker.
+                //
+                // The conservative set is:
+                //   - `transport_read`/`transport_send`: wire-level
+                //     break → no response will arrive for ANY in-
+                //     flight request including the local-create.
+                //   - Other client-synth codes (`request_cancelled`,
+                //     `readonly`, `frame_too_large`,
+                //     `too_many_pending_requests`) when the message
+                //     names `profile/local/create`: the rejection
+                //     is attributed to the local-create RPC itself
+                //     (cancellation, pre-send policy/encoding/queue
+                //     gate) so the request is GONE.
+                //
+                // `malformed_frame` and `malformed_json` are
+                // recoverable parser errors — the transport stays
+                // connected and `pending_requests` is not drained,
+                // so the original `profile/local/create` response
+                // can still arrive. Clearing the pending flag for
+                // those would allow a duplicate create and
+                // misattribute the eventual response.
+                let names_local_create = error.message.contains("profile/local/create");
+                let cancels_in_flight_create =
+                    matches!(error.code.as_str(), "transport_read" | "transport_send")
+                        || (matches!(
+                            error.code.as_str(),
+                            "request_cancelled"
+                                | "readonly"
+                                | "frame_too_large"
+                                | "too_many_pending_requests"
+                        ) && names_local_create);
+                let is_transport_error = matches!(
+                    error.code.as_str(),
+                    "transport_read" | "transport_send" | "malformed_frame"
+                );
+                if cancels_in_flight_create && self.state.onboarding.local_profile_create_pending {
+                    self.state.onboarding.local_profile_create_pending = false;
+                    self.state.onboarding.local_profile_create_pending_username = None;
+                    self.state.status = if is_transport_error {
+                        format!(
+                            "Local profile create cancelled by transport error [{}]: {}",
+                            error.code, error.message
+                        )
+                    } else {
+                        format!(
+                            "Local profile create cancelled [{}]: {}",
+                            error.code, error.message
+                        )
+                    };
+                } else if is_client_synth_error {
+                    // Surfaced for the user but does NOT touch the
+                    // local-create pending state.
+                    self.state.status = format!("Error [{}]: {}", error.code, error.message);
+                } else if attribute_to_local_create {
+                    self.state
+                        .onboarding
+                        .apply_local_profile_error(&error.code, &error.message);
+                    let recovery_message_and_focus = self
+                        .state
+                        .onboarding
+                        .local_profile_recovery
+                        .as_ref()
+                        .map(|recovery| (recovery.message.clone(), recovery.focus_field));
+                    if let Some((message, focus_field)) = recovery_message_and_focus {
+                        self.state.status = format!("Local profile setup blocked: {message}");
+                        self.refresh_active_menu_if_open();
+                        self.focus_local_profile_field(focus_field);
+                    } else {
+                        self.state.status = format!("Error [{}]: {}", error.code, error.message);
+                    }
+                } else {
+                    self.state.status = format!("Error [{}]: {}", error.code, error.message);
+                }
                 self.state.push_activity(
                     ActivityItem::new(
                         ActivityKind::Error,
@@ -2565,7 +3008,6 @@ impl Store {
                     )
                     .with_detail("app-ui error"),
                 );
-                self.state.status = format!("Error [{}]: {}", error.code, error.message);
                 self.state.set_run_state_error(error.message);
                 None
             }
@@ -2887,9 +3329,29 @@ impl Store {
                 session.profile_id = Some(profile_id.to_owned());
             }
         }
+        // M22-D: snapshot the stamp BEFORE consuming the result so
+        // we can compare it against the staged permission profile.
+        let stamp = event.result.runtime_policy_stamp.clone();
         let message = event.message;
         self.state
             .set_runtime_status(SessionRuntimeStatus::from(event.result));
+        if let (Some(staged), Some(stamp)) = (
+            self.state.onboarding.staged_permission_profile.clone(),
+            stamp,
+        ) {
+            let mismatch = permission_profile_stamp_mismatch(&staged, &stamp);
+            self.state.onboarding.permission_profile_mismatch = mismatch.clone();
+            if let Some(reason) = mismatch {
+                self.state.push_activity(
+                    ActivityItem::new(
+                        ActivityKind::Warning,
+                        "permission profile mismatch",
+                        reason.clone(),
+                    )
+                    .with_detail("Server clamped or rejected the staged onboarding choice."),
+                );
+            }
+        }
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
             "runtime status",
@@ -3028,6 +3490,27 @@ impl Store {
                 }
                 self.state.status =
                     format!("Opened {} on {}", session_id.0, self.state.protocol_version);
+                // M22-D: if the user staged a permission profile in
+                // onboarding, apply it now that we have a session id.
+                // Server authority is preserved — the follow-up RPC
+                // is only emitted when `permission/profile/set` is
+                // advertised, and the runtime policy stamp returned
+                // afterward is the source of truth.
+                if let Some(update) = self.state.onboarding.staged_permission_profile.clone() {
+                    if self.state.capabilities.as_ref().is_some_and(|caps| {
+                        caps.supports_method(
+                            crate::menu::registry::APPUI_METHOD_PERMISSION_PROFILE_SET,
+                        )
+                    }) {
+                        return Some(AppUiCommand::SetPermissionProfile(
+                            octos_core::ui_protocol::PermissionProfileSetParams {
+                                session_id,
+                                update,
+                                runtime_mode: None,
+                            },
+                        ));
+                    }
+                }
                 None
             }
             UiNotification::TurnStarted(event) => {
@@ -3863,11 +4346,156 @@ fn slash_command_try_hint(ctx: &crate::menu::AvailabilityContext<'_>) -> String 
     }
 }
 
+/// M22-D: parse a `/onboard permissions <mode>` token into a typed
+/// `PermissionProfileUpdate`. Accepted modes mirror the labels in
+/// `permission_profile_items` so the onboarding step and the
+/// `/permissions` menu speak the same vocabulary. Returns `Ok(None)`
+/// when the user passed `clear`/`reset`/empty to drop the staged
+/// choice.
+fn parse_onboarding_permission_mode(
+    raw: &str,
+) -> Result<Option<octos_core::ui_protocol::PermissionProfileUpdate>, String> {
+    use octos_core::ui_protocol::{
+        PermissionNetworkPolicy, PermissionProfileMode, PermissionProfileUpdate,
+    };
+    let token = raw.trim().to_ascii_lowercase();
+    if token.is_empty() || matches!(token.as_str(), "clear" | "reset" | "none") {
+        return Ok(None);
+    }
+    let update = match token.as_str() {
+        "default" => PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::WorkspaceWrite),
+            network: Some(PermissionNetworkPolicy::Deny),
+            approval_policy: Some("on-request".into()),
+        },
+        "read-only" | "read_only" | "readonly" => PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::ReadOnly),
+            network: None,
+            approval_policy: Some("on-request".into()),
+        },
+        "workspace-write" | "workspace_write" | "ws-write" => PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::WorkspaceWrite),
+            network: None,
+            approval_policy: Some("on-request".into()),
+        },
+        "workspace-write-never" | "workspace_write_never" | "ws-write-never" => {
+            PermissionProfileUpdate {
+                mode: Some(PermissionProfileMode::WorkspaceWrite),
+                network: Some(PermissionNetworkPolicy::Deny),
+                approval_policy: Some("never".into()),
+            }
+        }
+        "danger-full-access" | "danger_full_access" | "full-access" | "full_access" => {
+            PermissionProfileUpdate {
+                mode: Some(PermissionProfileMode::DangerFullAccess),
+                network: Some(PermissionNetworkPolicy::Allow),
+                approval_policy: Some("never".into()),
+            }
+        }
+        other => {
+            return Err(format!(
+                "Unknown permission profile mode '{other}'. Use: default, read-only, workspace-write, workspace-write-never, full-access, or clear."
+            ));
+        }
+    };
+    Ok(Some(update))
+}
+
+/// M22-D: compare a `PermissionProfileUpdate` against the server-
+/// effective fields in a `RuntimePolicyStamp`. Returns a typed
+/// mismatch reason when the server clamped or rejected the staged
+/// choice, `None` when the stamp matches what the user asked for.
+fn permission_profile_stamp_mismatch(
+    staged: &octos_core::ui_protocol::PermissionProfileUpdate,
+    stamp: &crate::model::RuntimePolicyStamp,
+) -> Option<String> {
+    use octos_core::ui_protocol::PermissionProfileMode;
+    let mut mismatches: Vec<String> = Vec::new();
+    if let Some(mode) = staged.mode {
+        let expected = match mode {
+            PermissionProfileMode::ReadOnly => "read_only",
+            PermissionProfileMode::WorkspaceWrite => "workspace_write",
+            PermissionProfileMode::DangerFullAccess => "danger_full_access",
+        };
+        let actual = stamp.permission_profile.as_deref().unwrap_or("");
+        // Tolerate aliasing (server may publish kebab-case).
+        let actual_normalized = actual.replace('-', "_");
+        if !actual_normalized.eq_ignore_ascii_case(expected) {
+            mismatches.push(format!(
+                "permission_profile: staged {expected}, server effective {}",
+                if actual.is_empty() { "(unset)" } else { actual }
+            ));
+        }
+    }
+    if let Some(approval) = staged.approval_policy.as_deref() {
+        let actual = stamp.approval_policy.as_deref().unwrap_or("");
+        let staged_norm = approval.replace('_', "-");
+        let actual_norm = actual.replace('_', "-");
+        if !actual_norm.eq_ignore_ascii_case(&staged_norm) {
+            mismatches.push(format!(
+                "approval_policy: staged {approval}, server effective {}",
+                if actual.is_empty() { "(unset)" } else { actual }
+            ));
+        }
+    }
+    if let Some(network) = staged.network {
+        // Backend publishes `allowed`/`blocked` (past-tense) in
+        // the stamp, while the request shape uses `allow`/`deny`.
+        // Accept both spellings so a correctly-applied policy
+        // never reads as clamped.
+        let expected_aliases: &[&str] = match network {
+            octos_core::ui_protocol::PermissionNetworkPolicy::Allow => {
+                &["allow", "allowed", "network_allowed", "network-allowed"]
+            }
+            octos_core::ui_protocol::PermissionNetworkPolicy::Deny => &[
+                "deny",
+                "denied",
+                "blocked",
+                "network_blocked",
+                "network-blocked",
+            ],
+        };
+        let actual = stamp.network.as_deref().unwrap_or("");
+        if !actual.is_empty()
+            && !expected_aliases
+                .iter()
+                .any(|alias| actual.eq_ignore_ascii_case(alias))
+        {
+            mismatches.push(format!(
+                "network: staged {}, server effective {actual}",
+                expected_aliases[0]
+            ));
+        }
+    }
+    if mismatches.is_empty() {
+        None
+    } else {
+        Some(mismatches.join("; "))
+    }
+}
+
 fn onboarding_pending_status(pending: OnboardingProviderPending) -> String {
     match pending {
         OnboardingProviderPending::Test => "Provider test already in progress".into(),
         OnboardingProviderPending::Save => "Provider save already in progress".into(),
     }
+}
+
+/// M22-B: structured error codes the backend may publish for a
+/// failing `profile/local/create`. The transport layer surfaces these
+/// via `AppUiError::code` (preferring `data.kind` over the numeric
+/// JSON-RPC code) so the TUI can attribute them back to the profile
+/// step. `apply_local_profile_error` maps each one to the offending
+/// field and a typed recovery message.
+fn is_local_create_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "profile_local_collision"
+            | "profile_local_unsupported"
+            | "profile_local_invalid_name"
+            | "profile_local_invalid_username"
+            | "profile_local_invalid_email"
+    )
 }
 
 fn split_first_word(input: &str) -> (&str, &str) {
@@ -5058,6 +5686,707 @@ mod tests {
         );
     }
 
+    /// M22-B: client-side pre-flight validation rejects obviously
+    /// malformed fields before any backend round-trip. The wizard
+    /// surfaces a typed recovery (focus field + message) so the user
+    /// is not stuck staring at "Local profile is incomplete".
+    #[test]
+    fn local_profile_invalid_email_is_blocked_pre_flight() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+
+        for command in [
+            "/onboard name Ada Lovelace",
+            "/onboard username ada",
+            "/onboard email not-an-email",
+            "/onboard finish",
+        ] {
+            store.state.composer = command.into();
+            assert!(
+                store.compose_command().is_none(),
+                "no RPC should be issued when pre-flight validation fails: {command}"
+            );
+        }
+
+        let recovery = store
+            .state
+            .onboarding
+            .local_profile_recovery
+            .as_ref()
+            .expect("recovery should be set after invalid-email finish");
+        assert_eq!(
+            recovery.kind,
+            crate::model::OnboardingLocalProfileErrorKind::InvalidField
+        );
+        assert_eq!(
+            recovery.focus_field,
+            crate::model::OnboardingLocalProfileField::Email
+        );
+        assert!(
+            recovery.message.contains("Email must contain"),
+            "expected typed recovery message, got: {}",
+            recovery.message
+        );
+    }
+
+    /// M22-B: a backend `profile_local_collision` error keeps the
+    /// user on the profile step with a typed recovery focused on
+    /// `username`. Generic status text would have shoved the user out
+    /// of the wizard.
+    #[test]
+    fn local_profile_collision_keeps_user_on_profile_step_and_focuses_username() {
+        use octos_core::app_ui::AppUiError;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        for command in [
+            "/onboard name Ada Lovelace",
+            "/onboard username ada",
+            "/onboard email ada@example.com",
+            "/onboard finish",
+        ] {
+            store.state.composer = command.into();
+            // The first three are field setters (None); the last is
+            // the create RPC dispatch.
+            let _ = store.compose_command();
+        }
+        assert!(store.state.onboarding.local_profile_create_pending);
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "profile_local_collision".into(),
+            message: "profile/local/create request tui-3 failed: username already taken".into(),
+        }));
+
+        let recovery = store
+            .state
+            .onboarding
+            .local_profile_recovery
+            .as_ref()
+            .expect("collision error must populate recovery");
+        assert_eq!(
+            recovery.kind,
+            crate::model::OnboardingLocalProfileErrorKind::Collision
+        );
+        assert_eq!(
+            recovery.focus_field,
+            crate::model::OnboardingLocalProfileField::Username
+        );
+        assert!(
+            recovery.message.contains("collision for 'ada'"),
+            "expected collision message naming the submitted username, got: {}",
+            recovery.message
+        );
+        // Pending flag clears so a follow-up create can fire after edit.
+        assert!(!store.state.onboarding.local_profile_create_pending);
+        // local_profile_created stays false so the user is held on
+        // the profile step.
+        assert!(!store.state.onboarding.local_profile_created);
+        // Status text is the typed one, not the raw `Error [...]`.
+        assert!(
+            store.state.status.contains("Local profile setup blocked"),
+            "expected typed status, got: {}",
+            store.state.status
+        );
+    }
+
+    /// M22-B: pre-flight validation must drop the user onto the
+    /// offending row so they can edit it immediately. Without this
+    /// the selected row stays on `onboard.local.create` after the
+    /// "finish" press and the keyboard user has no signal where to go.
+    #[test]
+    fn pre_flight_invalid_email_focuses_email_row() {
+        // Use a no-sessions store so the onboarding menu renders the
+        // local-profile sub-menu (which has the email row) rather
+        // than the provider-setup menu that fires when a profile is
+        // already resolved.
+        let mut store = protocol_store_without_sessions();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+        ]));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        store.state.onboarding.name = "Ada".into();
+        store.state.onboarding.username = "ada".into();
+        store.state.onboarding.email = "not-an-email".into();
+
+        store.state.composer = "/onboard finish".into();
+        assert!(store.compose_command().is_none());
+
+        // The selected row index must now correspond to the email
+        // row, not the create/continue row.
+        let MenuBuildResult::Ready(spec) = store
+            .state
+            .active_menu
+            .as_ref()
+            .expect("active menu after validation failure")
+        else {
+            panic!("expected ready menu");
+        };
+        let email_index = spec
+            .items
+            .iter()
+            .position(|item| item.id == "onboard.local.email")
+            .expect("email row exists");
+        let selected = store
+            .state
+            .menu_stack
+            .active()
+            .expect("active menu frame")
+            .selected_index;
+        assert_eq!(
+            selected, email_index,
+            "pre-flight validation should focus the email row"
+        );
+    }
+
+    /// M22-B: when the user edits the username while a create is
+    /// still in flight, a late `profile_local_collision` for the OLD
+    /// username must surface the OLD username in the recovery copy.
+    /// The pending-username snapshot captured at submit time is the
+    /// source of truth so the message never claims the freshly-edited
+    /// new username was rejected.
+    #[test]
+    fn late_collision_uses_pending_username_snapshot_not_edited_value() {
+        use octos_core::app_ui::AppUiError;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.name = "Ada Lovelace".into();
+        store.state.onboarding.username = "ada".into();
+        store.state.onboarding.email = "ada@example.com".into();
+
+        store.state.composer = "/onboard finish".into();
+        let _ = store
+            .compose_command()
+            .expect("finish issues profile/local/create");
+        // Snapshot captured at submit time.
+        assert_eq!(
+            store
+                .state
+                .onboarding
+                .local_profile_create_pending_username
+                .as_deref(),
+            Some("ada")
+        );
+
+        // Simulate the user editing the username before the server
+        // response arrives. The snapshot must SURVIVE this edit so a
+        // late response can still render the recovery against the
+        // username actually submitted.
+        store.state.composer = "/onboard username ada2".into();
+        let _ = store.compose_command();
+        assert_eq!(
+            store
+                .state
+                .onboarding
+                .local_profile_create_pending_username
+                .as_deref(),
+            Some("ada"),
+            "pending-username snapshot must survive a staged edit"
+        );
+
+        // Late collision arrives.
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "profile_local_collision".into(),
+            message: "profile/local/create request tui-1 failed: collision".into(),
+        }));
+
+        let recovery = store
+            .state
+            .onboarding
+            .local_profile_recovery
+            .as_ref()
+            .expect("late collision still routes to recovery");
+        assert_eq!(
+            recovery.focus_field,
+            crate::model::OnboardingLocalProfileField::Username
+        );
+        // The message MUST attribute the rejection to the username
+        // that was actually submitted, not the freshly-edited new
+        // value.
+        assert!(
+            recovery.message.contains("for 'ada'"),
+            "expected recovery to reference submitted username 'ada', got: {}",
+            recovery.message
+        );
+        assert!(
+            !recovery.message.contains("'ada2'"),
+            "recovery must not misattribute collision to edited value: {}",
+            recovery.message
+        );
+    }
+
+    /// M22-B: a second `/onboard finish` press while a create is
+    /// still in flight must NOT fire another RPC or overwrite the
+    /// pending-username snapshot — the backend would otherwise see
+    /// a duplicate create, and a late collision for the first
+    /// request would blame the wrong username.
+    #[test]
+    fn overlapping_local_profile_create_is_blocked() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.name = "Ada Lovelace".into();
+        store.state.onboarding.username = "ada".into();
+        store.state.onboarding.email = "ada@example.com".into();
+
+        store.state.composer = "/onboard finish".into();
+        let first = store
+            .compose_command()
+            .expect("first finish issues profile/local/create");
+        assert!(matches!(first, AppUiCommand::ProfileLocalCreate(_)));
+        let pending_username = store
+            .state
+            .onboarding
+            .local_profile_create_pending_username
+            .clone();
+        assert_eq!(pending_username.as_deref(), Some("ada"));
+
+        // User edits to ada2 and presses finish again.
+        store.state.composer = "/onboard username ada2".into();
+        let _ = store.compose_command();
+        store.state.composer = "/onboard finish".into();
+        let second = store.compose_command();
+
+        assert!(
+            second.is_none(),
+            "second finish must not fire an RPC while a create is pending"
+        );
+        // Pending snapshot is unchanged — still 'ada', not 'ada2'.
+        assert_eq!(
+            store
+                .state
+                .onboarding
+                .local_profile_create_pending_username
+                .as_deref(),
+            Some("ada"),
+            "snapshot must not be overwritten by a blocked overlapping create"
+        );
+        assert!(
+            store.state.status.contains("already in progress"),
+            "expected blocked-overlap status, got: {}",
+            store.state.status
+        );
+    }
+
+    /// M22-B: when the transport disconnects mid-flight,
+    /// `cancel_pending_requests` emits `request_cancelled` with the
+    /// method-prefixed message. That cancellation is NOT a profile
+    /// rejection — the substring match must not route it through
+    /// the typed recovery, otherwise the user sees a username
+    /// collision message for a network drop.
+    ///
+    /// Only `request_cancelled` events that name `profile/local/create`
+    /// clear the pending state — cancellations of OTHER tracked
+    /// requests must not touch the local-create snapshot.
+    #[test]
+    fn request_cancelled_during_pending_create_clears_pending_without_misattribution() {
+        use octos_core::app_ui::AppUiError;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.name = "Ada".into();
+        store.state.onboarding.username = "ada".into();
+        store.state.onboarding.email = "ada@example.com".into();
+        store.state.composer = "/onboard finish".into();
+        let _ = store.compose_command();
+        assert!(store.state.onboarding.local_profile_create_pending);
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "request_cancelled".into(),
+            message: "profile/local/create request tui-1 cancelled: transport disconnected".into(),
+        }));
+
+        assert!(!store.state.onboarding.local_profile_create_pending);
+        assert!(
+            store
+                .state
+                .onboarding
+                .local_profile_create_pending_username
+                .is_none()
+        );
+        assert!(store.state.onboarding.local_profile_recovery.is_none());
+    }
+
+    /// M22-B: a pre-send rejection (e.g. `frame_too_large`) for the
+    /// local-create request itself must clear the pending snapshot
+    /// — the request is gone and a retry must be possible.
+    /// Otherwise the wizard sits in "already in progress" until the
+    /// user manually resets state.
+    #[test]
+    fn frame_too_large_for_local_create_clears_pending() {
+        use octos_core::app_ui::AppUiError;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.name = "Ada".into();
+        store.state.onboarding.username = "ada".into();
+        store.state.onboarding.email = "ada@example.com".into();
+        store.state.composer = "/onboard finish".into();
+        let _ = store.compose_command();
+        assert!(store.state.onboarding.local_profile_create_pending);
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "frame_too_large".into(),
+            message: "profile/local/create request encoded payload exceeds 64KB".into(),
+        }));
+
+        assert!(!store.state.onboarding.local_profile_create_pending);
+        assert!(
+            store
+                .state
+                .onboarding
+                .local_profile_create_pending_username
+                .is_none()
+        );
+        assert!(store.state.onboarding.local_profile_recovery.is_none());
+    }
+
+    /// M22-B: when the transport rejects `profile/local/create`
+    /// because the pending-request queue is saturated, the error
+    /// message now names the method (thanks to a small transport
+    /// fix that includes the rejected method in the
+    /// `too_many_pending_requests` text). The store must clear the
+    /// pending flag so the user can retry — otherwise the wizard
+    /// sits in "already in progress" indefinitely.
+    #[test]
+    fn too_many_pending_requests_for_local_create_clears_pending() {
+        use octos_core::app_ui::AppUiError;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.name = "Ada".into();
+        store.state.onboarding.username = "ada".into();
+        store.state.onboarding.email = "ada@example.com".into();
+        store.state.composer = "/onboard finish".into();
+        let _ = store.compose_command();
+        assert!(store.state.onboarding.local_profile_create_pending);
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "too_many_pending_requests".into(),
+            message: "UI protocol has 8 pending request(s); refusing to enqueue profile/local/create request".into(),
+        }));
+
+        assert!(!store.state.onboarding.local_profile_create_pending);
+        assert!(
+            store
+                .state
+                .onboarding
+                .local_profile_create_pending_username
+                .is_none()
+        );
+        assert!(store.state.onboarding.local_profile_recovery.is_none());
+    }
+
+    /// M22-B: a `readonly` or `too_many_pending_requests` error on
+    /// an UNRELATED command while a local-create is in flight must
+    /// NOT touch the local-create pending state. Clearing it would
+    /// allow a second create to dispatch (overlapping submits) and
+    /// would misattribute the eventual real response.
+    #[test]
+    fn unrelated_client_error_does_not_clear_pending_create() {
+        use octos_core::app_ui::AppUiError;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.name = "Ada".into();
+        store.state.onboarding.username = "ada".into();
+        store.state.onboarding.email = "ada@example.com".into();
+        store.state.composer = "/onboard finish".into();
+        let _ = store.compose_command();
+        assert!(store.state.onboarding.local_profile_create_pending);
+        let pending_username = store
+            .state
+            .onboarding
+            .local_profile_create_pending_username
+            .clone();
+        assert_eq!(pending_username.as_deref(), Some("ada"));
+
+        // A `too_many_pending_requests` error on an unrelated
+        // command must NOT touch the pending local-create snapshot.
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "too_many_pending_requests".into(),
+            message: "queue full".into(),
+        }));
+
+        assert!(
+            store.state.onboarding.local_profile_create_pending,
+            "pending must persist across unrelated client errors"
+        );
+        assert_eq!(
+            store
+                .state
+                .onboarding
+                .local_profile_create_pending_username
+                .as_deref(),
+            Some("ada"),
+            "pending-username snapshot must persist across unrelated client errors"
+        );
+    }
+
+    /// M22-B: a `readonly` client-synth error names
+    /// `profile/local/create` in its message (the transport
+    /// formats "Read-only mode blocks <method>; …") but is NOT a
+    /// profile-level rejection. Code-level signal MUST take
+    /// precedence over the method substring so the user sees the
+    /// readonly status, not a fake username collision.
+    #[test]
+    fn readonly_with_method_message_is_not_attributed_to_local_create() {
+        use octos_core::app_ui::AppUiError;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.name = "Ada".into();
+        store.state.onboarding.username = "ada".into();
+        store.state.onboarding.email = "ada@example.com".into();
+        store.state.composer = "/onboard finish".into();
+        let _ = store.compose_command();
+        assert!(store.state.onboarding.local_profile_create_pending);
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "readonly".into(),
+            message: "Read-only mode blocks profile/local/create; no network request was sent."
+                .into(),
+        }));
+
+        assert!(!store.state.onboarding.local_profile_create_pending);
+        assert!(store.state.onboarding.local_profile_recovery.is_none());
+        assert!(
+            store.state.status.contains("cancelled") || store.state.status.contains("blocked"),
+            "expected cancellation status, got: {}",
+            store.state.status
+        );
+    }
+
+    /// M22-B: even when a transport-level error message names
+    /// `profile/local/create` (because the transport built the
+    /// outbound payload before failing to send it), the code-level
+    /// signal `transport_send`/`transport_read`/`malformed_frame`
+    /// MUST take precedence over the method-substring attribution.
+    /// Otherwise the typed recovery would falsely blame the
+    /// username field for a wire-level fault.
+    #[test]
+    fn transport_send_with_method_message_is_not_attributed_to_local_create() {
+        use octos_core::app_ui::AppUiError;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.name = "Ada".into();
+        store.state.onboarding.username = "ada".into();
+        store.state.onboarding.email = "ada@example.com".into();
+        store.state.composer = "/onboard finish".into();
+        let _ = store.compose_command();
+        assert!(store.state.onboarding.local_profile_create_pending);
+
+        // Transport_send may include the method name when the send
+        // failed during outbound encoding.
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "transport_send".into(),
+            message: "failed to send profile/local/create request tui-1".into(),
+        }));
+
+        // Transport precedence wins: pending cleared, no recovery,
+        // status names the transport error.
+        assert!(!store.state.onboarding.local_profile_create_pending);
+        assert!(store.state.onboarding.local_profile_recovery.is_none());
+        assert!(
+            store.state.status.contains("transport error"),
+            "expected transport-error status, got: {}",
+            store.state.status
+        );
+    }
+
+    /// M22-B: a transport-level `AppUiError` (e.g. `transport_read`,
+    /// `malformed_frame`) that fires while a local-profile create is
+    /// pending must NOT be misclassified as a profile rejection. It
+    /// unblocks the pending flag so the user can retry, but renders
+    /// a transport-error status instead of typed local-profile
+    /// recovery.
+    #[test]
+    fn transport_error_during_pending_create_clears_pending_without_misattribution() {
+        use octos_core::app_ui::AppUiError;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.name = "Ada".into();
+        store.state.onboarding.username = "ada".into();
+        store.state.onboarding.email = "ada@example.com".into();
+        store.state.composer = "/onboard finish".into();
+        let _ = store.compose_command();
+        assert!(store.state.onboarding.local_profile_create_pending);
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "transport_read".into(),
+            message: "failed to read UI protocol transport message: pipe closed".into(),
+        }));
+
+        // Pending cleared so retry is possible…
+        assert!(!store.state.onboarding.local_profile_create_pending);
+        assert!(
+            store
+                .state
+                .onboarding
+                .local_profile_create_pending_username
+                .is_none()
+        );
+        // …but recovery is NOT populated — transport errors are not
+        // profile rejections.
+        assert!(store.state.onboarding.local_profile_recovery.is_none());
+        assert!(
+            store.state.status.contains("transport error"),
+            "expected transport-error status, got: {}",
+            store.state.status
+        );
+    }
+
+    /// M22-B: editing the username after a collision must clear the
+    /// recovery state so the next create attempt starts fresh.
+    #[test]
+    fn editing_username_after_collision_clears_recovery() {
+        use octos_core::app_ui::AppUiError;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.name = "Ada Lovelace".into();
+        store.state.onboarding.username = "ada".into();
+        store.state.onboarding.email = "ada@example.com".into();
+        store.state.onboarding.local_profile_create_pending = true;
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "profile_local_collision".into(),
+            message: "profile/local/create failed: username already taken".into(),
+        }));
+        assert!(store.state.onboarding.local_profile_recovery.is_some());
+
+        store.state.composer = "/onboard username ada2".into();
+        let _ = store.compose_command();
+
+        assert!(store.state.onboarding.local_profile_recovery.is_none());
+    }
+
+    /// M22-B: `profile_local_unsupported` from the backend renders a
+    /// typed "this server does not advertise profile/local/create"
+    /// recovery instead of a generic `Error [...]` status line.
+    #[test]
+    fn local_profile_unsupported_renders_typed_recovery() {
+        use octos_core::app_ui::AppUiError;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.local_profile_create_pending = true;
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "profile_local_unsupported".into(),
+            message: "profile/local/create request tui-4 failed: not supported".into(),
+        }));
+
+        let recovery = store
+            .state
+            .onboarding
+            .local_profile_recovery
+            .as_ref()
+            .expect("unsupported error must populate recovery");
+        assert_eq!(
+            recovery.kind,
+            crate::model::OnboardingLocalProfileErrorKind::Unsupported
+        );
+        assert!(
+            recovery.message.contains("misconfigured")
+                || recovery.message.contains("profile_local_unsupported"),
+            "expected unsupported recovery text, got: {}",
+            recovery.message
+        );
+    }
+
+    /// M22-B: solo onboarding never issues `auth/send_code` or
+    /// `auth/verify`, even when the backend advertises them, when
+    /// `profile/local/create` is also advertised. The transcript-
+    /// equivalent assertion is that `compose_command` returns no
+    /// AppUiCommand for the OTP slash subcommands.
+    #[test]
+    fn solo_onboarding_emits_no_otp_methods_when_local_create_is_supported() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+            crate::model::APPUI_METHOD_AUTH_SEND_CODE,
+            crate::model::APPUI_METHOD_AUTH_VERIFY,
+        ]);
+        store.state.workspace.root = "/tmp/solo".into();
+
+        for command in [
+            "/onboard name Ada Lovelace",
+            "/onboard username ada",
+            "/onboard email ada@example.com",
+        ] {
+            store.state.composer = command.into();
+            assert!(store.compose_command().is_none());
+        }
+
+        // OTP send-code and verify are explicitly hidden when local
+        // profile create is advertised. They must NOT emit any AppUi
+        // command.
+        for otp_command in ["/onboard send-code", "/onboard verify"] {
+            store.state.composer = otp_command.into();
+            let result = store.compose_command();
+            assert!(
+                result.is_none(),
+                "{otp_command} must not emit any AppUiCommand in solo mode"
+            );
+        }
+
+        // Finish path emits exactly `profile/local/create`, no OTP.
+        store.state.composer = "/onboard finish".into();
+        let command = store
+            .compose_command()
+            .expect("finish emits profile/local/create");
+        assert!(
+            matches!(command, AppUiCommand::ProfileLocalCreate(_)),
+            "expected ProfileLocalCreate, got: {command:?}"
+        );
+    }
+
+    /// M22-B: an idempotent backend response (existing local owner)
+    /// — `profile/local/create` returns `created: false` for the same
+    /// owner — must NOT strand the user on the profile step. The
+    /// wizard treats it as a resume and continues to provider setup,
+    /// proven by the auto-loaded provider catalog follow-up.
+    #[test]
+    fn local_profile_idempotent_existing_owner_resumes_to_provider_step() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+            crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+        ]);
+        store.state.onboarding.name = "Ada Lovelace".into();
+        store.state.onboarding.username = "ada".into();
+        store.state.onboarding.email = "ada@example.com".into();
+        store.state.onboarding.local_profile_create_pending = true;
+
+        let follow_up = store.apply_client_event(ClientEvent::ProfileLocalCreate(
+            crate::client_event::ProfileLocalCreateClientEvent {
+                result: ProfileLocalCreateResult {
+                    profile_id: "ada".into(),
+                    user_id: "ada-user".into(),
+                    name: "Ada Lovelace".into(),
+                    username: "ada".into(),
+                    email: "ada@example.com".into(),
+                    created: false,
+                    runtime_mode: "solo".into(),
+                },
+                message: "Local profile already exists: ada".into(),
+            },
+        ));
+
+        // After idempotent response, pending flag and recovery clear,
+        // local_profile_created is true (proves we treat existing
+        // owner as resumed), and the follow-up auto-loads the
+        // provider catalog so the user lands on provider setup.
+        assert!(!store.state.onboarding.local_profile_create_pending);
+        assert!(store.state.onboarding.local_profile_recovery.is_none());
+        assert!(store.state.onboarding.local_profile_created);
+        assert_eq!(store.state.onboarding.profile_id.as_deref(), Some("ada"));
+        assert!(
+            matches!(follow_up, Some(AppUiCommand::ProfileLlmCatalog(_))),
+            "expected ProfileLlmCatalog follow-up, got: {follow_up:?}"
+        );
+    }
+
     /// M22-A: provider-only capabilities (e.g. `profile/llm/catalog`)
     /// must NOT auto-open onboarding on first launch — without any
     /// profile creation method, there is no onboarding to drive.
@@ -5277,6 +6606,68 @@ mod tests {
         );
     }
 
+    /// M22-D: `/onboard permissions <mode>` stages a permission
+    /// profile update. The wizard does NOT claim the choice is
+    /// effective — the staged update is just held for application
+    /// after `session/open`.
+    #[test]
+    fn onboard_permissions_command_stages_workspace_write_never() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+
+        store.state.composer = "/onboard permissions workspace-write-never".into();
+        assert!(store.compose_command().is_none());
+
+        let staged = store
+            .state
+            .onboarding
+            .staged_permission_profile
+            .clone()
+            .expect("staged permission profile");
+        assert_eq!(
+            staged.mode,
+            Some(octos_core::ui_protocol::PermissionProfileMode::WorkspaceWrite)
+        );
+        assert_eq!(staged.approval_policy.as_deref(), Some("never"));
+        assert!(store.state.status.contains("staged"));
+    }
+
+    /// M22-D: `/onboard permissions clear` removes the staged
+    /// permission profile.
+    #[test]
+    fn onboard_permissions_clear_drops_staged_profile() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.composer = "/onboard permissions read-only".into();
+        let _ = store.compose_command();
+        assert!(store.state.onboarding.staged_permission_profile.is_some());
+
+        store.state.composer = "/onboard permissions clear".into();
+        let _ = store.compose_command();
+
+        assert!(store.state.onboarding.staged_permission_profile.is_none());
+    }
+
+    /// M22-D: an unknown mode is rejected with a typed status that
+    /// names the accepted modes.
+    #[test]
+    fn onboard_permissions_rejects_unknown_mode() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.composer = "/onboard permissions yolo".into();
+        assert!(store.compose_command().is_none());
+
+        assert!(store.state.onboarding.staged_permission_profile.is_none());
+        assert!(
+            store
+                .state
+                .status
+                .contains("Unknown permission profile mode"),
+            "expected typed error, got: {}",
+            store.state.status
+        );
+    }
+
     /// M22-C: validating a candidate that exists and is writable
     /// marks it `Valid`, and `/onboard finish` then emits
     /// `session/open` with the validated canonical cwd. Paths with
@@ -5475,6 +6866,496 @@ mod tests {
         assert!(matches!(
             store.state.onboarding.workspace_validation,
             crate::model::OnboardingWorkspaceValidation::Invalid { .. }
+        ));
+    }
+
+    /// M22-D: after `session/open` succeeds and `permission/profile/set`
+    /// is advertised, the store emits a follow-up `permission/profile/set`
+    /// RPC carrying the staged update. Without the capability, the
+    /// staged choice remains held but no RPC fires.
+    #[test]
+    fn session_opened_emits_permission_profile_set_when_staged() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy, PermissionProfileMode, PermissionProfileUpdate, SessionOpened,
+        };
+
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+            crate::menu::registry::APPUI_METHOD_PERMISSION_PROFILE_SET,
+        ]);
+        store.state.onboarding.staged_permission_profile = Some(PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::ReadOnly),
+            network: Some(PermissionNetworkPolicy::Deny),
+            approval_policy: Some("on-request".into()),
+        });
+
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": SessionKey("alice:local:tui#coding".into()),
+            "active_profile_id": "alice",
+        }))
+        .expect("session/opened payload");
+        let follow_up =
+            store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        let Some(AppUiCommand::SetPermissionProfile(params)) = follow_up else {
+            panic!("expected permission/profile/set follow-up, got: {follow_up:?}");
+        };
+        assert_eq!(params.update.mode, Some(PermissionProfileMode::ReadOnly));
+        assert_eq!(params.update.approval_policy.as_deref(), Some("on-request"));
+    }
+
+    /// M22-D: when `permission/profile/set` is NOT advertised, the
+    /// SessionOpened handler does NOT emit a follow-up — the
+    /// staged choice stays in the wizard state but the server is
+    /// trusted to fall back to its default policy.
+    #[test]
+    fn session_opened_without_set_capability_does_not_emit_follow_up() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::{
+            PermissionProfileMode, PermissionProfileUpdate, SessionOpened,
+        };
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.staged_permission_profile = Some(PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::WorkspaceWrite),
+            network: None,
+            approval_policy: Some("on-request".into()),
+        });
+
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": SessionKey("alice:local:tui#coding".into()),
+            "active_profile_id": "alice",
+        }))
+        .expect("session/opened payload");
+        let follow_up =
+            store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        assert!(follow_up.is_none());
+        // Staged choice stays present so a later capability
+        // advertisement can still apply it.
+        assert!(store.state.onboarding.staged_permission_profile.is_some());
+    }
+
+    /// M22-D: when the runtime policy stamp disagrees with the
+    /// staged permission profile (server clamped or rejected), the
+    /// wizard records a typed `permission_profile_mismatch` reason
+    /// so the UI can surface "your staged choice was rejected".
+    #[test]
+    fn runtime_policy_stamp_mismatch_populates_typed_reason() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::{PermissionProfileMode, PermissionProfileUpdate};
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.staged_permission_profile = Some(PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::DangerFullAccess),
+            network: None,
+            approval_policy: Some("never".into()),
+        });
+        // Server clamps to workspace_write + on-request (typical
+        // tenant policy that rejects danger-full-access).
+        store.apply_client_event(ClientEvent::SessionStatus(
+            crate::client_event::SessionStatusClientEvent {
+                result: crate::model::SessionStatusReadResult {
+                    session_id: SessionKey("alice:local:tui#coding".into()),
+                    profile_id: Some("alice".into()),
+                    runtime_mode: Some("tenant".into()),
+                    cwd: None,
+                    workspace_root: None,
+                    active_turn_id: None,
+                    runtime_policy_stamp: Some(crate::model::RuntimePolicyStamp {
+                        permission_profile: Some("workspace_write".into()),
+                        approval_policy: Some("on-request".into()),
+                        ..Default::default()
+                    }),
+                    model: None,
+                    permission_profile: None,
+                    approval_policy: None,
+                    sandbox_mode: None,
+                    sandbox: None,
+                    filesystem_scope: None,
+                    network: None,
+                    tool_policy_id: None,
+                    mcp_servers: Vec::new(),
+                    memory_scope: None,
+                    health: None,
+                    capabilities: None,
+                    mcp_summary: None,
+                    tool_summary: None,
+                    usage: None,
+                    cursor: None,
+                },
+                message: "runtime status".into(),
+            },
+        ));
+
+        let mismatch = store
+            .state
+            .onboarding
+            .permission_profile_mismatch
+            .as_ref()
+            .expect("mismatch should be recorded");
+        assert!(
+            mismatch.contains("permission_profile"),
+            "expected mismatch to name the field, got: {mismatch}"
+        );
+        assert!(mismatch.contains("danger_full_access"));
+    }
+
+    /// M22-D: the runtime policy stamp publishes
+    /// `"allowed"`/`"blocked"` for network, but the request shape
+    /// uses `"allow"`/`"deny"`. The comparator must accept both so
+    /// a correctly-applied policy never reads as clamped.
+    #[test]
+    fn runtime_policy_stamp_network_aliases_accepted_as_match() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy, PermissionProfileMode, PermissionProfileUpdate,
+        };
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.staged_permission_profile = Some(PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::WorkspaceWrite),
+            network: Some(PermissionNetworkPolicy::Deny),
+            approval_policy: Some("on-request".into()),
+        });
+        store.apply_client_event(ClientEvent::SessionStatus(
+            crate::client_event::SessionStatusClientEvent {
+                result: crate::model::SessionStatusReadResult {
+                    session_id: SessionKey("alice:local:tui#coding".into()),
+                    profile_id: Some("alice".into()),
+                    runtime_mode: Some("solo".into()),
+                    cwd: None,
+                    workspace_root: None,
+                    active_turn_id: None,
+                    runtime_policy_stamp: Some(crate::model::RuntimePolicyStamp {
+                        permission_profile: Some("workspace_write".into()),
+                        approval_policy: Some("on-request".into()),
+                        // Backend publishes "blocked" (past tense)
+                        // for network=Deny — the comparator must
+                        // recognize the alias.
+                        network: Some("blocked".into()),
+                        ..Default::default()
+                    }),
+                    model: None,
+                    permission_profile: None,
+                    approval_policy: None,
+                    sandbox_mode: None,
+                    sandbox: None,
+                    filesystem_scope: None,
+                    network: None,
+                    tool_policy_id: None,
+                    mcp_servers: Vec::new(),
+                    memory_scope: None,
+                    health: None,
+                    capabilities: None,
+                    mcp_summary: None,
+                    tool_summary: None,
+                    usage: None,
+                    cursor: None,
+                },
+                message: "runtime status".into(),
+            },
+        ));
+
+        assert!(
+            store.state.onboarding.permission_profile_mismatch.is_none(),
+            "'blocked' must be accepted as matching network=Deny, got: {:?}",
+            store.state.onboarding.permission_profile_mismatch
+        );
+    }
+
+    /// M22-D: after `permission/profile/set` resolves, the store
+    /// must refresh `session/status/read` so the runtime policy
+    /// stamp arrives and the mismatch validator can run. Without
+    /// this follow-up the user never sees a clamp warning in the
+    /// normal onboarding flow.
+    #[test]
+    fn permission_profile_set_response_refreshes_session_status() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::{
+            PermissionProfileMode, PermissionProfileSelection, PermissionProfileUpdate,
+        };
+
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+            crate::menu::registry::APPUI_METHOD_PERMISSION_PROFILE_SET,
+            crate::model::APPUI_METHOD_SESSION_STATUS_READ,
+        ]);
+        store.state.onboarding.staged_permission_profile = Some(PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::WorkspaceWrite),
+            network: None,
+            approval_policy: Some("on-request".into()),
+        });
+
+        let follow_up = store.apply_client_event(ClientEvent::PermissionProfile(
+            crate::client_event::PermissionProfileClientEvent {
+                session_id: SessionKey("alice:local:tui#coding".into()),
+                current: PermissionProfileSelection::default(),
+                message: "permission/profile/set applied".into(),
+            },
+        ));
+
+        let Some(AppUiCommand::ReadSessionStatus(params)) = follow_up else {
+            panic!(
+                "expected session/status/read follow-up after permission set, got: {follow_up:?}"
+            );
+        };
+        assert_eq!(
+            params.session_id,
+            SessionKey("alice:local:tui#coding".into())
+        );
+    }
+
+    /// M22-D: matching stamps leave `permission_profile_mismatch`
+    /// as `None`. The wizard only flags divergence.
+    #[test]
+    fn runtime_policy_stamp_match_clears_mismatch() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::{PermissionProfileMode, PermissionProfileUpdate};
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.staged_permission_profile = Some(PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::WorkspaceWrite),
+            network: None,
+            approval_policy: Some("on-request".into()),
+        });
+        store.apply_client_event(ClientEvent::SessionStatus(
+            crate::client_event::SessionStatusClientEvent {
+                result: crate::model::SessionStatusReadResult {
+                    session_id: SessionKey("alice:local:tui#coding".into()),
+                    profile_id: Some("alice".into()),
+                    runtime_mode: Some("solo".into()),
+                    cwd: None,
+                    workspace_root: None,
+                    active_turn_id: None,
+                    runtime_policy_stamp: Some(crate::model::RuntimePolicyStamp {
+                        permission_profile: Some("workspace-write".into()),
+                        approval_policy: Some("on-request".into()),
+                        ..Default::default()
+                    }),
+                    model: None,
+                    permission_profile: None,
+                    approval_policy: None,
+                    sandbox_mode: None,
+                    sandbox: None,
+                    filesystem_scope: None,
+                    network: None,
+                    tool_policy_id: None,
+                    mcp_servers: Vec::new(),
+                    memory_scope: None,
+                    health: None,
+                    capabilities: None,
+                    mcp_summary: None,
+                    tool_summary: None,
+                    usage: None,
+                    cursor: None,
+                },
+                message: "runtime status".into(),
+            },
+        ));
+
+        assert!(
+            store.state.onboarding.permission_profile_mismatch.is_none(),
+            "matching stamp should clear mismatch, got: {:?}",
+            store.state.onboarding.permission_profile_mismatch
+        );
+    }
+
+    /// M22-F: doctor report for a fresh store with a local-create
+    /// capability surfaces a FAIL for profile (no profile yet)
+    /// and FAIL for provider, but PASS for transport/capabilities/
+    /// workspace. Uses `protocol_store_without_sessions` so no
+    /// session-resolved profile exists to obscure the FAIL.
+    #[test]
+    fn doctor_report_for_fresh_store_flags_profile_and_provider() {
+        let mut store = protocol_store_without_sessions();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+        ]));
+        store.state.workspace.root = "/tmp/project".into();
+        let report = store.onboarding_doctor_report();
+        assert!(
+            report.any_failures(),
+            "fresh store must flag at least one FAIL"
+        );
+        let profile = report
+            .checks
+            .iter()
+            .find(|check| check.id == "profile")
+            .expect("profile check exists");
+        assert!(matches!(
+            profile.outcome,
+            crate::model::OnboardingDoctorOutcome::Fail { .. }
+        ));
+        let provider = report
+            .checks
+            .iter()
+            .find(|check| check.id == "provider")
+            .expect("provider check exists");
+        assert!(matches!(
+            provider.outcome,
+            crate::model::OnboardingDoctorOutcome::Fail { .. }
+        ));
+        let workspace = report
+            .checks
+            .iter()
+            .find(|check| check.id == "workspace")
+            .expect("workspace check exists");
+        assert!(workspace.outcome.is_pass());
+    }
+
+    /// M22-F: `/onboard doctor` writes a status summary line that
+    /// names each check id and outcome, and pushes per-check
+    /// activity entries.
+    #[test]
+    fn onboard_doctor_writes_status_summary_and_activity_entries() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.workspace.root = "/tmp/project".into();
+        let activity_before = store.state.activity.len();
+
+        store.state.composer = "/onboard doctor".into();
+        let result = store.compose_command();
+        assert!(result.is_none(), "doctor is a local read; no RPC");
+
+        assert!(
+            store.state.status.starts_with("Onboarding doctor"),
+            "doctor must update status line, got: {}",
+            store.state.status
+        );
+        assert!(
+            store.state.activity.len() > activity_before,
+            "doctor must push per-check activity entries"
+        );
+    }
+
+    /// M22-F: when the profile is created and provider saved, the
+    /// doctor report has zero FAILs (workspace and transport
+    /// still pass, capabilities OK).
+    #[test]
+    fn doctor_report_passes_once_profile_and_provider_ready() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.workspace.root = "/tmp/project".into();
+        store.state.onboarding.profile_id = Some("alice".into());
+        store.state.onboarding.local_profile_created = true;
+        store.state.onboarding.provider_saved = true;
+        store.state.onboarding.saved_primary_provider_label = Some("openai / gpt / openai".into());
+
+        let report = store.onboarding_doctor_report();
+        assert!(!report.any_failures(), "report: {:?}", report);
+        let profile = report
+            .checks
+            .iter()
+            .find(|check| check.id == "profile")
+            .unwrap();
+        assert!(profile.outcome.is_pass());
+        let provider = report
+            .checks
+            .iter()
+            .find(|check| check.id == "provider")
+            .unwrap();
+        assert!(provider.outcome.is_pass());
+    }
+
+    /// M22-F: when the profile is resolved from an active session
+    /// rather than `onboarding.profile_id`, the doctor still
+    /// reports PASS — the same resolved-profile source as
+    /// `onboarding_finish_command` must be used.
+    #[test]
+    fn doctor_report_uses_resolved_profile_from_session() {
+        // Default store has an empty session with profile_id = "coding".
+        let mut store = store_with_empty_session();
+        store.state.target = Some("ws://example.test/ui-protocol".into());
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+        ]));
+        store.state.workspace.root = "/tmp/project".into();
+        // `onboarding.profile_id` is blank; the session carries
+        // `profile_id = Some("coding")` which the resolver picks up.
+
+        let report = store.onboarding_doctor_report();
+        let profile = report
+            .checks
+            .iter()
+            .find(|check| check.id == "profile")
+            .expect("profile check exists");
+        assert!(
+            profile.outcome.is_pass(),
+            "doctor must accept the session-resolved profile, got: {:?}",
+            profile.outcome
+        );
+    }
+
+    /// M22-F: when the server has published a primary provider via
+    /// `profile_llm_state` (post-`/onboard providers`), the doctor
+    /// recognises it even though `onboarding.provider_saved` is
+    /// still false.
+    #[test]
+    fn doctor_report_honors_server_published_primary_provider() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.workspace.root = "/tmp/project".into();
+        store.state.profile_llm_state = Some(crate::model::ProfileLlmListResult {
+            profile_id: Some("alice".into()),
+            primary: Some(crate::model::LlmConfiguredProvider {
+                provider: "openai".into(),
+                model: "gpt-test".into(),
+                family_id: Some("openai".into()),
+                model_id: Some("gpt-test".into()),
+                route: None,
+                route_id: Some("openai".into()),
+                base_url: None,
+                api_key_env: None,
+                has_api_key: true,
+                selected: true,
+                available: Some(true),
+                model_hints: None,
+                cost_per_m: None,
+                strong: Some(true),
+            }),
+            fallbacks: Vec::new(),
+            llm: None,
+            runtime_policy_stamp: None,
+        });
+
+        let report = store.onboarding_doctor_report();
+        let provider = report
+            .checks
+            .iter()
+            .find(|check| check.id == "provider")
+            .expect("provider check exists");
+        assert!(
+            provider.outcome.is_pass(),
+            "doctor must accept server-published primary, got: {:?}",
+            provider.outcome
+        );
+    }
+
+    /// M22-F: a server that does not advertise
+    /// `profile/local/create` is non-solo-onboarding; the
+    /// profile check skips rather than failing.
+    #[test]
+    fn doctor_report_skips_profile_when_capability_absent() {
+        let mut store = protocol_store_without_sessions();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods(
+            std::iter::empty::<&str>(),
+        ));
+        store.state.workspace.root = "/tmp/project".into();
+        let report = store.onboarding_doctor_report();
+        let profile = report
+            .checks
+            .iter()
+            .find(|check| check.id == "profile")
+            .unwrap();
+        assert!(matches!(
+            profile.outcome,
+            crate::model::OnboardingDoctorOutcome::Skipped { .. }
         ));
     }
 
