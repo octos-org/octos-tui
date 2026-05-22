@@ -368,6 +368,24 @@ pub struct SessionGoalSetResult {
     pub transition_actor: Option<String>,
 }
 
+/// Two-step goal pause/resume state. Pause/resume must NOT carry a
+/// possibly-stale cached objective to the backend (the cached mirror
+/// can drift between `session/goal/get` refreshes). Instead, the
+/// dispatch issues a `session/goal/get` first and stages the desired
+/// transition here; when the `GoalGet` response arrives, the store
+/// emits the follow-up `session/goal/set` with the freshly-fetched
+/// objective and the staged status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingGoalTransition {
+    pub session_id: SessionKey,
+    pub profile_id: Option<String>,
+    /// `"paused"` for `/goal pause`, `"active"` for `/goal resume`.
+    pub status: &'static str,
+    /// TUI-side classifier echoed into the emitted
+    /// [`SessionGoalSetParams::action`].
+    pub action: SessionGoalSetAction,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionGoalClearParams {
     pub session_id: SessionKey,
@@ -2990,6 +3008,13 @@ pub struct AppState {
     /// queue is bounded so a misbehaving server cannot cause it to
     /// grow without bound.
     pub pending_autonomy_hydration: std::collections::VecDeque<AppUiCommand>,
+    /// M15-E follow-up: pause/resume issues a `session/goal/get` first
+    /// to refresh server truth, then emits a `session/goal/set` with
+    /// the freshly-fetched objective + this staged status. `None` when
+    /// no pause/resume is in flight. Cleared when the next `GoalGet`
+    /// response is consumed (success path) or when the user explicitly
+    /// clears the goal.
+    pub pending_goal_transition: Option<PendingGoalTransition>,
     pub exit_requested: bool,
 }
 
@@ -4053,6 +4078,7 @@ impl AppState {
             context_lifecycle: Vec::new(),
             session_autonomy: Vec::new(),
             pending_autonomy_hydration: std::collections::VecDeque::new(),
+            pending_goal_transition: None,
             exit_requested: false,
         }
     }
