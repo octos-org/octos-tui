@@ -939,6 +939,29 @@ impl Store {
                 self.onboarding_save_provider_fallback_command()
             }
             OnboardingAction::TestProvider => self.onboarding_test_provider_command(),
+            OnboardingAction::StagePermissionProfile(update) => {
+                self.state.onboarding.staged_permission_profile = update.clone();
+                self.state.onboarding.permission_profile_mismatch = None;
+                self.state.status = match update {
+                    Some(update) => {
+                        let mode = update.mode.map(|m| m.label()).unwrap_or("(unchanged mode)");
+                        let approval = update
+                            .approval_policy
+                            .as_deref()
+                            .unwrap_or("(unchanged approval)");
+                        let network = update
+                            .network
+                            .map(|n| n.label())
+                            .unwrap_or("(unchanged network)");
+                        format!(
+                            "Permission profile staged: {mode} · {approval} · {network} (server confirms on session open)"
+                        )
+                    }
+                    None => "Permission profile staging cleared".into(),
+                };
+                self.refresh_active_menu_if_open();
+                None
+            }
             OnboardingAction::Doctor => {
                 self.run_onboarding_doctor();
                 None
@@ -1011,6 +1034,20 @@ impl Store {
             "fetch-models" => self.dispatch_onboarding_action(OnboardingAction::FetchModels, None),
             "save" => self.dispatch_onboarding_action(OnboardingAction::SaveProvider, None),
             "test" => self.dispatch_onboarding_action(OnboardingAction::TestProvider, None),
+            "permissions" | "permission" => {
+                let update = match parse_onboarding_permission_mode(rest) {
+                    Ok(update) => update,
+                    Err(reason) => {
+                        self.state.status = reason;
+                        self.refresh_active_menu_if_open();
+                        return None;
+                    }
+                };
+                self.dispatch_onboarding_action(
+                    OnboardingAction::StagePermissionProfile(update),
+                    None,
+                )
+            }
             "doctor" | "check" => self.dispatch_onboarding_action(OnboardingAction::Doctor, None),
             "finish" | "open-session" => {
                 self.dispatch_onboarding_action(OnboardingAction::Finish, None)
@@ -2407,8 +2444,25 @@ impl Store {
                 self.mcp_config_list_command()
             }
             ClientEvent::PermissionProfile(event) => {
+                // M22-D: if we just applied a staged onboarding
+                // permission profile and `session/status/read` is
+                // advertised, refresh status so the runtime policy
+                // stamp arrives and the mismatch validator runs.
+                // `PermissionProfileSetResult` itself does not carry
+                // the stamp, so without this refresh the user would
+                // never see a clamp warning.
+                let session_id = event.session_id.clone();
                 self.apply_permission_profile_event(event);
                 self.refresh_active_menu_if_open();
+                if self.state.onboarding.staged_permission_profile.is_some()
+                    && self.state.capabilities.as_ref().is_some_and(|caps| {
+                        caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ)
+                    })
+                {
+                    return Some(AppUiCommand::ReadSessionStatus(
+                        crate::model::SessionStatusReadParams { session_id },
+                    ));
+                }
                 None
             }
             ClientEvent::AuthStatus(event) => {
@@ -3072,9 +3126,29 @@ impl Store {
                 session.profile_id = Some(profile_id.to_owned());
             }
         }
+        // M22-D: snapshot the stamp BEFORE consuming the result so
+        // we can compare it against the staged permission profile.
+        let stamp = event.result.runtime_policy_stamp.clone();
         let message = event.message;
         self.state
             .set_runtime_status(SessionRuntimeStatus::from(event.result));
+        if let (Some(staged), Some(stamp)) = (
+            self.state.onboarding.staged_permission_profile.clone(),
+            stamp,
+        ) {
+            let mismatch = permission_profile_stamp_mismatch(&staged, &stamp);
+            self.state.onboarding.permission_profile_mismatch = mismatch.clone();
+            if let Some(reason) = mismatch {
+                self.state.push_activity(
+                    ActivityItem::new(
+                        ActivityKind::Warning,
+                        "permission profile mismatch",
+                        reason.clone(),
+                    )
+                    .with_detail("Server clamped or rejected the staged onboarding choice."),
+                );
+            }
+        }
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
             "runtime status",
@@ -3213,6 +3287,27 @@ impl Store {
                 }
                 self.state.status =
                     format!("Opened {} on {}", session_id.0, self.state.protocol_version);
+                // M22-D: if the user staged a permission profile in
+                // onboarding, apply it now that we have a session id.
+                // Server authority is preserved — the follow-up RPC
+                // is only emitted when `permission/profile/set` is
+                // advertised, and the runtime policy stamp returned
+                // afterward is the source of truth.
+                if let Some(update) = self.state.onboarding.staged_permission_profile.clone() {
+                    if self.state.capabilities.as_ref().is_some_and(|caps| {
+                        caps.supports_method(
+                            crate::menu::registry::APPUI_METHOD_PERMISSION_PROFILE_SET,
+                        )
+                    }) {
+                        return Some(AppUiCommand::SetPermissionProfile(
+                            octos_core::ui_protocol::PermissionProfileSetParams {
+                                session_id,
+                                update,
+                                runtime_mode: None,
+                            },
+                        ));
+                    }
+                }
                 None
             }
             UiNotification::TurnStarted(event) => {
@@ -4045,6 +4140,134 @@ fn slash_command_try_hint(ctx: &crate::menu::AvailabilityContext<'_>) -> String 
             let last = names.last().expect("non-empty command names");
             format!("{}, or {last}", names[..names.len() - 1].join(", "))
         }
+    }
+}
+
+/// M22-D: parse a `/onboard permissions <mode>` token into a typed
+/// `PermissionProfileUpdate`. Accepted modes mirror the labels in
+/// `permission_profile_items` so the onboarding step and the
+/// `/permissions` menu speak the same vocabulary. Returns `Ok(None)`
+/// when the user passed `clear`/`reset`/empty to drop the staged
+/// choice.
+fn parse_onboarding_permission_mode(
+    raw: &str,
+) -> Result<Option<octos_core::ui_protocol::PermissionProfileUpdate>, String> {
+    use octos_core::ui_protocol::{
+        PermissionNetworkPolicy, PermissionProfileMode, PermissionProfileUpdate,
+    };
+    let token = raw.trim().to_ascii_lowercase();
+    if token.is_empty() || matches!(token.as_str(), "clear" | "reset" | "none") {
+        return Ok(None);
+    }
+    let update = match token.as_str() {
+        "default" => PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::WorkspaceWrite),
+            network: Some(PermissionNetworkPolicy::Deny),
+            approval_policy: Some("on-request".into()),
+        },
+        "read-only" | "read_only" | "readonly" => PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::ReadOnly),
+            network: None,
+            approval_policy: Some("on-request".into()),
+        },
+        "workspace-write" | "workspace_write" | "ws-write" => PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::WorkspaceWrite),
+            network: None,
+            approval_policy: Some("on-request".into()),
+        },
+        "workspace-write-never" | "workspace_write_never" | "ws-write-never" => {
+            PermissionProfileUpdate {
+                mode: Some(PermissionProfileMode::WorkspaceWrite),
+                network: Some(PermissionNetworkPolicy::Deny),
+                approval_policy: Some("never".into()),
+            }
+        }
+        "danger-full-access" | "danger_full_access" | "full-access" | "full_access" => {
+            PermissionProfileUpdate {
+                mode: Some(PermissionProfileMode::DangerFullAccess),
+                network: Some(PermissionNetworkPolicy::Allow),
+                approval_policy: Some("never".into()),
+            }
+        }
+        other => {
+            return Err(format!(
+                "Unknown permission profile mode '{other}'. Use: default, read-only, workspace-write, workspace-write-never, full-access, or clear."
+            ));
+        }
+    };
+    Ok(Some(update))
+}
+
+/// M22-D: compare a `PermissionProfileUpdate` against the server-
+/// effective fields in a `RuntimePolicyStamp`. Returns a typed
+/// mismatch reason when the server clamped or rejected the staged
+/// choice, `None` when the stamp matches what the user asked for.
+fn permission_profile_stamp_mismatch(
+    staged: &octos_core::ui_protocol::PermissionProfileUpdate,
+    stamp: &crate::model::RuntimePolicyStamp,
+) -> Option<String> {
+    use octos_core::ui_protocol::PermissionProfileMode;
+    let mut mismatches: Vec<String> = Vec::new();
+    if let Some(mode) = staged.mode {
+        let expected = match mode {
+            PermissionProfileMode::ReadOnly => "read_only",
+            PermissionProfileMode::WorkspaceWrite => "workspace_write",
+            PermissionProfileMode::DangerFullAccess => "danger_full_access",
+        };
+        let actual = stamp.permission_profile.as_deref().unwrap_or("");
+        // Tolerate aliasing (server may publish kebab-case).
+        let actual_normalized = actual.replace('-', "_");
+        if !actual_normalized.eq_ignore_ascii_case(expected) {
+            mismatches.push(format!(
+                "permission_profile: staged {expected}, server effective {}",
+                if actual.is_empty() { "(unset)" } else { actual }
+            ));
+        }
+    }
+    if let Some(approval) = staged.approval_policy.as_deref() {
+        let actual = stamp.approval_policy.as_deref().unwrap_or("");
+        let staged_norm = approval.replace('_', "-");
+        let actual_norm = actual.replace('_', "-");
+        if !actual_norm.eq_ignore_ascii_case(&staged_norm) {
+            mismatches.push(format!(
+                "approval_policy: staged {approval}, server effective {}",
+                if actual.is_empty() { "(unset)" } else { actual }
+            ));
+        }
+    }
+    if let Some(network) = staged.network {
+        // Backend publishes `allowed`/`blocked` (past-tense) in
+        // the stamp, while the request shape uses `allow`/`deny`.
+        // Accept both spellings so a correctly-applied policy
+        // never reads as clamped.
+        let expected_aliases: &[&str] = match network {
+            octos_core::ui_protocol::PermissionNetworkPolicy::Allow => {
+                &["allow", "allowed", "network_allowed", "network-allowed"]
+            }
+            octos_core::ui_protocol::PermissionNetworkPolicy::Deny => &[
+                "deny",
+                "denied",
+                "blocked",
+                "network_blocked",
+                "network-blocked",
+            ],
+        };
+        let actual = stamp.network.as_deref().unwrap_or("");
+        if !actual.is_empty()
+            && !expected_aliases
+                .iter()
+                .any(|alias| actual.eq_ignore_ascii_case(alias))
+        {
+            mismatches.push(format!(
+                "network: staged {}, server effective {actual}",
+                expected_aliases[0]
+            ));
+        }
+    }
+    if mismatches.is_empty() {
+        None
+    } else {
+        Some(mismatches.join("; "))
     }
 }
 
@@ -6067,6 +6290,365 @@ mod tests {
             .map(|frame| frame.id.as_str().to_owned())
             .expect("/setup must open the onboarding menu");
         assert_eq!(active_id, crate::menu::registry::MENU_ONBOARD);
+    }
+
+    /// M22-D: `/onboard permissions <mode>` stages a permission
+    /// profile update. The wizard does NOT claim the choice is
+    /// effective — the staged update is just held for application
+    /// after `session/open`.
+    #[test]
+    fn onboard_permissions_command_stages_workspace_write_never() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+
+        store.state.composer = "/onboard permissions workspace-write-never".into();
+        assert!(store.compose_command().is_none());
+
+        let staged = store
+            .state
+            .onboarding
+            .staged_permission_profile
+            .clone()
+            .expect("staged permission profile");
+        assert_eq!(
+            staged.mode,
+            Some(octos_core::ui_protocol::PermissionProfileMode::WorkspaceWrite)
+        );
+        assert_eq!(staged.approval_policy.as_deref(), Some("never"));
+        assert!(store.state.status.contains("staged"));
+    }
+
+    /// M22-D: `/onboard permissions clear` removes the staged
+    /// permission profile.
+    #[test]
+    fn onboard_permissions_clear_drops_staged_profile() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.composer = "/onboard permissions read-only".into();
+        let _ = store.compose_command();
+        assert!(store.state.onboarding.staged_permission_profile.is_some());
+
+        store.state.composer = "/onboard permissions clear".into();
+        let _ = store.compose_command();
+
+        assert!(store.state.onboarding.staged_permission_profile.is_none());
+    }
+
+    /// M22-D: an unknown mode is rejected with a typed status that
+    /// names the accepted modes.
+    #[test]
+    fn onboard_permissions_rejects_unknown_mode() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.composer = "/onboard permissions yolo".into();
+        assert!(store.compose_command().is_none());
+
+        assert!(store.state.onboarding.staged_permission_profile.is_none());
+        assert!(
+            store
+                .state
+                .status
+                .contains("Unknown permission profile mode"),
+            "expected typed error, got: {}",
+            store.state.status
+        );
+    }
+
+    /// M22-D: after `session/open` succeeds and `permission/profile/set`
+    /// is advertised, the store emits a follow-up `permission/profile/set`
+    /// RPC carrying the staged update. Without the capability, the
+    /// staged choice remains held but no RPC fires.
+    #[test]
+    fn session_opened_emits_permission_profile_set_when_staged() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy, PermissionProfileMode, PermissionProfileUpdate, SessionOpened,
+        };
+
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+            crate::menu::registry::APPUI_METHOD_PERMISSION_PROFILE_SET,
+        ]);
+        store.state.onboarding.staged_permission_profile = Some(PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::ReadOnly),
+            network: Some(PermissionNetworkPolicy::Deny),
+            approval_policy: Some("on-request".into()),
+        });
+
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": SessionKey("alice:local:tui#coding".into()),
+            "active_profile_id": "alice",
+        }))
+        .expect("session/opened payload");
+        let follow_up =
+            store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        let Some(AppUiCommand::SetPermissionProfile(params)) = follow_up else {
+            panic!("expected permission/profile/set follow-up, got: {follow_up:?}");
+        };
+        assert_eq!(params.update.mode, Some(PermissionProfileMode::ReadOnly));
+        assert_eq!(params.update.approval_policy.as_deref(), Some("on-request"));
+    }
+
+    /// M22-D: when `permission/profile/set` is NOT advertised, the
+    /// SessionOpened handler does NOT emit a follow-up — the
+    /// staged choice stays in the wizard state but the server is
+    /// trusted to fall back to its default policy.
+    #[test]
+    fn session_opened_without_set_capability_does_not_emit_follow_up() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::{
+            PermissionProfileMode, PermissionProfileUpdate, SessionOpened,
+        };
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.staged_permission_profile = Some(PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::WorkspaceWrite),
+            network: None,
+            approval_policy: Some("on-request".into()),
+        });
+
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": SessionKey("alice:local:tui#coding".into()),
+            "active_profile_id": "alice",
+        }))
+        .expect("session/opened payload");
+        let follow_up =
+            store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        assert!(follow_up.is_none());
+        // Staged choice stays present so a later capability
+        // advertisement can still apply it.
+        assert!(store.state.onboarding.staged_permission_profile.is_some());
+    }
+
+    /// M22-D: when the runtime policy stamp disagrees with the
+    /// staged permission profile (server clamped or rejected), the
+    /// wizard records a typed `permission_profile_mismatch` reason
+    /// so the UI can surface "your staged choice was rejected".
+    #[test]
+    fn runtime_policy_stamp_mismatch_populates_typed_reason() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::{PermissionProfileMode, PermissionProfileUpdate};
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.staged_permission_profile = Some(PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::DangerFullAccess),
+            network: None,
+            approval_policy: Some("never".into()),
+        });
+        // Server clamps to workspace_write + on-request (typical
+        // tenant policy that rejects danger-full-access).
+        store.apply_client_event(ClientEvent::SessionStatus(
+            crate::client_event::SessionStatusClientEvent {
+                result: crate::model::SessionStatusReadResult {
+                    session_id: SessionKey("alice:local:tui#coding".into()),
+                    profile_id: Some("alice".into()),
+                    runtime_mode: Some("tenant".into()),
+                    cwd: None,
+                    workspace_root: None,
+                    active_turn_id: None,
+                    runtime_policy_stamp: Some(crate::model::RuntimePolicyStamp {
+                        permission_profile: Some("workspace_write".into()),
+                        approval_policy: Some("on-request".into()),
+                        ..Default::default()
+                    }),
+                    model: None,
+                    permission_profile: None,
+                    approval_policy: None,
+                    sandbox_mode: None,
+                    sandbox: None,
+                    filesystem_scope: None,
+                    network: None,
+                    tool_policy_id: None,
+                    mcp_servers: Vec::new(),
+                    memory_scope: None,
+                    health: None,
+                    capabilities: None,
+                    mcp_summary: None,
+                    tool_summary: None,
+                    usage: None,
+                    cursor: None,
+                },
+                message: "runtime status".into(),
+            },
+        ));
+
+        let mismatch = store
+            .state
+            .onboarding
+            .permission_profile_mismatch
+            .as_ref()
+            .expect("mismatch should be recorded");
+        assert!(
+            mismatch.contains("permission_profile"),
+            "expected mismatch to name the field, got: {mismatch}"
+        );
+        assert!(mismatch.contains("danger_full_access"));
+    }
+
+    /// M22-D: the runtime policy stamp publishes
+    /// `"allowed"`/`"blocked"` for network, but the request shape
+    /// uses `"allow"`/`"deny"`. The comparator must accept both so
+    /// a correctly-applied policy never reads as clamped.
+    #[test]
+    fn runtime_policy_stamp_network_aliases_accepted_as_match() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy, PermissionProfileMode, PermissionProfileUpdate,
+        };
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.staged_permission_profile = Some(PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::WorkspaceWrite),
+            network: Some(PermissionNetworkPolicy::Deny),
+            approval_policy: Some("on-request".into()),
+        });
+        store.apply_client_event(ClientEvent::SessionStatus(
+            crate::client_event::SessionStatusClientEvent {
+                result: crate::model::SessionStatusReadResult {
+                    session_id: SessionKey("alice:local:tui#coding".into()),
+                    profile_id: Some("alice".into()),
+                    runtime_mode: Some("solo".into()),
+                    cwd: None,
+                    workspace_root: None,
+                    active_turn_id: None,
+                    runtime_policy_stamp: Some(crate::model::RuntimePolicyStamp {
+                        permission_profile: Some("workspace_write".into()),
+                        approval_policy: Some("on-request".into()),
+                        // Backend publishes "blocked" (past tense)
+                        // for network=Deny — the comparator must
+                        // recognize the alias.
+                        network: Some("blocked".into()),
+                        ..Default::default()
+                    }),
+                    model: None,
+                    permission_profile: None,
+                    approval_policy: None,
+                    sandbox_mode: None,
+                    sandbox: None,
+                    filesystem_scope: None,
+                    network: None,
+                    tool_policy_id: None,
+                    mcp_servers: Vec::new(),
+                    memory_scope: None,
+                    health: None,
+                    capabilities: None,
+                    mcp_summary: None,
+                    tool_summary: None,
+                    usage: None,
+                    cursor: None,
+                },
+                message: "runtime status".into(),
+            },
+        ));
+
+        assert!(
+            store.state.onboarding.permission_profile_mismatch.is_none(),
+            "'blocked' must be accepted as matching network=Deny, got: {:?}",
+            store.state.onboarding.permission_profile_mismatch
+        );
+    }
+
+    /// M22-D: after `permission/profile/set` resolves, the store
+    /// must refresh `session/status/read` so the runtime policy
+    /// stamp arrives and the mismatch validator can run. Without
+    /// this follow-up the user never sees a clamp warning in the
+    /// normal onboarding flow.
+    #[test]
+    fn permission_profile_set_response_refreshes_session_status() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::{
+            PermissionProfileMode, PermissionProfileSelection, PermissionProfileUpdate,
+        };
+
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+            crate::menu::registry::APPUI_METHOD_PERMISSION_PROFILE_SET,
+            crate::model::APPUI_METHOD_SESSION_STATUS_READ,
+        ]);
+        store.state.onboarding.staged_permission_profile = Some(PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::WorkspaceWrite),
+            network: None,
+            approval_policy: Some("on-request".into()),
+        });
+
+        let follow_up = store.apply_client_event(ClientEvent::PermissionProfile(
+            crate::client_event::PermissionProfileClientEvent {
+                session_id: SessionKey("alice:local:tui#coding".into()),
+                current: PermissionProfileSelection::default(),
+                message: "permission/profile/set applied".into(),
+            },
+        ));
+
+        let Some(AppUiCommand::ReadSessionStatus(params)) = follow_up else {
+            panic!(
+                "expected session/status/read follow-up after permission set, got: {follow_up:?}"
+            );
+        };
+        assert_eq!(
+            params.session_id,
+            SessionKey("alice:local:tui#coding".into())
+        );
+    }
+
+    /// M22-D: matching stamps leave `permission_profile_mismatch`
+    /// as `None`. The wizard only flags divergence.
+    #[test]
+    fn runtime_policy_stamp_match_clears_mismatch() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::{PermissionProfileMode, PermissionProfileUpdate};
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.staged_permission_profile = Some(PermissionProfileUpdate {
+            mode: Some(PermissionProfileMode::WorkspaceWrite),
+            network: None,
+            approval_policy: Some("on-request".into()),
+        });
+        store.apply_client_event(ClientEvent::SessionStatus(
+            crate::client_event::SessionStatusClientEvent {
+                result: crate::model::SessionStatusReadResult {
+                    session_id: SessionKey("alice:local:tui#coding".into()),
+                    profile_id: Some("alice".into()),
+                    runtime_mode: Some("solo".into()),
+                    cwd: None,
+                    workspace_root: None,
+                    active_turn_id: None,
+                    runtime_policy_stamp: Some(crate::model::RuntimePolicyStamp {
+                        permission_profile: Some("workspace-write".into()),
+                        approval_policy: Some("on-request".into()),
+                        ..Default::default()
+                    }),
+                    model: None,
+                    permission_profile: None,
+                    approval_policy: None,
+                    sandbox_mode: None,
+                    sandbox: None,
+                    filesystem_scope: None,
+                    network: None,
+                    tool_policy_id: None,
+                    mcp_servers: Vec::new(),
+                    memory_scope: None,
+                    health: None,
+                    capabilities: None,
+                    mcp_summary: None,
+                    tool_summary: None,
+                    usage: None,
+                    cursor: None,
+                },
+                message: "runtime status".into(),
+            },
+        ));
+
+        assert!(
+            store.state.onboarding.permission_profile_mismatch.is_none(),
+            "matching stamp should clear mismatch, got: {:?}",
+            store.state.onboarding.permission_profile_mismatch
+        );
     }
 
     /// M22-F: doctor report for a fresh store with a local-create
