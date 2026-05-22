@@ -939,6 +939,10 @@ impl Store {
                 self.onboarding_save_provider_fallback_command()
             }
             OnboardingAction::TestProvider => self.onboarding_test_provider_command(),
+            OnboardingAction::Doctor => {
+                self.run_onboarding_doctor();
+                None
+            }
             OnboardingAction::Finish => self.onboarding_finish_command(),
             OnboardingAction::Reset => {
                 self.state.onboarding = Default::default();
@@ -1007,6 +1011,7 @@ impl Store {
             "fetch-models" => self.dispatch_onboarding_action(OnboardingAction::FetchModels, None),
             "save" => self.dispatch_onboarding_action(OnboardingAction::SaveProvider, None),
             "test" => self.dispatch_onboarding_action(OnboardingAction::TestProvider, None),
+            "doctor" | "check" => self.dispatch_onboarding_action(OnboardingAction::Doctor, None),
             "finish" | "open-session" => {
                 self.dispatch_onboarding_action(OnboardingAction::Finish, None)
             }
@@ -1622,6 +1627,222 @@ impl Store {
         frame.selected_index = index;
         self.refresh_active_menu();
         true
+    }
+
+    /// M22-F: produce the onboarding doctor report. Each check is
+    /// a typed projection of existing wizard / app state, so the
+    /// doctor surface itself is read-only — recovery is delegated
+    /// back to the existing `/onboard <step>` actions via the
+    /// per-check `recovery` strings.
+    pub fn onboarding_doctor_report(&self) -> crate::model::OnboardingDoctorReport {
+        use crate::model::{
+            OnboardingDoctorCheck, OnboardingDoctorOutcome, OnboardingDoctorReport,
+        };
+        let onboarding = &self.state.onboarding;
+        let capabilities = self.state.capabilities.as_ref();
+        let supports = |method: &str| -> bool {
+            capabilities.is_some_and(|caps| caps.supports_method(method))
+        };
+        let local_create_supported = supports(crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE);
+
+        // M22-F: use the same resolved-profile source as
+        // `onboarding_finish_command` so the doctor recognises a
+        // profile that the server has already published (active
+        // session, runtime status, profile_llm_state, …) even
+        // when the local `onboarding.profile_id` is still blank.
+        let resolved_profile = self.current_profile_for_onboarding();
+        let profile_check = if onboarding.local_profile_created || resolved_profile.is_some() {
+            let label = resolved_profile
+                .clone()
+                .or_else(|| onboarding.profile_id.clone())
+                .unwrap_or_else(|| onboarding.username.clone());
+            OnboardingDoctorOutcome::Pass {
+                detail: format!("profile id: {label}"),
+            }
+        } else if local_create_supported {
+            OnboardingDoctorOutcome::Fail {
+                reason: "no local profile yet".into(),
+                recovery: "Use /onboard name / username / email, then /onboard finish.".into(),
+            }
+        } else {
+            OnboardingDoctorOutcome::Skipped {
+                detail: "profile/local/create not advertised by server".into(),
+            }
+        };
+
+        // M22-F: accept a server-published primary provider — the
+        // `/onboard finish` open-session path already trusts
+        // `profile_llm_state.primary_provider().has_api_key`, so
+        // the doctor must too. Falls back to the local wizard
+        // checks (selection + key staged, etc.) when the server
+        // has not yet published a primary.
+        let published_primary = self
+            .state
+            .profile_llm_state
+            .as_ref()
+            .and_then(|llm| llm.primary_provider())
+            .filter(|provider| provider.has_api_key);
+        let provider_check = if let Some(provider) = published_primary {
+            OnboardingDoctorOutcome::Pass {
+                detail: format!(
+                    "server published primary provider: {} / {}",
+                    provider
+                        .family_id
+                        .clone()
+                        .unwrap_or_else(|| provider.provider.clone()),
+                    provider
+                        .model_id
+                        .clone()
+                        .unwrap_or_else(|| provider.model.clone())
+                ),
+            }
+        } else if onboarding.provider_saved {
+            OnboardingDoctorOutcome::Pass {
+                detail: format!(
+                    "saved primary provider: {}",
+                    onboarding
+                        .saved_primary_provider_label
+                        .clone()
+                        .unwrap_or_else(|| onboarding.provider_label())
+                ),
+            }
+        } else if onboarding.selection_ready() && onboarding.has_api_key() {
+            OnboardingDoctorOutcome::Warn {
+                reason: "provider selected with API key but not saved as primary".into(),
+                recovery: "Use /onboard save to persist; /onboard test to verify first.".into(),
+            }
+        } else if onboarding.selection_ready() {
+            OnboardingDoctorOutcome::Warn {
+                reason: "provider selected but API key missing".into(),
+                recovery: "Use /onboard key <secret>.".into(),
+            }
+        } else {
+            OnboardingDoctorOutcome::Fail {
+                reason: "no provider selected".into(),
+                recovery: "Use /onboard family / model / route, /onboard key, /onboard save."
+                    .into(),
+            }
+        };
+
+        // Workspace check.
+        let workspace_check = if onboarding_workspace_cwd(&self.state.workspace.root).is_some() {
+            OnboardingDoctorOutcome::Pass {
+                detail: format!(
+                    "workspace cwd resolvable from `{}`",
+                    self.state.workspace.root
+                ),
+            }
+        } else {
+            OnboardingDoctorOutcome::Fail {
+                reason: format!(
+                    "workspace cwd is `{}` (not a usable path)",
+                    self.state.workspace.root
+                ),
+                recovery:
+                    "Restart Octos with `--cwd <path>` or set workspace.root via the transport launch."
+                        .into(),
+            }
+        };
+
+        // Capability check.
+        let capability_check = if let Some(caps) = capabilities {
+            // Probe known onboarding-relevant methods to summarize.
+            let known = [
+                crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+                crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+                crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
+                crate::model::APPUI_METHOD_PROFILE_LLM_TEST,
+                crate::model::APPUI_METHOD_MODEL_LIST,
+                crate::model::APPUI_METHOD_SESSION_STATUS_READ,
+                crate::menu::registry::APPUI_METHOD_PERMISSION_PROFILE_SET,
+            ];
+            let advertised = known
+                .iter()
+                .filter(|method| caps.supports_method(method))
+                .count();
+            OnboardingDoctorOutcome::Pass {
+                detail: format!("{advertised}/{} onboarding methods advertised", known.len()),
+            }
+        } else {
+            OnboardingDoctorOutcome::Fail {
+                reason: "AppUI capabilities not yet received".into(),
+                recovery: "Wait for `config/capabilities/list` or reconnect the transport.".into(),
+            }
+        };
+
+        // Transport check.
+        let transport_check = match self.state.target.as_deref() {
+            Some(target) if !target.is_empty() => OnboardingDoctorOutcome::Pass {
+                detail: format!("AppUI target: {target}"),
+            },
+            _ => OnboardingDoctorOutcome::Fail {
+                reason: "no AppUI transport configured".into(),
+                recovery: "Start the TUI with `octos tui --target <stdio:...|ws://...>`.".into(),
+            },
+        };
+
+        OnboardingDoctorReport {
+            checks: vec![
+                OnboardingDoctorCheck {
+                    id: "transport",
+                    title: "AppUI transport",
+                    outcome: transport_check,
+                },
+                OnboardingDoctorCheck {
+                    id: "capabilities",
+                    title: "Server capabilities",
+                    outcome: capability_check,
+                },
+                OnboardingDoctorCheck {
+                    id: "profile",
+                    title: "Local profile",
+                    outcome: profile_check,
+                },
+                OnboardingDoctorCheck {
+                    id: "workspace",
+                    title: "Workspace cwd",
+                    outcome: workspace_check,
+                },
+                OnboardingDoctorCheck {
+                    id: "provider",
+                    title: "LLM provider",
+                    outcome: provider_check,
+                },
+            ],
+        }
+    }
+
+    fn run_onboarding_doctor(&mut self) {
+        let report = self.onboarding_doctor_report();
+        let summary_line = report
+            .checks
+            .iter()
+            .map(|check| format!("{}: {}", check.id, check.outcome.label()))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        self.state.status = format!("Onboarding doctor — {summary_line}");
+        for check in &report.checks {
+            let detail = match &check.outcome {
+                crate::model::OnboardingDoctorOutcome::Pass { detail }
+                | crate::model::OnboardingDoctorOutcome::Skipped { detail } => detail.clone(),
+                crate::model::OnboardingDoctorOutcome::Warn { reason, recovery } => {
+                    format!("{reason} → {recovery}")
+                }
+                crate::model::OnboardingDoctorOutcome::Fail { reason, recovery } => {
+                    format!("{reason} → {recovery}")
+                }
+            };
+            let kind = match check.outcome {
+                crate::model::OnboardingDoctorOutcome::Pass { .. }
+                | crate::model::OnboardingDoctorOutcome::Skipped { .. } => ActivityKind::Progress,
+                crate::model::OnboardingDoctorOutcome::Warn { .. } => ActivityKind::Warning,
+                crate::model::OnboardingDoctorOutcome::Fail { .. } => ActivityKind::Error,
+            };
+            self.state.push_activity(
+                ActivityItem::new(kind, check.id, check.outcome.label()).with_detail(detail),
+            );
+        }
+        self.refresh_active_menu_if_open();
     }
 
     fn focus_provider_api_key_row(&mut self) -> bool {
@@ -5846,6 +6067,199 @@ mod tests {
             .map(|frame| frame.id.as_str().to_owned())
             .expect("/setup must open the onboarding menu");
         assert_eq!(active_id, crate::menu::registry::MENU_ONBOARD);
+    }
+
+    /// M22-F: doctor report for a fresh store with a local-create
+    /// capability surfaces a FAIL for profile (no profile yet)
+    /// and FAIL for provider, but PASS for transport/capabilities/
+    /// workspace. Uses `protocol_store_without_sessions` so no
+    /// session-resolved profile exists to obscure the FAIL.
+    #[test]
+    fn doctor_report_for_fresh_store_flags_profile_and_provider() {
+        let mut store = protocol_store_without_sessions();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+        ]));
+        store.state.workspace.root = "/tmp/project".into();
+        let report = store.onboarding_doctor_report();
+        assert!(
+            report.any_failures(),
+            "fresh store must flag at least one FAIL"
+        );
+        let profile = report
+            .checks
+            .iter()
+            .find(|check| check.id == "profile")
+            .expect("profile check exists");
+        assert!(matches!(
+            profile.outcome,
+            crate::model::OnboardingDoctorOutcome::Fail { .. }
+        ));
+        let provider = report
+            .checks
+            .iter()
+            .find(|check| check.id == "provider")
+            .expect("provider check exists");
+        assert!(matches!(
+            provider.outcome,
+            crate::model::OnboardingDoctorOutcome::Fail { .. }
+        ));
+        let workspace = report
+            .checks
+            .iter()
+            .find(|check| check.id == "workspace")
+            .expect("workspace check exists");
+        assert!(workspace.outcome.is_pass());
+    }
+
+    /// M22-F: `/onboard doctor` writes a status summary line that
+    /// names each check id and outcome, and pushes per-check
+    /// activity entries.
+    #[test]
+    fn onboard_doctor_writes_status_summary_and_activity_entries() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.workspace.root = "/tmp/project".into();
+        let activity_before = store.state.activity.len();
+
+        store.state.composer = "/onboard doctor".into();
+        let result = store.compose_command();
+        assert!(result.is_none(), "doctor is a local read; no RPC");
+
+        assert!(
+            store.state.status.starts_with("Onboarding doctor"),
+            "doctor must update status line, got: {}",
+            store.state.status
+        );
+        assert!(
+            store.state.activity.len() > activity_before,
+            "doctor must push per-check activity entries"
+        );
+    }
+
+    /// M22-F: when the profile is created and provider saved, the
+    /// doctor report has zero FAILs (workspace and transport
+    /// still pass, capabilities OK).
+    #[test]
+    fn doctor_report_passes_once_profile_and_provider_ready() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.workspace.root = "/tmp/project".into();
+        store.state.onboarding.profile_id = Some("alice".into());
+        store.state.onboarding.local_profile_created = true;
+        store.state.onboarding.provider_saved = true;
+        store.state.onboarding.saved_primary_provider_label = Some("openai / gpt / openai".into());
+
+        let report = store.onboarding_doctor_report();
+        assert!(!report.any_failures(), "report: {:?}", report);
+        let profile = report
+            .checks
+            .iter()
+            .find(|check| check.id == "profile")
+            .unwrap();
+        assert!(profile.outcome.is_pass());
+        let provider = report
+            .checks
+            .iter()
+            .find(|check| check.id == "provider")
+            .unwrap();
+        assert!(provider.outcome.is_pass());
+    }
+
+    /// M22-F: when the profile is resolved from an active session
+    /// rather than `onboarding.profile_id`, the doctor still
+    /// reports PASS — the same resolved-profile source as
+    /// `onboarding_finish_command` must be used.
+    #[test]
+    fn doctor_report_uses_resolved_profile_from_session() {
+        // Default store has an empty session with profile_id = "coding".
+        let mut store = store_with_empty_session();
+        store.state.target = Some("ws://example.test/ui-protocol".into());
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+        ]));
+        store.state.workspace.root = "/tmp/project".into();
+        // `onboarding.profile_id` is blank; the session carries
+        // `profile_id = Some("coding")` which the resolver picks up.
+
+        let report = store.onboarding_doctor_report();
+        let profile = report
+            .checks
+            .iter()
+            .find(|check| check.id == "profile")
+            .expect("profile check exists");
+        assert!(
+            profile.outcome.is_pass(),
+            "doctor must accept the session-resolved profile, got: {:?}",
+            profile.outcome
+        );
+    }
+
+    /// M22-F: when the server has published a primary provider via
+    /// `profile_llm_state` (post-`/onboard providers`), the doctor
+    /// recognises it even though `onboarding.provider_saved` is
+    /// still false.
+    #[test]
+    fn doctor_report_honors_server_published_primary_provider() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.workspace.root = "/tmp/project".into();
+        store.state.profile_llm_state = Some(crate::model::ProfileLlmListResult {
+            profile_id: Some("alice".into()),
+            primary: Some(crate::model::LlmConfiguredProvider {
+                provider: "openai".into(),
+                model: "gpt-test".into(),
+                family_id: Some("openai".into()),
+                model_id: Some("gpt-test".into()),
+                route: None,
+                route_id: Some("openai".into()),
+                base_url: None,
+                api_key_env: None,
+                has_api_key: true,
+                selected: true,
+                available: Some(true),
+                model_hints: None,
+                cost_per_m: None,
+                strong: Some(true),
+            }),
+            fallbacks: Vec::new(),
+            llm: None,
+            runtime_policy_stamp: None,
+        });
+
+        let report = store.onboarding_doctor_report();
+        let provider = report
+            .checks
+            .iter()
+            .find(|check| check.id == "provider")
+            .expect("provider check exists");
+        assert!(
+            provider.outcome.is_pass(),
+            "doctor must accept server-published primary, got: {:?}",
+            provider.outcome
+        );
+    }
+
+    /// M22-F: a server that does not advertise
+    /// `profile/local/create` is non-solo-onboarding; the
+    /// profile check skips rather than failing.
+    #[test]
+    fn doctor_report_skips_profile_when_capability_absent() {
+        let mut store = protocol_store_without_sessions();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods(
+            std::iter::empty::<&str>(),
+        ));
+        store.state.workspace.root = "/tmp/project".into();
+        let report = store.onboarding_doctor_report();
+        let profile = report
+            .checks
+            .iter()
+            .find(|check| check.id == "profile")
+            .unwrap();
+        assert!(matches!(
+            profile.outcome,
+            crate::model::OnboardingDoctorOutcome::Skipped { .. }
+        ));
     }
 
     #[test]
