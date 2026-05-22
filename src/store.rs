@@ -624,17 +624,6 @@ impl Store {
             .and_then(|session| session.profile_id.clone())
     }
 
-    /// Returns the objective of the currently cached goal for a
-    /// session, or `None` when no goal has been observed yet. Used to
-    /// satisfy the backend's `session/goal/set` contract, which
-    /// requires the objective on every call (including pause/resume).
-    fn current_goal_objective(&self, session_id: &SessionKey) -> Option<String> {
-        self.state
-            .session_autonomy_for(session_id)
-            .and_then(|entry| entry.goal.as_ref())
-            .map(|goal| goal.objective.clone())
-    }
-
     /// Returns the cached goal record IFF the goal is in a state the
     /// TUI is allowed to transition. Per UPCR-2026-021 the model owns
     /// the `complete` transition — the TUI must not reactivate a
