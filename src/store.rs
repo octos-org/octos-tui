@@ -525,7 +525,7 @@ impl Store {
         let session_id = self.active_autonomy_session_id()?;
         let profile_id = self.active_session_profile_id();
         match cmd {
-            LoopCommand::Show | LoopCommand::List => {
+            LoopCommand::List => {
                 if !self.require_appui_method(crate::model::APPUI_METHOD_LOOP_LIST) {
                     return None;
                 }
@@ -10732,13 +10732,22 @@ mod tests {
     }
 
     #[test]
-    fn loop_bare_lists_loops() {
+    fn loop_bare_dispatches_create_maintenance() {
+        // Per UPCR-2026-021 §"Parsing rules" line 298: bare `/loop`
+        // creates a maintenance loop with an empty prompt — the
+        // backend resolves the prompt from `.octos/loop.md`, then
+        // `~/.octos/loop.md`, then a built-in fallback. The TUI must
+        // dispatch `loop/create` (not `loop/list`).
         let mut store = protocol_store_with_autonomy();
         store.state.composer = "/loop".into();
-        assert!(matches!(
-            store.compose_command(),
-            Some(AppUiCommand::ListLoops(_))
-        ));
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::CreateLoop(params) => {
+                assert_eq!(params.prompt, "");
+                assert_eq!(params.mode, crate::model::LoopMode::Maintenance);
+                assert!(params.interval_seconds.is_none());
+            }
+            other => panic!("expected CreateLoop maintenance, got {other:?}"),
+        }
     }
 
     #[test]

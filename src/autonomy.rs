@@ -63,14 +63,18 @@ pub enum LoopCadence {
 /// Parsed `/loop` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoopCommand {
+    /// `/loop` (bare → maintenance, empty prompt),
     /// `/loop <prompt>`, `/loop <interval> <prompt>`,
     /// `/loop <prompt> every <interval>`, `/loop maintenance <prompt>`.
+    ///
+    /// Per UPCR-2026-021 §"Parsing rules": bare `/loop` (no prompt, no
+    /// interval, no verb) creates a maintenance loop. The backend
+    /// resolves the prompt from `.octos/loop.md`, then `~/.octos/loop.md`,
+    /// then a built-in fallback.
     Create {
         prompt: String,
         cadence: LoopCadence,
     },
-    /// Bare `/loop` — show open loops.
-    Show,
     /// `/loop list`.
     List,
     /// `/loop delete <id>`.
@@ -218,7 +222,14 @@ fn parse_goal(tail: &str) -> Result<GoalCommand, AutonomyParseError> {
 fn parse_loop(tail: &str) -> Result<LoopCommand, AutonomyParseError> {
     let trimmed = tail.trim();
     if trimmed.is_empty() {
-        return Ok(LoopCommand::Show);
+        // Per UPCR-2026-021 §"Parsing rules" line 298: without an
+        // interval and without a prompt, create a maintenance loop.
+        // The backend resolves the prompt from `.octos/loop.md`, then
+        // `~/.octos/loop.md`, then a built-in fallback.
+        return Ok(LoopCommand::Create {
+            prompt: String::new(),
+            cadence: LoopCadence::Maintenance,
+        });
     }
     let (verb, args) = split_head(trimmed);
     // Verb-style subcommands take precedence so users can refer to
@@ -273,6 +284,18 @@ fn parse_loop_create(body: &str) -> Result<LoopCommand, AutonomyParseError> {
         let prompt = rest.trim().to_string();
         if prompt.is_empty() {
             return Err(AutonomyParseError::EmptyLoopPrompt);
+        }
+        // Per UPCR-2026-021 §"Parsing rules" line 295-296: if both
+        // leading and trailing intervals are present, reject with
+        // `loop_invalid_interval`. Otherwise the trailing `every ...`
+        // would silently be treated as part of the prompt body.
+        if let Some((_, trailing_interval_raw)) = prompt.rsplit_once(" every ") {
+            let trailing = trailing_interval_raw.trim();
+            if parse_interval(trailing).is_ok() {
+                return Err(AutonomyParseError::InvalidInterval(format!(
+                    "{head} ... every {trailing}"
+                )));
+            }
         }
         return Ok(LoopCommand::Create {
             prompt,
@@ -423,11 +446,48 @@ mod tests {
     }
 
     #[test]
-    fn loop_bare_shows_open_loops() {
+    fn bare_loop_creates_maintenance() {
+        // Per UPCR-2026-021 §"Parsing rules" line 298: bare `/loop`
+        // (no prompt, no interval, no verb) creates a maintenance loop.
+        // The backend resolves the prompt from `.octos/loop.md`, then
+        // `~/.octos/loop.md`, then a built-in fallback.
         assert_eq!(
             parse_autonomy_slash("/loop").unwrap(),
-            Some(AutonomyCommand::Loop(LoopCommand::Show))
+            Some(AutonomyCommand::Loop(LoopCommand::Create {
+                prompt: String::new(),
+                cadence: LoopCadence::Maintenance,
+            }))
         );
+        // Whitespace-only tail behaves identically.
+        assert_eq!(
+            parse_autonomy_slash("/loop   ").unwrap(),
+            Some(AutonomyCommand::Loop(LoopCommand::Create {
+                prompt: String::new(),
+                cadence: LoopCadence::Maintenance,
+            }))
+        );
+    }
+
+    #[test]
+    fn bare_loop_with_only_subcommand_keeps_list() {
+        // `/loop list` still routes to the list verb — only fully bare
+        // `/loop` is rerouted to maintenance create.
+        assert_eq!(
+            parse_autonomy_slash("/loop list").unwrap(),
+            Some(AutonomyCommand::Loop(LoopCommand::List))
+        );
+    }
+
+    #[test]
+    fn dual_interval_rejects() {
+        // Per UPCR-2026-021 §"Parsing rules" line 295-296: if both a
+        // leading and a trailing interval are present, reject with
+        // `loop_invalid_interval`. Today the leading interval would
+        // silently win and `every 10m` would be treated as prompt text.
+        assert!(matches!(
+            parse_autonomy_slash("/loop 5m run tests every 10m").unwrap_err(),
+            AutonomyParseError::InvalidInterval(_)
+        ));
     }
 
     #[test]
