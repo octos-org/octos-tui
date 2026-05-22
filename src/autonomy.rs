@@ -19,6 +19,14 @@
 //! - Schedule timers locally for `/loop`. Loop firing is backend-owned.
 //! - Invent default intervals; if the user did not supply one, the
 //!   parsed intent records "self-paced" and the backend decides.
+//!
+//! Menu surface: `/agents`, `/goal`, and `/loop` are currently
+//! discoverable only via slash entry. A menu-surface wrapper (the
+//! sub-menu shape sketched in #74 acceptance criterion 2) is deferred
+//! to M15-F UX work — no other autonomy slash commands have menu
+//! surfaces today, so adding one in isolation here would create an
+//! inconsistent UX. Tracking issue: octos-tui#74 (acceptance criterion
+//! #2 — `Add menu entries in src/menu/providers.rs`).
 
 use std::time::Duration;
 
