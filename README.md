@@ -11,15 +11,26 @@ Architecture and ownership boundaries are documented in
 
 ## Repository Layout
 
-For source builds, keep `octos` and `octos-tui` as sibling directories:
+For source builds, keep `octos` and `octos-tui` as sibling directories. The
+currently verified source pair is:
+
+```text
+octos:     origin/feat/m9-client-hello-capability-handshake @ f32c6e9a
+octos-tui: origin/feat/m9-tui-capability-menus @ 50d8240
+```
+
+Clone that pair with:
 
 ```bash
 mkdir octos-m9-test
 cd octos-m9-test
 
-git clone -b coding-green-m9-test-20260428 https://github.com/octos-org/octos.git
-git clone -b coding-green-m9-test-20260428 https://github.com/octos-org/octos-tui.git
+git clone -b feat/m9-client-hello-capability-handshake https://github.com/octos-org/octos.git
+git clone -b feat/m9-tui-capability-menus https://github.com/octos-org/octos-tui.git
 ```
+
+This pair was verified from the `octos-tui` checkout with sibling `../octos`
+using `cargo +stable check` and `cargo +stable test`.
 
 The sibling layout is required while `octos-tui` depends on:
 
