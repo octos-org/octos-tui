@@ -108,6 +108,8 @@ Environment:
   OCTOS_TUI_SOAK_SOLO_STRICT     Set to 1 to fail when M12-A/C capability blockers remain.
                                  Also requires MCP/tool fixture mutations to pass
                                  when the backend advertises those methods.
+  OCTOS_TUI_SOAK_REQUIRED_SOLO_CASES Space/comma-separated case names that
+                                 must be status=ok in verify-solo.
 
 Interactive flow after start:
   1. Attach: tmux attach -t "$OCTOS_TUI_SOAK_TUI_SESSION"
@@ -707,6 +709,34 @@ verify_solo_tenant_negative_case() {
       die "M12 solo tenant/cloud dangerous-mode rejection row missing or not passed"
       ;;
   esac
+}
+
+verify_solo_required_cases() {
+  local summary_json="$artifact_dir/soak-summary.json"
+  local required_cases="$1"
+  [ -n "$required_cases" ] || return 0
+  [ -f "$summary_json" ] || die "M12 solo summary missing: $summary_json"
+
+  required_cases="${required_cases//,/ }"
+  local case_name
+  if command -v jq >/dev/null 2>&1; then
+    for case_name in $required_cases; do
+      jq -e --arg name "$case_name" '
+        any(.cases[]?; .name == $name and .status == "ok")
+      ' "$summary_json" >/dev/null \
+        || die "M12 solo required case missing or not ok: $case_name"
+    done
+    return
+  fi
+
+  local compact
+  compact="$(tr -d '\n[:space:]' < "$summary_json")"
+  for case_name in $required_cases; do
+    case "$compact" in
+      *'"name":"'"$case_name"'"'*'"status":"ok"'*) ;;
+      *) die "M12 solo required case missing or not ok: $case_name" ;;
+    esac
+  done
 }
 
 assert_capture_clean() {
@@ -1867,6 +1897,11 @@ verify_solo() {
       die "M12 solo strict verification requires passed soak-summary.json"
     fi
   fi
+  local required_solo_cases="${OCTOS_TUI_SOAK_REQUIRED_SOLO_CASES:-}"
+  if [ "${OCTOS_TUI_SOAK_SOLO_STRICT:-0}" = "1" ] && [ -z "$required_solo_cases" ]; then
+    required_solo_cases="workspace-cwd-open approval-never-sandbox-active danger-full-access-approval-never"
+  fi
+  verify_solo_required_cases "$required_solo_cases"
   if [ "${OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE:-${OCTOS_TUI_SOAK_TENANT_NEGATIVE:-0}}" = "1" ]; then
     verify_solo_tenant_negative_case
   fi
@@ -2995,6 +3030,8 @@ JSONL
   "transport": "stdio",
   "cases": [
     {"name": "workspace-cwd-open", "status": "ok"},
+    {"name": "approval-never-sandbox-active", "status": "ok"},
+    {"name": "danger-full-access-approval-never", "status": "ok"},
     {"name": "coding-tool-contract-ready", "status": "ok", "contract_status": "ready", "missing_required_tools": []}
   ]
 }
@@ -3009,6 +3046,26 @@ JSON
   [ -f "$tmp_root/solo-core/summary-matrix.md" ] || die "self-test missing solo summary matrix"
   grep --fixed-strings -- '"scenario": "solo-onboarding"' "$tmp_root/solo-core/ux-validation.json" >/dev/null 2>&1 \
     || die "self-test missing solo-onboarding ux validation"
+
+  cp -R "$tmp_root/solo-core" "$tmp_root/bad-solo-required-case"
+  cat > "$tmp_root/bad-solo-required-case/soak-summary.json" <<'JSON'
+{
+  "schema": "octos-m12-solo-appui-soak-v1",
+  "status": "passed",
+  "transport": "stdio",
+  "cases": [
+    {"name": "workspace-cwd-open", "status": "ok"},
+    {"name": "approval-never-sandbox-active", "status": "ok"},
+    {"name": "danger-full-access-approval-never", "status": "blocked"}
+  ]
+}
+JSON
+  if env \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-solo-required-case" \
+    "OCTOS_TUI_SOAK_SOLO_STRICT=1" \
+    "$0" verify-solo >/dev/null 2>&1; then
+    die "self-test expected required solo case verification to fail"
+  fi
 
   cp -R "$tmp_root/solo-core" "$tmp_root/solo-tenant-negative"
   cat > "$tmp_root/solo-tenant-negative/soak-summary.json" <<'JSON'

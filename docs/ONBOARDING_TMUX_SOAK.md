@@ -95,6 +95,10 @@ drives the MCP/tool config fixture through AppUI:
 Current backends may not have M12-A/C fully wired. In that case the runner keeps
 the evidence files and records blockers in `soak-summary.json`; set
 `OCTOS_TUI_SOAK_SOLO_STRICT=1` when the backend is ready to require a pass.
+Strict mode also requires `workspace-cwd-open`,
+`approval-never-sandbox-active`, and `danger-full-access-approval-never` rows
+to be `ok`. Override or extend this list with
+`OCTOS_TUI_SOAK_REQUIRED_SOLO_CASES` for a specific closure bundle.
 MCP/tool config blockers are recorded the same way until the backend advertises
 `mcp/config/*`, `mcp/config/test`, and `tool/config/set_enabled`.
 Set `OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE=1` during `verify-solo` when the
