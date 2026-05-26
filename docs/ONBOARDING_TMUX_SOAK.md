@@ -82,7 +82,8 @@ writes `live-preflight.json` into the retained artifact directory even when a
 required check fails, so blocker comments can link the exact failed readiness
 state without exposing provider secrets. The JSON includes the tmux version,
 backend `octos --version` output when available, and the `octos-tui --version`
-status for the executable under test.
+status for the executable under test. When the source checkouts are available,
+it also records the `octos` and `octos-tui` Git commits used by the run.
 
 ## Live Closure Checklist
 

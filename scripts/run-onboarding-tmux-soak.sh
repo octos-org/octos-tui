@@ -174,6 +174,12 @@ profile_has_provider_secret() {
   fi
 }
 
+git_commit_for_dir() {
+  local dir="$1"
+  [ -n "$dir" ] || return 0
+  git -C "$dir" rev-parse HEAD 2>/dev/null || true
+}
+
 provider_credential_source() {
   if [ -n "${OCTOS_TUI_SOAK_API_KEY:-}" ]; then
     printf 'OCTOS_TUI_SOAK_API_KEY\n'
@@ -207,6 +213,8 @@ write_live_preflight_json() {
   local tmux_version="$7"
   local octos_version="$8"
   local octos_tui_version="$9"
+  local octos_repo_commit="${10}"
+  local octos_tui_repo_commit="${11}"
   mkdir -p "$artifact_dir"
   {
     printf '{\n'
@@ -220,9 +228,11 @@ write_live_preflight_json() {
     write_json_string_field octos_serve "$octos_check"
     write_json_string_field octos_bin "$octos_bin"
     write_json_string_field octos_version "$octos_version"
+    write_json_string_field octos_repo_commit "$octos_repo_commit"
     write_json_string_field octos_tui "$tui_check"
     write_json_string_field octos_tui_bin "$octos_tui_bin"
     write_json_string_field octos_tui_version "$octos_tui_version"
+    write_json_string_field octos_tui_repo_commit "$octos_tui_repo_commit"
     write_json_string_field provider_credential "$provider_source"
     write_json_string_field require_live_provider "$require_live_provider"
     write_json_string_field failure "$failure"
@@ -240,7 +250,12 @@ preflight_live() {
   local tmux_version=""
   local octos_version=""
   local octos_tui_version=""
+  local octos_repo_commit=""
+  local octos_tui_repo_commit=""
   local provider_source=""
+
+  octos_repo_commit="$(git_commit_for_dir "$octos_repo")"
+  octos_tui_repo_commit="$(git_commit_for_dir "$repo_root")"
 
   if ! command -v tmux >/dev/null 2>&1; then
     tmux_check="missing"
@@ -283,7 +298,7 @@ preflight_live() {
     provider_source="not required"
   fi
 
-  write_live_preflight_json "$status" "$failure" "$provider_source" "$tmux_check" "$octos_check" "$tui_check" "$tmux_version" "$octos_version" "$octos_tui_version"
+  write_live_preflight_json "$status" "$failure" "$provider_source" "$tmux_check" "$octos_check" "$tui_check" "$tmux_version" "$octos_version" "$octos_tui_version" "$octos_repo_commit" "$octos_tui_repo_commit"
 
   if [ "$status" != "passed" ]; then
     die "Live closure preflight failed: $failure (artifact: $artifact_dir/live-preflight.json)"
@@ -293,8 +308,10 @@ preflight_live() {
   printf 'transport=%s\n' "$transport"
   printf 'octos_bin=%s\n' "$octos_bin"
   printf 'octos_version=%s\n' "$octos_version"
+  printf 'octos_repo_commit=%s\n' "$octos_repo_commit"
   printf 'octos_tui_bin=%s\n' "$octos_tui_bin"
   printf 'octos_tui_version=%s\n' "$octos_tui_version"
+  printf 'octos_tui_repo_commit=%s\n' "$octos_tui_repo_commit"
   printf 'provider_credential=%s\n' "$provider_source"
   printf 'artifact=%s\n' "$artifact_dir/live-preflight.json"
 }
@@ -3077,6 +3094,10 @@ SH
     || die "self-test expected octos version in preflight artifact"
   grep -F '"octos_tui_version": "octos-tui 0.0.0-self-test"' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
     || die "self-test expected octos-tui version status in preflight artifact"
+  grep -F '"octos_repo_commit": "' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
+    || die "self-test expected octos repo commit field in preflight artifact"
+  grep -F '"octos_tui_repo_commit": "' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
+    || die "self-test expected octos-tui repo commit field in preflight artifact"
   grep -F '"tmux_version": "tmux ' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
     || die "self-test expected tmux version in preflight artifact"
   if env \
