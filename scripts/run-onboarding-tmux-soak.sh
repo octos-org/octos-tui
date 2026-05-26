@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -1140,6 +1140,43 @@ verify_provider_missing() {
   echo "Verified provider-missing onboarding recovery in $artifact_dir"
 }
 
+verify_permissions() {
+  local open_capture="$artifact_dir/tui-capture-permissions-open.txt"
+  local applied_capture="$artifact_dir/tui-capture-permissions-applied.txt"
+  [ -f "$open_capture" ] || die "permissions-open capture missing: $open_capture"
+  [ -f "$applied_capture" ] || die "permissions-applied capture missing: $applied_capture"
+
+  for required_text in \
+    "Update Model Permissions" \
+    "Default" \
+    "Read Only" \
+    "Workspace Write"
+  do
+    grep --fixed-strings -- "$required_text" "$open_capture" >/dev/null 2>&1 \
+      || die "permissions-open capture missing required text: $required_text"
+  done
+
+  for required_text in \
+    "Permissions updated: Workspace Write" \
+    "Workspace Write, Never Ask" \
+    "Ask Octos to change code"
+  do
+    grep --fixed-strings -- "$required_text" "$applied_capture" >/dev/null 2>&1 \
+      || die "permissions-applied capture missing required text: $required_text"
+  done
+
+  if grep --fixed-strings -- "Set Up LLM Provider" "$applied_capture" >/dev/null 2>&1; then
+    die "permissions capture is still on provider setup"
+  fi
+  if grep -E 'Task Error|app-ui error|malformed_json|unsupported method|unavailable: AppUI capabilities' \
+    "$open_capture" "$applied_capture" >/dev/null 2>&1; then
+    die "permissions capture contains AppUI error text"
+  fi
+
+  secret_leak_check
+  echo "Verified permissions onboarding selection in $artifact_dir"
+}
+
 self_test_solo() {
   local probe="$octos_repo/scripts/m12-solo-appui-soak.sh"
   [ -x "$probe" ] || die "M12 solo soak wrapper missing or not executable: $probe"
@@ -1228,6 +1265,26 @@ CAPTURE
     die "self-test expected bad provider-missing capture verification to fail"
   fi
 
+  cat > "$tmp_root/artifacts/tui-capture-permissions-open.txt" <<'CAPTURE'
+Update Model Permissions
+Default - Workspace edits; ask for network/outside.
+Read Only - No writes without approval.
+Workspace Write - Read/write inside workspace.
+CAPTURE
+  cat > "$tmp_root/artifacts/tui-capture-permissions-applied.txt" <<'CAPTURE'
+Permissions updated: Workspace Write, network blocked
+Workspace Write, Never Ask - Read/write inside workspace; deny approval-gated actions.
+Ask Octos to change code...
+CAPTURE
+  env "${child_env[@]}" "$0" verify-permissions >/dev/null
+
+  mkdir -p "$tmp_root/bad-permissions"
+  printf 'Update Model Permissions\n' > "$tmp_root/bad-permissions/tui-capture-permissions-open.txt"
+  printf 'Set Up LLM Provider\n' > "$tmp_root/bad-permissions/tui-capture-permissions-applied.txt"
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-permissions" "$0" verify-permissions >/dev/null 2>&1; then
+    die "self-test expected bad permissions capture verification to fail"
+  fi
+
   while IFS= read -r -d '' file; do
     if grep --fixed-strings -- "selftest-secret" "$file" >/dev/null 2>&1; then
       die "self-test secret leaked into artifacts: $file"
@@ -1267,6 +1324,7 @@ case "${1:-help}" in
   verify-solo) verify_solo ;;
   verify-first-launch) verify_first_launch ;;
   verify-provider-missing) verify_provider_missing ;;
+  verify-permissions) verify_permissions ;;
   api-parity) api_parity ;;
   self-test) self_test ;;
   solo-self-test) self_test_solo ;;

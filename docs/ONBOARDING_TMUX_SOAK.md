@@ -36,6 +36,7 @@ scripts/run-onboarding-tmux-soak.sh verify
 scripts/run-onboarding-tmux-soak.sh verify-solo
 scripts/run-onboarding-tmux-soak.sh verify-first-launch
 scripts/run-onboarding-tmux-soak.sh verify-provider-missing
+scripts/run-onboarding-tmux-soak.sh verify-permissions
 scripts/run-onboarding-tmux-soak.sh api-parity
 scripts/run-onboarding-tmux-soak.sh self-test
 scripts/run-onboarding-tmux-soak.sh solo-self-test
@@ -136,6 +137,27 @@ provider setup recovery screen, local profile readiness, provider catalog
 action, and API-key row. It fails if the capture is still on the first-launch
 splash, has already opened a coding session, or contains OTP/AppUI error text.
 
+Permissions capture:
+
+```sh
+OCTOS_TUI_SOAK_TRANSPORT=stdio \
+OCTOS_TUI_SOAK_INIT_PROFILE_LLM=1 \
+OCTOS_TUI_SOAK_API_KEY=<secret-value> \
+OCTOS_TUI_SOAK_RUN_ID=permissions-$(date -u +%Y%m%dT%H%M%SZ) \
+scripts/run-onboarding-tmux-soak.sh start
+
+OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-permissions
+
+OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-permissions
+```
+
+`verify-permissions` checks the open and applied permission pane captures for
+the server-backed permission menu, `Workspace Write` update acknowledgement,
+and a returned coding-session composer. It fails if the capture is still on
+provider setup or contains AppUI error text.
+
 The solo lane writes these M12 artifacts into
 `e2e/test-results-tui-onboarding/<run-id>/`:
 
@@ -143,6 +165,8 @@ The solo lane writes these M12 artifacts into
 - `tui-capture-first-launch.txt` when
   `OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE=1`
 - `tui-capture-provider-missing.txt` when running `drive-provider-missing`
+- `tui-capture-permissions-open.txt` and
+  `tui-capture-permissions-applied.txt` when running `drive-permissions`
 - `server.log`
 - `appui-transcript.jsonl`
 - `runtime-policy-stamp.json`
