@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-task-subagent-tree|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-task-subagent-tree|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -1238,6 +1238,47 @@ verify_permissions() {
   echo "Verified permissions onboarding selection in $artifact_dir"
 }
 
+verify_approval_denial() {
+  local request_capture="$artifact_dir/tui-capture-approval-request.txt"
+  local denied_capture="$artifact_dir/tui-capture-approval-denied.txt"
+  assert_capture_clean "$request_capture" "approval-request"
+  assert_capture_clean "$denied_capture" "approval-denied"
+
+  for required_text in \
+    "Approval Requested" \
+    "tool shell" \
+    "kind command" \
+    "n = deny it"
+  do
+    grep --fixed-strings -- "$required_text" "$request_capture" >/dev/null 2>&1 \
+      || die "approval request capture missing required text: $required_text"
+  done
+
+  for required_text in \
+    "approval denied" \
+    "decision  deny" \
+    "Ask Octos to change code"
+  do
+    grep --fixed-strings -- "$required_text" "$denied_capture" >/dev/null 2>&1 \
+      || die "approval denied capture missing required text: $required_text"
+  done
+  grep --fixed-strings -- "state" "$denied_capture" >/dev/null 2>&1 \
+    && grep --fixed-strings -- "Done" "$denied_capture" >/dev/null 2>&1 \
+    || die "approval denied capture missing Done status"
+
+  if grep -E 'state ! Blocked|Approval Requested' "$denied_capture" >/dev/null 2>&1; then
+    die "approval denied capture still shows a blocked approval prompt"
+  fi
+  if [ -f "$artifact_dir/validation.json" ] \
+    && ! grep --fixed-strings -- '"status": "passed"' "$artifact_dir/validation.json" >/dev/null 2>&1; then
+    die "approval-denial validation.json is not passed"
+  fi
+
+  write_ux_validation "approval-denial" "passed" "approval denial captures verified"
+  secret_leak_check
+  echo "Verified approval denial artifacts in $artifact_dir"
+}
+
 verify_task_subagent_tree() {
   local running_capture="$artifact_dir/tui-capture-task-subagent-tree-running.txt"
   local final_capture="$artifact_dir/tui-capture-task-subagent-tree-final.txt"
@@ -1438,6 +1479,32 @@ CAPTURE
     die "self-test expected unsupported-method capture verification to fail"
   fi
 
+  mkdir -p "$tmp_root/approval-denial"
+  cat > "$tmp_root/approval-denial/tui-capture-approval-request.txt" <<'CAPTURE'
+Approval Requested inline
+tool shell
+kind command risk low
+n = deny it
+CAPTURE
+  cat > "$tmp_root/approval-denial/tui-capture-approval-denied.txt" <<'CAPTURE'
+approval denied
+decision  deny  decided by coding
+Ask Octos to change code...
+state Done
+CAPTURE
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/approval-denial" "$0" verify-approval-denial >/dev/null
+
+  mkdir -p "$tmp_root/bad-approval-denial"
+  cp "$tmp_root/approval-denial/tui-capture-approval-request.txt" "$tmp_root/bad-approval-denial/"
+  cat > "$tmp_root/bad-approval-denial/tui-capture-approval-denied.txt" <<'CAPTURE'
+Approval Requested inline
+approval denied
+state ! Blocked
+CAPTURE
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-approval-denial" "$0" verify-approval-denial >/dev/null 2>&1; then
+    die "self-test expected blocked approval denial verification to fail"
+  fi
+
   mkdir -p "$tmp_root/task-subagent/m15-evidence"
   cat > "$tmp_root/task-subagent/tui-capture-task-subagent-tree-running.txt" <<'CAPTURE'
 Subagents
@@ -1528,6 +1595,7 @@ case "${1:-help}" in
   verify-first-launch) verify_first_launch ;;
   verify-provider-missing) verify_provider_missing ;;
   verify-permissions) verify_permissions ;;
+  verify-approval-denial) verify_approval_denial ;;
   verify-task-subagent-tree) verify_task_subagent_tree ;;
   api-parity) api_parity ;;
   self-test) self_test ;;

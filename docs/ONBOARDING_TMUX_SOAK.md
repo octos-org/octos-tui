@@ -37,6 +37,7 @@ scripts/run-onboarding-tmux-soak.sh verify-solo
 scripts/run-onboarding-tmux-soak.sh verify-first-launch
 scripts/run-onboarding-tmux-soak.sh verify-provider-missing
 scripts/run-onboarding-tmux-soak.sh verify-permissions
+scripts/run-onboarding-tmux-soak.sh verify-approval-denial
 scripts/run-onboarding-tmux-soak.sh verify-task-subagent-tree
 scripts/run-onboarding-tmux-soak.sh api-parity
 scripts/run-onboarding-tmux-soak.sh self-test
@@ -159,6 +160,26 @@ the server-backed permission menu, `Workspace Write` update acknowledgement,
 and a returned coding-session composer. It fails if the capture is still on
 provider setup or contains AppUI error text.
 
+## Approval Denial
+
+For M9/M19 approval-denial evidence:
+
+```sh
+OCTOS_TUI_SOAK_RUN_ID=approval-denial-$(date -u +%Y%m%dT%H%M%SZ) \
+scripts/run-onboarding-tmux-soak.sh start
+
+OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-approval-denial
+
+OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-approval-denial
+```
+
+`verify-approval-denial` checks the retained request and denied captures for a
+visible shell approval prompt, the deny action, the returned composer, and a
+completed post-denial status. It fails if the final capture still shows a
+blocked approval prompt.
+
 ## Task/Subagent Tree
 
 For M13 supervised task inspection evidence:
@@ -189,6 +210,8 @@ The solo lane writes these M12 artifacts into
 - `tui-capture-provider-missing.txt` when running `drive-provider-missing`
 - `tui-capture-permissions-open.txt` and
   `tui-capture-permissions-applied.txt` when running `drive-permissions`
+- `tui-capture-approval-request.txt` and
+  `tui-capture-approval-denied.txt` when running `drive-approval-denial`
 - `tui-capture-task-subagent-tree-running.txt`,
   `tui-capture-task-subagent-tree-final.txt`, and
   `tui-capture-task-subagent-tree-summary.txt` when running
