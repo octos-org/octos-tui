@@ -257,6 +257,30 @@ the retained capture fails if the UI remains falsely working after a dropped
 `turn/completed` lifecycle notification or if the final composer is hidden.
 It also requires a `protocol/replay_lossy` notification in the transcript.
 
+## Interrupt And Reconnect
+
+For live interrupt and reconnect evidence:
+
+```sh
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-interrupt-reconnect
+
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-interrupt-reconnect
+```
+
+`drive-interrupt-reconnect` starts a long-running prompt, captures the active
+turn, sends `Ctrl-C`, then captures the interrupted state and a post-interrupt
+status/reconnect pane. In WebSocket mode it restarts the backend before the
+final capture.
+
+`verify-interrupt-reconnect` checks
+`tui-capture-interrupt-running.txt`, `tui-capture-interrupt.txt`,
+`tui-capture-interrupt-reconnect.txt`, and `appui-transcript.jsonl`. The
+verifier requires an active-turn capture, a visible interrupt/cancel
+acknowledgement, a usable composer after recovery, a client `turn/interrupt`
+request, and session hydration/status evidence.
+
 ## M19 UX Run Bundle
 
 For M19 runner-owned artifacts, set `OCTOS_TUI_SOAK_ARTIFACT_DIR` to the
@@ -285,6 +309,9 @@ The solo lane writes these M12 artifacts into
   `tui-capture-permissions-applied.txt` when running `drive-permissions`
 - `tui-capture-approval-request.txt` and
   `tui-capture-approval-denied.txt` when running `drive-approval-denial`
+- `tui-capture-interrupt-running.txt`, `tui-capture-interrupt.txt`, and
+  `tui-capture-interrupt-reconnect.txt` when running
+  `drive-interrupt-reconnect`
 - `tui-capture-task-subagent-tree-running.txt`,
   `tui-capture-task-subagent-tree-final.txt`, and
   `tui-capture-task-subagent-tree-summary.txt` when running
