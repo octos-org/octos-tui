@@ -39,6 +39,7 @@ scripts/run-onboarding-tmux-soak.sh verify-provider-missing
 scripts/run-onboarding-tmux-soak.sh verify-permissions
 scripts/run-onboarding-tmux-soak.sh verify-approval-denial
 scripts/run-onboarding-tmux-soak.sh verify-task-subagent-tree
+scripts/run-onboarding-tmux-soak.sh verify-ux-run
 scripts/run-onboarding-tmux-soak.sh api-parity
 scripts/run-onboarding-tmux-soak.sh self-test
 scripts/run-onboarding-tmux-soak.sh solo-self-test
@@ -200,6 +201,23 @@ captures for visible subagent/artifact output, the final review marker, and a
 usable composer. It also checks the retained transcript/ledger evidence and
 fails if the TUI issued client-owned `task/spawn`, `task/send`, or `task/join`
 calls in the normal backend-supervised review flow.
+
+## M19 UX Run Bundle
+
+For M19 runner-owned artifacts, set `OCTOS_TUI_SOAK_ARTIFACT_DIR` to the
+scenario directory and run:
+
+```sh
+OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-ux/<run-id>/<scenario-id> \
+scripts/run-onboarding-tmux-soak.sh verify-ux-run
+```
+
+`verify-ux-run` checks the M19 `scenario.json`, `summary.json`,
+`validation.json`, `terminal-size.json`, `appui-transcript.jsonl`,
+`runtime-policy-stamp.json`, `server.log`, and `tui-capture.txt` bundle. It
+requires a passed real-tmux summary, passed validation, declared terminal
+geometry with the M19 `screen_geometry_consistent` validator, core AppUI
+session methods, and a visible composer/status line.
 
 The solo lane writes these M12 artifacts into
 `e2e/test-results-tui-onboarding/<run-id>/`:
