@@ -441,68 +441,20 @@ impl Store {
                     },
                 ))
             }
-            GoalCommand::Pause => {
-                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_SET)
-                {
-                    return None;
-                }
-                let goal = match self.cached_goal_for_transition(&session_id) {
-                    Ok(goal) => goal,
-                    Err(None) => {
-                        self.state.status =
-                            "Cannot pause: no goal cached. Run /goal to refresh first.".into();
-                        return None;
-                    }
-                    Err(Some(status)) => {
-                        self.state.status =
-                            format!("Cannot pause goal in `{status}` state (model-owned).");
-                        return None;
-                    }
-                };
-                self.state.status = "Pausing goal".into();
-                Some(AppUiCommand::SetSessionGoal(
-                    crate::model::SessionGoalSetParams {
-                        session_id,
-                        profile_id,
-                        objective: goal.objective,
-                        status: Some("paused".into()),
-                        token_budget: None,
-                        transition_actor: Some("user".into()),
-                        action: crate::model::SessionGoalSetAction::Pause,
-                    },
-                ))
-            }
-            GoalCommand::Resume => {
-                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_SET)
-                {
-                    return None;
-                }
-                let goal = match self.cached_goal_for_transition(&session_id) {
-                    Ok(goal) => goal,
-                    Err(None) => {
-                        self.state.status =
-                            "Cannot resume: no goal cached. Run /goal to refresh first.".into();
-                        return None;
-                    }
-                    Err(Some(status)) => {
-                        self.state.status =
-                            format!("Cannot resume goal in `{status}` state (model-owned).");
-                        return None;
-                    }
-                };
-                self.state.status = "Resuming goal".into();
-                Some(AppUiCommand::SetSessionGoal(
-                    crate::model::SessionGoalSetParams {
-                        session_id,
-                        profile_id,
-                        objective: goal.objective,
-                        status: Some("active".into()),
-                        token_budget: None,
-                        transition_actor: Some("user".into()),
-                        action: crate::model::SessionGoalSetAction::Resume,
-                    },
-                ))
-            }
+            GoalCommand::Pause => self.start_goal_transition(
+                session_id,
+                profile_id,
+                "paused",
+                crate::model::SessionGoalSetAction::Pause,
+                "pause",
+            ),
+            GoalCommand::Resume => self.start_goal_transition(
+                session_id,
+                profile_id,
+                "active",
+                crate::model::SessionGoalSetAction::Resume,
+                "resume",
+            ),
             GoalCommand::Clear => {
                 if !self
                     .require_mutating_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_CLEAR)
@@ -644,6 +596,62 @@ impl Store {
             "active" | "paused" | "budget_limited" => Ok(goal),
             other => Err(Some(other.to_string())),
         }
+    }
+
+    /// Shared `/goal pause` / `/goal resume` entry. To avoid sending a
+    /// stale cached objective on transition (the cached mirror can drift
+    /// between explicit refreshes), this stages the desired status in
+    /// `pending_goal_transition` and emits a `session/goal/get`. When
+    /// the `GoalGet` response arrives, [`Self::apply_autonomy_result`]
+    /// emits the follow-up `session/goal/set` with the freshly-fetched
+    /// objective + staged status. The model-owned `complete` guard is
+    /// still enforced up front using the cached mirror so the TUI fails
+    /// fast on a clearly invalid transition without a round-trip.
+    fn start_goal_transition(
+        &mut self,
+        session_id: SessionKey,
+        profile_id: Option<String>,
+        status: &'static str,
+        action: crate::model::SessionGoalSetAction,
+        verb: &str,
+    ) -> Option<AppUiCommand> {
+        if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_SET) {
+            return None;
+        }
+        match self.cached_goal_for_transition(&session_id) {
+            Ok(_) => {}
+            Err(None) => {
+                self.state.status =
+                    format!("Cannot {verb}: no goal cached. Run /goal to refresh first.");
+                return None;
+            }
+            Err(Some(state)) => {
+                self.state.status = format!("Cannot {verb} goal in `{state}` state (model-owned).");
+                return None;
+            }
+        }
+        // `session/goal/get` is the precondition for the follow-up set.
+        // If the server advertised set but not get, the TUI cannot do
+        // the refresh dance — fall back to "no transition" and let the
+        // user re-issue `/goal <objective>` explicitly.
+        if !self.require_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_GET) {
+            self.state.status =
+                format!("Cannot {verb}: backend does not advertise session/goal/get for refresh.");
+            return None;
+        }
+        self.state.pending_goal_transition = Some(crate::model::PendingGoalTransition {
+            session_id: session_id.clone(),
+            profile_id: profile_id.clone(),
+            status,
+            action,
+        });
+        self.state.status = format!("Refreshing goal before {verb}");
+        Some(AppUiCommand::GetSessionGoal(
+            crate::model::SessionGoalGetParams {
+                session_id,
+                profile_id,
+            },
+        ))
     }
 
     fn dispatch_command_entry(
@@ -3189,10 +3197,7 @@ impl Store {
                 self.refresh_active_menu_if_open();
                 self.tool_config_list_command()
             }
-            ClientEvent::Autonomy(event) => {
-                self.apply_autonomy_result(event);
-                None
-            }
+            ClientEvent::Autonomy(event) => self.apply_autonomy_result(event),
         }
     }
 
@@ -3201,7 +3206,16 @@ impl Store {
     /// notification handler in [`Self::apply_notification`]; the
     /// mirror stays consistent whether updates arrive as a response
     /// or as a server-pushed notification.
-    fn apply_autonomy_result(&mut self, event: crate::client_event::AutonomyClientEvent) {
+    ///
+    /// Returns an optional follow-up command. Today only the `GoalGet`
+    /// branch produces one — when a pause/resume is pending (see
+    /// [`Self::start_goal_transition`]), the freshly-fetched goal
+    /// objective is forwarded as a `session/goal/set` so the backend
+    /// receives server truth, not a possibly-stale cached mirror.
+    fn apply_autonomy_result(
+        &mut self,
+        event: crate::client_event::AutonomyClientEvent,
+    ) -> Option<AppUiCommand> {
         use crate::client_event::AutonomyResult;
         match event.result {
             AutonomyResult::AgentList(result) => {
@@ -3259,8 +3273,13 @@ impl Store {
                     Some(goal) => format!("Goal {}: {}", goal.status, goal.objective),
                     None => "No active goal".into(),
                 };
+                let fresh_goal = result.goal.clone();
                 self.state.set_session_goal(&session_id, result.goal, None);
                 self.state.status = summary;
+                // Pause/resume staged a transition before the refresh.
+                // Consume it now with the freshly-fetched objective so
+                // the backend never receives a stale cached mirror.
+                return self.consume_pending_goal_transition(&session_id, fresh_goal.as_ref());
             }
             AutonomyResult::GoalSet(result) => {
                 let session_id = result.session_id.clone();
@@ -3281,6 +3300,11 @@ impl Store {
                 } else {
                     self.state.status = "Goal clear rejected".into();
                 }
+                // Goal cleared / clear-rejected: a previously-staged
+                // pause/resume against this session no longer makes
+                // sense. Drop it so a later `/goal pause` cannot fire
+                // an orphan transition.
+                self.discard_pending_goal_transition_for(&result.session_id);
             }
             AutonomyResult::LoopCreate(result) => {
                 let loop_id = result.loop_state.loop_id.clone();
@@ -3327,6 +3351,70 @@ impl Store {
                     if result.ok { "accepted" } else { "rejected" }
                 );
             }
+        }
+        None
+    }
+
+    /// Consume a staged pause/resume transition with the freshly-fetched
+    /// goal record. Returns the follow-up `session/goal/set` command, or
+    /// `None` if there is no matching pending transition, if the goal
+    /// vanished server-side, or if the fresh goal status is no longer
+    /// transitionable (e.g. the model marked it complete between dispatch
+    /// and refresh).
+    fn consume_pending_goal_transition(
+        &mut self,
+        session_id: &SessionKey,
+        fresh_goal: Option<&octos_core::ui_protocol::UiGoalRecord>,
+    ) -> Option<AppUiCommand> {
+        let pending = self.state.pending_goal_transition.as_ref()?;
+        if &pending.session_id != session_id {
+            return None;
+        }
+        let pending = self.state.pending_goal_transition.take()?;
+        let goal = match fresh_goal {
+            Some(goal) => goal,
+            None => {
+                self.state.status = "Cannot transition: server reports no goal.".into();
+                return None;
+            }
+        };
+        if !matches!(goal.status.as_str(), "active" | "paused" | "budget_limited") {
+            self.state.status = format!(
+                "Cannot transition goal in `{}` state (model-owned).",
+                goal.status
+            );
+            return None;
+        }
+        let verb = match pending.action {
+            crate::model::SessionGoalSetAction::Pause => "Pausing",
+            crate::model::SessionGoalSetAction::Resume => "Resuming",
+            crate::model::SessionGoalSetAction::Set => "Updating",
+        };
+        self.state.status = format!("{verb} goal");
+        Some(AppUiCommand::SetSessionGoal(
+            crate::model::SessionGoalSetParams {
+                session_id: pending.session_id,
+                profile_id: pending.profile_id,
+                objective: goal.objective.clone(),
+                status: Some(pending.status.into()),
+                token_budget: None,
+                transition_actor: Some("user".into()),
+                action: pending.action,
+            },
+        ))
+    }
+
+    /// Drop any staged pause/resume that targeted the given session.
+    /// Used when the goal is cleared (so a stale transition cannot fire
+    /// against a non-existent goal).
+    fn discard_pending_goal_transition_for(&mut self, session_id: &SessionKey) {
+        if self
+            .state
+            .pending_goal_transition
+            .as_ref()
+            .is_some_and(|pending| &pending.session_id == session_id)
+        {
+            self.state.pending_goal_transition = None;
         }
     }
 
@@ -10588,10 +10676,13 @@ mod tests {
     }
 
     #[test]
-    fn goal_pause_with_cached_goal_emits_paused_status() {
+    fn goal_pause_refreshes_via_goal_get_first() {
+        // Audit follow-up: pause/resume must NOT forward a cached
+        // objective straight to the backend — the cached mirror can
+        // drift. The dispatch issues `session/goal/get` first; the
+        // staged transition fires from the response handler.
         let mut store = protocol_store_with_autonomy();
         let session_id = SessionKey("local:test".into());
-        // Seed the mirror so pause has an objective to forward.
         store.state.set_session_goal(
             &session_id,
             Some(octos_core::ui_protocol::UiGoalRecord {
@@ -10609,13 +10700,20 @@ mod tests {
         );
         store.state.composer = "/goal pause".into();
         match store.compose_command().expect("dispatch") {
-            AppUiCommand::SetSessionGoal(params) => {
-                assert_eq!(params.action, crate::model::SessionGoalSetAction::Pause);
-                assert_eq!(params.status.as_deref(), Some("paused"));
-                assert_eq!(params.objective, "ongoing work");
+            AppUiCommand::GetSessionGoal(params) => {
+                assert_eq!(params.session_id, session_id);
+                assert_eq!(params.profile_id.as_deref(), Some("coding"));
             }
-            other => panic!("expected SetSessionGoal Pause, got {other:?}"),
+            other => panic!("expected GetSessionGoal, got {other:?}"),
         }
+        let pending = store
+            .state
+            .pending_goal_transition
+            .as_ref()
+            .expect("pause stages a transition");
+        assert_eq!(pending.session_id, session_id);
+        assert_eq!(pending.status, "paused");
+        assert_eq!(pending.action, crate::model::SessionGoalSetAction::Pause);
     }
 
     #[test]
@@ -10690,7 +10788,7 @@ mod tests {
     }
 
     #[test]
-    fn goal_resume_with_cached_goal_emits_active_status() {
+    fn goal_resume_refreshes_via_goal_get_first() {
         let mut store = protocol_store_with_autonomy();
         let session_id = SessionKey("local:test".into());
         store.state.set_session_goal(
@@ -10710,13 +10808,212 @@ mod tests {
         );
         store.state.composer = "/goal resume".into();
         match store.compose_command().expect("dispatch") {
-            AppUiCommand::SetSessionGoal(params) => {
-                assert_eq!(params.action, crate::model::SessionGoalSetAction::Resume);
-                assert_eq!(params.status.as_deref(), Some("active"));
-                assert_eq!(params.objective, "ongoing work");
+            AppUiCommand::GetSessionGoal(params) => {
+                assert_eq!(params.session_id, session_id);
             }
-            other => panic!("expected SetSessionGoal Resume, got {other:?}"),
+            other => panic!("expected GetSessionGoal, got {other:?}"),
         }
+        let pending = store
+            .state
+            .pending_goal_transition
+            .as_ref()
+            .expect("resume stages a transition");
+        assert_eq!(pending.status, "active");
+        assert_eq!(pending.action, crate::model::SessionGoalSetAction::Resume);
+    }
+
+    #[test]
+    fn goal_pause_carries_server_objective_not_stale_cache() {
+        // Audit follow-up: when the cached mirror has drifted (local
+        // says "X", server says "Y"), the pause/resume transition must
+        // forward server truth — not the stale cache — to the backend.
+        // Otherwise the set call would silently overwrite the server's
+        // current objective with the TUI's outdated copy.
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+
+        // Cache holds the stale "X".
+        let stale_goal = octos_core::ui_protocol::UiGoalRecord {
+            profile_id: Some("coding".into()),
+            goal_id: "goal_01".into(),
+            objective: "X (stale cache)".into(),
+            status: "active".into(),
+            token_budget: 1000,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        store
+            .state
+            .set_session_goal(&session_id, Some(stale_goal), Some("user".into()));
+
+        // User issues /goal pause — dispatch returns `session/goal/get`
+        // (not `session/goal/set`), and stages the transition.
+        store.state.composer = "/goal pause".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::GetSessionGoal(_) => {}
+            other => panic!("pause should refresh first, got {other:?}"),
+        }
+
+        // Server responds with the FRESH objective "Y" (the cache has
+        // drifted — what the server actually has on file).
+        let fresh_goal = octos_core::ui_protocol::UiGoalRecord {
+            profile_id: Some("coding".into()),
+            goal_id: "goal_01".into(),
+            objective: "Y (server truth)".into(),
+            status: "active".into(),
+            token_budget: 1000,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            created_at_ms: 1,
+            updated_at_ms: 7,
+        };
+        let follow_up = store
+            .apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+                result: AutonomyResult::GoalGet(crate::model::SessionGoalGetResult {
+                    session_id: session_id.clone(),
+                    profile_id: Some("coding".into()),
+                    goal: Some(fresh_goal),
+                }),
+            }))
+            .expect("goal_get response triggers the staged transition");
+
+        // The follow-up must be `session/goal/set` carrying SERVER's
+        // "Y", NOT the cached "X".
+        match follow_up {
+            AppUiCommand::SetSessionGoal(params) => {
+                assert_eq!(
+                    params.objective, "Y (server truth)",
+                    "pause must forward refreshed server objective, not stale cache"
+                );
+                assert_eq!(params.status.as_deref(), Some("paused"));
+                assert_eq!(params.action, crate::model::SessionGoalSetAction::Pause);
+            }
+            other => panic!("expected SetSessionGoal follow-up, got {other:?}"),
+        }
+        // Pending transition is consumed.
+        assert!(store.state.pending_goal_transition.is_none());
+    }
+
+    #[test]
+    fn goal_pause_aborts_when_refresh_returns_complete_status() {
+        // If the server reports the goal is now `complete` between
+        // dispatch and refresh, the staged pause must abort — the TUI
+        // never reactivates a model-completed goal.
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+
+        store.state.set_session_goal(
+            &session_id,
+            Some(octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some("coding".into()),
+                goal_id: "g".into(),
+                objective: "ongoing".into(),
+                status: "active".into(),
+                token_budget: 1000,
+                tokens_used: 0,
+                time_used_seconds: 0,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }),
+            Some("user".into()),
+        );
+        store.state.composer = "/goal pause".into();
+        let _ = store.compose_command().expect("dispatch get");
+
+        // Server's refresh shows the model marked the goal complete
+        // while the user was typing.
+        let follow_up = store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::GoalGet(crate::model::SessionGoalGetResult {
+                session_id: session_id.clone(),
+                profile_id: Some("coding".into()),
+                goal: Some(octos_core::ui_protocol::UiGoalRecord {
+                    profile_id: Some("coding".into()),
+                    goal_id: "g".into(),
+                    objective: "ongoing".into(),
+                    status: "complete".into(),
+                    token_budget: 1000,
+                    tokens_used: 1000,
+                    time_used_seconds: 1,
+                    created_at_ms: 1,
+                    updated_at_ms: 9,
+                }),
+            }),
+        }));
+        assert!(
+            follow_up.is_none(),
+            "must not fire pause against a complete goal"
+        );
+        assert!(store.state.pending_goal_transition.is_none());
+        assert!(
+            store.state.status.to_lowercase().contains("complete"),
+            "expected complete-state diagnostic, got: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn goal_pause_aborts_when_refresh_reports_no_goal() {
+        // If the goal vanished between dispatch and refresh (cleared,
+        // expired, etc.), there is nothing to pause — the staged
+        // transition must be dropped silently.
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+
+        store.state.set_session_goal(
+            &session_id,
+            Some(octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some("coding".into()),
+                goal_id: "g".into(),
+                objective: "ongoing".into(),
+                status: "active".into(),
+                token_budget: 1000,
+                tokens_used: 0,
+                time_used_seconds: 0,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }),
+            Some("user".into()),
+        );
+        store.state.composer = "/goal pause".into();
+        let _ = store.compose_command().expect("dispatch get");
+
+        let follow_up = store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::GoalGet(crate::model::SessionGoalGetResult {
+                session_id: session_id.clone(),
+                profile_id: Some("coding".into()),
+                goal: None,
+            }),
+        }));
+        assert!(follow_up.is_none());
+        assert!(store.state.pending_goal_transition.is_none());
+    }
+
+    #[test]
+    fn goal_clear_drops_any_pending_goal_transition() {
+        // A staged pause/resume against this session no longer makes
+        // sense once the goal is cleared.
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.state.pending_goal_transition = Some(crate::model::PendingGoalTransition {
+            session_id: session_id.clone(),
+            profile_id: Some("coding".into()),
+            status: "paused",
+            action: crate::model::SessionGoalSetAction::Pause,
+        });
+        let _ = store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::GoalClear(crate::model::SessionGoalClearResult {
+                session_id,
+                cleared: true,
+                transition_actor: Some("user".into()),
+            }),
+        }));
+        assert!(store.state.pending_goal_transition.is_none());
     }
 
     #[test]

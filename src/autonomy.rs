@@ -6,14 +6,27 @@
 //! `session/goal/set`, `loop/create`, …) is wired in a later PR once
 //! the backend exposes those AppUI methods.
 //!
-//! Contract reference: octos-tui#47 (M15-E) and
-//! `docs/M15_AGENT_GOAL_LOOP_TUI_CONTRACT.md`. The TUI must never:
+//! Contract reference: octos-tui#47 (M15-E) and upstream
+//! `UPCR-2026-021` (Agent / Goal / Loop autonomy). The canonical spec
+//! lives at
+//! `octos/docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_021_AGENT_GOAL_LOOP_AUTONOMY.md`
+//! in the upstream octos repo. The earlier
+//! `docs/M15_AGENT_GOAL_LOOP_TUI_CONTRACT.md` working title was never
+//! landed — reference UPCR-2026-021 directly instead. The TUI must never:
 //!
 //! - Probe these methods on servers that did not advertise
 //!   [`super::model::APPUI_FEATURE_CODING_AUTONOMY_V1`].
 //! - Schedule timers locally for `/loop`. Loop firing is backend-owned.
 //! - Invent default intervals; if the user did not supply one, the
 //!   parsed intent records "self-paced" and the backend decides.
+//!
+//! Menu surface: `/agents`, `/goal`, and `/loop` are currently
+//! discoverable only via slash entry. A menu-surface wrapper (the
+//! sub-menu shape sketched in #74 acceptance criterion 2) is deferred
+//! to M15-F UX work — no other autonomy slash commands have menu
+//! surfaces today, so adding one in isolation here would create an
+//! inconsistent UX. Tracking issue: octos-tui#74 (acceptance criterion
+//! #2 — `Add menu entries in src/menu/providers.rs`).
 
 use std::time::Duration;
 
