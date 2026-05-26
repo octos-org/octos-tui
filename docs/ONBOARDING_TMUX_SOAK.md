@@ -34,6 +34,7 @@ scripts/run-onboarding-tmux-soak.sh capture
 scripts/run-onboarding-tmux-soak.sh send-turn
 scripts/run-onboarding-tmux-soak.sh verify
 scripts/run-onboarding-tmux-soak.sh verify-solo
+scripts/run-onboarding-tmux-soak.sh verify-first-launch
 scripts/run-onboarding-tmux-soak.sh api-parity
 scripts/run-onboarding-tmux-soak.sh self-test
 scripts/run-onboarding-tmux-soak.sh solo-self-test
@@ -101,12 +102,17 @@ OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE=1 \
 OCTOS_TUI_SOAK_TRANSPORT=stdio \
 OCTOS_TUI_SOAK_RUN_ID=first-launch-$(date -u +%Y%m%dT%H%M%SZ) \
 scripts/run-onboarding-tmux-soak.sh start
+
+OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-first-launch
 ```
 
 This mode is intentionally opt-in. It starts the TUI without a preselected
 profile or session, refuses to reuse an existing profile JSON, waits for the
 `Welcome to Octos` onboarding surface, and writes
-`tui-capture-first-launch.txt` beside the regular `tui-capture.txt`. Use it
+`tui-capture-first-launch.txt` beside the regular `tui-capture.txt`.
+`verify-first-launch` checks the retained capture for the local profile splash,
+the `OCTOS` wordmark, and absence of OTP/setup-provider text. Use this lane
 when collecting M22/M19 evidence for the first-launch splash; keep the default
 launch shape for provider-missing and coding-session lanes.
 

@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|verify-first-launch|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -1074,6 +1074,40 @@ verify_solo() {
   echo "Verified M12 solo soak artifacts in $artifact_dir"
 }
 
+verify_first_launch() {
+  local capture_file="$artifact_dir/tui-capture-first-launch.txt"
+  [ -f "$capture_file" ] || die "first-launch capture missing: $capture_file"
+
+  if [ -f "$artifact_dir/summary.env" ] \
+    && ! grep --fixed-strings -- "first_launch_capture=1" "$artifact_dir/summary.env" >/dev/null 2>&1; then
+    die "summary.env does not record first_launch_capture=1"
+  fi
+
+  for required_text in \
+    "Welcome to Octos" \
+    "Create your local Octos profile" \
+    "OCTOS"
+  do
+    grep --fixed-strings -- "$required_text" "$capture_file" >/dev/null 2>&1 \
+      || die "first-launch capture missing required text: $required_text"
+  done
+
+  if grep --fixed-strings -- "Set Up LLM Provider" "$capture_file" >/dev/null 2>&1; then
+    die "first-launch capture advanced past the local profile splash"
+  fi
+
+  if grep -E 'auth/(send_code|verify)|Email OTP' "$capture_file" >/dev/null 2>&1; then
+    die "first-launch capture contains OTP onboarding text"
+  fi
+  if [ -f "$artifact_dir/server.log" ] \
+    && grep -E 'auth/(send_code|verify)' "$artifact_dir/server.log" >/dev/null 2>&1; then
+    die "first-launch server log contains OTP method traffic"
+  fi
+
+  secret_leak_check
+  echo "Verified first-launch onboarding splash in $artifact_dir"
+}
+
 self_test_solo() {
   local probe="$octos_repo/scripts/m12-solo-appui-soak.sh"
   [ -x "$probe" ] || die "M12 solo soak wrapper missing or not executable: $probe"
@@ -1131,6 +1165,23 @@ JSON
   [ -f "$tmp_root/artifacts/runtime-policy-stamp.json" ] || die "self-test missing runtime-policy-stamp.json"
   [ -f "$tmp_root/artifacts/soak-summary.json" ] || die "self-test missing soak-summary.json"
   [ -f "$tmp_root/artifacts/api-parity-checklist.json" ] || die "self-test missing api-parity-checklist.json"
+  printf 'first_launch_capture=1\n' >> "$tmp_root/artifacts/summary.env"
+  cat > "$tmp_root/artifacts/tui-capture-first-launch.txt" <<'CAPTURE'
+Welcome to Octos
+Set up a local solo profile to continue.
+> Create your local Octos profile - This stays on this machine; no email OTP is sent.
+OCTOS
+Welcome to Octos - local solo onboarding
+CAPTURE
+  env "${child_env[@]}" "$0" verify-first-launch >/dev/null
+
+  mkdir -p "$tmp_root/bad-first-launch"
+  printf 'first_launch_capture=1\n' > "$tmp_root/bad-first-launch/summary.env"
+  printf 'Set Up LLM Provider\n' > "$tmp_root/bad-first-launch/tui-capture-first-launch.txt"
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-first-launch" "$0" verify-first-launch >/dev/null 2>&1; then
+    die "self-test expected bad first-launch capture verification to fail"
+  fi
+
   while IFS= read -r -d '' file; do
     if grep --fixed-strings -- "selftest-secret" "$file" >/dev/null 2>&1; then
       die "self-test secret leaked into artifacts: $file"
@@ -1168,6 +1219,7 @@ case "${1:-help}" in
   send-turn) send_turn ;;
   verify) verify ;;
   verify-solo) verify_solo ;;
+  verify-first-launch) verify_first_launch ;;
   api-parity) api_parity ;;
   self-test) self_test ;;
   solo-self-test) self_test_solo ;;
