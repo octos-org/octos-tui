@@ -285,10 +285,17 @@ For the reconnect/hydration leg, retain `server-pane-after-restart.txt`,
 ledgers, then run:
 
 ```sh
+OCTOS_TUI_SOAK_TRANSPORT=ws \
+OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-autonomy-reconnect
+
 OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-autonomy-reconnect
 ```
 
+`drive-autonomy-reconnect` restarts the WebSocket backend, re-requests
+`/agents list`, `/goal`, and `/loop list`, and writes
+`tui-capture-autonomy-reconnect.txt` as an aggregate of the hydration captures.
 `verify-autonomy-reconnect` checks that the restarted run visibly rehydrates
 agent, goal, and loop state; that the transcript issues `session/open`,
 `agent/list`, `session/goal/get`, and `loop/list`; and that agent/goal/loop

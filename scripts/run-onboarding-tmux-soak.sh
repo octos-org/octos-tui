@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-autonomy-live|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-autonomy-live|drive-autonomy-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -1384,6 +1384,67 @@ drive_autonomy_live() {
 
   capture
   echo "Drove M15 autonomy live flow in $tui_session"
+}
+
+drive_autonomy_reconnect() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-autonomy-reconnect"
+  if [ "$transport" != "ws" ]; then
+    die "drive-autonomy-reconnect requires OCTOS_TUI_SOAK_TRANSPORT=ws"
+  fi
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  restart_server
+  wait_for_tui_text "UI protocol reconnected|Ask Octos to change code|state" \
+    "${OCTOS_TUI_SOAK_RECONNECT_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI to settle after autonomy backend restart"
+
+  send_tui_line "/agents list"
+  wait_for_tui_text "Agent|agent|agent/list" "${OCTOS_TUI_SOAK_AUTONOMY_AGENT_WAIT_SECS:-20}" || \
+    die "Timed out waiting for reconnect agent hydration evidence in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-reconnect-agents.txt"
+
+  send_tui_line "/goal"
+  wait_for_tui_text "Goal|goal|session/goal" "${OCTOS_TUI_SOAK_AUTONOMY_GOAL_WAIT_SECS:-20}" || \
+    die "Timed out waiting for reconnect goal hydration evidence in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-reconnect-goal.txt"
+
+  send_tui_line "/loop list"
+  wait_for_tui_text "Loop|loop|loop/list" "${OCTOS_TUI_SOAK_AUTONOMY_LOOP_WAIT_SECS:-20}" || \
+    die "Timed out waiting for reconnect loop hydration evidence in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-reconnect-loops.txt"
+
+  local aggregate_capture="$artifact_dir/tui-capture-autonomy-reconnect.txt"
+  : > "$aggregate_capture"
+  local step_capture
+  for step_capture in \
+    "$artifact_dir/tui-capture-autonomy-reconnect-agents.txt" \
+    "$artifact_dir/tui-capture-autonomy-reconnect-goal.txt" \
+    "$artifact_dir/tui-capture-autonomy-reconnect-loops.txt"
+  do
+    [ -f "$step_capture" ] || continue
+    printf '\n== %s ==\n' "$(basename "$step_capture")" >> "$aggregate_capture"
+    cat "$step_capture" >> "$aggregate_capture"
+  done
+  [ -s "$aggregate_capture" ] || die "M15 autonomy reconnect aggregate capture was not written"
+
+  if [ -n "${OCTOS_TUI_M15_UX_OUTPUT_DIR:-}" ] && [ -d "$OCTOS_TUI_M15_UX_OUTPUT_DIR" ]; then
+    local m15_source_abs
+    local m15_dest_abs
+    m15_source_abs="$(cd "$OCTOS_TUI_M15_UX_OUTPUT_DIR" && pwd -P)"
+    mkdir -p "$artifact_dir/m15-evidence"
+    m15_dest_abs="$(cd "$artifact_dir/m15-evidence" && pwd -P)"
+    case "$m15_dest_abs/" in
+      "$m15_source_abs"/*|"$m15_source_abs/")
+        die "Refusing recursive M15 evidence copy from $m15_source_abs to $m15_dest_abs"
+        ;;
+    esac
+    cp -R "$m15_source_abs"/. "$m15_dest_abs"/
+  fi
+
+  capture
+  echo "Drove M15 autonomy reconnect capture in $tui_session"
 }
 
 drive_dropped_completion_backpressure() {
@@ -3299,6 +3360,7 @@ case "${1:-help}" in
   drive-task-subagent-tree) drive_task_subagent_tree ;;
   drive-task-subagent-reconnect) drive_task_subagent_reconnect ;;
   drive-autonomy-live) drive_autonomy_live ;;
+  drive-autonomy-reconnect) drive_autonomy_reconnect ;;
   drive-dropped-completion-backpressure) drive_dropped_completion_backpressure ;;
   drive-interrupt-reconnect) drive_interrupt_reconnect ;;
   drive-validator-cycle) drive_validator_cycle ;;
