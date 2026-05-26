@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|verify-first-launch|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -1108,6 +1108,38 @@ verify_first_launch() {
   echo "Verified first-launch onboarding splash in $artifact_dir"
 }
 
+verify_provider_missing() {
+  local capture_file="$artifact_dir/tui-capture-provider-missing.txt"
+  [ -f "$capture_file" ] || die "provider-missing capture missing: $capture_file"
+
+  for required_text in \
+    "Set Up LLM Provider" \
+    "Profile:" \
+    "Local profile ready" \
+    "API key"
+  do
+    grep --fixed-strings -- "$required_text" "$capture_file" >/dev/null 2>&1 \
+      || die "provider-missing capture missing required text: $required_text"
+  done
+
+  grep -E '(Load|Reload) provider catalog' "$capture_file" >/dev/null 2>&1 \
+    || die "provider-missing capture missing provider catalog action"
+
+  if grep --fixed-strings -- "Welcome to Octos" "$capture_file" >/dev/null 2>&1; then
+    die "provider-missing capture is still on the first-launch splash"
+  fi
+  if grep --fixed-strings -- "Ask Octos to change code" "$capture_file" >/dev/null 2>&1; then
+    die "provider-missing capture already opened a coding session"
+  fi
+  if grep -E 'auth/(send_code|verify)|Email OTP|Task Error|app-ui error|malformed_json' \
+    "$capture_file" >/dev/null 2>&1; then
+    die "provider-missing capture contains onboarding or AppUI error text"
+  fi
+
+  secret_leak_check
+  echo "Verified provider-missing onboarding recovery in $artifact_dir"
+}
+
 self_test_solo() {
   local probe="$octos_repo/scripts/m12-solo-appui-soak.sh"
   [ -x "$probe" ] || die "M12 solo soak wrapper missing or not executable: $probe"
@@ -1182,6 +1214,20 @@ CAPTURE
     die "self-test expected bad first-launch capture verification to fail"
   fi
 
+  cat > "$tmp_root/artifacts/tui-capture-provider-missing.txt" <<'CAPTURE'
+Set Up LLM Provider
+> Profile: coding - Local profile ready
+Load provider catalog - Load dashboard model families and provider routes
+API key: not set
+CAPTURE
+  env "${child_env[@]}" "$0" verify-provider-missing >/dev/null
+
+  mkdir -p "$tmp_root/bad-provider-missing"
+  printf 'Welcome to Octos\n' > "$tmp_root/bad-provider-missing/tui-capture-provider-missing.txt"
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-provider-missing" "$0" verify-provider-missing >/dev/null 2>&1; then
+    die "self-test expected bad provider-missing capture verification to fail"
+  fi
+
   while IFS= read -r -d '' file; do
     if grep --fixed-strings -- "selftest-secret" "$file" >/dev/null 2>&1; then
       die "self-test secret leaked into artifacts: $file"
@@ -1220,6 +1266,7 @@ case "${1:-help}" in
   verify) verify ;;
   verify-solo) verify_solo ;;
   verify-first-launch) verify_first_launch ;;
+  verify-provider-missing) verify_provider_missing ;;
   api-parity) api_parity ;;
   self-test) self_test ;;
   solo-self-test) self_test_solo ;;

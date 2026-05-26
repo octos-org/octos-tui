@@ -35,6 +35,7 @@ scripts/run-onboarding-tmux-soak.sh send-turn
 scripts/run-onboarding-tmux-soak.sh verify
 scripts/run-onboarding-tmux-soak.sh verify-solo
 scripts/run-onboarding-tmux-soak.sh verify-first-launch
+scripts/run-onboarding-tmux-soak.sh verify-provider-missing
 scripts/run-onboarding-tmux-soak.sh api-parity
 scripts/run-onboarding-tmux-soak.sh self-test
 scripts/run-onboarding-tmux-soak.sh solo-self-test
@@ -116,12 +117,32 @@ the `OCTOS` wordmark, and absence of OTP/setup-provider text. Use this lane
 when collecting M22/M19 evidence for the first-launch splash; keep the default
 launch shape for provider-missing and coding-session lanes.
 
+Missing-provider recovery capture:
+
+```sh
+OCTOS_TUI_SOAK_TRANSPORT=stdio \
+OCTOS_TUI_SOAK_RUN_ID=provider-missing-$(date -u +%Y%m%dT%H%M%SZ) \
+scripts/run-onboarding-tmux-soak.sh start
+
+OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-provider-missing
+
+OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-provider-missing
+```
+
+`verify-provider-missing` checks `tui-capture-provider-missing.txt` for the
+provider setup recovery screen, local profile readiness, provider catalog
+action, and API-key row. It fails if the capture is still on the first-launch
+splash, has already opened a coding session, or contains OTP/AppUI error text.
+
 The solo lane writes these M12 artifacts into
 `e2e/test-results-tui-onboarding/<run-id>/`:
 
 - `tui-capture.txt`
 - `tui-capture-first-launch.txt` when
   `OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE=1`
+- `tui-capture-provider-missing.txt` when running `drive-provider-missing`
 - `server.log`
 - `appui-transcript.jsonl`
 - `runtime-policy-stamp.json`
