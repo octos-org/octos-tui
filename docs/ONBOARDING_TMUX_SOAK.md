@@ -280,6 +280,20 @@ if production evidence is still deterministic fixture text, if agent/goal/loop
 notifications appear to come from the TUI as client traffic, or if the capture
 does not visibly show agent, goal, loop, and final summary state.
 
+For the reconnect/hydration leg, retain `server-pane-after-restart.txt`,
+`tui-capture-autonomy-reconnect.txt`, the AppUI transcript, and agent/goal/loop
+ledgers, then run:
+
+```sh
+OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-autonomy-reconnect
+```
+
+`verify-autonomy-reconnect` checks that the restarted run visibly rehydrates
+agent, goal, and loop state; that the transcript issues `session/open`,
+`agent/list`, `session/goal/get`, and `loop/list`; and that agent/goal/loop
+notifications are not client-owned timer traffic.
+
 ## Dropped Completion Backpressure
 
 For replay-lossy and dropped-completion regression evidence:

@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-autonomy-live|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-autonomy-live|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -2330,6 +2330,81 @@ verify_autonomy_live() {
   echo "Verified M15 autonomy artifacts in $artifact_dir"
 }
 
+verify_autonomy_reconnect() {
+  local server_restart_capture="$artifact_dir/server-pane-after-restart.txt"
+  local reconnect_capture="$artifact_dir/tui-capture-autonomy-reconnect.txt"
+  local transcript
+  transcript="$(first_existing_artifact "M15 autonomy reconnect AppUI transcript" \
+    "$artifact_dir/m15-evidence/appui-transcript.jsonl" \
+    "$artifact_dir/appui-transcript.jsonl")"
+  local agent_ledger
+  agent_ledger="$(first_existing_artifact "M15 autonomy reconnect agent ledger" \
+    "$artifact_dir/m15-evidence/agent-ledger.jsonl" \
+    "$artifact_dir/agent-ledger.jsonl")"
+  local goal_ledger
+  goal_ledger="$(first_existing_artifact "M15 autonomy reconnect goal ledger" \
+    "$artifact_dir/m15-evidence/goal-ledger.jsonl" \
+    "$artifact_dir/goal-ledger.jsonl")"
+  local loop_ledger
+  loop_ledger="$(first_existing_artifact "M15 autonomy reconnect loop ledger" \
+    "$artifact_dir/m15-evidence/loop-ledger.jsonl" \
+    "$artifact_dir/loop-ledger.jsonl")"
+
+  local required_file
+  for required_file in \
+    "$server_restart_capture" \
+    "$reconnect_capture" \
+    "$transcript" \
+    "$agent_ledger" \
+    "$goal_ledger" \
+    "$loop_ledger"
+  do
+    [ -s "$required_file" ] || die "M15 autonomy reconnect artifact missing or empty: $required_file"
+  done
+
+  assert_capture_clean "$server_restart_capture" "M15 autonomy server after restart"
+  assert_capture_clean "$reconnect_capture" "M15 autonomy reconnect"
+  for required_text in \
+    "Agent" \
+    "Goal" \
+    "Loop" \
+    "Ask Octos to change code"
+  do
+    grep --fixed-strings -- "$required_text" "$reconnect_capture" >/dev/null 2>&1 \
+      || die "M15 autonomy reconnect capture missing required text: $required_text"
+  done
+  grep --fixed-strings -- "state" "$reconnect_capture" >/dev/null 2>&1 \
+    || die "M15 autonomy reconnect capture missing status line"
+
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"session/open"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "M15 autonomy reconnect transcript missing session/open hydration"
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"agent/list"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "M15 autonomy reconnect transcript missing agent/list hydration"
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"session/goal/get"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "M15 autonomy reconnect transcript missing session/goal/get hydration"
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"loop/list"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "M15 autonomy reconnect transcript missing loop/list hydration"
+  if grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"(agent/updated|agent/output/delta|agent/artifact/updated|session/goal/updated|session/goal/cleared|loop/updated|loop/fired|loop/completed)"' \
+    "$transcript" >/dev/null 2>&1; then
+    die "M15 autonomy reconnect transcript shows TUI-owned notification/timer traffic"
+  fi
+
+  grep -E '"event"[[:space:]]*:[[:space:]]*"agent_(started|completed|hydrated|replayed)"' "$agent_ledger" >/dev/null 2>&1 \
+    || die "M15 autonomy reconnect agent ledger missing durable agent event"
+  grep -E '"event"[[:space:]]*:[[:space:]]*"(goal_started|goal_continuation|goal_updated|goal_hydrated|goal_replayed)"' "$goal_ledger" >/dev/null 2>&1 \
+    || die "M15 autonomy reconnect goal ledger missing durable goal event"
+  grep -E '"event"[[:space:]]*:[[:space:]]*"(loop_iteration|loop_fired|loop_completed|loop_updated|loop_hydrated|loop_replayed)"' "$loop_ledger" >/dev/null 2>&1 \
+    || die "M15 autonomy reconnect loop ledger missing durable loop event"
+
+  write_ux_validation "autonomy-reconnect" "passed" "M15 autonomy reconnect hydration verified"
+  secret_leak_check
+  echo "Verified M15 autonomy reconnect artifacts in $artifact_dir"
+}
+
 verify_ux_run() {
   local scenario_json="$artifact_dir/scenario.json"
   local summary_json="$artifact_dir/summary.json"
@@ -3098,6 +3173,50 @@ JSONL
     die "self-test expected autonomy live fixture-marker verification to fail"
   fi
 
+  mkdir -p "$tmp_root/autonomy-reconnect/m15-evidence"
+  cat > "$tmp_root/autonomy-reconnect/server-pane-after-restart.txt" <<'CAPTURE'
+Listening: http://127.0.0.1:50179
+CAPTURE
+  cat > "$tmp_root/autonomy-reconnect/tui-capture-autonomy-reconnect.txt" <<'CAPTURE'
+Agent reviewer-api completed and hydrated
+Goal active continuation hydrated
+Loop fire_now schedule hydrated
+Ask Octos to change code...
+state Done
+CAPTURE
+  cat > "$tmp_root/autonomy-reconnect/m15-evidence/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"session/open"}}
+{"direction":"client_to_server","frame":{"method":"agent/list"}}
+{"direction":"client_to_server","frame":{"method":"session/goal/get"}}
+{"direction":"client_to_server","frame":{"method":"loop/list"}}
+JSONL
+  cat > "$tmp_root/autonomy-reconnect/m15-evidence/agent-ledger.jsonl" <<'JSONL'
+{"event":"agent_completed","agent_id":"reviewer-api"}
+JSONL
+  cat > "$tmp_root/autonomy-reconnect/m15-evidence/goal-ledger.jsonl" <<'JSONL'
+{"event":"goal_continuation","goal_id":"goal-1","status":"active"}
+JSONL
+  cat > "$tmp_root/autonomy-reconnect/m15-evidence/loop-ledger.jsonl" <<'JSONL'
+{"event":"loop_fired","loop_id":"loop-1","status":"completed"}
+JSONL
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/autonomy-reconnect" "$0" verify-autonomy-reconnect >/dev/null
+
+  mkdir -p "$tmp_root/bad-autonomy-reconnect/m15-evidence"
+  cp "$tmp_root/autonomy-reconnect/server-pane-after-restart.txt" "$tmp_root/bad-autonomy-reconnect/"
+  cp "$tmp_root/autonomy-reconnect/tui-capture-autonomy-reconnect.txt" "$tmp_root/bad-autonomy-reconnect/"
+  cp "$tmp_root/autonomy-reconnect/m15-evidence/agent-ledger.jsonl" "$tmp_root/bad-autonomy-reconnect/m15-evidence/"
+  cp "$tmp_root/autonomy-reconnect/m15-evidence/goal-ledger.jsonl" "$tmp_root/bad-autonomy-reconnect/m15-evidence/"
+  cp "$tmp_root/autonomy-reconnect/m15-evidence/loop-ledger.jsonl" "$tmp_root/bad-autonomy-reconnect/m15-evidence/"
+  cat > "$tmp_root/bad-autonomy-reconnect/m15-evidence/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"session/open"}}
+{"direction":"client_to_server","frame":{"method":"agent/list"}}
+{"direction":"client_to_server","frame":{"method":"session/goal/get"}}
+{"direction":"client_to_server","frame":{"method":"loop/fired"}}
+JSONL
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-autonomy-reconnect" "$0" verify-autonomy-reconnect >/dev/null 2>&1; then
+    die "self-test expected autonomy reconnect verification to fail"
+  fi
+
   mkdir -p "$tmp_root/ux-run"
   cat > "$tmp_root/ux-run/scenario.json" <<'JSON'
 {"schema":"octos.ux.scenario.v1","scenario_id":"narrow-layout","transport":"stdio"}
@@ -3211,6 +3330,7 @@ case "${1:-help}" in
   verify-tool-denial) verify_tool_denial ;;
   verify-tool-success) verify_tool_success ;;
   verify-autonomy-live) verify_autonomy_live ;;
+  verify-autonomy-reconnect) verify_autonomy_reconnect ;;
   verify-ux-run) verify_ux_run ;;
   api-parity) api_parity ;;
   self-test) self_test ;;
