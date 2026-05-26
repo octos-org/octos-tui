@@ -829,6 +829,26 @@ require_matching_summary_tui_commit_for_dir() {
     || die "$label octos_tui_repo_commit mismatch: $actual_tui_commit != $expected_tui_commit"
 }
 
+require_live_preflight_for_dir() {
+  local dir="$1"
+  local label="$2"
+  local preflight_file="$dir/live-preflight.json"
+  [ -f "$preflight_file" ] || die "$label missing live-preflight.json: $preflight_file"
+
+  grep -F '"schema": "octos-tui.live-preflight.v1"' "$preflight_file" >/dev/null 2>&1 \
+    || die "$label live-preflight.json schema mismatch: $preflight_file"
+  grep -F '"status": "passed"' "$preflight_file" >/dev/null 2>&1 \
+    || die "$label live preflight did not pass: $preflight_file"
+  if grep -E '"provider_credential"[[:space:]]*:[[:space:]]*"(missing|not required)"' \
+    "$preflight_file" >/dev/null 2>&1; then
+    die "$label live preflight is not provider-backed: $preflight_file"
+  fi
+  grep -F '"octos_repo_commit": "' "$preflight_file" >/dev/null 2>&1 \
+    || die "$label live preflight missing octos_repo_commit: $preflight_file"
+  grep -F '"octos_tui_repo_commit": "' "$preflight_file" >/dev/null 2>&1 \
+    || die "$label live preflight missing octos_tui_repo_commit: $preflight_file"
+}
+
 write_ux_validation() {
   local scenario="$1"
   local status="$2"
@@ -2167,6 +2187,7 @@ verify_solo_strict_bundle() {
 
 verify_solo_closure() {
   require_summary_source_commits_for_dir "$artifact_dir" "M12 solo closure"
+  require_live_preflight_for_dir "$artifact_dir" "M12 solo closure"
   verify_solo_strict_bundle 1
 
   local multiline_dir="${OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR:-$artifact_dir}"
@@ -2802,6 +2823,7 @@ verify_task_subagent_old_server_fallback() {
 verify_task_subagent_closure() {
   local original_artifact_dir="$artifact_dir"
   require_summary_source_commits_for_dir "$artifact_dir" "M13 task/subagent closure"
+  require_live_preflight_for_dir "$artifact_dir" "M13 task/subagent closure"
   verify_task_subagent_tree
 
   local reconnect_dir="${OCTOS_TUI_SOAK_TASK_RECONNECT_ARTIFACT_DIR:-$original_artifact_dir}"
@@ -3020,6 +3042,7 @@ verify_autonomy_reconnect() {
 verify_autonomy_closure() {
   local original_artifact_dir="$artifact_dir"
   require_summary_source_commits_for_dir "$artifact_dir" "M15 autonomy closure"
+  require_live_preflight_for_dir "$artifact_dir" "M15 autonomy closure"
   verify_autonomy_live
 
   local reconnect_dir="${OCTOS_TUI_SOAK_AUTONOMY_RECONNECT_ARTIFACT_DIR:-$original_artifact_dir}"
@@ -3182,6 +3205,23 @@ transport=$summary_transport
 octos_repo_commit=1111111111111111111111111111111111111111
 octos_tui_repo_commit=2222222222222222222222222222222222222222
 SUMMARY
+}
+
+write_self_test_live_preflight_json() {
+  local dir="$1"
+  local preflight_run_id="$2"
+  mkdir -p "$dir"
+  cat > "$dir/live-preflight.json" <<JSON
+{
+  "schema": "octos-tui.live-preflight.v1",
+  "run_id": "$preflight_run_id",
+  "status": "passed",
+  "transport": "ws",
+  "provider_credential": "OCTOS_TUI_SOAK_API_KEY",
+  "octos_repo_commit": "1111111111111111111111111111111111111111",
+  "octos_tui_repo_commit": "2222222222222222222222222222222222222222"
+}
+JSON
 }
 
 self_test() {
@@ -3609,6 +3649,7 @@ CAPTURE
   env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/multiline-composer" "$0" verify-multiline-composer >/dev/null
 
   cp -R "$tmp_root/solo-core" "$tmp_root/solo-closure"
+  write_self_test_live_preflight_json "$tmp_root/solo-closure" solo-closure-selftest
   cat > "$tmp_root/solo-closure/soak-summary.json" <<'JSON'
 {
   "schema": "octos-m12-solo-appui-soak-v1",
@@ -3628,6 +3669,16 @@ JSON
     "$0" verify-solo-closure >/dev/null
   grep --fixed-strings -- '"scenario": "solo-closure"' "$tmp_root/solo-closure/ux-validation.json" >/dev/null 2>&1 \
     || die "self-test missing solo-closure ux validation"
+  cp -R "$tmp_root/solo-closure" "$tmp_root/bad-solo-closure-provider-free"
+  sed 's/"provider_credential": "OCTOS_TUI_SOAK_API_KEY"/"provider_credential": "not required"/' \
+    "$tmp_root/solo-closure/live-preflight.json" \
+    > "$tmp_root/bad-solo-closure-provider-free/live-preflight.json"
+  if env \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-solo-closure-provider-free" \
+    "OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR=$tmp_root/multiline-composer" \
+    "$0" verify-solo-closure >/dev/null 2>&1; then
+    die "self-test expected solo closure verification to fail on provider-free live preflight"
+  fi
   cp -R "$tmp_root/solo-closure" "$tmp_root/bad-solo-closure-source-commit"
   grep -v '^octos_tui_repo_commit=' "$tmp_root/bad-solo-closure-source-commit/summary.env" \
     > "$tmp_root/bad-solo-closure-source-commit/summary.env.tmp"
@@ -3957,6 +4008,7 @@ CAPTURE
 
   mkdir -p "$tmp_root/task-subagent/m15-evidence"
   write_self_test_summary_env "$tmp_root/task-subagent" task-subagent-selftest stdio
+  write_self_test_live_preflight_json "$tmp_root/task-subagent" task-subagent-selftest
   cat > "$tmp_root/task-subagent/tui-capture-task-subagent-tree-running.txt" <<'CAPTURE'
 Subagents
 1. Ada Lovelace (reviewer-api) completed: true
@@ -4132,6 +4184,7 @@ JSONL
 
   mkdir -p "$tmp_root/autonomy-live/m15-evidence"
   write_self_test_summary_env "$tmp_root/autonomy-live" autonomy-live-selftest ws
+  write_self_test_live_preflight_json "$tmp_root/autonomy-live" autonomy-live-selftest
   cat > "$tmp_root/autonomy-live/tui-capture-autonomy-live.txt" <<'CAPTURE'
 Agent reviewer-api summary generated by model
 Goal active continuation rendered

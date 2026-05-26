@@ -861,6 +861,8 @@ has valid `octos_repo_commit` and `octos_tui_repo_commit` fields.
 They also reject mixed-revision closure bundles; old-server fallback artifacts
 may use a different `octos` backend commit, but must still use the same
 `octos-tui` commit as the closure run under test.
+Strict closure verifiers also require the primary closure artifact directory to
+retain a passed, provider-backed `live-preflight.json`.
 
 Verifier-backed pane captures must be non-empty and must not contain tmux
 capture failures, hidden task errors, malformed AppUI frames, unsupported-method
