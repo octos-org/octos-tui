@@ -80,7 +80,9 @@ pre-seeded profile `env_vars`. Set `OCTOS_TUI_SOAK_REQUIRE_LIVE_PROVIDER=0`
 only for provider-free dry runs that cannot close #31, #40, or #44. The command
 writes `live-preflight.json` into the retained artifact directory even when a
 required check fails, so blocker comments can link the exact failed readiness
-state without exposing provider secrets.
+state without exposing provider secrets. The JSON includes the tmux version,
+backend `octos --version` output when available, and the `octos-tui --version`
+status for the executable under test.
 
 ## Live Closure Checklist
 
