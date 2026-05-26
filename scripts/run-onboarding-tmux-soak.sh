@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-autonomy-live|drive-autonomy-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-task-subagent-old-server-fallback|drive-autonomy-live|drive-autonomy-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -1255,6 +1255,20 @@ drive_task_subagent_reconnect() {
   capture_pane "$tui_session" "$artifact_dir/tui-capture-task-subagent-tree-reconnect.txt"
   capture
   echo "Drove task/subagent reconnect capture in $tui_session"
+}
+
+drive_task_subagent_old_server_fallback() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-task-subagent-old-server-fallback"
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  wait_for_tui_text "Ask Octos to change code|state|AppUI capabilities refreshed" \
+    "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI ready signal before old-server fallback capture"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-task-subagent-old-server-fallback.txt"
+  capture
+  echo "Drove task/subagent old-server fallback capture in $tui_session"
 }
 
 drive_autonomy_live() {
@@ -3359,6 +3373,7 @@ case "${1:-help}" in
   drive-runtime-menus) drive_runtime_menus ;;
   drive-task-subagent-tree) drive_task_subagent_tree ;;
   drive-task-subagent-reconnect) drive_task_subagent_reconnect ;;
+  drive-task-subagent-old-server-fallback) drive_task_subagent_old_server_fallback ;;
   drive-autonomy-live) drive_autonomy_live ;;
   drive-autonomy-reconnect) drive_autonomy_reconnect ;;
   drive-dropped-completion-backpressure) drive_dropped_completion_backpressure ;;

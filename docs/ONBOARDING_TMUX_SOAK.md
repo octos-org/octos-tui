@@ -230,6 +230,9 @@ For the old-server fallback leg, retain a capture and transcript from a backend
 that does not advertise supervised task inspection capabilities, then run:
 
 ```sh
+OCTOS_TUI_SOAK_RUN_ID=<old-server-run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-task-subagent-old-server-fallback
+
 OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-task-subagent-old-server-fallback
 ```
