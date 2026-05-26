@@ -77,7 +77,10 @@ scripts/run-onboarding-tmux-soak.sh preflight-live
 `octos-tui`, and a provider credential source. By default the provider source
 can be `OCTOS_TUI_SOAK_API_KEY`, one of `OCTOS_TUI_SOAK_PROVIDER_ENV_VARS`, or
 pre-seeded profile `env_vars`. Set `OCTOS_TUI_SOAK_REQUIRE_LIVE_PROVIDER=0`
-only for provider-free dry runs that cannot close #31, #40, or #44.
+only for provider-free dry runs that cannot close #31, #40, or #44. The command
+writes `live-preflight.json` into the retained artifact directory even when a
+required check fails, so blocker comments can link the exact failed readiness
+state without exposing provider secrets.
 
 ## Live Closure Checklist
 

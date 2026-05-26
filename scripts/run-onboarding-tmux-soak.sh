@@ -197,19 +197,79 @@ provider_credential_source() {
   return 1
 }
 
-preflight_live() {
-  command -v tmux >/dev/null 2>&1 || die "tmux is required for live soak"
-  require_octos_serve
-  require_bin OCTOS_TUI_BIN "$octos_tui_bin"
+write_live_preflight_json() {
+  local status="$1"
+  local failure="$2"
+  local provider_source="$3"
+  local tmux_check="$4"
+  local octos_check="$5"
+  local tui_check="$6"
+  mkdir -p "$artifact_dir"
+  {
+    printf '{\n'
+    write_json_string_field schema "octos-tui.live-preflight.v1"
+    write_json_string_field run_id "$run_id"
+    write_json_string_field status "$status"
+    write_json_string_field transport "$transport"
+    write_json_string_field artifact_dir "$artifact_dir"
+    write_json_string_field tmux "$tmux_check"
+    write_json_string_field octos_serve "$octos_check"
+    write_json_string_field octos_bin "$octos_bin"
+    write_json_string_field octos_tui "$tui_check"
+    write_json_string_field octos_tui_bin "$octos_tui_bin"
+    write_json_string_field provider_credential "$provider_source"
+    write_json_string_field require_live_provider "$require_live_provider"
+    write_json_string_field failure "$failure"
+    write_json_string_field generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ""
+    printf '}\n'
+  } > "$artifact_dir/live-preflight.json"
+}
 
+preflight_live() {
+  local status="passed"
+  local failure=""
+  local tmux_check="passed"
+  local octos_check="passed"
+  local tui_check="passed"
   local provider_source=""
+
+  if ! command -v tmux >/dev/null 2>&1; then
+    tmux_check="missing"
+    status="failed"
+    failure="tmux is required for live soak"
+  fi
+
+  if [ -z "$octos_bin" ] || [ ! -x "$octos_bin" ]; then
+    octos_check="not executable"
+    status="failed"
+    [ -n "$failure" ] || failure="OCTOS_BIN is not executable: ${octos_bin:-<unset>}"
+  elif ! "$octos_bin" serve --help >/dev/null 2>&1; then
+    octos_check="missing serve"
+    status="failed"
+    [ -n "$failure" ] || failure="OCTOS_BIN does not expose 'serve'; build octos-cli with the api feature or set OCTOS_BIN to an API-enabled binary"
+  fi
+
+  if [ -z "$octos_tui_bin" ] || [ ! -x "$octos_tui_bin" ]; then
+    tui_check="not executable"
+    status="failed"
+    [ -n "$failure" ] || failure="OCTOS_TUI_BIN is not executable: ${octos_tui_bin:-<unset>}"
+  fi
+
   if [ "$require_live_provider" != "0" ]; then
     provider_source="$(provider_credential_source || true)"
     if [ -z "$provider_source" ]; then
-      die "Live closure preflight failed: no provider credential found. Set OCTOS_TUI_SOAK_API_KEY, one of OCTOS_TUI_SOAK_PROVIDER_ENV_VARS, or pre-seed $data_dir/profiles/$profile_id.json with profile env_vars. Set OCTOS_TUI_SOAK_REQUIRE_LIVE_PROVIDER=0 only for provider-free dry runs."
+      provider_source="missing"
+      status="failed"
+      [ -n "$failure" ] || failure="no provider credential found. Set OCTOS_TUI_SOAK_API_KEY, one of OCTOS_TUI_SOAK_PROVIDER_ENV_VARS, or pre-seed $data_dir/profiles/$profile_id.json with profile env_vars. Set OCTOS_TUI_SOAK_REQUIRE_LIVE_PROVIDER=0 only for provider-free dry runs."
     fi
   else
     provider_source="not required"
+  fi
+
+  write_live_preflight_json "$status" "$failure" "$provider_source" "$tmux_check" "$octos_check" "$tui_check"
+
+  if [ "$status" != "passed" ]; then
+    die "Live closure preflight failed: $failure (artifact: $artifact_dir/live-preflight.json)"
   fi
 
   printf 'Live soak preflight passed\n'
@@ -217,6 +277,7 @@ preflight_live() {
   printf 'octos_bin=%s\n' "$octos_bin"
   printf 'octos_tui_bin=%s\n' "$octos_tui_bin"
   printf 'provider_credential=%s\n' "$provider_source"
+  printf 'artifact=%s\n' "$artifact_dir/live-preflight.json"
 }
 
 json_escape() {
@@ -2977,21 +3038,39 @@ SH
     "OCTOS_BIN=$fake_octos_bin" \
     "OCTOS_TUI_BIN=$fake_tui_bin" \
     "OCTOS_TUI_SOAK_DATA_DIR=$tmp_root/preflight-empty-data" \
+    "OCTOS_TUI_SOAK_ARTIFACT_ROOT=$tmp_root/preflight-artifacts" \
+    "OCTOS_TUI_SOAK_RUN_ID=preflight-provider-ok" \
     "OCTOS_TUI_SOAK_API_KEY=selftest-secret" \
     "$0" preflight-live >/dev/null
+  [ -f "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" ] \
+    || die "self-test expected provider-backed preflight artifact"
+  grep -F '"status": "passed"' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
+    || die "self-test expected provider-backed preflight to pass"
   if env \
     "OCTOS_BIN=$fake_octos_bin" \
     "OCTOS_TUI_BIN=$fake_tui_bin" \
     "OCTOS_TUI_SOAK_DATA_DIR=$tmp_root/preflight-empty-data" \
+    "OCTOS_TUI_SOAK_ARTIFACT_ROOT=$tmp_root/preflight-artifacts" \
+    "OCTOS_TUI_SOAK_RUN_ID=preflight-provider-missing" \
     "$0" preflight-live >/dev/null 2>&1; then
     die "self-test expected live preflight to fail without provider credentials"
   fi
+  [ -f "$tmp_root/preflight-artifacts/preflight-provider-missing/live-preflight.json" ] \
+    || die "self-test expected failed preflight artifact"
+  grep -F '"provider_credential": "missing"' "$tmp_root/preflight-artifacts/preflight-provider-missing/live-preflight.json" >/dev/null \
+    || die "self-test expected missing-provider preflight artifact"
   env \
     "OCTOS_BIN=$fake_octos_bin" \
     "OCTOS_TUI_BIN=$fake_tui_bin" \
     "OCTOS_TUI_SOAK_DATA_DIR=$tmp_root/preflight-empty-data" \
+    "OCTOS_TUI_SOAK_ARTIFACT_ROOT=$tmp_root/preflight-artifacts" \
+    "OCTOS_TUI_SOAK_RUN_ID=preflight-provider-free" \
     "OCTOS_TUI_SOAK_REQUIRE_LIVE_PROVIDER=0" \
     "$0" preflight-live >/dev/null
+  [ -f "$tmp_root/preflight-artifacts/preflight-provider-free/live-preflight.json" ] \
+    || die "self-test expected provider-free preflight artifact"
+  grep -F '"provider_credential": "not required"' "$tmp_root/preflight-artifacts/preflight-provider-free/live-preflight.json" >/dev/null \
+    || die "self-test expected provider-free preflight artifact"
   cat > "$tmp_root/data/profiles/coding.json" <<'JSON'
 {
   "id": "coding",
