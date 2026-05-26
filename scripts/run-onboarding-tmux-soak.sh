@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -732,7 +732,7 @@ Manual checkpoints:
   drive -> scripts/run-onboarding-tmux-soak.sh drive-onboard
   /model -> verify server-returned model list
   prompt -> "Reply with exactly OK."
-  verify -> scripts/run-onboarding-tmux-soak.sh verify
+  verify -> scripts/run-onboarding-tmux-soak.sh verify-onboard
 EOF
 }
 
@@ -881,7 +881,7 @@ drive_onboard() {
   echo "Drove /onboard flow in $tui_session"
 }
 
-verify() {
+verify_onboard() {
   capture
   local profile_path="$data_dir/profiles/$profile_id.json"
   local redacted_profile="$artifact_dir/profile-json-after.json"
@@ -947,6 +947,10 @@ verify() {
   write_ux_validation "provider-onboarding" "passed" "provider onboarding artifacts verified"
   secret_leak_check
   echo "Verified onboarding soak artifacts in $artifact_dir"
+}
+
+verify() {
+  verify_onboard
 }
 
 api_parity() {
@@ -2256,7 +2260,7 @@ self_test() {
   }
 }
 JSON
-  env "${child_env[@]}" "$0" verify >/dev/null
+  env "${child_env[@]}" "$0" verify-onboard >/dev/null
 
   [ -f "$tmp_root/artifacts/summary.env" ] || die "self-test missing summary.env"
   [ -f "$tmp_root/artifacts/server.log" ] || die "self-test missing server.log"
@@ -2862,6 +2866,7 @@ case "${1:-help}" in
   capture) capture ;;
   send-turn) send_turn ;;
   verify) verify ;;
+  verify-onboard) verify_onboard ;;
   verify-solo) verify_solo ;;
   verify-first-launch) verify_first_launch ;;
   verify-provider-missing) verify_provider_missing ;;
