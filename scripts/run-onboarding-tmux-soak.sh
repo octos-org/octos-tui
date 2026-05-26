@@ -213,10 +213,11 @@ write_live_preflight_json() {
   local tmux_version="$7"
   local octos_version="$8"
   local octos_tui_version="$9"
-  local octos_repo_commit="${10}"
-  local octos_tui_repo_commit="${11}"
-  local host_name="${12}"
-  local os_release="${13}"
+  local octos_tui_version_status="${10}"
+  local octos_repo_commit="${11}"
+  local octos_tui_repo_commit="${12}"
+  local host_name="${13}"
+  local os_release="${14}"
   mkdir -p "$artifact_dir"
   {
     printf '{\n'
@@ -242,6 +243,7 @@ write_live_preflight_json() {
     write_json_string_field octos_tui "$tui_check"
     write_json_string_field octos_tui_bin "$octos_tui_bin"
     write_json_string_field octos_tui_version "$octos_tui_version"
+    write_json_string_field octos_tui_version_status "$octos_tui_version_status"
     write_json_string_field octos_tui_repo_commit "$octos_tui_repo_commit"
     write_json_string_field provider_credential "$provider_source"
     write_json_string_field provider_env_vars_checked "$provider_env_vars"
@@ -261,6 +263,7 @@ preflight_live() {
   local tmux_version=""
   local octos_version=""
   local octos_tui_version=""
+  local octos_tui_version_status=""
   local octos_repo_commit=""
   local octos_tui_repo_commit=""
   local host_name=""
@@ -294,12 +297,14 @@ preflight_live() {
 
   if [ -z "$octos_tui_bin" ] || [ ! -x "$octos_tui_bin" ]; then
     tui_check="not executable"
+    octos_tui_version_status="not executable"
     status="failed"
     [ -n "$failure" ] || failure="OCTOS_TUI_BIN is not executable: ${octos_tui_bin:-<unset>}"
   elif octos_tui_version="$("$octos_tui_bin" --version 2>/dev/null)"; then
-    :
+    octos_tui_version_status="passed"
   else
     octos_tui_version="unsupported"
+    octos_tui_version_status="unsupported"
   fi
 
   if [ "$require_live_provider" != "0" ]; then
@@ -313,7 +318,7 @@ preflight_live() {
     provider_source="not required"
   fi
 
-  write_live_preflight_json "$status" "$failure" "$provider_source" "$tmux_check" "$octos_check" "$tui_check" "$tmux_version" "$octos_version" "$octos_tui_version" "$octos_repo_commit" "$octos_tui_repo_commit" "$host_name" "$os_release"
+  write_live_preflight_json "$status" "$failure" "$provider_source" "$tmux_check" "$octos_check" "$tui_check" "$tmux_version" "$octos_version" "$octos_tui_version" "$octos_tui_version_status" "$octos_repo_commit" "$octos_tui_repo_commit" "$host_name" "$os_release"
 
   if [ "$status" != "passed" ]; then
     die "Live closure preflight failed: $failure (artifact: $artifact_dir/live-preflight.json)"
@@ -328,6 +333,7 @@ preflight_live() {
   printf 'octos_repo_commit=%s\n' "$octos_repo_commit"
   printf 'octos_tui_bin=%s\n' "$octos_tui_bin"
   printf 'octos_tui_version=%s\n' "$octos_tui_version"
+  printf 'octos_tui_version_status=%s\n' "$octos_tui_version_status"
   printf 'octos_tui_repo_commit=%s\n' "$octos_tui_repo_commit"
   printf 'provider_credential=%s\n' "$provider_source"
   printf 'provider_env_vars_checked=%s\n' "$provider_env_vars"
@@ -3119,6 +3125,8 @@ SH
   grep -F '"octos_version": "octos 0.0.0-self-test"' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
     || die "self-test expected octos version in preflight artifact"
   grep -F '"octos_tui_version": "octos-tui 0.0.0-self-test"' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
+    || die "self-test expected octos-tui version in preflight artifact"
+  grep -F '"octos_tui_version_status": "passed"' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
     || die "self-test expected octos-tui version status in preflight artifact"
   grep -F '"octos_repo_commit": "' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
     || die "self-test expected octos repo commit field in preflight artifact"
@@ -3153,6 +3161,27 @@ SH
     || die "self-test expected provider-free preflight artifact"
   grep -F '"provider_credential": "not required"' "$tmp_root/preflight-artifacts/preflight-provider-free/live-preflight.json" >/dev/null \
     || die "self-test expected provider-free preflight artifact"
+  local fake_tui_no_version="$tmp_root/fake-octos-tui-no-version"
+  cat > "$fake_tui_no_version" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+  exit 2
+fi
+exit 0
+SH
+  chmod +x "$fake_tui_no_version"
+  env \
+    "OCTOS_BIN=$fake_octos_bin" \
+    "OCTOS_TUI_BIN=$fake_tui_no_version" \
+    "OCTOS_TUI_SOAK_DATA_DIR=$tmp_root/preflight-empty-data" \
+    "OCTOS_TUI_SOAK_ARTIFACT_ROOT=$tmp_root/preflight-artifacts" \
+    "OCTOS_TUI_SOAK_RUN_ID=preflight-tui-version-unsupported" \
+    "OCTOS_TUI_SOAK_REQUIRE_LIVE_PROVIDER=0" \
+    "$0" preflight-live >/dev/null
+  grep -F '"octos_tui_version": "unsupported"' "$tmp_root/preflight-artifacts/preflight-tui-version-unsupported/live-preflight.json" >/dev/null \
+    || die "self-test expected unsupported octos-tui version in preflight artifact"
+  grep -F '"octos_tui_version_status": "unsupported"' "$tmp_root/preflight-artifacts/preflight-tui-version-unsupported/live-preflight.json" >/dev/null \
+    || die "self-test expected unsupported octos-tui version status in preflight artifact"
   cat > "$tmp_root/data/profiles/coding.json" <<'JSON'
 {
   "id": "coding",
