@@ -353,6 +353,23 @@ visible diff preview text, visible artifact text, a usable composer, an
 artifact-index `artifacts` array, and diff/artifact readiness evidence in the
 transcript.
 
+## Denied Tool Policy
+
+For denied-tool / blocked-policy evidence:
+
+```sh
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-tool-denial
+
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-tool-denial
+```
+
+`verify-tool-denial` checks `tui-capture-tool-denial.txt` and
+`appui-transcript.jsonl`. The verifier requires visible denied-policy text, a
+usable composer after the blocked tool path, `tool/denied` transcript evidence,
+and no `approval/requested` frame for that retained bundle.
+
 ## M19 UX Run Bundle
 
 For M19 runner-owned artifacts, set `OCTOS_TUI_SOAK_ARTIFACT_DIR` to the
@@ -391,6 +408,7 @@ The solo lane writes these M12 artifacts into
   `drive-narrow-terminal`
 - `tui-capture-diff-artifact.txt` and `artifact-index.json` when running
   `drive-diff-artifact`
+- `tui-capture-tool-denial.txt` when running `drive-tool-denial`
 - `tui-capture-task-subagent-tree-running.txt`,
   `tui-capture-task-subagent-tree-final.txt`, and
   `tui-capture-task-subagent-tree-summary.txt` when running
