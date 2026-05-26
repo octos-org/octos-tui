@@ -531,6 +531,17 @@ write_ux_validation() {
   } > "$artifact_dir/ux-validation.json"
 }
 
+assert_capture_clean() {
+  local file="$1"
+  local label="$2"
+  [ -f "$file" ] || die "$label capture missing: $file"
+  grep -q '[^[:space:]]' "$file" || die "$label capture is empty: $file"
+  if grep -E 'tmux unavailable|tmux session not running|Task Error|app-ui error|malformed_json|unsupported method|unavailable: AppUI capabilities|Traceback|panicked at' \
+    "$file" >/dev/null 2>&1; then
+    die "$label capture contains tmux/AppUI error text: $file"
+  fi
+}
+
 start() {
   command -v tmux >/dev/null 2>&1 || die "tmux is required for start"
   require_bin OCTOS_BIN "$octos_bin"
@@ -811,6 +822,7 @@ verify() {
   write_api_parity_checklist
 
   if [ -f "$artifact_dir/tui-capture.txt" ]; then
+    assert_capture_clean "$artifact_dir/tui-capture.txt" "TUI"
     if grep -E 'malformed_json|session\.workspace_cwd|requires protocol|provider is unavailable|Task Error|app-ui error|unavailable: AppUI capabilities' \
       "$artifact_dir/tui-capture.txt" >/dev/null 2>&1; then
       die "TUI capture contains AppUI/onboarding error text"
@@ -1074,6 +1086,7 @@ verify_solo() {
   for file in "${required[@]}"; do
     [ -f "$file" ] || die "M12 solo artifact missing: $file"
   done
+  assert_capture_clean "$artifact_dir/tui-capture.txt" "M12 solo"
   if grep -E 'auth/(send_code|verify)' "$artifact_dir/appui-transcript.jsonl" >/dev/null 2>&1; then
     die "M12 solo transcript contains OTP method traffic"
   fi
@@ -1108,7 +1121,7 @@ verify_solo() {
 
 verify_first_launch() {
   local capture_file="$artifact_dir/tui-capture-first-launch.txt"
-  [ -f "$capture_file" ] || die "first-launch capture missing: $capture_file"
+  assert_capture_clean "$capture_file" "first-launch"
 
   if [ -f "$artifact_dir/summary.env" ] \
     && ! grep --fixed-strings -- "first_launch_capture=1" "$artifact_dir/summary.env" >/dev/null 2>&1; then
@@ -1143,7 +1156,7 @@ verify_first_launch() {
 
 verify_provider_missing() {
   local capture_file="$artifact_dir/tui-capture-provider-missing.txt"
-  [ -f "$capture_file" ] || die "provider-missing capture missing: $capture_file"
+  assert_capture_clean "$capture_file" "provider-missing"
 
   for required_text in \
     "Set Up LLM Provider" \
@@ -1177,8 +1190,8 @@ verify_provider_missing() {
 verify_permissions() {
   local open_capture="$artifact_dir/tui-capture-permissions-open.txt"
   local applied_capture="$artifact_dir/tui-capture-permissions-applied.txt"
-  [ -f "$open_capture" ] || die "permissions-open capture missing: $open_capture"
-  [ -f "$applied_capture" ] || die "permissions-applied capture missing: $applied_capture"
+  assert_capture_clean "$open_capture" "permissions-open"
+  assert_capture_clean "$applied_capture" "permissions-applied"
 
   for required_text in \
     "Update Model Permissions" \
@@ -1221,11 +1234,16 @@ self_test_solo() {
 self_test() {
   local tmp_root
   tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/octos-tui-soak-self-test.XXXXXX")"
+  local self_test_server_session="octos-tui-soak-selftest-server-$$"
+  local self_test_tui_session="octos-tui-soak-selftest-tui-$$"
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for self-test"
   local child_env=(
     "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/artifacts"
     "OCTOS_TUI_SOAK_DATA_DIR=$tmp_root/data"
     "OCTOS_TUI_SOAK_WORKSPACE=$tmp_root/workspace"
     "OCTOS_TUI_SOAK_RUN_ID=selftest"
+    "OCTOS_TUI_SOAK_SERVER_SESSION=$self_test_server_session"
+    "OCTOS_TUI_SOAK_TUI_SESSION=$self_test_tui_session"
     "OCTOS_TUI_SOAK_PROFILE=coding"
     "OCTOS_TUI_SOAK_REQUIRE_PROFILE=1"
     "OCTOS_TUI_SOAK_EXPECT_FAMILY=moonshot"
@@ -1234,7 +1252,17 @@ self_test() {
     "OCTOS_TUI_SOAK_EXPECT_BASE_URL=https://www.autodl.art/api/v1"
     "OCTOS_TUI_SOAK_API_KEY=selftest-secret"
   )
+  cleanup_self_test() {
+    tmux kill-session -t "$self_test_server_session" >/dev/null 2>&1 || true
+    tmux kill-session -t "$self_test_tui_session" >/dev/null 2>&1 || true
+    rm -rf "$tmp_root"
+  }
+  trap cleanup_self_test EXIT
   mkdir -p "$tmp_root/data/profiles" "$tmp_root/workspace"
+  tmux kill-session -t "$self_test_server_session" >/dev/null 2>&1 || true
+  tmux kill-session -t "$self_test_tui_session" >/dev/null 2>&1 || true
+  tmux new-session -d -s "$self_test_server_session" "printf 'Synthetic self-test server pane\n'; sleep 600"
+  tmux new-session -d -s "$self_test_tui_session" "printf 'Ask Octos to change code\nOCTOS self-test\n'; sleep 600"
   cat > "$tmp_root/data/profiles/coding.json" <<'JSON'
 {
   "id": "coding",
@@ -1321,6 +1349,19 @@ CAPTURE
     die "self-test expected bad permissions capture verification to fail"
   fi
 
+  mkdir -p "$tmp_root/empty-capture"
+  : > "$tmp_root/empty-capture/tui-capture-first-launch.txt"
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/empty-capture" "$0" verify-first-launch >/dev/null 2>&1; then
+    die "self-test expected empty first-launch capture verification to fail"
+  fi
+
+  mkdir -p "$tmp_root/error-capture"
+  printf 'Update Model Permissions\nunsupported method: profile/set\n' > "$tmp_root/error-capture/tui-capture-permissions-open.txt"
+  printf 'Permissions updated: Workspace Write\nAsk Octos to change code...\n' > "$tmp_root/error-capture/tui-capture-permissions-applied.txt"
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/error-capture" "$0" verify-permissions >/dev/null 2>&1; then
+    die "self-test expected unsupported-method capture verification to fail"
+  fi
+
   while IFS= read -r -d '' file; do
     if grep --fixed-strings -- "selftest-secret" "$file" >/dev/null 2>&1; then
       die "self-test secret leaked into artifacts: $file"
@@ -1331,7 +1372,8 @@ CAPTURE
   if env "${child_env[@]}" "$0" verify >/dev/null 2>&1; then
     die "self-test expected leak verification to fail"
   fi
-  rm -rf "$tmp_root"
+  cleanup_self_test
+  trap - EXIT
   echo "Self-test passed"
 }
 
