@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -1476,6 +1476,41 @@ verify_runtime_menus() {
   echo "Verified runtime menu captures in $artifact_dir"
 }
 
+verify_backpressure() {
+  local replay_capture="$artifact_dir/tui-capture-replay-lossy.txt"
+  local final_capture="$artifact_dir/tui-capture-backpressure-final.txt"
+  local server_log="$artifact_dir/server.log"
+  local transcript
+  transcript="$(first_existing_artifact "backpressure AppUI transcript" \
+    "$artifact_dir/appui-transcript.jsonl" \
+    "$artifact_dir/m15-evidence/appui-transcript.jsonl")"
+
+  assert_capture_clean "$replay_capture" "backpressure-replay-lossy"
+  assert_capture_clean "$final_capture" "backpressure-final"
+  [ -f "$server_log" ] || die "backpressure server log missing: $server_log"
+
+  grep --fixed-strings -- "Replay lossy" "$replay_capture" "$final_capture" >/dev/null 2>&1 \
+    || die "backpressure captures missing Replay lossy status"
+  grep --fixed-strings -- "Ask Octos to change code" "$final_capture" >/dev/null 2>&1 \
+    || die "backpressure final capture missing usable composer"
+  grep --fixed-strings -- "Done" "$final_capture" >/dev/null 2>&1 \
+    || die "backpressure final capture did not settle to Done"
+
+  "$script_dir/validate-tmux-ux-capture.sh" "$final_capture" "$server_log" >/dev/null
+
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(server_to_client|rx)".*"method"[[:space:]]*:[[:space:]]*"protocol/replay_lossy"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "backpressure transcript missing protocol/replay_lossy notification"
+  if grep -E 'lifecycle notification not delivered.*turn/completed|writer channel full for lifecycle frame|lifecycle ws send failed; aborting connection' \
+    "$server_log" >/dev/null 2>&1; then
+    die "backpressure server log contains dropped turn/completed lifecycle notification"
+  fi
+
+  write_ux_validation "dropped-completion-backpressure" "passed" "dropped-completion backpressure captures verified"
+  secret_leak_check
+  echo "Verified dropped-completion backpressure artifacts in $artifact_dir"
+}
+
 verify_task_subagent_tree() {
   local running_capture="$artifact_dir/tui-capture-task-subagent-tree-running.txt"
   local final_capture="$artifact_dir/tui-capture-task-subagent-tree-final.txt"
@@ -1978,6 +2013,38 @@ JSONL
     die "self-test expected runtime menu MCP transcript verification to fail"
   fi
 
+  mkdir -p "$tmp_root/backpressure"
+  cat > "$tmp_root/backpressure/tui-capture-replay-lossy.txt" <<'CAPTURE'
+Replay lossy: 3 dropped (last durable seq 42); reconnect to rehydrate
+state Working
+CAPTURE
+  cat > "$tmp_root/backpressure/tui-capture-backpressure-final.txt" <<'CAPTURE'
+Replay lossy: 3 dropped (last durable seq 42); reconnect to rehydrate
+Assistant response recovered after replay refresh.
+┌Composer
+Ask Octos to change code...
+state Done
+CAPTURE
+  cat > "$tmp_root/backpressure/appui-transcript.jsonl" <<'JSONL'
+{"direction":"server_to_client","frame":{"method":"protocol/replay_lossy"}}
+JSONL
+  printf 'Listening\n' > "$tmp_root/backpressure/server.log"
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/backpressure" "$0" verify-backpressure >/dev/null
+
+  mkdir -p "$tmp_root/bad-backpressure"
+  cp "$tmp_root/backpressure/tui-capture-replay-lossy.txt" "$tmp_root/bad-backpressure/"
+  cat > "$tmp_root/bad-backpressure/tui-capture-backpressure-final.txt" <<'CAPTURE'
+Replay lossy: 3 dropped (last durable seq 42); reconnect to rehydrate
+┌Composer
+Ask Octos to change code...
+state Working
+CAPTURE
+  cp "$tmp_root/backpressure/appui-transcript.jsonl" "$tmp_root/bad-backpressure/"
+  printf 'writer channel full for lifecycle frame turn/completed\n' > "$tmp_root/bad-backpressure/server.log"
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-backpressure" "$0" verify-backpressure >/dev/null 2>&1; then
+    die "self-test expected dropped turn/completed backpressure verification to fail"
+  fi
+
   mkdir -p "$tmp_root/bad-approval-denial"
   cp "$tmp_root/approval-denial/tui-capture-approval-request.txt" "$tmp_root/bad-approval-denial/"
   cat > "$tmp_root/bad-approval-denial/tui-capture-approval-denied.txt" <<'CAPTURE'
@@ -2230,6 +2297,7 @@ case "${1:-help}" in
   verify-runtime-menus) verify_runtime_menus ;;
   verify-task-subagent-tree) verify_task_subagent_tree ;;
   verify-task-subagent-reconnect) verify_task_subagent_reconnect ;;
+  verify-backpressure) verify_backpressure ;;
   verify-autonomy-live) verify_autonomy_live ;;
   verify-ux-run) verify_ux_run ;;
   api-parity) api_parity ;;

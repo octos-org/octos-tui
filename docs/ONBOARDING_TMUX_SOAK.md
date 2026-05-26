@@ -238,6 +238,25 @@ if production evidence is still deterministic fixture text, if agent/goal/loop
 notifications appear to come from the TUI as client traffic, or if the capture
 does not visibly show agent, goal, loop, and final summary state.
 
+## Dropped Completion Backpressure
+
+For replay-lossy and dropped-completion regression evidence:
+
+```sh
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-dropped-completion-backpressure
+
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-backpressure
+```
+
+`verify-backpressure` checks `tui-capture-replay-lossy.txt`,
+`tui-capture-backpressure-final.txt`, `server.log`, and
+`appui-transcript.jsonl`. It reuses `scripts/validate-tmux-ux-capture.sh`, so
+the retained capture fails if the UI remains falsely working after a dropped
+`turn/completed` lifecycle notification or if the final composer is hidden.
+It also requires a `protocol/replay_lossy` notification in the transcript.
+
 ## M19 UX Run Bundle
 
 For M19 runner-owned artifacts, set `OCTOS_TUI_SOAK_ARTIFACT_DIR` to the
