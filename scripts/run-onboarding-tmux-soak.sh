@@ -238,6 +238,7 @@ write_live_preflight_json() {
     write_json_string_field octos_tui_version "$octos_tui_version"
     write_json_string_field octos_tui_repo_commit "$octos_tui_repo_commit"
     write_json_string_field provider_credential "$provider_source"
+    write_json_string_field provider_env_vars_checked "$provider_env_vars"
     write_json_string_field require_live_provider "$require_live_provider"
     write_json_string_field failure "$failure"
     write_json_string_field generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ""
@@ -323,6 +324,7 @@ preflight_live() {
   printf 'octos_tui_version=%s\n' "$octos_tui_version"
   printf 'octos_tui_repo_commit=%s\n' "$octos_tui_repo_commit"
   printf 'provider_credential=%s\n' "$provider_source"
+  printf 'provider_env_vars_checked=%s\n' "$provider_env_vars"
   printf 'artifact=%s\n' "$artifact_dir/live-preflight.json"
 }
 
@@ -3112,6 +3114,8 @@ SH
     || die "self-test expected octos repo commit field in preflight artifact"
   grep -F '"octos_tui_repo_commit": "' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
     || die "self-test expected octos-tui repo commit field in preflight artifact"
+  grep -F '"provider_env_vars_checked": "OPENAI_API_KEY ANTHROPIC_API_KEY DEEPSEEK_API_KEY OPENROUTER_API_KEY MOONSHOT_API_KEY KIMI_API_KEY AUTODL_API_KEY"' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
+    || die "self-test expected provider env names in preflight artifact"
   grep -F '"tmux_version": "tmux ' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
     || die "self-test expected tmux version in preflight artifact"
   if env \
