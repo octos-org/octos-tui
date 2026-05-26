@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-task-subagent-tree|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-task-subagent-tree|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -553,6 +553,16 @@ first_existing_artifact() {
     fi
   done
   die "$label missing"
+}
+
+json_scalar_value() {
+  local file="$1"
+  local key="$2"
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg key "$key" '.[$key] // empty' "$file" 2>/dev/null | head -n 1
+  else
+    sed -n -E "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"?([^\",}]*)\"?.*/\1/p" "$file" | head -n 1
+  fi
 }
 
 start() {
@@ -1342,6 +1352,92 @@ verify_task_subagent_tree() {
   echo "Verified task/subagent tree artifacts in $artifact_dir"
 }
 
+verify_ux_run() {
+  local scenario_json="$artifact_dir/scenario.json"
+  local summary_json="$artifact_dir/summary.json"
+  local validation_json="$artifact_dir/validation.json"
+  local terminal_size_json="$artifact_dir/terminal-size.json"
+  local capture_file="$artifact_dir/tui-capture.txt"
+  local transcript="$artifact_dir/appui-transcript.jsonl"
+  local runtime_policy="$artifact_dir/runtime-policy-stamp.json"
+  local server_log="$artifact_dir/server.log"
+  local required
+  for required in \
+    "$scenario_json" \
+    "$summary_json" \
+    "$validation_json" \
+    "$terminal_size_json" \
+    "$capture_file" \
+    "$transcript" \
+    "$runtime_policy" \
+    "$server_log"
+  do
+    [ -f "$required" ] || die "UX run artifact missing: $required"
+  done
+  assert_capture_clean "$capture_file" "UX run"
+
+  local scenario_id
+  local scenario_transport
+  local summary_status
+  local validation_status
+  local cols
+  local rows
+  scenario_id="$(json_scalar_value "$scenario_json" scenario_id)"
+  scenario_transport="$(json_scalar_value "$scenario_json" transport)"
+  summary_status="$(json_scalar_value "$summary_json" status)"
+  validation_status="$(json_scalar_value "$validation_json" status)"
+  cols="$(json_scalar_value "$terminal_size_json" cols)"
+  rows="$(json_scalar_value "$terminal_size_json" rows)"
+
+  [ -n "$scenario_id" ] || die "UX run scenario_id missing"
+  [ -n "$scenario_transport" ] || die "UX run transport missing"
+  [ "$summary_status" = "passed" ] || die "UX run summary status is not passed: ${summary_status:-<missing>}"
+  [ "$validation_status" = "passed" ] || die "UX run validation status is not passed: ${validation_status:-<missing>}"
+  grep --fixed-strings -- '"real_tmux_launched": true' "$summary_json" >/dev/null 2>&1 \
+    || die "UX run summary does not prove real tmux launch"
+  grep --fixed-strings -- '"placeholder_artifacts": false' "$summary_json" >/dev/null 2>&1 \
+    || die "UX run summary still marks placeholder artifacts"
+  grep --fixed-strings -- '"schema": "octos.ux.validation.v1"' "$validation_json" >/dev/null 2>&1 \
+    || die "UX run validation schema mismatch"
+
+  if [ -n "${OCTOS_TUI_SOAK_EXPECT_SCENARIO:-}" ] && [ "$scenario_id" != "$OCTOS_TUI_SOAK_EXPECT_SCENARIO" ]; then
+    die "Expected UX scenario $OCTOS_TUI_SOAK_EXPECT_SCENARIO, got $scenario_id"
+  fi
+  if [ -n "${OCTOS_TUI_SOAK_EXPECT_TRANSPORT:-}" ] && [ "$scenario_transport" != "$OCTOS_TUI_SOAK_EXPECT_TRANSPORT" ]; then
+    die "Expected UX transport $OCTOS_TUI_SOAK_EXPECT_TRANSPORT, got $scenario_transport"
+  fi
+
+  case "$cols" in
+    ''|*[!0-9]*) die "UX run terminal cols invalid: ${cols:-<missing>}" ;;
+  esac
+  case "$rows" in
+    ''|*[!0-9]*) die "UX run terminal rows invalid: ${rows:-<missing>}" ;;
+  esac
+  [ "$cols" -gt 0 ] && [ "$rows" -gt 0 ] || die "UX run terminal size must be positive"
+  grep --fixed-strings -- '"id": "screen_geometry_consistent"' "$validation_json" >/dev/null 2>&1 \
+    || die "UX run validation missing screen_geometry_consistent check"
+
+  for required in \
+    "Ask Octos to change code" \
+    "state"
+  do
+    grep --fixed-strings -- "$required" "$capture_file" >/dev/null 2>&1 \
+      || die "UX run capture missing required text: $required"
+  done
+  for required in \
+    '"method":"config/capabilities/list"' \
+    '"method":"session/open"' \
+    '"method":"session/status/read"'
+  do
+    grep --fixed-strings -- "$required" "$transcript" >/dev/null 2>&1 \
+      || die "UX run transcript missing required method: $required"
+  done
+
+  write_ux_validation "$scenario_id" "passed" "M19 UX run artifacts verified"
+  secret_leak_check
+  echo "Verified M19 UX run artifacts in $artifact_dir"
+}
+
 self_test_solo() {
   local probe="$octos_repo/scripts/m12-solo-appui-soak.sh"
   [ -x "$probe" ] || die "M12 solo soak wrapper missing or not executable: $probe"
@@ -1554,6 +1650,51 @@ JSONL
     die "self-test expected task-subagent client task-control verification to fail"
   fi
 
+  mkdir -p "$tmp_root/ux-run"
+  cat > "$tmp_root/ux-run/scenario.json" <<'JSON'
+{"schema":"octos.ux.scenario.v1","scenario_id":"narrow-layout","transport":"stdio"}
+JSON
+  cat > "$tmp_root/ux-run/summary.json" <<'JSON'
+{"schema":"octos.ux.summary.v1","status":"passed","ok":true,"real_tmux_launched": true,"placeholder_artifacts": false}
+JSON
+  cat > "$tmp_root/ux-run/validation.json" <<'JSON'
+{"schema": "octos.ux.validation.v1","status":"passed","checks":[{"id": "screen_geometry_consistent","status":"passed"}]}
+JSON
+  cat > "$tmp_root/ux-run/terminal-size.json" <<'JSON'
+{"schema":"octos.ux.terminal_size.v1","cols":80,"rows":24}
+JSON
+  cat > "$tmp_root/ux-run/tui-capture.txt" <<'CAPTURE'
+Agent task completed
+Ask Octos to change code...
+state Done
+CAPTURE
+  cat > "$tmp_root/ux-run/appui-transcript.jsonl" <<'JSONL'
+{"direction":"tx","method":"config/capabilities/list"}
+{"direction":"tx","method":"session/open"}
+{"direction":"tx","method":"session/status/read"}
+JSONL
+  printf '{}\n' > "$tmp_root/ux-run/runtime-policy-stamp.json"
+  printf 'Listening\n' > "$tmp_root/ux-run/server.log"
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/ux-run" \
+    "OCTOS_TUI_SOAK_EXPECT_SCENARIO=narrow-layout" \
+    "OCTOS_TUI_SOAK_EXPECT_TRANSPORT=stdio" \
+    "$0" verify-ux-run >/dev/null
+
+  mkdir -p "$tmp_root/bad-ux-run"
+  cp "$tmp_root/ux-run"/scenario.json "$tmp_root/bad-ux-run/"
+  cp "$tmp_root/ux-run"/summary.json "$tmp_root/bad-ux-run/"
+  cp "$tmp_root/ux-run"/terminal-size.json "$tmp_root/bad-ux-run/"
+  cp "$tmp_root/ux-run"/tui-capture.txt "$tmp_root/bad-ux-run/"
+  cp "$tmp_root/ux-run"/appui-transcript.jsonl "$tmp_root/bad-ux-run/"
+  cp "$tmp_root/ux-run"/runtime-policy-stamp.json "$tmp_root/bad-ux-run/"
+  cp "$tmp_root/ux-run"/server.log "$tmp_root/bad-ux-run/"
+  cat > "$tmp_root/bad-ux-run/validation.json" <<'JSON'
+{"schema": "octos.ux.validation.v1","status":"failed","checks":[]}
+JSON
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-ux-run" "$0" verify-ux-run >/dev/null 2>&1; then
+    die "self-test expected failed UX run verification to fail"
+  fi
+
   while IFS= read -r -d '' file; do
     if grep --fixed-strings -- "selftest-secret" "$file" >/dev/null 2>&1; then
       die "self-test secret leaked into artifacts: $file"
@@ -1597,6 +1738,7 @@ case "${1:-help}" in
   verify-permissions) verify_permissions ;;
   verify-approval-denial) verify_approval_denial ;;
   verify-task-subagent-tree) verify_task_subagent_tree ;;
+  verify-ux-run) verify_ux_run ;;
   api-parity) api_parity ;;
   self-test) self_test ;;
   solo-self-test) self_test_solo ;;
