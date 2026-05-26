@@ -43,6 +43,7 @@ scripts/run-onboarding-tmux-soak.sh verify-permissions
 scripts/run-onboarding-tmux-soak.sh verify-approval-denial
 scripts/run-onboarding-tmux-soak.sh verify-task-subagent-tree
 scripts/run-onboarding-tmux-soak.sh verify-task-subagent-closure
+scripts/run-onboarding-tmux-soak.sh verify-autonomy-closure
 scripts/run-onboarding-tmux-soak.sh verify-transport-parity
 scripts/run-onboarding-tmux-soak.sh verify-ux-run
 scripts/run-onboarding-tmux-soak.sh api-parity
@@ -378,6 +379,21 @@ re-requests `/agents list`, `/goal`, and `/loop list`, and writes
 agent, goal, and loop state; that the transcript issues `session/open`,
 `agent/list`, `session/goal/get`, and `loop/list`; and that agent/goal/loop
 notifications are not client-owned timer traffic.
+
+For the full #44 closure bundle, retain the main production autonomy run, the
+restart/reconnect run, and one WebSocket plus one stdio transcript pair. Then
+run:
+
+```sh
+OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<autonomy-run-id> \
+OCTOS_TUI_SOAK_AUTONOMY_RECONNECT_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<reconnect-run-id> \
+OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<ws-run-id> \
+OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<stdio-run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-autonomy-closure
+```
+
+`verify-autonomy-closure` runs the autonomy live, reconnect, and
+transport-parity verifiers as one fail-closed bundle.
 
 ## Transport Parity
 

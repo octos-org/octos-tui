@@ -46,7 +46,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <preflight-live|start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-task-subagent-old-server-fallback|drive-autonomy-live|drive-autonomy-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-solo-closure|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-task-subagent-closure|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-transport-parity|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <preflight-live|start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-task-subagent-old-server-fallback|drive-autonomy-live|drive-autonomy-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-solo-closure|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-task-subagent-closure|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-autonomy-closure|verify-transport-parity|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -106,6 +106,8 @@ Environment:
                                  used by verify-task-subagent-closure.
   OCTOS_TUI_SOAK_TASK_OLD_SERVER_ARTIFACT_DIR Optional old-server fallback
                                  artifact dir used by verify-task-subagent-closure.
+  OCTOS_TUI_SOAK_AUTONOMY_RECONNECT_ARTIFACT_DIR Optional reconnect artifact
+                                 dir used by verify-autonomy-closure.
   OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE Set to 1 to launch without a preselected
                                  profile/session and save tui-capture-first-launch.txt.
   OCTOS_TUI_SOAK_REQUIRE_PROFILE Set to 0 to allow verify without profile JSON.
@@ -2741,6 +2743,21 @@ verify_autonomy_reconnect() {
   echo "Verified M15 autonomy reconnect artifacts in $artifact_dir"
 }
 
+verify_autonomy_closure() {
+  local original_artifact_dir="$artifact_dir"
+  verify_autonomy_live
+
+  local reconnect_dir="${OCTOS_TUI_SOAK_AUTONOMY_RECONNECT_ARTIFACT_DIR:-$original_artifact_dir}"
+  artifact_dir="$reconnect_dir"
+  verify_autonomy_reconnect
+
+  artifact_dir="$original_artifact_dir"
+  verify_transport_parity
+
+  write_ux_validation "autonomy-closure" "passed" "M15 autonomy closure bundle verified"
+  echo "Verified M15 autonomy closure bundle in $original_artifact_dir"
+}
+
 verify_transport_parity() {
   local ws_dir="${OCTOS_TUI_SOAK_WS_ARTIFACT_DIR:-}"
   local stdio_dir="${OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR:-}"
@@ -3805,6 +3822,23 @@ JSONL
     "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/parity-stdio" \
     "$0" verify-transport-parity >/dev/null
 
+  env \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/autonomy-live" \
+    "OCTOS_TUI_SOAK_AUTONOMY_RECONNECT_ARTIFACT_DIR=$tmp_root/autonomy-reconnect" \
+    "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/parity-ws" \
+    "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/parity-stdio" \
+    "$0" verify-autonomy-closure >/dev/null
+  grep --fixed-strings -- '"scenario": "autonomy-closure"' "$tmp_root/autonomy-live/ux-validation.json" >/dev/null 2>&1 \
+    || die "self-test missing autonomy-closure ux validation"
+
+  if env \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/autonomy-live" \
+    "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/parity-ws" \
+    "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/parity-stdio" \
+    "$0" verify-autonomy-closure >/dev/null 2>&1; then
+    die "self-test expected autonomy closure verification to fail without reconnect artifacts"
+  fi
+
   mkdir -p "$tmp_root/bad-parity-stdio/m15-evidence"
   cp "$tmp_root/parity-stdio/m15-evidence/appui-transcript.jsonl" "$tmp_root/bad-parity-stdio/m15-evidence/"
   printf '{"direction":"tx","frame":{"method":"session/goal/get"}}\n' \
@@ -3935,6 +3969,7 @@ case "${1:-help}" in
   verify-tool-success) verify_tool_success ;;
   verify-autonomy-live) verify_autonomy_live ;;
   verify-autonomy-reconnect) verify_autonomy_reconnect ;;
+  verify-autonomy-closure) verify_autonomy_closure ;;
   verify-transport-parity) verify_transport_parity ;;
   verify-ux-run) verify_ux_run ;;
   api-parity) api_parity ;;
