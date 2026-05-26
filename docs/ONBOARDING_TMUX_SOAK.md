@@ -78,6 +78,10 @@ the evidence files and records blockers in `soak-summary.json`; set
 `OCTOS_TUI_SOAK_SOLO_STRICT=1` when the backend is ready to require a pass.
 MCP/tool config blockers are recorded the same way until the backend advertises
 `mcp/config/*`, `mcp/config/test`, and `tool/config/set_enabled`.
+Set `OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE=1` during `verify-solo` when the
+tenant/cloud dangerous-mode rejection row is part of the closure bundle; the
+verifier then requires `tenant-danger-rejection` to pass with server-side
+rejection evidence in `soak-summary.json`.
 Live transports also require `OCTOS_BIN` to point at an API-enabled `octos`
 binary that exposes `serve`.
 

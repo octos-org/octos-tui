@@ -63,6 +63,8 @@ Environment:
   OCTOS_TUI_SOAK_API_KEY         Optional secret string checked for capture leaks.
   OCTOS_TUI_SOAK_INIT_PROFILE_LLM Set to 1 to pre-seed profile JSON before backend bootstraps.
   OCTOS_TUI_SOAK_TENANT_NEGATIVE Set to 1 to also run tenant/cloud dangerous-mode negative probe.
+  OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE Set to 1 during verify-solo to require
+                                 a passed tenant/cloud dangerous-mode rejection row.
   OCTOS_TUI_SOAK_SOLO_PROBE_DATA_DIR Optional separate data dir for stdio solo probe.
   OCTOS_TUI_SOAK_FAKE_OPENAI     Set to 1 to start scripts/fake-openai-server.py in tmux.
   OCTOS_TUI_SOAK_FAKE_OPENAI_PORT Local fake OpenAI-compatible port, default 50180.
@@ -603,6 +605,39 @@ write_solo_summary_matrix() {
       printf '| soak-summary | present | jq unavailable; inspect `soak-summary.json` for per-case status. |\n'
     fi
   } > "$summary_matrix"
+}
+
+verify_solo_tenant_negative_case() {
+  local summary_json="$artifact_dir/soak-summary.json"
+  [ -f "$summary_json" ] || die "M12 tenant-negative summary missing: $summary_json"
+
+  if command -v jq >/dev/null 2>&1; then
+    jq -e '
+      any(.cases[]?;
+        .name == "tenant-danger-rejection"
+        and .status == "ok"
+        and (
+          .rejected == true
+          or .result.rejected == true
+          or .applied == false
+          or .result.applied == false
+        )
+      )
+    ' "$summary_json" >/dev/null \
+      || die "M12 solo tenant/cloud dangerous-mode rejection row missing or not passed"
+    return
+  fi
+
+  local compact
+  compact="$(tr -d '\n[:space:]' < "$summary_json")"
+  case "$compact" in
+    *'"name":"tenant-danger-rejection"'*'"status":"ok"'*'"rejected":true'*|\
+    *'"name":"tenant-danger-rejection"'*'"status":"ok"'*'"applied":false'*)
+      ;;
+    *)
+      die "M12 solo tenant/cloud dangerous-mode rejection row missing or not passed"
+      ;;
+  esac
 }
 
 assert_capture_clean() {
@@ -1575,6 +1610,9 @@ verify_solo() {
       die "M12 solo strict verification requires passed soak-summary.json"
     fi
   fi
+  if [ "${OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE:-${OCTOS_TUI_SOAK_TENANT_NEGATIVE:-0}}" = "1" ]; then
+    verify_solo_tenant_negative_case
+  fi
   write_solo_summary_matrix
   [ -f "$artifact_dir/summary-matrix.md" ] || die "M12 solo summary matrix missing"
   write_ux_validation "solo-onboarding" "passed" "M12 solo soak artifacts verified"
@@ -2523,6 +2561,42 @@ JSON
   [ -f "$tmp_root/solo-core/summary-matrix.md" ] || die "self-test missing solo summary matrix"
   grep --fixed-strings -- '"scenario": "solo-onboarding"' "$tmp_root/solo-core/ux-validation.json" >/dev/null 2>&1 \
     || die "self-test missing solo-onboarding ux validation"
+
+  cp -R "$tmp_root/solo-core" "$tmp_root/solo-tenant-negative"
+  cat > "$tmp_root/solo-tenant-negative/soak-summary.json" <<'JSON'
+{
+  "schema": "octos-m12-solo-appui-soak-v1",
+  "status": "passed",
+  "transport": "stdio",
+  "cases": [
+    {"name": "workspace-cwd-open", "status": "ok"},
+    {"name": "tenant-danger-rejection", "status": "ok", "result": {"rejected": true, "applied": false}}
+  ]
+}
+JSON
+  env \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/solo-tenant-negative" \
+    "OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE=1" \
+    "$0" verify-solo >/dev/null
+
+  cp -R "$tmp_root/solo-core" "$tmp_root/bad-solo-tenant-negative"
+  cat > "$tmp_root/bad-solo-tenant-negative/soak-summary.json" <<'JSON'
+{
+  "schema": "octos-m12-solo-appui-soak-v1",
+  "status": "failed",
+  "transport": "stdio",
+  "cases": [
+    {"name": "workspace-cwd-open", "status": "ok"},
+    {"name": "tenant-danger-rejection", "status": "failed", "result": {"rejected": false, "applied": true}}
+  ]
+}
+JSON
+  if env \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-solo-tenant-negative" \
+    "OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE=1" \
+    "$0" verify-solo >/dev/null 2>&1; then
+    die "self-test expected tenant-negative solo verification to fail"
+  fi
 
   mkdir -p "$tmp_root/approval-denial"
   cat > "$tmp_root/approval-denial/tui-capture-approval-request.txt" <<'CAPTURE'
