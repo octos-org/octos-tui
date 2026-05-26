@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -81,6 +81,8 @@ Environment:
                                  drive-diff-artifact.
   OCTOS_TUI_SOAK_TOOL_DENIAL_PROMPT Optional prompt used by
                                  drive-tool-denial.
+  OCTOS_TUI_SOAK_TOOL_SUCCESS_PROMPT Optional prompt used by
+                                 drive-tool-success.
   OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE Set to 1 to launch without a preselected
                                  profile/session and save tui-capture-first-launch.txt.
   OCTOS_TUI_SOAK_REQUIRE_PROFILE Set to 0 to allow verify without profile JSON.
@@ -1358,6 +1360,24 @@ drive_tool_denial() {
   echo "Drove denied-tool capture in $tui_session"
 }
 
+drive_tool_success() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-tool-success"
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  local prompt="${OCTOS_TUI_SOAK_TOOL_SUCCESS_PROMPT:-M12 normal-tool fixture: run a safe shell command and show a successful tool card in the TUI.}"
+  wait_for_tui_text "Ask Octos to change code" "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI composer before driving successful tool call"
+  submit_composer_prompt "$prompt"
+  wait_for_tui_text "Tool|tool|shell|complete|succeeded|Done" \
+    "${OCTOS_TUI_SOAK_TOOL_SUCCESS_WAIT_SECS:-80}" || \
+    die "Timed out waiting for successful tool-call evidence in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-tool-success.txt"
+  capture
+  echo "Drove successful tool-call capture in $tui_session"
+}
+
 verify_solo() {
   capture
   local required=(
@@ -1853,6 +1873,30 @@ verify_tool_denial() {
   write_ux_validation "tool-denial" "passed" "denied-tool capture verified"
   secret_leak_check
   echo "Verified denied-tool artifacts in $artifact_dir"
+}
+
+verify_tool_success() {
+  local capture_file="$artifact_dir/tui-capture-tool-success.txt"
+  local transcript
+  transcript="$(first_existing_artifact "tool-success AppUI transcript" \
+    "$artifact_dir/appui-transcript.jsonl" \
+    "$artifact_dir/m15-evidence/appui-transcript.jsonl")"
+
+  assert_capture_clean "$capture_file" "tool-success"
+  grep -Ei 'tool|shell|command|exec|stdout|complete|succeeded|success' "$capture_file" >/dev/null 2>&1 \
+    || die "tool-success capture missing successful tool-call text"
+  grep --fixed-strings -- "Ask Octos to change code" "$capture_file" >/dev/null 2>&1 \
+    || die "tool-success capture missing usable composer"
+  grep -E '"method"[[:space:]]*:[[:space:]]*"(turn/start|task/output/delta|task/output/read|agent/output/delta|agent/output/read|tool/status/list)"|activity[.]tool[.](progress|complete)|"tool"[[:space:]]*:' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "tool-success transcript missing turn/tool output evidence"
+  if grep -E '"method"[[:space:]]*:[[:space:]]*"tool/denied"|tool[.]denied|tool_denied' "$transcript" >/dev/null 2>&1; then
+    die "tool-success transcript contains denied-tool evidence"
+  fi
+
+  write_ux_validation "tool-success" "passed" "successful tool-call capture verified"
+  secret_leak_check
+  echo "Verified successful tool-call artifacts in $artifact_dir"
 }
 
 verify_task_subagent_tree() {
@@ -2546,6 +2590,28 @@ JSONL
     die "self-test expected tool-denial verification to fail without tool/denied evidence"
   fi
 
+  mkdir -p "$tmp_root/tool-success"
+  cat > "$tmp_root/tool-success/tui-capture-tool-success.txt" <<'CAPTURE'
+tool shell complete
+stdout: normal tool call completed
+Ask Octos to change code...
+state Done
+CAPTURE
+  cat > "$tmp_root/tool-success/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"turn/start"}}
+{"event":"activity.tool.complete","tool":"shell","status":"success"}
+JSONL
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/tool-success" "$0" verify-tool-success >/dev/null
+
+  mkdir -p "$tmp_root/bad-tool-success"
+  cp "$tmp_root/tool-success/tui-capture-tool-success.txt" "$tmp_root/bad-tool-success/"
+  cat > "$tmp_root/bad-tool-success/appui-transcript.jsonl" <<'JSONL'
+{"direction":"server_to_client","frame":{"method":"tool/denied","params":{"code":"tool_denied"}}}
+JSONL
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-tool-success" "$0" verify-tool-success >/dev/null 2>&1; then
+    die "self-test expected tool-success verification to fail with denied-tool evidence"
+  fi
+
   mkdir -p "$tmp_root/bad-approval-denial"
   cp "$tmp_root/approval-denial/tui-capture-approval-request.txt" "$tmp_root/bad-approval-denial/"
   cat > "$tmp_root/bad-approval-denial/tui-capture-approval-denied.txt" <<'CAPTURE'
@@ -2792,6 +2858,7 @@ case "${1:-help}" in
   drive-narrow-terminal) drive_narrow_terminal ;;
   drive-diff-artifact) drive_diff_artifact ;;
   drive-tool-denial) drive_tool_denial ;;
+  drive-tool-success) drive_tool_success ;;
   capture) capture ;;
   send-turn) send_turn ;;
   verify) verify ;;
@@ -2811,6 +2878,7 @@ case "${1:-help}" in
   verify-narrow-terminal) verify_narrow_terminal ;;
   verify-diff-artifact) verify_diff_artifact ;;
   verify-tool-denial) verify_tool_denial ;;
+  verify-tool-success) verify_tool_success ;;
   verify-autonomy-live) verify_autonomy_live ;;
   verify-ux-run) verify_ux_run ;;
   api-parity) api_parity ;;

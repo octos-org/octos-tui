@@ -370,6 +370,23 @@ scripts/run-onboarding-tmux-soak.sh verify-tool-denial
 usable composer after the blocked tool path, `tool/denied` transcript evidence,
 and no `approval/requested` frame for that retained bundle.
 
+## Successful Tool Call
+
+For normal successful tool-call evidence:
+
+```sh
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-tool-success
+
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-tool-success
+```
+
+`verify-tool-success` checks `tui-capture-tool-success.txt` and
+`appui-transcript.jsonl`. The verifier requires visible successful tool/output
+text, a usable composer after the turn, turn/tool-output transcript evidence,
+and no denied-tool event in that retained bundle.
+
 ## M19 UX Run Bundle
 
 For M19 runner-owned artifacts, set `OCTOS_TUI_SOAK_ARTIFACT_DIR` to the
@@ -409,6 +426,7 @@ The solo lane writes these M12 artifacts into
 - `tui-capture-diff-artifact.txt` and `artifact-index.json` when running
   `drive-diff-artifact`
 - `tui-capture-tool-denial.txt` when running `drive-tool-denial`
+- `tui-capture-tool-success.txt` when running `drive-tool-success`
 - `tui-capture-task-subagent-tree-running.txt`,
   `tui-capture-task-subagent-tree-final.txt`, and
   `tui-capture-task-subagent-tree-summary.txt` when running
