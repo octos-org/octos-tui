@@ -50,6 +50,7 @@ pub struct Cli {
 #[derive(Debug, Parser)]
 #[command(
     name = "octos-tui",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Mock-backed Octos TUI prototype on the AppUi/UI Protocol boundary"
 )]
 struct CliArgs {
@@ -244,6 +245,8 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use clap::{Parser, error::ErrorKind};
+
     use super::{Cli, Mode, ThemeName};
 
     fn write_config(name: &str, contents: &str) -> PathBuf {
@@ -300,6 +303,15 @@ mod tests {
         assert!(cli.base_url.is_none());
         assert!(cli.stdio_command.is_none());
         assert_eq!(cli.theme, ThemeName::Codex);
+    }
+
+    #[test]
+    fn prints_package_version() {
+        let err = super::CliArgs::try_parse_from(["octos-tui", "--version"])
+            .expect_err("version flag exits early");
+
+        assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

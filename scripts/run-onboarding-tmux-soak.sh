@@ -3055,7 +3055,8 @@ SH
   cat > "$fake_tui_bin" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = "--version" ]; then
-  exit 2
+  printf 'octos-tui 0.0.0-self-test\n'
+  exit 0
 fi
 exit 0
 SH
@@ -3074,7 +3075,7 @@ SH
     || die "self-test expected provider-backed preflight to pass"
   grep -F '"octos_version": "octos 0.0.0-self-test"' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
     || die "self-test expected octos version in preflight artifact"
-  grep -F '"octos_tui_version": "unsupported"' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
+  grep -F '"octos_tui_version": "octos-tui 0.0.0-self-test"' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
     || die "self-test expected octos-tui version status in preflight artifact"
   grep -F '"tmux_version": "tmux ' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
     || die "self-test expected tmux version in preflight artifact"
