@@ -81,11 +81,11 @@ only for provider-free dry runs that cannot close #31, #40, or #44. The command
 writes `live-preflight.json` into the retained artifact directory even when a
 required check fails, so blocker comments can link the exact failed readiness
 state without exposing provider secrets. The JSON includes host and OS details,
-the tmux version, backend `octos --version` output when available, and the
-`octos-tui --version` status for the executable under test. It records the
-provider environment variable names checked, but never their values. When the
-source checkouts are available, it also records the `octos` and `octos-tui` Git
-commits used by the run.
+profile/session/runtime context, the tmux version, backend `octos --version`
+output when available, and the `octos-tui --version` status for the executable
+under test. It records the provider environment variable names checked, but
+never their values. When the source checkouts are available, it also records the
+`octos` and `octos-tui` Git commits used by the run.
 
 ## Live Closure Checklist
 

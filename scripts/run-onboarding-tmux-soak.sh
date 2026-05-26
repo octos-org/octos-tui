@@ -225,6 +225,12 @@ write_live_preflight_json() {
     write_json_string_field status "$status"
     write_json_string_field transport "$transport"
     write_json_string_field artifact_dir "$artifact_dir"
+    write_json_string_field profile_id "$profile_id"
+    write_json_string_field session_id "$session_id"
+    write_json_string_field open_session "$open_session"
+    write_json_string_field runtime_root "$runtime_root"
+    write_json_string_field workspace "$workspace"
+    write_json_string_field data_dir "$data_dir"
     write_json_string_field host "$host_name"
     write_json_string_field os "$os_release"
     write_json_string_field tmux "$tmux_check"
@@ -3106,6 +3112,10 @@ SH
     || die "self-test expected host field in preflight artifact"
   grep -F '"os": "' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
     || die "self-test expected os field in preflight artifact"
+  grep -F '"profile_id": "coding"' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
+    || die "self-test expected profile id in preflight artifact"
+  grep -F '"session_id": "coding:local:onboarding#preflight-provider-ok"' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
+    || die "self-test expected session id in preflight artifact"
   grep -F '"octos_version": "octos 0.0.0-self-test"' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
     || die "self-test expected octos version in preflight artifact"
   grep -F '"octos_tui_version": "octos-tui 0.0.0-self-test"' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
