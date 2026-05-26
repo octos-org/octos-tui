@@ -33,6 +33,7 @@ scripts/run-onboarding-tmux-soak.sh drive-solo
 scripts/run-onboarding-tmux-soak.sh capture
 scripts/run-onboarding-tmux-soak.sh send-turn
 scripts/run-onboarding-tmux-soak.sh verify
+scripts/run-onboarding-tmux-soak.sh verify-onboard
 scripts/run-onboarding-tmux-soak.sh verify-solo
 scripts/run-onboarding-tmux-soak.sh verify-first-launch
 scripts/run-onboarding-tmux-soak.sh verify-provider-missing
@@ -528,7 +529,7 @@ OCTOS_TUI_SOAK_EXPECT_FAMILY=moonshot \
 OCTOS_TUI_SOAK_EXPECT_MODEL=kimi-k2.5 \
 OCTOS_TUI_SOAK_EXPECT_ROUTE=autodl \
 OCTOS_TUI_SOAK_EXPECT_BASE_URL=https://www.autodl.art/api/v1 \
-scripts/run-onboarding-tmux-soak.sh verify
+scripts/run-onboarding-tmux-soak.sh verify-onboard
 ```
 
 For MiniMax WiseModel:
@@ -539,7 +540,7 @@ OCTOS_TUI_SOAK_EXPECT_FAMILY=minimax \
 OCTOS_TUI_SOAK_EXPECT_MODEL=MiniMax-M2.5-highspeed \
 OCTOS_TUI_SOAK_EXPECT_ROUTE=wisemodel \
 OCTOS_TUI_SOAK_EXPECT_BASE_URL=https://open.ospreyai.cn/v1 \
-scripts/run-onboarding-tmux-soak.sh verify
+scripts/run-onboarding-tmux-soak.sh verify-onboard
 ```
 
 For a custom OpenAI-compatible route:
@@ -550,13 +551,15 @@ OCTOS_TUI_SOAK_EXPECT_FAMILY=<custom-family-id> \
 OCTOS_TUI_SOAK_EXPECT_MODEL=<custom-model-id> \
 OCTOS_TUI_SOAK_EXPECT_ROUTE=<custom-route-id> \
 OCTOS_TUI_SOAK_EXPECT_BASE_URL=<custom-base-url> \
-scripts/run-onboarding-tmux-soak.sh verify
+scripts/run-onboarding-tmux-soak.sh verify-onboard
 ```
+
+`verify` remains a backwards-compatible alias for `verify-onboard`.
 
 To check secret redaction, pass the test key as an environment variable only:
 
 ```sh
-OCTOS_TUI_SOAK_API_KEY=<secret-value> scripts/run-onboarding-tmux-soak.sh verify
+OCTOS_TUI_SOAK_API_KEY=<secret-value> scripts/run-onboarding-tmux-soak.sh verify-onboard
 ```
 
 The verifier fails if that value appears in any retained evidence artifact
