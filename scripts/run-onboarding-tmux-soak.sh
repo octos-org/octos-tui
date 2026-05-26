@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -75,6 +75,8 @@ Environment:
                                  drive-validator-cycle.
   OCTOS_TUI_SOAK_LONG_OUTPUT_PROMPT Optional prompt used by
                                  drive-long-output.
+  OCTOS_TUI_SOAK_NARROW_COLS    Narrow terminal columns, default 80.
+  OCTOS_TUI_SOAK_NARROW_ROWS    Narrow terminal rows, default 24.
   OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE Set to 1 to launch without a preselected
                                  profile/session and save tui-capture-first-launch.txt.
   OCTOS_TUI_SOAK_REQUIRE_PROFILE Set to 0 to allow verify without profile JSON.
@@ -1287,6 +1289,35 @@ drive_long_output() {
   echo "Drove long-output folding capture in $tui_session"
 }
 
+drive_narrow_terminal() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-narrow-terminal"
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  local cols="${OCTOS_TUI_SOAK_NARROW_COLS:-80}"
+  local rows="${OCTOS_TUI_SOAK_NARROW_ROWS:-24}"
+  case "$cols" in ''|*[!0-9]*) die "OCTOS_TUI_SOAK_NARROW_COLS must be numeric: ${cols:-<empty>}" ;; esac
+  case "$rows" in ''|*[!0-9]*) die "OCTOS_TUI_SOAK_NARROW_ROWS must be numeric: ${rows:-<empty>}" ;; esac
+  [ "$cols" -le 80 ] || die "Narrow terminal cols must be <= 80, got $cols"
+  [ "$rows" -le 24 ] || die "Narrow terminal rows must be <= 24, got $rows"
+
+  tmux resize-window -t "$tui_session" -x "$cols" -y "$rows"
+  wait_for_tui_text "Ask Octos to change code|state|AppUI capabilities refreshed" \
+    "${OCTOS_TUI_SOAK_NARROW_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI ready signal after narrow resize"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-narrow-terminal.txt"
+  {
+    printf '{\n'
+    write_json_string_field schema "octos-tui.narrow-terminal.v1"
+    printf '  "cols": %s,\n' "$cols"
+    printf '  "rows": %s\n' "$rows"
+    printf '}\n'
+  } > "$artifact_dir/terminal-size.json"
+  capture
+  echo "Drove narrow terminal capture in $tui_session at ${cols}x${rows}"
+}
+
 verify_solo() {
   capture
   local required=(
@@ -1696,6 +1727,37 @@ verify_long_output() {
   write_ux_validation "long-output" "passed" "long-output folding capture verified"
   secret_leak_check
   echo "Verified long-output folding artifacts in $artifact_dir"
+}
+
+verify_narrow_terminal() {
+  local capture_file="$artifact_dir/tui-capture-narrow-terminal.txt"
+  local terminal_size_json="$artifact_dir/terminal-size.json"
+  local server_log="$artifact_dir/server.log"
+  local cols
+  local rows
+
+  assert_capture_clean "$capture_file" "narrow-terminal"
+  [ -f "$terminal_size_json" ] || die "narrow-terminal size artifact missing: $terminal_size_json"
+  cols="$(json_scalar_value "$terminal_size_json" cols)"
+  rows="$(json_scalar_value "$terminal_size_json" rows)"
+  case "$cols" in ''|*[!0-9]*) die "narrow terminal cols invalid: ${cols:-<missing>}" ;; esac
+  case "$rows" in ''|*[!0-9]*) die "narrow terminal rows invalid: ${rows:-<missing>}" ;; esac
+  [ "$cols" -le 80 ] || die "narrow terminal cols must be <= 80, got $cols"
+  [ "$rows" -le 24 ] || die "narrow terminal rows must be <= 24, got $rows"
+
+  grep --fixed-strings -- "Ask Octos to change code" "$capture_file" >/dev/null 2>&1 \
+    || die "narrow-terminal capture missing usable composer"
+  grep --fixed-strings -- "state" "$capture_file" >/dev/null 2>&1 \
+    || die "narrow-terminal capture missing status line"
+  if [ -f "$server_log" ]; then
+    "$script_dir/validate-tmux-ux-capture.sh" "$capture_file" "$server_log" >/dev/null
+  else
+    "$script_dir/validate-tmux-ux-capture.sh" "$capture_file" >/dev/null
+  fi
+
+  write_ux_validation "narrow-terminal" "passed" "narrow terminal capture verified"
+  secret_leak_check
+  echo "Verified narrow terminal artifacts in $artifact_dir"
 }
 
 verify_task_subagent_tree() {
@@ -2320,6 +2382,26 @@ CAPTURE
     die "self-test expected long-output verification to fail without folded-output marker"
   fi
 
+  mkdir -p "$tmp_root/narrow-terminal"
+  cat > "$tmp_root/narrow-terminal/tui-capture-narrow-terminal.txt" <<'CAPTURE'
+┌Composer
+Ask Octos to change code...
+state Done
+CAPTURE
+  cat > "$tmp_root/narrow-terminal/terminal-size.json" <<'JSON'
+{"schema":"octos-tui.narrow-terminal.v1","cols":80,"rows":24}
+JSON
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/narrow-terminal" "$0" verify-narrow-terminal >/dev/null
+
+  mkdir -p "$tmp_root/bad-narrow-terminal"
+  cp "$tmp_root/narrow-terminal/tui-capture-narrow-terminal.txt" "$tmp_root/bad-narrow-terminal/"
+  cat > "$tmp_root/bad-narrow-terminal/terminal-size.json" <<'JSON'
+{"schema":"octos-tui.narrow-terminal.v1","cols":120,"rows":40}
+JSON
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-narrow-terminal" "$0" verify-narrow-terminal >/dev/null 2>&1; then
+    die "self-test expected narrow-terminal verification to fail for wide geometry"
+  fi
+
   mkdir -p "$tmp_root/bad-approval-denial"
   cp "$tmp_root/approval-denial/tui-capture-approval-request.txt" "$tmp_root/bad-approval-denial/"
   cat > "$tmp_root/bad-approval-denial/tui-capture-approval-denied.txt" <<'CAPTURE'
@@ -2563,6 +2645,7 @@ case "${1:-help}" in
   drive-interrupt-reconnect) drive_interrupt_reconnect ;;
   drive-validator-cycle) drive_validator_cycle ;;
   drive-long-output) drive_long_output ;;
+  drive-narrow-terminal) drive_narrow_terminal ;;
   capture) capture ;;
   send-turn) send_turn ;;
   verify) verify ;;
@@ -2579,6 +2662,7 @@ case "${1:-help}" in
   verify-interrupt-reconnect) verify_interrupt_reconnect ;;
   verify-validator-cycle) verify_validator_cycle ;;
   verify-long-output) verify_long_output ;;
+  verify-narrow-terminal) verify_narrow_terminal ;;
   verify-autonomy-live) verify_autonomy_live ;;
   verify-ux-run) verify_ux_run ;;
   api-parity) api_parity ;;
