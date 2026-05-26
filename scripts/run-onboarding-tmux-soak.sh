@@ -754,6 +754,14 @@ summary_env_value() {
   sed -n -E "s/^${key}=(.*)$/\\1/p" "$summary_file" | head -n 1
 }
 
+summary_env_value_for_dir() {
+  local dir="$1"
+  local key="$2"
+  local summary_file="$dir/summary.env"
+  [ -f "$summary_file" ] || return 1
+  sed -n -E "s/^${key}=(.*)$/\\1/p" "$summary_file" | head -n 1
+}
+
 write_ux_validation() {
   local scenario="$1"
   local status="$2"
@@ -918,6 +926,18 @@ appui_transcript_for_dir() {
   first_existing_artifact "$label AppUI transcript" \
     "$dir/m15-evidence/appui-transcript.jsonl" \
     "$dir/appui-transcript.jsonl"
+}
+
+verify_transport_dir_kind() {
+  local label="$1"
+  local dir="$2"
+  local expected="$3"
+  local actual
+  if ! actual="$(summary_env_value_for_dir "$dir" transport)"; then
+    die "$label artifact dir missing summary.env transport: $dir/summary.env"
+  fi
+  [ "$actual" = "$expected" ] \
+    || die "$label artifact dir has transport=$actual, expected $expected: $dir/summary.env"
 }
 
 extract_appui_method_sequence() {
@@ -2940,6 +2960,8 @@ verify_transport_parity() {
   local stdio_transcript
   ws_transcript="$(appui_transcript_for_dir "WebSocket transport parity" "$ws_dir")"
   stdio_transcript="$(appui_transcript_for_dir "stdio transport parity" "$stdio_dir")"
+  verify_transport_dir_kind "WebSocket transport parity" "$ws_dir" ws
+  verify_transport_dir_kind "stdio transport parity" "$stdio_dir" stdio
 
   local tmp_dir
   tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/octos-tui-transport-parity.XXXXXX")"
@@ -3948,6 +3970,8 @@ JSONL
   fi
 
   mkdir -p "$tmp_root/task-subagent-parity-ws/m15-evidence" "$tmp_root/task-subagent-parity-stdio/m15-evidence"
+  printf 'transport=ws\n' > "$tmp_root/task-subagent-parity-ws/summary.env"
+  printf 'transport=stdio\n' > "$tmp_root/task-subagent-parity-stdio/summary.env"
   cat > "$tmp_root/task-subagent-parity-ws/m15-evidence/appui-transcript.jsonl" <<'JSONL'
 {"direction":"client_to_server","frame":{"method":"turn/start"}}
 {"direction":"server_to_client","frame":{"method":"task/updated"}}
@@ -4133,6 +4157,8 @@ JSONL
   fi
 
   mkdir -p "$tmp_root/parity-ws/m15-evidence" "$tmp_root/parity-stdio/m15-evidence"
+  printf 'transport=ws\n' > "$tmp_root/parity-ws/summary.env"
+  printf 'transport=stdio\n' > "$tmp_root/parity-stdio/summary.env"
   cat > "$tmp_root/parity-ws/m15-evidence/appui-transcript.jsonl" <<'JSONL'
 {"direction":"client_to_server","frame":{"method":"session/open"}}
 {"direction":"client_to_server","frame":{"method":"agent/list"}}
@@ -4169,6 +4195,7 @@ JSONL
 
   mkdir -p "$tmp_root/bad-parity-stdio/m15-evidence"
   cp "$tmp_root/parity-stdio/m15-evidence/appui-transcript.jsonl" "$tmp_root/bad-parity-stdio/m15-evidence/"
+  cp "$tmp_root/parity-stdio/summary.env" "$tmp_root/bad-parity-stdio/summary.env"
   printf '{"direction":"tx","frame":{"method":"session/goal/get"}}\n' \
     >> "$tmp_root/bad-parity-stdio/m15-evidence/appui-transcript.jsonl"
   if env \
@@ -4176,6 +4203,16 @@ JSONL
     "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/bad-parity-stdio" \
     "$0" verify-transport-parity >/dev/null 2>&1; then
     die "self-test expected transport parity verification to fail"
+  fi
+
+  mkdir -p "$tmp_root/bad-parity-wrong-kind/m15-evidence"
+  cp "$tmp_root/parity-ws/m15-evidence/appui-transcript.jsonl" "$tmp_root/bad-parity-wrong-kind/m15-evidence/"
+  printf 'transport=stdio\n' > "$tmp_root/bad-parity-wrong-kind/summary.env"
+  if env \
+    "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/bad-parity-wrong-kind" \
+    "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/parity-stdio" \
+    "$0" verify-transport-parity >/dev/null 2>&1; then
+    die "self-test expected transport parity verification to fail on wrong transport kind"
   fi
 
   mkdir -p "$tmp_root/ux-run"
