@@ -856,6 +856,8 @@ summary for the retained pane captures and JSONL evidence; keep
 `soak-summary.json` for provider/profile-specific details.
 `summary.env` records the run id, transport, runtime paths, and the source
 checkout commits for both `octos` and `octos-tui`.
+Strict closure verifiers fail unless each retained closure artifact directory
+has valid `octos_repo_commit` and `octos_tui_repo_commit` fields.
 
 Verifier-backed pane captures must be non-empty and must not contain tmux
 capture failures, hidden task errors, malformed AppUI frames, unsupported-method
