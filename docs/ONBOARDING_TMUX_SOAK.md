@@ -43,10 +43,10 @@ scripts/run-onboarding-tmux-soak.sh solo-self-test
 scripts/run-onboarding-tmux-soak.sh stop
 ```
 
-`self-test` is local and synthetic. It does not start the backend; it creates a
-temporary profile JSON, runs `verify`, checks required artifact creation and
-redaction, then proves verification fails if `OCTOS_TUI_SOAK_API_KEY` appears
-in any artifact.
+`self-test` is local and synthetic. It does not start the backend; it creates
+temporary tmux panes and a temporary profile JSON, runs `verify`, checks
+required artifact creation and redaction, then proves verification fails if
+`OCTOS_TUI_SOAK_API_KEY` appears in any artifact.
 
 `solo-self-test` delegates to the backend M12 fixture probe. It validates the
 solo artifact schema and proves the retained AppUI transcript contains no OTP
@@ -286,6 +286,10 @@ Each verifier writes `ux-validation.json` with the run id, scenario, transport,
 artifact directory, status, and timestamp. Treat it as the machine-readable
 summary for the retained pane captures and JSONL evidence; keep
 `soak-summary.json` for provider/profile-specific details.
+
+Verifier-backed pane captures must be non-empty and must not contain tmux
+capture failures, hidden task errors, malformed AppUI frames, unsupported-method
+spam, or panic/traceback text.
 
 ## Required Artifacts
 
