@@ -835,8 +835,12 @@ write_ux_validation() {
   local summary="$3"
   local validation_run_id="$run_id"
   local validation_transport="$transport"
+  local validation_octos_repo_commit=""
+  local validation_octos_tui_repo_commit=""
   validation_run_id="$(summary_env_value run_id || printf '%s' "$run_id")"
   validation_transport="$(summary_env_value transport || printf '%s' "$transport")"
+  validation_octos_repo_commit="$(summary_env_value octos_repo_commit || true)"
+  validation_octos_tui_repo_commit="$(summary_env_value octos_tui_repo_commit || true)"
   mkdir -p "$artifact_dir"
   {
     printf '{\n'
@@ -846,6 +850,8 @@ write_ux_validation() {
     write_json_string_field status "$status"
     write_json_string_field transport "$validation_transport"
     write_json_string_field artifact_dir "$artifact_dir"
+    write_json_string_field octos_repo_commit "$validation_octos_repo_commit"
+    write_json_string_field octos_tui_repo_commit "$validation_octos_tui_repo_commit"
     write_json_string_field summary "$summary"
     write_json_string_field generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ""
     printf '}\n'
@@ -3410,6 +3416,10 @@ JSON
   [ -f "$tmp_root/artifacts/soak-summary.json" ] || die "self-test missing soak-summary.json"
   [ -f "$tmp_root/artifacts/api-parity-checklist.json" ] || die "self-test missing api-parity-checklist.json"
   [ -f "$tmp_root/artifacts/ux-validation.json" ] || die "self-test missing ux-validation.json"
+  grep -F '"octos_repo_commit": "' "$tmp_root/artifacts/ux-validation.json" >/dev/null \
+    || die "self-test missing octos_repo_commit in ux-validation.json"
+  grep -F '"octos_tui_repo_commit": "' "$tmp_root/artifacts/ux-validation.json" >/dev/null \
+    || die "self-test missing octos_tui_repo_commit in ux-validation.json"
   printf 'first_launch_capture=1\n' >> "$tmp_root/artifacts/summary.env"
   cat > "$tmp_root/artifacts/tui-capture-first-launch.txt" <<'CAPTURE'
 Welcome to Octos
