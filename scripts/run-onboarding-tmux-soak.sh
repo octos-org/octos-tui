@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -69,6 +69,8 @@ Environment:
   OCTOS_TUI_SOAK_FAKE_OPENAI_DELAY_SECS Optional fake API response delay for progress captures.
   OCTOS_TUI_SOAK_MULTILINE_PROMPT Optional multiline composer text used by
                                  drive-multiline-composer.
+  OCTOS_TUI_SOAK_INTERRUPT_PROMPT Optional long-running prompt used by
+                                 drive-interrupt-reconnect.
   OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE Set to 1 to launch without a preselected
                                  profile/session and save tui-capture-first-launch.txt.
   OCTOS_TUI_SOAK_REQUIRE_PROFILE Set to 0 to allow verify without profile JSON.
@@ -1209,6 +1211,42 @@ drive_dropped_completion_backpressure() {
   echo "Drove replay-lossy backpressure recovery in $tui_session"
 }
 
+drive_interrupt_reconnect() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-interrupt-reconnect"
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  local prompt="${OCTOS_TUI_SOAK_INTERRUPT_PROMPT:-M12 interrupt/reconnect fixture: start a long response, then interrupt and resume.}"
+  wait_for_tui_text "Ask Octos to change code" "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI composer before driving interrupt/reconnect"
+  submit_composer_prompt "$prompt"
+  wait_for_tui_text "Working|Thinking|Agent task|Running" "${OCTOS_TUI_SOAK_INTERRUPT_RUNNING_WAIT_SECS:-20}" || \
+    die "Timed out waiting for active turn before interrupt"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-interrupt-running.txt"
+
+  tmux send-keys -t "$tui_session" C-c
+  wait_for_tui_text "interrupt|cancel|Ask Octos to change code|Done" \
+    "${OCTOS_TUI_SOAK_INTERRUPT_DONE_WAIT_SECS:-30}" || \
+    die "Timed out waiting for interrupt acknowledgement in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-interrupt.txt"
+
+  if [ "$transport" = "ws" ]; then
+    restart_server
+    wait_for_tui_text "UI protocol reconnected|Ask Octos to change code|state" \
+      "${OCTOS_TUI_SOAK_RECONNECT_WAIT_SECS:-20}" || \
+      die "Timed out waiting for TUI to settle after interrupt reconnect"
+  else
+    send_tui_line "/status"
+    wait_for_tui_text "Status|Ask Octos to change code|state" \
+      "${OCTOS_TUI_SOAK_STATUS_WAIT_SECS:-10}" || \
+      die "Timed out waiting for post-interrupt status capture"
+  fi
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-interrupt-reconnect.txt"
+  capture
+  echo "Drove interrupt/reconnect capture in $tui_session"
+}
+
 verify_solo() {
   capture
   local required=(
@@ -1509,6 +1547,44 @@ verify_backpressure() {
   write_ux_validation "dropped-completion-backpressure" "passed" "dropped-completion backpressure captures verified"
   secret_leak_check
   echo "Verified dropped-completion backpressure artifacts in $artifact_dir"
+}
+
+verify_interrupt_reconnect() {
+  local running_capture="$artifact_dir/tui-capture-interrupt-running.txt"
+  local interrupt_capture="$artifact_dir/tui-capture-interrupt.txt"
+  local reconnect_capture="$artifact_dir/tui-capture-interrupt-reconnect.txt"
+  local transcript
+  transcript="$(first_existing_artifact "interrupt/reconnect AppUI transcript" \
+    "$artifact_dir/appui-transcript.jsonl" \
+    "$artifact_dir/m15-evidence/appui-transcript.jsonl")"
+
+  assert_capture_clean "$running_capture" "interrupt-running"
+  assert_capture_clean "$interrupt_capture" "interrupt"
+  assert_capture_clean "$reconnect_capture" "interrupt-reconnect"
+
+  grep -Ei 'Working|Thinking|Agent task|Running' "$running_capture" >/dev/null 2>&1 \
+    || die "interrupt running capture missing active turn state"
+  grep -Ei 'interrupt|cancel' "$interrupt_capture" >/dev/null 2>&1 \
+    || die "interrupt capture missing interrupt/cancel acknowledgement"
+  grep --fixed-strings -- "Ask Octos to change code" "$interrupt_capture" "$reconnect_capture" >/dev/null 2>&1 \
+    || die "interrupt/reconnect captures missing usable composer"
+  grep -E 'UI protocol reconnected|Status|state' "$reconnect_capture" >/dev/null 2>&1 \
+    || die "interrupt reconnect capture missing reconnect/status evidence"
+
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"turn/interrupt"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "interrupt transcript missing turn/interrupt request"
+  grep -E '"method"[[:space:]]*:[[:space:]]*"(session/open|session/status/read|session/snapshot|session/hydrate|config/capabilities/list|protocol/replay_lossy)"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "interrupt/reconnect transcript missing session hydration/status evidence"
+  if grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"(turn/completed|protocol/replay_lossy)"' \
+    "$transcript" >/dev/null 2>&1; then
+    die "interrupt/reconnect transcript shows client-owned lifecycle/replay notification traffic"
+  fi
+
+  write_ux_validation "interrupt-reconnect" "passed" "interrupt and reconnect capture verified"
+  secret_leak_check
+  echo "Verified interrupt/reconnect artifacts in $artifact_dir"
 }
 
 verify_task_subagent_tree() {
@@ -2045,6 +2121,39 @@ CAPTURE
     die "self-test expected dropped turn/completed backpressure verification to fail"
   fi
 
+  mkdir -p "$tmp_root/interrupt-reconnect"
+  cat > "$tmp_root/interrupt-reconnect/tui-capture-interrupt-running.txt" <<'CAPTURE'
+Assistant is streaming a long answer
+state Working
+CAPTURE
+  cat > "$tmp_root/interrupt-reconnect/tui-capture-interrupt.txt" <<'CAPTURE'
+Turn interrupted by client request
+Ask Octos to change code...
+state Done
+CAPTURE
+  cat > "$tmp_root/interrupt-reconnect/tui-capture-interrupt-reconnect.txt" <<'CAPTURE'
+UI protocol reconnected to ws://127.0.0.1:50179/api/ui-protocol/ws.
+Ask Octos to change code...
+state Done
+CAPTURE
+  cat > "$tmp_root/interrupt-reconnect/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"turn/interrupt"}}
+{"direction":"client_to_server","frame":{"method":"session/status/read"}}
+JSONL
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/interrupt-reconnect" "$0" verify-interrupt-reconnect >/dev/null
+
+  mkdir -p "$tmp_root/bad-interrupt-reconnect"
+  cp "$tmp_root/interrupt-reconnect/tui-capture-interrupt-running.txt" "$tmp_root/bad-interrupt-reconnect/"
+  cp "$tmp_root/interrupt-reconnect/tui-capture-interrupt.txt" "$tmp_root/bad-interrupt-reconnect/"
+  cp "$tmp_root/interrupt-reconnect/tui-capture-interrupt-reconnect.txt" "$tmp_root/bad-interrupt-reconnect/"
+  cat > "$tmp_root/bad-interrupt-reconnect/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"turn/start"}}
+{"direction":"client_to_server","frame":{"method":"session/status/read"}}
+JSONL
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-interrupt-reconnect" "$0" verify-interrupt-reconnect >/dev/null 2>&1; then
+    die "self-test expected interrupt/reconnect verification to fail without turn/interrupt"
+  fi
+
   mkdir -p "$tmp_root/bad-approval-denial"
   cp "$tmp_root/approval-denial/tui-capture-approval-request.txt" "$tmp_root/bad-approval-denial/"
   cat > "$tmp_root/bad-approval-denial/tui-capture-approval-denied.txt" <<'CAPTURE'
@@ -2285,6 +2394,7 @@ case "${1:-help}" in
   drive-task-subagent-tree) drive_task_subagent_tree ;;
   drive-task-subagent-reconnect) drive_task_subagent_reconnect ;;
   drive-dropped-completion-backpressure) drive_dropped_completion_backpressure ;;
+  drive-interrupt-reconnect) drive_interrupt_reconnect ;;
   capture) capture ;;
   send-turn) send_turn ;;
   verify) verify ;;
@@ -2298,6 +2408,7 @@ case "${1:-help}" in
   verify-task-subagent-tree) verify_task_subagent_tree ;;
   verify-task-subagent-reconnect) verify_task_subagent_reconnect ;;
   verify-backpressure) verify_backpressure ;;
+  verify-interrupt-reconnect) verify_interrupt_reconnect ;;
   verify-autonomy-live) verify_autonomy_live ;;
   verify-ux-run) verify_ux_run ;;
   api-parity) api_parity ;;
