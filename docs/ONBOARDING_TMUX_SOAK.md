@@ -854,6 +854,8 @@ Each verifier writes `ux-validation.json` with the run id, scenario, transport,
 artifact directory, status, and timestamp. Treat it as the machine-readable
 summary for the retained pane captures and JSONL evidence; keep
 `soak-summary.json` for provider/profile-specific details.
+`summary.env` records the run id, transport, runtime paths, and the source
+checkout commits for both `octos` and `octos-tui`.
 
 Verifier-backed pane captures must be non-empty and must not contain tmux
 capture failures, hidden task errors, malformed AppUI frames, unsupported-method

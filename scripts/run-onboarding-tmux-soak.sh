@@ -633,6 +633,8 @@ write_summary() {
     printf 'first_launch_capture=%s\n' "$first_launch_capture"
     printf 'workspace=%s\n' "$workspace"
     printf 'data_dir=%s\n' "$data_dir"
+    printf 'octos_repo_commit=%s\n' "$(git_commit_for_dir "$octos_repo")"
+    printf 'octos_tui_repo_commit=%s\n' "$(git_commit_for_dir "$repo_root")"
     printf 'host=%s\n' "$host"
     printf 'port=%s\n' "$port"
   } > "$artifact_dir/summary.env"
@@ -3308,6 +3310,10 @@ JSON
   env "${child_env[@]}" "$0" verify-onboard >/dev/null
 
   [ -f "$tmp_root/artifacts/summary.env" ] || die "self-test missing summary.env"
+  grep -F 'octos_repo_commit=' "$tmp_root/artifacts/summary.env" >/dev/null \
+    || die "self-test missing octos_repo_commit in summary.env"
+  grep -F 'octos_tui_repo_commit=' "$tmp_root/artifacts/summary.env" >/dev/null \
+    || die "self-test missing octos_tui_repo_commit in summary.env"
   [ -f "$tmp_root/artifacts/server.log" ] || die "self-test missing server.log"
   [ -f "$tmp_root/artifacts/server-pane.txt" ] || die "self-test missing server-pane.txt"
   [ -f "$tmp_root/artifacts/tui-capture.txt" ] || die "self-test missing tui-capture.txt"
