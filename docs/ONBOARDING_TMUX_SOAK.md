@@ -224,8 +224,33 @@ evidence such as `session/open`, `agent/list`, `session/goal/get`,
 
 ## M15 Autonomy Live Artifacts
 
-For M15 production autonomy evidence, point the verifier at a retained live
-artifact directory:
+For M15 production autonomy evidence, start the normal tmux harness against a
+production-capable backend and drive the autonomy path:
+
+```sh
+OCTOS_TUI_SOAK_RUN_ID=autonomy-live-$(date -u +%Y%m%dT%H%M%SZ) \
+scripts/run-onboarding-tmux-soak.sh start
+
+OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-autonomy-live
+```
+
+`drive-autonomy-live` sends `/goal`, fixed/self-paced/maintenance `/loop`
+commands, `/loop list`, a supervised review prompt, and `/agents list`. Set
+`OCTOS_TUI_SOAK_AUTONOMY_LOOP_ID=<loop-id>` after a loop is visible to also
+drive `/loop fire-now`, `/loop pause`, and `/loop resume`. Set
+`OCTOS_TUI_SOAK_AUTONOMY_AGENT_ID=<agent-id>` after an agent is visible to also
+drive `/agents status`, `/agents output`, and `/agents artifacts`.
+
+If the backend writes M15 JSON evidence outside the TUI artifact directory, set
+`OCTOS_TUI_M15_UX_OUTPUT_DIR=<path>` before `drive-autonomy-live`; the driver
+copies it under `m15-evidence/` for the verifier.
+
+The driver keeps per-step captures and also writes
+`tui-capture-autonomy-live.txt` as the aggregate capture used by
+`verify-autonomy-live`.
+
+Then point the verifier at the retained live artifact directory:
 
 ```sh
 OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<run-id> \

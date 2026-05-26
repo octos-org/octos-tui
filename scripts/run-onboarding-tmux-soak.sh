@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-autonomy-live|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -83,6 +83,14 @@ Environment:
                                  drive-tool-denial.
   OCTOS_TUI_SOAK_TOOL_SUCCESS_PROMPT Optional prompt used by
                                  drive-tool-success.
+  OCTOS_TUI_SOAK_AUTONOMY_GOAL Optional /goal objective used by
+                                 drive-autonomy-live.
+  OCTOS_TUI_SOAK_AUTONOMY_LOOP_ID Optional loop id used by
+                                 drive-autonomy-live for fire-now/pause/resume.
+  OCTOS_TUI_SOAK_AUTONOMY_AGENT_ID Optional agent id used by
+                                 drive-autonomy-live for status/output/artifacts.
+  OCTOS_TUI_M15_UX_OUTPUT_DIR    Optional live M15 evidence directory copied
+                                 into the retained artifact bundle.
   OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE Set to 1 to launch without a preselected
                                  profile/session and save tui-capture-first-launch.txt.
   OCTOS_TUI_SOAK_REQUIRE_PROFILE Set to 0 to allow verify without profile JSON.
@@ -1212,6 +1220,135 @@ drive_task_subagent_reconnect() {
   capture_pane "$tui_session" "$artifact_dir/tui-capture-task-subagent-tree-reconnect.txt"
   capture
   echo "Drove task/subagent reconnect capture in $tui_session"
+}
+
+drive_autonomy_live() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-autonomy-live"
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  local goal="${OCTOS_TUI_SOAK_AUTONOMY_GOAL:-Keep the production autonomy soak moving until the final joined answer is visible.}"
+  local loop_fixed="${OCTOS_TUI_SOAK_AUTONOMY_LOOP_FIXED_PROMPT:-check child-agent progress and report backend truth}"
+  local loop_self="${OCTOS_TUI_SOAK_AUTONOMY_LOOP_SELF_PROMPT:-continue the autonomy soak when the backend decides it is idle}"
+  local loop_maintenance="${OCTOS_TUI_SOAK_AUTONOMY_LOOP_MAINTENANCE_PROMPT:-prune stale autonomy artifacts after the soak}"
+  local review_prompt="${OCTOS_TUI_SOAK_AUTONOMY_REVIEW_PROMPT:-Run a production autonomy review with supervised child agents. Produce model-generated per-child progress summaries, a model-generated final joined answer, goal continuation updates, and loop fire evidence.}"
+  local loop_id="${OCTOS_TUI_SOAK_AUTONOMY_LOOP_ID:-}"
+  local agent_id="${OCTOS_TUI_SOAK_AUTONOMY_AGENT_ID:-}"
+
+  wait_for_tui_text "Ask Octos to change code" "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI composer before driving M15 autonomy"
+
+  send_tui_line "/goal $goal"
+  wait_for_tui_text "Goal|goal|session/goal" "${OCTOS_TUI_SOAK_AUTONOMY_GOAL_WAIT_SECS:-20}" || \
+    die "Timed out waiting for goal runtime evidence in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-goal.txt"
+
+  send_tui_line "/loop 5m $loop_fixed"
+  wait_for_tui_text "Loop|loop|loop/create" "${OCTOS_TUI_SOAK_AUTONOMY_LOOP_WAIT_SECS:-20}" || \
+    die "Timed out waiting for fixed loop evidence in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-loop-fixed.txt"
+
+  send_tui_line "/loop $loop_self"
+  wait_for_tui_text "Loop|loop|loop/create" "${OCTOS_TUI_SOAK_AUTONOMY_LOOP_WAIT_SECS:-20}" || \
+    die "Timed out waiting for self-paced loop evidence in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-loop-self-paced.txt"
+
+  send_tui_line "/loop maintenance $loop_maintenance"
+  wait_for_tui_text "Loop|loop|loop/create" "${OCTOS_TUI_SOAK_AUTONOMY_LOOP_WAIT_SECS:-20}" || \
+    die "Timed out waiting for maintenance loop evidence in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-loop-maintenance.txt"
+
+  send_tui_line "/loop list"
+  wait_for_tui_text "Loop|loop|loop/list" "${OCTOS_TUI_SOAK_AUTONOMY_LOOP_WAIT_SECS:-20}" || \
+    die "Timed out waiting for loop list evidence in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-loop-list.txt"
+
+  if [ -n "$loop_id" ]; then
+    send_tui_line "/loop fire-now $loop_id"
+    wait_for_tui_text "Loop|loop|fire|fired|completed" "${OCTOS_TUI_SOAK_AUTONOMY_FIRE_WAIT_SECS:-40}" || \
+      die "Timed out waiting for loop fire-now evidence in TUI"
+    capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-loop-fire-now.txt"
+
+    send_tui_line "/loop pause $loop_id"
+    wait_for_tui_text "Loop|loop|pause|paused" "${OCTOS_TUI_SOAK_AUTONOMY_LOOP_WAIT_SECS:-20}" || \
+      die "Timed out waiting for loop pause evidence in TUI"
+    capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-loop-paused.txt"
+
+    send_tui_line "/loop resume $loop_id"
+    wait_for_tui_text "Loop|loop|resume|resumed" "${OCTOS_TUI_SOAK_AUTONOMY_LOOP_WAIT_SECS:-20}" || \
+      die "Timed out waiting for loop resume evidence in TUI"
+    capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-loop-resumed.txt"
+  fi
+
+  submit_composer_prompt "$review_prompt"
+  wait_for_tui_text "Agent|agent|Goal|goal|Loop|loop|summary|final|completed|joined answer" \
+    "${OCTOS_TUI_SOAK_AUTONOMY_REVIEW_WAIT_SECS:-120}" || \
+    die "Timed out waiting for production autonomy review evidence in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-review.txt"
+
+  send_tui_line "/agents list"
+  wait_for_tui_text "Agent|agent|agent/list" "${OCTOS_TUI_SOAK_AUTONOMY_AGENT_WAIT_SECS:-20}" || \
+    die "Timed out waiting for agent list evidence in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-agents.txt"
+
+  if [ -n "$agent_id" ]; then
+    send_tui_line "/agents status $agent_id"
+    wait_for_tui_text "Agent|agent|status" "${OCTOS_TUI_SOAK_AUTONOMY_AGENT_WAIT_SECS:-20}" || \
+      die "Timed out waiting for agent status evidence in TUI"
+    capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-agent-status.txt"
+
+    send_tui_line "/agents output $agent_id"
+    wait_for_tui_text "Agent|agent|output|summary|final" "${OCTOS_TUI_SOAK_AUTONOMY_AGENT_WAIT_SECS:-20}" || \
+      die "Timed out waiting for agent output evidence in TUI"
+    capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-agent-output.txt"
+
+    send_tui_line "/agents artifacts $agent_id"
+    wait_for_tui_text "Agent|agent|Artifacts|artifacts" "${OCTOS_TUI_SOAK_AUTONOMY_AGENT_WAIT_SECS:-20}" || \
+      die "Timed out waiting for agent artifact evidence in TUI"
+    capture_pane "$tui_session" "$artifact_dir/tui-capture-autonomy-agent-artifacts.txt"
+  fi
+
+  local aggregate_capture="$artifact_dir/tui-capture-autonomy-live.txt"
+  : > "$aggregate_capture"
+  local step_capture
+  for step_capture in \
+    "$artifact_dir/tui-capture-autonomy-goal.txt" \
+    "$artifact_dir/tui-capture-autonomy-loop-fixed.txt" \
+    "$artifact_dir/tui-capture-autonomy-loop-self-paced.txt" \
+    "$artifact_dir/tui-capture-autonomy-loop-maintenance.txt" \
+    "$artifact_dir/tui-capture-autonomy-loop-list.txt" \
+    "$artifact_dir/tui-capture-autonomy-loop-fire-now.txt" \
+    "$artifact_dir/tui-capture-autonomy-loop-paused.txt" \
+    "$artifact_dir/tui-capture-autonomy-loop-resumed.txt" \
+    "$artifact_dir/tui-capture-autonomy-review.txt" \
+    "$artifact_dir/tui-capture-autonomy-agents.txt" \
+    "$artifact_dir/tui-capture-autonomy-agent-status.txt" \
+    "$artifact_dir/tui-capture-autonomy-agent-output.txt" \
+    "$artifact_dir/tui-capture-autonomy-agent-artifacts.txt"
+  do
+    [ -f "$step_capture" ] || continue
+    printf '\n== %s ==\n' "$(basename "$step_capture")" >> "$aggregate_capture"
+    cat "$step_capture" >> "$aggregate_capture"
+  done
+  [ -s "$aggregate_capture" ] || die "M15 autonomy aggregate capture was not written"
+
+  if [ -n "${OCTOS_TUI_M15_UX_OUTPUT_DIR:-}" ] && [ -d "$OCTOS_TUI_M15_UX_OUTPUT_DIR" ]; then
+    local m15_source_abs
+    local m15_dest_abs
+    m15_source_abs="$(cd "$OCTOS_TUI_M15_UX_OUTPUT_DIR" && pwd -P)"
+    mkdir -p "$artifact_dir/m15-evidence"
+    m15_dest_abs="$(cd "$artifact_dir/m15-evidence" && pwd -P)"
+    case "$m15_dest_abs/" in
+      "$m15_source_abs"/*|"$m15_source_abs/")
+        die "Refusing recursive M15 evidence copy from $m15_source_abs to $m15_dest_abs"
+        ;;
+    esac
+    cp -R "$m15_source_abs"/. "$m15_dest_abs"/
+  fi
+
+  capture
+  echo "Drove M15 autonomy live flow in $tui_session"
 }
 
 drive_dropped_completion_backpressure() {
@@ -2906,6 +3043,7 @@ case "${1:-help}" in
   drive-runtime-menus) drive_runtime_menus ;;
   drive-task-subagent-tree) drive_task_subagent_tree ;;
   drive-task-subagent-reconnect) drive_task_subagent_reconnect ;;
+  drive-autonomy-live) drive_autonomy_live ;;
   drive-dropped-completion-backpressure) drive_dropped_completion_backpressure ;;
   drive-interrupt-reconnect) drive_interrupt_reconnect ;;
   drive-validator-cycle) drive_validator_cycle ;;
