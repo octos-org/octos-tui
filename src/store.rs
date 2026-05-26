@@ -1924,6 +1924,7 @@ impl Store {
         self.state.status = format!("Opening coding session for profile {profile_id}");
         Some(AppUiCommand::OpenSession(SessionOpenParams {
             session_id,
+            topic: None,
             profile_id: Some(profile_id),
             cwd: onboarding_workspace_cwd(&self.state.workspace.root),
             after: None,
@@ -4206,6 +4207,7 @@ impl Store {
                 session_id,
                 turn_id,
                 text,
+                ..
             }) => {
                 let follow_tail = self.state.transcript_scroll == 0;
                 let mut reset_scroll = false;
@@ -4761,6 +4763,7 @@ impl Store {
             task_id,
             cursor,
             text,
+            ..
         } = event;
 
         let Some(task) = self.find_task_mut(&session_id, &task_id) else {
@@ -8991,6 +8994,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
                 session_id,
+                topic: None,
                 turn_id,
                 cursor: None,
                 tokens_in: None,
@@ -9024,6 +9028,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
                 session_id,
+                topic: None,
                 turn_id: turn_id.clone(),
                 cursor: None,
                 tokens_in: None,
@@ -9064,6 +9069,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
                 session_id,
+                topic: None,
                 turn_id,
                 cursor: None,
                 tokens_in: None,
@@ -9096,6 +9102,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
                 session_id,
+                topic: None,
                 turn_id,
                 cursor: None,
                 tokens_in: None,
@@ -9132,6 +9139,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
                 session_id,
+                topic: None,
                 turn_id,
                 cursor: None,
                 tokens_in: None,
@@ -9162,6 +9170,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
                 session_id,
+                topic: None,
                 turn_id: TurnId::new(),
                 cursor: None,
                 tokens_in: None,
@@ -9189,6 +9198,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
             MessageDeltaEvent {
                 session_id,
+                topic: None,
                 turn_id: TurnId::new(),
                 text: " stale".into(),
             },
@@ -9342,6 +9352,7 @@ mod tests {
             .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
                     session_id: session_id.clone(),
+                    topic: None,
                     turn_id,
                     cursor: None,
                     tokens_in: None,
@@ -9422,6 +9433,7 @@ mod tests {
             .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
                     session_id: session_id.clone(),
+                    topic: None,
                     turn_id,
                     cursor: None,
                     tokens_in: None,
@@ -9746,6 +9758,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
                 session_id,
+                topic: None,
                 turn_id,
                 cursor: None,
                 tokens_in: None,
@@ -9926,6 +9939,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::TaskOutputDelta(
             TaskOutputDeltaEvent {
                 session_id: session_id.clone(),
+                topic: None,
                 task_id: task_id.clone(),
                 text: "line one\n".into(),
                 cursor: OutputCursor { offset: 9 },
@@ -10103,6 +10117,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
             TurnErrorEvent {
                 session_id,
+                topic: None,
                 turn_id,
                 code: "interrupted".into(),
                 message: "turn interrupted by client".into(),
@@ -10265,6 +10280,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
             TurnErrorEvent {
                 session_id,
+                topic: None,
                 turn_id: TurnId::new(),
                 code: "stale_error".into(),
                 message: "old turn failed".into(),
@@ -10314,6 +10330,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::TaskOutputDelta(
             TaskOutputDeltaEvent {
                 session_id,
+                topic: None,
                 task_id,
                 text,
                 cursor: OutputCursor { offset: 601 },

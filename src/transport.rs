@@ -1238,6 +1238,7 @@ impl AppUiBackend for ProtocolAppUiBackend {
             self.send(AppUiCommand::OpenSession(
                 octos_core::ui_protocol::SessionOpenParams {
                     session_id,
+                    topic: None,
                     profile_id: self.launch.profile_id.clone(),
                     cwd: self.launch.cwd.clone(),
                     after: None,
@@ -1976,6 +1977,7 @@ fn success_response_to_app_event(
                 Ok(Some(
                     AppUiEvent::Protocol(UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
                         session_id: result.session_id,
+                        topic: None,
                         task_id: result.task_id,
                         cursor: result.next_cursor,
                         text,
@@ -2906,21 +2908,25 @@ impl MockAppUiBackend {
         }));
         self.enqueue_protocol(UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: turn_id.clone(),
             text: "Planning ".into(),
         }));
         self.enqueue_protocol(UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: turn_id.clone(),
             text: "a safe ".into(),
         }));
         self.enqueue_protocol(UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: turn_id.clone(),
             text: "M9 scaffold over mock transport.".into(),
         }));
         self.enqueue_protocol(UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: session_id.clone(),
+            topic: None,
             task_id: build_task_id.clone(),
             tool_call_id: None,
             title: "mock background synthesis".into(),
@@ -2934,6 +2940,7 @@ impl MockAppUiBackend {
         }));
         self.enqueue_protocol(UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             task_id: build_task_id.clone(),
             cursor: OutputCursor { offset: 42 },
             text: "mock worker: draft protocol notifications\n".into(),
@@ -2954,6 +2961,7 @@ impl MockAppUiBackend {
         }));
         self.enqueue_protocol(UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: session_id.clone(),
+            topic: None,
             task_id: build_task_id,
             tool_call_id: None,
             title: "mock background synthesis".into(),
@@ -2975,6 +2983,7 @@ impl MockAppUiBackend {
         }));
         self.enqueue_protocol(UiNotification::TurnCompleted(TurnCompletedEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id,
             cursor: Some(UiCursor {
                 stream: "session_events".into(),
@@ -4623,6 +4632,7 @@ mod tests {
             AppUiCommand::ListConfigCapabilities(ConfigCapabilitiesListParams {}),
             AppUiCommand::OpenSession(SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: Some("coding".into()),
                 cwd: Some("/repo".into()),
                 after: None,
@@ -5111,6 +5121,7 @@ mod tests {
         let request = exchange
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: Some("coding".into()),
                 cwd: None,
                 after: None,
@@ -5332,6 +5343,7 @@ mod tests {
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: Some("coding".into()),
                 cwd: Some("/repo".into()),
                 after: None,
@@ -5898,6 +5910,7 @@ mod tests {
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
                 session_id: SessionKey("local:test".into()),
+                topic: None,
                 profile_id: Some("coding".into()),
                 cwd: None,
                 after: None,
@@ -5971,6 +5984,7 @@ mod tests {
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
                 session_id: SessionKey("local:test".into()),
+                topic: None,
                 profile_id: Some("coding".into()),
                 cwd: Some("/tmp/project".into()),
                 after: None,
@@ -6046,6 +6060,7 @@ mod tests {
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: Some("coding".into()),
                 cwd: None,
                 after: None,
