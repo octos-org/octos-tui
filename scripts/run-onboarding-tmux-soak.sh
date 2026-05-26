@@ -565,20 +565,26 @@ assert_profile_value() {
   fi
 }
 
-secret_leak_check() {
+secret_leak_check_dir() {
+  local dir="$1"
+  local label="$2"
   local secret="${OCTOS_TUI_SOAK_API_KEY:-}"
   local file
   if [ -z "$secret" ]; then
     return 0
   fi
-  if [ ! -d "$artifact_dir" ]; then
+  if [ ! -d "$dir" ]; then
     return 0
   fi
   while IFS= read -r -d '' file; do
     if [ -f "$file" ] && grep --fixed-strings -- "$secret" "$file" >/dev/null 2>&1; then
-      die "Secret leaked into soak artifact: $file"
+      die "Secret leaked into $label artifact: $file"
     fi
-  done < <(find "$artifact_dir" -type f -print0)
+  done < <(find "$dir" -type f -print0)
+}
+
+secret_leak_check() {
+  secret_leak_check_dir "$artifact_dir" "soak"
 }
 
 runtime_env_prefix() {
@@ -2962,6 +2968,8 @@ verify_transport_parity() {
   stdio_transcript="$(appui_transcript_for_dir "stdio transport parity" "$stdio_dir")"
   verify_transport_dir_kind "WebSocket transport parity" "$ws_dir" ws
   verify_transport_dir_kind "stdio transport parity" "$stdio_dir" stdio
+  secret_leak_check_dir "$ws_dir" "WebSocket transport parity"
+  secret_leak_check_dir "$stdio_dir" "stdio transport parity"
 
   local tmp_dir
   tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/octos-tui-transport-parity.XXXXXX")"
@@ -4213,6 +4221,18 @@ JSONL
     "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/parity-stdio" \
     "$0" verify-transport-parity >/dev/null 2>&1; then
     die "self-test expected transport parity verification to fail on wrong transport kind"
+  fi
+
+  mkdir -p "$tmp_root/bad-parity-secret/m15-evidence"
+  cp "$tmp_root/parity-ws/m15-evidence/appui-transcript.jsonl" "$tmp_root/bad-parity-secret/m15-evidence/"
+  cp "$tmp_root/parity-ws/summary.env" "$tmp_root/bad-parity-secret/summary.env"
+  printf 'retained secret: selftest-secret\n' > "$tmp_root/bad-parity-secret/leak.txt"
+  if env \
+    "OCTOS_TUI_SOAK_API_KEY=selftest-secret" \
+    "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/bad-parity-secret" \
+    "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/parity-stdio" \
+    "$0" verify-transport-parity >/dev/null 2>&1; then
+    die "self-test expected transport parity verification to fail on secret leak"
   fi
 
   mkdir -p "$tmp_root/ux-run"
