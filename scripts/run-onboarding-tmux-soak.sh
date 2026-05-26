@@ -2344,6 +2344,49 @@ CAPTURE
     die "self-test expected unsupported-method capture verification to fail"
   fi
 
+  mkdir -p "$tmp_root/solo-core"
+  cat > "$tmp_root/solo-core/summary.env" <<'SUMMARY'
+run_id=solo-core-selftest
+transport=stdio
+SUMMARY
+  cat > "$tmp_root/solo-core/tui-capture.txt" <<'CAPTURE'
+Agent task completed
+Ask Octos to change code...
+state Done | approval gated | coding
+CAPTURE
+  cp "$tmp_root/solo-core/tui-capture.txt" "$tmp_root/solo-core/tui-capture.before"
+  printf 'synthetic server log\n' > "$tmp_root/solo-core/server.log"
+  cat > "$tmp_root/solo-core/appui-transcript.jsonl" <<'JSONL'
+{"direction":"tx","frame":{"method":"config/capabilities/list"}}
+{"direction":"tx","frame":{"method":"session/open"}}
+{"direction":"tx","frame":{"method":"session/status/read"}}
+JSONL
+  printf '{"runtime_mode":"solo","permission_profile":"danger_full_access"}\n' > "$tmp_root/solo-core/runtime-policy-stamp.json"
+  printf '{"coding_tool_contract":{"status":"ready","missing_required_tools":[]}}\n' > "$tmp_root/solo-core/tool-registry-snapshot.json"
+  printf '{"total":0,"requested":0}\n' > "$tmp_root/solo-core/approval-events.jsonl"
+  printf '{"workspace_write":true}\n' > "$tmp_root/solo-core/filesystem-probe.json"
+  cat > "$tmp_root/solo-core/soak-summary.json" <<'JSON'
+{
+  "schema": "octos-m12-solo-appui-soak-v1",
+  "status": "passed",
+  "transport": "stdio",
+  "cases": [
+    {"name": "workspace-cwd-open", "status": "ok"},
+    {"name": "coding-tool-contract-ready", "status": "ok", "contract_status": "ready", "missing_required_tools": []}
+  ]
+}
+JSON
+  env \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/solo-core" \
+    "OCTOS_TUI_SOAK_SOLO_STRICT=1" \
+    "OCTOS_TUI_SOAK_API_KEY=selftest-secret" \
+    "$0" verify-solo >/dev/null
+  cmp -s "$tmp_root/solo-core/tui-capture.before" "$tmp_root/solo-core/tui-capture.txt" \
+    || die "self-test expected verify-solo to preserve retained tui-capture.txt"
+  [ -f "$tmp_root/solo-core/summary-matrix.md" ] || die "self-test missing solo summary matrix"
+  grep --fixed-strings -- '"scenario": "solo-onboarding"' "$tmp_root/solo-core/ux-validation.json" >/dev/null 2>&1 \
+    || die "self-test missing solo-onboarding ux validation"
+
   mkdir -p "$tmp_root/approval-denial"
   cat > "$tmp_root/approval-denial/tui-capture-approval-request.txt" <<'CAPTURE'
 Approval Requested inline
