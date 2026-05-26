@@ -507,11 +507,14 @@ OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<stdio-run-id>
 scripts/run-onboarding-tmux-soak.sh verify-transport-parity
 ```
 
-The verifier reads `appui-transcript.jsonl` from each directory, including the
-`m15-evidence/` subdirectory when present, normalizes `client_to_server`/`tx`
-and `server_to_client`/`rx`, then compares the direction + method sequence.
-Set `OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE=set` only when the issue acceptance
-requires method-set parity rather than ordering parity.
+The verifier first checks each directory's `summary.env` transport metadata:
+the WebSocket directory must record `transport=ws`, and the stdio directory
+must record `transport=stdio`. It then reads `appui-transcript.jsonl` from each
+directory, including the `m15-evidence/` subdirectory when present, normalizes
+`client_to_server`/`tx` and `server_to_client`/`rx`, then compares the
+direction + method sequence. Set `OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE=set`
+only when the issue acceptance requires method-set parity rather than ordering
+parity.
 
 ## Dropped Completion Backpressure
 
