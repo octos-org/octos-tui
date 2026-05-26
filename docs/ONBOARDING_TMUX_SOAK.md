@@ -94,10 +94,28 @@ OCTOS_TUI_SOAK_TRANSPORT=ws OCTOS_TUI_SOAK_RUN_ID=<run-id> scripts/run-onboardin
 OCTOS_TUI_SOAK_TRANSPORT=ws OCTOS_TUI_SOAK_RUN_ID=<run-id> scripts/run-onboarding-tmux-soak.sh verify-solo
 ```
 
+First-launch splash capture:
+
+```sh
+OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE=1 \
+OCTOS_TUI_SOAK_TRANSPORT=stdio \
+OCTOS_TUI_SOAK_RUN_ID=first-launch-$(date -u +%Y%m%dT%H%M%SZ) \
+scripts/run-onboarding-tmux-soak.sh start
+```
+
+This mode is intentionally opt-in. It starts the TUI without a preselected
+profile or session, refuses to reuse an existing profile JSON, waits for the
+`Welcome to Octos` onboarding surface, and writes
+`tui-capture-first-launch.txt` beside the regular `tui-capture.txt`. Use it
+when collecting M22/M19 evidence for the first-launch splash; keep the default
+launch shape for provider-missing and coding-session lanes.
+
 The solo lane writes these M12 artifacts into
 `e2e/test-results-tui-onboarding/<run-id>/`:
 
 - `tui-capture.txt`
+- `tui-capture-first-launch.txt` when
+  `OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE=1`
 - `server.log`
 - `appui-transcript.jsonl`
 - `runtime-policy-stamp.json`

@@ -38,6 +38,7 @@ fake_openai_host="${OCTOS_TUI_SOAK_FAKE_OPENAI_HOST:-127.0.0.1}"
 fake_openai_port="${OCTOS_TUI_SOAK_FAKE_OPENAI_PORT:-50180}"
 fake_openai_session="${OCTOS_TUI_SOAK_FAKE_OPENAI_SESSION:-octos-onboard-fake-openai-$run_id}"
 fake_openai_delay_secs="${OCTOS_TUI_SOAK_FAKE_OPENAI_DELAY_SECS:-0}"
+first_launch_capture="${OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE:-0}"
 endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
@@ -66,6 +67,8 @@ Environment:
   OCTOS_TUI_SOAK_FAKE_OPENAI     Set to 1 to start scripts/fake-openai-server.py in tmux.
   OCTOS_TUI_SOAK_FAKE_OPENAI_PORT Local fake OpenAI-compatible port, default 50180.
   OCTOS_TUI_SOAK_FAKE_OPENAI_DELAY_SECS Optional fake API response delay for progress captures.
+  OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE Set to 1 to launch without a preselected
+                                 profile/session and save tui-capture-first-launch.txt.
   OCTOS_TUI_SOAK_REQUIRE_PROFILE Set to 0 to allow verify without profile JSON.
   OCTOS_TUI_SOAK_SOLO_STRICT     Set to 1 to fail when M12-A/C capability blockers remain.
                                  Also requires MCP/tool fixture mutations to pass
@@ -375,6 +378,7 @@ write_summary() {
     printf 'profile_id=%s\n' "$profile_id"
     printf 'session_id=%s\n' "$session_id"
     printf 'open_session=%s\n' "$open_session"
+    printf 'first_launch_capture=%s\n' "$first_launch_capture"
     printf 'workspace=%s\n' "$workspace"
     printf 'data_dir=%s\n' "$data_dir"
     printf 'host=%s\n' "$host"
@@ -506,11 +510,17 @@ start() {
   write_api_parity_checklist
 
   local profile_path="$data_dir/profiles/$profile_id.json"
-  init_profile_if_missing "$profile_path"
+  if [ "$first_launch_capture" = "1" ]; then
+    if [ -f "$profile_path" ]; then
+      die "OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE=1 requires no existing profile JSON: $profile_path"
+    fi
+  else
+    init_profile_if_missing "$profile_path"
+  fi
   local launch_session_id="$session_id"
   local profile_family=""
   profile_family="$(profile_value "$profile_path" family_id || true)"
-  if [ "$open_session" = "0" ] || { [ "$open_session" = "auto" ] && { [ ! -f "$profile_path" ] || [ -z "$profile_family" ]; }; }; then
+  if [ "$first_launch_capture" = "1" ] || [ "$open_session" = "0" ] || { [ "$open_session" = "auto" ] && { [ ! -f "$profile_path" ] || [ -z "$profile_family" ]; }; }; then
     launch_session_id=""
   fi
   if [ -f "$profile_path" ]; then
@@ -564,11 +574,20 @@ start() {
   if [ -n "$launch_session_id" ]; then
     tui_cmd="$tui_cmd --session $(shell_quote "$launch_session_id")"
   fi
-  tui_cmd="$tui_cmd --profile-id $(shell_quote "$profile_id") --cwd $(shell_quote "$workspace") --theme $(shell_quote "$theme")"
+  if [ "$first_launch_capture" != "1" ]; then
+    tui_cmd="$tui_cmd --profile-id $(shell_quote "$profile_id")"
+  fi
+  tui_cmd="$tui_cmd --cwd $(shell_quote "$workspace") --theme $(shell_quote "$theme")"
   tui_cmd="$tui_cmd 2>&1; exit_code=\$?; echo octos-tui exited with status \$exit_code; sleep ${OCTOS_TUI_SOAK_EXIT_HOLD_SECS:-30}"
   tmux new-session -d -s "$tui_session" "$tui_cmd"
 
-  sleep "${OCTOS_TUI_SOAK_TUI_WAIT_SECS:-2}"
+  if [ "$first_launch_capture" = "1" ]; then
+    wait_for_tui_text "Welcome to Octos" "${OCTOS_TUI_SOAK_FIRST_LAUNCH_WAIT_SECS:-20}" || \
+      die "Timed out waiting for first-launch onboarding splash"
+    capture_pane "$tui_session" "$artifact_dir/tui-capture-first-launch.txt"
+  else
+    sleep "${OCTOS_TUI_SOAK_TUI_WAIT_SECS:-2}"
+  fi
   capture
 
   cat <<EOF
