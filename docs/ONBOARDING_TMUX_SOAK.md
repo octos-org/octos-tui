@@ -36,6 +36,7 @@ scripts/run-onboarding-tmux-soak.sh send-turn
 scripts/run-onboarding-tmux-soak.sh verify
 scripts/run-onboarding-tmux-soak.sh verify-onboard
 scripts/run-onboarding-tmux-soak.sh verify-solo
+scripts/run-onboarding-tmux-soak.sh verify-solo-closure
 scripts/run-onboarding-tmux-soak.sh verify-first-launch
 scripts/run-onboarding-tmux-soak.sh verify-provider-missing
 scripts/run-onboarding-tmux-soak.sh verify-permissions
@@ -105,6 +106,10 @@ Set `OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE=1` during `verify-solo` when the
 tenant/cloud dangerous-mode rejection row is part of the closure bundle; the
 verifier then requires `tenant-danger-rejection` to pass with server-side
 rejection evidence in `soak-summary.json`.
+For the full M12-G closure bundle, run `verify-solo-closure`; it enables strict
+solo verification, requires tenant-negative evidence, and also verifies the
+multiline composer capture. If multiline evidence was retained in a separate
+run, set `OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR=<path>`.
 Live transports also require `OCTOS_BIN` to point at an API-enabled `octos`
 binary that exposes `serve`.
 

@@ -46,7 +46,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <preflight-live|start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-task-subagent-old-server-fallback|drive-autonomy-live|drive-autonomy-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-transport-parity|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <preflight-live|start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-task-subagent-old-server-fallback|drive-autonomy-live|drive-autonomy-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-solo-closure|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-transport-parity|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -110,6 +110,8 @@ Environment:
                                  when the backend advertises those methods.
   OCTOS_TUI_SOAK_REQUIRED_SOLO_CASES Space/comma-separated case names that
                                  must be status=ok in verify-solo.
+  OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR Optional multiline artifact dir used
+                                 by verify-solo-closure.
 
 Interactive flow after start:
   1. Attach: tmux attach -t "$OCTOS_TUI_SOAK_TUI_SESSION"
@@ -1912,6 +1914,25 @@ verify_solo() {
   echo "Verified M12 solo soak artifacts in $artifact_dir"
 }
 
+verify_solo_closure() {
+  local original_strict="${OCTOS_TUI_SOAK_SOLO_STRICT:-}"
+  local original_tenant_negative="${OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE:-}"
+  OCTOS_TUI_SOAK_SOLO_STRICT=1
+  OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE=1
+  verify_solo
+  OCTOS_TUI_SOAK_SOLO_STRICT="$original_strict"
+  OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE="$original_tenant_negative"
+
+  local multiline_dir="${OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR:-$artifact_dir}"
+  local original_artifact_dir="$artifact_dir"
+  artifact_dir="$multiline_dir"
+  verify_multiline_composer
+  artifact_dir="$original_artifact_dir"
+
+  write_ux_validation "solo-closure" "passed" "M12 solo closure bundle verified"
+  echo "Verified M12 solo closure bundle in $original_artifact_dir with multiline artifacts in $multiline_dir"
+}
+
 verify_first_launch() {
   local capture_file="$artifact_dir/tui-capture-first-launch.txt"
   assert_capture_clean "$capture_file" "first-launch"
@@ -3128,6 +3149,33 @@ state Done
 CAPTURE
   env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/multiline-composer" "$0" verify-multiline-composer >/dev/null
 
+  cp -R "$tmp_root/solo-core" "$tmp_root/solo-closure"
+  cat > "$tmp_root/solo-closure/soak-summary.json" <<'JSON'
+{
+  "schema": "octos-m12-solo-appui-soak-v1",
+  "status": "passed",
+  "transport": "stdio",
+  "cases": [
+    {"name": "workspace-cwd-open", "status": "ok"},
+    {"name": "approval-never-sandbox-active", "status": "ok"},
+    {"name": "danger-full-access-approval-never", "status": "ok"},
+    {"name": "tenant-danger-rejection", "status": "ok", "result": {"rejected": true, "applied": false}}
+  ]
+}
+JSON
+  env \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/solo-closure" \
+    "OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR=$tmp_root/multiline-composer" \
+    "$0" verify-solo-closure >/dev/null
+  grep --fixed-strings -- '"scenario": "solo-closure"' "$tmp_root/solo-closure/ux-validation.json" >/dev/null 2>&1 \
+    || die "self-test missing solo-closure ux validation"
+
+  if env \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/solo-closure" \
+    "$0" verify-solo-closure >/dev/null 2>&1; then
+    die "self-test expected solo closure verification to fail without multiline artifact"
+  fi
+
   mkdir -p "$tmp_root/bad-multiline-composer"
   cat > "$tmp_root/bad-multiline-composer/tui-capture-multiline-composer.txt" <<'CAPTURE'
 Composer  Enter send | Tab inspector
@@ -3816,6 +3864,7 @@ case "${1:-help}" in
   verify) verify ;;
   verify-onboard) verify_onboard ;;
   verify-solo) verify_solo ;;
+  verify-solo-closure) verify_solo_closure ;;
   verify-first-launch) verify_first_launch ;;
   verify-provider-missing) verify_provider_missing ;;
   verify-permissions) verify_permissions ;;
