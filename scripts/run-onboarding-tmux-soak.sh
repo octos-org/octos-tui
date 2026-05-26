@@ -501,6 +501,36 @@ write_api_parity_checklist() {
   } > "$artifact_dir/api-parity-checklist.json"
 }
 
+summary_env_value() {
+  local key="$1"
+  local summary_file="$artifact_dir/summary.env"
+  [ -f "$summary_file" ] || return 1
+  sed -n -E "s/^${key}=(.*)$/\\1/p" "$summary_file" | head -n 1
+}
+
+write_ux_validation() {
+  local scenario="$1"
+  local status="$2"
+  local summary="$3"
+  local validation_run_id="$run_id"
+  local validation_transport="$transport"
+  validation_run_id="$(summary_env_value run_id || printf '%s' "$run_id")"
+  validation_transport="$(summary_env_value transport || printf '%s' "$transport")"
+  mkdir -p "$artifact_dir"
+  {
+    printf '{\n'
+    write_json_string_field schema "octos-tui-onboarding-ux-validation-v1"
+    write_json_string_field run_id "$validation_run_id"
+    write_json_string_field scenario "$scenario"
+    write_json_string_field status "$status"
+    write_json_string_field transport "$validation_transport"
+    write_json_string_field artifact_dir "$artifact_dir"
+    write_json_string_field summary "$summary"
+    write_json_string_field generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ""
+    printf '}\n'
+  } > "$artifact_dir/ux-validation.json"
+}
+
 start() {
   command -v tmux >/dev/null 2>&1 || die "tmux is required for start"
   require_bin OCTOS_BIN "$octos_bin"
@@ -813,6 +843,7 @@ verify() {
     printf '}\n'
   } > "$artifact_dir/soak-summary.json"
 
+  write_ux_validation "provider-onboarding" "passed" "provider onboarding artifacts verified"
   secret_leak_check
   echo "Verified onboarding soak artifacts in $artifact_dir"
 }
@@ -1070,6 +1101,7 @@ verify_solo() {
       die "M12 solo strict verification requires passed soak-summary.json"
     fi
   fi
+  write_ux_validation "solo-onboarding" "passed" "M12 solo soak artifacts verified"
   secret_leak_check
   echo "Verified M12 solo soak artifacts in $artifact_dir"
 }
@@ -1104,6 +1136,7 @@ verify_first_launch() {
     die "first-launch server log contains OTP method traffic"
   fi
 
+  write_ux_validation "first-launch" "passed" "first-launch onboarding splash verified"
   secret_leak_check
   echo "Verified first-launch onboarding splash in $artifact_dir"
 }
@@ -1136,6 +1169,7 @@ verify_provider_missing() {
     die "provider-missing capture contains onboarding or AppUI error text"
   fi
 
+  write_ux_validation "provider-missing" "passed" "missing-provider recovery capture verified"
   secret_leak_check
   echo "Verified provider-missing onboarding recovery in $artifact_dir"
 }
@@ -1173,6 +1207,7 @@ verify_permissions() {
     die "permissions capture contains AppUI error text"
   fi
 
+  write_ux_validation "permissions" "passed" "permissions selection captures verified"
   secret_leak_check
   echo "Verified permissions onboarding selection in $artifact_dir"
 }
@@ -1234,6 +1269,7 @@ JSON
   [ -f "$tmp_root/artifacts/runtime-policy-stamp.json" ] || die "self-test missing runtime-policy-stamp.json"
   [ -f "$tmp_root/artifacts/soak-summary.json" ] || die "self-test missing soak-summary.json"
   [ -f "$tmp_root/artifacts/api-parity-checklist.json" ] || die "self-test missing api-parity-checklist.json"
+  [ -f "$tmp_root/artifacts/ux-validation.json" ] || die "self-test missing ux-validation.json"
   printf 'first_launch_capture=1\n' >> "$tmp_root/artifacts/summary.env"
   cat > "$tmp_root/artifacts/tui-capture-first-launch.txt" <<'CAPTURE'
 Welcome to Octos

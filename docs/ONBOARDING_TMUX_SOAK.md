@@ -282,9 +282,15 @@ expected, set
 `OCTOS_TUI_SOAK_REQUIRE_PROFILE=0`; provider expectation variables still require
 profile JSON.
 
+Each verifier writes `ux-validation.json` with the run id, scenario, transport,
+artifact directory, status, and timestamp. Treat it as the machine-readable
+summary for the retained pane captures and JSONL evidence; keep
+`soak-summary.json` for provider/profile-specific details.
+
 ## Required Artifacts
 
 - `summary.env`
+- `ux-validation.json`
 - `server.log`
 - `server-pane.txt`
 - `tui-capture.txt`
