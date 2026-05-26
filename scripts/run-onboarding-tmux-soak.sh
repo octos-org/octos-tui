@@ -737,7 +737,8 @@ start() {
     tui_cmd="$tui_cmd --endpoint $(shell_quote "$endpoint") --auth-token $(shell_quote "$auth_token")"
   else
     local stdio_cmd
-    stdio_cmd="cd $(shell_quote "$workspace") && ${env_prefix}$(shell_quote "$octos_bin") serve --stdio --data-dir $(shell_quote "$data_dir")"
+    local stdio_pid_file="$logs_dir/stdio-backend.pid"
+    stdio_cmd="cd $(shell_quote "$workspace") && printf '%s\n' \$\$ > $(shell_quote "$stdio_pid_file") && exec ${env_prefix}$(shell_quote "$octos_bin") serve --stdio --data-dir $(shell_quote "$data_dir")"
     if [ -n "$serve_args" ]; then
       stdio_cmd="$stdio_cmd $serve_args"
     fi
@@ -820,6 +821,86 @@ restart_server() {
   capture_pane "$server_session" "$artifact_dir/server-pane-after-restart.txt"
   capture
   echo "Restarted backend tmux server for $tui_session"
+}
+
+stdio_backend_pids() {
+  local pid_file="$logs_dir/stdio-backend.pid"
+  if [ -f "$pid_file" ]; then
+    local pid
+    while IFS= read -r pid; do
+      case "$pid" in
+        ''|*[!0-9]*) continue ;;
+      esac
+      if kill -0 "$pid" 2>/dev/null; then
+        printf '%s\n' "$pid"
+      fi
+    done < "$pid_file"
+    return 0
+  fi
+
+  command -v ps >/dev/null 2>&1 || die "ps is required to locate stdio backend processes"
+  ps -ax -o pid= -o command= | awk \
+    -v bin="$octos_bin" \
+    -v data="$data_dir" '
+      index($0, bin) &&
+      index($0, "serve --stdio") &&
+      index($0, data) &&
+      index($0, "octos-tui") == 0 &&
+      index($0, "--stdio-command") == 0 &&
+      index($0, "run-onboarding-tmux-soak.sh") == 0 {
+        pid = $1
+        if (pid ~ /^[0-9]+$/) {
+          print pid
+        }
+      }
+    '
+}
+
+restart_stdio_child() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for stdio restart"
+  require_bin OCTOS_BIN "$octos_bin"
+  if [ "$transport" != "stdio" ]; then
+    die "restart_stdio_child is only supported for stdio transport"
+  fi
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running before stdio restart: $tui_session"
+  fi
+
+  mkdir -p "$workspace" "$data_dir" "$logs_dir" "$artifact_dir"
+  local pids
+  pids="$(stdio_backend_pids | sort -u)"
+  if [ -z "$pids" ]; then
+    die "No scoped stdio backend process matched OCTOS_BIN=$octos_bin and data_dir=$data_dir"
+  fi
+
+  if [ -f "$logs_dir/server.log" ]; then
+    cp "$logs_dir/server.log" "$artifact_dir/server-before-restart.log"
+  fi
+
+  local pid
+  for pid in $pids; do
+    kill "$pid" 2>/dev/null || true
+  done
+
+  local shutdown_deadline=$((SECONDS + ${OCTOS_TUI_SOAK_STDIO_SHUTDOWN_WAIT_SECS:-10}))
+  local remaining
+  while [ "$SECONDS" -le "$shutdown_deadline" ]; do
+    remaining="$(stdio_backend_pids | sort -u)"
+    [ -z "$remaining" ] && break
+    sleep 0.2
+  done
+  remaining="$(stdio_backend_pids | sort -u)"
+  if [ -n "$remaining" ]; then
+    die "Scoped stdio backend did not exit after SIGTERM: $remaining"
+  fi
+
+  {
+    printf 'Terminated scoped stdio backend process(es): %s\n' "$pids"
+    printf 'OCTOS_BIN=%s\n' "$octos_bin"
+    printf 'data_dir=%s\n' "$data_dir"
+  } > "$artifact_dir/server-pane-after-restart.txt"
+  capture
+  echo "Restarted stdio backend child for $tui_session"
 }
 
 capture() {
@@ -1402,15 +1483,16 @@ drive_autonomy_live() {
 
 drive_autonomy_reconnect() {
   command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-autonomy-reconnect"
-  if [ "$transport" != "ws" ]; then
-    die "drive-autonomy-reconnect requires OCTOS_TUI_SOAK_TRANSPORT=ws"
-  fi
   if ! tmux has-session -t "$tui_session" 2>/dev/null; then
     die "TUI tmux session is not running: $tui_session"
   fi
 
-  restart_server
-  wait_for_tui_text "UI protocol reconnected|Ask Octos to change code|state" \
+  if [ "$transport" = "ws" ]; then
+    restart_server
+  else
+    restart_stdio_child
+  fi
+  wait_for_tui_text "UI protocol reconnected|stdio child exited|relaunch|Ask Octos to change code|state" \
     "${OCTOS_TUI_SOAK_RECONNECT_WAIT_SECS:-20}" || \
     die "Timed out waiting for TUI to settle after autonomy backend restart"
 
@@ -2594,9 +2676,15 @@ self_test() {
     "OCTOS_TUI_SOAK_API_KEY=selftest-secret"
   )
   cleanup_self_test() {
-    tmux kill-session -t "$self_test_server_session" >/dev/null 2>&1 || true
-    tmux kill-session -t "$self_test_tui_session" >/dev/null 2>&1 || true
-    rm -rf "$tmp_root"
+    if [ -n "${self_test_server_session:-}" ]; then
+      tmux kill-session -t "$self_test_server_session" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${self_test_tui_session:-}" ]; then
+      tmux kill-session -t "$self_test_tui_session" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${tmp_root:-}" ]; then
+      rm -rf "$tmp_root"
+    fi
   }
   trap cleanup_self_test EXIT
   mkdir -p "$tmp_root/data/profiles" "$tmp_root/workspace"
@@ -3275,6 +3363,44 @@ JSONL
 {"event":"loop_fired","loop_id":"loop-1","status":"completed"}
 JSONL
   env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/autonomy-reconnect" "$0" verify-autonomy-reconnect >/dev/null
+
+  local fake_stdio_bin="$tmp_root/fake-octos-stdio"
+  local fake_stdio_data="$tmp_root/stdio-drive-data"
+  local fake_stdio_logs="$tmp_root/stdio-drive-logs"
+  local fake_stdio_artifacts="$tmp_root/autonomy-stdio-drive"
+  mkdir -p "$fake_stdio_data" "$fake_stdio_logs" "$fake_stdio_artifacts"
+  cat > "$fake_stdio_bin" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "serve" ] && [ "${2:-}" = "--stdio" ]; then
+  while true; do
+    sleep 5
+  done
+fi
+exit 0
+SH
+  chmod +x "$fake_stdio_bin"
+  "$fake_stdio_bin" serve --stdio --data-dir "$fake_stdio_data" &
+  local fake_stdio_pid=$!
+  printf '%s\n' "$fake_stdio_pid" > "$fake_stdio_logs/stdio-backend.pid"
+  sleep 0.3
+  tmux kill-session -t "$self_test_tui_session" >/dev/null 2>&1 || true
+  tmux new-session -d -s "$self_test_tui_session" "printf 'UI protocol reconnected\nAgent reviewer-api hydrated\nGoal active continuation hydrated\nLoop fire_now schedule hydrated\nAsk Octos to change code...\nstate Done\n'; sleep 600"
+  env \
+    "${child_env[@]}" \
+    "OCTOS_BIN=$fake_stdio_bin" \
+    "OCTOS_TUI_SOAK_TRANSPORT=stdio" \
+    "OCTOS_TUI_SOAK_DATA_DIR=$fake_stdio_data" \
+    "OCTOS_TUI_SOAK_LOGS_DIR=$fake_stdio_logs" \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$fake_stdio_artifacts" \
+    "$0" drive-autonomy-reconnect >/dev/null
+  wait "$fake_stdio_pid" 2>/dev/null || true
+  if kill -0 "$fake_stdio_pid" 2>/dev/null; then
+    die "self-test expected stdio autonomy reconnect driver to terminate scoped backend"
+  fi
+  [ -s "$fake_stdio_artifacts/server-pane-after-restart.txt" ] \
+    || die "self-test missing stdio reconnect restart artifact"
+  [ -s "$fake_stdio_artifacts/tui-capture-autonomy-reconnect.txt" ] \
+    || die "self-test missing stdio reconnect aggregate capture"
 
   mkdir -p "$tmp_root/bad-autonomy-reconnect/m15-evidence"
   cp "$tmp_root/autonomy-reconnect/server-pane-after-restart.txt" "$tmp_root/bad-autonomy-reconnect/"
