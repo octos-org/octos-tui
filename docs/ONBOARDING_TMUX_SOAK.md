@@ -41,6 +41,7 @@ scripts/run-onboarding-tmux-soak.sh verify-provider-missing
 scripts/run-onboarding-tmux-soak.sh verify-permissions
 scripts/run-onboarding-tmux-soak.sh verify-approval-denial
 scripts/run-onboarding-tmux-soak.sh verify-task-subagent-tree
+scripts/run-onboarding-tmux-soak.sh verify-transport-parity
 scripts/run-onboarding-tmux-soak.sh verify-ux-run
 scripts/run-onboarding-tmux-soak.sh api-parity
 scripts/run-onboarding-tmux-soak.sh self-test
@@ -351,6 +352,23 @@ re-requests `/agents list`, `/goal`, and `/loop list`, and writes
 agent, goal, and loop state; that the transcript issues `session/open`,
 `agent/list`, `session/goal/get`, and `loop/list`; and that agent/goal/loop
 notifications are not client-owned timer traffic.
+
+## Transport Parity
+
+After retaining one WebSocket artifact directory and one stdio artifact
+directory for the same live scenario, compare their AppUI method traffic:
+
+```sh
+OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<ws-run-id> \
+OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<stdio-run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-transport-parity
+```
+
+The verifier reads `appui-transcript.jsonl` from each directory, including the
+`m15-evidence/` subdirectory when present, normalizes `client_to_server`/`tx`
+and `server_to_client`/`rx`, then compares the direction + method sequence.
+Set `OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE=set` only when the issue acceptance
+requires method-set parity rather than ordering parity.
 
 ## Dropped Completion Backpressure
 

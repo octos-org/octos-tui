@@ -40,12 +40,13 @@ fake_openai_session="${OCTOS_TUI_SOAK_FAKE_OPENAI_SESSION:-octos-onboard-fake-op
 fake_openai_delay_secs="${OCTOS_TUI_SOAK_FAKE_OPENAI_DELAY_SECS:-0}"
 provider_env_vars="${OCTOS_TUI_SOAK_PROVIDER_ENV_VARS:-OPENAI_API_KEY ANTHROPIC_API_KEY DEEPSEEK_API_KEY OPENROUTER_API_KEY MOONSHOT_API_KEY KIMI_API_KEY AUTODL_API_KEY}"
 require_live_provider="${OCTOS_TUI_SOAK_REQUIRE_LIVE_PROVIDER:-1}"
+transport_parity_mode="${OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE:-sequence}"
 first_launch_capture="${OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE:-0}"
 endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <preflight-live|start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-task-subagent-old-server-fallback|drive-autonomy-live|drive-autonomy-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <preflight-live|start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-task-subagent-old-server-fallback|drive-autonomy-live|drive-autonomy-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-transport-parity|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -98,6 +99,9 @@ Environment:
                                  drive-autonomy-live for status/output/artifacts.
   OCTOS_TUI_M15_UX_OUTPUT_DIR    Optional live M15 evidence directory copied
                                  into the retained artifact bundle.
+  OCTOS_TUI_SOAK_WS_ARTIFACT_DIR WebSocket artifact dir for verify-transport-parity.
+  OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR Stdio artifact dir for verify-transport-parity.
+  OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE sequence or set, default sequence.
   OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE Set to 1 to launch without a preselected
                                  profile/session and save tui-capture-first-launch.txt.
   OCTOS_TUI_SOAK_REQUIRE_PROFILE Set to 0 to allow verify without profile JSON.
@@ -727,6 +731,36 @@ first_existing_artifact() {
     fi
   done
   die "$label missing"
+}
+
+appui_transcript_for_dir() {
+  local label="$1"
+  local dir="$2"
+  first_existing_artifact "$label AppUI transcript" \
+    "$dir/m15-evidence/appui-transcript.jsonl" \
+    "$dir/appui-transcript.jsonl"
+}
+
+extract_appui_method_sequence() {
+  local transcript="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -Rr '
+      def norm_dir($d):
+        if $d == "client_to_server" then "tx"
+        elif $d == "server_to_client" then "rx"
+        elif $d == null or $d == "" then "unknown"
+        else $d
+        end;
+      fromjson?
+      | select(type == "object")
+      | (.frame.method // .method // empty) as $method
+      | select($method != "")
+      | norm_dir(.direction // .frame.direction // .dir // null) + "\t" + $method
+    ' "$transcript"
+  else
+    sed -n -E 's/.*"direction"[[:space:]]*:[[:space:]]*"([^"]+)".*"method"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1	\2/p' "$transcript" \
+      | sed -e 's/^client_to_server	/tx	/' -e 's/^server_to_client	/rx	/'
+  fi
 }
 
 json_scalar_value() {
@@ -2628,6 +2662,48 @@ verify_autonomy_reconnect() {
   echo "Verified M15 autonomy reconnect artifacts in $artifact_dir"
 }
 
+verify_transport_parity() {
+  local ws_dir="${OCTOS_TUI_SOAK_WS_ARTIFACT_DIR:-}"
+  local stdio_dir="${OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR:-}"
+  [ -n "$ws_dir" ] || die "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR is required for verify-transport-parity"
+  [ -n "$stdio_dir" ] || die "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR is required for verify-transport-parity"
+  [ -d "$ws_dir" ] || die "WebSocket artifact dir missing: $ws_dir"
+  [ -d "$stdio_dir" ] || die "stdio artifact dir missing: $stdio_dir"
+
+  local ws_transcript
+  local stdio_transcript
+  ws_transcript="$(appui_transcript_for_dir "WebSocket transport parity" "$ws_dir")"
+  stdio_transcript="$(appui_transcript_for_dir "stdio transport parity" "$stdio_dir")"
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/octos-tui-transport-parity.XXXXXX")"
+  cleanup_transport_parity() {
+    rm -rf "$tmp_dir"
+  }
+  trap cleanup_transport_parity RETURN
+
+  extract_appui_method_sequence "$ws_transcript" > "$tmp_dir/ws.methods"
+  extract_appui_method_sequence "$stdio_transcript" > "$tmp_dir/stdio.methods"
+  [ -s "$tmp_dir/ws.methods" ] || die "WebSocket transcript contains no AppUI methods: $ws_transcript"
+  [ -s "$tmp_dir/stdio.methods" ] || die "stdio transcript contains no AppUI methods: $stdio_transcript"
+
+  case "$transport_parity_mode" in
+    sequence) ;;
+    set)
+      sort -u "$tmp_dir/ws.methods" -o "$tmp_dir/ws.methods"
+      sort -u "$tmp_dir/stdio.methods" -o "$tmp_dir/stdio.methods"
+      ;;
+    *) die "OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE must be sequence or set, got: $transport_parity_mode" ;;
+  esac
+
+  if ! diff -u "$tmp_dir/ws.methods" "$tmp_dir/stdio.methods" > "$tmp_dir/diff"; then
+    cat "$tmp_dir/diff" >&2
+    die "transport parity mismatch between WebSocket and stdio AppUI method sequences"
+  fi
+
+  echo "Verified $transport_parity_mode transport parity between $ws_dir and $stdio_dir"
+}
+
 verify_ux_run() {
   local scenario_json="$artifact_dir/scenario.json"
   local summary_json="$artifact_dir/summary.json"
@@ -3556,6 +3632,35 @@ JSONL
     die "self-test expected autonomy reconnect verification to fail"
   fi
 
+  mkdir -p "$tmp_root/parity-ws/m15-evidence" "$tmp_root/parity-stdio/m15-evidence"
+  cat > "$tmp_root/parity-ws/m15-evidence/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"session/open"}}
+{"direction":"client_to_server","frame":{"method":"agent/list"}}
+{"direction":"server_to_client","frame":{"method":"agent/updated"}}
+{"direction":"client_to_server","frame":{"method":"loop/list"}}
+JSONL
+  cat > "$tmp_root/parity-stdio/m15-evidence/appui-transcript.jsonl" <<'JSONL'
+{"direction":"tx","frame":{"method":"session/open"}}
+{"direction":"tx","frame":{"method":"agent/list"}}
+{"direction":"rx","frame":{"method":"agent/updated"}}
+{"direction":"tx","frame":{"method":"loop/list"}}
+JSONL
+  env \
+    "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/parity-ws" \
+    "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/parity-stdio" \
+    "$0" verify-transport-parity >/dev/null
+
+  mkdir -p "$tmp_root/bad-parity-stdio/m15-evidence"
+  cp "$tmp_root/parity-stdio/m15-evidence/appui-transcript.jsonl" "$tmp_root/bad-parity-stdio/m15-evidence/"
+  printf '{"direction":"tx","frame":{"method":"session/goal/get"}}\n' \
+    >> "$tmp_root/bad-parity-stdio/m15-evidence/appui-transcript.jsonl"
+  if env \
+    "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/parity-ws" \
+    "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/bad-parity-stdio" \
+    "$0" verify-transport-parity >/dev/null 2>&1; then
+    die "self-test expected transport parity verification to fail"
+  fi
+
   mkdir -p "$tmp_root/ux-run"
   cat > "$tmp_root/ux-run/scenario.json" <<'JSON'
 {"schema":"octos.ux.scenario.v1","scenario_id":"narrow-layout","transport":"stdio"}
@@ -3673,6 +3778,7 @@ case "${1:-help}" in
   verify-tool-success) verify_tool_success ;;
   verify-autonomy-live) verify_autonomy_live ;;
   verify-autonomy-reconnect) verify_autonomy_reconnect ;;
+  verify-transport-parity) verify_transport_parity ;;
   verify-ux-run) verify_ux_run ;;
   api-parity) api_parity ;;
   self-test) self_test ;;
