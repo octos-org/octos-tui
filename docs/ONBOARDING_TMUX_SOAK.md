@@ -299,6 +299,24 @@ visible failed and passed validator states, a usable composer after the rerun,
 named failed and passed rows in `validator-results.jsonl`, and the failed row
 must appear before the passing rerun.
 
+## Long Output Folding
+
+For long-output folding evidence:
+
+```sh
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-long-output
+
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-long-output
+```
+
+`verify-long-output` checks `tui-capture-long-output.txt` and
+`appui-transcript.jsonl`. The verifier requires the rendered
+`... N more line(s) hidden (Ctrl+O expand|collapse)` marker, visible tool/output
+text, a usable composer after the run, and turn/output method evidence in the
+transcript.
+
 ## M19 UX Run Bundle
 
 For M19 runner-owned artifacts, set `OCTOS_TUI_SOAK_ARTIFACT_DIR` to the
@@ -332,6 +350,7 @@ The solo lane writes these M12 artifacts into
   `drive-interrupt-reconnect`
 - `tui-capture-validator-cycle.txt` and `validator-results.jsonl` when running
   `drive-validator-cycle`
+- `tui-capture-long-output.txt` when running `drive-long-output`
 - `tui-capture-task-subagent-tree-running.txt`,
   `tui-capture-task-subagent-tree-final.txt`, and
   `tui-capture-task-subagent-tree-summary.txt` when running

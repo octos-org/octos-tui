@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -73,6 +73,8 @@ Environment:
                                  drive-interrupt-reconnect.
   OCTOS_TUI_SOAK_VALIDATOR_PROMPT Optional prompt used by
                                  drive-validator-cycle.
+  OCTOS_TUI_SOAK_LONG_OUTPUT_PROMPT Optional prompt used by
+                                 drive-long-output.
   OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE Set to 1 to launch without a preselected
                                  profile/session and save tui-capture-first-launch.txt.
   OCTOS_TUI_SOAK_REQUIRE_PROFILE Set to 0 to allow verify without profile JSON.
@@ -1267,6 +1269,24 @@ drive_validator_cycle() {
   echo "Drove validator cycle capture in $tui_session"
 }
 
+drive_long_output() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-long-output"
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  local prompt="${OCTOS_TUI_SOAK_LONG_OUTPUT_PROMPT:-M12 long-output fixture: run a shell command that prints 40 unique output-line-NN rows so the TUI folds the tool output preview.}"
+  wait_for_tui_text "Ask Octos to change code" "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI composer before driving long-output capture"
+  submit_composer_prompt "$prompt"
+  wait_for_tui_text "more line(s) hidden|Ctrl+O expand|Ctrl+O collapse|output-line-" \
+    "${OCTOS_TUI_SOAK_LONG_OUTPUT_WAIT_SECS:-80}" || \
+    die "Timed out waiting for long-output folding evidence in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-long-output.txt"
+  capture
+  echo "Drove long-output folding capture in $tui_session"
+}
+
 verify_solo() {
   capture
   local required=(
@@ -1648,6 +1668,34 @@ verify_validator_cycle() {
   write_ux_validation "validator-cycle" "passed" "validator fail/pass cycle verified"
   secret_leak_check
   echo "Verified validator cycle artifacts in $artifact_dir"
+}
+
+verify_long_output() {
+  local capture_file="$artifact_dir/tui-capture-long-output.txt"
+  local transcript
+  transcript="$(first_existing_artifact "long-output AppUI transcript" \
+    "$artifact_dir/appui-transcript.jsonl" \
+    "$artifact_dir/m15-evidence/appui-transcript.jsonl")"
+
+  assert_capture_clean "$capture_file" "long-output"
+
+  grep -E '[0-9]+ more line\(s\) hidden \(Ctrl\+O (expand|collapse)\)' "$capture_file" >/dev/null 2>&1 \
+    || die "long-output capture missing folded-output marker"
+  grep -Ei 'output-line|tool|shell|command|stdout|preview' "$capture_file" >/dev/null 2>&1 \
+    || die "long-output capture missing command/tool output text"
+  grep --fixed-strings -- "Ask Octos to change code" "$capture_file" >/dev/null 2>&1 \
+    || die "long-output capture missing usable composer"
+  if grep -E '^┌(Work|Progress).*›|^┌Wor ›|^┌Progress.*›' "$capture_file" >/dev/null 2>&1; then
+    die "long-output capture shows input overlap with removed work/progress pane"
+  fi
+
+  grep -E '"method"[[:space:]]*:[[:space:]]*"(turn/start|task/output/delta|task/output/read|agent/output/delta|agent/output/read)"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "long-output transcript missing turn/output method evidence"
+
+  write_ux_validation "long-output" "passed" "long-output folding capture verified"
+  secret_leak_check
+  echo "Verified long-output folding artifacts in $artifact_dir"
 }
 
 verify_task_subagent_tree() {
@@ -2244,6 +2292,34 @@ JSONL
     die "self-test expected validator-cycle verification to fail without failed result"
   fi
 
+  mkdir -p "$tmp_root/long-output"
+  cat > "$tmp_root/long-output/tui-capture-long-output.txt" <<'CAPTURE'
+tool shell complete
+     │ output-line-01-unique
+     │ output-line-02-unique
+     │ ... 16 more line(s) hidden (Ctrl+O collapse)
+Ask Octos to change code...
+state Done
+CAPTURE
+  cat > "$tmp_root/long-output/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"turn/start"}}
+{"direction":"server_to_client","frame":{"method":"task/output/delta"}}
+JSONL
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/long-output" "$0" verify-long-output >/dev/null
+
+  mkdir -p "$tmp_root/bad-long-output"
+  cat > "$tmp_root/bad-long-output/tui-capture-long-output.txt" <<'CAPTURE'
+tool shell complete
+     │ output-line-01-unique
+     │ output-line-02-unique
+Ask Octos to change code...
+state Done
+CAPTURE
+  cp "$tmp_root/long-output/appui-transcript.jsonl" "$tmp_root/bad-long-output/"
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-long-output" "$0" verify-long-output >/dev/null 2>&1; then
+    die "self-test expected long-output verification to fail without folded-output marker"
+  fi
+
   mkdir -p "$tmp_root/bad-approval-denial"
   cp "$tmp_root/approval-denial/tui-capture-approval-request.txt" "$tmp_root/bad-approval-denial/"
   cat > "$tmp_root/bad-approval-denial/tui-capture-approval-denied.txt" <<'CAPTURE'
@@ -2486,6 +2562,7 @@ case "${1:-help}" in
   drive-dropped-completion-backpressure) drive_dropped_completion_backpressure ;;
   drive-interrupt-reconnect) drive_interrupt_reconnect ;;
   drive-validator-cycle) drive_validator_cycle ;;
+  drive-long-output) drive_long_output ;;
   capture) capture ;;
   send-turn) send_turn ;;
   verify) verify ;;
@@ -2501,6 +2578,7 @@ case "${1:-help}" in
   verify-backpressure) verify_backpressure ;;
   verify-interrupt-reconnect) verify_interrupt_reconnect ;;
   verify-validator-cycle) verify_validator_cycle ;;
+  verify-long-output) verify_long_output ;;
   verify-autonomy-live) verify_autonomy_live ;;
   verify-ux-run) verify_ux_run ;;
   api-parity) api_parity ;;
