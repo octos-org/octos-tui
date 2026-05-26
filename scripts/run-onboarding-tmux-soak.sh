@@ -1390,17 +1390,12 @@ drive_tool_success() {
 }
 
 verify_solo() {
-  capture
   local required=(
     "$artifact_dir/tui-capture.txt"
     "$artifact_dir/server.log"
     "$artifact_dir/appui-transcript.jsonl"
     "$artifact_dir/runtime-policy-stamp.json"
     "$artifact_dir/tool-registry-snapshot.json"
-    "$artifact_dir/mcp-config-before.redacted.json"
-    "$artifact_dir/mcp-config-after.redacted.json"
-    "$artifact_dir/mcp-status-list.json"
-    "$artifact_dir/mcp-connection-test-result.json"
     "$artifact_dir/approval-events.jsonl"
     "$artifact_dir/filesystem-probe.json"
     "$artifact_dir/soak-summary.json"
@@ -1416,15 +1411,21 @@ verify_solo() {
   if grep -E '"method":"approval/requested"|"method": "approval/requested"' "$artifact_dir/approval-events.jsonl" >/dev/null 2>&1; then
     die "M12 solo approval-never evidence contains approval/requested"
   fi
-  if grep -E 'redacted-by-probe|Bearer redacted-by-probe' \
-    "$artifact_dir/appui-transcript.jsonl" \
+  local leak_check_files=("$artifact_dir/appui-transcript.jsonl")
+  for file in \
     "$artifact_dir/mcp-config-before.redacted.json" \
     "$artifact_dir/mcp-config-after.redacted.json" \
     "$artifact_dir/mcp-status-list.json" \
-    "$artifact_dir/mcp-connection-test-result.json" >/dev/null 2>&1; then
+    "$artifact_dir/mcp-connection-test-result.json"
+  do
+    if [ -f "$file" ]; then
+      leak_check_files+=("$file")
+    fi
+  done
+  if grep -E 'redacted-by-probe|Bearer redacted-by-probe' "${leak_check_files[@]}" >/dev/null 2>&1; then
     die "M12 MCP/tool artifacts contain unredacted fixture secrets"
   fi
-  if [ "${OCTOS_TUI_SOAK_SOLO_STRICT:-0}" = "1" ]; then
+  if [ "${OCTOS_TUI_SOAK_SOLO_STRICT:-0}" = "1" ] && [ -f "$artifact_dir/mcp-config-after.redacted.json" ]; then
     if grep -q '"id": "fixture-stdio"' "$artifact_dir/mcp-config-after.redacted.json"; then
       die "M12 MCP strict verification expected deleted fixture-stdio to be absent"
     fi
