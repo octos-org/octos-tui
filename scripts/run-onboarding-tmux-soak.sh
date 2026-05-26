@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -71,6 +71,8 @@ Environment:
                                  drive-multiline-composer.
   OCTOS_TUI_SOAK_INTERRUPT_PROMPT Optional long-running prompt used by
                                  drive-interrupt-reconnect.
+  OCTOS_TUI_SOAK_VALIDATOR_PROMPT Optional prompt used by
+                                 drive-validator-cycle.
   OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE Set to 1 to launch without a preselected
                                  profile/session and save tui-capture-first-launch.txt.
   OCTOS_TUI_SOAK_REQUIRE_PROFILE Set to 0 to allow verify without profile JSON.
@@ -1247,6 +1249,24 @@ drive_interrupt_reconnect() {
   echo "Drove interrupt/reconnect capture in $tui_session"
 }
 
+drive_validator_cycle() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-validator-cycle"
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  local prompt="${OCTOS_TUI_SOAK_VALIDATOR_PROMPT:-M12 validator fixture: make a tiny change, show one failing validator, fix it, then show the passing validator rerun.}"
+  wait_for_tui_text "Ask Octos to change code" "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI composer before driving validator cycle"
+  submit_composer_prompt "$prompt"
+  wait_for_tui_text "validator|Validator|failed|passed" \
+    "${OCTOS_TUI_SOAK_VALIDATOR_WAIT_SECS:-80}" || \
+    die "Timed out waiting for validator evidence in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-validator-cycle.txt"
+  capture
+  echo "Drove validator cycle capture in $tui_session"
+}
+
 verify_solo() {
   capture
   local required=(
@@ -1585,6 +1605,49 @@ verify_interrupt_reconnect() {
   write_ux_validation "interrupt-reconnect" "passed" "interrupt and reconnect capture verified"
   secret_leak_check
   echo "Verified interrupt/reconnect artifacts in $artifact_dir"
+}
+
+verify_validator_cycle() {
+  local capture_file="$artifact_dir/tui-capture-validator-cycle.txt"
+  local validator_results="$artifact_dir/validator-results.jsonl"
+  local transcript
+  transcript="$(first_existing_artifact "validator cycle AppUI transcript" \
+    "$artifact_dir/appui-transcript.jsonl" \
+    "$artifact_dir/m15-evidence/appui-transcript.jsonl")"
+
+  assert_capture_clean "$capture_file" "validator-cycle"
+  [ -s "$validator_results" ] || die "validator-results artifact missing or empty: $validator_results"
+
+  grep -Ei 'validator|validation|check' "$capture_file" >/dev/null 2>&1 \
+    || die "validator capture missing validator/check text"
+  grep -Ei 'failed|fail' "$capture_file" >/dev/null 2>&1 \
+    || die "validator capture missing failed validator state"
+  grep -Ei 'passed|pass' "$capture_file" >/dev/null 2>&1 \
+    || die "validator capture missing passed validator state"
+  grep --fixed-strings -- "Ask Octos to change code" "$capture_file" >/dev/null 2>&1 \
+    || die "validator capture missing usable composer"
+
+  grep -E '"status"[[:space:]]*:[[:space:]]*"failed"' "$validator_results" >/dev/null 2>&1 \
+    || die "validator-results.jsonl missing failed status"
+  grep -E '"status"[[:space:]]*:[[:space:]]*"passed"' "$validator_results" >/dev/null 2>&1 \
+    || die "validator-results.jsonl missing passed status"
+  grep -E '"name"[[:space:]]*:' "$validator_results" >/dev/null 2>&1 \
+    || die "validator-results.jsonl missing validator name"
+
+  if grep -E '"status"[[:space:]]*:[[:space:]]*"(failed|passed)"' "$validator_results" \
+    | awk '/"failed"/ {failed=NR} /"passed"/ {passed=NR; exit} END {exit !(failed && passed && failed < passed)}'; then
+    :
+  else
+    die "validator-results.jsonl must record failed status before passed rerun"
+  fi
+
+  grep -E '"method"[[:space:]]*:[[:space:]]*"(turn/start|task/updated|agent/updated)"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "validator cycle transcript missing turn/task evidence"
+
+  write_ux_validation "validator-cycle" "passed" "validator fail/pass cycle verified"
+  secret_leak_check
+  echo "Verified validator cycle artifacts in $artifact_dir"
 }
 
 verify_task_subagent_tree() {
@@ -2154,6 +2217,33 @@ JSONL
     die "self-test expected interrupt/reconnect verification to fail without turn/interrupt"
   fi
 
+  mkdir -p "$tmp_root/validator-cycle"
+  cat > "$tmp_root/validator-cycle/tui-capture-validator-cycle.txt" <<'CAPTURE'
+validator cargo fmt --check failed on attempt 1
+validator cargo fmt --check passed on attempt 2
+Ask Octos to change code...
+state Done
+CAPTURE
+  cat > "$tmp_root/validator-cycle/validator-results.jsonl" <<'JSONL'
+{"name":"cargo fmt --check","status":"failed","attempt":1,"exit_code":1}
+{"name":"cargo fmt --check","status":"passed","attempt":2,"exit_code":0}
+JSONL
+  cat > "$tmp_root/validator-cycle/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"turn/start"}}
+{"direction":"server_to_client","frame":{"method":"task/updated"}}
+JSONL
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/validator-cycle" "$0" verify-validator-cycle >/dev/null
+
+  mkdir -p "$tmp_root/bad-validator-cycle"
+  cp "$tmp_root/validator-cycle/tui-capture-validator-cycle.txt" "$tmp_root/bad-validator-cycle/"
+  cp "$tmp_root/validator-cycle/appui-transcript.jsonl" "$tmp_root/bad-validator-cycle/"
+  cat > "$tmp_root/bad-validator-cycle/validator-results.jsonl" <<'JSONL'
+{"name":"cargo fmt --check","status":"passed","attempt":1,"exit_code":0}
+JSONL
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-validator-cycle" "$0" verify-validator-cycle >/dev/null 2>&1; then
+    die "self-test expected validator-cycle verification to fail without failed result"
+  fi
+
   mkdir -p "$tmp_root/bad-approval-denial"
   cp "$tmp_root/approval-denial/tui-capture-approval-request.txt" "$tmp_root/bad-approval-denial/"
   cat > "$tmp_root/bad-approval-denial/tui-capture-approval-denied.txt" <<'CAPTURE'
@@ -2395,6 +2485,7 @@ case "${1:-help}" in
   drive-task-subagent-reconnect) drive_task_subagent_reconnect ;;
   drive-dropped-completion-backpressure) drive_dropped_completion_backpressure ;;
   drive-interrupt-reconnect) drive_interrupt_reconnect ;;
+  drive-validator-cycle) drive_validator_cycle ;;
   capture) capture ;;
   send-turn) send_turn ;;
   verify) verify ;;
@@ -2409,6 +2500,7 @@ case "${1:-help}" in
   verify-task-subagent-reconnect) verify_task_subagent_reconnect ;;
   verify-backpressure) verify_backpressure ;;
   verify-interrupt-reconnect) verify_interrupt_reconnect ;;
+  verify-validator-cycle) verify_validator_cycle ;;
   verify-autonomy-live) verify_autonomy_live ;;
   verify-ux-run) verify_ux_run ;;
   api-parity) api_parity ;;

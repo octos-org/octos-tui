@@ -281,6 +281,24 @@ verifier requires an active-turn capture, a visible interrupt/cancel
 acknowledgement, a usable composer after recovery, a client `turn/interrupt`
 request, and session hydration/status evidence.
 
+## Validator Fail/Pass Cycle
+
+For validator evidence in a live coding run:
+
+```sh
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-validator-cycle
+
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-validator-cycle
+```
+
+`verify-validator-cycle` checks `tui-capture-validator-cycle.txt`,
+`validator-results.jsonl`, and `appui-transcript.jsonl`. The verifier requires
+visible failed and passed validator states, a usable composer after the rerun,
+named failed and passed rows in `validator-results.jsonl`, and the failed row
+must appear before the passing rerun.
+
 ## M19 UX Run Bundle
 
 For M19 runner-owned artifacts, set `OCTOS_TUI_SOAK_ARTIFACT_DIR` to the
@@ -312,6 +330,8 @@ The solo lane writes these M12 artifacts into
 - `tui-capture-interrupt-running.txt`, `tui-capture-interrupt.txt`, and
   `tui-capture-interrupt-reconnect.txt` when running
   `drive-interrupt-reconnect`
+- `tui-capture-validator-cycle.txt` and `validator-results.jsonl` when running
+  `drive-validator-cycle`
 - `tui-capture-task-subagent-tree-running.txt`,
   `tui-capture-task-subagent-tree-final.txt`, and
   `tui-capture-task-subagent-tree-summary.txt` when running
