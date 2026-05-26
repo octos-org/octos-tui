@@ -1140,10 +1140,17 @@ drive_runtime_menus() {
     "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
     die "Timed out waiting for TUI ready signal before runtime menu capture"
   send_tui_line "/status"
+  tmux send-keys -t "$tui_session" Down Down Down Enter
+  sleep "${OCTOS_TUI_SOAK_COMMAND_WAIT_SECS:-1}"
   capture_pane "$tui_session" "$artifact_dir/tui-capture-runtime-status.txt"
   send_tui_line "/model"
+  tmux send-keys -t "$tui_session" Enter
+  sleep "${OCTOS_TUI_SOAK_COMMAND_WAIT_SECS:-1}"
   capture_pane "$tui_session" "$artifact_dir/tui-capture-runtime-model.txt"
+  send_tui_line "/mcp config"
+  send_tui_line "/mcp status"
   send_tui_line "/mcp"
+  sleep "${OCTOS_TUI_SOAK_COMMAND_WAIT_SECS:-1}"
   capture_pane "$tui_session" "$artifact_dir/tui-capture-runtime-mcp.txt"
   capture
   echo "Drove runtime menu captures in $tui_session"
@@ -1626,7 +1633,7 @@ verify_runtime_menus() {
     "Profile" \
     "Model"
   do
-    grep --fixed-strings -- "$required_text" "$status_capture" "$model_capture" >/dev/null 2>&1 \
+    grep --fixed-strings --ignore-case -- "$required_text" "$status_capture" "$model_capture" >/dev/null 2>&1 \
       || die "runtime menu captures missing required text: $required_text"
   done
   grep -Ei 'provider|route|configured|profile/llm' "$model_capture" >/dev/null 2>&1 \
