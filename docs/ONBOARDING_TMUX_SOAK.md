@@ -42,6 +42,7 @@ scripts/run-onboarding-tmux-soak.sh verify-provider-missing
 scripts/run-onboarding-tmux-soak.sh verify-permissions
 scripts/run-onboarding-tmux-soak.sh verify-approval-denial
 scripts/run-onboarding-tmux-soak.sh verify-task-subagent-tree
+scripts/run-onboarding-tmux-soak.sh verify-task-subagent-closure
 scripts/run-onboarding-tmux-soak.sh verify-transport-parity
 scripts/run-onboarding-tmux-soak.sh verify-ux-run
 scripts/run-onboarding-tmux-soak.sh api-parity
@@ -283,6 +284,22 @@ scripts/run-onboarding-tmux-soak.sh verify-task-subagent-old-server-fallback
 The verifier checks that the fallback capture still has a usable composer/status
 line, does not expose task/subagent inspection controls, and does not probe
 `review/start`, `task/list`, or `task/artifact/*` methods.
+
+For the full #40 closure bundle, retain the main task/subagent run, the
+restart/reconnect run, the old-server fallback run, and one WebSocket plus one
+stdio transcript pair. Then run:
+
+```sh
+OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<task-run-id> \
+OCTOS_TUI_SOAK_TASK_RECONNECT_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<reconnect-run-id> \
+OCTOS_TUI_SOAK_TASK_OLD_SERVER_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<old-server-run-id> \
+OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<ws-run-id> \
+OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<stdio-run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-task-subagent-closure
+```
+
+`verify-task-subagent-closure` runs the task/subagent tree, reconnect,
+old-server fallback, and transport-parity verifiers as one fail-closed bundle.
 
 ## M15 Autonomy Live Artifacts
 

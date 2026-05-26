@@ -46,7 +46,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <preflight-live|start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-task-subagent-old-server-fallback|drive-autonomy-live|drive-autonomy-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-solo-closure|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-transport-parity|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <preflight-live|start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-task-subagent-old-server-fallback|drive-autonomy-live|drive-autonomy-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-solo-closure|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-task-subagent-closure|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-transport-parity|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -102,6 +102,10 @@ Environment:
   OCTOS_TUI_SOAK_WS_ARTIFACT_DIR WebSocket artifact dir for verify-transport-parity.
   OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR Stdio artifact dir for verify-transport-parity.
   OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE sequence or set, default sequence.
+  OCTOS_TUI_SOAK_TASK_RECONNECT_ARTIFACT_DIR Optional reconnect artifact dir
+                                 used by verify-task-subagent-closure.
+  OCTOS_TUI_SOAK_TASK_OLD_SERVER_ARTIFACT_DIR Optional old-server fallback
+                                 artifact dir used by verify-task-subagent-closure.
   OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE Set to 1 to launch without a preselected
                                  profile/session and save tui-capture-first-launch.txt.
   OCTOS_TUI_SOAK_REQUIRE_PROFILE Set to 0 to allow verify without profile JSON.
@@ -2524,6 +2528,25 @@ verify_task_subagent_old_server_fallback() {
   echo "Verified task/subagent old-server fallback artifacts in $artifact_dir"
 }
 
+verify_task_subagent_closure() {
+  local original_artifact_dir="$artifact_dir"
+  verify_task_subagent_tree
+
+  local reconnect_dir="${OCTOS_TUI_SOAK_TASK_RECONNECT_ARTIFACT_DIR:-$original_artifact_dir}"
+  artifact_dir="$reconnect_dir"
+  verify_task_subagent_reconnect
+
+  local old_server_dir="${OCTOS_TUI_SOAK_TASK_OLD_SERVER_ARTIFACT_DIR:-$original_artifact_dir}"
+  artifact_dir="$old_server_dir"
+  verify_task_subagent_old_server_fallback
+
+  artifact_dir="$original_artifact_dir"
+  verify_transport_parity
+
+  write_ux_validation "task-subagent-closure" "passed" "M13 task/subagent closure bundle verified"
+  echo "Verified M13 task/subagent closure bundle in $original_artifact_dir"
+}
+
 verify_autonomy_live() {
   local capture_file
   capture_file="$(first_existing_artifact "M15 autonomy TUI capture" \
@@ -2733,10 +2756,7 @@ verify_transport_parity() {
 
   local tmp_dir
   tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/octos-tui-transport-parity.XXXXXX")"
-  cleanup_transport_parity() {
-    rm -rf "$tmp_dir"
-  }
-  trap cleanup_transport_parity RETURN
+  trap 'rm -rf "$tmp_dir"; trap - RETURN' RETURN
 
   extract_appui_method_sequence "$ws_transcript" > "$tmp_dir/ws.methods"
   extract_appui_method_sequence "$stdio_transcript" > "$tmp_dir/stdio.methods"
@@ -3582,6 +3602,36 @@ JSONL
     die "self-test expected task-subagent old-server fallback verification to fail"
   fi
 
+  mkdir -p "$tmp_root/task-subagent-parity-ws/m15-evidence" "$tmp_root/task-subagent-parity-stdio/m15-evidence"
+  cat > "$tmp_root/task-subagent-parity-ws/m15-evidence/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"turn/start"}}
+{"direction":"server_to_client","frame":{"method":"task/updated"}}
+{"direction":"client_to_server","frame":{"method":"agent/list"}}
+JSONL
+  cat > "$tmp_root/task-subagent-parity-stdio/m15-evidence/appui-transcript.jsonl" <<'JSONL'
+{"direction":"tx","frame":{"method":"turn/start"}}
+{"direction":"rx","frame":{"method":"task/updated"}}
+{"direction":"tx","frame":{"method":"agent/list"}}
+JSONL
+  env \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/task-subagent" \
+    "OCTOS_TUI_SOAK_TASK_RECONNECT_ARTIFACT_DIR=$tmp_root/task-subagent-reconnect" \
+    "OCTOS_TUI_SOAK_TASK_OLD_SERVER_ARTIFACT_DIR=$tmp_root/task-subagent-old-server" \
+    "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/task-subagent-parity-ws" \
+    "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/task-subagent-parity-stdio" \
+    "$0" verify-task-subagent-closure >/dev/null
+  grep --fixed-strings -- '"scenario": "task-subagent-closure"' "$tmp_root/task-subagent/ux-validation.json" >/dev/null 2>&1 \
+    || die "self-test missing task-subagent-closure ux validation"
+
+  if env \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/task-subagent" \
+    "OCTOS_TUI_SOAK_TASK_RECONNECT_ARTIFACT_DIR=$tmp_root/task-subagent-reconnect" \
+    "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/task-subagent-parity-ws" \
+    "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/task-subagent-parity-stdio" \
+    "$0" verify-task-subagent-closure >/dev/null 2>&1; then
+    die "self-test expected task-subagent closure verification to fail without old-server artifacts"
+  fi
+
   mkdir -p "$tmp_root/autonomy-live/m15-evidence"
   cat > "$tmp_root/autonomy-live/tui-capture-autonomy-live.txt" <<'CAPTURE'
 Agent reviewer-api summary generated by model
@@ -3874,6 +3924,7 @@ case "${1:-help}" in
   verify-task-subagent-tree) verify_task_subagent_tree ;;
   verify-task-subagent-reconnect) verify_task_subagent_reconnect ;;
   verify-task-subagent-old-server-fallback) verify_task_subagent_old_server_fallback ;;
+  verify-task-subagent-closure) verify_task_subagent_closure ;;
   verify-backpressure) verify_backpressure ;;
   verify-interrupt-reconnect) verify_interrupt_reconnect ;;
   verify-validator-cycle) verify_validator_cycle ;;
