@@ -858,6 +858,9 @@ summary for the retained pane captures and JSONL evidence; keep
 checkout commits for both `octos` and `octos-tui`.
 Strict closure verifiers fail unless each retained closure artifact directory
 has valid `octos_repo_commit` and `octos_tui_repo_commit` fields.
+They also reject mixed-revision closure bundles; old-server fallback artifacts
+may use a different `octos` backend commit, but must still use the same
+`octos-tui` commit as the closure run under test.
 
 Verifier-backed pane captures must be non-empty and must not contain tmux
 capture failures, hidden task errors, malformed AppUI frames, unsupported-method

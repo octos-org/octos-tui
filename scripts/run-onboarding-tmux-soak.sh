@@ -777,6 +777,7 @@ is_git_sha() {
 require_summary_source_commits_for_dir() {
   local dir="$1"
   local label="$2"
+  [ -n "$dir" ] || die "$label artifact dir is required"
   local summary_file="$dir/summary.env"
   [ -f "$summary_file" ] || die "$label artifact dir missing summary.env: $summary_file"
 
@@ -788,6 +789,44 @@ require_summary_source_commits_for_dir() {
     || die "$label summary.env missing valid octos_repo_commit: $summary_file"
   is_git_sha "$octos_tui_commit" \
     || die "$label summary.env missing valid octos_tui_repo_commit: $summary_file"
+}
+
+require_matching_summary_source_commits_for_dir() {
+  local expected_dir="$1"
+  local actual_dir="$2"
+  local label="$3"
+  require_summary_source_commits_for_dir "$expected_dir" "$label expected"
+  require_summary_source_commits_for_dir "$actual_dir" "$label"
+
+  local expected_octos_commit
+  local actual_octos_commit
+  local expected_tui_commit
+  local actual_tui_commit
+  expected_octos_commit="$(summary_env_value_for_dir "$expected_dir" octos_repo_commit)"
+  actual_octos_commit="$(summary_env_value_for_dir "$actual_dir" octos_repo_commit)"
+  expected_tui_commit="$(summary_env_value_for_dir "$expected_dir" octos_tui_repo_commit)"
+  actual_tui_commit="$(summary_env_value_for_dir "$actual_dir" octos_tui_repo_commit)"
+
+  [ "$actual_octos_commit" = "$expected_octos_commit" ] \
+    || die "$label octos_repo_commit mismatch: $actual_octos_commit != $expected_octos_commit"
+  [ "$actual_tui_commit" = "$expected_tui_commit" ] \
+    || die "$label octos_tui_repo_commit mismatch: $actual_tui_commit != $expected_tui_commit"
+}
+
+require_matching_summary_tui_commit_for_dir() {
+  local expected_dir="$1"
+  local actual_dir="$2"
+  local label="$3"
+  require_summary_source_commits_for_dir "$expected_dir" "$label expected"
+  require_summary_source_commits_for_dir "$actual_dir" "$label"
+
+  local expected_tui_commit
+  local actual_tui_commit
+  expected_tui_commit="$(summary_env_value_for_dir "$expected_dir" octos_tui_repo_commit)"
+  actual_tui_commit="$(summary_env_value_for_dir "$actual_dir" octos_tui_repo_commit)"
+
+  [ "$actual_tui_commit" = "$expected_tui_commit" ] \
+    || die "$label octos_tui_repo_commit mismatch: $actual_tui_commit != $expected_tui_commit"
 }
 
 write_ux_validation() {
@@ -2127,7 +2166,7 @@ verify_solo_closure() {
   local multiline_dir="${OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR:-$artifact_dir}"
   local original_artifact_dir="$artifact_dir"
   artifact_dir="$multiline_dir"
-  require_summary_source_commits_for_dir "$artifact_dir" "M12 multiline closure"
+  require_matching_summary_source_commits_for_dir "$original_artifact_dir" "$artifact_dir" "M12 multiline closure"
   verify_multiline_composer
   artifact_dir="$original_artifact_dir"
 
@@ -2147,16 +2186,16 @@ verify_solo_transport_closure() {
   verify_solo_closure
 
   artifact_dir="$stdio_dir"
-  require_summary_source_commits_for_dir "$artifact_dir" "M12 stdio solo closure"
+  require_matching_summary_source_commits_for_dir "$original_artifact_dir" "$artifact_dir" "M12 stdio solo closure"
   verify_solo_strict_bundle 0
 
   artifact_dir="$ws_dir"
-  require_summary_source_commits_for_dir "$artifact_dir" "M12 WebSocket solo closure"
+  require_matching_summary_source_commits_for_dir "$original_artifact_dir" "$artifact_dir" "M12 WebSocket solo closure"
   verify_solo_strict_bundle 0
 
   artifact_dir="$original_artifact_dir"
-  require_summary_source_commits_for_dir "$ws_dir" "M12 WebSocket parity closure"
-  require_summary_source_commits_for_dir "$stdio_dir" "M12 stdio parity closure"
+  require_matching_summary_source_commits_for_dir "$original_artifact_dir" "$ws_dir" "M12 WebSocket parity closure"
+  require_matching_summary_source_commits_for_dir "$original_artifact_dir" "$stdio_dir" "M12 stdio parity closure"
   verify_transport_parity
 
   write_ux_validation "solo-transport-closure" "passed" "M12 solo transport closure bundle verified"
@@ -2761,17 +2800,17 @@ verify_task_subagent_closure() {
 
   local reconnect_dir="${OCTOS_TUI_SOAK_TASK_RECONNECT_ARTIFACT_DIR:-$original_artifact_dir}"
   artifact_dir="$reconnect_dir"
-  require_summary_source_commits_for_dir "$artifact_dir" "M13 task/subagent reconnect closure"
+  require_matching_summary_source_commits_for_dir "$original_artifact_dir" "$artifact_dir" "M13 task/subagent reconnect closure"
   verify_task_subagent_reconnect
 
   local old_server_dir="${OCTOS_TUI_SOAK_TASK_OLD_SERVER_ARTIFACT_DIR:-$original_artifact_dir}"
   artifact_dir="$old_server_dir"
-  require_summary_source_commits_for_dir "$artifact_dir" "M13 task/subagent old-server closure"
+  require_matching_summary_tui_commit_for_dir "$original_artifact_dir" "$artifact_dir" "M13 task/subagent old-server closure"
   verify_task_subagent_old_server_fallback
 
   artifact_dir="$original_artifact_dir"
-  require_summary_source_commits_for_dir "${OCTOS_TUI_SOAK_WS_ARTIFACT_DIR:-}" "M13 WebSocket parity closure"
-  require_summary_source_commits_for_dir "${OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR:-}" "M13 stdio parity closure"
+  require_matching_summary_source_commits_for_dir "$original_artifact_dir" "${OCTOS_TUI_SOAK_WS_ARTIFACT_DIR:-}" "M13 WebSocket parity closure"
+  require_matching_summary_source_commits_for_dir "$original_artifact_dir" "${OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR:-}" "M13 stdio parity closure"
   verify_transport_parity
 
   write_ux_validation "task-subagent-closure" "passed" "M13 task/subagent closure bundle verified"
@@ -2979,12 +3018,12 @@ verify_autonomy_closure() {
 
   local reconnect_dir="${OCTOS_TUI_SOAK_AUTONOMY_RECONNECT_ARTIFACT_DIR:-$original_artifact_dir}"
   artifact_dir="$reconnect_dir"
-  require_summary_source_commits_for_dir "$artifact_dir" "M15 autonomy reconnect closure"
+  require_matching_summary_source_commits_for_dir "$original_artifact_dir" "$artifact_dir" "M15 autonomy reconnect closure"
   verify_autonomy_reconnect
 
   artifact_dir="$original_artifact_dir"
-  require_summary_source_commits_for_dir "${OCTOS_TUI_SOAK_WS_ARTIFACT_DIR:-}" "M15 WebSocket parity closure"
-  require_summary_source_commits_for_dir "${OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR:-}" "M15 stdio parity closure"
+  require_matching_summary_source_commits_for_dir "$original_artifact_dir" "${OCTOS_TUI_SOAK_WS_ARTIFACT_DIR:-}" "M15 WebSocket parity closure"
+  require_matching_summary_source_commits_for_dir "$original_artifact_dir" "${OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR:-}" "M15 stdio parity closure"
   verify_transport_parity
 
   write_ux_validation "autonomy-closure" "passed" "M15 autonomy closure bundle verified"
@@ -3613,6 +3652,18 @@ JSONL
     "$0" verify-solo-transport-closure >/dev/null
   grep --fixed-strings -- '"scenario": "solo-transport-closure"' "$tmp_root/solo-closure/ux-validation.json" >/dev/null 2>&1 \
     || die "self-test missing solo-transport-closure ux validation"
+  cp -R "$tmp_root/solo-transport-stdio" "$tmp_root/bad-solo-transport-stdio-mismatch"
+  sed 's/^octos_repo_commit=.*/octos_repo_commit=3333333333333333333333333333333333333333/' \
+    "$tmp_root/solo-transport-stdio/summary.env" \
+    > "$tmp_root/bad-solo-transport-stdio-mismatch/summary.env"
+  if env \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/solo-closure" \
+    "OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR=$tmp_root/multiline-composer" \
+    "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/bad-solo-transport-stdio-mismatch" \
+    "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/solo-transport-ws" \
+    "$0" verify-solo-transport-closure >/dev/null 2>&1; then
+    die "self-test expected solo transport closure verification to fail on source commit mismatch"
+  fi
 
   if env \
     "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/solo-closure" \
