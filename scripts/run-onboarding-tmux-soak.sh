@@ -1948,7 +1948,7 @@ drive_dropped_completion_backpressure() {
   wait_for_tui_text "Replay lossy" "${OCTOS_TUI_SOAK_BACKPRESSURE_WAIT_SECS:-30}" || \
     die "Timed out waiting for replay-lossy status in TUI"
   capture_pane "$tui_session" "$artifact_dir/tui-capture-replay-lossy.txt"
-  wait_for_tui_text "Done" "${OCTOS_TUI_SOAK_BACKPRESSURE_DONE_WAIT_SECS:-20}" || \
+  wait_for_tui_text "Done|state .*Idle|interactive idle" "${OCTOS_TUI_SOAK_BACKPRESSURE_DONE_WAIT_SECS:-20}" || \
     die "Timed out waiting for TUI to settle after replay-lossy fixture"
   capture_pane "$tui_session" "$artifact_dir/tui-capture-backpressure-final.txt"
   capture

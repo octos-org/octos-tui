@@ -11,11 +11,11 @@ use octos_core::ui_protocol::{
     ApprovalRequestedEvent, ApprovalSandboxDetails, ApprovalSandboxEscalationDetails,
     ApprovalSandboxEscalationEndpoint, ApprovalScopesListResult, ApprovalTypedDetails,
     MessageDeltaEvent, OutputCursor, PermissionProfileListResult, PermissionProfileSelection,
-    PermissionProfileSetResult, PreviewId, SessionOpenResult, SessionOpened, TaskOutputDeltaEvent,
-    TaskOutputReadResult, TaskRuntimeState, TaskUpdatedEvent, ToolCompletedEvent,
-    ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnId, TurnStartedEvent, UiCursor,
-    UiNotification, UiPaneSnapshot, UiProtocolCapabilities, WarningEvent, approval_kinds, methods,
-    rpc_error_codes,
+    PermissionProfileSetResult, PreviewId, SessionOpenParams, SessionOpenResult, SessionOpened,
+    TaskOutputDeltaEvent, TaskOutputReadResult, TaskRuntimeState, TaskUpdatedEvent,
+    ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnId,
+    TurnStartedEvent, UiCursor, UiNotification, UiPaneSnapshot, UiProtocolCapabilities,
+    WarningEvent, approval_kinds, methods, rpc_error_codes,
 };
 use octos_core::ui_protocol::{
     JSON_RPC_VERSION, MAX_TEXT_FRAME_BYTES, RpcRequest, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
@@ -927,9 +927,14 @@ impl ProtocolAppUiBackend {
             .as_mut()
             .ok_or_else(|| eyre!("UI protocol transport driver is not initialized"))?;
 
+        let should_reopen_session =
+            self.disconnected_status_reported && self.launch.session_id.is_some();
         driver.connect(runtime)?;
         let endpoint = driver.label().to_string();
         self.mark_connected(&endpoint);
+        if should_reopen_session {
+            self.send_launch_session_open()?;
+        }
         Ok(())
     }
 
@@ -973,6 +978,25 @@ impl ProtocolAppUiBackend {
         }
         self.queue
             .extend(cancelled_requests.into_iter().map(Into::into));
+    }
+
+    fn launch_session_open_command(&self) -> Option<AppUiCommand> {
+        self.launch.session_id.clone().map(|session_id| {
+            AppUiCommand::OpenSession(SessionOpenParams {
+                session_id,
+                topic: None,
+                profile_id: self.launch.profile_id.clone(),
+                cwd: self.launch.cwd.clone(),
+                after: None,
+            })
+        })
+    }
+
+    fn send_launch_session_open(&mut self) -> Result<()> {
+        let Some(command) = self.launch_session_open_command() else {
+            return Ok(());
+        };
+        self.send(command)
     }
 
     fn build_tracked_request(
@@ -6200,6 +6224,42 @@ mod tests {
             panic!("expected status event");
         };
         assert!(status.message.contains("disconnected"));
+    }
+
+    #[test]
+    fn reconnect_session_open_command_resumes_from_recorded_cursor() {
+        let session_id = SessionKey("local:test".into());
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            profile_id: Some("coding".into()),
+            session_id: Some(session_id.clone()),
+            cwd: Some("/tmp/workspace".into()),
+            ..AppUiLaunch::default()
+        });
+        backend.protocol.session_cursors.insert(
+            session_id.clone(),
+            UiCursor {
+                stream: session_id.0.clone(),
+                seq: 42,
+            },
+        );
+
+        let command = backend
+            .launch_session_open_command()
+            .expect("launch session should reopen");
+        let request = backend
+            .build_tracked_request(command)
+            .expect("request builds");
+
+        assert_eq!(request.method, methods::SESSION_OPEN);
+        assert_eq!(request.params["session_id"], "local:test");
+        assert_eq!(request.params["profile_id"], "coding");
+        assert_eq!(request.params["cwd"], "/tmp/workspace");
+        assert_eq!(request.params["after"]["stream"], "local:test");
+        assert_eq!(request.params["after"]["seq"], 42);
     }
 
     #[test]
