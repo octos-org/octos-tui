@@ -29,3 +29,6 @@ unicode-width = "0.2"
 
 [lints.rust]
 unsafe_code = "deny"
+
+[workspace]
+resolver = "3"
