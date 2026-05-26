@@ -24,15 +24,38 @@ It writes artifacts under:
 e2e/test-results-tui-onboarding/<run-id>/
 ```
 
-The command surface is:
+The command surface is grouped as:
 
 ```sh
 scripts/run-onboarding-tmux-soak.sh preflight-live
 scripts/run-onboarding-tmux-soak.sh start
+scripts/run-onboarding-tmux-soak.sh restart-server
+scripts/run-onboarding-tmux-soak.sh stop
+
 scripts/run-onboarding-tmux-soak.sh drive-onboard
 scripts/run-onboarding-tmux-soak.sh drive-solo
+scripts/run-onboarding-tmux-soak.sh drive-permissions
+scripts/run-onboarding-tmux-soak.sh drive-provider-missing
+scripts/run-onboarding-tmux-soak.sh drive-approval-denial
+scripts/run-onboarding-tmux-soak.sh drive-multiline-composer
+scripts/run-onboarding-tmux-soak.sh drive-runtime-menus
+scripts/run-onboarding-tmux-soak.sh drive-task-subagent-tree
+scripts/run-onboarding-tmux-soak.sh drive-task-subagent-reconnect
+scripts/run-onboarding-tmux-soak.sh drive-task-subagent-old-server-fallback
+scripts/run-onboarding-tmux-soak.sh drive-autonomy-live
+scripts/run-onboarding-tmux-soak.sh drive-autonomy-reconnect
+scripts/run-onboarding-tmux-soak.sh drive-dropped-completion-backpressure
+scripts/run-onboarding-tmux-soak.sh drive-interrupt-reconnect
+scripts/run-onboarding-tmux-soak.sh drive-validator-cycle
+scripts/run-onboarding-tmux-soak.sh drive-long-output
+scripts/run-onboarding-tmux-soak.sh drive-narrow-terminal
+scripts/run-onboarding-tmux-soak.sh drive-diff-artifact
+scripts/run-onboarding-tmux-soak.sh drive-tool-denial
+scripts/run-onboarding-tmux-soak.sh drive-tool-success
+
 scripts/run-onboarding-tmux-soak.sh capture
 scripts/run-onboarding-tmux-soak.sh send-turn
+
 scripts/run-onboarding-tmux-soak.sh verify
 scripts/run-onboarding-tmux-soak.sh verify-onboard
 scripts/run-onboarding-tmux-soak.sh verify-solo
@@ -42,15 +65,30 @@ scripts/run-onboarding-tmux-soak.sh verify-first-launch
 scripts/run-onboarding-tmux-soak.sh verify-provider-missing
 scripts/run-onboarding-tmux-soak.sh verify-permissions
 scripts/run-onboarding-tmux-soak.sh verify-approval-denial
+scripts/run-onboarding-tmux-soak.sh verify-multiline-composer
+scripts/run-onboarding-tmux-soak.sh verify-runtime-menus
 scripts/run-onboarding-tmux-soak.sh verify-task-subagent-tree
+scripts/run-onboarding-tmux-soak.sh verify-task-subagent-reconnect
+scripts/run-onboarding-tmux-soak.sh verify-task-subagent-old-server-fallback
 scripts/run-onboarding-tmux-soak.sh verify-task-subagent-closure
+scripts/run-onboarding-tmux-soak.sh verify-backpressure
+scripts/run-onboarding-tmux-soak.sh verify-interrupt-reconnect
+scripts/run-onboarding-tmux-soak.sh verify-validator-cycle
+scripts/run-onboarding-tmux-soak.sh verify-long-output
+scripts/run-onboarding-tmux-soak.sh verify-narrow-terminal
+scripts/run-onboarding-tmux-soak.sh verify-diff-artifact
+scripts/run-onboarding-tmux-soak.sh verify-tool-denial
+scripts/run-onboarding-tmux-soak.sh verify-tool-success
+scripts/run-onboarding-tmux-soak.sh verify-autonomy-live
+scripts/run-onboarding-tmux-soak.sh verify-autonomy-reconnect
 scripts/run-onboarding-tmux-soak.sh verify-autonomy-closure
 scripts/run-onboarding-tmux-soak.sh verify-transport-parity
 scripts/run-onboarding-tmux-soak.sh verify-ux-run
+
 scripts/run-onboarding-tmux-soak.sh api-parity
 scripts/run-onboarding-tmux-soak.sh self-test
 scripts/run-onboarding-tmux-soak.sh solo-self-test
-scripts/run-onboarding-tmux-soak.sh stop
+scripts/run-onboarding-tmux-soak.sh help
 ```
 
 `self-test` is local and synthetic. It does not start the backend; it creates
