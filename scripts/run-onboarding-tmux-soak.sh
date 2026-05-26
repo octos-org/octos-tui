@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-task-subagent-tree|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -540,6 +540,19 @@ assert_capture_clean() {
     "$file" >/dev/null 2>&1; then
     die "$label capture contains tmux/AppUI error text: $file"
   fi
+}
+
+first_existing_artifact() {
+  local label="$1"
+  shift
+  local file
+  for file in "$@"; do
+    if [ -f "$file" ]; then
+      printf '%s\n' "$file"
+      return 0
+    fi
+  done
+  die "$label missing"
 }
 
 start() {
@@ -1225,6 +1238,69 @@ verify_permissions() {
   echo "Verified permissions onboarding selection in $artifact_dir"
 }
 
+verify_task_subagent_tree() {
+  local running_capture="$artifact_dir/tui-capture-task-subagent-tree-running.txt"
+  local final_capture="$artifact_dir/tui-capture-task-subagent-tree-final.txt"
+  local summary_capture="$artifact_dir/tui-capture-task-subagent-tree-summary.txt"
+  assert_capture_clean "$running_capture" "task-subagent-running"
+  assert_capture_clean "$final_capture" "task-subagent-final"
+  assert_capture_clean "$summary_capture" "task-subagent-summary"
+
+  for required_text in \
+    "Subagents" \
+    "Artifacts"
+  do
+    grep --fixed-strings -- "$required_text" "$running_capture" "$final_capture" >/dev/null 2>&1 \
+      || die "task-subagent captures missing required text: $required_text"
+  done
+
+  for required_text in \
+    "M15CODEREVIEWFINALLINE" \
+    "Ask Octos to change code"
+  do
+    grep --fixed-strings -- "$required_text" "$final_capture" >/dev/null 2>&1 \
+      || die "task-subagent final capture missing required text: $required_text"
+  done
+
+  tr '\n' ' ' < "$summary_capture" | grep -E 'Code[[:space:]]+Review[[:space:]]+Summary' >/dev/null 2>&1 \
+    || die "task-subagent summary capture missing Code Review Summary"
+
+  local transcript
+  local task_ledger
+  local artifact_index
+  transcript="$(first_existing_artifact "task-subagent AppUI transcript" \
+    "$artifact_dir/m15-evidence/appui-transcript.jsonl" \
+    "$artifact_dir/appui-transcript.jsonl")"
+  task_ledger="$(first_existing_artifact "task-subagent task ledger" \
+    "$artifact_dir/m15-evidence/task-ledger.jsonl" \
+    "$artifact_dir/task-ledger.jsonl")"
+  artifact_index="$(first_existing_artifact "task-subagent artifact index" \
+    "$artifact_dir/m15-evidence/artifact-index.json" \
+    "$artifact_dir/artifact-index.json")"
+
+  grep -E '"event"[[:space:]]*:[[:space:]]*"task_started"' "$task_ledger" >/dev/null 2>&1 \
+    || die "task-subagent task ledger missing task_started event"
+  grep -E '"event"[[:space:]]*:[[:space:]]*"task_completed"' "$task_ledger" >/dev/null 2>&1 \
+    || die "task-subagent task ledger missing task_completed event"
+  grep -E '"artifacts"[[:space:]]*:' "$artifact_index" >/dev/null 2>&1 \
+    || die "task-subagent artifact index missing artifacts array"
+
+  if grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"task/(spawn|send|join)"' \
+    "$transcript" >/dev/null 2>&1; then
+    die "task-subagent transcript contains client-owned task control methods"
+  fi
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"(turn/start|review/start)"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "task-subagent transcript missing turn/start or review/start request"
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(server_to_client|rx)".*"method"[[:space:]]*:[[:space:]]*"(task/updated|agent/updated)"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "task-subagent transcript missing backend task/agent update notification"
+
+  write_ux_validation "task-subagent-tree" "passed" "task/subagent tree captures verified"
+  secret_leak_check
+  echo "Verified task/subagent tree artifacts in $artifact_dir"
+}
+
 self_test_solo() {
   local probe="$octos_repo/scripts/m12-solo-appui-soak.sh"
   [ -x "$probe" ] || die "M12 solo soak wrapper missing or not executable: $probe"
@@ -1362,6 +1438,55 @@ CAPTURE
     die "self-test expected unsupported-method capture verification to fail"
   fi
 
+  mkdir -p "$tmp_root/task-subagent/m15-evidence"
+  cat > "$tmp_root/task-subagent/tui-capture-task-subagent-tree-running.txt" <<'CAPTURE'
+Subagents
+1. Ada Lovelace (reviewer-api) completed: true
+Artifacts
+- reviewer-api-notes
+CAPTURE
+  cat > "$tmp_root/task-subagent/tui-capture-task-subagent-tree-final.txt" <<'CAPTURE'
+Subagents
+1. Ada Lovelace (reviewer-api) completed: true
+Artifacts
+- reviewer-api-notes
+M15_CODE_REVIEW_FINAL_LINE M15CODEREVIEWFINALLINE
+Ask Octos to change code...
+CAPTURE
+  cat > "$tmp_root/task-subagent/tui-capture-task-subagent-tree-summary.txt" <<'CAPTURE'
+Code Review Summary
+Findings
+Subagents
+Artifacts
+CAPTURE
+  cat > "$tmp_root/task-subagent/m15-evidence/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"turn/start"}}
+{"direction":"server_to_client","frame":{"method":"task/updated"}}
+JSONL
+  cat > "$tmp_root/task-subagent/m15-evidence/task-ledger.jsonl" <<'JSONL'
+{"event":"task_started","task_id":"task-1"}
+{"event":"task_completed","task_id":"task-1"}
+JSONL
+  cat > "$tmp_root/task-subagent/m15-evidence/artifact-index.json" <<'JSON'
+{"artifacts":[{"id":"reviewer-api-notes"}]}
+JSON
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/task-subagent" "$0" verify-task-subagent-tree >/dev/null
+
+  mkdir -p "$tmp_root/bad-task-subagent/m15-evidence"
+  cp "$tmp_root/task-subagent/tui-capture-task-subagent-tree-running.txt" "$tmp_root/bad-task-subagent/"
+  cp "$tmp_root/task-subagent/tui-capture-task-subagent-tree-final.txt" "$tmp_root/bad-task-subagent/"
+  cp "$tmp_root/task-subagent/tui-capture-task-subagent-tree-summary.txt" "$tmp_root/bad-task-subagent/"
+  cp "$tmp_root/task-subagent/m15-evidence/task-ledger.jsonl" "$tmp_root/bad-task-subagent/m15-evidence/"
+  cp "$tmp_root/task-subagent/m15-evidence/artifact-index.json" "$tmp_root/bad-task-subagent/m15-evidence/"
+  cat > "$tmp_root/bad-task-subagent/m15-evidence/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"turn/start"}}
+{"direction":"client_to_server","frame":{"method":"task/spawn"}}
+{"direction":"server_to_client","frame":{"method":"task/updated"}}
+JSONL
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-task-subagent" "$0" verify-task-subagent-tree >/dev/null 2>&1; then
+    die "self-test expected task-subagent client task-control verification to fail"
+  fi
+
   while IFS= read -r -d '' file; do
     if grep --fixed-strings -- "selftest-secret" "$file" >/dev/null 2>&1; then
       die "self-test secret leaked into artifacts: $file"
@@ -1403,6 +1528,7 @@ case "${1:-help}" in
   verify-first-launch) verify_first_launch ;;
   verify-provider-missing) verify_provider_missing ;;
   verify-permissions) verify_permissions ;;
+  verify-task-subagent-tree) verify_task_subagent_tree ;;
   api-parity) api_parity ;;
   self-test) self_test ;;
   solo-self-test) self_test_solo ;;

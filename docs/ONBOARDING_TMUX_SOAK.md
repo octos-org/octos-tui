@@ -37,6 +37,7 @@ scripts/run-onboarding-tmux-soak.sh verify-solo
 scripts/run-onboarding-tmux-soak.sh verify-first-launch
 scripts/run-onboarding-tmux-soak.sh verify-provider-missing
 scripts/run-onboarding-tmux-soak.sh verify-permissions
+scripts/run-onboarding-tmux-soak.sh verify-task-subagent-tree
 scripts/run-onboarding-tmux-soak.sh api-parity
 scripts/run-onboarding-tmux-soak.sh self-test
 scripts/run-onboarding-tmux-soak.sh solo-self-test
@@ -158,6 +159,27 @@ the server-backed permission menu, `Workspace Write` update acknowledgement,
 and a returned coding-session composer. It fails if the capture is still on
 provider setup or contains AppUI error text.
 
+## Task/Subagent Tree
+
+For M13 supervised task inspection evidence:
+
+```sh
+OCTOS_TUI_SOAK_RUN_ID=task-subagent-$(date -u +%Y%m%dT%H%M%SZ) \
+scripts/run-onboarding-tmux-soak.sh start
+
+OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-task-subagent-tree
+
+OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-task-subagent-tree
+```
+
+`verify-task-subagent-tree` checks the running, final, and scrolled summary
+captures for visible subagent/artifact output, the final review marker, and a
+usable composer. It also checks the retained transcript/ledger evidence and
+fails if the TUI issued client-owned `task/spawn`, `task/send`, or `task/join`
+calls in the normal backend-supervised review flow.
+
 The solo lane writes these M12 artifacts into
 `e2e/test-results-tui-onboarding/<run-id>/`:
 
@@ -167,6 +189,10 @@ The solo lane writes these M12 artifacts into
 - `tui-capture-provider-missing.txt` when running `drive-provider-missing`
 - `tui-capture-permissions-open.txt` and
   `tui-capture-permissions-applied.txt` when running `drive-permissions`
+- `tui-capture-task-subagent-tree-running.txt`,
+  `tui-capture-task-subagent-tree-final.txt`, and
+  `tui-capture-task-subagent-tree-summary.txt` when running
+  `drive-task-subagent-tree`
 - `server.log`
 - `appui-transcript.jsonl`
 - `runtime-policy-stamp.json`
