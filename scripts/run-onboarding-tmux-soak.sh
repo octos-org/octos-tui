@@ -892,6 +892,7 @@ api_parity() {
 solo_probe_args() {
   local probe_transport="$1"
   local stdio_command="${2:-}"
+  local local_name="${OCTOS_TUI_SOAK_LOCAL_NAME:-M12 Solo Soak}"
   local probe="$octos_repo/scripts/m12-solo-appui-probe.mjs"
   [ -f "$probe" ] || die "M12 solo AppUI probe missing: $probe"
   local args=(
@@ -902,7 +903,7 @@ solo_probe_args() {
     --data-dir "$solo_probe_data_dir"
     --profile-id "$profile_id"
     --session-id "$session_id"
-    --local-name "${OCTOS_TUI_SOAK_LOCAL_NAME:-M12 Solo Soak}"
+    --local-name "$local_name"
     --local-username "${OCTOS_TUI_SOAK_LOCAL_USERNAME:-$profile_id}"
     --local-email "${OCTOS_TUI_SOAK_LOCAL_EMAIL:-$profile_id@example.invalid}"
     --server-log "$solo_probe_server_log"
@@ -927,7 +928,9 @@ drive_solo() {
   require_octos_serve
   mkdir -p "$workspace" "$data_dir" "$solo_probe_data_dir" "$logs_dir" "$artifact_dir"
   write_summary
+  local local_name="${OCTOS_TUI_SOAK_LOCAL_NAME:-M12 Solo Soak}"
   OCTOS_TUI_SOAK_INIT_PROFILE_LLM="${OCTOS_TUI_SOAK_INIT_PROFILE_LLM:-1}" \
+    OCTOS_TUI_SOAK_LOCAL_NAME="$local_name" \
     init_profile_if_missing "$solo_probe_data_dir/profiles/$profile_id.json"
   capture
 
