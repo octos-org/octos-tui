@@ -79,6 +79,47 @@ can be `OCTOS_TUI_SOAK_API_KEY`, one of `OCTOS_TUI_SOAK_PROVIDER_ENV_VARS`, or
 pre-seeded profile `env_vars`. Set `OCTOS_TUI_SOAK_REQUIRE_LIVE_PROVIDER=0`
 only for provider-free dry runs that cannot close #31, #40, or #44.
 
+## Live Closure Checklist
+
+Use this checklist before posting closure evidence for #31, #40, or #44. A
+provider-free run can prove harness readiness, but it is not closure evidence
+for these issues because each acceptance row requires provider-backed live TUI
+behavior.
+
+For each issue, keep the retained artifact directories outside generated
+workspace paths that should not be committed. Then post a GitHub issue comment
+with:
+
+- the `octos` and `octos-tui` commits;
+- host, OS, tmux version, transport, and provider credential source without the
+  secret value;
+- exact commands;
+- retained artifact paths;
+- verifier result and any remaining gaps.
+
+Minimum closeable bundle per issue:
+
+- #31 solo/dangerous mode: one strict stdio run, one strict WebSocket run,
+  tenant/cloud dangerous-mode rejection evidence, multiline composer evidence,
+  and a passing `verify-solo-transport-closure`.
+- #40 supervised task inspection: one stdio run, one WebSocket run,
+  reconnect/hydration evidence, old-server fallback evidence, and a passing
+  `verify-task-subagent-closure`.
+- #44 production autonomy: one stdio run, one WebSocket run,
+  production autonomy evidence, reconnect/hydration evidence, and a passing
+  `verify-autonomy-closure`.
+
+Run live preflight first:
+
+```sh
+OCTOS_BIN=/path/to/octos \
+OCTOS_TUI_BIN=/path/to/octos-tui \
+scripts/run-onboarding-tmux-soak.sh preflight-live
+```
+
+After closure verification, make sure `git status --short` does not include
+retained artifacts such as `e2e/test-results*` before opening any PR.
+
 ## M12 Solo No-OTP Flow
 
 The solo lane calls `profile/local/create` with display name, username, and
