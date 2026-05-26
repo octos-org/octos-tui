@@ -38,12 +38,14 @@ fake_openai_host="${OCTOS_TUI_SOAK_FAKE_OPENAI_HOST:-127.0.0.1}"
 fake_openai_port="${OCTOS_TUI_SOAK_FAKE_OPENAI_PORT:-50180}"
 fake_openai_session="${OCTOS_TUI_SOAK_FAKE_OPENAI_SESSION:-octos-onboard-fake-openai-$run_id}"
 fake_openai_delay_secs="${OCTOS_TUI_SOAK_FAKE_OPENAI_DELAY_SECS:-0}"
+provider_env_vars="${OCTOS_TUI_SOAK_PROVIDER_ENV_VARS:-OPENAI_API_KEY ANTHROPIC_API_KEY DEEPSEEK_API_KEY OPENROUTER_API_KEY MOONSHOT_API_KEY KIMI_API_KEY AUTODL_API_KEY}"
+require_live_provider="${OCTOS_TUI_SOAK_REQUIRE_LIVE_PROVIDER:-1}"
 first_launch_capture="${OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE:-0}"
 endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-task-subagent-old-server-fallback|drive-autonomy-live|drive-autonomy-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <preflight-live|start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-task-subagent-old-server-fallback|drive-autonomy-live|drive-autonomy-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -61,6 +63,9 @@ Environment:
   OCTOS_TUI_SOAK_EXPECT_ROUTE    Optional route.route_id expected in profile JSON.
   OCTOS_TUI_SOAK_EXPECT_BASE_URL Optional route.base_url expected in profile JSON.
   OCTOS_TUI_SOAK_API_KEY         Optional secret string checked for capture leaks.
+  OCTOS_TUI_SOAK_PROVIDER_ENV_VARS Space/comma-separated provider key env vars
+                                 accepted by preflight-live.
+  OCTOS_TUI_SOAK_REQUIRE_LIVE_PROVIDER Set to 0 for provider-free dry-run preflight.
   OCTOS_TUI_SOAK_INIT_PROFILE_LLM Set to 1 to pre-seed profile JSON before backend bootstraps.
   OCTOS_TUI_SOAK_TENANT_NEGATIVE Set to 1 to also run tenant/cloud dangerous-mode negative probe.
   OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE Set to 1 during verify-solo to require
@@ -136,6 +141,66 @@ require_octos_serve() {
   if ! "$octos_bin" serve --help >/dev/null 2>&1; then
     die "OCTOS_BIN does not expose 'serve'; build octos-cli with the api feature or set OCTOS_BIN to an API-enabled binary"
   fi
+}
+
+profile_has_provider_secret() {
+  local profile_path="$data_dir/profiles/$profile_id.json"
+  [ -f "$profile_path" ] || return 1
+  if command -v jq >/dev/null 2>&1; then
+    jq -e '
+      (.config.env_vars // .env_vars // {})
+      | type == "object"
+      and any(to_entries[]?; (.value | type == "string" and length > 0))
+    ' "$profile_path" >/dev/null 2>&1
+  else
+    grep -E '"env_vars"[[:space:]]*:' "$profile_path" >/dev/null 2>&1 \
+      && grep -E '"[^"]+"[[:space:]]*:[[:space:]]*"[^"]+"' "$profile_path" >/dev/null 2>&1
+  fi
+}
+
+provider_credential_source() {
+  if [ -n "${OCTOS_TUI_SOAK_API_KEY:-}" ]; then
+    printf 'OCTOS_TUI_SOAK_API_KEY\n'
+    return 0
+  fi
+
+  local env_names="${provider_env_vars//,/ }"
+  local env_name
+  for env_name in $env_names; do
+    if [ -n "${!env_name:-}" ]; then
+      printf '%s\n' "$env_name"
+      return 0
+    fi
+  done
+
+  if profile_has_provider_secret; then
+    printf 'profile env_vars for %s\n' "$profile_id"
+    return 0
+  fi
+
+  return 1
+}
+
+preflight_live() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for live soak"
+  require_octos_serve
+  require_bin OCTOS_TUI_BIN "$octos_tui_bin"
+
+  local provider_source=""
+  if [ "$require_live_provider" != "0" ]; then
+    provider_source="$(provider_credential_source || true)"
+    if [ -z "$provider_source" ]; then
+      die "Live closure preflight failed: no provider credential found. Set OCTOS_TUI_SOAK_API_KEY, one of OCTOS_TUI_SOAK_PROVIDER_ENV_VARS, or pre-seed $data_dir/profiles/$profile_id.json with profile env_vars. Set OCTOS_TUI_SOAK_REQUIRE_LIVE_PROVIDER=0 only for provider-free dry runs."
+    fi
+  else
+    provider_source="not required"
+  fi
+
+  printf 'Live soak preflight passed\n'
+  printf 'transport=%s\n' "$transport"
+  printf 'octos_bin=%s\n' "$octos_bin"
+  printf 'octos_tui_bin=%s\n' "$octos_tui_bin"
+  printf 'provider_credential=%s\n' "$provider_source"
 }
 
 json_escape() {
@@ -2693,6 +2758,40 @@ self_test() {
   tmux kill-session -t "$self_test_tui_session" >/dev/null 2>&1 || true
   tmux new-session -d -s "$self_test_server_session" "printf 'Synthetic self-test server pane\n'; sleep 600"
   tmux new-session -d -s "$self_test_tui_session" "printf 'Ask Octos to change code\nOCTOS self-test\n'; sleep 600"
+  local fake_octos_bin="$tmp_root/fake-octos-preflight"
+  local fake_tui_bin="$tmp_root/fake-octos-tui-preflight"
+  cat > "$fake_octos_bin" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "serve" ] && [ "${2:-}" = "--help" ]; then
+  printf 'serve help\n'
+  exit 0
+fi
+exit 0
+SH
+  cat > "$fake_tui_bin" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fake_octos_bin" "$fake_tui_bin"
+  env \
+    "OCTOS_BIN=$fake_octos_bin" \
+    "OCTOS_TUI_BIN=$fake_tui_bin" \
+    "OCTOS_TUI_SOAK_DATA_DIR=$tmp_root/preflight-empty-data" \
+    "OCTOS_TUI_SOAK_API_KEY=selftest-secret" \
+    "$0" preflight-live >/dev/null
+  if env \
+    "OCTOS_BIN=$fake_octos_bin" \
+    "OCTOS_TUI_BIN=$fake_tui_bin" \
+    "OCTOS_TUI_SOAK_DATA_DIR=$tmp_root/preflight-empty-data" \
+    "$0" preflight-live >/dev/null 2>&1; then
+    die "self-test expected live preflight to fail without provider credentials"
+  fi
+  env \
+    "OCTOS_BIN=$fake_octos_bin" \
+    "OCTOS_TUI_BIN=$fake_tui_bin" \
+    "OCTOS_TUI_SOAK_DATA_DIR=$tmp_root/preflight-empty-data" \
+    "OCTOS_TUI_SOAK_REQUIRE_LIVE_PROVIDER=0" \
+    "$0" preflight-live >/dev/null
   cat > "$tmp_root/data/profiles/coding.json" <<'JSON'
 {
   "id": "coding",
@@ -3527,6 +3626,7 @@ stop() {
 }
 
 case "${1:-help}" in
+  preflight-live) preflight_live ;;
   start) start ;;
   restart-server) restart_server ;;
   drive-onboard) drive_onboard ;;

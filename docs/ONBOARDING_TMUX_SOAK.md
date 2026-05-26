@@ -27,6 +27,7 @@ e2e/test-results-tui-onboarding/<run-id>/
 The command surface is:
 
 ```sh
+scripts/run-onboarding-tmux-soak.sh preflight-live
 scripts/run-onboarding-tmux-soak.sh start
 scripts/run-onboarding-tmux-soak.sh drive-onboard
 scripts/run-onboarding-tmux-soak.sh drive-solo
@@ -55,6 +56,23 @@ required artifact creation and redaction, then proves verification fails if
 `solo-self-test` delegates to the backend M12 fixture probe. It validates the
 solo artifact schema and proves the retained AppUI transcript contains no OTP
 method traffic.
+
+## Live Preflight
+
+Run the live preflight before validation-only closure attempts for M12/M13/M15
+tmux evidence:
+
+```sh
+OCTOS_BIN=/path/to/octos \
+OCTOS_TUI_BIN=/path/to/octos-tui \
+scripts/run-onboarding-tmux-soak.sh preflight-live
+```
+
+`preflight-live` checks for tmux, an API-enabled `octos serve`, an executable
+`octos-tui`, and a provider credential source. By default the provider source
+can be `OCTOS_TUI_SOAK_API_KEY`, one of `OCTOS_TUI_SOAK_PROVIDER_ENV_VARS`, or
+pre-seeded profile `env_vars`. Set `OCTOS_TUI_SOAK_REQUIRE_LIVE_PROVIDER=0`
+only for provider-free dry runs that cannot close #31, #40, or #44.
 
 ## M12 Solo No-OTP Flow
 
