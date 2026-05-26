@@ -207,20 +207,35 @@ usable composer. It also checks the retained transcript/ledger evidence and
 fails if the TUI issued client-owned `task/spawn`, `task/send`, or `task/join`
 calls in the normal backend-supervised review flow.
 
-For the WebSocket reconnect/hydration leg, keep the same run id and run:
+For the reconnect/hydration leg, keep the same run id and run one lane per
+transport.
+
+WebSocket:
 
 ```sh
 OCTOS_TUI_SOAK_TRANSPORT=ws \
 OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-task-subagent-reconnect
+```
 
-OCTOS_TUI_SOAK_TRANSPORT=ws \
+Stdio:
+
+```sh
+OCTOS_TUI_SOAK_TRANSPORT=stdio \
+OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-task-subagent-reconnect
+```
+
+Then verify the retained artifact directory:
+
+```sh
 OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-task-subagent-reconnect
 ```
 
-`drive-task-subagent-reconnect` restarts the backend tmux session, waits for
-the TUI to settle again, and saves
+`drive-task-subagent-reconnect` restarts the WebSocket backend or terminates the
+scoped stdio child process so the TUI exercises its relaunch path. It waits for
+the TUI to settle again and saves
 `tui-capture-task-subagent-tree-reconnect.txt`. The verifier checks the restart
 capture, the post-reconnect composer/status line, and AppUI hydration method
 evidence such as `session/open`, `agent/list`, `session/goal/get`,

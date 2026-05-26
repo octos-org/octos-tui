@@ -1326,11 +1326,12 @@ drive_task_subagent_tree() {
 }
 
 drive_task_subagent_reconnect() {
-  if [ "$transport" != "ws" ]; then
-    die "drive-task-subagent-reconnect requires OCTOS_TUI_SOAK_TRANSPORT=ws"
+  if [ "$transport" = "ws" ]; then
+    restart_server
+  else
+    restart_stdio_child
   fi
-  restart_server
-  wait_for_tui_text "Ask Octos to change code|UI protocol reconnected|state" \
+  wait_for_tui_text "Ask Octos to change code|UI protocol reconnected|stdio child exited|relaunch|state" \
     "${OCTOS_TUI_SOAK_RECONNECT_WAIT_SECS:-20}" || \
     die "Timed out waiting for TUI to settle after backend restart"
   capture_pane "$tui_session" "$artifact_dir/tui-capture-task-subagent-tree-reconnect.txt"
@@ -3224,6 +3225,44 @@ CAPTURE
 {"direction":"client_to_server","frame":{"method":"agent/list"}}
 JSONL
   env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/task-subagent-reconnect" "$0" verify-task-subagent-reconnect >/dev/null
+
+  local fake_task_stdio_bin="$tmp_root/fake-octos-task-stdio"
+  local fake_task_stdio_data="$tmp_root/task-stdio-drive-data"
+  local fake_task_stdio_logs="$tmp_root/task-stdio-drive-logs"
+  local fake_task_stdio_artifacts="$tmp_root/task-subagent-stdio-drive"
+  mkdir -p "$fake_task_stdio_data" "$fake_task_stdio_logs" "$fake_task_stdio_artifacts"
+  cat > "$fake_task_stdio_bin" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "serve" ] && [ "${2:-}" = "--stdio" ]; then
+  while true; do
+    sleep 5
+  done
+fi
+exit 0
+SH
+  chmod +x "$fake_task_stdio_bin"
+  "$fake_task_stdio_bin" serve --stdio --data-dir "$fake_task_stdio_data" &
+  local fake_task_stdio_pid=$!
+  printf '%s\n' "$fake_task_stdio_pid" > "$fake_task_stdio_logs/stdio-backend.pid"
+  sleep 0.3
+  tmux kill-session -t "$self_test_tui_session" >/dev/null 2>&1 || true
+  tmux new-session -d -s "$self_test_tui_session" "printf 'UI protocol reconnected\nAsk Octos to change code...\nstate Done\n'; sleep 600"
+  env \
+    "${child_env[@]}" \
+    "OCTOS_BIN=$fake_task_stdio_bin" \
+    "OCTOS_TUI_SOAK_TRANSPORT=stdio" \
+    "OCTOS_TUI_SOAK_DATA_DIR=$fake_task_stdio_data" \
+    "OCTOS_TUI_SOAK_LOGS_DIR=$fake_task_stdio_logs" \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$fake_task_stdio_artifacts" \
+    "$0" drive-task-subagent-reconnect >/dev/null
+  wait "$fake_task_stdio_pid" 2>/dev/null || true
+  if kill -0 "$fake_task_stdio_pid" 2>/dev/null; then
+    die "self-test expected stdio task/subagent reconnect driver to terminate scoped backend"
+  fi
+  [ -s "$fake_task_stdio_artifacts/server-pane-after-restart.txt" ] \
+    || die "self-test missing stdio task/subagent reconnect restart artifact"
+  [ -s "$fake_task_stdio_artifacts/tui-capture-task-subagent-tree-reconnect.txt" ] \
+    || die "self-test missing stdio task/subagent reconnect capture"
 
   mkdir -p "$tmp_root/bad-task-subagent-reconnect/m15-evidence"
   cp "$tmp_root/task-subagent-reconnect/server-pane-after-restart.txt" "$tmp_root/bad-task-subagent-reconnect/"
