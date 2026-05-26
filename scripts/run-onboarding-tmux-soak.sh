@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-autonomy-live|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-autonomy-live|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -2177,6 +2177,40 @@ verify_task_subagent_reconnect() {
   echo "Verified task/subagent reconnect artifacts in $artifact_dir"
 }
 
+verify_task_subagent_old_server_fallback() {
+  local capture_file
+  capture_file="$(first_existing_artifact "task-subagent old-server fallback capture" \
+    "$artifact_dir/tui-capture-task-subagent-old-server-fallback.txt" \
+    "$artifact_dir/tui-capture.txt")"
+  local transcript
+  transcript="$(first_existing_artifact "task-subagent old-server fallback AppUI transcript" \
+    "$artifact_dir/m15-evidence/appui-transcript.jsonl" \
+    "$artifact_dir/appui-transcript.jsonl")"
+
+  assert_capture_clean "$capture_file" "task-subagent old-server fallback"
+  grep --fixed-strings -- "Ask Octos to change code" "$capture_file" >/dev/null 2>&1 \
+    || die "task-subagent old-server fallback capture missing usable composer"
+  grep --fixed-strings -- "state" "$capture_file" >/dev/null 2>&1 \
+    || die "task-subagent old-server fallback capture missing status line"
+
+  if grep -Ei 'Subagents|Task[[:space:]]+Inspector|task/artifact|artifact/list|review/start' \
+    "$capture_file" >/dev/null 2>&1; then
+    die "task-subagent old-server fallback capture shows hidden inspection controls"
+  fi
+  if grep -E 'harness[.]task_supervision_inspection[.]v1|harness[.]task_artifacts[.]v1' \
+    "$transcript" >/dev/null 2>&1; then
+    die "task-subagent old-server fallback transcript advertises supervised task capabilities"
+  fi
+  if grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"(review/start|task/list|task/artifact/(list|read))"' \
+    "$transcript" >/dev/null 2>&1; then
+    die "task-subagent old-server fallback transcript probes inspection methods"
+  fi
+
+  write_ux_validation "task-subagent-old-server-fallback" "passed" "old-server task/subagent fallback capture verified"
+  secret_leak_check
+  echo "Verified task/subagent old-server fallback artifacts in $artifact_dir"
+}
+
 verify_autonomy_live() {
   local capture_file
   capture_file="$(first_existing_artifact "M15 autonomy TUI capture" \
@@ -2963,6 +2997,34 @@ JSONL
     die "self-test expected task-subagent reconnect verification to fail"
   fi
 
+  mkdir -p "$tmp_root/task-subagent-old-server"
+  cat > "$tmp_root/task-subagent-old-server/tui-capture-task-subagent-old-server-fallback.txt" <<'CAPTURE'
+Assistant response rendered without supervised task controls.
+Ask Octos to change code...
+state Done
+CAPTURE
+  cat > "$tmp_root/task-subagent-old-server/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"config/capabilities/list"}}
+{"direction":"client_to_server","frame":{"method":"session/open"}}
+{"direction":"client_to_server","frame":{"method":"turn/start"}}
+JSONL
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/task-subagent-old-server" "$0" verify-task-subagent-old-server-fallback >/dev/null
+
+  mkdir -p "$tmp_root/bad-task-subagent-old-server"
+  cat > "$tmp_root/bad-task-subagent-old-server/tui-capture-task-subagent-old-server-fallback.txt" <<'CAPTURE'
+Task Inspector
+Subagents
+Ask Octos to change code...
+state Done
+CAPTURE
+  cat > "$tmp_root/bad-task-subagent-old-server/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"config/capabilities/list"}}
+{"direction":"client_to_server","frame":{"method":"task/artifact/list"}}
+JSONL
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-task-subagent-old-server" "$0" verify-task-subagent-old-server-fallback >/dev/null 2>&1; then
+    die "self-test expected task-subagent old-server fallback verification to fail"
+  fi
+
   mkdir -p "$tmp_root/autonomy-live/m15-evidence"
   cat > "$tmp_root/autonomy-live/tui-capture-autonomy-live.txt" <<'CAPTURE'
 Agent reviewer-api summary generated by model
@@ -3139,6 +3201,7 @@ case "${1:-help}" in
   verify-runtime-menus) verify_runtime_menus ;;
   verify-task-subagent-tree) verify_task_subagent_tree ;;
   verify-task-subagent-reconnect) verify_task_subagent_reconnect ;;
+  verify-task-subagent-old-server-fallback) verify_task_subagent_old_server_fallback ;;
   verify-backpressure) verify_backpressure ;;
   verify-interrupt-reconnect) verify_interrupt_reconnect ;;
   verify-validator-cycle) verify_validator_cycle ;;

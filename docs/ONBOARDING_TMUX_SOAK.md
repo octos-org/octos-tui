@@ -226,6 +226,18 @@ capture, the post-reconnect composer/status line, and AppUI hydration method
 evidence such as `session/open`, `agent/list`, `session/goal/get`,
 `loop/list`, or `task/list`.
 
+For the old-server fallback leg, retain a capture and transcript from a backend
+that does not advertise supervised task inspection capabilities, then run:
+
+```sh
+OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-task-subagent-old-server-fallback
+```
+
+The verifier checks that the fallback capture still has a usable composer/status
+line, does not expose task/subagent inspection controls, and does not probe
+`review/start`, `task/list`, or `task/artifact/*` methods.
+
 ## M15 Autonomy Live Artifacts
 
 For M15 production autonomy evidence, start the normal tmux harness against a
