@@ -37,6 +37,7 @@ scripts/run-onboarding-tmux-soak.sh verify
 scripts/run-onboarding-tmux-soak.sh verify-onboard
 scripts/run-onboarding-tmux-soak.sh verify-solo
 scripts/run-onboarding-tmux-soak.sh verify-solo-closure
+scripts/run-onboarding-tmux-soak.sh verify-solo-transport-closure
 scripts/run-onboarding-tmux-soak.sh verify-first-launch
 scripts/run-onboarding-tmux-soak.sh verify-provider-missing
 scripts/run-onboarding-tmux-soak.sh verify-permissions
@@ -112,6 +113,19 @@ For the full M12-G closure bundle, run `verify-solo-closure`; it enables strict
 solo verification, requires tenant-negative evidence, and also verifies the
 multiline composer capture. If multiline evidence was retained in a separate
 run, set `OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR=<path>`.
+For final transport coverage, retain one strict stdio solo run and one strict
+WebSocket solo run, then run `verify-solo-transport-closure`:
+
+```sh
+OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<solo-run-id> \
+OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<multiline-run-id> \
+OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<stdio-run-id> \
+OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<ws-run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-solo-transport-closure
+```
+
+`verify-solo-transport-closure` runs the strict solo closure bundle, verifies
+both retained transport artifacts, and compares their AppUI method sequence.
 Live transports also require `OCTOS_BIN` to point at an API-enabled `octos`
 binary that exposes `serve`.
 

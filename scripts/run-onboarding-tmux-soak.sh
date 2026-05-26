@@ -46,7 +46,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <preflight-live|start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-task-subagent-old-server-fallback|drive-autonomy-live|drive-autonomy-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-solo-closure|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-task-subagent-closure|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-autonomy-closure|verify-transport-parity|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <preflight-live|start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-task-subagent-old-server-fallback|drive-autonomy-live|drive-autonomy-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|drive-tool-denial|drive-tool-success|capture|send-turn|verify|verify-onboard|verify-solo|verify-solo-closure|verify-solo-transport-closure|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-task-subagent-old-server-fallback|verify-task-subagent-closure|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-tool-denial|verify-tool-success|verify-autonomy-live|verify-autonomy-reconnect|verify-autonomy-closure|verify-transport-parity|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -99,8 +99,10 @@ Environment:
                                  drive-autonomy-live for status/output/artifacts.
   OCTOS_TUI_M15_UX_OUTPUT_DIR    Optional live M15 evidence directory copied
                                  into the retained artifact bundle.
-  OCTOS_TUI_SOAK_WS_ARTIFACT_DIR WebSocket artifact dir for verify-transport-parity.
-  OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR Stdio artifact dir for verify-transport-parity.
+  OCTOS_TUI_SOAK_WS_ARTIFACT_DIR WebSocket artifact dir for transport parity
+                                 and verify-solo-transport-closure.
+  OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR Stdio artifact dir for transport parity
+                                 and verify-solo-transport-closure.
   OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE sequence or set, default sequence.
   OCTOS_TUI_SOAK_TASK_RECONNECT_ARTIFACT_DIR Optional reconnect artifact dir
                                  used by verify-task-subagent-closure.
@@ -1920,14 +1922,19 @@ verify_solo() {
   echo "Verified M12 solo soak artifacts in $artifact_dir"
 }
 
-verify_solo_closure() {
+verify_solo_strict_bundle() {
+  local expect_tenant_negative="${1:-0}"
   local original_strict="${OCTOS_TUI_SOAK_SOLO_STRICT:-}"
   local original_tenant_negative="${OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE:-}"
   OCTOS_TUI_SOAK_SOLO_STRICT=1
-  OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE=1
+  OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE="$expect_tenant_negative"
   verify_solo
   OCTOS_TUI_SOAK_SOLO_STRICT="$original_strict"
   OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE="$original_tenant_negative"
+}
+
+verify_solo_closure() {
+  verify_solo_strict_bundle 1
 
   local multiline_dir="${OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR:-$artifact_dir}"
   local original_artifact_dir="$artifact_dir"
@@ -1937,6 +1944,30 @@ verify_solo_closure() {
 
   write_ux_validation "solo-closure" "passed" "M12 solo closure bundle verified"
   echo "Verified M12 solo closure bundle in $original_artifact_dir with multiline artifacts in $multiline_dir"
+}
+
+verify_solo_transport_closure() {
+  local original_artifact_dir="$artifact_dir"
+  local stdio_dir="${OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR:-}"
+  local ws_dir="${OCTOS_TUI_SOAK_WS_ARTIFACT_DIR:-}"
+  [ -n "$stdio_dir" ] || die "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR is required for verify-solo-transport-closure"
+  [ -n "$ws_dir" ] || die "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR is required for verify-solo-transport-closure"
+  [ -d "$stdio_dir" ] || die "stdio artifact dir missing: $stdio_dir"
+  [ -d "$ws_dir" ] || die "WebSocket artifact dir missing: $ws_dir"
+
+  verify_solo_closure
+
+  artifact_dir="$stdio_dir"
+  verify_solo_strict_bundle 0
+
+  artifact_dir="$ws_dir"
+  verify_solo_strict_bundle 0
+
+  artifact_dir="$original_artifact_dir"
+  verify_transport_parity
+
+  write_ux_validation "solo-transport-closure" "passed" "M12 solo transport closure bundle verified"
+  echo "Verified M12 solo transport closure bundle with stdio artifacts in $stdio_dir and WebSocket artifacts in $ws_dir"
 }
 
 verify_first_launch() {
@@ -3207,6 +3238,43 @@ JSON
   grep --fixed-strings -- '"scenario": "solo-closure"' "$tmp_root/solo-closure/ux-validation.json" >/dev/null 2>&1 \
     || die "self-test missing solo-closure ux validation"
 
+  cp -R "$tmp_root/solo-closure" "$tmp_root/solo-transport-stdio"
+  cp -R "$tmp_root/solo-closure" "$tmp_root/solo-transport-ws"
+  cat > "$tmp_root/solo-transport-stdio/summary.env" <<'SUMMARY'
+run_id=solo-transport-stdio-selftest
+transport=stdio
+SUMMARY
+  cat > "$tmp_root/solo-transport-ws/summary.env" <<'SUMMARY'
+run_id=solo-transport-ws-selftest
+transport=ws
+SUMMARY
+  cat > "$tmp_root/solo-transport-stdio/appui-transcript.jsonl" <<'JSONL'
+{"direction":"tx","frame":{"method":"config/capabilities/list"}}
+{"direction":"tx","frame":{"method":"session/open"}}
+{"direction":"tx","frame":{"method":"session/status/read"}}
+JSONL
+  cat > "$tmp_root/solo-transport-ws/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"config/capabilities/list"}}
+{"direction":"client_to_server","frame":{"method":"session/open"}}
+{"direction":"client_to_server","frame":{"method":"session/status/read"}}
+JSONL
+  env \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/solo-closure" \
+    "OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR=$tmp_root/multiline-composer" \
+    "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/solo-transport-stdio" \
+    "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/solo-transport-ws" \
+    "$0" verify-solo-transport-closure >/dev/null
+  grep --fixed-strings -- '"scenario": "solo-transport-closure"' "$tmp_root/solo-closure/ux-validation.json" >/dev/null 2>&1 \
+    || die "self-test missing solo-transport-closure ux validation"
+
+  if env \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/solo-closure" \
+    "OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR=$tmp_root/multiline-composer" \
+    "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/solo-transport-stdio" \
+    "$0" verify-solo-transport-closure >/dev/null 2>&1; then
+    die "self-test expected solo transport closure verification to fail without WebSocket artifacts"
+  fi
+
   if env \
     "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/solo-closure" \
     "$0" verify-solo-closure >/dev/null 2>&1; then
@@ -3949,6 +4017,7 @@ case "${1:-help}" in
   verify-onboard) verify_onboard ;;
   verify-solo) verify_solo ;;
   verify-solo-closure) verify_solo_closure ;;
+  verify-solo-transport-closure) verify_solo_transport_closure ;;
   verify-first-launch) verify_first_launch ;;
   verify-provider-missing) verify_provider_missing ;;
   verify-permissions) verify_permissions ;;
