@@ -335,6 +335,24 @@ writes `tui-capture-narrow-terminal.txt` plus `terminal-size.json`.
 composer, a status line, and the shared tmux UX capture checks for hidden panes,
 overlap, leaked markdown markers, and stale running state.
 
+## Diff And Artifact Readiness
+
+For diff/artifact readiness evidence:
+
+```sh
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-diff-artifact
+
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-diff-artifact
+```
+
+`verify-diff-artifact` checks `tui-capture-diff-artifact.txt`,
+`artifact-index.json`, and `appui-transcript.jsonl`. The verifier requires
+visible diff preview text, visible artifact text, a usable composer, an
+artifact-index `artifacts` array, and diff/artifact readiness evidence in the
+transcript.
+
 ## M19 UX Run Bundle
 
 For M19 runner-owned artifacts, set `OCTOS_TUI_SOAK_ARTIFACT_DIR` to the
@@ -371,6 +389,8 @@ The solo lane writes these M12 artifacts into
 - `tui-capture-long-output.txt` when running `drive-long-output`
 - `tui-capture-narrow-terminal.txt` and `terminal-size.json` when running
   `drive-narrow-terminal`
+- `tui-capture-diff-artifact.txt` and `artifact-index.json` when running
+  `drive-diff-artifact`
 - `tui-capture-task-subagent-tree-running.txt`,
   `tui-capture-task-subagent-tree-final.txt`, and
   `tui-capture-task-subagent-tree-summary.txt` when running

@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|drive-dropped-completion-backpressure|drive-interrupt-reconnect|drive-validator-cycle|drive-long-output|drive-narrow-terminal|drive-diff-artifact|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-backpressure|verify-interrupt-reconnect|verify-validator-cycle|verify-long-output|verify-narrow-terminal|verify-diff-artifact|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -77,6 +77,8 @@ Environment:
                                  drive-long-output.
   OCTOS_TUI_SOAK_NARROW_COLS    Narrow terminal columns, default 80.
   OCTOS_TUI_SOAK_NARROW_ROWS    Narrow terminal rows, default 24.
+  OCTOS_TUI_SOAK_DIFF_ARTIFACT_PROMPT Optional prompt used by
+                                 drive-diff-artifact.
   OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE Set to 1 to launch without a preselected
                                  profile/session and save tui-capture-first-launch.txt.
   OCTOS_TUI_SOAK_REQUIRE_PROFILE Set to 0 to allow verify without profile JSON.
@@ -1318,6 +1320,24 @@ drive_narrow_terminal() {
   echo "Drove narrow terminal capture in $tui_session at ${cols}x${rows}"
 }
 
+drive_diff_artifact() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-diff-artifact"
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  local prompt="${OCTOS_TUI_SOAK_DIFF_ARTIFACT_PROMPT:-M12 diff/artifact fixture: make a tiny patch, show the diff preview, and publish an artifact summary.}"
+  wait_for_tui_text "Ask Octos to change code" "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI composer before driving diff/artifact capture"
+  submit_composer_prompt "$prompt"
+  wait_for_tui_text "Diff Preview|diff preview|artifact ready|Artifacts|artifact" \
+    "${OCTOS_TUI_SOAK_DIFF_ARTIFACT_WAIT_SECS:-80}" || \
+    die "Timed out waiting for diff/artifact evidence in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-diff-artifact.txt"
+  capture
+  echo "Drove diff/artifact capture in $tui_session"
+}
+
 verify_solo() {
   capture
   local required=(
@@ -1758,6 +1778,37 @@ verify_narrow_terminal() {
   write_ux_validation "narrow-terminal" "passed" "narrow terminal capture verified"
   secret_leak_check
   echo "Verified narrow terminal artifacts in $artifact_dir"
+}
+
+verify_diff_artifact() {
+  local capture_file="$artifact_dir/tui-capture-diff-artifact.txt"
+  local artifact_index
+  local transcript
+  artifact_index="$(first_existing_artifact "diff/artifact artifact index" \
+    "$artifact_dir/m15-evidence/artifact-index.json" \
+    "$artifact_dir/artifact-index.json")"
+  transcript="$(first_existing_artifact "diff/artifact AppUI transcript" \
+    "$artifact_dir/appui-transcript.jsonl" \
+    "$artifact_dir/m15-evidence/appui-transcript.jsonl")"
+
+  assert_capture_clean "$capture_file" "diff-artifact"
+  [ -s "$artifact_index" ] || die "diff/artifact index missing or empty: $artifact_index"
+
+  grep -Ei 'Diff Preview|diff preview|patch|modify|apply_patch' "$capture_file" >/dev/null 2>&1 \
+    || die "diff/artifact capture missing diff preview text"
+  grep -Ei 'Artifacts?|artifact ready|summary.env|artifact-index' "$capture_file" >/dev/null 2>&1 \
+    || die "diff/artifact capture missing artifact text"
+  grep --fixed-strings -- "Ask Octos to change code" "$capture_file" >/dev/null 2>&1 \
+    || die "diff/artifact capture missing usable composer"
+  grep -E '"artifacts"[[:space:]]*:[[:space:]]*\[' "$artifact_index" >/dev/null 2>&1 \
+    || die "diff/artifact index missing artifacts array"
+  grep -Ei 'diff preview ready|diff.preview.ready|artifact ready|artifact.ready|task/updated|artifact/updated|task/artifact' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "diff/artifact transcript missing diff or artifact readiness evidence"
+
+  write_ux_validation "diff-artifact" "passed" "diff/artifact readiness capture verified"
+  secret_leak_check
+  echo "Verified diff/artifact artifacts in $artifact_dir"
 }
 
 verify_task_subagent_tree() {
@@ -2402,6 +2453,34 @@ JSON
     die "self-test expected narrow-terminal verification to fail for wide geometry"
   fi
 
+  mkdir -p "$tmp_root/diff-artifact"
+  cat > "$tmp_root/diff-artifact/tui-capture-diff-artifact.txt" <<'CAPTURE'
+Diff Preview
+modify src/app.rs | diff preview ready
+Artifacts
+artifact ready: summary.env
+Ask Octos to change code...
+state Done
+CAPTURE
+  cat > "$tmp_root/diff-artifact/artifact-index.json" <<'JSON'
+{"artifacts":[{"id":"summary.env","title":"summary.env"}]}
+JSON
+  cat > "$tmp_root/diff-artifact/appui-transcript.jsonl" <<'JSONL'
+{"event":"diff.preview.ready","message":"modify src/app.rs | diff preview ready"}
+{"event":"artifact.ready","message":"artifact ready: summary.env"}
+JSONL
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/diff-artifact" "$0" verify-diff-artifact >/dev/null
+
+  mkdir -p "$tmp_root/bad-diff-artifact"
+  cp "$tmp_root/diff-artifact/tui-capture-diff-artifact.txt" "$tmp_root/bad-diff-artifact/"
+  cp "$tmp_root/diff-artifact/appui-transcript.jsonl" "$tmp_root/bad-diff-artifact/"
+  cat > "$tmp_root/bad-diff-artifact/artifact-index.json" <<'JSON'
+{"items":[]}
+JSON
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-diff-artifact" "$0" verify-diff-artifact >/dev/null 2>&1; then
+    die "self-test expected diff/artifact verification to fail without artifact index"
+  fi
+
   mkdir -p "$tmp_root/bad-approval-denial"
   cp "$tmp_root/approval-denial/tui-capture-approval-request.txt" "$tmp_root/bad-approval-denial/"
   cat > "$tmp_root/bad-approval-denial/tui-capture-approval-denied.txt" <<'CAPTURE'
@@ -2646,6 +2725,7 @@ case "${1:-help}" in
   drive-validator-cycle) drive_validator_cycle ;;
   drive-long-output) drive_long_output ;;
   drive-narrow-terminal) drive_narrow_terminal ;;
+  drive-diff-artifact) drive_diff_artifact ;;
   capture) capture ;;
   send-turn) send_turn ;;
   verify) verify ;;
@@ -2663,6 +2743,7 @@ case "${1:-help}" in
   verify-validator-cycle) verify_validator_cycle ;;
   verify-long-output) verify_long_output ;;
   verify-narrow-terminal) verify_narrow_terminal ;;
+  verify-diff-artifact) verify_diff_artifact ;;
   verify-autonomy-live) verify_autonomy_live ;;
   verify-ux-run) verify_ux_run ;;
   api-parity) api_parity ;;
