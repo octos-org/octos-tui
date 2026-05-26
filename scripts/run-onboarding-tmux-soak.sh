@@ -770,6 +770,26 @@ summary_env_value_for_dir() {
   sed -n -E "s/^${key}=(.*)$/\\1/p" "$summary_file" | head -n 1
 }
 
+is_git_sha() {
+  printf '%s\n' "$1" | grep -E '^[0-9a-f]{40}$' >/dev/null 2>&1
+}
+
+require_summary_source_commits_for_dir() {
+  local dir="$1"
+  local label="$2"
+  local summary_file="$dir/summary.env"
+  [ -f "$summary_file" ] || die "$label artifact dir missing summary.env: $summary_file"
+
+  local octos_commit
+  local octos_tui_commit
+  octos_commit="$(summary_env_value_for_dir "$dir" octos_repo_commit || true)"
+  octos_tui_commit="$(summary_env_value_for_dir "$dir" octos_tui_repo_commit || true)"
+  is_git_sha "$octos_commit" \
+    || die "$label summary.env missing valid octos_repo_commit: $summary_file"
+  is_git_sha "$octos_tui_commit" \
+    || die "$label summary.env missing valid octos_tui_repo_commit: $summary_file"
+}
+
 write_ux_validation() {
   local scenario="$1"
   local status="$2"
@@ -2101,11 +2121,13 @@ verify_solo_strict_bundle() {
 }
 
 verify_solo_closure() {
+  require_summary_source_commits_for_dir "$artifact_dir" "M12 solo closure"
   verify_solo_strict_bundle 1
 
   local multiline_dir="${OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR:-$artifact_dir}"
   local original_artifact_dir="$artifact_dir"
   artifact_dir="$multiline_dir"
+  require_summary_source_commits_for_dir "$artifact_dir" "M12 multiline closure"
   verify_multiline_composer
   artifact_dir="$original_artifact_dir"
 
@@ -2125,12 +2147,16 @@ verify_solo_transport_closure() {
   verify_solo_closure
 
   artifact_dir="$stdio_dir"
+  require_summary_source_commits_for_dir "$artifact_dir" "M12 stdio solo closure"
   verify_solo_strict_bundle 0
 
   artifact_dir="$ws_dir"
+  require_summary_source_commits_for_dir "$artifact_dir" "M12 WebSocket solo closure"
   verify_solo_strict_bundle 0
 
   artifact_dir="$original_artifact_dir"
+  require_summary_source_commits_for_dir "$ws_dir" "M12 WebSocket parity closure"
+  require_summary_source_commits_for_dir "$stdio_dir" "M12 stdio parity closure"
   verify_transport_parity
 
   write_ux_validation "solo-transport-closure" "passed" "M12 solo transport closure bundle verified"
@@ -2730,17 +2756,22 @@ verify_task_subagent_old_server_fallback() {
 
 verify_task_subagent_closure() {
   local original_artifact_dir="$artifact_dir"
+  require_summary_source_commits_for_dir "$artifact_dir" "M13 task/subagent closure"
   verify_task_subagent_tree
 
   local reconnect_dir="${OCTOS_TUI_SOAK_TASK_RECONNECT_ARTIFACT_DIR:-$original_artifact_dir}"
   artifact_dir="$reconnect_dir"
+  require_summary_source_commits_for_dir "$artifact_dir" "M13 task/subagent reconnect closure"
   verify_task_subagent_reconnect
 
   local old_server_dir="${OCTOS_TUI_SOAK_TASK_OLD_SERVER_ARTIFACT_DIR:-$original_artifact_dir}"
   artifact_dir="$old_server_dir"
+  require_summary_source_commits_for_dir "$artifact_dir" "M13 task/subagent old-server closure"
   verify_task_subagent_old_server_fallback
 
   artifact_dir="$original_artifact_dir"
+  require_summary_source_commits_for_dir "${OCTOS_TUI_SOAK_WS_ARTIFACT_DIR:-}" "M13 WebSocket parity closure"
+  require_summary_source_commits_for_dir "${OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR:-}" "M13 stdio parity closure"
   verify_transport_parity
 
   write_ux_validation "task-subagent-closure" "passed" "M13 task/subagent closure bundle verified"
@@ -2943,13 +2974,17 @@ verify_autonomy_reconnect() {
 
 verify_autonomy_closure() {
   local original_artifact_dir="$artifact_dir"
+  require_summary_source_commits_for_dir "$artifact_dir" "M15 autonomy closure"
   verify_autonomy_live
 
   local reconnect_dir="${OCTOS_TUI_SOAK_AUTONOMY_RECONNECT_ARTIFACT_DIR:-$original_artifact_dir}"
   artifact_dir="$reconnect_dir"
+  require_summary_source_commits_for_dir "$artifact_dir" "M15 autonomy reconnect closure"
   verify_autonomy_reconnect
 
   artifact_dir="$original_artifact_dir"
+  require_summary_source_commits_for_dir "${OCTOS_TUI_SOAK_WS_ARTIFACT_DIR:-}" "M15 WebSocket parity closure"
+  require_summary_source_commits_for_dir "${OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR:-}" "M15 stdio parity closure"
   verify_transport_parity
 
   write_ux_validation "autonomy-closure" "passed" "M15 autonomy closure bundle verified"
@@ -3089,6 +3124,19 @@ self_test_solo() {
   local probe="$octos_repo/scripts/m12-solo-appui-soak.sh"
   [ -x "$probe" ] || die "M12 solo soak wrapper missing or not executable: $probe"
   "$probe" self-test
+}
+
+write_self_test_summary_env() {
+  local dir="$1"
+  local summary_run_id="$2"
+  local summary_transport="$3"
+  mkdir -p "$dir"
+  cat > "$dir/summary.env" <<SUMMARY
+run_id=$summary_run_id
+transport=$summary_transport
+octos_repo_commit=1111111111111111111111111111111111111111
+octos_tui_repo_commit=2222222222222222222222222222222222222222
+SUMMARY
 }
 
 self_test() {
@@ -3388,10 +3436,7 @@ CAPTURE
   fi
 
   mkdir -p "$tmp_root/solo-core"
-  cat > "$tmp_root/solo-core/summary.env" <<'SUMMARY'
-run_id=solo-core-selftest
-transport=stdio
-SUMMARY
+  write_self_test_summary_env "$tmp_root/solo-core" solo-core-selftest stdio
   cat > "$tmp_root/solo-core/tui-capture.txt" <<'CAPTURE'
 Agent task completed
 Ask Octos to change code...
@@ -3504,6 +3549,7 @@ CAPTURE
   env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/approval-denial" "$0" verify-approval-denial >/dev/null
 
   mkdir -p "$tmp_root/multiline-composer"
+  write_self_test_summary_env "$tmp_root/multiline-composer" multiline-composer-selftest stdio
   cat > "$tmp_root/multiline-composer/tui-capture-multiline-composer.txt" <<'CAPTURE'
 Composer  Enter send | Tab inspector
 > first instruction
@@ -3533,17 +3579,22 @@ JSON
     "$0" verify-solo-closure >/dev/null
   grep --fixed-strings -- '"scenario": "solo-closure"' "$tmp_root/solo-closure/ux-validation.json" >/dev/null 2>&1 \
     || die "self-test missing solo-closure ux validation"
+  cp -R "$tmp_root/solo-closure" "$tmp_root/bad-solo-closure-source-commit"
+  grep -v '^octos_tui_repo_commit=' "$tmp_root/bad-solo-closure-source-commit/summary.env" \
+    > "$tmp_root/bad-solo-closure-source-commit/summary.env.tmp"
+  mv "$tmp_root/bad-solo-closure-source-commit/summary.env.tmp" \
+    "$tmp_root/bad-solo-closure-source-commit/summary.env"
+  if env \
+    "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-solo-closure-source-commit" \
+    "OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR=$tmp_root/multiline-composer" \
+    "$0" verify-solo-closure >/dev/null 2>&1; then
+    die "self-test expected solo closure verification to fail without source commit metadata"
+  fi
 
   cp -R "$tmp_root/solo-closure" "$tmp_root/solo-transport-stdio"
   cp -R "$tmp_root/solo-closure" "$tmp_root/solo-transport-ws"
-  cat > "$tmp_root/solo-transport-stdio/summary.env" <<'SUMMARY'
-run_id=solo-transport-stdio-selftest
-transport=stdio
-SUMMARY
-  cat > "$tmp_root/solo-transport-ws/summary.env" <<'SUMMARY'
-run_id=solo-transport-ws-selftest
-transport=ws
-SUMMARY
+  write_self_test_summary_env "$tmp_root/solo-transport-stdio" solo-transport-stdio-selftest stdio
+  write_self_test_summary_env "$tmp_root/solo-transport-ws" solo-transport-ws-selftest ws
   cat > "$tmp_root/solo-transport-stdio/appui-transcript.jsonl" <<'JSONL'
 {"direction":"tx","frame":{"method":"config/capabilities/list"}}
 {"direction":"tx","frame":{"method":"session/open"}}
@@ -3844,6 +3895,7 @@ CAPTURE
   fi
 
   mkdir -p "$tmp_root/task-subagent/m15-evidence"
+  write_self_test_summary_env "$tmp_root/task-subagent" task-subagent-selftest stdio
   cat > "$tmp_root/task-subagent/tui-capture-task-subagent-tree-running.txt" <<'CAPTURE'
 Subagents
 1. Ada Lovelace (reviewer-api) completed: true
@@ -3893,6 +3945,7 @@ JSONL
   fi
 
   mkdir -p "$tmp_root/task-subagent-reconnect/m15-evidence"
+  write_self_test_summary_env "$tmp_root/task-subagent-reconnect" task-subagent-reconnect-selftest stdio
   cat > "$tmp_root/task-subagent-reconnect/server-pane-after-restart.txt" <<'CAPTURE'
 Listening: http://127.0.0.1:50179
 CAPTURE
@@ -3956,6 +4009,7 @@ JSONL
   fi
 
   mkdir -p "$tmp_root/task-subagent-old-server"
+  write_self_test_summary_env "$tmp_root/task-subagent-old-server" task-subagent-old-server-selftest stdio
   cat > "$tmp_root/task-subagent-old-server/tui-capture-task-subagent-old-server-fallback.txt" <<'CAPTURE'
 Assistant response rendered without supervised task controls.
 Ask Octos to change code...
@@ -3984,8 +4038,8 @@ JSONL
   fi
 
   mkdir -p "$tmp_root/task-subagent-parity-ws/m15-evidence" "$tmp_root/task-subagent-parity-stdio/m15-evidence"
-  printf 'transport=ws\n' > "$tmp_root/task-subagent-parity-ws/summary.env"
-  printf 'transport=stdio\n' > "$tmp_root/task-subagent-parity-stdio/summary.env"
+  write_self_test_summary_env "$tmp_root/task-subagent-parity-ws" task-subagent-parity-ws-selftest ws
+  write_self_test_summary_env "$tmp_root/task-subagent-parity-stdio" task-subagent-parity-stdio-selftest stdio
   cat > "$tmp_root/task-subagent-parity-ws/m15-evidence/appui-transcript.jsonl" <<'JSONL'
 {"direction":"client_to_server","frame":{"method":"turn/start"}}
 {"direction":"server_to_client","frame":{"method":"task/updated"}}
@@ -4016,6 +4070,7 @@ JSONL
   fi
 
   mkdir -p "$tmp_root/autonomy-live/m15-evidence"
+  write_self_test_summary_env "$tmp_root/autonomy-live" autonomy-live-selftest ws
   cat > "$tmp_root/autonomy-live/tui-capture-autonomy-live.txt" <<'CAPTURE'
 Agent reviewer-api summary generated by model
 Goal active continuation rendered
@@ -4089,6 +4144,7 @@ JSONL
   fi
 
   mkdir -p "$tmp_root/autonomy-reconnect/m15-evidence"
+  write_self_test_summary_env "$tmp_root/autonomy-reconnect" autonomy-reconnect-selftest ws
   cat > "$tmp_root/autonomy-reconnect/server-pane-after-restart.txt" <<'CAPTURE'
 Listening: http://127.0.0.1:50179
 CAPTURE
@@ -4171,8 +4227,8 @@ JSONL
   fi
 
   mkdir -p "$tmp_root/parity-ws/m15-evidence" "$tmp_root/parity-stdio/m15-evidence"
-  printf 'transport=ws\n' > "$tmp_root/parity-ws/summary.env"
-  printf 'transport=stdio\n' > "$tmp_root/parity-stdio/summary.env"
+  write_self_test_summary_env "$tmp_root/parity-ws" parity-ws-selftest ws
+  write_self_test_summary_env "$tmp_root/parity-stdio" parity-stdio-selftest stdio
   cat > "$tmp_root/parity-ws/m15-evidence/appui-transcript.jsonl" <<'JSONL'
 {"direction":"client_to_server","frame":{"method":"session/open"}}
 {"direction":"client_to_server","frame":{"method":"agent/list"}}
