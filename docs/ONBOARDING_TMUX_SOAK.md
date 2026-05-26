@@ -496,8 +496,10 @@ OCTOS_TUI_SOAK_API_KEY=<secret-value> \
 scripts/run-onboarding-tmux-soak.sh drive-onboard
 ```
 
-`drive-onboard` sends only `/onboard` commands through the live tmux TUI and
-then captures the pane. The retained artifacts must show masked secrets only.
+`drive-onboard` drives the live tmux TUI through the provider-onboarding smoke:
+it refreshes login/provider state, selects and saves the configured provider,
+finishes onboarding when requested, opens `/provider` and `/model`, then
+captures the pane. The retained artifacts must show masked secrets only.
 
 ## Runtime Menus
 
