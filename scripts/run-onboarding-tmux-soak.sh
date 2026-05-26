@@ -211,14 +211,15 @@ write_live_preflight_json() {
   local octos_check="$5"
   local tui_check="$6"
   local tmux_version="$7"
-  local octos_version="$8"
-  local octos_version_status="$9"
-  local octos_tui_version="${10}"
-  local octos_tui_version_status="${11}"
-  local octos_repo_commit="${12}"
-  local octos_tui_repo_commit="${13}"
-  local host_name="${14}"
-  local os_release="${15}"
+  local tmux_version_status="$8"
+  local octos_version="$9"
+  local octos_version_status="${10}"
+  local octos_tui_version="${11}"
+  local octos_tui_version_status="${12}"
+  local octos_repo_commit="${13}"
+  local octos_tui_repo_commit="${14}"
+  local host_name="${15}"
+  local os_release="${16}"
   mkdir -p "$artifact_dir"
   {
     printf '{\n'
@@ -237,6 +238,7 @@ write_live_preflight_json() {
     write_json_string_field os "$os_release"
     write_json_string_field tmux "$tmux_check"
     write_json_string_field tmux_version "$tmux_version"
+    write_json_string_field tmux_version_status "$tmux_version_status"
     write_json_string_field octos_serve "$octos_check"
     write_json_string_field octos_bin "$octos_bin"
     write_json_string_field octos_version "$octos_version"
@@ -263,6 +265,7 @@ preflight_live() {
   local octos_check="passed"
   local tui_check="passed"
   local tmux_version=""
+  local tmux_version_status=""
   local octos_version=""
   local octos_version_status=""
   local octos_tui_version=""
@@ -280,10 +283,14 @@ preflight_live() {
 
   if ! command -v tmux >/dev/null 2>&1; then
     tmux_check="missing"
+    tmux_version_status="missing"
     status="failed"
     failure="tmux is required for live soak"
+  elif tmux_version="$(tmux -V 2>/dev/null)"; then
+    tmux_version_status="passed"
   else
-    tmux_version="$(tmux -V 2>/dev/null || true)"
+    tmux_version="unsupported"
+    tmux_version_status="unsupported"
   fi
 
   if [ -z "$octos_bin" ] || [ ! -x "$octos_bin" ]; then
@@ -326,7 +333,7 @@ preflight_live() {
     provider_source="not required"
   fi
 
-  write_live_preflight_json "$status" "$failure" "$provider_source" "$tmux_check" "$octos_check" "$tui_check" "$tmux_version" "$octos_version" "$octos_version_status" "$octos_tui_version" "$octos_tui_version_status" "$octos_repo_commit" "$octos_tui_repo_commit" "$host_name" "$os_release"
+  write_live_preflight_json "$status" "$failure" "$provider_source" "$tmux_check" "$octos_check" "$tui_check" "$tmux_version" "$tmux_version_status" "$octos_version" "$octos_version_status" "$octos_tui_version" "$octos_tui_version_status" "$octos_repo_commit" "$octos_tui_repo_commit" "$host_name" "$os_release"
 
   if [ "$status" != "passed" ]; then
     die "Live closure preflight failed: $failure (artifact: $artifact_dir/live-preflight.json)"
@@ -336,6 +343,8 @@ preflight_live() {
   printf 'transport=%s\n' "$transport"
   printf 'host=%s\n' "$host_name"
   printf 'os=%s\n' "$os_release"
+  printf 'tmux_version=%s\n' "$tmux_version"
+  printf 'tmux_version_status=%s\n' "$tmux_version_status"
   printf 'octos_bin=%s\n' "$octos_bin"
   printf 'octos_version=%s\n' "$octos_version"
   printf 'octos_version_status=%s\n' "$octos_version_status"
@@ -3147,6 +3156,31 @@ SH
     || die "self-test expected provider env names in preflight artifact"
   grep -F '"tmux_version": "tmux ' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
     || die "self-test expected tmux version in preflight artifact"
+  grep -F '"tmux_version_status": "passed"' "$tmp_root/preflight-artifacts/preflight-provider-ok/live-preflight.json" >/dev/null \
+    || die "self-test expected tmux version status in preflight artifact"
+  local fake_bin_dir="$tmp_root/fake-bin"
+  mkdir -p "$fake_bin_dir"
+  cat > "$fake_bin_dir/tmux" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-V" ]; then
+  exit 2
+fi
+exit 0
+SH
+  chmod +x "$fake_bin_dir/tmux"
+  env \
+    "PATH=$fake_bin_dir:$PATH" \
+    "OCTOS_BIN=$fake_octos_bin" \
+    "OCTOS_TUI_BIN=$fake_tui_bin" \
+    "OCTOS_TUI_SOAK_DATA_DIR=$tmp_root/preflight-empty-data" \
+    "OCTOS_TUI_SOAK_ARTIFACT_ROOT=$tmp_root/preflight-artifacts" \
+    "OCTOS_TUI_SOAK_RUN_ID=preflight-tmux-version-unsupported" \
+    "OCTOS_TUI_SOAK_REQUIRE_LIVE_PROVIDER=0" \
+    "$0" preflight-live >/dev/null
+  grep -F '"tmux_version": "unsupported"' "$tmp_root/preflight-artifacts/preflight-tmux-version-unsupported/live-preflight.json" >/dev/null \
+    || die "self-test expected unsupported tmux version in preflight artifact"
+  grep -F '"tmux_version_status": "unsupported"' "$tmp_root/preflight-artifacts/preflight-tmux-version-unsupported/live-preflight.json" >/dev/null \
+    || die "self-test expected unsupported tmux version status in preflight artifact"
   if env \
     "OCTOS_BIN=$fake_octos_bin" \
     "OCTOS_TUI_BIN=$fake_tui_bin" \
