@@ -2918,6 +2918,7 @@ impl MockAppUiBackend {
         }));
         self.enqueue_protocol(UiNotification::ToolStarted(ToolStartedEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: turn_id.clone(),
             tool_call_id: "mock.read_file.1".into(),
             tool_name: "read_file".into(),
@@ -2925,6 +2926,7 @@ impl MockAppUiBackend {
         }));
         self.enqueue_protocol(UiNotification::ToolProgress(ToolProgressEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: turn_id.clone(),
             tool_call_id: "mock.read_file.1".into(),
             message: Some("Hydrating prototype context".into()),
@@ -2976,6 +2978,7 @@ impl MockAppUiBackend {
         )));
         self.enqueue_protocol(UiNotification::ToolCompleted(ToolCompletedEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: turn_id.clone(),
             tool_call_id: "mock.read_file.1".into(),
             tool_name: "read_file".into(),

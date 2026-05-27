@@ -9624,6 +9624,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalAutoResolved(
             ApprovalAutoResolvedEvent {
                 session_id,
+                topic: None,
                 approval_id: ApprovalId::new(),
                 turn_id: TurnId::new(),
                 tool_name: "shell".into(),
@@ -9738,6 +9739,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
             ToolStartedEvent {
                 session_id: session_id.clone(),
+                topic: None,
                 turn_id: turn_id.clone(),
                 tool_call_id: "call-1".into(),
                 tool_name: "shell".into(),
@@ -9747,6 +9749,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::ToolCompleted(
             ToolCompletedEvent {
                 session_id: session_id.clone(),
+                topic: None,
                 turn_id: turn_id.clone(),
                 tool_call_id: "call-1".into(),
                 tool_name: "shell".into(),
@@ -9781,6 +9784,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
             ToolStartedEvent {
                 session_id: session_id.clone(),
+                topic: None,
                 turn_id: turn_id.clone(),
                 tool_call_id: "call-1".into(),
                 tool_name: "shell".into(),
@@ -9790,6 +9794,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::ToolProgress(
             octos_core::ui_protocol::ToolProgressEvent {
                 session_id: session_id.clone(),
+                topic: None,
                 turn_id: turn_id.clone(),
                 tool_call_id: "call-1".into(),
                 message: Some("cargo test".into()),
@@ -9799,6 +9804,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::ToolCompleted(
             ToolCompletedEvent {
                 session_id,
+                topic: None,
                 turn_id,
                 tool_call_id: "call-1".into(),
                 tool_name: "shell".into(),
@@ -9831,6 +9837,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
             ToolStartedEvent {
                 session_id: session_id.clone(),
+                topic: None,
                 turn_id: turn_id.clone(),
                 tool_call_id: tool_call_id.clone(),
                 tool_name: "shell".into(),
@@ -9840,6 +9847,7 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(UiNotification::ToolCompleted(
             ToolCompletedEvent {
                 session_id,
+                topic: None,
                 turn_id,
                 tool_call_id,
                 tool_name: "shell".into(),
