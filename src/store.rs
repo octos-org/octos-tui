@@ -1,12 +1,13 @@
 use octos_core::app_ui::{AppUiEvent, AppUiSnapshot};
 use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
-    ApprovalRespondParams, DiffPreviewGetParams, InputItem, MessageDeltaEvent,
-    MessagePersistedEvent, ReplayLossyEvent, SessionOpenParams, TaskOutputDeltaEvent,
-    TaskOutputReadParams, TaskRuntimeState, TaskUpdatedEvent, TurnCompletedEvent, TurnErrorEvent,
-    TurnId, TurnInterruptParams, TurnStartParams, UiNotification, UiProgressEvent,
+    ApprovalRespondParams, DiffPreviewGetParams, EnvelopeNotification, EnvelopeToolEndStatus,
+    InputItem, MessageDeltaEvent, MessagePersistedEvent, Payload, ReplayLossyEvent,
+    SessionOpenParams, TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState,
+    TaskUpdatedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
+    TurnStartParams, UiNotification, UiProgressEvent,
 };
-use octos_core::{Message, SessionKey, TaskId};
+use octos_core::{Message, MessageRole, SessionKey, TaskId, ThreadId};
 use serde_json::Value;
 
 use crate::{
@@ -4372,6 +4373,7 @@ impl Store {
             UiNotification::MessagePersisted(event) => self.apply_message_persisted(event),
             UiNotification::TurnSpawnComplete(event) => self.apply_turn_spawn_complete(event),
             UiNotification::FileAttached(event) => self.apply_file_attached(event),
+            UiNotification::Envelope(event) => self.apply_envelope(event),
             UiNotification::SessionEventBridged(event) => self.apply_session_event_bridged(event),
             UiNotification::RouterStatus(event) => {
                 self.state.status = format!(
@@ -4598,6 +4600,144 @@ impl Store {
                 self.state.status = format!("Context normalized: {prompt_count} prompt messages");
                 None
             }
+        }
+    }
+
+    fn apply_envelope(&mut self, event: EnvelopeNotification) -> Option<AppUiCommand> {
+        let EnvelopeNotification {
+            session_id,
+            envelope,
+            ..
+        } = event;
+        let thread_id = envelope.thread_id.clone();
+
+        match envelope.payload {
+            Payload::UserMessage { text, files } => {
+                if let Some(session) = self.find_session_mut(&session_id) {
+                    let already_present = session.messages.iter().any(|message| {
+                        message.role == MessageRole::User
+                            && message.thread_id.as_deref() == Some(thread_id.as_str())
+                    });
+                    if !already_present {
+                        let mut message =
+                            Message::user(text).with_thread_id(ThreadId::new(thread_id.clone()));
+                        message.media = files.into_iter().map(|file| file.path).collect();
+                        session.messages.push(message);
+                    }
+                }
+                self.state.status = format!("User message projected for {thread_id}");
+                None
+            }
+            Payload::AssistantDelta { text } => {
+                self.upsert_envelope_assistant_message(&session_id, &thread_id, text, false);
+                self.state.status = format!("Assistant delta projected for {thread_id}");
+                None
+            }
+            Payload::AssistantPersisted { text, .. } => {
+                self.upsert_envelope_assistant_message(&session_id, &thread_id, text, true);
+                self.state.status = format!("Assistant message persisted for {thread_id}");
+                None
+            }
+            Payload::ToolStart { tool_call_id, name } => {
+                self.state.push_activity(
+                    ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
+                        .with_tool_call(tool_call_id.clone())
+                        .with_detail(format!("thread {thread_id}")),
+                );
+                self.state.set_run_state_in_progress();
+                self.state.status = format!("Tool started: {name} ({tool_call_id})");
+                None
+            }
+            Payload::ToolProgress {
+                tool_call_id,
+                message,
+            } => {
+                self.state.update_tool_activity(
+                    &tool_call_id,
+                    "running",
+                    Some(message.clone()),
+                    None,
+                    None,
+                    None,
+                );
+                self.state.set_run_state_in_progress();
+                self.state.status = message;
+                None
+            }
+            Payload::ToolEnd {
+                tool_call_id,
+                status,
+                error,
+                reason,
+            } => {
+                let (label, success) = match status {
+                    EnvelopeToolEndStatus::Complete => ("complete", Some(true)),
+                    EnvelopeToolEndStatus::Error => ("failed", Some(false)),
+                    EnvelopeToolEndStatus::Skipped => ("skipped", None),
+                    EnvelopeToolEndStatus::Aborted => ("aborted", Some(false)),
+                };
+                let detail = error.or(reason);
+                self.state.update_tool_activity(
+                    &tool_call_id,
+                    label,
+                    detail.clone(),
+                    detail,
+                    success,
+                    None,
+                );
+                self.state.status = format!("Tool {label}: {tool_call_id}");
+                None
+            }
+            Payload::FileAttached {
+                path,
+                mime,
+                size_bytes,
+            } => {
+                self.state.push_activity(
+                    ActivityItem::new(ActivityKind::Tool, path.clone(), "attached")
+                        .with_detail(format!("{mime}, {size_bytes} bytes")),
+                );
+                self.state.status = format!("File attached: {path}");
+                None
+            }
+            Payload::TurnCompleted { .. } => {
+                self.state.status = format!("Turn completed for {thread_id}");
+                self.state.set_run_state_success();
+                self.submit_next_pending_if_idle()
+            }
+        }
+    }
+
+    fn upsert_envelope_assistant_message(
+        &mut self,
+        session_id: &SessionKey,
+        thread_id: &str,
+        text: String,
+        replace: bool,
+    ) {
+        let follow_tail = self.state.transcript_scroll == 0;
+        let Some(session) = self.find_session_mut(session_id) else {
+            return;
+        };
+        if let Some(message) = session.messages.iter_mut().rev().find(|message| {
+            message.role == MessageRole::Assistant
+                && message.thread_id.as_deref() == Some(thread_id)
+        }) {
+            if replace {
+                message.content = text;
+            } else {
+                message.content.push_str(&text);
+            }
+        } else {
+            session.messages.push(Message::assistant_with_thread(
+                text,
+                ThreadId::new(thread_id.to_owned()),
+            ));
+        }
+        if follow_tail {
+            self.state.scroll_transcript_to_latest();
+        } else {
+            self.state.preserve_transcript_position_after_append(1);
         }
     }
 
@@ -5781,11 +5921,11 @@ mod tests {
     use octos_core::SessionKey;
     use octos_core::ui_protocol::{
         ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalDecision,
-        ApprovalDiffDetails, ApprovalId, ApprovalRequestedEvent, ApprovalTypedDetails,
-        OutputCursor, PreviewId, ReplayLossyEvent, TaskRuntimeState, ToolCompletedEvent,
-        ToolStartedEvent, TurnId, UiCursor, UiFileMutationNotice, UiProgressMetadata,
-        UiProtocolCapabilities, UiTokenCostUpdate, approval_kinds, approval_scopes, methods,
-        progress_kinds,
+        ApprovalDiffDetails, ApprovalId, ApprovalRequestedEvent, ApprovalTypedDetails, Envelope,
+        EnvelopeNotification, OutputCursor, Payload, PreviewId, ReplayLossyEvent, TaskRuntimeState,
+        ToolCompletedEvent, ToolStartedEvent, TurnId, UiCursor, UiFileMutationNotice,
+        UiProgressMetadata, UiProtocolCapabilities, UiTokenCostUpdate, approval_kinds,
+        approval_scopes, methods, progress_kinds,
     };
 
     fn store_with_live_reply(turn_id: TurnId, text: impl Into<String>) -> Store {
@@ -9209,6 +9349,78 @@ mod tests {
             .as_ref()
             .expect("live reply remains active");
         assert_eq!(live_reply.text, "hello");
+    }
+
+    fn envelope_notification(session_id: SessionKey, seq: u64, payload: Payload) -> UiNotification {
+        UiNotification::Envelope(EnvelopeNotification {
+            session_id,
+            topic: None,
+            envelope: Envelope {
+                thread_id: "thread-1".into(),
+                seq,
+                client_message_id: None,
+                payload,
+            },
+        })
+    }
+
+    #[test]
+    fn envelope_assistant_delta_projects_into_threaded_message() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id.clone(),
+            1,
+            Payload::AssistantDelta {
+                text: "hello".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id,
+            2,
+            Payload::AssistantDelta {
+                text: " world".into(),
+            },
+        )));
+
+        let messages = &store.state.sessions[0].messages;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert_eq!(messages[0].thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(messages[0].content, "hello world");
+    }
+
+    #[test]
+    fn envelope_assistant_persisted_replaces_streamed_text() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id.clone(),
+            1,
+            Payload::AssistantDelta {
+                text: "draft".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id,
+            2,
+            Payload::AssistantPersisted {
+                text: "final answer".into(),
+                meta: octos_core::ui_protocol::MessageMeta {
+                    message_id: "message-1".into(),
+                    persisted_at: chrono::Utc::now(),
+                    media: vec![],
+                },
+            },
+        )));
+
+        let messages = &store.state.sessions[0].messages;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert_eq!(messages[0].thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(messages[0].content, "final answer");
     }
 
     #[test]
