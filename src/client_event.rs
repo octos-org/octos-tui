@@ -2,8 +2,8 @@ use octos_core::{
     SessionKey,
     app_ui::AppUiEvent,
     ui_protocol::{
-        PermissionProfileSelection, TaskArtifactReadResult, ThreadGraphGetResult,
-        TurnStateGetResult,
+        PermissionProfileSelection, SessionHydrateResult, TaskArtifactReadResult,
+        ThreadGraphGetResult, TurnStateGetResult,
     },
 };
 
@@ -31,6 +31,7 @@ pub enum ClientEvent {
     McpConfigList(McpConfigListClientEvent),
     McpConfigMutation(McpConfigMutationClientEvent),
     PermissionProfile(PermissionProfileClientEvent),
+    SessionHydrate(SessionHydrateResult),
     AuthStatus(AuthStatusClientEvent),
     AuthSendCode(AuthSendCodeClientEvent),
     AuthVerify(AuthVerifyClientEvent),
