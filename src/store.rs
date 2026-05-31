@@ -3111,6 +3111,28 @@ impl Store {
                 format!("Task \"{title}\" is already {state_label}; nothing to cancel");
             return None;
         }
+        // octos#1380: only send task/cancel when the server actually advertises
+        // task control. Capabilities arrive via the authoritative
+        // config/capabilities/list response (negotiated through the
+        // X-Octos-Ui-Features header); until that lands, or against a server
+        // that doesn't advertise harness.task_control.v1, the method is
+        // unsupported — so disable the affordance with a clear status rather
+        // than send a doomed RPC. We deliberately do NOT trust the in-band
+        // session/opened slice, which serde-defaults to the full first-server
+        // surface when the field is absent and would re-enable cancel against a
+        // non-negotiating server (codex P1).
+        let task_control_supported = self
+            .state
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                capabilities.supports_method(octos_core::ui_protocol::methods::TASK_CANCEL)
+            });
+        if !task_control_supported {
+            self.state.status =
+                "Task control is not available on this server; cancel is disabled".into();
+            return None;
+        }
         let session_id = self
             .state
             .active_session()
@@ -10770,6 +10792,9 @@ mod tests {
     fn cancel_task_command_targets_selected_running_task() {
         let task_id = TaskId::new();
         let mut store = store_with_task(task_id.clone());
+        store
+            .state
+            .set_capabilities(UiProtocolCapabilities::new(&[methods::TASK_CANCEL], &[]));
         let session_id = store.state.sessions[0].id.clone();
 
         let command = store
@@ -10782,6 +10807,39 @@ mod tests {
         assert_eq!(params.task_id, task_id);
         assert_eq!(params.session_id, Some(session_id));
         assert!(store.state.status.starts_with("Requested cancel"));
+    }
+
+    /// octos#1380: if the server has not advertised task control (e.g. before
+    /// config/capabilities/list lands, or a non-negotiating server), `x` must
+    /// not send a doomed task/cancel — it reports the affordance is
+    /// unavailable instead (codex P1).
+    #[test]
+    fn cancel_task_command_disabled_without_task_control_capability() {
+        let task_id = TaskId::new();
+        let mut store = store_with_task(task_id);
+        // Capabilities present, but task/cancel is NOT advertised.
+        store
+            .state
+            .set_capabilities(UiProtocolCapabilities::new(&[methods::SESSION_OPEN], &[]));
+
+        let command = store.cancel_task_command();
+
+        assert!(command.is_none());
+        assert!(store.state.status.contains("not available"));
+    }
+
+    /// octos#1380: with no capabilities negotiated yet (capabilities == None),
+    /// cancel is conservatively disabled rather than sending a doomed RPC.
+    #[test]
+    fn cancel_task_command_disabled_when_capabilities_unknown() {
+        let task_id = TaskId::new();
+        let mut store = store_with_task(task_id);
+        assert!(store.state.capabilities.is_none());
+
+        let command = store.cancel_task_command();
+
+        assert!(command.is_none());
+        assert!(store.state.status.contains("not available"));
     }
 
     #[test]
