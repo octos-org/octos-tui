@@ -1,8 +1,8 @@
 use octos_core::{SessionKey, app_ui::AppUiEvent, ui_protocol::PermissionProfileSelection};
 
 use crate::model::{
-    AgentArtifactListResult, AgentCloseResult, AgentInterruptResult, AgentListResult,
-    AgentOutputReadResult, AgentStatusReadResult, AuthLogoutResult, AuthMeResult,
+    AgentArtifactListResult, AgentArtifactReadResult, AgentCloseResult, AgentInterruptResult,
+    AgentListResult, AgentOutputReadResult, AgentStatusReadResult, AuthLogoutResult, AuthMeResult,
     AuthSendCodeResult, AuthStatusResult, AuthVerifyResult, ConfigCapabilitiesListResult,
     DiffPreviewGetResult, LoopCreateResult, LoopListResult, LoopMutationResult,
     McpConfigListResult, McpConfigMutationResult, McpStatusListResult, ModelListResult,
@@ -200,6 +200,7 @@ pub enum AutonomyResult {
     AgentStatus(AgentStatusReadResult),
     AgentOutput(AgentOutputReadResult),
     AgentArtifacts(AgentArtifactListResult),
+    AgentArtifactRead(AgentArtifactReadResult),
     AgentInterrupt(AgentInterruptResult),
     AgentClose(AgentCloseResult),
     GoalGet(SessionGoalGetResult),

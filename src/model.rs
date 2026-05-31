@@ -262,6 +262,25 @@ pub struct AgentArtifactListResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentArtifactReadParams {
+    pub session_id: SessionKey,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentArtifactReadResult {
+    pub session_id: SessionKey,
+    pub agent_id: String,
+    pub artifact: octos_core::ui_protocol::UiAgentArtifact,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInterruptParams {
     pub session_id: SessionKey,
     pub agent_id: String,
@@ -604,6 +623,7 @@ pub enum AppUiCommand {
     ReadAgentStatus(AgentStatusReadParams),
     ReadAgentOutput(AgentOutputReadParams),
     ListAgentArtifacts(AgentArtifactListParams),
+    ReadAgentArtifact(AgentArtifactReadParams),
     InterruptAgent(AgentInterruptParams),
     CloseAgent(AgentCloseParams),
     GetSessionGoal(SessionGoalGetParams),
@@ -673,6 +693,7 @@ impl AppUiCommand {
             Self::ReadAgentStatus(_) => APPUI_METHOD_AGENT_STATUS_READ,
             Self::ReadAgentOutput(_) => APPUI_METHOD_AGENT_OUTPUT_READ,
             Self::ListAgentArtifacts(_) => APPUI_METHOD_AGENT_ARTIFACT_LIST,
+            Self::ReadAgentArtifact(_) => APPUI_METHOD_AGENT_ARTIFACT_READ,
             Self::InterruptAgent(_) => APPUI_METHOD_AGENT_INTERRUPT,
             Self::CloseAgent(_) => APPUI_METHOD_AGENT_CLOSE,
             Self::GetSessionGoal(_) => APPUI_METHOD_SESSION_GOAL_GET,
@@ -2969,6 +2990,7 @@ pub struct AppState {
     pub approval_auto_open: bool,
     pub approval: Option<ApprovalModalState>,
     pub task_output: TaskOutputDetailState,
+    pub artifact_detail: ArtifactDetailState,
     pub task_output_cursors: Vec<TaskOutputCursor>,
     pub diff_preview: DiffPreviewPaneState,
     pub activity: Vec<ActivityItem>,
@@ -3363,6 +3385,44 @@ impl TaskOutputDetailState {
         self.output.push_str(text);
         self.cursor = Some(cursor);
         self.scroll = 0;
+    }
+
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_sub(lines);
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_add(lines);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArtifactDetailState {
+    pub active: bool,
+    pub title: String,
+    pub subtitle: String,
+    pub content: String,
+    pub scroll: usize,
+}
+
+impl ArtifactDetailState {
+    pub fn open_agent_artifact(
+        &mut self,
+        agent_id: &str,
+        artifact: &octos_core::ui_protocol::UiAgentArtifact,
+        content: Option<String>,
+    ) {
+        self.active = true;
+        self.title = artifact.title.clone();
+        self.subtitle = format!("agent {agent_id} | {} | {}", artifact.kind, artifact.status);
+        self.content = content
+            .or_else(|| artifact.content.clone())
+            .unwrap_or_else(|| "No content returned for this artifact".into());
+        self.scroll = 0;
+    }
+
+    pub fn close(&mut self) {
+        *self = Self::default();
     }
 
     pub fn scroll_up(&mut self, lines: usize) {
@@ -4055,6 +4115,7 @@ impl AppState {
             approval_auto_open: true,
             approval: None,
             task_output: TaskOutputDetailState::default(),
+            artifact_detail: ArtifactDetailState::default(),
             task_output_cursors: Vec::new(),
             diff_preview: DiffPreviewPaneState::default(),
             activity: Vec::new(),

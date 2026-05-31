@@ -377,6 +377,30 @@ impl Store {
                     },
                 ))
             }
+            AgentsCommand::ArtifactRead { agent_id, selector } => {
+                if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_ARTIFACT_READ) {
+                    return None;
+                }
+                let (artifact_id, path, label) = match selector {
+                    crate::autonomy::AgentArtifactSelector::Id(id) => {
+                        let label = id.clone();
+                        (Some(id), None, label)
+                    }
+                    crate::autonomy::AgentArtifactSelector::Path(path) => {
+                        let label = path.clone();
+                        (None, Some(path), label)
+                    }
+                };
+                self.state.status = format!("Reading artifact {label} for {agent_id}");
+                Some(AppUiCommand::ReadAgentArtifact(
+                    crate::model::AgentArtifactReadParams {
+                        session_id,
+                        agent_id,
+                        artifact_id,
+                        path,
+                    },
+                ))
+            }
             AgentsCommand::Interrupt(agent_id) => {
                 if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_AGENT_INTERRUPT) {
                     return None;
@@ -2973,6 +2997,12 @@ impl Store {
             return true;
         }
 
+        if self.state.artifact_detail.active {
+            self.state.artifact_detail.close();
+            self.state.status = "Closed artifact detail".into();
+            return true;
+        }
+
         if self.state.diff_preview.active {
             self.state.diff_preview.close();
             self.state.status = "Closed inline diff preview".into();
@@ -3285,6 +3315,15 @@ impl Store {
                 self.state
                     .set_agent_artifacts(&result.session_id, &agent_id, result.artifacts);
                 self.state.status = format!("Agent {agent_id} artifacts: {count} item(s)");
+            }
+            AutonomyResult::AgentArtifactRead(result) => {
+                let title = result.artifact.title.clone();
+                self.state.artifact_detail.open_agent_artifact(
+                    &result.agent_id,
+                    &result.artifact,
+                    result.content,
+                );
+                self.state.status = format!("Agent {} artifact loaded: {title}", result.agent_id);
             }
             AutonomyResult::AgentInterrupt(result) => {
                 if let Some(agent) = result.agent.clone() {
@@ -10831,6 +10870,7 @@ mod tests {
                 crate::model::APPUI_METHOD_AGENT_STATUS_READ,
                 crate::model::APPUI_METHOD_AGENT_OUTPUT_READ,
                 crate::model::APPUI_METHOD_AGENT_ARTIFACT_LIST,
+                crate::model::APPUI_METHOD_AGENT_ARTIFACT_READ,
                 crate::model::APPUI_METHOD_AGENT_INTERRUPT,
                 crate::model::APPUI_METHOD_AGENT_CLOSE,
                 crate::model::APPUI_METHOD_SESSION_GOAL_GET,
@@ -10915,6 +10955,34 @@ mod tests {
                 assert_eq!(params.agent_id, "ag-7");
             }
             other => panic!("expected ListAgentArtifacts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agents_artifact_dispatches_artifact_read() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/agents artifact ag-7 artifact-1".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::ReadAgentArtifact(params) => {
+                assert_eq!(params.agent_id, "ag-7");
+                assert_eq!(params.artifact_id.as_deref(), Some("artifact-1"));
+                assert!(params.path.is_none());
+            }
+            other => panic!("expected ReadAgentArtifact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agents_artifact_dispatches_path_selector() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/agents artifact ag-7 path:reports/out.md".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::ReadAgentArtifact(params) => {
+                assert_eq!(params.agent_id, "ag-7");
+                assert!(params.artifact_id.is_none());
+                assert_eq!(params.path.as_deref(), Some("reports/out.md"));
+            }
+            other => panic!("expected ReadAgentArtifact, got {other:?}"),
         }
     }
 
@@ -11817,6 +11885,38 @@ mod tests {
             .expect("mirror");
         assert_eq!(mirror.agents.len(), 1);
         assert!(store.state.status.contains("1 agent"));
+    }
+
+    #[test]
+    fn autonomy_agent_artifact_read_opens_detail_modal() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        use octos_core::ui_protocol::UiAgentArtifact;
+        use std::collections::BTreeMap;
+
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::AgentArtifactRead(crate::model::AgentArtifactReadResult {
+                session_id,
+                agent_id: "ag-7".into(),
+                artifact: UiAgentArtifact {
+                    id: "artifact-1".into(),
+                    title: "notes.md".into(),
+                    kind: "markdown".into(),
+                    status: "ready".into(),
+                    path: Some("notes.md".into()),
+                    content: None,
+                    extra: BTreeMap::new(),
+                },
+                content: Some("artifact body".into()),
+            }),
+        }));
+
+        assert!(store.state.artifact_detail.active);
+        assert_eq!(store.state.artifact_detail.title, "notes.md");
+        assert!(store.state.artifact_detail.subtitle.contains("ag-7"));
+        assert_eq!(store.state.artifact_detail.content, "artifact body");
+        assert_eq!(store.state.status, "Agent ag-7 artifact loaded: notes.md");
     }
 
     #[test]

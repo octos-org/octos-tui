@@ -12,10 +12,10 @@ use octos_core::ui_protocol::approval_kinds;
 use crate::{
     menu::render as menu_render,
     model::{
-        ActivityItem, ActivityKind, AppState, ApprovalModalState, ComposerPresentation,
-        DiffPreviewPaneState, FocusPane, PlanStep as RenderedPlanStep, SessionAutonomyState,
-        SessionRunState, SessionView, TaskOutputDetailState, TurnActivityLog, extract_plan_steps,
-        task_state_label,
+        ActivityItem, ActivityKind, AppState, ApprovalModalState, ArtifactDetailState,
+        ComposerPresentation, DiffPreviewPaneState, FocusPane, PlanStep as RenderedPlanStep,
+        SessionAutonomyState, SessionRunState, SessionView, TaskOutputDetailState, TurnActivityLog,
+        extract_plan_steps, task_state_label,
     },
     theme::Palette,
 };
@@ -29,6 +29,9 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
 
     if app.task_output.active {
         render_task_output_modal(frame, &app.task_output, palette);
+    }
+    if app.artifact_detail.active {
+        render_artifact_detail_modal(frame, &app.artifact_detail, palette);
     }
 }
 
@@ -3253,6 +3256,42 @@ fn render_task_output_modal(
     frame.render_widget(pane, area);
 }
 
+fn render_artifact_detail_modal(
+    frame: &mut Frame<'_>,
+    artifact: &ArtifactDetailState,
+    palette: Palette,
+) {
+    let area = centered_rect(82, 68, frame.area());
+    let mut lines = vec![
+        Line::from(Span::styled(artifact.title.clone(), palette.title())),
+        Line::from(Span::styled(artifact.subtitle.clone(), palette.muted())),
+        Line::from(""),
+    ];
+
+    lines.extend(
+        artifact
+            .content
+            .lines()
+            .map(|line| Line::from(Span::styled(line.to_string(), palette.text()))),
+    );
+
+    let visible_height = usize::from(area.height.saturating_sub(2)).max(1);
+    let max_scroll = lines.len().saturating_sub(visible_height);
+    let scroll_from_bottom = artifact.scroll.min(max_scroll);
+    let scroll_top = max_scroll.saturating_sub(scroll_from_bottom) as u16;
+
+    let pane = Paragraph::new(Text::from(lines))
+        .block(
+            titled_block("Artifact", palette, true, Some("PgUp/PgDn | Esc close"))
+                .border_style(palette.selected()),
+        )
+        .scroll((scroll_top, 0))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(pane, area);
+}
+
 fn diff_line_sign(kind: &str) -> &'static str {
     match kind {
         "added" => "+",
@@ -3532,6 +3571,38 @@ mod tests {
         assert!(!text.contains("INFO calling LLM"));
         assert!(!text.contains("parallel_tools"));
         assert!(!text.contains("tool_ids="));
+    }
+
+    #[test]
+    fn render_artifact_detail_modal_shows_content() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::system("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.artifact_detail = crate::model::ArtifactDetailState {
+            active: true,
+            title: "notes.md".into(),
+            subtitle: "agent ag-7 | markdown | ready".into(),
+            content: "artifact body".into(),
+            scroll: 0,
+        };
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("Artifact"));
+        assert!(text.contains("notes.md"));
+        assert!(text.contains("agent ag-7"));
+        assert!(text.contains("artifact body"));
     }
 
     #[test]

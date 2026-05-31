@@ -157,6 +157,7 @@ pub const APPUI_AGENTS_MENU_METHODS_ANY: &[&str] = &[
     crate::model::APPUI_METHOD_AGENT_STATUS_READ,
     crate::model::APPUI_METHOD_AGENT_OUTPUT_READ,
     crate::model::APPUI_METHOD_AGENT_ARTIFACT_LIST,
+    crate::model::APPUI_METHOD_AGENT_ARTIFACT_READ,
     crate::model::APPUI_METHOD_AGENT_INTERRUPT,
     crate::model::APPUI_METHOD_AGENT_CLOSE,
 ];

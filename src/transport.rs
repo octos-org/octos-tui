@@ -1039,6 +1039,7 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ReadAgentStatus(_)
                 | AppUiCommand::ReadAgentOutput(_)
                 | AppUiCommand::ListAgentArtifacts(_)
+                | AppUiCommand::ReadAgentArtifact(_)
                 | AppUiCommand::GetSessionGoal(_)
                 | AppUiCommand::ListLoops(_)
         )
@@ -1556,6 +1557,7 @@ fn rpc_request_from_command(
         AppUiCommand::ReadAgentStatus(params) => serde_json::to_value(params),
         AppUiCommand::ReadAgentOutput(params) => serde_json::to_value(params),
         AppUiCommand::ListAgentArtifacts(params) => serde_json::to_value(params),
+        AppUiCommand::ReadAgentArtifact(params) => serde_json::to_value(params),
         AppUiCommand::InterruptAgent(params) => serde_json::to_value(params),
         AppUiCommand::CloseAgent(params) => serde_json::to_value(params),
         AppUiCommand::GetSessionGoal(params) => serde_json::to_value(params),
@@ -2214,6 +2216,17 @@ fn success_response_to_app_event(
                 Ok(result) => Ok(Some(autonomy_event(AutonomyResult::AgentArtifacts(result)))),
                 Err(err) => Ok(Some(autonomy_decode_error(
                     crate::model::APPUI_METHOD_AGENT_ARTIFACT_LIST,
+                    err,
+                ))),
+            }
+        }
+        crate::model::APPUI_METHOD_AGENT_ARTIFACT_READ => {
+            match serde_json::from_value::<crate::model::AgentArtifactReadResult>(result) {
+                Ok(result) => Ok(Some(autonomy_event(AutonomyResult::AgentArtifactRead(
+                    result,
+                )))),
+                Err(err) => Ok(Some(autonomy_decode_error(
+                    crate::model::APPUI_METHOD_AGENT_ARTIFACT_READ,
                     err,
                 ))),
             }
@@ -4064,13 +4077,13 @@ fn mock_diff_preview(session_id: SessionKey, preview_id: PreviewId) -> DiffPrevi
 mod tests {
     use super::*;
     use crate::model::{
-        ConfigCapabilitiesListParams, McpConfigDeleteParams, McpConfigListParams,
-        McpConfigSetEnabledParams, McpConfigTestParams, McpConfigUpsertParams, McpStatusListParams,
-        ModelListParams, ModelSelectParams, ProfileLocalCreateParams, ProfileSkillsInstallParams,
-        ProfileSkillsListParams, ProfileSkillsRegistrySearchParams, ProfileSkillsRemoveParams,
-        SessionStatusReadParams, ToolConfigDeleteParams, ToolConfigListParams,
-        ToolConfigSetEnabledParams, ToolConfigTestParams, ToolConfigUpsertParams,
-        ToolStatusListParams,
+        AgentArtifactReadParams, ConfigCapabilitiesListParams, McpConfigDeleteParams,
+        McpConfigListParams, McpConfigSetEnabledParams, McpConfigTestParams, McpConfigUpsertParams,
+        McpStatusListParams, ModelListParams, ModelSelectParams, ProfileLocalCreateParams,
+        ProfileSkillsInstallParams, ProfileSkillsListParams, ProfileSkillsRegistrySearchParams,
+        ProfileSkillsRemoveParams, SessionStatusReadParams, ToolConfigDeleteParams,
+        ToolConfigListParams, ToolConfigSetEnabledParams, ToolConfigTestParams,
+        ToolConfigUpsertParams, ToolStatusListParams,
     };
     use octos_core::TaskId;
     use octos_core::ui_protocol::{
@@ -4286,6 +4299,70 @@ mod tests {
         assert_eq!(request.method, methods::APPROVAL_SCOPES_LIST);
         assert_eq!(request.params["session_id"], "local:test");
         assert!(request.params.get("kind").is_none());
+    }
+
+    #[test]
+    fn protocol_command_serializes_agent_artifact_read() {
+        let request = rpc_request_from_command(
+            "tui-10".into(),
+            AppUiCommand::ReadAgentArtifact(AgentArtifactReadParams {
+                session_id: SessionKey("local:test".into()),
+                agent_id: "ag-7".into(),
+                artifact_id: Some("artifact-1".into()),
+                path: None,
+            }),
+        )
+        .expect("request encodes");
+
+        assert_eq!(request.jsonrpc, "2.0");
+        assert_eq!(request.method, methods::AGENT_ARTIFACT_READ);
+        assert_eq!(request.params["session_id"], "local:test");
+        assert_eq!(request.params["agent_id"], "ag-7");
+        assert_eq!(request.params["artifact_id"], "artifact-1");
+        assert!(request.params.get("path").is_none());
+    }
+
+    #[test]
+    fn protocol_decodes_agent_artifact_read_result() {
+        let mut exchange = ProtocolExchange::default();
+        let request = exchange
+            .build_tracked_request(AppUiCommand::ReadAgentArtifact(AgentArtifactReadParams {
+                session_id: SessionKey("local:test".into()),
+                agent_id: "ag-7".into(),
+                artifact_id: Some("artifact-1".into()),
+                path: None,
+            }))
+            .expect("tracked request");
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": {
+                "session_id": "local:test",
+                "agent_id": "ag-7",
+                "artifact": {
+                    "id": "artifact-1",
+                    "title": "notes.md",
+                    "kind": "markdown",
+                    "status": "ready"
+                },
+                "content": "artifact body"
+            }
+        });
+
+        let event = exchange
+            .decode_rpc_text(&response.to_string())
+            .expect("response decodes")
+            .expect("event");
+
+        let ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::AgentArtifactRead(result),
+        }) = event
+        else {
+            panic!("expected agent artifact read event");
+        };
+        assert_eq!(result.agent_id, "ag-7");
+        assert_eq!(result.artifact.id, "artifact-1");
+        assert_eq!(result.content.as_deref(), Some("artifact body"));
     }
 
     #[test]

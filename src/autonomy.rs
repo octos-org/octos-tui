@@ -41,10 +41,22 @@ pub enum AgentsCommand {
     Output(String),
     /// `/agents artifacts <agent_id>`.
     Artifacts(String),
+    /// `/agents artifact <agent_id> <artifact_id>` or
+    /// `/agents artifact <agent_id> path:<artifact_path>`.
+    ArtifactRead {
+        agent_id: String,
+        selector: AgentArtifactSelector,
+    },
     /// `/agents interrupt <agent_id>`.
     Interrupt(String),
     /// `/agents close <agent_id>`.
     Close(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentArtifactSelector {
+    Id(String),
+    Path(String),
 }
 
 /// Parsed `/goal` subcommand.
@@ -203,6 +215,7 @@ fn parse_agents(tail: &str) -> Result<AgentsCommand, AutonomyParseError> {
             "/agents artifacts",
             args,
         )?)),
+        "artifact" | "artifact-read" | "read-artifact" => parse_agent_artifact_read(args),
         "interrupt" => Ok(AgentsCommand::Interrupt(require_id(
             "/agents interrupt",
             args,
@@ -210,6 +223,44 @@ fn parse_agents(tail: &str) -> Result<AgentsCommand, AutonomyParseError> {
         "close" => Ok(AgentsCommand::Close(require_id("/agents close", args)?)),
         other => Err(AutonomyParseError::UnknownAgentsVerb(other.to_string())),
     }
+}
+
+fn parse_agent_artifact_read(args: &str) -> Result<AgentsCommand, AutonomyParseError> {
+    let (agent_id, selector_raw) = split_head(args);
+    if agent_id.is_empty() {
+        return Err(AutonomyParseError::MissingId {
+            command: "/agents artifact",
+        });
+    }
+    let selector_raw = selector_raw.trim();
+    if selector_raw.is_empty() {
+        return Err(AutonomyParseError::MissingId {
+            command: "/agents artifact <agent_id>",
+        });
+    }
+    let selector = if let Some(path) = selector_raw.strip_prefix("path:") {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err(AutonomyParseError::MissingId {
+                command: "/agents artifact <agent_id>",
+            });
+        }
+        AgentArtifactSelector::Path(path.to_string())
+    } else if let Some(id) = selector_raw.strip_prefix("id:") {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(AutonomyParseError::MissingId {
+                command: "/agents artifact <agent_id>",
+            });
+        }
+        AgentArtifactSelector::Id(id.to_string())
+    } else {
+        AgentArtifactSelector::Id(selector_raw.to_string())
+    };
+    Ok(AgentsCommand::ArtifactRead {
+        agent_id: agent_id.to_string(),
+        selector,
+    })
 }
 
 fn parse_goal(tail: &str) -> Result<GoalCommand, AutonomyParseError> {
@@ -414,6 +465,24 @@ mod tests {
             Some(AutonomyCommand::Agents(AgentsCommand::Output(
                 "ag-7".into()
             )))
+        );
+    }
+
+    #[test]
+    fn agents_artifact_read_accepts_id_or_path_selector() {
+        assert_eq!(
+            parse_autonomy_slash("/agents artifact ag-7 artifact-1").unwrap(),
+            Some(AutonomyCommand::Agents(AgentsCommand::ArtifactRead {
+                agent_id: "ag-7".into(),
+                selector: AgentArtifactSelector::Id("artifact-1".into()),
+            }))
+        );
+        assert_eq!(
+            parse_autonomy_slash("/agents read-artifact ag-7 path:reports/out.md").unwrap(),
+            Some(AutonomyCommand::Agents(AgentsCommand::ArtifactRead {
+                agent_id: "ag-7".into(),
+                selector: AgentArtifactSelector::Path("reports/out.md".into()),
+            }))
         );
     }
 
