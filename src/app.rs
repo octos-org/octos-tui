@@ -1022,8 +1022,10 @@ fn flush_prose_paragraph(
     prose.clear();
 }
 
-/// Minimum width a table column is allowed to shrink to (room for `…`).
-const MIN_TABLE_COL: usize = 3;
+/// Minimum width a table column is allowed to shrink to (just an `…`). Columns
+/// shrink this far before the per-line clip (below) becomes the last resort, so
+/// even many-column tables fit the pane whenever the column count allows.
+const MIN_TABLE_COL: usize = 1;
 
 fn flush_markdown_table(
     lines: &mut Vec<Line<'static>>,
@@ -1075,7 +1077,7 @@ fn flush_markdown_table(
     let has_header = table.len() > 1;
 
     lines.push(table_border_line(
-        indent, &widths, '┌', '┬', '┐', border, bg,
+        indent, &widths, '┌', '┬', '┐', border, bg, width,
     ));
     for (row_idx, row) in table.iter().enumerate() {
         let header = has_header && row_idx == 0;
@@ -1096,19 +1098,23 @@ fn flush_markdown_table(
             ));
             spans.push(Span::styled("│", border));
         }
-        lines.push(chat_line(spans, bg));
+        // Last-resort clip: when even minimum-width columns plus borders exceed
+        // the pane (e.g. a many-column table in a narrow transcript), hard-cut
+        // the row so ratatui never wraps it into a broken grid.
+        lines.push(chat_line(clip_line_spans(spans, width), bg));
         if header {
             lines.push(table_border_line(
-                indent, &widths, '├', '┼', '┤', border, bg,
+                indent, &widths, '├', '┼', '┤', border, bg, width,
             ));
         }
     }
     lines.push(table_border_line(
-        indent, &widths, '└', '┴', '┘', border, bg,
+        indent, &widths, '└', '┴', '┘', border, bg, width,
     ));
     table.clear();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn table_border_line(
     indent: &'static str,
     widths: &[usize],
@@ -1117,6 +1123,7 @@ fn table_border_line(
     right: char,
     border: Style,
     bg: Option<Color>,
+    width: usize,
 ) -> Line<'static> {
     let mut s = String::new();
     s.push(left);
@@ -1129,10 +1136,40 @@ fn table_border_line(
         }
     }
     s.push(right);
-    chat_line(
-        vec![Span::styled(indent, border), Span::styled(s, border)],
-        bg,
-    )
+    let spans = vec![Span::styled(indent, border), Span::styled(s, border)];
+    chat_line(clip_line_spans(spans, width), bg)
+}
+
+/// Hard-cut a fully-built line's spans to `max_width` display columns (no
+/// ellipsis) so an over-wide table row is clipped rather than wrapped.
+fn clip_line_spans(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        if used >= max_width {
+            break;
+        }
+        let span_w = span.content.as_ref().width();
+        if used + span_w <= max_width {
+            used += span_w;
+            out.push(span);
+        } else {
+            let mut clipped = String::new();
+            for ch in span.content.chars() {
+                let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if used + ch_w > max_width {
+                    break;
+                }
+                clipped.push(ch);
+                used += ch_w;
+            }
+            if !clipped.is_empty() {
+                out.push(Span::styled(clipped, span.style));
+            }
+            break;
+        }
+    }
+    out
 }
 
 /// Render an inline-markdown table cell as styled spans, truncating to `max_w`
@@ -4746,6 +4783,51 @@ mod tests {
         assert!(text.contains("└"));
         assert!(text.contains("│"));
         assert!(text.contains("…"), "wide cells should be truncated to fit");
+    }
+
+    #[test]
+    fn render_markdown_table_clips_many_columns_to_pane_width() {
+        // codex P2: with enough columns, even minimum-width cells + borders
+        // exceed a narrow pane. No produced line may be wider than the pane,
+        // or ratatui wraps it and breaks the grid.
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let header = (1..=8)
+            .map(|i| format!("Col{i}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let sep = vec!["---"; 8].join("|");
+        let row = (1..=8)
+            .map(|i| format!("value {i} text"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let content = format!("| {header} |\n|{sep}|\n| {row} |");
+        let width = 30;
+        let mut lines = Vec::new();
+        push_formatted_body(
+            &mut lines,
+            palette,
+            &content,
+            "",
+            Some(palette.surface),
+            width,
+        );
+        for line in &lines {
+            let line_width: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref().width())
+                .sum();
+            assert!(
+                line_width <= width,
+                "table line width {line_width} exceeds pane width {width}"
+            );
+        }
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref().to_string())
+            .collect();
+        assert!(text.contains("│"), "still a bordered table");
     }
 
     #[test]
