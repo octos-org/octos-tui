@@ -302,6 +302,10 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return handle_artifact_detail_key(store, key);
     }
 
+    if store.state.thread_graph_detail.active {
+        return handle_thread_graph_detail_key(store, key);
+    }
+
     if store.state.menu_stack.is_active() {
         return handle_menu_key(store, key);
     }
@@ -728,6 +732,32 @@ fn handle_artifact_detail_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     KeyAction::Continue
 }
 
+fn handle_thread_graph_detail_key(store: &mut Store, key: KeyEvent) -> KeyAction {
+    match key.code {
+        KeyCode::Esc => {
+            store.close_modal();
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            store.state.thread_graph_detail.scroll_down(1);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            store.state.thread_graph_detail.scroll_up(1);
+        }
+        KeyCode::PageDown => {
+            store.state.thread_graph_detail.scroll_down(8);
+        }
+        KeyCode::PageUp => {
+            store.state.thread_graph_detail.scroll_up(8);
+        }
+        KeyCode::End => {
+            store.state.thread_graph_detail.scroll = 0;
+        }
+        _ => {}
+    }
+
+    KeyAction::Continue
+}
+
 fn move_down(state: &mut crate::model::AppState) {
     match state.focus {
         FocusPane::Sessions => state.select_next_session(),
@@ -759,6 +789,10 @@ fn scroll_current_surface_down(store: &mut Store, lines: usize) {
         store.state.artifact_detail.scroll_down(lines);
         return;
     }
+    if store.state.thread_graph_detail.active {
+        store.state.thread_graph_detail.scroll_down(lines);
+        return;
+    }
 
     match store.state.focus {
         FocusPane::Workspace => store.state.workspace.scroll_down(lines),
@@ -774,6 +808,10 @@ fn scroll_current_surface_up(store: &mut Store, lines: usize) {
     }
     if store.state.artifact_detail.active {
         store.state.artifact_detail.scroll_up(lines);
+        return;
+    }
+    if store.state.thread_graph_detail.active {
+        store.state.thread_graph_detail.scroll_up(lines);
         return;
     }
 

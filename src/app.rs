@@ -14,8 +14,8 @@ use crate::{
     model::{
         ActivityItem, ActivityKind, AppState, ApprovalModalState, ArtifactDetailState,
         ComposerPresentation, DiffPreviewPaneState, FocusPane, PlanStep as RenderedPlanStep,
-        SessionAutonomyState, SessionRunState, SessionView, TaskOutputDetailState, TurnActivityLog,
-        extract_plan_steps, task_state_label,
+        SessionAutonomyState, SessionRunState, SessionView, TaskOutputDetailState,
+        ThreadGraphDetailState, TurnActivityLog, extract_plan_steps, task_state_label,
     },
     theme::Palette,
 };
@@ -32,6 +32,9 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
     }
     if app.artifact_detail.active {
         render_artifact_detail_modal(frame, &app.artifact_detail, palette);
+    }
+    if app.thread_graph_detail.active {
+        render_thread_graph_detail_modal(frame, &app.thread_graph_detail, palette);
     }
 }
 
@@ -3292,6 +3295,42 @@ fn render_artifact_detail_modal(
     frame.render_widget(pane, area);
 }
 
+fn render_thread_graph_detail_modal(
+    frame: &mut Frame<'_>,
+    graph: &ThreadGraphDetailState,
+    palette: Palette,
+) {
+    let area = centered_rect(82, 68, frame.area());
+    let mut lines = vec![
+        Line::from(Span::styled(graph.title.clone(), palette.title())),
+        Line::from(Span::styled(graph.subtitle.clone(), palette.muted())),
+        Line::from(""),
+    ];
+
+    lines.extend(
+        graph
+            .content
+            .lines()
+            .map(|line| Line::from(Span::styled(line.to_string(), palette.text()))),
+    );
+
+    let visible_height = usize::from(area.height.saturating_sub(2)).max(1);
+    let max_scroll = lines.len().saturating_sub(visible_height);
+    let scroll_from_bottom = graph.scroll.min(max_scroll);
+    let scroll_top = max_scroll.saturating_sub(scroll_from_bottom) as u16;
+
+    let pane = Paragraph::new(Text::from(lines))
+        .block(
+            titled_block("Threads", palette, true, Some("PgUp/PgDn | Esc close"))
+                .border_style(palette.selected()),
+        )
+        .scroll((scroll_top, 0))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(pane, area);
+}
+
 fn diff_line_sign(kind: &str) -> &'static str {
     match kind {
         "added" => "+",
@@ -3603,6 +3642,38 @@ mod tests {
         assert!(text.contains("notes.md"));
         assert!(text.contains("agent ag-7"));
         assert!(text.contains("artifact body"));
+    }
+
+    #[test]
+    fn render_thread_graph_detail_modal_shows_threads() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::system("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.thread_graph_detail = crate::model::ThreadGraphDetailState {
+            active: true,
+            title: "Thread Graph".into(),
+            subtitle: "1 thread(s) @ session:7".into(),
+            content: "thread-1 | active | root seq 1 | 2 message(s)".into(),
+            scroll: 0,
+        };
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("Threads"));
+        assert!(text.contains("Thread Graph"));
+        assert!(text.contains("thread-1"));
+        assert!(text.contains("root seq 1"));
     }
 
     #[test]
