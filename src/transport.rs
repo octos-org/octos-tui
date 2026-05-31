@@ -11,12 +11,12 @@ use octos_core::ui_protocol::{
     ApprovalRequestedEvent, ApprovalSandboxDetails, ApprovalSandboxEscalationDetails,
     ApprovalSandboxEscalationEndpoint, ApprovalScopesListResult, ApprovalTypedDetails,
     MessageDeltaEvent, OutputCursor, PermissionProfileListResult, PermissionProfileSelection,
-    PermissionProfileSetResult, PreviewId, SessionOpenParams, SessionOpenResult, SessionOpened,
-    TaskArtifactReadResult, TaskOutputDeltaEvent, TaskOutputReadResult, TaskRuntimeState,
-    TaskUpdatedEvent, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
-    ToolStartedEvent, TurnCompletedEvent, TurnId, TurnStartedEvent, TurnStateGetResult, UiCursor,
-    UiNotification, UiPaneSnapshot, UiProtocolCapabilities, WarningEvent, approval_kinds, methods,
-    rpc_error_codes,
+    PermissionProfileSetResult, PreviewId, SessionHydrateResult, SessionOpenParams,
+    SessionOpenResult, SessionOpened, TaskArtifactReadResult, TaskOutputDeltaEvent,
+    TaskOutputReadResult, TaskRuntimeState, TaskUpdatedEvent, ThreadGraphGetResult,
+    ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnId,
+    TurnStartedEvent, TurnStateGetResult, UiCursor, UiNotification, UiPaneSnapshot,
+    UiProtocolCapabilities, WarningEvent, approval_kinds, methods, rpc_error_codes,
 };
 use octos_core::ui_protocol::{
     JSON_RPC_VERSION, MAX_TEXT_FRAME_BYTES, RpcRequest, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
@@ -1027,6 +1027,7 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::GetDiffPreview(_)
                 | AppUiCommand::ReadTaskOutput(_)
                 | AppUiCommand::ReadTaskArtifact(_)
+                | AppUiCommand::HydrateSession(_)
                 | AppUiCommand::GetThreadGraph(_)
                 | AppUiCommand::GetTurnState(_)
                 | AppUiCommand::AuthStatus(_)
@@ -1541,6 +1542,7 @@ fn rpc_request_from_command(
         AppUiCommand::RestartTaskFromNode(params) => serde_json::to_value(params),
         AppUiCommand::ReadTaskOutput(params) => serde_json::to_value(params),
         AppUiCommand::ReadTaskArtifact(params) => serde_json::to_value(params),
+        AppUiCommand::HydrateSession(params) => serde_json::to_value(params),
         AppUiCommand::GetThreadGraph(params) => serde_json::to_value(params),
         AppUiCommand::GetTurnState(params) => serde_json::to_value(params),
         AppUiCommand::AuthStatus(params) => serde_json::to_value(params),
@@ -2043,6 +2045,10 @@ fn success_response_to_app_event(
                 ))),
             }
         }
+        methods::SESSION_HYDRATE => match serde_json::from_value::<SessionHydrateResult>(result) {
+            Ok(result) => Ok(Some(ClientEvent::SessionHydrate(result))),
+            Err(err) => Ok(Some(autonomy_decode_error(methods::SESSION_HYDRATE, err))),
+        },
         methods::THREAD_GRAPH_GET => match serde_json::from_value::<ThreadGraphGetResult>(result) {
             Ok(result) => Ok(Some(autonomy_event(AutonomyResult::ThreadGraph(result)))),
             Err(err) => Ok(Some(autonomy_decode_error(methods::THREAD_GRAPH_GET, err))),
@@ -3584,6 +3590,9 @@ impl AppUiBackend for MockAppUiBackend {
             AppUiCommand::ReadTaskArtifact(_) => Err(eyre!(
                 "mock app-ui backend does not implement task artifact reads yet"
             )),
+            AppUiCommand::HydrateSession(_) => Err(eyre!(
+                "mock app-ui backend does not implement session hydrate yet"
+            )),
             AppUiCommand::GetThreadGraph(_) => Err(eyre!(
                 "mock app-ui backend does not implement thread graph reads yet"
             )),
@@ -4124,10 +4133,10 @@ mod tests {
     use octos_core::ui_protocol::{
         ApprovalDecision, ApprovalRespondParams, ApprovalScopesListParams, DiffPreviewGetParams,
         InputItem, PermissionNetworkPolicy, PermissionProfileListParams, PermissionProfileMode,
-        PermissionProfileSetParams, PermissionProfileUpdate, PreviewId, SessionOpenParams,
-        TaskArtifactReadParams, TaskCancelParams, TaskListParams, TaskOutputReadParams,
-        TaskRestartFromNodeParams, ThreadGraphGetParams, TurnInterruptParams, TurnLifecycleState,
-        TurnStartParams, TurnStateGetParams, UiCursor,
+        PermissionProfileSetParams, PermissionProfileUpdate, PreviewId, SessionHydrateParams,
+        SessionOpenParams, TaskArtifactReadParams, TaskCancelParams, TaskListParams,
+        TaskOutputReadParams, TaskRestartFromNodeParams, ThreadGraphGetParams, TurnInterruptParams,
+        TurnLifecycleState, TurnStartParams, TurnStateGetParams, UiCursor,
     };
     use serde_json::json;
     use std::{
@@ -4539,6 +4548,68 @@ mod tests {
         );
         assert_eq!(result.threads[0].thread_id, "thread-1");
         assert_eq!(result.orphans, vec![99]);
+    }
+
+    #[test]
+    fn protocol_command_serializes_session_hydrate() {
+        let request = rpc_request_from_command(
+            "tui-13".into(),
+            AppUiCommand::HydrateSession(SessionHydrateParams {
+                session_id: SessionKey("local:test".into()),
+                after: Some(UiCursor {
+                    stream: "session".into(),
+                    seq: 7,
+                }),
+                include: vec!["messages".into(), "pending_approvals".into()],
+            }),
+        )
+        .expect("request encodes");
+
+        assert_eq!(request.jsonrpc, "2.0");
+        assert_eq!(request.method, methods::SESSION_HYDRATE);
+        assert_eq!(request.params["session_id"], "local:test");
+        assert_eq!(request.params["after"]["seq"], 7);
+        assert_eq!(request.params["include"][0], "messages");
+    }
+
+    #[test]
+    fn protocol_decodes_session_hydrate_result() {
+        let mut exchange = ProtocolExchange::default();
+        let request = exchange
+            .build_tracked_request(AppUiCommand::HydrateSession(SessionHydrateParams {
+                session_id: SessionKey("local:test".into()),
+                after: None,
+                include: Vec::new(),
+            }))
+            .expect("tracked request");
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": {
+                "session_id": "local:test",
+                "cursor": {"stream": "session", "seq": 9},
+                "messages": [{
+                    "seq": 1,
+                    "role": "user",
+                    "content": "hello",
+                    "persisted_at": "2026-05-31T00:00:00Z"
+                }],
+                "pending_approvals": []
+            }
+        });
+
+        let event = exchange
+            .decode_rpc_text(&response.to_string())
+            .expect("response decodes")
+            .expect("event");
+
+        let ClientEvent::SessionHydrate(result) = event else {
+            panic!("expected session hydrate event");
+        };
+        assert_eq!(result.session_id, SessionKey("local:test".into()));
+        assert_eq!(result.cursor.seq, 9);
+        assert_eq!(result.messages.unwrap()[0].content, "hello");
+        assert_eq!(result.pending_approvals.unwrap().len(), 0);
     }
 
     #[test]
@@ -5050,6 +5121,11 @@ mod tests {
             AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
                 session_id: session_id.clone(),
                 preview_id: PreviewId::new(),
+            }),
+            AppUiCommand::HydrateSession(SessionHydrateParams {
+                session_id: session_id.clone(),
+                after: None,
+                include: Vec::new(),
             }),
             AppUiCommand::GetThreadGraph(ThreadGraphGetParams {
                 session_id: session_id.clone(),

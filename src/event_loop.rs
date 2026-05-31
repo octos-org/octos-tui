@@ -99,9 +99,9 @@ fn apply_client_event_and_send_followup(
     }
 }
 
-/// M15-E: send any queued autonomy hydration commands the store has
-/// staged (e.g. on `session/opened` after reconnect). Bounded by the
-/// queue cap inside `AppState` itself.
+/// Send any queued reconnect hydration commands the store has staged
+/// (e.g. on `session/opened` after reconnect). Bounded by the queue cap
+/// inside `AppState` itself.
 fn drain_pending_autonomy_hydration(backend: &mut dyn AppUiBackend, store: &mut Store) {
     while let Some(command) = store.state.dequeue_autonomy_hydration() {
         send_command(backend, store, command);

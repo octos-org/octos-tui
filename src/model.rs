@@ -5,10 +5,10 @@ use octos_core::ui_protocol::{
     ApprovalDecision, ApprovalId, ApprovalRenderHints, ApprovalRequestedEvent,
     ApprovalScopesListParams, ApprovalTypedDetails, DiffPreviewGetParams, OutputCursor,
     PermissionProfileListParams, PermissionProfileSelection, PermissionProfileSetParams, PreviewId,
-    TaskArtifactReadParams, TaskCancelParams, TaskListParams, TaskOutputReadParams,
-    TaskRestartFromNodeParams, TaskRuntimeState, ThreadGraphGetParams, ThreadGraphGetResult,
-    TurnId, TurnInterruptParams, TurnStartParams, TurnStateGetParams, TurnStateGetResult,
-    UiPaneSnapshot, UiProtocolCapabilities, approval_scopes,
+    SessionHydrateParams, TaskArtifactReadParams, TaskCancelParams, TaskListParams,
+    TaskOutputReadParams, TaskRestartFromNodeParams, TaskRuntimeState, ThreadGraphGetParams,
+    ThreadGraphGetResult, TurnId, TurnInterruptParams, TurnStartParams, TurnStateGetParams,
+    TurnStateGetResult, UiPaneSnapshot, UiProtocolCapabilities, approval_scopes,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -143,6 +143,10 @@ pub const APPUI_METHOD_CONTEXT_NORMALIZATION_REPORTED: &str = "context/normaliza
 /// UPCR-2026-010 thread graph read surface (`state.thread_graph.v1`).
 pub const APPUI_FEATURE_THREAD_GRAPH_V1: &str = "state.thread_graph.v1";
 pub const APPUI_METHOD_THREAD_GRAPH_GET: &str = "thread/graph/get";
+
+/// UPCR-2026-009 authoritative session-state reload surface.
+pub const APPUI_FEATURE_SESSION_HYDRATE_V1: &str = "state.session_hydrate.v1";
+pub const APPUI_METHOD_SESSION_HYDRATE: &str = "session/hydrate";
 
 /// UPCR-2026-011 turn lifecycle state read surface.
 pub const APPUI_FEATURE_TURN_STATE_GET_V1: &str = "state.turn_state_get.v1";
@@ -593,6 +597,7 @@ pub enum AppUiCommand {
     RestartTaskFromNode(TaskRestartFromNodeParams),
     ReadTaskOutput(TaskOutputReadParams),
     ReadTaskArtifact(TaskArtifactReadParams),
+    HydrateSession(SessionHydrateParams),
     GetThreadGraph(ThreadGraphGetParams),
     GetTurnState(TurnStateGetParams),
     ListConfigCapabilities(ConfigCapabilitiesListParams),
@@ -665,6 +670,7 @@ impl AppUiCommand {
             }
             Self::ReadTaskOutput(_) => octos_core::ui_protocol::methods::TASK_OUTPUT_READ,
             Self::ReadTaskArtifact(_) => APPUI_METHOD_TASK_ARTIFACT_READ,
+            Self::HydrateSession(_) => APPUI_METHOD_SESSION_HYDRATE,
             Self::GetThreadGraph(_) => APPUI_METHOD_THREAD_GRAPH_GET,
             Self::GetTurnState(_) => APPUI_METHOD_TURN_STATE_GET,
             Self::ListConfigCapabilities(_) => APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
@@ -3040,12 +3046,12 @@ pub struct AppState {
     /// notifications. Hydration on reconnect re-requests these and
     /// REPLACES the local mirror — local config never fills this in.
     pub session_autonomy: Vec<SessionAutonomyState>,
-    /// M15-E reconnect hydration queue. The store enqueues
-    /// follow-up AppUI commands (e.g. `agent/list`,
+    /// Reconnect hydration queue. The store enqueues follow-up AppUI
+    /// commands (e.g. `session/hydrate`, `agent/list`,
     /// `session/goal/get`, `loop/list`) when a session opens or after
     /// reconnect, and the event loop drains them one per tick. The
-    /// queue is bounded so a misbehaving server cannot cause it to
-    /// grow without bound.
+    /// queue is bounded so a misbehaving server cannot cause it to grow
+    /// without bound.
     pub pending_autonomy_hydration: std::collections::VecDeque<AppUiCommand>,
     /// M15-E follow-up: pause/resume issues a `session/goal/get` first
     /// to refresh server truth, then emits a `session/goal/set` with
@@ -4538,9 +4544,9 @@ impl AppState {
         }
     }
 
-    /// Enqueue a pending autonomy hydration command. Bounded — extra
-    /// commands beyond a small cap are dropped to keep the queue
-    /// O(1) — fresh hydration on the next reconnect is cheap.
+    /// Enqueue a pending reconnect hydration command. Bounded — extra
+    /// commands beyond a small cap are dropped to keep the queue O(1) —
+    /// fresh hydration on the next reconnect is cheap.
     pub fn enqueue_autonomy_hydration(&mut self, command: AppUiCommand) {
         const MAX_PENDING_HYDRATION: usize = 16;
         if self.pending_autonomy_hydration.len() >= MAX_PENDING_HYDRATION {

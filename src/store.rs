@@ -1,12 +1,15 @@
+use std::collections::BTreeSet;
+
 use octos_core::app_ui::{AppUiEvent, AppUiSnapshot};
 use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
     ApprovalRespondParams, DiffPreviewGetParams, EnvelopeNotification, EnvelopeToolEndStatus,
-    InputItem, MessageDeltaEvent, MessagePersistedEvent, Payload, ReplayLossyEvent,
-    SessionOpenParams, TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams,
-    TaskRuntimeState, TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent,
-    TurnId, TurnInterruptParams, TurnStartParams, TurnStateGetParams, UiNotification,
-    UiProgressEvent,
+    HydratedMessage, InputItem, MessageDeltaEvent, MessagePersistedEvent, Payload,
+    ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult, SessionOpenParams,
+    TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState,
+    TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent, TurnId,
+    TurnInterruptParams, TurnSpawnCompleteEvent, TurnStartParams, TurnStateGetParams,
+    UiContextState, UiNotification, UiProgressEvent,
 };
 use octos_core::{Message, MessageRole, SessionKey, TaskId, ThreadId};
 use serde_json::Value;
@@ -3266,6 +3269,11 @@ impl Store {
                 }
                 None
             }
+            ClientEvent::SessionHydrate(result) => {
+                self.apply_session_hydrate_result(result);
+                self.refresh_active_menu_if_open();
+                None
+            }
             ClientEvent::AuthStatus(event) => {
                 self.state.onboarding.apply_auth_status(&event.result);
                 self.state.push_activity(ActivityItem::new(
@@ -3706,6 +3714,25 @@ impl Store {
         commands
     }
 
+    pub fn hydrate_session_state_command(&self, session_id: &SessionKey) -> Option<AppUiCommand> {
+        let capabilities = self.state.capabilities.as_ref()?;
+        if !capabilities.supports_feature(crate::model::APPUI_FEATURE_SESSION_HYDRATE_V1)
+            || !capabilities.supports_method(crate::model::APPUI_METHOD_SESSION_HYDRATE)
+        {
+            return None;
+        }
+        Some(AppUiCommand::HydrateSession(SessionHydrateParams {
+            session_id: session_id.clone(),
+            after: None,
+            include: vec![
+                octos_core::ui_protocol::hydrate_sections::MESSAGES.into(),
+                octos_core::ui_protocol::hydrate_sections::THREADS.into(),
+                octos_core::ui_protocol::hydrate_sections::TURNS.into(),
+                octos_core::ui_protocol::hydrate_sections::PENDING_APPROVALS.into(),
+            ],
+        }))
+    }
+
     pub fn apply_event(&mut self, event: AppUiEvent) -> Option<AppUiCommand> {
         let command = match event {
             AppUiEvent::Snapshot(snapshot) => {
@@ -4049,6 +4076,133 @@ impl Store {
             event.message.clone(),
         ));
         self.state.status = event.message;
+    }
+
+    fn apply_session_hydrate_result(&mut self, result: SessionHydrateResult) {
+        let session_id = result.session_id.clone();
+        let projected_messages = hydrated_projection_messages(&result);
+        let message_count = projected_messages.as_ref().map_or(0, Vec::len);
+        let thread_count = result.threads.as_ref().map_or(0, Vec::len);
+        let turn_count = result.turns.as_ref().map_or(0, Vec::len);
+        let pending_approvals_present = result.pending_approvals.is_some();
+        let approval_count = result.pending_approvals.as_ref().map_or(0, Vec::len);
+
+        if let Some(messages) = projected_messages {
+            if let Some(session) = self.find_session_mut(&session_id) {
+                session.messages = messages;
+                session.live_reply = None;
+            } else {
+                self.state.sessions.push(SessionView {
+                    id: session_id.clone(),
+                    title: session_id.0.clone(),
+                    profile_id: self.active_session_profile_id(),
+                    messages,
+                    tasks: Vec::new(),
+                    live_reply: None,
+                });
+                self.state.selected_session = self.state.sessions.len().saturating_sub(1);
+            }
+            self.state
+                .optimistic_user_messages
+                .retain(|optimistic| optimistic.session_id != session_id);
+            self.state.scroll_transcript_to_latest();
+        }
+
+        if let Some(context_state) = result.context_state.as_ref() {
+            self.state.context_lifecycle_mut(&session_id).state =
+                Some(context_lifecycle_state_from_ui(context_state));
+        }
+
+        if let Some(threads) = result.threads.as_ref()
+            && self.state.thread_graph_detail.active
+        {
+            self.state
+                .thread_graph_detail
+                .open(&octos_core::ui_protocol::ThreadGraphGetResult {
+                    session_id: session_id.clone(),
+                    cursor: result.cursor.clone(),
+                    threads: threads.clone(),
+                    orphans: Vec::new(),
+                });
+        }
+
+        if let Some(turns) = result.turns.as_ref()
+            && self.state.turn_state_detail.active
+            && let Some(active_turn) = turns.last()
+        {
+            self.state
+                .turn_state_detail
+                .open(&octos_core::ui_protocol::TurnStateGetResult {
+                    session_id: session_id.clone(),
+                    turn_id: active_turn.turn_id.clone(),
+                    state: active_turn.state,
+                    context: result.context.clone(),
+                    context_state: result.context_state.clone(),
+                    started_at: active_turn.started_at,
+                    completed_at: active_turn.completed_at,
+                    thread_id: active_turn.thread_id.clone(),
+                    committed_seqs: Vec::new(),
+                });
+        }
+
+        if let Some(approvals) = result.pending_approvals {
+            self.apply_hydrated_pending_approvals(&session_id, approvals);
+        }
+
+        let mut sections = Vec::new();
+        if result.messages.is_some() {
+            sections.push(format!("{message_count} message(s)"));
+        }
+        if result.threads.is_some() {
+            sections.push(format!("{thread_count} thread(s)"));
+        }
+        if result.turns.is_some() {
+            sections.push(format!("{turn_count} turn(s)"));
+        }
+        if approval_count > 0 || pending_approvals_present {
+            sections.push(format!("{approval_count} pending approval(s)"));
+        }
+        let summary = if sections.is_empty() {
+            "session state".into()
+        } else {
+            sections.join(", ")
+        };
+        self.state.status = format!("Session hydrated: {summary}");
+    }
+
+    fn apply_hydrated_pending_approvals(
+        &mut self,
+        session_id: &SessionKey,
+        approvals: Vec<octos_core::ui_protocol::ApprovalRequestedEvent>,
+    ) {
+        let count = approvals.len();
+        let Some(event) = approvals.into_iter().last() else {
+            if self
+                .state
+                .approval
+                .as_ref()
+                .is_some_and(|approval| &approval.session_id == session_id)
+            {
+                self.state.approval = None;
+                self.state.set_run_state_idle();
+            }
+            return;
+        };
+        let title = event.title.clone();
+        self.state.push_activity(
+            ActivityItem::new(
+                ActivityKind::Approval,
+                "pending approvals",
+                format!("{count} pending approval(s)"),
+            )
+            .with_turn(event.turn_id.clone())
+            .with_detail(title.clone()),
+        );
+        let mut approval = ApprovalModalState::from_event(event);
+        approval.visible = self.state.approval_auto_open;
+        self.state.approval = Some(approval);
+        self.state.focus = FocusPane::Composer;
+        self.state.set_run_state_blocked(title);
     }
 
     fn apply_profile_llm_catalog_event(&mut self, event: ProfileLlmCatalogClientEvent) {
@@ -4401,6 +4555,9 @@ impl Store {
                 }
                 self.state.status =
                     format!("Opened {} on {}", session_id.0, self.state.protocol_version);
+                if let Some(command) = self.hydrate_session_state_command(&session_id) {
+                    self.state.enqueue_autonomy_hydration(command);
+                }
                 // M15-E: queue autonomy hydration follow-ups so the
                 // local mirror reflects backend truth on session open
                 // and after reconnect. Gated on
@@ -5880,6 +6037,128 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+enum HydratedProjection {
+    Message(HydratedMessage),
+    SpawnComplete(TurnSpawnCompleteEvent),
+}
+
+impl HydratedProjection {
+    fn seq(&self) -> u64 {
+        match self {
+            Self::Message(message) => message.seq,
+            Self::SpawnComplete(event) => event.seq,
+        }
+    }
+}
+
+fn hydrated_projection_messages(result: &SessionHydrateResult) -> Option<Vec<Message>> {
+    let rows = result.messages.as_ref()?;
+    let envelopes = result.replayed_envelopes.as_deref().unwrap_or_default();
+    let envelope_message_ids = envelopes
+        .iter()
+        .map(|event| event.message_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    let mut projections = rows
+        .iter()
+        .filter(|row| !hydrated_row_is_covered_by_envelope(row, envelopes, &envelope_message_ids))
+        .cloned()
+        .map(HydratedProjection::Message)
+        .collect::<Vec<_>>();
+    projections.extend(
+        envelopes
+            .iter()
+            .cloned()
+            .map(HydratedProjection::SpawnComplete),
+    );
+    projections.sort_by_key(HydratedProjection::seq);
+    Some(
+        projections
+            .into_iter()
+            .map(|projection| match projection {
+                HydratedProjection::Message(row) => hydrated_row_to_message(row),
+                HydratedProjection::SpawnComplete(event) => spawn_complete_to_message(event),
+            })
+            .collect(),
+    )
+}
+
+fn hydrated_row_is_covered_by_envelope(
+    row: &HydratedMessage,
+    envelopes: &[TurnSpawnCompleteEvent],
+    envelope_message_ids: &BTreeSet<String>,
+) -> bool {
+    if row
+        .message_id
+        .as_ref()
+        .is_some_and(|message_id| envelope_message_ids.contains(message_id))
+    {
+        return true;
+    }
+    if row.source.as_deref() != Some("background") {
+        return false;
+    }
+    let Some(thread_id) = row.thread_id.as_deref() else {
+        return false;
+    };
+    envelopes.iter().any(|event| {
+        event.thread_id.as_deref() == Some(thread_id)
+            && row.seq < event.seq
+            && row
+                .message_id
+                .as_ref()
+                .is_none_or(|message_id| !envelope_message_ids.contains(message_id))
+    })
+}
+
+fn hydrated_row_to_message(row: HydratedMessage) -> Message {
+    Message {
+        role: hydrated_role(&row.role),
+        content: row.content,
+        media: row.media,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+        client_message_id: row.client_message_id,
+        thread_id: row.thread_id,
+        timestamp: row.persisted_at,
+    }
+}
+
+fn spawn_complete_to_message(event: TurnSpawnCompleteEvent) -> Message {
+    let mut message = match event.thread_id {
+        Some(thread_id) => Message::assistant_with_thread(event.content, ThreadId::new(thread_id)),
+        None => Message::assistant(event.content),
+    };
+    message.media = event.media;
+    message.timestamp = event.persisted_at;
+    message
+}
+
+fn hydrated_role(role: &str) -> MessageRole {
+    match role {
+        "user" => MessageRole::User,
+        "assistant" => MessageRole::Assistant,
+        "tool" => MessageRole::Tool,
+        "system" => MessageRole::System,
+        _ => MessageRole::System,
+    }
+}
+
+fn context_lifecycle_state_from_ui(state: &UiContextState) -> crate::model::ContextLifecycleState {
+    crate::model::ContextLifecycleState {
+        session_id: state.session_id.clone(),
+        thread_id: state.thread_id.clone(),
+        generation: state.generation,
+        transcript_hash: state.transcript_hash.clone(),
+        item_count: state.item_count,
+        token_estimate: state.token_estimate,
+        recovery_state: state.recovery_state.clone(),
+        last_checkpoint_id: state.last_checkpoint_id.clone(),
+        last_compaction_id: state.last_compaction_id.clone(),
+    }
+}
+
 fn tool_invocation_detail(tool_name: &str, arguments: &Value) -> Option<String> {
     fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
         value
@@ -6161,10 +6440,11 @@ mod tests {
     use octos_core::ui_protocol::{
         ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalDecision,
         ApprovalDiffDetails, ApprovalId, ApprovalRequestedEvent, ApprovalTypedDetails, Envelope,
-        EnvelopeNotification, OutputCursor, Payload, PreviewId, ReplayLossyEvent, TaskRuntimeState,
-        ToolCompletedEvent, ToolStartedEvent, TurnId, TurnLifecycleState, UiCursor,
-        UiFileMutationNotice, UiProgressMetadata, UiProtocolCapabilities, UiTokenCostUpdate,
-        approval_kinds, approval_scopes, methods, progress_kinds,
+        EnvelopeNotification, HydratedMessage, HydratedTurn, OutputCursor, Payload, PreviewId,
+        ReplayLossyEvent, SessionHydrateResult, TaskRuntimeState, ThreadGraphEntry,
+        ToolCompletedEvent, ToolStartedEvent, TurnId, TurnLifecycleState, TurnSpawnCompleteEvent,
+        UiContextState, UiCursor, UiFileMutationNotice, UiProgressMetadata, UiProtocolCapabilities,
+        UiTokenCostUpdate, approval_kinds, approval_scopes, methods, progress_kinds,
     };
 
     fn store_with_live_reply(turn_id: TurnId, text: impl Into<String>) -> Store {
@@ -11290,6 +11570,40 @@ mod tests {
     }
 
     #[test]
+    fn session_hydrate_command_requires_feature_and_method() {
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_SESSION_HYDRATE,
+        ]));
+        assert!(store.hydrate_session_state_command(&session_id).is_none());
+
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [crate::model::APPUI_METHOD_SESSION_HYDRATE],
+            [crate::model::APPUI_FEATURE_SESSION_HYDRATE_V1],
+        ));
+        match store
+            .hydrate_session_state_command(&session_id)
+            .expect("hydrate command")
+        {
+            AppUiCommand::HydrateSession(params) => {
+                assert_eq!(params.session_id, session_id);
+                assert!(params.after.is_none());
+                assert_eq!(
+                    params.include,
+                    vec![
+                        octos_core::ui_protocol::hydrate_sections::MESSAGES.to_string(),
+                        octos_core::ui_protocol::hydrate_sections::THREADS.to_string(),
+                        octos_core::ui_protocol::hydrate_sections::TURNS.to_string(),
+                        octos_core::ui_protocol::hydrate_sections::PENDING_APPROVALS.to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected HydrateSession, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn agents_interrupt_dispatches_agent_interrupt() {
         let mut store = protocol_store_with_autonomy();
         store.state.composer = "/agents interrupt ag-7".into();
@@ -12384,6 +12698,139 @@ mod tests {
     }
 
     #[test]
+    fn session_hydrate_result_replaces_messages_and_pending_approval() {
+        use crate::client_event::ClientEvent;
+
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        let turn_id = TurnId::new();
+        let now = chrono::Utc::now();
+        let approval = ApprovalRequestedEvent::generic(
+            session_id.clone(),
+            ApprovalId::new(),
+            turn_id.clone(),
+            "write_file",
+            "Approve write",
+            "Allow write_file",
+        );
+        let result = SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: UiCursor {
+                stream: "session".into(),
+                seq: 4,
+            },
+            context: None,
+            context_state: Some(UiContextState {
+                session_id: session_id.clone(),
+                thread_id: Some("thread-1".into()),
+                generation: 2,
+                transcript_hash: "hash".into(),
+                item_count: 2,
+                token_estimate: 128,
+                recovery_state: "healthy".into(),
+                last_checkpoint_id: None,
+                last_compaction_id: None,
+            }),
+            messages: Some(vec![
+                HydratedMessage {
+                    seq: 1,
+                    role: "user".into(),
+                    content: "build this".into(),
+                    turn_id: Some(turn_id.clone()),
+                    thread_id: Some("thread-1".into()),
+                    client_message_id: Some("cmid-1".into()),
+                    persisted_at: now,
+                    message_id: Some("msg-user".into()),
+                    source: Some("user".into()),
+                    media: Vec::new(),
+                },
+                HydratedMessage {
+                    seq: 2,
+                    role: "assistant".into(),
+                    content: "legacy companion".into(),
+                    turn_id: Some(turn_id.clone()),
+                    thread_id: Some("thread-1".into()),
+                    client_message_id: None,
+                    persisted_at: now,
+                    message_id: Some("companion".into()),
+                    source: Some("background".into()),
+                    media: vec!["companion.md".into()],
+                },
+                HydratedMessage {
+                    seq: 3,
+                    role: "assistant".into(),
+                    content: "legacy ack".into(),
+                    turn_id: Some(turn_id.clone()),
+                    thread_id: Some("thread-1".into()),
+                    client_message_id: None,
+                    persisted_at: now,
+                    message_id: Some("spawn-ack".into()),
+                    source: Some("background".into()),
+                    media: Vec::new(),
+                },
+            ]),
+            threads: Some(vec![ThreadGraphEntry {
+                thread_id: "thread-1".into(),
+                root_seq: 1,
+                root_client_message_id: Some("cmid-1".into()),
+                turn_id: Some(turn_id.clone()),
+                message_seqs: vec![1, 3],
+                status: "active".into(),
+            }]),
+            turns: Some(vec![HydratedTurn {
+                turn_id: turn_id.clone(),
+                state: TurnLifecycleState::Active,
+                started_at: None,
+                completed_at: None,
+                thread_id: Some("thread-1".into()),
+            }]),
+            pending_approvals: Some(vec![approval]),
+            replayed_envelopes: Some(vec![TurnSpawnCompleteEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: Some(turn_id.clone()),
+                thread_id: Some("thread-1".into()),
+                task_id: "task-1".into(),
+                tool_call_id: None,
+                response_to_client_message_id: Some("cmid-1".into()),
+                seq: 3,
+                message_id: "spawn-ack".into(),
+                source: "background".into(),
+                cursor: UiCursor {
+                    stream: "session".into(),
+                    seq: 3,
+                },
+                persisted_at: now,
+                content: "background result".into(),
+                media: vec!["out.md".into()],
+            }]),
+        };
+
+        store.apply_client_event(ClientEvent::SessionHydrate(result));
+
+        let session = store.state.active_session().expect("active session");
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].content, "build this");
+        assert_eq!(session.messages[1].content, "background result");
+        assert_eq!(session.messages[1].media, vec!["out.md".to_string()]);
+        assert_eq!(session.messages[1].thread_id.as_deref(), Some("thread-1"));
+        assert!(store.state.approval.is_some());
+        assert_eq!(
+            store.state.approval.as_ref().unwrap().title,
+            "Approve write"
+        );
+        assert!(
+            store
+                .state
+                .context_lifecycle_for(&session_id)
+                .and_then(|ledger| ledger.state.as_ref())
+                .is_some_and(|state| state.generation == 2)
+        );
+        assert!(store.state.status.contains("2 message(s)"));
+        assert!(store.state.status.contains("1 pending approval"));
+    }
+
+    #[test]
     fn autonomy_loop_list_result_replaces_mirror_loops() {
         use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
         use octos_core::ui_protocol::UiLoopRecord;
@@ -12439,6 +12886,33 @@ mod tests {
         assert!(matches!(drained[0], AppUiCommand::ListAgents(_)));
         assert!(matches!(drained[1], AppUiCommand::GetSessionGoal(_)));
         assert!(matches!(drained[2], AppUiCommand::ListLoops(_)));
+    }
+
+    #[test]
+    fn session_open_enqueues_session_hydrate_when_advertised() {
+        use octos_core::ui_protocol::SessionOpened;
+
+        let mut store = protocol_store_with_autonomy();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [crate::model::APPUI_METHOD_SESSION_HYDRATE],
+            [crate::model::APPUI_FEATURE_SESSION_HYDRATE_V1],
+        ));
+        store.state.sessions.clear();
+        let session_id = SessionKey("local:test".into());
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": session_id,
+            "active_profile_id": "coding",
+            "workspace_root": null,
+            "cursor": null,
+            "panes": null,
+        }))
+        .expect("session_opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        let drained: Vec<_> =
+            std::iter::from_fn(|| store.state.dequeue_autonomy_hydration()).collect();
+        assert_eq!(drained.len(), 1);
+        assert!(matches!(drained[0], AppUiCommand::HydrateSession(_)));
     }
 
     #[test]
