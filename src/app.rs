@@ -435,6 +435,7 @@ fn render_artifacts(app: &AppState, palette: Palette) -> Paragraph<'static> {
 fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
     let mut lines = Vec::new();
     let mut approval_context_start = None;
+    let wrap_width = transcript_wrap_width(area);
 
     if let Some(session) = app.active_session() {
         let approval_visible = app
@@ -451,9 +452,15 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
 
         for (idx, message) in session.messages.iter().enumerate() {
             let message_start = lines.len();
-            push_message_block(&mut lines, palette, message.role.as_str(), &message.content);
+            push_message_block(
+                &mut lines,
+                palette,
+                message.role.as_str(),
+                &message.content,
+                wrap_width,
+            );
             if let Some(reasoning) = message.reasoning_content.as_deref() {
-                push_message_block(&mut lines, palette, "reasoning", reasoning);
+                push_message_block(&mut lines, palette, "reasoning", reasoning, wrap_width);
             }
             if let Some(tool_call_id) = message.tool_call_id.as_deref() {
                 lines.push(Line::from(vec![
@@ -471,7 +478,7 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
 
             if turn_flow_visible && Some(idx) == latest_user_index {
                 approval_context_start = Some(message_start);
-                push_turn_flow(&mut lines, palette, app, session);
+                push_turn_flow(&mut lines, palette, app, session, wrap_width);
                 turn_flow_rendered = true;
             }
         }
@@ -481,14 +488,14 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
             && let Some(prompt) = latest_user_message(session)
         {
             approval_context_start = Some(lines.len());
-            push_recent_user_context(&mut lines, palette, prompt);
-            push_turn_flow(&mut lines, palette, app, session);
+            push_recent_user_context(&mut lines, palette, prompt, wrap_width);
+            push_turn_flow(&mut lines, palette, app, session, wrap_width);
         } else if !turn_flow_rendered {
-            push_turn_flow(&mut lines, palette, app, session);
+            push_turn_flow(&mut lines, palette, app, session, wrap_width);
         }
 
         if !app.pending_messages.is_empty() {
-            push_pending_messages_block(&mut lines, palette, &app.pending_messages);
+            push_pending_messages_block(&mut lines, palette, &app.pending_messages, wrap_width);
         }
     } else {
         lines.push(Line::from(Span::styled(
@@ -497,7 +504,6 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
         )));
     }
 
-    let wrap_width = transcript_wrap_width(area);
     let visible_height = transcript_visible_height(area);
     let total_rows = transcript_visual_rows(&lines, wrap_width);
     let max_scroll = total_rows.saturating_sub(visible_height);
@@ -626,13 +632,14 @@ fn push_turn_flow(
     palette: Palette,
     app: &AppState,
     session: &SessionView,
+    width: usize,
 ) {
     if let Some(approval) = app.approval.as_ref().filter(|approval| approval.visible) {
         push_inline_approval_card(lines, palette, approval);
     }
 
     if let Some(live_reply) = &session.live_reply {
-        push_live_reply_block(lines, palette, &live_reply.text);
+        push_live_reply_block(lines, palette, &live_reply.text, width);
     }
 
     push_activity_section(lines, palette, app);
@@ -653,15 +660,26 @@ fn live_turn_diff_preview_visible(app: &AppState) -> bool {
         .is_some_and(|(_, active_turn_id)| active_turn_id == diff_turn_id)
 }
 
-fn push_recent_user_context(lines: &mut Vec<Line<'static>>, palette: Palette, content: &str) {
+fn push_recent_user_context(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    content: &str,
+    width: usize,
+) {
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
     let bg = chat_message_bg(palette, "user");
-    push_formatted_body(lines, palette, content, "› ", Some(bg));
+    push_formatted_body(lines, palette, content, "› ", Some(bg), width);
 }
 
-fn push_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, role: &str, content: &str) {
+fn push_message_block(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    role: &str,
+    content: &str,
+    width: usize,
+) {
     if role == "system" {
         return;
     }
@@ -690,22 +708,36 @@ fn push_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, role: &s
         return;
     }
 
-    push_formatted_body_marked(lines, palette, content, indent, prose_marker, Some(bg));
+    push_formatted_body_marked(
+        lines,
+        palette,
+        content,
+        indent,
+        prose_marker,
+        Some(bg),
+        width,
+    );
 }
 
-fn push_live_reply_block(lines: &mut Vec<Line<'static>>, palette: Palette, content: &str) {
+fn push_live_reply_block(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    content: &str,
+    width: usize,
+) {
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
 
     let bg = chat_message_bg(palette, "assistant");
-    push_formatted_body_marked(lines, palette, content, "", Some("• "), Some(bg));
+    push_formatted_body_marked(lines, palette, content, "", Some("• "), Some(bg), width);
 }
 
 fn push_pending_messages_block(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
     pending: &[String],
+    width: usize,
 ) {
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
@@ -731,7 +763,7 @@ fn push_pending_messages_block(
     ));
 
     for pending in pending.iter().take(3) {
-        push_formatted_body(lines, palette, pending, "› ", Some(bg));
+        push_formatted_body(lines, palette, pending, "› ", Some(bg), width);
     }
 
     if pending.len() > 3 {
@@ -761,8 +793,9 @@ fn push_formatted_body(
     content: &str,
     indent: &'static str,
     bg: Option<Color>,
+    width: usize,
 ) {
-    push_formatted_body_marked(lines, palette, content, indent, None, bg);
+    push_formatted_body_marked(lines, palette, content, indent, None, bg, width);
 }
 
 fn push_formatted_body_marked(
@@ -772,6 +805,7 @@ fn push_formatted_body_marked(
     indent: &'static str,
     prose_marker: Option<&'static str>,
     bg: Option<Color>,
+    width: usize,
 ) {
     let mut in_code = false;
     let mut last_blank = false;
@@ -784,7 +818,7 @@ fn push_formatted_body_marked(
         let line = if in_code { raw_line } else { raw_line.trim() };
         if let Some(rest) = line.trim_start().strip_prefix("```") {
             flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
-            flush_markdown_table(lines, palette, &mut table, indent, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             if in_code {
                 in_code = false;
                 lines.push(chat_line(
@@ -816,7 +850,7 @@ fn push_formatted_body_marked(
         }
 
         if in_code {
-            flush_markdown_table(lines, palette, &mut table, indent, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             lines.push(chat_line(
                 vec![
                     Span::styled(indent, style_bg(palette.border(), bg)),
@@ -834,7 +868,7 @@ fn push_formatted_body_marked(
 
         if line.is_empty() {
             flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
-            flush_markdown_table(lines, palette, &mut table, indent, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             checkbox_index = 1;
             if !last_blank && !lines.is_empty() {
                 lines.push(chat_line(
@@ -849,7 +883,7 @@ fn push_formatted_body_marked(
 
         if let Some(command) = shell_command_from_line(line) {
             flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
-            flush_markdown_table(lines, palette, &mut table, indent, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             push_command_row(lines, palette, indent, command);
             continue;
         }
@@ -867,7 +901,7 @@ fn push_formatted_body_marked(
 
         if let Some(heading) = markdown_heading(line) {
             flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
-            flush_markdown_table(lines, palette, &mut table, indent, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             let mut spans = vec![Span::styled(indent, style_bg(palette.border(), bg))];
             spans.extend(inline_markdown_spans(
                 heading,
@@ -881,7 +915,7 @@ fn push_formatted_body_marked(
 
         if let Some((_checked, text)) = markdown_checkbox(line) {
             flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
-            flush_markdown_table(lines, palette, &mut table, indent, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             let mut spans = vec![
                 Span::styled(indent, style_bg(palette.border(), bg)),
                 Span::styled(
@@ -902,7 +936,7 @@ fn push_formatted_body_marked(
 
         if let Some(text) = markdown_bullet(line) {
             flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
-            flush_markdown_table(lines, palette, &mut table, indent, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             let mut spans = vec![
                 Span::styled(indent, style_bg(palette.border(), bg)),
                 Span::styled("- ", style_bg(palette.selected(), bg)),
@@ -919,7 +953,7 @@ fn push_formatted_body_marked(
 
         if let Some((number, text)) = markdown_numbered(line) {
             flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
-            flush_markdown_table(lines, palette, &mut table, indent, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             let mut spans = vec![
                 Span::styled(indent, style_bg(palette.border(), bg)),
                 Span::styled(format!("{number}. "), style_bg(palette.selected(), bg)),
@@ -936,7 +970,7 @@ fn push_formatted_body_marked(
 
         if let Some(text) = markdown_blockquote(line) {
             flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
-            flush_markdown_table(lines, palette, &mut table, indent, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             // Render as a quoted line with a left bar + muted italics, instead of
             // leaking the literal `>` marker into prose.
             let mut spans = vec![
@@ -953,12 +987,12 @@ fn push_formatted_body_marked(
             continue;
         }
 
-        flush_markdown_table(lines, palette, &mut table, indent, bg);
+        flush_markdown_table(lines, palette, &mut table, indent, bg, width);
         prose.push(line.to_string());
     }
 
     flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
-    flush_markdown_table(lines, palette, &mut table, indent, bg);
+    flush_markdown_table(lines, palette, &mut table, indent, bg, width);
 }
 
 fn flush_prose_paragraph(
@@ -988,69 +1022,163 @@ fn flush_prose_paragraph(
     prose.clear();
 }
 
+/// Minimum width a table column is allowed to shrink to (room for `…`).
+const MIN_TABLE_COL: usize = 3;
+
 fn flush_markdown_table(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
     table: &mut Vec<Vec<String>>,
     indent: &'static str,
     bg: Option<Color>,
+    width: usize,
 ) {
     if table.is_empty() {
         return;
     }
-
     let col_count = table.iter().map(Vec::len).max().unwrap_or(0);
-    let mut widths = vec![0; col_count];
+    if col_count == 0 {
+        table.clear();
+        return;
+    }
+
+    // Natural (display-width) column sizes.
+    let mut widths = vec![0usize; col_count];
     for row in table.iter() {
         for (idx, cell) in row.iter().enumerate() {
             widths[idx] = widths[idx].max(table_cell_width(cell));
         }
     }
 
+    // Fit within the pane: a bordered row is `│ c1 │ c2 │ … │`, so the
+    // borders/padding cost 3*cols + 1 columns on top of the cell content.
+    // Shrink the widest columns (cells get ellipsized) so the grid never wraps.
+    let overhead = 3 * col_count + 1;
+    let budget = width.saturating_sub(indent.width() + overhead);
+    let mut current: usize = widths.iter().sum();
+    while current > budget {
+        let max_w = widths.iter().copied().max().unwrap_or(0);
+        if max_w <= MIN_TABLE_COL {
+            break;
+        }
+        if let Some(idx) = widths.iter().position(|w| *w == max_w) {
+            widths[idx] -= 1;
+            current -= 1;
+        } else {
+            break;
+        }
+    }
+
+    let border = style_bg(palette.border(), bg);
+    let bold = style_bg(palette.title().add_modifier(Modifier::BOLD), bg);
+    let code = style_bg(palette.selected(), bg);
+    let has_header = table.len() > 1;
+
+    lines.push(table_border_line(
+        indent, &widths, '┌', '┬', '┐', border, bg,
+    ));
     for (row_idx, row) in table.iter().enumerate() {
-        let header = row_idx == 0 && table.len() > 1;
-        let normal_style = if header {
-            style_bg(palette.title().add_modifier(Modifier::BOLD), bg)
+        let header = has_header && row_idx == 0;
+        let cell_style = if header {
+            bold
         } else {
             style_bg(palette.text(), bg)
         };
-        let mut spans = vec![Span::styled(indent, style_bg(palette.border(), bg))];
-        for (idx, width) in widths.iter().enumerate() {
-            if idx > 0 {
-                spans.push(Span::styled(" | ", style_bg(palette.muted(), bg)));
-            }
+        let mut spans = vec![Span::styled(indent, border), Span::styled("│", border)];
+        for (idx, w) in widths.iter().enumerate() {
             let cell = row.get(idx).map(String::as_str).unwrap_or("");
-            spans.extend(inline_markdown_spans(
-                cell,
-                normal_style,
-                style_bg(palette.title().add_modifier(Modifier::BOLD), bg),
-                style_bg(palette.selected(), bg),
+            let (cell_spans, used) = fit_cell_spans(cell, *w, cell_style, bold, code);
+            spans.push(Span::styled(" ", cell_style));
+            spans.extend(cell_spans);
+            spans.push(Span::styled(
+                " ".repeat(w.saturating_sub(used) + 1),
+                cell_style,
             ));
-            let padding = width.saturating_sub(table_cell_width(cell));
-            if padding > 0 {
-                spans.push(Span::styled(" ".repeat(padding), normal_style));
-            }
+            spans.push(Span::styled("│", border));
         }
         lines.push(chat_line(spans, bg));
-
         if header {
-            let mut separator = String::new();
-            for (idx, width) in widths.iter().enumerate() {
-                if idx > 0 {
-                    separator.push_str("-+-");
-                }
-                separator.push_str(&"-".repeat((*width).max(3)));
-            }
-            lines.push(chat_line(
-                vec![
-                    Span::styled(indent, style_bg(palette.border(), bg)),
-                    Span::styled(separator, style_bg(palette.muted(), bg)),
-                ],
-                bg,
+            lines.push(table_border_line(
+                indent, &widths, '├', '┼', '┤', border, bg,
             ));
         }
     }
+    lines.push(table_border_line(
+        indent, &widths, '└', '┴', '┘', border, bg,
+    ));
     table.clear();
+}
+
+fn table_border_line(
+    indent: &'static str,
+    widths: &[usize],
+    left: char,
+    mid: char,
+    right: char,
+    border: Style,
+    bg: Option<Color>,
+) -> Line<'static> {
+    let mut s = String::new();
+    s.push(left);
+    for (idx, w) in widths.iter().enumerate() {
+        if idx > 0 {
+            s.push(mid);
+        }
+        for _ in 0..(w + 2) {
+            s.push('─');
+        }
+    }
+    s.push(right);
+    chat_line(
+        vec![Span::styled(indent, border), Span::styled(s, border)],
+        bg,
+    )
+}
+
+/// Render an inline-markdown table cell as styled spans, truncating to `max_w`
+/// display columns (with an `…`) so the bordered grid stays aligned. Returns the
+/// spans and the display width they occupy (`<= max_w`).
+fn fit_cell_spans(
+    cell: &str,
+    max_w: usize,
+    normal: Style,
+    bold: Style,
+    code: Style,
+) -> (Vec<Span<'static>>, usize) {
+    let spans = inline_markdown_spans(cell, normal, bold, code);
+    let total: usize = spans.iter().map(|span| span.content.as_ref().width()).sum();
+    if total <= max_w {
+        return (spans, total);
+    }
+    if max_w == 0 {
+        return (Vec::new(), 0);
+    }
+    let budget = max_w - 1; // leave room for the ellipsis
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        let span_w = span.content.as_ref().width();
+        if used + span_w <= budget {
+            used += span_w;
+            out.push(span);
+        } else {
+            let mut clipped = String::new();
+            for ch in span.content.chars() {
+                let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if used + ch_w > budget {
+                    break;
+                }
+                clipped.push(ch);
+                used += ch_w;
+            }
+            if !clipped.is_empty() {
+                out.push(Span::styled(clipped, span.style));
+            }
+            break;
+        }
+    }
+    out.push(Span::styled("…", normal));
+    (out, used + 1)
 }
 
 fn table_cell_width(cell: &str) -> usize {
@@ -4429,7 +4557,10 @@ mod tests {
                 .is_some_and(|idx| idx < prose.find("First paragraph").unwrap())
         );
         assert_eq!(bullet.find("- "), Some(0));
-        assert_eq!(table.find("Page"), Some(0));
+        // The table is now drawn as a real bordered grid, so its rows start with
+        // the box border rather than the raw cell text — still no marker leakage.
+        assert!(table.starts_with("│"));
+        assert!(table.contains("Page"));
         assert!(!text.contains("|---|---|"));
         assert!(!text.contains("**Either**"));
         assert!(!text.contains("`Hero`"));
@@ -4522,7 +4653,7 @@ mod tests {
         assert!(text.contains("Renderer"));
         assert!(text.contains("layout"));
         assert!(!text.contains("|---|---|"));
-        assert!(text.contains(" | "));
+        assert!(text.contains("│"));
         let bold_style = style_for_text(&buffer, "Renderer").expect("bold cell style");
         let code_style = style_for_text(&buffer, "layout").expect("inline code style");
         assert!(bold_style.add_modifier.contains(Modifier::BOLD));
@@ -4556,10 +4687,65 @@ mod tests {
         assert!(header.contains("File"));
         assert!(header.contains("Problem"));
         assert!(header.contains("Fix"));
-        assert!(header.contains(" | "));
+        assert!(header.contains("│"));
         assert!(hero.contains("Hero.astro"));
-        assert!(hero.contains(" | "));
+        assert!(hero.contains("│"));
         assert!(!rows.join("\n").contains("|---|---|---|"));
+    }
+
+    #[test]
+    fn render_markdown_table_draws_box_borders() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("| A | B |\n|---|---|\n| x | y |")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let buffer = rendered_buffer(&app, Palette::for_theme(ThemeName::Codex));
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for ch in ["┌", "┬", "┐", "│", "├", "┼", "┤", "└", "┴", "┘"] {
+            assert!(text.contains(ch), "bordered table missing `{ch}`");
+        }
+        // The old dashed header separator is gone (box-drawing replaces it).
+        assert!(!text.contains("-+-"));
+    }
+
+    #[test]
+    fn render_markdown_table_fits_and_truncates_on_narrow_width() {
+        let wide = "| Column One | Column Two | Column Three |\n|---|---|---|\n| a very long first cell value | another long-ish value | a third long cell value |";
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant(wide)],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Codex), 44, 30);
+        let text = rendered_rows(&buffer).join("\n");
+        // Still a bordered grid, but cells are ellipsized to fit the narrow pane.
+        assert!(text.contains("┌"));
+        assert!(text.contains("└"));
+        assert!(text.contains("│"));
+        assert!(text.contains("…"), "wide cells should be truncated to fit");
     }
 
     #[test]
@@ -5338,7 +5524,14 @@ mod tests {
         let content = format!("```rust\n{long_code}\n```");
         let mut lines = Vec::new();
 
-        push_formatted_body(&mut lines, palette, &content, "", Some(palette.surface));
+        push_formatted_body(
+            &mut lines,
+            palette,
+            &content,
+            "",
+            Some(palette.surface),
+            120,
+        );
 
         let text = lines
             .iter()
