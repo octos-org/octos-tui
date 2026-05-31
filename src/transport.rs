@@ -14,8 +14,9 @@ use octos_core::ui_protocol::{
     PermissionProfileSetResult, PreviewId, SessionOpenParams, SessionOpenResult, SessionOpened,
     TaskArtifactReadResult, TaskOutputDeltaEvent, TaskOutputReadResult, TaskRuntimeState,
     TaskUpdatedEvent, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
-    ToolStartedEvent, TurnCompletedEvent, TurnId, TurnStartedEvent, UiCursor, UiNotification,
-    UiPaneSnapshot, UiProtocolCapabilities, WarningEvent, approval_kinds, methods, rpc_error_codes,
+    ToolStartedEvent, TurnCompletedEvent, TurnId, TurnStartedEvent, TurnStateGetResult, UiCursor,
+    UiNotification, UiPaneSnapshot, UiProtocolCapabilities, WarningEvent, approval_kinds, methods,
+    rpc_error_codes,
 };
 use octos_core::ui_protocol::{
     JSON_RPC_VERSION, MAX_TEXT_FRAME_BYTES, RpcRequest, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
@@ -1027,6 +1028,7 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ReadTaskOutput(_)
                 | AppUiCommand::ReadTaskArtifact(_)
                 | AppUiCommand::GetThreadGraph(_)
+                | AppUiCommand::GetTurnState(_)
                 | AppUiCommand::AuthStatus(_)
                 | AppUiCommand::AuthMe(_)
                 | AppUiCommand::ProfileLlmCatalog(_)
@@ -1540,6 +1542,7 @@ fn rpc_request_from_command(
         AppUiCommand::ReadTaskOutput(params) => serde_json::to_value(params),
         AppUiCommand::ReadTaskArtifact(params) => serde_json::to_value(params),
         AppUiCommand::GetThreadGraph(params) => serde_json::to_value(params),
+        AppUiCommand::GetTurnState(params) => serde_json::to_value(params),
         AppUiCommand::AuthStatus(params) => serde_json::to_value(params),
         AppUiCommand::AuthSendCode(params) => serde_json::to_value(params),
         AppUiCommand::AuthVerify(params) => serde_json::to_value(params),
@@ -2043,6 +2046,10 @@ fn success_response_to_app_event(
         methods::THREAD_GRAPH_GET => match serde_json::from_value::<ThreadGraphGetResult>(result) {
             Ok(result) => Ok(Some(autonomy_event(AutonomyResult::ThreadGraph(result)))),
             Err(err) => Ok(Some(autonomy_decode_error(methods::THREAD_GRAPH_GET, err))),
+        },
+        methods::TURN_STATE_GET => match serde_json::from_value::<TurnStateGetResult>(result) {
+            Ok(result) => Ok(Some(autonomy_event(AutonomyResult::TurnState(result)))),
+            Err(err) => Ok(Some(autonomy_decode_error(methods::TURN_STATE_GET, err))),
         },
         methods::TURN_INTERRUPT => Ok(Some(
             AppUiEvent::Status(AppUiStatus {
@@ -3580,6 +3587,9 @@ impl AppUiBackend for MockAppUiBackend {
             AppUiCommand::GetThreadGraph(_) => Err(eyre!(
                 "mock app-ui backend does not implement thread graph reads yet"
             )),
+            AppUiCommand::GetTurnState(_) => Err(eyre!(
+                "mock app-ui backend does not implement turn state reads yet"
+            )),
             _ => Err(eyre!(
                 "mock app-ui backend does not implement unsupported command {method} yet"
             )),
@@ -4116,8 +4126,8 @@ mod tests {
         InputItem, PermissionNetworkPolicy, PermissionProfileListParams, PermissionProfileMode,
         PermissionProfileSetParams, PermissionProfileUpdate, PreviewId, SessionOpenParams,
         TaskArtifactReadParams, TaskCancelParams, TaskListParams, TaskOutputReadParams,
-        TaskRestartFromNodeParams, ThreadGraphGetParams, TurnInterruptParams, TurnStartParams,
-        UiCursor,
+        TaskRestartFromNodeParams, ThreadGraphGetParams, TurnInterruptParams, TurnLifecycleState,
+        TurnStartParams, TurnStateGetParams, UiCursor,
     };
     use serde_json::json;
     use std::{
@@ -4529,6 +4539,63 @@ mod tests {
         );
         assert_eq!(result.threads[0].thread_id, "thread-1");
         assert_eq!(result.orphans, vec![99]);
+    }
+
+    #[test]
+    fn protocol_command_serializes_turn_state_get() {
+        let turn_id = TurnId::new();
+        let request = rpc_request_from_command(
+            "tui-13".into(),
+            AppUiCommand::GetTurnState(TurnStateGetParams {
+                session_id: SessionKey("local:test".into()),
+                turn_id: turn_id.clone(),
+            }),
+        )
+        .expect("request encodes");
+
+        assert_eq!(request.jsonrpc, "2.0");
+        assert_eq!(request.method, methods::TURN_STATE_GET);
+        assert_eq!(request.params["session_id"], "local:test");
+        assert_eq!(request.params["turn_id"], turn_id.0.to_string());
+    }
+
+    #[test]
+    fn protocol_decodes_turn_state_result() {
+        let mut exchange = ProtocolExchange::default();
+        let turn_id = TurnId::new();
+        let request = exchange
+            .build_tracked_request(AppUiCommand::GetTurnState(TurnStateGetParams {
+                session_id: SessionKey("local:test".into()),
+                turn_id: turn_id.clone(),
+            }))
+            .expect("tracked request");
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": {
+                "session_id": "local:test",
+                "turn_id": turn_id,
+                "state": "active",
+                "thread_id": "thread-1",
+                "committed_seqs": [1, 2]
+            }
+        });
+
+        let event = exchange
+            .decode_rpc_text(&response.to_string())
+            .expect("response decodes")
+            .expect("event");
+
+        let ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::TurnState(result),
+        }) = event
+        else {
+            panic!("expected turn state event");
+        };
+        assert_eq!(result.turn_id, turn_id);
+        assert_eq!(result.state, TurnLifecycleState::Active);
+        assert_eq!(result.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(result.committed_seqs, vec![1, 2]);
     }
 
     #[test]
@@ -4983,6 +5050,14 @@ mod tests {
             AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
                 session_id: session_id.clone(),
                 preview_id: PreviewId::new(),
+            }),
+            AppUiCommand::GetThreadGraph(ThreadGraphGetParams {
+                session_id: session_id.clone(),
+                at: None,
+            }),
+            AppUiCommand::GetTurnState(TurnStateGetParams {
+                session_id: session_id.clone(),
+                turn_id: TurnId::new(),
             }),
             AppUiCommand::ReadTaskOutput(TaskOutputReadParams {
                 session_id: session_id.clone(),

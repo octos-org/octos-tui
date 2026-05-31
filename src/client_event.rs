@@ -1,7 +1,10 @@
 use octos_core::{
     SessionKey,
     app_ui::AppUiEvent,
-    ui_protocol::{PermissionProfileSelection, TaskArtifactReadResult, ThreadGraphGetResult},
+    ui_protocol::{
+        PermissionProfileSelection, TaskArtifactReadResult, ThreadGraphGetResult,
+        TurnStateGetResult,
+    },
 };
 
 use crate::model::{
@@ -207,6 +210,7 @@ pub enum AutonomyResult {
     AgentArtifactRead(AgentArtifactReadResult),
     TaskArtifactRead(TaskArtifactReadResult),
     ThreadGraph(ThreadGraphGetResult),
+    TurnState(TurnStateGetResult),
     AgentInterrupt(AgentInterruptResult),
     AgentClose(AgentCloseResult),
     GoalGet(SessionGoalGetResult),

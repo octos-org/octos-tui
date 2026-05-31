@@ -7,8 +7,8 @@ use octos_core::ui_protocol::{
     PermissionProfileListParams, PermissionProfileSelection, PermissionProfileSetParams, PreviewId,
     TaskArtifactReadParams, TaskCancelParams, TaskListParams, TaskOutputReadParams,
     TaskRestartFromNodeParams, TaskRuntimeState, ThreadGraphGetParams, ThreadGraphGetResult,
-    TurnId, TurnInterruptParams, TurnStartParams, UiPaneSnapshot, UiProtocolCapabilities,
-    approval_scopes,
+    TurnId, TurnInterruptParams, TurnStartParams, TurnStateGetParams, TurnStateGetResult,
+    UiPaneSnapshot, UiProtocolCapabilities, approval_scopes,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -143,6 +143,10 @@ pub const APPUI_METHOD_CONTEXT_NORMALIZATION_REPORTED: &str = "context/normaliza
 /// UPCR-2026-010 thread graph read surface (`state.thread_graph.v1`).
 pub const APPUI_FEATURE_THREAD_GRAPH_V1: &str = "state.thread_graph.v1";
 pub const APPUI_METHOD_THREAD_GRAPH_GET: &str = "thread/graph/get";
+
+/// UPCR-2026-011 turn lifecycle state read surface.
+pub const APPUI_FEATURE_TURN_STATE_GET_V1: &str = "state.turn_state_get.v1";
+pub const APPUI_METHOD_TURN_STATE_GET: &str = "turn/state/get";
 
 /// M15-E required capability flag for backend-owned agent inspection /
 /// goal / loop UX (`coding.autonomy.v1`). When absent, the TUI must
@@ -590,6 +594,7 @@ pub enum AppUiCommand {
     ReadTaskOutput(TaskOutputReadParams),
     ReadTaskArtifact(TaskArtifactReadParams),
     GetThreadGraph(ThreadGraphGetParams),
+    GetTurnState(TurnStateGetParams),
     ListConfigCapabilities(ConfigCapabilitiesListParams),
     ReadSessionStatus(SessionStatusReadParams),
     ListModels(ModelListParams),
@@ -661,6 +666,7 @@ impl AppUiCommand {
             Self::ReadTaskOutput(_) => octos_core::ui_protocol::methods::TASK_OUTPUT_READ,
             Self::ReadTaskArtifact(_) => APPUI_METHOD_TASK_ARTIFACT_READ,
             Self::GetThreadGraph(_) => APPUI_METHOD_THREAD_GRAPH_GET,
+            Self::GetTurnState(_) => APPUI_METHOD_TURN_STATE_GET,
             Self::ListConfigCapabilities(_) => APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
             Self::ReadSessionStatus(_) => APPUI_METHOD_SESSION_STATUS_READ,
             Self::ListModels(_) | Self::ProfileLlmList(_) => APPUI_METHOD_MODEL_LIST,
@@ -3001,6 +3007,7 @@ pub struct AppState {
     pub task_output: TaskOutputDetailState,
     pub artifact_detail: ArtifactDetailState,
     pub thread_graph_detail: ThreadGraphDetailState,
+    pub turn_state_detail: TurnStateDetailState,
     pub task_output_cursors: Vec<TaskOutputCursor>,
     pub diff_preview: DiffPreviewPaneState,
     pub activity: Vec<ActivityItem>,
@@ -3540,6 +3547,72 @@ fn thread_graph_content(result: &ThreadGraphGetResult) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         lines.push(format!("Orphans: {orphans}"));
+    }
+    lines.join("\n")
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnStateDetailState {
+    pub active: bool,
+    pub title: String,
+    pub subtitle: String,
+    pub content: String,
+    pub scroll: usize,
+}
+
+impl TurnStateDetailState {
+    pub fn open(&mut self, result: &TurnStateGetResult) {
+        self.active = true;
+        self.title = "Turn State".into();
+        self.subtitle = format!("turn {}", result.turn_id.0);
+        self.content = turn_state_content(result);
+        self.scroll = 0;
+    }
+
+    pub fn close(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_sub(lines);
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_add(lines);
+    }
+}
+
+fn turn_state_content(result: &TurnStateGetResult) -> String {
+    let mut lines = vec![format!("state: {}", result.state.as_str())];
+    if let Some(thread_id) = result.thread_id.as_deref() {
+        lines.push(format!("thread: {thread_id}"));
+    }
+    if let Some(started_at) = result.started_at.as_ref() {
+        lines.push(format!("started: {started_at}"));
+    }
+    if let Some(completed_at) = result.completed_at.as_ref() {
+        lines.push(format!("completed: {completed_at}"));
+    }
+    if !result.committed_seqs.is_empty() {
+        let seqs = result
+            .committed_seqs
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("committed seqs: {seqs}"));
+    }
+    if let Some(context_state) = &result.context_state {
+        lines.push(format!(
+            "context: generation {} | {} items | {} tokens | {}",
+            context_state.generation,
+            context_state.item_count,
+            context_state.token_estimate,
+            context_state.recovery_state
+        ));
+    }
+    if let Some(context) = &result.context {
+        lines.push(format!("context payload: {context}"));
     }
     lines.join("\n")
 }
@@ -4220,6 +4293,7 @@ impl AppState {
             task_output: TaskOutputDetailState::default(),
             artifact_detail: ArtifactDetailState::default(),
             thread_graph_detail: ThreadGraphDetailState::default(),
+            turn_state_detail: TurnStateDetailState::default(),
             task_output_cursors: Vec::new(),
             diff_preview: DiffPreviewPaneState::default(),
             activity: Vec::new(),

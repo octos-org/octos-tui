@@ -15,7 +15,8 @@ use crate::{
         ActivityItem, ActivityKind, AppState, ApprovalModalState, ArtifactDetailState,
         ComposerPresentation, DiffPreviewPaneState, FocusPane, PlanStep as RenderedPlanStep,
         SessionAutonomyState, SessionRunState, SessionView, TaskOutputDetailState,
-        ThreadGraphDetailState, TurnActivityLog, extract_plan_steps, task_state_label,
+        ThreadGraphDetailState, TurnActivityLog, TurnStateDetailState, extract_plan_steps,
+        task_state_label,
     },
     theme::Palette,
 };
@@ -35,6 +36,9 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
     }
     if app.thread_graph_detail.active {
         render_thread_graph_detail_modal(frame, &app.thread_graph_detail, palette);
+    }
+    if app.turn_state_detail.active {
+        render_turn_state_detail_modal(frame, &app.turn_state_detail, palette);
     }
 }
 
@@ -3331,6 +3335,41 @@ fn render_thread_graph_detail_modal(
     frame.render_widget(pane, area);
 }
 
+fn render_turn_state_detail_modal(
+    frame: &mut Frame<'_>,
+    turn: &TurnStateDetailState,
+    palette: Palette,
+) {
+    let area = centered_rect(82, 68, frame.area());
+    let mut lines = vec![
+        Line::from(Span::styled(turn.title.clone(), palette.title())),
+        Line::from(Span::styled(turn.subtitle.clone(), palette.muted())),
+        Line::from(""),
+    ];
+
+    lines.extend(
+        turn.content
+            .lines()
+            .map(|line| Line::from(Span::styled(line.to_string(), palette.text()))),
+    );
+
+    let visible_height = usize::from(area.height.saturating_sub(2)).max(1);
+    let max_scroll = lines.len().saturating_sub(visible_height);
+    let scroll_from_bottom = turn.scroll.min(max_scroll);
+    let scroll_top = max_scroll.saturating_sub(scroll_from_bottom) as u16;
+
+    let pane = Paragraph::new(Text::from(lines))
+        .block(
+            titled_block("Turn", palette, true, Some("PgUp/PgDn | Esc close"))
+                .border_style(palette.selected()),
+        )
+        .scroll((scroll_top, 0))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(pane, area);
+}
+
 fn diff_line_sign(kind: &str) -> &'static str {
     match kind {
         "added" => "+",
@@ -3674,6 +3713,39 @@ mod tests {
         assert!(text.contains("Thread Graph"));
         assert!(text.contains("thread-1"));
         assert!(text.contains("root seq 1"));
+    }
+
+    #[test]
+    fn render_turn_state_detail_modal_shows_lifecycle() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::system("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_state_detail = crate::model::TurnStateDetailState {
+            active: true,
+            title: "Turn State".into(),
+            subtitle: "turn 00000000-0000-0000-0000-000000000011".into(),
+            content: "state: active\nthread: thread-1\ncommitted seqs: 1, 2".into(),
+            scroll: 0,
+        };
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("Turn"));
+        assert!(text.contains("Turn State"));
+        assert!(text.contains("state: active"));
+        assert!(text.contains("thread-1"));
+        assert!(text.contains("committed seqs"));
     }
 
     #[test]

@@ -5,7 +5,8 @@ use octos_core::ui_protocol::{
     InputItem, MessageDeltaEvent, MessagePersistedEvent, Payload, ReplayLossyEvent,
     SessionOpenParams, TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams,
     TaskRuntimeState, TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent,
-    TurnId, TurnInterruptParams, TurnStartParams, UiNotification, UiProgressEvent,
+    TurnId, TurnInterruptParams, TurnStartParams, TurnStateGetParams, UiNotification,
+    UiProgressEvent,
 };
 use octos_core::{Message, MessageRole, SessionKey, TaskId, ThreadId};
 use serde_json::Value;
@@ -304,6 +305,9 @@ impl Store {
             Ok(Some(crate::autonomy::AutonomyCommand::Thread(cmd))) => {
                 self.dispatch_thread_command(cmd)
             }
+            Ok(Some(crate::autonomy::AutonomyCommand::Turn(cmd))) => {
+                self.dispatch_turn_command(cmd)
+            }
             Ok(Some(crate::autonomy::AutonomyCommand::Goal(cmd))) => {
                 self.dispatch_goal_command(cmd)
             }
@@ -380,6 +384,44 @@ impl Store {
                 Some(AppUiCommand::GetThreadGraph(ThreadGraphGetParams {
                     session_id,
                     at: None,
+                }))
+            }
+        }
+    }
+
+    fn dispatch_turn_command(&mut self, cmd: crate::autonomy::TurnCommand) -> Option<AppUiCommand> {
+        use crate::autonomy::TurnCommand;
+        let session_id = self.active_autonomy_session_id()?;
+        match cmd {
+            TurnCommand::State(turn_id_raw) => {
+                if !self.require_appui_feature(crate::model::APPUI_FEATURE_TURN_STATE_GET_V1) {
+                    return None;
+                }
+                if !self.require_appui_method(crate::model::APPUI_METHOD_TURN_STATE_GET) {
+                    return None;
+                }
+                let turn_id = match turn_id_raw {
+                    Some(raw) => match serde_json::from_value::<TurnId>(Value::String(raw.clone()))
+                    {
+                        Ok(turn_id) => turn_id,
+                        Err(_) => {
+                            self.state.status = format!("Invalid turn id `{raw}`");
+                            return None;
+                        }
+                    },
+                    None => match self.state.active_turn().map(|(_, turn_id)| turn_id.clone()) {
+                        Some(turn_id) => turn_id,
+                        None => {
+                            self.state.status = "No active turn to inspect".into();
+                            return None;
+                        }
+                    },
+                };
+                self.state.status =
+                    format!("Reading turn state {}", short_id(&turn_id.0.to_string()));
+                Some(AppUiCommand::GetTurnState(TurnStateGetParams {
+                    session_id,
+                    turn_id,
                 }))
             }
         }
@@ -662,7 +704,7 @@ impl Store {
             Some(session) => Some(session.id.clone()),
             None => {
                 self.state.status =
-                    "No coding session open. Run /onboard open-session before /agents, /goal, or /loop."
+                    "No coding session open. Run /onboard open-session before runtime commands."
                         .into();
                 self.state.focus = FocusPane::Composer;
                 None
@@ -3096,6 +3138,12 @@ impl Store {
             return true;
         }
 
+        if self.state.turn_state_detail.active {
+            self.state.turn_state_detail.close();
+            self.state.status = "Closed turn state".into();
+            return true;
+        }
+
         if self.state.diff_preview.active {
             self.state.diff_preview.close();
             self.state.status = "Closed inline diff preview".into();
@@ -3431,6 +3479,14 @@ impl Store {
                 let count = result.threads.len();
                 self.state.thread_graph_detail.open(&result);
                 self.state.status = format!("Thread graph loaded: {count} thread(s)");
+            }
+            AutonomyResult::TurnState(result) => {
+                let state = result.state.as_str();
+                self.state.turn_state_detail.open(&result);
+                self.state.status = format!(
+                    "Turn {} state: {state}",
+                    short_id(&result.turn_id.0.to_string())
+                );
             }
             AutonomyResult::AgentInterrupt(result) => {
                 if let Some(agent) = result.agent.clone() {
@@ -6106,9 +6162,9 @@ mod tests {
         ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalDecision,
         ApprovalDiffDetails, ApprovalId, ApprovalRequestedEvent, ApprovalTypedDetails, Envelope,
         EnvelopeNotification, OutputCursor, Payload, PreviewId, ReplayLossyEvent, TaskRuntimeState,
-        ToolCompletedEvent, ToolStartedEvent, TurnId, UiCursor, UiFileMutationNotice,
-        UiProgressMetadata, UiProtocolCapabilities, UiTokenCostUpdate, approval_kinds,
-        approval_scopes, methods, progress_kinds,
+        ToolCompletedEvent, ToolStartedEvent, TurnId, TurnLifecycleState, UiCursor,
+        UiFileMutationNotice, UiProgressMetadata, UiProtocolCapabilities, UiTokenCostUpdate,
+        approval_kinds, approval_scopes, methods, progress_kinds,
     };
 
     fn store_with_live_reply(turn_id: TurnId, text: impl Into<String>) -> Store {
@@ -10980,6 +11036,7 @@ mod tests {
                 crate::model::APPUI_METHOD_AGENT_ARTIFACT_READ,
                 crate::model::APPUI_METHOD_TASK_ARTIFACT_READ,
                 crate::model::APPUI_METHOD_THREAD_GRAPH_GET,
+                crate::model::APPUI_METHOD_TURN_STATE_GET,
                 crate::model::APPUI_METHOD_AGENT_INTERRUPT,
                 crate::model::APPUI_METHOD_AGENT_CLOSE,
                 crate::model::APPUI_METHOD_SESSION_GOAL_GET,
@@ -10996,6 +11053,7 @@ mod tests {
                 crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1,
                 crate::model::APPUI_FEATURE_TASK_ARTIFACTS_V1,
                 crate::model::APPUI_FEATURE_THREAD_GRAPH_V1,
+                crate::model::APPUI_FEATURE_TURN_STATE_GET_V1,
             ],
         ));
         store
@@ -11176,6 +11234,58 @@ mod tests {
                 .state
                 .status
                 .contains(crate::model::APPUI_FEATURE_THREAD_GRAPH_V1)
+        );
+    }
+
+    #[test]
+    fn turn_state_dispatches_active_turn_state_get() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "working");
+        store.state.target = Some("ws://example.test/ui-protocol".into());
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [crate::model::APPUI_METHOD_TURN_STATE_GET],
+            [crate::model::APPUI_FEATURE_TURN_STATE_GET_V1],
+        ));
+        store.state.composer = "/turn state".into();
+
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::GetTurnState(params) => {
+                assert_eq!(params.session_id, SessionKey("local:test".into()));
+                assert_eq!(params.turn_id, turn_id);
+            }
+            other => panic!("expected GetTurnState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_state_dispatches_explicit_turn_id() {
+        let mut store = protocol_store_with_autonomy();
+        let turn_id = "00000000-0000-0000-0000-000000000011";
+        store.state.composer = format!("/turn state {turn_id}");
+
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::GetTurnState(params) => {
+                assert_eq!(params.session_id, SessionKey("local:test".into()));
+                assert_eq!(params.turn_id.0.to_string(), turn_id);
+            }
+            other => panic!("expected GetTurnState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_state_requires_turn_state_feature() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_TURN_STATE_GET,
+        ]));
+        store.state.composer = "/turn state 00000000-0000-0000-0000-000000000011".into();
+
+        assert!(store.compose_command().is_none());
+        assert!(
+            store
+                .state
+                .status
+                .contains(crate::model::APPUI_FEATURE_TURN_STATE_GET_V1)
         );
     }
 
@@ -12202,6 +12312,75 @@ mod tests {
                 .contains("Orphans: 99")
         );
         assert_eq!(store.state.status, "Thread graph loaded: 1 thread(s)");
+    }
+
+    #[test]
+    fn autonomy_turn_state_opens_detail_modal() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        use octos_core::ui_protocol::{TurnStateGetResult, UiContextState};
+
+        let mut store = protocol_store_with_autonomy();
+        let turn_id = TurnId::new();
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::TurnState(TurnStateGetResult {
+                session_id: SessionKey("local:test".into()),
+                turn_id: turn_id.clone(),
+                state: TurnLifecycleState::Active,
+                context: Some(serde_json::json!({"phase": "planning"})),
+                context_state: Some(UiContextState {
+                    session_id: SessionKey("local:test".into()),
+                    thread_id: Some("thread-1".into()),
+                    generation: 3,
+                    transcript_hash: "abc123".into(),
+                    item_count: 4,
+                    token_estimate: 512,
+                    recovery_state: "ready".into(),
+                    last_checkpoint_id: None,
+                    last_compaction_id: None,
+                }),
+                started_at: None,
+                completed_at: None,
+                thread_id: Some("thread-1".into()),
+                committed_seqs: vec![1, 2],
+            }),
+        }));
+
+        assert!(store.state.turn_state_detail.active);
+        assert_eq!(store.state.turn_state_detail.title, "Turn State");
+        assert!(
+            store
+                .state
+                .turn_state_detail
+                .subtitle
+                .contains(&turn_id.0.to_string())
+        );
+        assert!(
+            store
+                .state
+                .turn_state_detail
+                .content
+                .contains("state: active")
+        );
+        assert!(
+            store
+                .state
+                .turn_state_detail
+                .content
+                .contains("thread: thread-1")
+        );
+        assert!(
+            store
+                .state
+                .turn_state_detail
+                .content
+                .contains("committed seqs: 1, 2")
+        );
+        assert!(
+            store
+                .state
+                .status
+                .contains(&short_id(&turn_id.0.to_string()))
+        );
     }
 
     #[test]

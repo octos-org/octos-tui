@@ -83,6 +83,13 @@ pub enum ThreadCommand {
     Graph,
 }
 
+/// Parsed `/turn` subcommand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnCommand {
+    /// `/turn state [<turn_id>]`.
+    State(Option<String>),
+}
+
 /// Parsed `/goal` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalCommand {
@@ -142,6 +149,7 @@ pub enum AutonomyCommand {
     Agents(AgentsCommand),
     Task(TaskCommand),
     Thread(ThreadCommand),
+    Turn(TurnCommand),
     Goal(GoalCommand),
     Loop(LoopCommand),
 }
@@ -159,6 +167,8 @@ pub enum AutonomyParseError {
     UnknownTaskVerb(String),
     /// `/thread <verb>` where verb is unrecognized.
     UnknownThreadVerb(String),
+    /// `/turn <verb>` where verb is unrecognized.
+    UnknownTurnVerb(String),
     /// A subcommand that requires an `<agent_id>` or `<loop_id>` was
     /// missing one.
     MissingId { command: &'static str },
@@ -183,6 +193,9 @@ impl std::fmt::Display for AutonomyParseError {
             }
             Self::UnknownThreadVerb(verb) => {
                 write!(f, "unknown /thread subcommand: {verb}")
+            }
+            Self::UnknownTurnVerb(verb) => {
+                write!(f, "unknown /turn subcommand: {verb}")
             }
             Self::MissingId { command } => {
                 write!(f, "{command} requires an id argument")
@@ -214,6 +227,7 @@ pub fn parse_autonomy_slash(input: &str) -> Result<Option<AutonomyCommand>, Auto
         "agents" | "agent" => Ok(Some(AutonomyCommand::Agents(parse_agents(tail)?))),
         "task" => Ok(Some(AutonomyCommand::Task(parse_task(tail)?))),
         "thread" | "threads" => Ok(Some(AutonomyCommand::Thread(parse_thread(tail)?))),
+        "turn" => Ok(Some(AutonomyCommand::Turn(parse_turn(tail)?))),
         "goal" => Ok(Some(AutonomyCommand::Goal(parse_goal(tail)?))),
         "loop" => Ok(Some(AutonomyCommand::Loop(parse_loop(tail)?))),
         other => Err(AutonomyParseError::UnknownCommand(other.to_string())),
@@ -355,6 +369,17 @@ fn parse_thread(tail: &str) -> Result<ThreadCommand, AutonomyParseError> {
             format!("{verb} {args}").trim().to_string(),
         )),
         other => Err(AutonomyParseError::UnknownThreadVerb(other.to_string())),
+    }
+}
+
+fn parse_turn(tail: &str) -> Result<TurnCommand, AutonomyParseError> {
+    let (verb, args) = split_head(tail);
+    match verb {
+        "" | "state" | "state-get" => {
+            let id = args.trim();
+            Ok(TurnCommand::State((!id.is_empty()).then(|| id.to_string())))
+        }
+        other => Err(AutonomyParseError::UnknownTurnVerb(other.to_string())),
     }
 }
 
@@ -636,6 +661,28 @@ mod tests {
         assert_eq!(
             parse_autonomy_slash("/thread wat").unwrap_err(),
             AutonomyParseError::UnknownThreadVerb("wat".into())
+        );
+    }
+
+    #[test]
+    fn turn_state_parses_optional_turn_id() {
+        assert_eq!(
+            parse_autonomy_slash("/turn state").unwrap(),
+            Some(AutonomyCommand::Turn(TurnCommand::State(None)))
+        );
+        assert_eq!(
+            parse_autonomy_slash("/turn state 00000000-0000-0000-0000-000000000011").unwrap(),
+            Some(AutonomyCommand::Turn(TurnCommand::State(Some(
+                "00000000-0000-0000-0000-000000000011".into()
+            ))))
+        );
+    }
+
+    #[test]
+    fn turn_unknown_verb_errors() {
+        assert_eq!(
+            parse_autonomy_slash("/turn wat").unwrap_err(),
+            AutonomyParseError::UnknownTurnVerb("wat".into())
         );
     }
 

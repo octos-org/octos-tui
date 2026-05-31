@@ -158,6 +158,8 @@ pub const APPUI_TASK_ARTIFACT_MENU_METHODS_ANY: &[&str] =
 pub const APPUI_FEATURE_THREAD_GRAPH_V1: &str = crate::model::APPUI_FEATURE_THREAD_GRAPH_V1;
 pub const APPUI_THREAD_GRAPH_MENU_METHODS_ANY: &[&str] =
     &[crate::model::APPUI_METHOD_THREAD_GRAPH_GET];
+pub const APPUI_FEATURE_TURN_STATE_GET_V1: &str = crate::model::APPUI_FEATURE_TURN_STATE_GET_V1;
+pub const APPUI_TURN_STATE_MENU_METHODS_ANY: &[&str] = &[crate::model::APPUI_METHOD_TURN_STATE_GET];
 pub const APPUI_AGENTS_MENU_METHODS_ANY: &[&str] = &[
     crate::model::APPUI_METHOD_AGENT_LIST,
     crate::model::APPUI_METHOD_AGENT_STATUS_READ,
@@ -183,6 +185,7 @@ pub const APPUI_LOOP_MENU_METHODS_ANY: &[&str] = &[
 const AUTONOMY_FEATURES: &[&str] = &[APPUI_FEATURE_CODING_AUTONOMY_V1];
 const TASK_ARTIFACT_FEATURES: &[&str] = &[APPUI_FEATURE_TASK_ARTIFACTS_V1];
 const THREAD_GRAPH_FEATURES: &[&str] = &[APPUI_FEATURE_THREAD_GRAPH_V1];
+const TURN_STATE_FEATURES: &[&str] = &[APPUI_FEATURE_TURN_STATE_GET_V1];
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandRegistry {
@@ -645,6 +648,18 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
                 .with_session(SessionRequirement::Any)
                 .with_required_methods_any(APPUI_THREAD_GRAPH_MENU_METHODS_ANY)
                 .with_required_features(THREAD_GRAPH_FEATURES),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::Custom("autonomy")),
+        },
+        CommandSpec {
+            name: "turn",
+            aliases: &[],
+            description: "Inspect backend turn lifecycle state.",
+            category: CommandCategory::Runtime,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_any(APPUI_TURN_STATE_MENU_METHODS_ANY)
+                .with_required_features(TURN_STATE_FEATURES),
             inline_args: InlineArgMode::Optional,
             entry: CommandEntry::LocalAction(LocalAction::Custom("autonomy")),
         },
