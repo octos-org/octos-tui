@@ -1238,6 +1238,7 @@ impl AppUiBackend for ProtocolAppUiBackend {
             self.send(AppUiCommand::OpenSession(
                 octos_core::ui_protocol::SessionOpenParams {
                     session_id,
+                    topic: None,
                     profile_id: self.launch.profile_id.clone(),
                     cwd: self.launch.cwd.clone(),
                     after: None,
@@ -1361,6 +1362,11 @@ fn websocket_request(
             .wrap_err("failed to build UI protocol X-Profile-Id header")?;
         request.headers_mut().insert("X-Profile-Id", value);
     }
+    // NOTE: `projection.envelope.v1` is intentionally NOT requested. The TUI
+    // consumes the legacy per-event notification surface (message/delta,
+    // message/persisted, tool/*, turn/completed, file/attached); it does not
+    // implement the M9-γ canonical Envelope projection. The `Envelope` match arm
+    // in `store.rs::apply_notification` defensively ignores it. See octos-tui#152.
     request.headers_mut().insert(
         "X-Octos-Ui-Features",
         format!(
@@ -1507,6 +1513,9 @@ fn rpc_request_from_command(
         AppUiCommand::TestToolConfig(params) => serde_json::to_value(params),
         AppUiCommand::GetDiffPreview(params) => serde_json::to_value(params),
         AppUiCommand::ReadTaskOutput(params) => serde_json::to_value(params),
+        AppUiCommand::ListTasks(params) => serde_json::to_value(params),
+        AppUiCommand::CancelTask(params) => serde_json::to_value(params),
+        AppUiCommand::RestartTaskFromNode(params) => serde_json::to_value(params),
         AppUiCommand::AuthStatus(params) => serde_json::to_value(params),
         AppUiCommand::AuthSendCode(params) => serde_json::to_value(params),
         AppUiCommand::AuthVerify(params) => serde_json::to_value(params),
@@ -1979,6 +1988,7 @@ fn success_response_to_app_event(
                         task_id: result.task_id,
                         cursor: result.next_cursor,
                         text,
+                        topic: None,
                     }))
                     .into(),
                 ))
@@ -2896,6 +2906,7 @@ impl MockAppUiBackend {
             tool_call_id: "mock.read_file.1".into(),
             tool_name: "read_file".into(),
             arguments: Some(serde_json::json!({"path": "src/lib.rs"})),
+            topic: None,
         }));
         self.enqueue_protocol(UiNotification::ToolProgress(ToolProgressEvent {
             session_id: session_id.clone(),
@@ -2903,21 +2914,25 @@ impl MockAppUiBackend {
             tool_call_id: "mock.read_file.1".into(),
             message: Some("Hydrating prototype context".into()),
             progress_pct: Some(0.25),
+            topic: None,
         }));
         self.enqueue_protocol(UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             text: "Planning ".into(),
+            topic: None,
         }));
         self.enqueue_protocol(UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             text: "a safe ".into(),
+            topic: None,
         }));
         self.enqueue_protocol(UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             text: "M9 scaffold over mock transport.".into(),
+            topic: None,
         }));
         self.enqueue_protocol(UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: session_id.clone(),
@@ -2931,12 +2946,14 @@ impl MockAppUiBackend {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            topic: None,
         }));
         self.enqueue_protocol(UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
             session_id: session_id.clone(),
             task_id: build_task_id.clone(),
             cursor: OutputCursor { offset: 42 },
             text: "mock worker: draft protocol notifications\n".into(),
+            topic: None,
         }));
         self.enqueue_protocol(UiNotification::ApprovalRequested(mock_approval_event(
             session_id.clone(),
@@ -2951,6 +2968,7 @@ impl MockAppUiBackend {
             success: Some(true),
             output_preview: Some("1 | pub fn demo() {}\n".into()),
             duration_ms: Some(420),
+            topic: None,
         }));
         self.enqueue_protocol(UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: session_id.clone(),
@@ -2964,6 +2982,7 @@ impl MockAppUiBackend {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            topic: None,
         }));
         self.enqueue_protocol(UiNotification::Warning(WarningEvent {
             session_id: session_id.clone(),
@@ -2983,6 +3002,7 @@ impl MockAppUiBackend {
             tokens_in: None,
             tokens_out: None,
             session_result: None,
+            topic: None,
         }));
     }
 }
@@ -4201,6 +4221,53 @@ mod tests {
     }
 
     #[test]
+    fn protocol_task_control_commands_reach_the_wire() {
+        // octos-tui#152: task/list, task/cancel, and task/restart_from_node
+        // previously hit the `_ =>` error arm in `rpc_request_from_command` and
+        // never serialized to the wire. Guard that they now encode to their
+        // canonical methods with the expected params.
+        let session_id = SessionKey("local:test".into());
+        let task_id = TaskId::new();
+
+        let list = rpc_request_from_command(
+            "tui-task-list".into(),
+            AppUiCommand::ListTasks(octos_core::ui_protocol::TaskListParams {
+                session_id: session_id.clone(),
+                topic: None,
+            }),
+        )
+        .expect("task/list encodes");
+        assert_eq!(list.method, methods::TASK_LIST);
+        assert_eq!(list.params["session_id"], "local:test");
+
+        let cancel = rpc_request_from_command(
+            "tui-task-cancel".into(),
+            AppUiCommand::CancelTask(octos_core::ui_protocol::TaskCancelParams {
+                task_id: task_id.clone(),
+                session_id: Some(session_id.clone()),
+                profile_id: None,
+            }),
+        )
+        .expect("task/cancel encodes");
+        assert_eq!(cancel.method, methods::TASK_CANCEL);
+        assert!(cancel.params["task_id"].is_string());
+
+        let restart = rpc_request_from_command(
+            "tui-task-restart".into(),
+            AppUiCommand::RestartTaskFromNode(octos_core::ui_protocol::TaskRestartFromNodeParams {
+                task_id,
+                node_id: Some("node-1".into()),
+                session_id: Some(session_id),
+                profile_id: None,
+            }),
+        )
+        .expect("task/restart_from_node encodes");
+        assert_eq!(restart.method, methods::TASK_RESTART_FROM_NODE);
+        assert!(restart.params["task_id"].is_string());
+        assert_eq!(restart.params["node_id"], "node-1");
+    }
+
+    #[test]
     fn protocol_turn_start_request_preserves_submitted_prompt_text() {
         let request = rpc_request_from_command(
             "tui-9".into(),
@@ -4622,6 +4689,7 @@ mod tests {
         let read_style_commands = [
             AppUiCommand::ListConfigCapabilities(ConfigCapabilitiesListParams {}),
             AppUiCommand::OpenSession(SessionOpenParams {
+                topic: None,
                 session_id: session_id.clone(),
                 profile_id: Some("coding".into()),
                 cwd: Some("/repo".into()),
@@ -5110,6 +5178,7 @@ mod tests {
             .expect("session opened event");
         let request = exchange
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                topic: None,
                 session_id: session_id.clone(),
                 profile_id: Some("coding".into()),
                 cwd: None,
@@ -5331,6 +5400,7 @@ mod tests {
         let session_id = SessionKey("local:test".into());
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                topic: None,
                 session_id: session_id.clone(),
                 profile_id: Some("coding".into()),
                 cwd: Some("/repo".into()),
@@ -5897,6 +5967,7 @@ mod tests {
         });
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                topic: None,
                 session_id: SessionKey("local:test".into()),
                 profile_id: Some("coding".into()),
                 cwd: None,
@@ -5970,6 +6041,7 @@ mod tests {
         });
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                topic: None,
                 session_id: SessionKey("local:test".into()),
                 profile_id: Some("coding".into()),
                 cwd: Some("/tmp/project".into()),
@@ -6045,6 +6117,7 @@ mod tests {
 
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                topic: None,
                 session_id: session_id.clone(),
                 profile_id: Some("coding".into()),
                 cwd: None,

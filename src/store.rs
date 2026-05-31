@@ -1924,6 +1924,7 @@ impl Store {
         self.state.status = format!("Opening coding session for profile {profile_id}");
         Some(AppUiCommand::OpenSession(SessionOpenParams {
             session_id,
+            topic: None,
             profile_id: Some(profile_id),
             cwd: onboarding_workspace_cwd(&self.state.workspace.root),
             after: None,
@@ -4128,6 +4129,16 @@ impl Store {
 
     fn apply_notification(&mut self, notification: UiNotification) -> Option<AppUiCommand> {
         match notification {
+            // M9-γ `projection/envelope` (`UiNotification::Envelope`) supersedes
+            // the legacy message/delta + message/persisted + tool/* +
+            // turn/completed + file/attached notifications — but ONLY when the
+            // client negotiates `projection.envelope.v1`. This TUI intentionally
+            // does NOT request that feature (see the `X-Octos-Ui-Features` header
+            // in `transport.rs`), so the server never emits it and we stay on the
+            // legacy notification surface. If an Envelope arrives anyway it means a
+            // negotiation mismatch; ignore it rather than double-rendering.
+            // See octos-tui#152.
+            UiNotification::Envelope(_) => None,
             UiNotification::SessionOpened(event) => {
                 let session_id = event.session_id.clone();
                 if let Some(panes) = event.panes {
@@ -4206,6 +4217,7 @@ impl Store {
                 session_id,
                 turn_id,
                 text,
+                topic: _,
             }) => {
                 let follow_tail = self.state.transcript_scroll == 0;
                 let mut reset_scroll = false;
@@ -4761,6 +4773,7 @@ impl Store {
             task_id,
             cursor,
             text,
+            topic: _,
         } = event;
 
         let Some(task) = self.find_task_mut(&session_id, &task_id) else {
@@ -8990,6 +9003,7 @@ mod tests {
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                topic: None,
                 session_id,
                 turn_id,
                 cursor: None,
@@ -9023,6 +9037,7 @@ mod tests {
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                topic: None,
                 session_id,
                 turn_id: turn_id.clone(),
                 cursor: None,
@@ -9063,6 +9078,7 @@ mod tests {
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                topic: None,
                 session_id,
                 turn_id,
                 cursor: None,
@@ -9095,6 +9111,7 @@ mod tests {
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                topic: None,
                 session_id,
                 turn_id,
                 cursor: None,
@@ -9131,6 +9148,7 @@ mod tests {
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                topic: None,
                 session_id,
                 turn_id,
                 cursor: None,
@@ -9161,6 +9179,7 @@ mod tests {
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                topic: None,
                 session_id,
                 turn_id: TurnId::new(),
                 cursor: None,
@@ -9188,6 +9207,7 @@ mod tests {
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
             MessageDeltaEvent {
+                topic: None,
                 session_id,
                 turn_id: TurnId::new(),
                 text: " stale".into(),
@@ -9341,6 +9361,7 @@ mod tests {
         let command = store
             .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
+                    topic: None,
                     session_id: session_id.clone(),
                     turn_id,
                     cursor: None,
@@ -9421,6 +9442,7 @@ mod tests {
         let command = store
             .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
+                    topic: None,
                     session_id: session_id.clone(),
                     turn_id,
                     cursor: None,
@@ -9611,6 +9633,7 @@ mod tests {
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalAutoResolved(
             ApprovalAutoResolvedEvent {
+                topic: None,
                 session_id,
                 approval_id: ApprovalId::new(),
                 turn_id: TurnId::new(),
@@ -9725,6 +9748,7 @@ mod tests {
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
             ToolStartedEvent {
+                topic: None,
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 tool_call_id: "call-1".into(),
@@ -9734,6 +9758,7 @@ mod tests {
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::ToolCompleted(
             ToolCompletedEvent {
+                topic: None,
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 tool_call_id: "call-1".into(),
@@ -9745,6 +9770,7 @@ mod tests {
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                topic: None,
                 session_id,
                 turn_id,
                 cursor: None,
@@ -9767,6 +9793,7 @@ mod tests {
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
             ToolStartedEvent {
+                topic: None,
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 tool_call_id: "call-1".into(),
@@ -9776,6 +9803,7 @@ mod tests {
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::ToolProgress(
             octos_core::ui_protocol::ToolProgressEvent {
+                topic: None,
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 tool_call_id: "call-1".into(),
@@ -9785,6 +9813,7 @@ mod tests {
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::ToolCompleted(
             ToolCompletedEvent {
+                topic: None,
                 session_id,
                 turn_id,
                 tool_call_id: "call-1".into(),
@@ -9817,6 +9846,7 @@ mod tests {
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
             ToolStartedEvent {
+                topic: None,
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 tool_call_id: tool_call_id.clone(),
@@ -9826,6 +9856,7 @@ mod tests {
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::ToolCompleted(
             ToolCompletedEvent {
+                topic: None,
                 session_id,
                 turn_id,
                 tool_call_id,
@@ -9925,6 +9956,7 @@ mod tests {
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TaskOutputDelta(
             TaskOutputDeltaEvent {
+                topic: None,
                 session_id: session_id.clone(),
                 task_id: task_id.clone(),
                 text: "line one\n".into(),
@@ -10102,6 +10134,7 @@ mod tests {
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
             TurnErrorEvent {
+                topic: None,
                 session_id,
                 turn_id,
                 code: "interrupted".into(),
@@ -10264,6 +10297,7 @@ mod tests {
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
             TurnErrorEvent {
+                topic: None,
                 session_id,
                 turn_id: TurnId::new(),
                 code: "stale_error".into(),
@@ -10313,6 +10347,7 @@ mod tests {
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TaskOutputDelta(
             TaskOutputDeltaEvent {
+                topic: None,
                 session_id,
                 task_id,
                 text,
