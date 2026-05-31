@@ -15,9 +15,9 @@ use crate::model::{
     McpConfigListResult, McpConfigMutationResult, McpStatusListResult, ModelListResult,
     ModelSelectResult, ProfileLlmCatalogResult, ProfileLlmListResult, ProfileLlmMutationResult,
     ProfileLocalCreateResult, ProfileSkillsListResult, ProfileSkillsMutationResult,
-    ProfileSkillsRegistrySearchResult, SessionGoalClearResult, SessionGoalGetResult,
-    SessionGoalSetResult, SessionStatusReadResult, ToolConfigListResult, ToolConfigMutationResult,
-    ToolStatusListResult,
+    ProfileSkillsRegistrySearchResult, ReviewStartResult, SessionGoalClearResult,
+    SessionGoalGetResult, SessionGoalSetResult, SessionStatusReadResult, ToolConfigListResult,
+    ToolConfigMutationResult, ToolStatusListResult,
 };
 
 #[derive(Debug, Clone)]
@@ -32,6 +32,7 @@ pub enum ClientEvent {
     McpConfigMutation(McpConfigMutationClientEvent),
     PermissionProfile(PermissionProfileClientEvent),
     SessionHydrate(SessionHydrateResult),
+    ReviewStart(ReviewStartResult),
     AuthStatus(AuthStatusClientEvent),
     AuthSendCode(AuthSendCodeClientEvent),
     AuthVerify(AuthVerifyClientEvent),

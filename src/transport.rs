@@ -63,10 +63,10 @@ use crate::{
         ModelSelectResult, ModelStatus, ProfileLlmCatalogResult, ProfileLlmListParams,
         ProfileLlmListResult, ProfileLlmMutationResult, ProfileLocalCreateResult,
         ProfileSkillEntry, ProfileSkillRegistryPackage, ProfileSkillsListResult,
-        ProfileSkillsMutationResult, ProfileSkillsRegistrySearchResult, RuntimeHealthStatus,
-        RuntimePolicyMcpServer, RuntimePolicyStamp, SessionStatusReadResult, ToolConfigEntry,
-        ToolConfigListResult, ToolConfigMutationResult, ToolPolicyDenial, ToolStatus,
-        ToolStatusListResult, ToolStatusSummary, auth_me_email, auth_me_profile_id,
+        ProfileSkillsMutationResult, ProfileSkillsRegistrySearchResult, ReviewStartResult,
+        RuntimeHealthStatus, RuntimePolicyMcpServer, RuntimePolicyStamp, SessionStatusReadResult,
+        ToolConfigEntry, ToolConfigListResult, ToolConfigMutationResult, ToolPolicyDenial,
+        ToolStatus, ToolStatusListResult, ToolStatusSummary, auth_me_email, auth_me_profile_id,
     },
 };
 
@@ -1545,6 +1545,7 @@ fn rpc_request_from_command(
         AppUiCommand::HydrateSession(params) => serde_json::to_value(params),
         AppUiCommand::GetThreadGraph(params) => serde_json::to_value(params),
         AppUiCommand::GetTurnState(params) => serde_json::to_value(params),
+        AppUiCommand::StartReview(params) => serde_json::to_value(params),
         AppUiCommand::AuthStatus(params) => serde_json::to_value(params),
         AppUiCommand::AuthSendCode(params) => serde_json::to_value(params),
         AppUiCommand::AuthVerify(params) => serde_json::to_value(params),
@@ -2056,6 +2057,10 @@ fn success_response_to_app_event(
         methods::TURN_STATE_GET => match serde_json::from_value::<TurnStateGetResult>(result) {
             Ok(result) => Ok(Some(autonomy_event(AutonomyResult::TurnState(result)))),
             Err(err) => Ok(Some(autonomy_decode_error(methods::TURN_STATE_GET, err))),
+        },
+        methods::REVIEW_START => match serde_json::from_value::<ReviewStartResult>(result) {
+            Ok(result) => Ok(Some(ClientEvent::ReviewStart(result))),
+            Err(err) => Ok(Some(autonomy_decode_error(methods::REVIEW_START, err))),
         },
         methods::TURN_INTERRUPT => Ok(Some(
             AppUiEvent::Status(AppUiStatus {
@@ -3599,6 +3604,9 @@ impl AppUiBackend for MockAppUiBackend {
             AppUiCommand::GetTurnState(_) => Err(eyre!(
                 "mock app-ui backend does not implement turn state reads yet"
             )),
+            AppUiCommand::StartReview(_) => Err(eyre!(
+                "mock app-ui backend does not implement review start yet"
+            )),
             _ => Err(eyre!(
                 "mock app-ui backend does not implement unsupported command {method} yet"
             )),
@@ -4125,9 +4133,9 @@ mod tests {
         McpConfigListParams, McpConfigSetEnabledParams, McpConfigTestParams, McpConfigUpsertParams,
         McpStatusListParams, ModelListParams, ModelSelectParams, ProfileLocalCreateParams,
         ProfileSkillsInstallParams, ProfileSkillsListParams, ProfileSkillsRegistrySearchParams,
-        ProfileSkillsRemoveParams, SessionStatusReadParams, ToolConfigDeleteParams,
-        ToolConfigListParams, ToolConfigSetEnabledParams, ToolConfigTestParams,
-        ToolConfigUpsertParams, ToolStatusListParams,
+        ProfileSkillsRemoveParams, ReviewStartParams, SessionStatusReadParams,
+        ToolConfigDeleteParams, ToolConfigListParams, ToolConfigSetEnabledParams,
+        ToolConfigTestParams, ToolConfigUpsertParams, ToolStatusListParams,
     };
     use octos_core::TaskId;
     use octos_core::ui_protocol::{
@@ -4610,6 +4618,75 @@ mod tests {
         assert_eq!(result.cursor.seq, 9);
         assert_eq!(result.messages.unwrap()[0].content, "hello");
         assert_eq!(result.pending_approvals.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn protocol_command_serializes_review_start() {
+        let turn_id = TurnId::new();
+        let request = rpc_request_from_command(
+            "tui-14".into(),
+            AppUiCommand::StartReview(ReviewStartParams {
+                session_id: SessionKey("local:test".into()),
+                profile_id: Some("coding".into()),
+                turn_id: Some(turn_id.clone()),
+                target: Some(json!({"type": "working_tree"})),
+                prompt: Some("Check regressions".into()),
+                instructions: None,
+                delivery: Some("inline".into()),
+            }),
+        )
+        .expect("request encodes");
+
+        assert_eq!(request.jsonrpc, "2.0");
+        assert_eq!(request.method, methods::REVIEW_START);
+        assert_eq!(request.params["session_id"], "local:test");
+        assert_eq!(request.params["profile_id"], "coding");
+        assert_eq!(request.params["turn_id"], turn_id.0.to_string());
+        assert_eq!(request.params["target"]["type"], "working_tree");
+        assert_eq!(request.params["prompt"], "Check regressions");
+        assert_eq!(request.params["delivery"], "inline");
+    }
+
+    #[test]
+    fn protocol_decodes_review_start_result() {
+        let mut exchange = ProtocolExchange::default();
+        let turn_id = TurnId::new();
+        let request = exchange
+            .build_tracked_request(AppUiCommand::StartReview(ReviewStartParams {
+                session_id: SessionKey("local:test".into()),
+                profile_id: Some("coding".into()),
+                turn_id: Some(turn_id.clone()),
+                target: None,
+                prompt: None,
+                instructions: None,
+                delivery: Some("inline".into()),
+            }))
+            .expect("tracked request");
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": {
+                "accepted": true,
+                "session_id": "local:test",
+                "turn_id": turn_id,
+                "workflow": "code_review",
+                "backend": "native",
+                "agent_count": 3
+            }
+        });
+
+        let event = exchange
+            .decode_rpc_text(&response.to_string())
+            .expect("response decodes")
+            .expect("event");
+
+        let ClientEvent::ReviewStart(result) = event else {
+            panic!("expected review start event");
+        };
+        assert!(result.accepted);
+        assert_eq!(result.session_id, SessionKey("local:test".into()));
+        assert_eq!(result.turn_id, turn_id);
+        assert_eq!(result.agent_count, Some(3));
     }
 
     #[test]
@@ -5171,6 +5248,15 @@ mod tests {
             AppUiCommand::InterruptTurn(TurnInterruptParams {
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
+            }),
+            AppUiCommand::StartReview(ReviewStartParams {
+                session_id: session_id.clone(),
+                profile_id: Some("coding".into()),
+                turn_id: Some(TurnId::new()),
+                target: None,
+                prompt: None,
+                instructions: None,
+                delivery: Some("inline".into()),
             }),
             AppUiCommand::SelectModel(ModelSelectParams {
                 session_id: session_id.clone(),

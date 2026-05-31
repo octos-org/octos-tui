@@ -5,11 +5,11 @@ use octos_core::ui_protocol::methods;
 
 use crate::menu::availability::{
     AvailabilityContext, AvailabilityStatus, CommandAvailability, SessionRequirement,
-    evaluate_command,
+    TaskRequirement, evaluate_command,
 };
 use crate::menu::types::{
-    CommandCategory, CommandEntry, CommandSpec, InlineArgMode, LocalAction, MenuBuildResult,
-    MenuContext, MenuId, MenuProvider, MenuStatusSpec,
+    AppUiActionKind, CommandCategory, CommandEntry, CommandSpec, InlineArgMode, LocalAction,
+    MenuBuildResult, MenuContext, MenuId, MenuProvider, MenuStatusSpec,
 };
 
 pub const MENU_HELP: &str = "help";
@@ -160,6 +160,8 @@ pub const APPUI_THREAD_GRAPH_MENU_METHODS_ANY: &[&str] =
     &[crate::model::APPUI_METHOD_THREAD_GRAPH_GET];
 pub const APPUI_FEATURE_TURN_STATE_GET_V1: &str = crate::model::APPUI_FEATURE_TURN_STATE_GET_V1;
 pub const APPUI_TURN_STATE_MENU_METHODS_ANY: &[&str] = &[crate::model::APPUI_METHOD_TURN_STATE_GET];
+pub const APPUI_FEATURE_REVIEW_START_V1: &str = crate::model::APPUI_FEATURE_REVIEW_START_V1;
+pub const APPUI_REVIEW_START_METHODS_ANY: &[&str] = &[crate::model::APPUI_METHOD_REVIEW_START];
 pub const APPUI_AGENTS_MENU_METHODS_ANY: &[&str] = &[
     crate::model::APPUI_METHOD_AGENT_LIST,
     crate::model::APPUI_METHOD_AGENT_STATUS_READ,
@@ -186,6 +188,7 @@ const AUTONOMY_FEATURES: &[&str] = &[APPUI_FEATURE_CODING_AUTONOMY_V1];
 const TASK_ARTIFACT_FEATURES: &[&str] = &[APPUI_FEATURE_TASK_ARTIFACTS_V1];
 const THREAD_GRAPH_FEATURES: &[&str] = &[APPUI_FEATURE_THREAD_GRAPH_V1];
 const TURN_STATE_FEATURES: &[&str] = &[APPUI_FEATURE_TURN_STATE_GET_V1];
+const REVIEW_START_FEATURES: &[&str] = &[APPUI_FEATURE_REVIEW_START_V1];
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandRegistry {
@@ -662,6 +665,18 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
                 .with_required_features(TURN_STATE_FEATURES),
             inline_args: InlineArgMode::Optional,
             entry: CommandEntry::LocalAction(LocalAction::Custom("autonomy")),
+        },
+        CommandSpec {
+            name: "review",
+            aliases: &["code-review"],
+            description: "Start the backend-owned code review workflow.",
+            category: CommandCategory::Runtime,
+            availability: CommandAvailability::app_ui_mutating(&[])
+                .with_task(TaskRequirement::Idle)
+                .with_required_methods_any(APPUI_REVIEW_START_METHODS_ANY)
+                .with_required_features(REVIEW_START_FEATURES),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::AppUiAction(AppUiActionKind::ReviewStart),
         },
         // M15-E autonomy entry points. Each command is hidden unless
         // the server advertises `coding.autonomy.v1`. The actual RPC

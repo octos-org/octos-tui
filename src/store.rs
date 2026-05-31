@@ -37,10 +37,10 @@ use crate::{
         OnboardingProviderSaveTarget, ProfileLlmCatalogParams, ProfileLlmListParams,
         ProfileLlmListResult, ProfileLocalCreateParams, ProfileSkillsInstallParams,
         ProfileSkillsListParams, ProfileSkillsRegistrySearchParams, ProfileSkillsRemoveParams,
-        SecretString, SessionMcpCatalog, SessionModelCatalog, SessionRuntimeStatus,
-        SessionToolCatalog, SessionView, TaskView, ToolConfigDeleteParams, ToolConfigListParams,
-        ToolConfigSetEnabledParams, ToolConfigTestParams, ToolConfigUpsertParams,
-        complete_plan_steps_in_text, task_state_label,
+        ReviewStartParams, ReviewStartResult, SecretString, SessionMcpCatalog, SessionModelCatalog,
+        SessionRuntimeStatus, SessionToolCatalog, SessionView, TaskView, ToolConfigDeleteParams,
+        ToolConfigListParams, ToolConfigSetEnabledParams, ToolConfigTestParams,
+        ToolConfigUpsertParams, complete_plan_steps_in_text, task_state_label,
     },
 };
 
@@ -810,6 +810,9 @@ impl Store {
             }
             CommandEntry::LocalAction(action) => {
                 self.dispatch_local_action(action.clone(), inline_args)
+            }
+            CommandEntry::AppUiAction(crate::menu::types::AppUiActionKind::ReviewStart) => {
+                self.review_start_command(inline_args.unwrap_or_default())
             }
             CommandEntry::AppUiAction(action) => {
                 self.state.status = format!(
@@ -2933,6 +2936,40 @@ impl Store {
         }))
     }
 
+    fn review_start_command(&mut self, inline_args: &str) -> Option<AppUiCommand> {
+        if self.state.active_turn().is_some() {
+            self.state.status = "Cannot start review while a turn is active".into();
+            return None;
+        }
+        if !self.require_appui_feature(crate::model::APPUI_FEATURE_REVIEW_START_V1) {
+            return None;
+        }
+        if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_REVIEW_START) {
+            return None;
+        }
+        let session = self.active_session()?;
+        let session_id = session.id.clone();
+        let profile_id = session.profile_id.clone();
+        let prompt = inline_args.trim();
+        let prompt = (!prompt.is_empty()).then(|| prompt.to_owned());
+        let turn_id = TurnId::new();
+        self.state.status = "Starting backend code review".into();
+        self.state.set_run_state_in_progress();
+        self.state.push_activity(
+            ActivityItem::new(ActivityKind::Progress, "code review", "requested")
+                .with_turn(turn_id.clone()),
+        );
+        Some(AppUiCommand::StartReview(ReviewStartParams {
+            session_id,
+            profile_id,
+            turn_id: Some(turn_id),
+            target: None,
+            prompt,
+            instructions: None,
+            delivery: Some("inline".into()),
+        }))
+    }
+
     pub fn interrupt_staged_command(&mut self) -> Option<AppUiCommand> {
         if !self.state.has_pending_messages() {
             self.state.status = "No staged message to send".into();
@@ -3271,6 +3308,11 @@ impl Store {
             }
             ClientEvent::SessionHydrate(result) => {
                 self.apply_session_hydrate_result(result);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::ReviewStart(result) => {
+                self.apply_review_start_result(result);
                 self.refresh_active_menu_if_open();
                 None
             }
@@ -4168,6 +4210,29 @@ impl Store {
             sections.join(", ")
         };
         self.state.status = format!("Session hydrated: {summary}");
+    }
+
+    fn apply_review_start_result(&mut self, result: ReviewStartResult) {
+        let workflow = result.workflow.as_deref().unwrap_or("code_review");
+        let backend = result.backend.as_deref().unwrap_or("backend");
+        let agent_count = result.agent_count.unwrap_or_default();
+        let status = if result.accepted {
+            format!("Review started: {agent_count} specialist(s) via {backend}")
+        } else {
+            "Review request was not accepted".to_string()
+        };
+        self.state.push_activity(
+            ActivityItem::new(ActivityKind::Progress, "code review", status.clone())
+                .with_turn(result.turn_id.clone())
+                .with_detail(format!(
+                    "workflow={workflow}, session={}",
+                    result.session_id
+                )),
+        );
+        if result.accepted {
+            self.state.set_run_state_in_progress();
+        }
+        self.state.status = status;
     }
 
     fn apply_hydrated_pending_approvals(
@@ -11317,6 +11382,7 @@ mod tests {
                 crate::model::APPUI_METHOD_TASK_ARTIFACT_READ,
                 crate::model::APPUI_METHOD_THREAD_GRAPH_GET,
                 crate::model::APPUI_METHOD_TURN_STATE_GET,
+                crate::model::APPUI_METHOD_REVIEW_START,
                 crate::model::APPUI_METHOD_AGENT_INTERRUPT,
                 crate::model::APPUI_METHOD_AGENT_CLOSE,
                 crate::model::APPUI_METHOD_SESSION_GOAL_GET,
@@ -11334,6 +11400,7 @@ mod tests {
                 crate::model::APPUI_FEATURE_TASK_ARTIFACTS_V1,
                 crate::model::APPUI_FEATURE_THREAD_GRAPH_V1,
                 crate::model::APPUI_FEATURE_TURN_STATE_GET_V1,
+                crate::model::APPUI_FEATURE_REVIEW_START_V1,
             ],
         ));
         store
@@ -11566,6 +11633,77 @@ mod tests {
                 .state
                 .status
                 .contains(crate::model::APPUI_FEATURE_TURN_STATE_GET_V1)
+        );
+    }
+
+    #[test]
+    fn review_start_dispatches_review_rpc() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/review Check regressions and missing tests".into();
+
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::StartReview(params) => {
+                assert_eq!(params.session_id, SessionKey("local:test".into()));
+                assert_eq!(params.profile_id.as_deref(), Some("coding"));
+                assert!(params.turn_id.is_some());
+                assert!(params.target.is_none());
+                assert_eq!(
+                    params.prompt.as_deref(),
+                    Some("Check regressions and missing tests")
+                );
+                assert_eq!(params.delivery.as_deref(), Some("inline"));
+            }
+            other => panic!("expected StartReview, got {other:?}"),
+        }
+        assert_eq!(store.state.status, "Starting backend code review");
+        assert_eq!(store.state.run_state.label(), "running");
+    }
+
+    #[test]
+    fn review_start_requires_review_feature() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_REVIEW_START,
+        ]));
+        store.state.composer = "/review".into();
+
+        assert!(store.compose_command().is_none());
+        assert!(
+            store
+                .state
+                .status
+                .contains(crate::model::APPUI_FEATURE_REVIEW_START_V1)
+        );
+    }
+
+    #[test]
+    fn review_start_result_updates_status_and_activity() {
+        use crate::client_event::ClientEvent;
+
+        let mut store = protocol_store_with_autonomy();
+        let turn_id = TurnId::new();
+        store.apply_client_event(ClientEvent::ReviewStart(ReviewStartResult {
+            accepted: true,
+            session_id: SessionKey("local:test".into()),
+            turn_id: turn_id.clone(),
+            workflow: Some("code_review".into()),
+            backend: Some("native".into()),
+            agent_count: Some(3),
+        }));
+
+        assert_eq!(
+            store.state.status,
+            "Review started: 3 specialist(s) via native"
+        );
+        assert_eq!(store.state.run_state.label(), "running");
+        let activity = store.state.activity.last().expect("review activity");
+        assert_eq!(activity.title, "code review");
+        assert_eq!(activity.turn_id.as_ref(), Some(&turn_id));
+        assert!(
+            activity
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("workflow=code_review"))
         );
     }
 

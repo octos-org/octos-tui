@@ -115,6 +115,7 @@ pub const APPUI_METHOD_TASK_ARTIFACT_LIST: &str = "task/artifact/list";
 pub const APPUI_METHOD_TASK_ARTIFACT_READ: &str = "task/artifact/read";
 /// Optional M13-D review entrypoint (`review.start.v1` capability-gated).
 pub const APPUI_METHOD_REVIEW_START: &str = "review/start";
+pub const APPUI_FEATURE_REVIEW_START_V1: &str = "review.start.v1";
 
 /// M13-D capability flag for backend-owned supervised task list/status
 /// inspection (`harness.task_supervision_inspection.v1`). When absent, the
@@ -600,6 +601,7 @@ pub enum AppUiCommand {
     HydrateSession(SessionHydrateParams),
     GetThreadGraph(ThreadGraphGetParams),
     GetTurnState(TurnStateGetParams),
+    StartReview(ReviewStartParams),
     ListConfigCapabilities(ConfigCapabilitiesListParams),
     ReadSessionStatus(SessionStatusReadParams),
     ListModels(ModelListParams),
@@ -673,6 +675,7 @@ impl AppUiCommand {
             Self::HydrateSession(_) => APPUI_METHOD_SESSION_HYDRATE,
             Self::GetThreadGraph(_) => APPUI_METHOD_THREAD_GRAPH_GET,
             Self::GetTurnState(_) => APPUI_METHOD_TURN_STATE_GET,
+            Self::StartReview(_) => APPUI_METHOD_REVIEW_START,
             Self::ListConfigCapabilities(_) => APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
             Self::ReadSessionStatus(_) => APPUI_METHOD_SESSION_STATUS_READ,
             Self::ListModels(_) | Self::ProfileLlmList(_) => APPUI_METHOD_MODEL_LIST,
@@ -756,6 +759,37 @@ pub struct ModelSelectParams {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewStartParams {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewStartResult {
+    #[serde(default)]
+    pub accepted: bool,
+    pub session_id: SessionKey,
+    pub turn_id: TurnId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
