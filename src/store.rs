@@ -2894,6 +2894,42 @@ impl Store {
         }))
     }
 
+    /// Cancel the currently selected background task. octos-tui#152: gives the
+    /// task dock a user affordance that actually sends `task/cancel` (the
+    /// command was previously wire-capable but never triggered). Only
+    /// Pending/Running tasks are cancellable; the resulting terminal state
+    /// arrives via the `task/updated` notification.
+    pub fn cancel_task_command(&mut self) -> Option<AppUiCommand> {
+        let Some(task) = self.state.active_task() else {
+            self.state.status = "No selected task to cancel".into();
+            return None;
+        };
+        let cancellable = matches!(
+            task.state,
+            TaskRuntimeState::Pending | TaskRuntimeState::Running
+        );
+        let task_id = task.id.clone();
+        let title = task.title.clone();
+        let state_label = task_state_label(task.state);
+        if !cancellable {
+            self.state.status =
+                format!("Task \"{title}\" is already {state_label}; nothing to cancel");
+            return None;
+        }
+        let session_id = self
+            .state
+            .active_session()
+            .map(|session| session.id.clone());
+        self.state.status = format!("Requested cancel: {title}");
+        Some(AppUiCommand::CancelTask(
+            octos_core::ui_protocol::TaskCancelParams {
+                task_id,
+                session_id,
+                profile_id: None,
+            },
+        ))
+    }
+
     pub fn read_diff_preview_command(&mut self) -> Option<AppUiCommand> {
         let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
             self.state.status = "No active session for diff preview".into();
@@ -9978,6 +10014,36 @@ mod tests {
         assert!(store.state.task_output.active);
         assert_eq!(store.state.task_output.title, "task");
         assert_eq!(store.state.task_output.output, "line one\n");
+    }
+
+    #[test]
+    fn cancel_task_command_targets_selected_running_task() {
+        let task_id = TaskId::new();
+        let mut store = store_with_task(task_id.clone());
+        let session_id = store.state.sessions[0].id.clone();
+
+        let command = store
+            .cancel_task_command()
+            .expect("a running task is cancellable");
+
+        let AppUiCommand::CancelTask(params) = command else {
+            panic!("expected task cancel command");
+        };
+        assert_eq!(params.task_id, task_id);
+        assert_eq!(params.session_id, Some(session_id));
+        assert!(store.state.status.starts_with("Requested cancel"));
+    }
+
+    #[test]
+    fn cancel_task_command_skips_terminal_task() {
+        let task_id = TaskId::new();
+        let mut store = store_with_task(task_id);
+        store.state.sessions[0].tasks[0].state = TaskRuntimeState::Completed;
+
+        let command = store.cancel_task_command();
+
+        assert!(command.is_none());
+        assert!(store.state.status.contains("nothing to cancel"));
     }
 
     #[test]
