@@ -1531,6 +1531,9 @@ fn rpc_request_from_command(
         AppUiCommand::DeleteToolConfig(params) => serde_json::to_value(params),
         AppUiCommand::TestToolConfig(params) => serde_json::to_value(params),
         AppUiCommand::GetDiffPreview(params) => serde_json::to_value(params),
+        AppUiCommand::ListTasks(params) => serde_json::to_value(params),
+        AppUiCommand::CancelTask(params) => serde_json::to_value(params),
+        AppUiCommand::RestartTaskFromNode(params) => serde_json::to_value(params),
         AppUiCommand::ReadTaskOutput(params) => serde_json::to_value(params),
         AppUiCommand::AuthStatus(params) => serde_json::to_value(params),
         AppUiCommand::AuthSendCode(params) => serde_json::to_value(params),
@@ -4069,11 +4072,13 @@ mod tests {
         ToolConfigSetEnabledParams, ToolConfigTestParams, ToolConfigUpsertParams,
         ToolStatusListParams,
     };
+    use octos_core::TaskId;
     use octos_core::ui_protocol::{
         ApprovalDecision, ApprovalRespondParams, ApprovalScopesListParams, DiffPreviewGetParams,
         InputItem, PermissionNetworkPolicy, PermissionProfileListParams, PermissionProfileMode,
         PermissionProfileSetParams, PermissionProfileUpdate, PreviewId, SessionOpenParams,
-        TaskOutputReadParams, TurnInterruptParams, TurnStartParams,
+        TaskCancelParams, TaskListParams, TaskOutputReadParams, TaskRestartFromNodeParams,
+        TurnInterruptParams, TurnStartParams,
     };
     use serde_json::json;
     use std::{
@@ -4407,6 +4412,54 @@ mod tests {
         .expect("tool status request encodes");
         assert_eq!(tools.method, crate::model::APPUI_METHOD_TOOL_STATUS_LIST);
         assert_eq!(tools.params["include_denied"], true);
+    }
+
+    #[test]
+    fn protocol_task_control_commands_reach_the_wire() {
+        let session_id = SessionKey("local:test".into());
+        let task_id = TaskId::new();
+
+        let list = rpc_request_from_command(
+            "task-list-1".into(),
+            AppUiCommand::ListTasks(TaskListParams {
+                session_id: session_id.clone(),
+                topic: Some("coding".into()),
+            }),
+        )
+        .expect("task list request encodes");
+        assert_eq!(list.method, methods::TASK_LIST);
+        assert_eq!(list.params["session_id"], "local:test");
+        assert_eq!(list.params["topic"], "coding");
+
+        let cancel = rpc_request_from_command(
+            "task-cancel-1".into(),
+            AppUiCommand::CancelTask(TaskCancelParams {
+                task_id: task_id.clone(),
+                session_id: Some(session_id.clone()),
+                profile_id: Some("profile-a".into()),
+            }),
+        )
+        .expect("task cancel request encodes");
+        assert_eq!(cancel.method, methods::TASK_CANCEL);
+        assert_eq!(cancel.params["task_id"], task_id.0.to_string());
+        assert_eq!(cancel.params["session_id"], "local:test");
+        assert_eq!(cancel.params["profile_id"], "profile-a");
+
+        let restart = rpc_request_from_command(
+            "task-restart-1".into(),
+            AppUiCommand::RestartTaskFromNode(TaskRestartFromNodeParams {
+                task_id: task_id.clone(),
+                node_id: Some("synthesize".into()),
+                session_id: Some(session_id),
+                profile_id: Some("profile-a".into()),
+            }),
+        )
+        .expect("task restart request encodes");
+        assert_eq!(restart.method, methods::TASK_RESTART_FROM_NODE);
+        assert_eq!(restart.params["task_id"], task_id.0.to_string());
+        assert_eq!(restart.params["node_id"], "synthesize");
+        assert_eq!(restart.params["session_id"], "local:test");
+        assert_eq!(restart.params["profile_id"], "profile-a");
     }
 
     #[test]
