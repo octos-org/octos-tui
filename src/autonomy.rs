@@ -76,6 +76,13 @@ pub enum TaskArtifactSelector {
     Path(String),
 }
 
+/// Parsed `/thread` / `/threads` subcommand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadCommand {
+    /// `/threads` or `/thread graph`.
+    Graph,
+}
+
 /// Parsed `/goal` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalCommand {
@@ -134,6 +141,7 @@ pub enum LoopCommand {
 pub enum AutonomyCommand {
     Agents(AgentsCommand),
     Task(TaskCommand),
+    Thread(ThreadCommand),
     Goal(GoalCommand),
     Loop(LoopCommand),
 }
@@ -149,6 +157,8 @@ pub enum AutonomyParseError {
     UnknownAgentsVerb(String),
     /// `/task <verb>` where verb is unrecognized.
     UnknownTaskVerb(String),
+    /// `/thread <verb>` where verb is unrecognized.
+    UnknownThreadVerb(String),
     /// A subcommand that requires an `<agent_id>` or `<loop_id>` was
     /// missing one.
     MissingId { command: &'static str },
@@ -170,6 +180,9 @@ impl std::fmt::Display for AutonomyParseError {
             }
             Self::UnknownTaskVerb(verb) => {
                 write!(f, "unknown /task subcommand: {verb}")
+            }
+            Self::UnknownThreadVerb(verb) => {
+                write!(f, "unknown /thread subcommand: {verb}")
             }
             Self::MissingId { command } => {
                 write!(f, "{command} requires an id argument")
@@ -200,6 +213,7 @@ pub fn parse_autonomy_slash(input: &str) -> Result<Option<AutonomyCommand>, Auto
     match head {
         "agents" | "agent" => Ok(Some(AutonomyCommand::Agents(parse_agents(tail)?))),
         "task" => Ok(Some(AutonomyCommand::Task(parse_task(tail)?))),
+        "thread" | "threads" => Ok(Some(AutonomyCommand::Thread(parse_thread(tail)?))),
         "goal" => Ok(Some(AutonomyCommand::Goal(parse_goal(tail)?))),
         "loop" => Ok(Some(AutonomyCommand::Loop(parse_loop(tail)?))),
         other => Err(AutonomyParseError::UnknownCommand(other.to_string())),
@@ -331,6 +345,17 @@ fn parse_task_artifact_read(args: &str) -> Result<TaskCommand, AutonomyParseErro
         task_id: task_id.to_string(),
         selector,
     })
+}
+
+fn parse_thread(tail: &str) -> Result<ThreadCommand, AutonomyParseError> {
+    let (verb, args) = split_head(tail);
+    match verb {
+        "" | "graph" | "graph-get" if args.is_empty() => Ok(ThreadCommand::Graph),
+        "" | "graph" | "graph-get" => Err(AutonomyParseError::UnknownThreadVerb(
+            format!("{verb} {args}").trim().to_string(),
+        )),
+        other => Err(AutonomyParseError::UnknownThreadVerb(other.to_string())),
+    }
 }
 
 fn parse_goal(tail: &str) -> Result<GoalCommand, AutonomyParseError> {
@@ -591,6 +616,26 @@ mod tests {
         assert_eq!(
             parse_autonomy_slash("/task wat").unwrap_err(),
             AutonomyParseError::UnknownTaskVerb("wat".into())
+        );
+    }
+
+    #[test]
+    fn thread_graph_parses_bare_or_graph_verb() {
+        assert_eq!(
+            parse_autonomy_slash("/threads").unwrap(),
+            Some(AutonomyCommand::Thread(ThreadCommand::Graph))
+        );
+        assert_eq!(
+            parse_autonomy_slash("/thread graph").unwrap(),
+            Some(AutonomyCommand::Thread(ThreadCommand::Graph))
+        );
+    }
+
+    #[test]
+    fn thread_unknown_verb_errors() {
+        assert_eq!(
+            parse_autonomy_slash("/thread wat").unwrap_err(),
+            AutonomyParseError::UnknownThreadVerb("wat".into())
         );
     }
 

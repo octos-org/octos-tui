@@ -6,8 +6,9 @@ use octos_core::ui_protocol::{
     ApprovalScopesListParams, ApprovalTypedDetails, DiffPreviewGetParams, OutputCursor,
     PermissionProfileListParams, PermissionProfileSelection, PermissionProfileSetParams, PreviewId,
     TaskArtifactReadParams, TaskCancelParams, TaskListParams, TaskOutputReadParams,
-    TaskRestartFromNodeParams, TaskRuntimeState, TurnId, TurnInterruptParams, TurnStartParams,
-    UiPaneSnapshot, UiProtocolCapabilities, approval_scopes,
+    TaskRestartFromNodeParams, TaskRuntimeState, ThreadGraphGetParams, ThreadGraphGetResult,
+    TurnId, TurnInterruptParams, TurnStartParams, UiPaneSnapshot, UiProtocolCapabilities,
+    approval_scopes,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -138,6 +139,10 @@ pub const APPUI_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
 /// compact-context status surface; it must not call them as RPC.
 pub const APPUI_METHOD_CONTEXT_COMPACTION_COMPLETED: &str = "context/compaction_completed";
 pub const APPUI_METHOD_CONTEXT_NORMALIZATION_REPORTED: &str = "context/normalization_reported";
+
+/// UPCR-2026-010 thread graph read surface (`state.thread_graph.v1`).
+pub const APPUI_FEATURE_THREAD_GRAPH_V1: &str = "state.thread_graph.v1";
+pub const APPUI_METHOD_THREAD_GRAPH_GET: &str = "thread/graph/get";
 
 /// M15-E required capability flag for backend-owned agent inspection /
 /// goal / loop UX (`coding.autonomy.v1`). When absent, the TUI must
@@ -584,6 +589,7 @@ pub enum AppUiCommand {
     RestartTaskFromNode(TaskRestartFromNodeParams),
     ReadTaskOutput(TaskOutputReadParams),
     ReadTaskArtifact(TaskArtifactReadParams),
+    GetThreadGraph(ThreadGraphGetParams),
     ListConfigCapabilities(ConfigCapabilitiesListParams),
     ReadSessionStatus(SessionStatusReadParams),
     ListModels(ModelListParams),
@@ -654,6 +660,7 @@ impl AppUiCommand {
             }
             Self::ReadTaskOutput(_) => octos_core::ui_protocol::methods::TASK_OUTPUT_READ,
             Self::ReadTaskArtifact(_) => APPUI_METHOD_TASK_ARTIFACT_READ,
+            Self::GetThreadGraph(_) => APPUI_METHOD_THREAD_GRAPH_GET,
             Self::ListConfigCapabilities(_) => APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
             Self::ReadSessionStatus(_) => APPUI_METHOD_SESSION_STATUS_READ,
             Self::ListModels(_) | Self::ProfileLlmList(_) => APPUI_METHOD_MODEL_LIST,
@@ -2993,6 +3000,7 @@ pub struct AppState {
     pub approval: Option<ApprovalModalState>,
     pub task_output: TaskOutputDetailState,
     pub artifact_detail: ArtifactDetailState,
+    pub thread_graph_detail: ThreadGraphDetailState,
     pub task_output_cursors: Vec<TaskOutputCursor>,
     pub diff_preview: DiffPreviewPaneState,
     pub activity: Vec<ActivityItem>,
@@ -3456,6 +3464,84 @@ pub struct TaskOutputCursor {
     pub session_id: SessionKey,
     pub task_id: TaskId,
     pub cursor: OutputCursor,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThreadGraphDetailState {
+    pub active: bool,
+    pub title: String,
+    pub subtitle: String,
+    pub content: String,
+    pub scroll: usize,
+}
+
+impl ThreadGraphDetailState {
+    pub fn open(&mut self, result: &ThreadGraphGetResult) {
+        self.active = true;
+        self.title = "Thread Graph".into();
+        self.subtitle = format!(
+            "{} thread(s) @ {}:{}",
+            result.threads.len(),
+            result.cursor.stream,
+            result.cursor.seq
+        );
+        self.content = thread_graph_content(result);
+        self.scroll = 0;
+    }
+
+    pub fn close(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_sub(lines);
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_add(lines);
+    }
+}
+
+fn thread_graph_content(result: &ThreadGraphGetResult) -> String {
+    let mut lines = Vec::new();
+    if result.threads.is_empty() {
+        lines.push("No threads returned for this session".to_string());
+    } else {
+        for thread in &result.threads {
+            let turn = thread
+                .turn_id
+                .as_ref()
+                .map(|turn_id| format!(" | turn {}", turn_id.0))
+                .unwrap_or_default();
+            lines.push(format!(
+                "{} | {} | root seq {} | {} message(s){}",
+                thread.thread_id,
+                thread.status,
+                thread.root_seq,
+                thread.message_seqs.len(),
+                turn
+            ));
+            if !thread.message_seqs.is_empty() {
+                let seqs = thread
+                    .message_seqs
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!("  messages: {seqs}"));
+            }
+        }
+    }
+    if !result.orphans.is_empty() {
+        let orphans = result
+            .orphans
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("Orphans: {orphans}"));
+    }
+    lines.join("\n")
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -4133,6 +4219,7 @@ impl AppState {
             approval: None,
             task_output: TaskOutputDetailState::default(),
             artifact_detail: ArtifactDetailState::default(),
+            thread_graph_detail: ThreadGraphDetailState::default(),
             task_output_cursors: Vec::new(),
             diff_preview: DiffPreviewPaneState::default(),
             activity: Vec::new(),

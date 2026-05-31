@@ -13,9 +13,9 @@ use octos_core::ui_protocol::{
     MessageDeltaEvent, OutputCursor, PermissionProfileListResult, PermissionProfileSelection,
     PermissionProfileSetResult, PreviewId, SessionOpenParams, SessionOpenResult, SessionOpened,
     TaskArtifactReadResult, TaskOutputDeltaEvent, TaskOutputReadResult, TaskRuntimeState,
-    TaskUpdatedEvent, ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent,
-    TurnId, TurnStartedEvent, UiCursor, UiNotification, UiPaneSnapshot, UiProtocolCapabilities,
-    WarningEvent, approval_kinds, methods, rpc_error_codes,
+    TaskUpdatedEvent, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
+    ToolStartedEvent, TurnCompletedEvent, TurnId, TurnStartedEvent, UiCursor, UiNotification,
+    UiPaneSnapshot, UiProtocolCapabilities, WarningEvent, approval_kinds, methods, rpc_error_codes,
 };
 use octos_core::ui_protocol::{
     JSON_RPC_VERSION, MAX_TEXT_FRAME_BYTES, RpcRequest, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
@@ -1026,6 +1026,7 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::GetDiffPreview(_)
                 | AppUiCommand::ReadTaskOutput(_)
                 | AppUiCommand::ReadTaskArtifact(_)
+                | AppUiCommand::GetThreadGraph(_)
                 | AppUiCommand::AuthStatus(_)
                 | AppUiCommand::AuthMe(_)
                 | AppUiCommand::ProfileLlmCatalog(_)
@@ -1538,6 +1539,7 @@ fn rpc_request_from_command(
         AppUiCommand::RestartTaskFromNode(params) => serde_json::to_value(params),
         AppUiCommand::ReadTaskOutput(params) => serde_json::to_value(params),
         AppUiCommand::ReadTaskArtifact(params) => serde_json::to_value(params),
+        AppUiCommand::GetThreadGraph(params) => serde_json::to_value(params),
         AppUiCommand::AuthStatus(params) => serde_json::to_value(params),
         AppUiCommand::AuthSendCode(params) => serde_json::to_value(params),
         AppUiCommand::AuthVerify(params) => serde_json::to_value(params),
@@ -2038,6 +2040,10 @@ fn success_response_to_app_event(
                 ))),
             }
         }
+        methods::THREAD_GRAPH_GET => match serde_json::from_value::<ThreadGraphGetResult>(result) {
+            Ok(result) => Ok(Some(autonomy_event(AutonomyResult::ThreadGraph(result)))),
+            Err(err) => Ok(Some(autonomy_decode_error(methods::THREAD_GRAPH_GET, err))),
+        },
         methods::TURN_INTERRUPT => Ok(Some(
             AppUiEvent::Status(AppUiStatus {
                 message: interrupt_ack_status(&result),
@@ -3571,6 +3577,9 @@ impl AppUiBackend for MockAppUiBackend {
             AppUiCommand::ReadTaskArtifact(_) => Err(eyre!(
                 "mock app-ui backend does not implement task artifact reads yet"
             )),
+            AppUiCommand::GetThreadGraph(_) => Err(eyre!(
+                "mock app-ui backend does not implement thread graph reads yet"
+            )),
             _ => Err(eyre!(
                 "mock app-ui backend does not implement unsupported command {method} yet"
             )),
@@ -4107,7 +4116,8 @@ mod tests {
         InputItem, PermissionNetworkPolicy, PermissionProfileListParams, PermissionProfileMode,
         PermissionProfileSetParams, PermissionProfileUpdate, PreviewId, SessionOpenParams,
         TaskArtifactReadParams, TaskCancelParams, TaskListParams, TaskOutputReadParams,
-        TaskRestartFromNodeParams, TurnInterruptParams, TurnStartParams,
+        TaskRestartFromNodeParams, ThreadGraphGetParams, TurnInterruptParams, TurnStartParams,
+        UiCursor,
     };
     use serde_json::json;
     use std::{
@@ -4455,6 +4465,70 @@ mod tests {
         assert_eq!(result.task_id, task_id);
         assert_eq!(result.artifact.id, "summary");
         assert_eq!(result.content.as_deref(), Some("task artifact body"));
+    }
+
+    #[test]
+    fn protocol_command_serializes_thread_graph_get() {
+        let request = rpc_request_from_command(
+            "tui-12".into(),
+            AppUiCommand::GetThreadGraph(ThreadGraphGetParams {
+                session_id: SessionKey("local:test".into()),
+                at: None,
+            }),
+        )
+        .expect("request encodes");
+
+        assert_eq!(request.jsonrpc, "2.0");
+        assert_eq!(request.method, methods::THREAD_GRAPH_GET);
+        assert_eq!(request.params["session_id"], "local:test");
+        assert!(request.params.get("at").is_none());
+    }
+
+    #[test]
+    fn protocol_decodes_thread_graph_result() {
+        let mut exchange = ProtocolExchange::default();
+        let request = exchange
+            .build_tracked_request(AppUiCommand::GetThreadGraph(ThreadGraphGetParams {
+                session_id: SessionKey("local:test".into()),
+                at: None,
+            }))
+            .expect("tracked request");
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": {
+                "session_id": "local:test",
+                "cursor": {"stream": "session", "seq": 7},
+                "threads": [{
+                    "thread_id": "thread-1",
+                    "root_seq": 1,
+                    "message_seqs": [1, 2],
+                    "status": "active"
+                }],
+                "orphans": [99]
+            }
+        });
+
+        let event = exchange
+            .decode_rpc_text(&response.to_string())
+            .expect("response decodes")
+            .expect("event");
+
+        let ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::ThreadGraph(result),
+        }) = event
+        else {
+            panic!("expected thread graph event");
+        };
+        assert_eq!(
+            result.cursor,
+            UiCursor {
+                stream: "session".into(),
+                seq: 7
+            }
+        );
+        assert_eq!(result.threads[0].thread_id, "thread-1");
+        assert_eq!(result.orphans, vec![99]);
     }
 
     #[test]

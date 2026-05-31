@@ -4,8 +4,8 @@ use octos_core::ui_protocol::{
     ApprovalRespondParams, DiffPreviewGetParams, EnvelopeNotification, EnvelopeToolEndStatus,
     InputItem, MessageDeltaEvent, MessagePersistedEvent, Payload, ReplayLossyEvent,
     SessionOpenParams, TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams,
-    TaskRuntimeState, TaskUpdatedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId,
-    TurnInterruptParams, TurnStartParams, UiNotification, UiProgressEvent,
+    TaskRuntimeState, TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent,
+    TurnId, TurnInterruptParams, TurnStartParams, UiNotification, UiProgressEvent,
 };
 use octos_core::{Message, MessageRole, SessionKey, TaskId, ThreadId};
 use serde_json::Value;
@@ -301,6 +301,9 @@ impl Store {
             Ok(Some(crate::autonomy::AutonomyCommand::Task(cmd))) => {
                 self.dispatch_task_command(cmd)
             }
+            Ok(Some(crate::autonomy::AutonomyCommand::Thread(cmd))) => {
+                self.dispatch_thread_command(cmd)
+            }
             Ok(Some(crate::autonomy::AutonomyCommand::Goal(cmd))) => {
                 self.dispatch_goal_command(cmd)
             }
@@ -354,6 +357,29 @@ impl Store {
                     limit_bytes: Some(TASK_ARTIFACT_READ_LIMIT_BYTES),
                     profile_id,
                     agent_id: None,
+                }))
+            }
+        }
+    }
+
+    fn dispatch_thread_command(
+        &mut self,
+        cmd: crate::autonomy::ThreadCommand,
+    ) -> Option<AppUiCommand> {
+        use crate::autonomy::ThreadCommand;
+        let session_id = self.active_autonomy_session_id()?;
+        match cmd {
+            ThreadCommand::Graph => {
+                if !self.require_appui_feature(crate::model::APPUI_FEATURE_THREAD_GRAPH_V1) {
+                    return None;
+                }
+                if !self.require_appui_method(crate::model::APPUI_METHOD_THREAD_GRAPH_GET) {
+                    return None;
+                }
+                self.state.status = "Reading thread graph".into();
+                Some(AppUiCommand::GetThreadGraph(ThreadGraphGetParams {
+                    session_id,
+                    at: None,
                 }))
             }
         }
@@ -3064,6 +3090,12 @@ impl Store {
             return true;
         }
 
+        if self.state.thread_graph_detail.active {
+            self.state.thread_graph_detail.close();
+            self.state.status = "Closed thread graph".into();
+            return true;
+        }
+
         if self.state.diff_preview.active {
             self.state.diff_preview.close();
             self.state.status = "Closed inline diff preview".into();
@@ -3394,6 +3426,11 @@ impl Store {
                     result.content,
                 );
                 self.state.status = format!("Task {} artifact loaded: {title}", result.task_id);
+            }
+            AutonomyResult::ThreadGraph(result) => {
+                let count = result.threads.len();
+                self.state.thread_graph_detail.open(&result);
+                self.state.status = format!("Thread graph loaded: {count} thread(s)");
             }
             AutonomyResult::AgentInterrupt(result) => {
                 if let Some(agent) = result.agent.clone() {
@@ -10942,6 +10979,7 @@ mod tests {
                 crate::model::APPUI_METHOD_AGENT_ARTIFACT_LIST,
                 crate::model::APPUI_METHOD_AGENT_ARTIFACT_READ,
                 crate::model::APPUI_METHOD_TASK_ARTIFACT_READ,
+                crate::model::APPUI_METHOD_THREAD_GRAPH_GET,
                 crate::model::APPUI_METHOD_AGENT_INTERRUPT,
                 crate::model::APPUI_METHOD_AGENT_CLOSE,
                 crate::model::APPUI_METHOD_SESSION_GOAL_GET,
@@ -10957,6 +10995,7 @@ mod tests {
             [
                 crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1,
                 crate::model::APPUI_FEATURE_TASK_ARTIFACTS_V1,
+                crate::model::APPUI_FEATURE_THREAD_GRAPH_V1,
             ],
         ));
         store
@@ -11107,6 +11146,36 @@ mod tests {
                 .state
                 .status
                 .contains(crate::model::APPUI_FEATURE_TASK_ARTIFACTS_V1)
+        );
+    }
+
+    #[test]
+    fn thread_graph_dispatches_thread_graph_get() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/threads".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::GetThreadGraph(params) => {
+                assert_eq!(params.session_id, SessionKey("local:test".into()));
+                assert!(params.at.is_none());
+            }
+            other => panic!("expected GetThreadGraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thread_graph_requires_thread_graph_feature() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_THREAD_GRAPH_GET,
+        ]));
+        store.state.composer = "/thread graph".into();
+
+        assert!(store.compose_command().is_none());
+        assert!(
+            store
+                .state
+                .status
+                .contains(crate::model::APPUI_FEATURE_THREAD_GRAPH_V1)
         );
     }
 
@@ -12088,6 +12157,51 @@ mod tests {
             store.state.status,
             format!("Task {task_id} artifact loaded: Summary")
         );
+    }
+
+    #[test]
+    fn autonomy_thread_graph_opens_detail_modal() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        use octos_core::ui_protocol::{ThreadGraphEntry, ThreadGraphGetResult, UiCursor};
+
+        let mut store = protocol_store_with_autonomy();
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::ThreadGraph(ThreadGraphGetResult {
+                session_id: SessionKey("local:test".into()),
+                cursor: UiCursor {
+                    stream: "session".into(),
+                    seq: 7,
+                },
+                threads: vec![ThreadGraphEntry {
+                    thread_id: "thread-1".into(),
+                    root_seq: 1,
+                    root_client_message_id: None,
+                    turn_id: None,
+                    message_seqs: vec![1, 2],
+                    status: "active".into(),
+                }],
+                orphans: vec![99],
+            }),
+        }));
+
+        assert!(store.state.thread_graph_detail.active);
+        assert_eq!(store.state.thread_graph_detail.title, "Thread Graph");
+        assert!(
+            store
+                .state
+                .thread_graph_detail
+                .subtitle
+                .contains("1 thread")
+        );
+        assert!(store.state.thread_graph_detail.content.contains("thread-1"));
+        assert!(
+            store
+                .state
+                .thread_graph_detail
+                .content
+                .contains("Orphans: 99")
+        );
+        assert_eq!(store.state.status, "Thread graph loaded: 1 thread(s)");
     }
 
     #[test]
