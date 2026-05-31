@@ -5,9 +5,9 @@ use octos_core::ui_protocol::{
     ApprovalDecision, ApprovalId, ApprovalRenderHints, ApprovalRequestedEvent,
     ApprovalScopesListParams, ApprovalTypedDetails, DiffPreviewGetParams, OutputCursor,
     PermissionProfileListParams, PermissionProfileSelection, PermissionProfileSetParams, PreviewId,
-    TaskCancelParams, TaskListParams, TaskOutputReadParams, TaskRestartFromNodeParams,
-    TaskRuntimeState, TurnId, TurnInterruptParams, TurnStartParams, UiPaneSnapshot,
-    UiProtocolCapabilities, approval_scopes,
+    TaskArtifactReadParams, TaskCancelParams, TaskListParams, TaskOutputReadParams,
+    TaskRestartFromNodeParams, TaskRuntimeState, TurnId, TurnInterruptParams, TurnStartParams,
+    UiPaneSnapshot, UiProtocolCapabilities, approval_scopes,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -583,6 +583,7 @@ pub enum AppUiCommand {
     CancelTask(TaskCancelParams),
     RestartTaskFromNode(TaskRestartFromNodeParams),
     ReadTaskOutput(TaskOutputReadParams),
+    ReadTaskArtifact(TaskArtifactReadParams),
     ListConfigCapabilities(ConfigCapabilitiesListParams),
     ReadSessionStatus(SessionStatusReadParams),
     ListModels(ModelListParams),
@@ -652,6 +653,7 @@ impl AppUiCommand {
                 octos_core::ui_protocol::methods::TASK_RESTART_FROM_NODE
             }
             Self::ReadTaskOutput(_) => octos_core::ui_protocol::methods::TASK_OUTPUT_READ,
+            Self::ReadTaskArtifact(_) => APPUI_METHOD_TASK_ARTIFACT_READ,
             Self::ListConfigCapabilities(_) => APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
             Self::ReadSessionStatus(_) => APPUI_METHOD_SESSION_STATUS_READ,
             Self::ListModels(_) | Self::ProfileLlmList(_) => APPUI_METHOD_MODEL_LIST,
@@ -3415,6 +3417,21 @@ impl ArtifactDetailState {
         self.active = true;
         self.title = artifact.title.clone();
         self.subtitle = format!("agent {agent_id} | {} | {}", artifact.kind, artifact.status);
+        self.content = content
+            .or_else(|| artifact.content.clone())
+            .unwrap_or_else(|| "No content returned for this artifact".into());
+        self.scroll = 0;
+    }
+
+    pub fn open_task_artifact(
+        &mut self,
+        task_id: &TaskId,
+        artifact: &octos_core::ui_protocol::TaskArtifactRecord,
+        content: Option<String>,
+    ) {
+        self.active = true;
+        self.title = artifact.title.clone();
+        self.subtitle = format!("task {task_id} | {} | {}", artifact.kind, artifact.status);
         self.content = content
             .or_else(|| artifact.content.clone())
             .unwrap_or_else(|| "No content returned for this artifact".into());

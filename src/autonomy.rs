@@ -59,6 +59,23 @@ pub enum AgentArtifactSelector {
     Path(String),
 }
 
+/// Parsed `/task` subcommand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskCommand {
+    /// `/task artifact <task_id> <artifact_id>` or
+    /// `/task artifact <task_id> path:<artifact_path>`.
+    ArtifactRead {
+        task_id: String,
+        selector: TaskArtifactSelector,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskArtifactSelector {
+    Id(String),
+    Path(String),
+}
+
 /// Parsed `/goal` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalCommand {
@@ -116,6 +133,7 @@ pub enum LoopCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutonomyCommand {
     Agents(AgentsCommand),
+    Task(TaskCommand),
     Goal(GoalCommand),
     Loop(LoopCommand),
 }
@@ -129,6 +147,8 @@ pub enum AutonomyParseError {
     UnknownCommand(String),
     /// `/agents <verb>` where verb is unrecognized.
     UnknownAgentsVerb(String),
+    /// `/task <verb>` where verb is unrecognized.
+    UnknownTaskVerb(String),
     /// A subcommand that requires an `<agent_id>` or `<loop_id>` was
     /// missing one.
     MissingId { command: &'static str },
@@ -147,6 +167,9 @@ impl std::fmt::Display for AutonomyParseError {
             Self::UnknownCommand(name) => write!(f, "unknown autonomy command: /{name}"),
             Self::UnknownAgentsVerb(verb) => {
                 write!(f, "unknown /agents subcommand: {verb}")
+            }
+            Self::UnknownTaskVerb(verb) => {
+                write!(f, "unknown /task subcommand: {verb}")
             }
             Self::MissingId { command } => {
                 write!(f, "{command} requires an id argument")
@@ -176,6 +199,7 @@ pub fn parse_autonomy_slash(input: &str) -> Result<Option<AutonomyCommand>, Auto
     let (head, tail) = split_head(rest);
     match head {
         "agents" | "agent" => Ok(Some(AutonomyCommand::Agents(parse_agents(tail)?))),
+        "task" => Ok(Some(AutonomyCommand::Task(parse_task(tail)?))),
         "goal" => Ok(Some(AutonomyCommand::Goal(parse_goal(tail)?))),
         "loop" => Ok(Some(AutonomyCommand::Loop(parse_loop(tail)?))),
         other => Err(AutonomyParseError::UnknownCommand(other.to_string())),
@@ -259,6 +283,52 @@ fn parse_agent_artifact_read(args: &str) -> Result<AgentsCommand, AutonomyParseE
     };
     Ok(AgentsCommand::ArtifactRead {
         agent_id: agent_id.to_string(),
+        selector,
+    })
+}
+
+fn parse_task(tail: &str) -> Result<TaskCommand, AutonomyParseError> {
+    let (verb, args) = split_head(tail);
+    match verb {
+        "artifact" | "artifact-read" | "read-artifact" => parse_task_artifact_read(args),
+        other => Err(AutonomyParseError::UnknownTaskVerb(other.to_string())),
+    }
+}
+
+fn parse_task_artifact_read(args: &str) -> Result<TaskCommand, AutonomyParseError> {
+    let (task_id, selector_raw) = split_head(args);
+    if task_id.is_empty() {
+        return Err(AutonomyParseError::MissingId {
+            command: "/task artifact",
+        });
+    }
+    let selector_raw = selector_raw.trim();
+    if selector_raw.is_empty() {
+        return Err(AutonomyParseError::MissingId {
+            command: "/task artifact <task_id>",
+        });
+    }
+    let selector = if let Some(path) = selector_raw.strip_prefix("path:") {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err(AutonomyParseError::MissingId {
+                command: "/task artifact <task_id>",
+            });
+        }
+        TaskArtifactSelector::Path(path.to_string())
+    } else if let Some(id) = selector_raw.strip_prefix("id:") {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(AutonomyParseError::MissingId {
+                command: "/task artifact <task_id>",
+            });
+        }
+        TaskArtifactSelector::Id(id.to_string())
+    } else {
+        TaskArtifactSelector::Id(selector_raw.to_string())
+    };
+    Ok(TaskCommand::ArtifactRead {
+        task_id: task_id.to_string(),
         selector,
     })
 }
@@ -491,6 +561,36 @@ mod tests {
         assert_eq!(
             parse_autonomy_slash("/agents wat").unwrap_err(),
             AutonomyParseError::UnknownAgentsVerb("wat".into())
+        );
+    }
+
+    #[test]
+    fn task_artifact_read_accepts_id_or_path_selector() {
+        assert_eq!(
+            parse_autonomy_slash("/task artifact 00000000-0000-0000-0000-000000000007 summary")
+                .unwrap(),
+            Some(AutonomyCommand::Task(TaskCommand::ArtifactRead {
+                task_id: "00000000-0000-0000-0000-000000000007".into(),
+                selector: TaskArtifactSelector::Id("summary".into()),
+            }))
+        );
+        assert_eq!(
+            parse_autonomy_slash(
+                "/task read-artifact 00000000-0000-0000-0000-000000000007 path:reports/out.md",
+            )
+            .unwrap(),
+            Some(AutonomyCommand::Task(TaskCommand::ArtifactRead {
+                task_id: "00000000-0000-0000-0000-000000000007".into(),
+                selector: TaskArtifactSelector::Path("reports/out.md".into()),
+            }))
+        );
+    }
+
+    #[test]
+    fn task_unknown_verb_errors() {
+        assert_eq!(
+            parse_autonomy_slash("/task wat").unwrap_err(),
+            AutonomyParseError::UnknownTaskVerb("wat".into())
         );
     }
 

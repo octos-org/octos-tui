@@ -12,9 +12,9 @@ use octos_core::ui_protocol::{
     ApprovalSandboxEscalationEndpoint, ApprovalScopesListResult, ApprovalTypedDetails,
     MessageDeltaEvent, OutputCursor, PermissionProfileListResult, PermissionProfileSelection,
     PermissionProfileSetResult, PreviewId, SessionOpenParams, SessionOpenResult, SessionOpened,
-    TaskOutputDeltaEvent, TaskOutputReadResult, TaskRuntimeState, TaskUpdatedEvent,
-    ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnId,
-    TurnStartedEvent, UiCursor, UiNotification, UiPaneSnapshot, UiProtocolCapabilities,
+    TaskArtifactReadResult, TaskOutputDeltaEvent, TaskOutputReadResult, TaskRuntimeState,
+    TaskUpdatedEvent, ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent,
+    TurnId, TurnStartedEvent, UiCursor, UiNotification, UiPaneSnapshot, UiProtocolCapabilities,
     WarningEvent, approval_kinds, methods, rpc_error_codes,
 };
 use octos_core::ui_protocol::{
@@ -1025,6 +1025,7 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ListToolConfig(_)
                 | AppUiCommand::GetDiffPreview(_)
                 | AppUiCommand::ReadTaskOutput(_)
+                | AppUiCommand::ReadTaskArtifact(_)
                 | AppUiCommand::AuthStatus(_)
                 | AppUiCommand::AuthMe(_)
                 | AppUiCommand::ProfileLlmCatalog(_)
@@ -1536,6 +1537,7 @@ fn rpc_request_from_command(
         AppUiCommand::CancelTask(params) => serde_json::to_value(params),
         AppUiCommand::RestartTaskFromNode(params) => serde_json::to_value(params),
         AppUiCommand::ReadTaskOutput(params) => serde_json::to_value(params),
+        AppUiCommand::ReadTaskArtifact(params) => serde_json::to_value(params),
         AppUiCommand::AuthStatus(params) => serde_json::to_value(params),
         AppUiCommand::AuthSendCode(params) => serde_json::to_value(params),
         AppUiCommand::AuthVerify(params) => serde_json::to_value(params),
@@ -2025,6 +2027,17 @@ fn success_response_to_app_event(
                 .into(),
             )),
         },
+        methods::TASK_ARTIFACT_READ => {
+            match serde_json::from_value::<TaskArtifactReadResult>(result) {
+                Ok(result) => Ok(Some(autonomy_event(AutonomyResult::TaskArtifactRead(
+                    result,
+                )))),
+                Err(err) => Ok(Some(autonomy_decode_error(
+                    methods::TASK_ARTIFACT_READ,
+                    err,
+                ))),
+            }
+        }
         methods::TURN_INTERRUPT => Ok(Some(
             AppUiEvent::Status(AppUiStatus {
                 message: interrupt_ack_status(&result),
@@ -3555,6 +3568,9 @@ impl AppUiBackend for MockAppUiBackend {
             AppUiCommand::ReadTaskOutput(_) => Err(eyre!(
                 "mock app-ui backend does not implement task output reads yet"
             )),
+            AppUiCommand::ReadTaskArtifact(_) => Err(eyre!(
+                "mock app-ui backend does not implement task artifact reads yet"
+            )),
             _ => Err(eyre!(
                 "mock app-ui backend does not implement unsupported command {method} yet"
             )),
@@ -4090,8 +4106,8 @@ mod tests {
         ApprovalDecision, ApprovalRespondParams, ApprovalScopesListParams, DiffPreviewGetParams,
         InputItem, PermissionNetworkPolicy, PermissionProfileListParams, PermissionProfileMode,
         PermissionProfileSetParams, PermissionProfileUpdate, PreviewId, SessionOpenParams,
-        TaskCancelParams, TaskListParams, TaskOutputReadParams, TaskRestartFromNodeParams,
-        TurnInterruptParams, TurnStartParams,
+        TaskArtifactReadParams, TaskCancelParams, TaskListParams, TaskOutputReadParams,
+        TaskRestartFromNodeParams, TurnInterruptParams, TurnStartParams,
     };
     use serde_json::json;
     use std::{
@@ -4363,6 +4379,82 @@ mod tests {
         assert_eq!(result.agent_id, "ag-7");
         assert_eq!(result.artifact.id, "artifact-1");
         assert_eq!(result.content.as_deref(), Some("artifact body"));
+    }
+
+    #[test]
+    fn protocol_command_serializes_task_artifact_read() {
+        let task_id = TaskId::default();
+        let request = rpc_request_from_command(
+            "tui-11".into(),
+            AppUiCommand::ReadTaskArtifact(TaskArtifactReadParams {
+                session_id: SessionKey("local:test".into()),
+                task_id: task_id.clone(),
+                artifact_id: Some("summary".into()),
+                path: None,
+                cursor: None,
+                limit_bytes: Some(4096),
+                profile_id: Some("coding".into()),
+                agent_id: None,
+            }),
+        )
+        .expect("request encodes");
+
+        assert_eq!(request.jsonrpc, "2.0");
+        assert_eq!(request.method, methods::TASK_ARTIFACT_READ);
+        assert_eq!(request.params["session_id"], "local:test");
+        assert_eq!(request.params["task_id"], serde_json::json!(task_id));
+        assert_eq!(request.params["artifact_id"], "summary");
+        assert_eq!(request.params["profile_id"], "coding");
+        assert!(request.params.get("path").is_none());
+    }
+
+    #[test]
+    fn protocol_decodes_task_artifact_read_result() {
+        let mut exchange = ProtocolExchange::default();
+        let task_id = TaskId::default();
+        let request = exchange
+            .build_tracked_request(AppUiCommand::ReadTaskArtifact(TaskArtifactReadParams {
+                session_id: SessionKey("local:test".into()),
+                task_id: task_id.clone(),
+                artifact_id: Some("summary".into()),
+                path: None,
+                cursor: None,
+                limit_bytes: Some(4096),
+                profile_id: None,
+                agent_id: None,
+            }))
+            .expect("tracked request");
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": {
+                "session_id": "local:test",
+                "task_id": task_id,
+                "artifact": {
+                    "id": "summary",
+                    "title": "Summary",
+                    "kind": "markdown",
+                    "status": "ready"
+                },
+                "content": "task artifact body",
+                "has_more": false
+            }
+        });
+
+        let event = exchange
+            .decode_rpc_text(&response.to_string())
+            .expect("response decodes")
+            .expect("event");
+
+        let ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::TaskArtifactRead(result),
+        }) = event
+        else {
+            panic!("expected task artifact read event");
+        };
+        assert_eq!(result.task_id, task_id);
+        assert_eq!(result.artifact.id, "summary");
+        assert_eq!(result.content.as_deref(), Some("task artifact body"));
     }
 
     #[test]

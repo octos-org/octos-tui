@@ -3,9 +3,9 @@ use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
     ApprovalRespondParams, DiffPreviewGetParams, EnvelopeNotification, EnvelopeToolEndStatus,
     InputItem, MessageDeltaEvent, MessagePersistedEvent, Payload, ReplayLossyEvent,
-    SessionOpenParams, TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState,
-    TaskUpdatedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
-    TurnStartParams, UiNotification, UiProgressEvent,
+    SessionOpenParams, TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams,
+    TaskRuntimeState, TaskUpdatedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId,
+    TurnInterruptParams, TurnStartParams, UiNotification, UiProgressEvent,
 };
 use octos_core::{Message, MessageRole, SessionKey, TaskId, ThreadId};
 use serde_json::Value;
@@ -42,6 +42,7 @@ use crate::{
 
 const TASK_OUTPUT_TAIL_BYTES: usize = 600;
 const TASK_OUTPUT_READ_LIMIT_BYTES: u64 = 4096;
+const TASK_ARTIFACT_READ_LIMIT_BYTES: u64 = 4096;
 
 #[derive(Default)]
 struct TurnActivitySummary {
@@ -297,6 +298,9 @@ impl Store {
             Ok(Some(crate::autonomy::AutonomyCommand::Agents(cmd))) => {
                 self.dispatch_agents_command(cmd)
             }
+            Ok(Some(crate::autonomy::AutonomyCommand::Task(cmd))) => {
+                self.dispatch_task_command(cmd)
+            }
             Ok(Some(crate::autonomy::AutonomyCommand::Goal(cmd))) => {
                 self.dispatch_goal_command(cmd)
             }
@@ -307,6 +311,50 @@ impl Store {
             Err(err) => {
                 self.state.status = err.to_string();
                 None
+            }
+        }
+    }
+
+    fn dispatch_task_command(&mut self, cmd: crate::autonomy::TaskCommand) -> Option<AppUiCommand> {
+        use crate::autonomy::TaskCommand;
+        let session_id = self.active_autonomy_session_id()?;
+        let profile_id = self
+            .state
+            .active_session()
+            .and_then(|session| session.profile_id.clone());
+        match cmd {
+            TaskCommand::ArtifactRead { task_id, selector } => {
+                if !self.require_appui_feature(crate::model::APPUI_FEATURE_TASK_ARTIFACTS_V1) {
+                    return None;
+                }
+                if !self.require_appui_method(crate::model::APPUI_METHOD_TASK_ARTIFACT_READ) {
+                    return None;
+                }
+                let Ok(task_id) = task_id.parse::<TaskId>() else {
+                    self.state.status = format!("Invalid task id `{task_id}`");
+                    return None;
+                };
+                let (artifact_id, path, label) = match selector {
+                    crate::autonomy::TaskArtifactSelector::Id(id) => {
+                        let label = id.clone();
+                        (Some(id), None, label)
+                    }
+                    crate::autonomy::TaskArtifactSelector::Path(path) => {
+                        let label = path.clone();
+                        (None, Some(path), label)
+                    }
+                };
+                self.state.status = format!("Reading task artifact {label} for {task_id}");
+                Some(AppUiCommand::ReadTaskArtifact(TaskArtifactReadParams {
+                    session_id,
+                    task_id,
+                    artifact_id,
+                    path,
+                    cursor: None,
+                    limit_bytes: Some(TASK_ARTIFACT_READ_LIMIT_BYTES),
+                    profile_id,
+                    agent_id: None,
+                }))
             }
         }
     }
@@ -2183,6 +2231,19 @@ impl Store {
         false
     }
 
+    fn require_appui_feature(&mut self, feature: &'static str) -> bool {
+        if self
+            .state
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.supports_feature(feature))
+        {
+            return true;
+        }
+        self.state.status = format!("AppUI feature `{feature}` is not advertised");
+        false
+    }
+
     fn require_mutating_appui_method(&mut self, method: &'static str) -> bool {
         if self.state.readonly {
             self.state.status = format!("Read-only mode: {method} disabled");
@@ -3324,6 +3385,15 @@ impl Store {
                     result.content,
                 );
                 self.state.status = format!("Agent {} artifact loaded: {title}", result.agent_id);
+            }
+            AutonomyResult::TaskArtifactRead(result) => {
+                let title = result.artifact.title.clone();
+                self.state.artifact_detail.open_task_artifact(
+                    &result.task_id,
+                    &result.artifact,
+                    result.content,
+                );
+                self.state.status = format!("Task {} artifact loaded: {title}", result.task_id);
             }
             AutonomyResult::AgentInterrupt(result) => {
                 if let Some(agent) = result.agent.clone() {
@@ -10871,6 +10941,7 @@ mod tests {
                 crate::model::APPUI_METHOD_AGENT_OUTPUT_READ,
                 crate::model::APPUI_METHOD_AGENT_ARTIFACT_LIST,
                 crate::model::APPUI_METHOD_AGENT_ARTIFACT_READ,
+                crate::model::APPUI_METHOD_TASK_ARTIFACT_READ,
                 crate::model::APPUI_METHOD_AGENT_INTERRUPT,
                 crate::model::APPUI_METHOD_AGENT_CLOSE,
                 crate::model::APPUI_METHOD_SESSION_GOAL_GET,
@@ -10883,7 +10954,10 @@ mod tests {
                 crate::model::APPUI_METHOD_LOOP_RESUME,
                 crate::model::APPUI_METHOD_LOOP_FIRE_NOW,
             ],
-            [crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1],
+            [
+                crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1,
+                crate::model::APPUI_FEATURE_TASK_ARTIFACTS_V1,
+            ],
         ));
         store
     }
@@ -10984,6 +11058,56 @@ mod tests {
             }
             other => panic!("expected ReadAgentArtifact, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn task_artifact_dispatches_task_artifact_read() {
+        let mut store = protocol_store_with_autonomy();
+        let task_id = "00000000-0000-0000-0000-000000000007";
+        store.state.composer = format!("/task artifact {task_id} summary");
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::ReadTaskArtifact(params) => {
+                assert_eq!(params.session_id, SessionKey("local:test".into()));
+                assert_eq!(params.task_id.to_string(), task_id);
+                assert_eq!(params.artifact_id.as_deref(), Some("summary"));
+                assert!(params.path.is_none());
+                assert_eq!(params.profile_id.as_deref(), Some("coding"));
+                assert_eq!(params.limit_bytes, Some(TASK_ARTIFACT_READ_LIMIT_BYTES));
+            }
+            other => panic!("expected ReadTaskArtifact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_artifact_dispatches_path_selector() {
+        let mut store = protocol_store_with_autonomy();
+        let task_id = "00000000-0000-0000-0000-000000000007";
+        store.state.composer = format!("/task read-artifact {task_id} path:reports/out.md");
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::ReadTaskArtifact(params) => {
+                assert_eq!(params.task_id.to_string(), task_id);
+                assert!(params.artifact_id.is_none());
+                assert_eq!(params.path.as_deref(), Some("reports/out.md"));
+            }
+            other => panic!("expected ReadTaskArtifact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_artifact_requires_task_artifact_feature() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_TASK_ARTIFACT_READ,
+        ]));
+        store.state.composer = "/task artifact 00000000-0000-0000-0000-000000000007 summary".into();
+
+        assert!(store.compose_command().is_none());
+        assert!(
+            store
+                .state
+                .status
+                .contains(crate::model::APPUI_FEATURE_TASK_ARTIFACTS_V1)
+        );
     }
 
     #[test]
@@ -11917,6 +12041,53 @@ mod tests {
         assert!(store.state.artifact_detail.subtitle.contains("ag-7"));
         assert_eq!(store.state.artifact_detail.content, "artifact body");
         assert_eq!(store.state.status, "Agent ag-7 artifact loaded: notes.md");
+    }
+
+    #[test]
+    fn autonomy_task_artifact_read_opens_detail_modal() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        use octos_core::ui_protocol::{TaskArtifactReadResult, TaskArtifactRecord};
+        use std::collections::BTreeMap;
+
+        let mut store = protocol_store_with_autonomy();
+        let task_id: TaskId = "00000000-0000-0000-0000-000000000007"
+            .parse()
+            .expect("task id");
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::TaskArtifactRead(TaskArtifactReadResult {
+                session_id: SessionKey("local:test".into()),
+                task_id: task_id.clone(),
+                agent_id: None,
+                artifact: TaskArtifactRecord {
+                    id: "summary".into(),
+                    title: "Summary".into(),
+                    kind: "markdown".into(),
+                    status: "ready".into(),
+                    path: None,
+                    content: None,
+                    extra: BTreeMap::new(),
+                },
+                content: Some("task artifact body".into()),
+                cursor: None,
+                next_cursor: None,
+                has_more: false,
+            }),
+        }));
+
+        assert!(store.state.artifact_detail.active);
+        assert_eq!(store.state.artifact_detail.title, "Summary");
+        assert!(
+            store
+                .state
+                .artifact_detail
+                .subtitle
+                .contains(&task_id.to_string())
+        );
+        assert_eq!(store.state.artifact_detail.content, "task artifact body");
+        assert_eq!(
+            store.state.status,
+            format!("Task {task_id} artifact loaded: Summary")
+        );
     }
 
     #[test]

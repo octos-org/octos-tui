@@ -152,6 +152,9 @@ pub const APPUI_SKILLS_MENU_METHODS_ANY: &[&str] = &[
 /// `coding.autonomy.v1`; old servers must hide the controls instead
 /// of being probed for unsupported methods.
 pub const APPUI_FEATURE_CODING_AUTONOMY_V1: &str = crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1;
+pub const APPUI_FEATURE_TASK_ARTIFACTS_V1: &str = crate::model::APPUI_FEATURE_TASK_ARTIFACTS_V1;
+pub const APPUI_TASK_ARTIFACT_MENU_METHODS_ANY: &[&str] =
+    &[crate::model::APPUI_METHOD_TASK_ARTIFACT_READ];
 pub const APPUI_AGENTS_MENU_METHODS_ANY: &[&str] = &[
     crate::model::APPUI_METHOD_AGENT_LIST,
     crate::model::APPUI_METHOD_AGENT_STATUS_READ,
@@ -175,6 +178,7 @@ pub const APPUI_LOOP_MENU_METHODS_ANY: &[&str] = &[
     crate::model::APPUI_METHOD_LOOP_FIRE_NOW,
 ];
 const AUTONOMY_FEATURES: &[&str] = &[APPUI_FEATURE_CODING_AUTONOMY_V1];
+const TASK_ARTIFACT_FEATURES: &[&str] = &[APPUI_FEATURE_TASK_ARTIFACTS_V1];
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandRegistry {
@@ -615,6 +619,18 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
                 .with_required_methods_any(APPUI_SKILLS_MENU_METHODS_ANY),
             inline_args: InlineArgMode::Optional,
             entry: CommandEntry::LocalAction(LocalAction::Skills),
+        },
+        CommandSpec {
+            name: "task",
+            aliases: &[],
+            description: "Read backend task artifacts.",
+            category: CommandCategory::Runtime,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_any(APPUI_TASK_ARTIFACT_MENU_METHODS_ANY)
+                .with_required_features(TASK_ARTIFACT_FEATURES),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::Custom("autonomy")),
         },
         // M15-E autonomy entry points. Each command is hidden unless
         // the server advertises `coding.autonomy.v1`. The actual RPC

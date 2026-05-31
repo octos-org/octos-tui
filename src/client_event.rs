@@ -1,4 +1,8 @@
-use octos_core::{SessionKey, app_ui::AppUiEvent, ui_protocol::PermissionProfileSelection};
+use octos_core::{
+    SessionKey,
+    app_ui::AppUiEvent,
+    ui_protocol::{PermissionProfileSelection, TaskArtifactReadResult},
+};
 
 use crate::model::{
     AgentArtifactListResult, AgentArtifactReadResult, AgentCloseResult, AgentInterruptResult,
@@ -201,6 +205,7 @@ pub enum AutonomyResult {
     AgentOutput(AgentOutputReadResult),
     AgentArtifacts(AgentArtifactListResult),
     AgentArtifactRead(AgentArtifactReadResult),
+    TaskArtifactRead(TaskArtifactReadResult),
     AgentInterrupt(AgentInterruptResult),
     AgentClose(AgentCloseResult),
     GoalGet(SessionGoalGetResult),
