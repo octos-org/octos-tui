@@ -368,6 +368,11 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
                 return KeyAction::Send(command);
             }
         }
+        KeyCode::Char('x') if store.state.focus == FocusPane::Tasks => {
+            if let Some(command) = store.cancel_task_command() {
+                return KeyAction::Send(command);
+            }
+        }
         KeyCode::Char('d') if store.state.focus != FocusPane::Composer => {
             if let Some(command) = store.read_diff_preview_command() {
                 return KeyAction::Send(command);
