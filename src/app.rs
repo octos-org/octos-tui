@@ -774,7 +774,6 @@ fn push_formatted_body_marked(
     bg: Option<Color>,
 ) {
     let mut in_code = false;
-    let mut code_language: Option<String> = None;
     let mut last_blank = false;
     let mut prose = Vec::new();
     let mut table = Vec::new();
@@ -786,36 +785,32 @@ fn push_formatted_body_marked(
         if let Some(rest) = line.trim_start().strip_prefix("```") {
             flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg);
-            let label = if in_code {
-                let language = code_language.take();
+            if in_code {
                 in_code = false;
-                language
-                    .map(|language| format!("end code {language}"))
-                    .unwrap_or_else(|| "end code".to_string())
+                lines.push(chat_line(
+                    vec![
+                        Span::styled(indent, style_bg(palette.border(), bg)),
+                        Span::styled("└─", style_bg(palette.border(), bg)),
+                    ],
+                    bg,
+                ));
             } else {
+                in_code = true;
                 let language = rest
-                    .trim()
                     .split_whitespace()
                     .next()
                     .filter(|language| !language.is_empty())
-                    .map(str::to_string);
-                code_language = language.clone();
-                in_code = true;
-                language
-                    .map(|language| format!("code {language}"))
-                    .unwrap_or_else(|| "code".to_string())
-            };
-            lines.push(chat_line(
-                vec![
-                    Span::styled(indent, style_bg(palette.border(), bg)),
-                    Span::styled(label, style_bg(palette.selected(), bg)),
-                    Span::styled(
-                        " ------------------------------------------------",
-                        style_bg(palette.border(), bg),
-                    ),
-                ],
-                bg,
-            ));
+                    .unwrap_or("code")
+                    .to_string();
+                lines.push(chat_line(
+                    vec![
+                        Span::styled(indent, style_bg(palette.border(), bg)),
+                        Span::styled("┌─ ", style_bg(palette.border(), bg)),
+                        Span::styled(language, style_bg(palette.selected(), bg)),
+                    ],
+                    bg,
+                ));
+            }
             last_blank = false;
             continue;
         }
@@ -825,6 +820,7 @@ fn push_formatted_body_marked(
             lines.push(chat_line(
                 vec![
                     Span::styled(indent, style_bg(palette.border(), bg)),
+                    Span::styled("│ ", style_bg(palette.border(), bg)),
                     Span::styled(
                         truncate_terminal_line(line, CODE_BLOCK_LINE_LIMIT),
                         style_bg(palette.muted(), bg),
@@ -938,6 +934,25 @@ fn push_formatted_body_marked(
             continue;
         }
 
+        if let Some(text) = markdown_blockquote(line) {
+            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg);
+            // Render as a quoted line with a left bar + muted italics, instead of
+            // leaking the literal `>` marker into prose.
+            let mut spans = vec![
+                Span::styled(indent, style_bg(palette.border(), bg)),
+                Span::styled("▌ ", style_bg(palette.muted(), bg)),
+            ];
+            spans.extend(inline_markdown_spans(
+                text,
+                style_bg(palette.muted().add_modifier(Modifier::ITALIC), bg),
+                style_bg(palette.title().add_modifier(Modifier::BOLD), bg),
+                style_bg(palette.selected(), bg),
+            ));
+            lines.push(chat_line(spans, bg));
+            continue;
+        }
+
         flush_markdown_table(lines, palette, &mut table, indent, bg);
         prose.push(line.to_string());
     }
@@ -1039,9 +1054,12 @@ fn flush_markdown_table(
 }
 
 fn table_cell_width(cell: &str) -> usize {
+    // Column padding must match the terminal's *display* width, not the char
+    // count — emoji/CJK render at width 2 but are a single char, so
+    // chars().count() under-pads their columns and misaligns the table.
     restore_streamed_sentence_spacing(&plain_inline_markdown(cell))
-        .chars()
-        .count()
+        .as_str()
+        .width()
 }
 
 fn chat_line(spans: Vec<Span<'static>>, bg: Option<Color>) -> Line<'static> {
@@ -1126,6 +1144,15 @@ fn markdown_bullet(line: &str) -> Option<&str> {
         .or_else(|| trimmed.strip_prefix("* "))
         .filter(|text| !text.trim().is_empty())
         .map(str::trim)
+}
+
+fn markdown_blockquote(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    trimmed
+        .strip_prefix("> ")
+        .or_else(|| trimmed.strip_prefix('>'))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
 }
 
 fn markdown_numbered(line: &str) -> Option<(&str, &str)> {
@@ -4536,6 +4563,83 @@ mod tests {
     }
 
     #[test]
+    fn table_cell_width_uses_display_width_for_wide_characters() {
+        // Regression: emoji/CJK have display width 2 but a single char, so
+        // chars().count() under-padded their table columns and misaligned the
+        // separators. Width math must use display width.
+        assert_eq!(table_cell_width("ab"), 2);
+        assert_eq!(table_cell_width("🐳"), 2);
+        assert_eq!(table_cell_width("中文"), 4);
+        assert_eq!(table_cell_width("a🐳b"), 4);
+    }
+
+    #[test]
+    fn markdown_blockquote_detects_quote_lines() {
+        assert_eq!(markdown_blockquote("> quoted text"), Some("quoted text"));
+        assert_eq!(markdown_blockquote(">quoted"), Some("quoted"));
+        assert_eq!(markdown_blockquote("not a quote"), None);
+        assert_eq!(markdown_blockquote(">"), None);
+    }
+
+    #[test]
+    fn render_markdown_blockquote_strips_marker() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("> a quoted line")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let buffer = rendered_buffer(&app, Palette::for_theme(ThemeName::Codex));
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("a quoted line"));
+        // The literal markdown `>` marker must not leak into the rendered prose.
+        assert!(!text.contains("> a quoted line"));
+        assert!(text.contains("▌"));
+    }
+
+    #[test]
+    fn render_markdown_code_fence_uses_clean_gutter() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("```python\nprint('hi')\n```")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let buffer = rendered_buffer(&app, Palette::for_theme(ThemeName::Codex));
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("python"));
+        assert!(text.contains("print('hi')"));
+        // The verbose "end code … --------" footer is gone; a clean box gutter is used.
+        assert!(!text.contains("end code"));
+        assert!(text.contains("┌─"));
+        assert!(text.contains("└─"));
+    }
+
+    #[test]
     fn render_pipe_commands_are_not_treated_as_markdown_tables() {
         let app = AppState::new(
             vec![SessionView {
@@ -5242,8 +5346,10 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(text.contains("code rust"));
-        assert!(text.contains("end code rust"));
+        assert!(text.contains("┌─ "));
+        assert!(text.contains("rust"));
+        assert!(text.contains("└─"));
+        assert!(!text.contains("end code"));
         assert!(text.contains("let value ="));
         assert!(text.contains(" ..."));
         assert!(!text.contains("TAIL_UNIQUE_SHOULD_NOT_RENDER"));
