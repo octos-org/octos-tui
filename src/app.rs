@@ -281,15 +281,27 @@ const CODE_BLOCK_LINE_LIMIT: usize = 120;
 const COLLAPSED_TOOL_PREVIEW_LINES: usize = 1;
 const EXPANDED_TOOL_PREVIEW_LINES: usize = 24;
 
-/// An activity is "running" until it reaches a terminal state. The server
-/// reports several non-terminal task states beyond `running`/`queued` — e.g.
-/// `TaskRuntimeState::Active` (`"active"`) and `"delivering_outputs"` — so an
-/// explicit running-list silently miscounts those as inactive and flips the
-/// agent-task group title to "Agent task completed" while a sub-agent is still
-/// working. Classify by terminality instead, so any present (or future)
-/// non-terminal state counts as active.
+/// True while an activity is genuinely in-flight. Uses an EXPLICIT set of
+/// running states (tool `running`/`streaming`, task `active`/`delivering_outputs`/
+/// `pending`/`queued`, or a `<pct>%` progress) rather than "anything
+/// non-terminal". A "not-terminal" rule over-counts: a row whose status never
+/// reaches a terminal value — e.g. a file-mutation / diff-preview row stuck at
+/// `preview ready` / `pending_store` — would pin the chip on "Orchestrating…"
+/// forever. Sub-agent liveness is tracked separately via the task count
+/// ([`running_subagents_for_chip`]), so anything not in this set is treated as
+/// not-running here.
 fn is_running_activity(item: &ActivityItem) -> bool {
-    !activity_is_completed(item) && !activity_is_failed(item) && !activity_is_cancelled(item)
+    let status = item.status.trim().to_ascii_lowercase();
+    matches!(
+        status.as_str(),
+        "running"
+            | "queued"
+            | "pending"
+            | "active"
+            | "streaming"
+            | "delivering_outputs"
+            | "in_progress"
+    ) || status.ends_with('%')
 }
 
 fn render_sessions(app: &AppState, palette: Palette) -> List<'static> {
@@ -1708,7 +1720,14 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
         let turn_id = item.turn_id.as_ref();
         if last_turn != turn_id {
             if !group.is_empty() {
-                push_agent_task_group(lines, palette, last_turn, &group, app.expanded_tool_outputs);
+                push_agent_task_group(
+                    lines,
+                    palette,
+                    last_turn,
+                    &group,
+                    running_subagents_for_chip(app, last_turn),
+                    app.expanded_tool_outputs,
+                );
                 group.clear();
             }
             last_turn = turn_id;
@@ -1716,7 +1735,14 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
         group.push(item);
     }
     if !group.is_empty() {
-        push_agent_task_group(lines, palette, last_turn, &group, app.expanded_tool_outputs);
+        push_agent_task_group(
+            lines,
+            palette,
+            last_turn,
+            &group,
+            running_subagents_for_chip(app, last_turn),
+            app.expanded_tool_outputs,
+        );
     }
     if flow_activity.len() > recent.len() {
         lines.push(Line::from(vec![
@@ -1772,6 +1798,7 @@ fn push_turn_activity_log_section(
         palette,
         Some(&log.turn_id),
         &shown,
+        running_subagents_for_chip(app, Some(&log.turn_id)),
         app.expanded_tool_outputs,
     );
     if log.items.len() > shown.len() {
@@ -1804,6 +1831,7 @@ fn push_agent_task_group(
     palette: Palette,
     turn_id: Option<&octos_core::ui_protocol::TurnId>,
     items: &[&ActivityItem],
+    active_subagents: usize,
     expanded: bool,
 ) {
     if items.is_empty() {
@@ -1818,7 +1846,12 @@ fn push_agent_task_group(
         .filter(|item| activity_is_completed(item))
         .count();
     let failed = items.iter().filter(|item| activity_is_failed(item)).count();
-    let title = if active > 0 {
+    // `spawn` returns immediately, so the parent's tool-call rollup can be all
+    // "completed" while the sub-agents it launched are still running (tracked
+    // separately in `session.tasks`). Treat the turn as still orchestrating
+    // while any of its sub-agents are live, so the chip never says "completed"
+    // with work outstanding.
+    let title = if active > 0 || active_subagents > 0 {
         "Orchestrating..."
     } else if failed > 0 {
         "Agent task finished with errors"
@@ -1834,6 +1867,9 @@ fn push_agent_task_group(
     }
     if failed > 0 {
         metadata.push(format!("{failed} failed"));
+    }
+    if active_subagents > 0 {
+        metadata.push(format!("{active_subagents} sub-agent(s) running"));
     }
     if let Some(turn_id) = turn_id {
         metadata.push(format!("turn {}", short_id(&turn_id.0.to_string())));
@@ -2024,10 +2060,6 @@ fn activity_is_completed(item: &ActivityItem) -> bool {
 
 fn activity_is_failed(item: &ActivityItem) -> bool {
     matches!(item.success, Some(false)) || matches!(item.status.as_str(), "failed" | "error")
-}
-
-fn activity_is_cancelled(item: &ActivityItem) -> bool {
-    matches!(item.status.as_str(), "cancelled" | "canceled")
 }
 
 fn push_inline_diff_preview(
@@ -2223,6 +2255,26 @@ fn active_background_tasks(app: &AppState) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+/// Running sub-agents to attribute to an agent-task chip. Attributed to the
+/// chip whose turn is the active turn OR the latest turn — background sub-agents
+/// outlive the parent turn (it shows "done" while they keep running), so we must
+/// still surface them on that turn's chip. Older turns' chips get 0, so a
+/// completed earlier turn doesn't flip back to "Orchestrating".
+fn running_subagents_for_chip(
+    app: &AppState,
+    turn_id: Option<&octos_core::ui_protocol::TurnId>,
+) -> usize {
+    let is_current_turn = turn_id.is_some_and(|chip| {
+        app.active_turn().map(|(_, t)| t) == Some(chip)
+            || app.turn_activity_logs.last().map(|log| &log.turn_id) == Some(chip)
+    });
+    if is_current_turn {
+        active_background_tasks(app)
+    } else {
+        0
+    }
 }
 
 fn render_plan(app: &AppState, palette: Palette) -> Paragraph<'static> {
@@ -5605,6 +5657,77 @@ mod tests {
         assert!(text.contains("... +9 more"));
         assert!(text.contains("12 completed"));
         assert!(!text.contains("src/file_1.rs"));
+    }
+
+    #[test]
+    fn chip_stays_orchestrating_while_sub_agents_run_after_parent_calls_complete() {
+        // Parallel-spawn regression: `spawn` returns immediately, so the parent
+        // turn's tool calls are all "completed" while the spawned sub-agents
+        // (session.tasks, Running) are still working. The chip must NOT say
+        // "Agent task completed" — it should stay "Orchestrating…" and surface
+        // the running sub-agent count.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("launch agents to study X, Y, Z")],
+                tasks: vec![
+                    crate::model::TaskView {
+                        id: octos_core::TaskId::new(),
+                        title: "hermes-research".into(),
+                        state: TaskRuntimeState::Running,
+                        runtime_detail: None,
+                        output_tail: String::new(),
+                    },
+                    crate::model::TaskView {
+                        id: octos_core::TaskId::new(),
+                        title: "openclaw-research".into(),
+                        state: TaskRuntimeState::Running,
+                        runtime_detail: None,
+                        output_tail: String::new(),
+                    },
+                ],
+                // Parent turn has FINISHED (no live_reply) but the background
+                // sub-agents it spawned are still running — the chip must still
+                // attribute them (via latest-turn), not flip to "completed".
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_id.clone(),
+            request: Some("launch agents".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "spawn", "complete")
+                    .with_turn(turn_id.clone())
+                    .with_success(true),
+                ActivityItem::new(ActivityKind::Tool, "glob", "complete")
+                    .with_turn(turn_id)
+                    .with_success(true),
+            ],
+        });
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Orchestrating"),
+            "chip must stay Orchestrating while sub-agents run: {text:?}"
+        );
+        assert!(
+            text.contains("2 sub-agent(s) running"),
+            "chip should surface the running sub-agent count: {text:?}"
+        );
+        assert!(
+            !text.contains("Agent task completed"),
+            "chip must NOT report completed while sub-agents run: {text:?}"
+        );
     }
 
     #[test]
