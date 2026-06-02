@@ -1008,32 +1008,19 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
     })
 }
 
-/// M22 (#58): first-run ASCII splash. The narrow preview pane
-/// (80x24 layout) gives us only ~3 body rows after the title bar,
-/// so the splash body prioritises:
-///   line 1: tagline / call to action (always visible),
-///   line 2: a compact one-line OCTOS wordmark,
-///   line 3+: extended wordmark + stylised logo (visible when the
-///           preview row budget grows on a wider terminal).
-/// The title line "OCTOS" is rendered separately by the preview
-/// frame, so this body intentionally repeats the wordmark in
-/// ASCII below the tagline for users on wide terminals while
-/// keeping the most important content in the first row.
+/// M22 (#58): first-run ASCII splash, shown in the onboarding preview
+/// pane — a one-line tagline above the OCTOS figlet wordmark. The title
+/// line "OCTOS" is rendered separately by the preview frame.
 const ONBOARDING_SPLASH_ASCII: &str = "\
-  Welcome to Octos — local solo onboarding
-  [ O ][ C ][ T ][ O ][ S ]
-   ____   ____ _____ ___  ____
-  / __ \\ / ___|_   _/ _ \\/ ___|
- | |  | | |     | || | | \\___ \\
- | |__| | |___  | || |_| |___) |
-  \\____/ \\____| |_| \\___/|____/
-
-       .-''''-.
-    .-'  o  o  '-.
-   /      __      \\
-   \\   .-'  '-.   /
- ~~~\\_/  /\\/\\  \\_/~~~
-      \\_/ /\\ \\_/";
+  Welcome to Octos — Your Coding Buddy
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~ ██████╗  ██████╗████████╗ ██████╗ ███████╗~
+~██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔════╝~
+~██║   ██║██║        ██║   ██║   ██║███████╗~
+~██║   ██║██║        ██║   ██║   ██║╚════██║~
+~╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║~
+~ ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~";
 
 fn onboarding_family_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let Some(catalog) = ctx.app.profile_llm_catalog else {
