@@ -4571,12 +4571,15 @@ impl Store {
                 .state
                 .session_usage
                 .entry(event.session_id.clone())
-                .or_insert((None, None));
-            if token_cost.total_tokens.is_some() {
-                entry.0 = token_cost.total_tokens;
+                .or_insert((None, None, None));
+            if token_cost.input_tokens.is_some() {
+                entry.0 = token_cost.input_tokens;
+            }
+            if token_cost.output_tokens.is_some() {
+                entry.1 = token_cost.output_tokens;
             }
             if token_cost.session_cost.is_some() {
-                entry.1 = token_cost.session_cost;
+                entry.2 = token_cost.session_cost;
             }
         }
         let status = progress_status(&event);

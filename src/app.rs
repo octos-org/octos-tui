@@ -2137,7 +2137,12 @@ fn push_compact_tool_preview(
 
 fn activity_status_icon(item: &ActivityItem, palette: Palette) -> (&'static str, Style) {
     if is_running_activity(item) {
-        ("◻", palette.selected())
+        // Animate the marker for in-progress rows (octopus spinner) so a row
+        // like "Background work started for run_pipeline" visibly reads as
+        // still-running rather than a static dot. Uses the shared
+        // process-clock spinner (not terminal SGR blink, which is unreliable /
+        // distracting and inconsistently supported).
+        (spinner_frame(), palette.selected())
     } else if activity_is_failed(item) {
         ("✗", Style::default().fg(palette.danger))
     } else if activity_is_completed(item) {
@@ -3034,11 +3039,16 @@ fn orchestration_indicator(app: &AppState) -> Option<String> {
     } else {
         String::new()
     };
-    // Cumulative tokens + session cost (from token_cost progress updates).
+    // In/out tokens + cumulative session cost (from token_cost progress).
+    // `↑` = input/prompt tokens, `↓` = output tokens.
     let mut usage = String::new();
-    if let Some((tokens, cost)) = app.session_usage.get(&session.id) {
-        if let Some(tokens) = tokens {
-            usage.push_str(&format!(" · {} tok", humanize_token_count(*tokens)));
+    if let Some((input, output, cost)) = app.session_usage.get(&session.id) {
+        if input.is_some() || output.is_some() {
+            usage.push_str(&format!(
+                " · ↑{} ↓{}",
+                humanize_token_count(input.unwrap_or(0)),
+                humanize_token_count(output.unwrap_or(0)),
+            ));
         }
         if let Some(cost) = cost.filter(|c| *c > 0.0) {
             usage.push_str(&format!(" · ${cost:.4}"));
@@ -4090,14 +4100,15 @@ mod tests {
                 phase: Some("orchestrating".into()),
             },
         );
-        // Cumulative usage (from token_cost progress) is folded in.
+        // In/out tokens + cost (from token_cost progress) is folded in.
         app.session_usage
-            .insert(session_id.clone(), (Some(34_211), Some(0.0123)));
+            .insert(session_id.clone(), (Some(34_211), Some(374), Some(0.0123)));
         let indicator =
             orchestration_indicator(&app).expect("active orchestration shows an indicator");
         assert!(indicator.contains("Orchestrating"), "{indicator}");
         assert!(indicator.contains("2 agents"), "{indicator}");
-        assert!(indicator.contains("34.2k tok"), "{indicator}");
+        assert!(indicator.contains("↑34.2k"), "{indicator}");
+        assert!(indicator.contains("↓374"), "{indicator}");
         assert!(indicator.contains("$0.0123"), "{indicator}");
 
         // The re-entry gap (no running agents, a continuation pending) STILL
