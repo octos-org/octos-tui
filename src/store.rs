@@ -4817,12 +4817,27 @@ impl Store {
                 // If a prior turn's live_reply is still bound (its TurnCompleted
                 // was missed or this turn started before it committed), commit
                 // the prior answer first so it is neither lost nor merged.
+                // (No-op when the bound buffer is for the SAME turn — that case
+                // is the lazy-bind/replay race handled just below.)
                 self.commit_pending_live_reply_for_turn_switch(&event.session_id, &event.turn_id);
                 if let Some(session) = self.find_session_mut(&event.session_id) {
-                    session.live_reply = Some(LiveReply {
-                        turn_id: event.turn_id,
-                        text: String::new(),
-                    });
+                    // Out-of-order lifecycle (nit 1): a MessageDelta may have
+                    // already lazy-bound THIS turn before its TurnStarted was
+                    // delivered/replayed. Replacing the buffer unconditionally
+                    // would wipe the accumulated text, so preserve a buffer that
+                    // is already bound to the same turn; only bind a fresh empty
+                    // one when there is no buffer (the prior turn was committed/
+                    // dropped above for the different-turn case).
+                    let same_turn_already_bound = session
+                        .live_reply
+                        .as_ref()
+                        .is_some_and(|live_reply| live_reply.turn_id == event.turn_id);
+                    if !same_turn_already_bound {
+                        session.live_reply = Some(LiveReply {
+                            turn_id: event.turn_id,
+                            text: String::new(),
+                        });
+                    }
                     self.state.status = format!("Turn started in {}", session.title);
                     self.state.set_run_state_in_progress();
                 }
@@ -5707,6 +5722,20 @@ impl Store {
     }
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
+        // Idempotence vs a turn-switch: if this turn was ALREADY finalized
+        // (committed or dropped) by `commit_pending_live_reply_for_turn_switch`,
+        // its late terminal is a no-op. Without this the late terminal would hit
+        // the `None` arm (when its successor already completed) and emit a FALSE
+        // "did not receive a final assistant answer" fallback for a turn that
+        // committed cleanly, or be swallowed by the `Some(mismatched)` arm —
+        // either way mishandling the already-closed turn. Consume the marker so
+        // a genuine future terminal for the same turn id is unaffected.
+        if self
+            .state
+            .take_turn_finalized_by_switch(&event.session_id, &event.turn_id)
+        {
+            return None;
+        }
         let seq = event.cursor.map(|cursor| cursor.seq).unwrap_or(0);
         let follow_tail = self.state.transcript_scroll == 0;
         let complete_live_plan = self.turn_had_completion_activity(&event.turn_id);
@@ -5778,6 +5807,15 @@ impl Store {
     }
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
+        // Idempotence vs a turn-switch (see `commit_live_reply`): a late
+        // `TurnError` for a turn already finalized at a switch boundary is a
+        // no-op — the turn was committed/dropped at switch time.
+        if self
+            .state
+            .take_turn_finalized_by_switch(&event.session_id, &event.turn_id)
+        {
+            return None;
+        }
         let follow_tail = self.state.transcript_scroll == 0;
         let fallback_summary =
             self.turn_error_fallback_message(&event.turn_id, &event.code, &event.message);
@@ -5894,6 +5932,13 @@ impl Store {
             Some(turn_id) => turn_id,
             None => return,
         };
+        // The switch finalizes the prior turn here (committed if non-empty,
+        // dropped if empty). Record it so its OWN late `TurnCompleted`/
+        // `TurnError` — which may still arrive on an out-of-order stream — is
+        // recognized as already-handled and no-ops instead of emitting a false
+        // fallback card or mishandling the dropped-empty case.
+        self.state
+            .mark_turn_finalized_by_switch(session_id, &prior_turn);
         let complete_live_plan = self.turn_had_completion_activity(&prior_turn);
         let fallback_summary = self.turn_completion_fallback_message(&prior_turn);
         let partial_fallback_summary = self.turn_partial_completion_fallback_message(&prior_turn);
@@ -10757,6 +10802,248 @@ mod tests {
             .expect("a fresh live reply binds to the new turn");
         assert_eq!(live_reply.turn_id, next_turn_id);
         assert_eq!(live_reply.text, "next answer");
+    }
+
+    #[test]
+    fn late_prior_terminal_after_switch_does_not_emit_false_fallback() {
+        // Out-of-order lifecycle: deltas lazy-bind turn A (non-empty), then a
+        // delta for turn B switches turns — A is committed by the switch — then
+        // B completes (live_reply == None). A LATE `TurnCompleted{A}` then
+        // arrives. Because A was already finalized at switch time, the late
+        // terminal must be a NO-OP: no spurious "did not receive a final
+        // assistant answer" fallback card (which the `None` arm would otherwise
+        // emit), and no duplicate commit of A's answer.
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Deltas lazy-bind turn A (non-empty).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                text: "answer A".into(),
+            },
+        )));
+        // A delta for turn B switches turns: A is committed at the switch.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                text: "answer B".into(),
+            },
+        )));
+        // B completes — live_reply is now None.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let before: Vec<String> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        // A's committed answer is present (one copy).
+        assert_eq!(
+            before.iter().filter(|c| c.contains("answer A")).count(),
+            1,
+            "turn A must be committed exactly once before the late terminal: {before:?}"
+        );
+
+        // LATE TurnCompleted{A} arrives after B already committed.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_a.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let after: Vec<String> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert!(
+            !after
+                .iter()
+                .any(|c| c.contains("did not receive a final assistant answer")),
+            "late prior terminal after switch must NOT emit a false fallback card: {after:?}"
+        );
+        assert_eq!(
+            after, before,
+            "late prior terminal after switch must be a no-op (no new/duplicated messages)"
+        );
+    }
+
+    #[test]
+    fn empty_prior_dropped_on_switch_late_terminal_is_noop() {
+        // Empty turn A is bound (TurnStarted, no deltas), then a delta for turn
+        // B switches turns: the empty A is DROPPED at the switch and marked as
+        // finalized-by-switch. Turn B then completes (live_reply == None). A
+        // LATE `TurnCompleted{A}` then arrives. Intended behavior: the late
+        // terminal is a NO-OP — the empty turn was already handled (dropped) at
+        // switch time. Pre-fix, this hit the `None` arm and emitted a spurious
+        // "did not receive a final assistant answer" fallback for a turn that
+        // was intentionally dropped; the finalized-by-switch marker suppresses
+        // that.
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Empty turn A: TurnStarted, no deltas.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_a.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        // Switch to turn B via a delta — empty A is dropped at the switch.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                text: "answer B".into(),
+            },
+        )));
+        // Turn B completes — live_reply is now None.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let before: Vec<String> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        // B committed its own answer exactly once; no fallback so far.
+        assert_eq!(
+            before.iter().filter(|c| c.contains("answer B")).count(),
+            1,
+            "turn B must commit its own answer exactly once: {before:?}"
+        );
+        assert!(
+            !before
+                .iter()
+                .any(|c| c.contains("did not receive a final assistant answer")),
+            "no fallback should exist before the late terminal: {before:?}"
+        );
+
+        // LATE TurnCompleted{A} arrives after B has completed (live_reply None).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_a.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let after: Vec<String> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        // No spurious/duplicate fallback for the dropped empty turn.
+        assert!(
+            !after
+                .iter()
+                .any(|c| c.contains("did not receive a final assistant answer")),
+            "dropped-empty prior turn's late terminal must NOT emit a fallback card: {after:?}"
+        );
+        assert_eq!(
+            after, before,
+            "late terminal for a dropped-empty prior turn must be a no-op"
+        );
+    }
+
+    #[test]
+    fn turn_started_after_delta_preserves_same_turn_buffer() {
+        // nit 1: a MessageDelta lazy-binds turn A with "partial ", then a
+        // TurnStarted for the SAME turn A is delivered/replayed. The previously
+        // accumulated text must be PRESERVED (not wiped), so a subsequent delta
+        // appends and the committed assistant message is the full "partial rest".
+        let turn_a = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                text: "partial ".into(),
+            },
+        )));
+        // Same-turn TurnStarted arrives AFTER the lazy-bound delta.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_a.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                text: "rest".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_a,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let committed = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("turn A commits an assistant message")
+            .content
+            .clone();
+        assert!(
+            committed.contains("partial rest"),
+            "same-turn TurnStarted must preserve the lazy-bound buffer (got: {committed:?})"
+        );
     }
 
     fn envelope_notification(session_id: SessionKey, seq: u64, payload: Payload) -> UiNotification {

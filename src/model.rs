@@ -3040,6 +3040,22 @@ pub struct AppState {
     /// Cleared on the session's next non-retry progress event so a settled
     /// turn doesn't linger as "retrying".
     pub session_retry: std::collections::HashMap<SessionKey, UiRetryBackoff>,
+    /// Per-session set of turn ids that were already finalized (committed OR
+    /// dropped) by `commit_pending_live_reply_for_turn_switch` at a turn-switch
+    /// boundary. A prior turn's OWN late `TurnCompleted`/`TurnError` may still
+    /// arrive after the switch already closed it; the terminal handlers consume
+    /// this marker and no-op so they neither emit a false fallback card (for a
+    /// committed turn whose successor already completed and left `live_reply ==
+    /// None`) nor mishandle a dropped-empty turn. Bounded per session via the
+    /// paired FIFO queue (capped at [`Self::FINALIZED_BY_SWITCH_CAP`]) so an
+    /// adversarial/long-running session cannot grow it without bound.
+    pub finalized_by_switch: std::collections::HashMap<
+        SessionKey,
+        (
+            std::collections::HashSet<TurnId>,
+            std::collections::VecDeque<TurnId>,
+        ),
+    >,
     pub selected_session: usize,
     pub selected_task: usize,
     pub transcript_scroll: usize,
@@ -4316,6 +4332,54 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 }
 
 impl AppState {
+    /// Per-session cap on the [`AppState::finalized_by_switch`] marker set. A
+    /// long-running session that switches turns many times must not retain an
+    /// unbounded set of finalized turn ids — only the most recent switches can
+    /// realistically be followed by a late terminal, so older ids are evicted
+    /// FIFO.
+    pub const FINALIZED_BY_SWITCH_CAP: usize = 128;
+
+    /// Record that `turn_id` in `session_id` was finalized (committed OR
+    /// dropped) by a turn-switch, so the turn's OWN late terminal can be
+    /// recognized and treated as a no-op. Bounded FIFO per session.
+    pub fn mark_turn_finalized_by_switch(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        let (set, queue) = self
+            .finalized_by_switch
+            .entry(session_id.clone())
+            .or_default();
+        if set.insert(turn_id.clone()) {
+            queue.push_back(turn_id.clone());
+            while queue.len() > Self::FINALIZED_BY_SWITCH_CAP {
+                if let Some(evicted) = queue.pop_front() {
+                    set.remove(&evicted);
+                }
+            }
+        }
+    }
+
+    /// Consume the finalized-by-switch marker for `turn_id` in `session_id`,
+    /// returning `true` iff it was present (and removing it). A late terminal
+    /// for a turn that was already closed at a switch boundary uses this to
+    /// no-op exactly once.
+    pub fn take_turn_finalized_by_switch(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> bool {
+        let Some((set, queue)) = self.finalized_by_switch.get_mut(session_id) else {
+            return false;
+        };
+        if set.remove(turn_id) {
+            queue.retain(|id| id != turn_id);
+            if set.is_empty() {
+                self.finalized_by_switch.remove(session_id);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn from_snapshot(snapshot: AppUiSnapshot) -> Self {
         let panes = SnapshotPaneSeed::from_snapshot(&snapshot);
         Self::new_with_panes(
@@ -4361,6 +4425,7 @@ impl AppState {
             orchestration: std::collections::HashMap::new(),
             session_usage: std::collections::HashMap::new(),
             session_retry: std::collections::HashMap::new(),
+            finalized_by_switch: std::collections::HashMap::new(),
             selected_session,
             selected_task: 0,
             transcript_scroll: 0,
