@@ -10039,6 +10039,103 @@ mod tests {
     }
 
     #[test]
+    fn turn_completed_reconciles_leaked_running_activity_item() {
+        // Orphan activity-chip self-heal: a `ToolStarted` whose matching
+        // `ToolCompleted` never arrived (a leaked spawn_only chip / any future
+        // uncovered path) leaves a "running"-status item bound to the turn. When
+        // the turn reaches its terminal state (`TurnCompleted`) WITHOUT a
+        // completing event for that item, capturing the turn's activity must
+        // reconcile the stranded running item to a terminal display status so it
+        // can no longer count as in-flight ("Orchestrating…").
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "done");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            "run job".into(),
+        );
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-leaked"),
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let log = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_id)
+            .expect("turn activity log");
+        let leaked = log
+            .items
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-leaked"))
+            .expect("leaked item retained in log");
+        assert_ne!(
+            leaked.status, "running",
+            "the leaked running item must be reconciled to a terminal status, not left running"
+        );
+    }
+
+    #[test]
+    fn turn_error_reconciles_leaked_running_activity_item() {
+        // Same self-heal on the error terminal path: a stranded running item
+        // must be reconciled when the turn fails too.
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "partial");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            "run job".into(),
+        );
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-leaked"),
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_id.clone(),
+                code: "internal".into(),
+                message: "boom".into(),
+            },
+        )));
+
+        let log = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_id)
+            .expect("turn activity log");
+        let leaked = log
+            .items
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-leaked"))
+            .expect("leaked item retained in log");
+        assert_ne!(
+            leaked.status, "running",
+            "the leaked running item must be reconciled to a terminal status on turn error"
+        );
+    }
+
+    #[test]
     fn turn_completed_without_model_answer_inserts_fallback_summary() {
         let turn_id = TurnId::new();
         let mut store = store_with_empty_session();

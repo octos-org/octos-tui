@@ -317,27 +317,14 @@ const CODE_BLOCK_LINE_LIMIT: usize = 120;
 const COLLAPSED_TOOL_PREVIEW_LINES: usize = 1;
 const EXPANDED_TOOL_PREVIEW_LINES: usize = 24;
 
-/// True while an activity is genuinely in-flight. Uses an EXPLICIT set of
-/// running states (tool `running`/`streaming`, task `active`/`delivering_outputs`/
-/// `pending`/`queued`, or a `<pct>%` progress) rather than "anything
-/// non-terminal". A "not-terminal" rule over-counts: a row whose status never
-/// reaches a terminal value — e.g. a file-mutation / diff-preview row stuck at
-/// `preview ready` / `pending_store` — would pin the chip on "Orchestrating…"
-/// forever. Sub-agent liveness is tracked separately via the task count
-/// ([`running_subagent_titles_for_chip`]), so anything not in this set is treated as
-/// not-running here.
+/// True while an activity is genuinely in-flight. Thin wrapper over the shared
+/// [`crate::model::activity_status_is_running`] running-status set so the
+/// renderer's chip "active" count and the orphan activity-chip self-heal in
+/// [`crate::model::AppState::capture_completed_turn_activity`] stay in lockstep.
+/// Sub-agent liveness is tracked separately via the task count
+/// ([`running_subagent_titles_for_chip`]).
 fn is_running_activity(item: &ActivityItem) -> bool {
-    let status = item.status.trim().to_ascii_lowercase();
-    matches!(
-        status.as_str(),
-        "running"
-            | "queued"
-            | "pending"
-            | "active"
-            | "streaming"
-            | "delivering_outputs"
-            | "in_progress"
-    ) || status.ends_with('%')
+    crate::model::activity_status_is_running(&item.status)
 }
 
 fn render_sessions(app: &AppState, palette: Palette) -> List<'static> {
@@ -5952,6 +5939,100 @@ mod tests {
         assert!(
             !text.contains("Agent task completed"),
             "chip must NOT report completed while sub-agents run: {text:?}"
+        );
+    }
+
+    #[test]
+    fn leaked_running_item_in_terminal_turn_log_does_not_pin_orchestrating() {
+        // Orphan activity-chip self-heal: a `ToolStarted` whose matching
+        // `ToolCompleted` never arrived (a leaked spawn_only chip / any future
+        // uncovered path) leaves a "running"-status item bound to the turn. When
+        // the turn reaches its terminal state, `capture_completed_turn_activity`
+        // archives the turn's activity AND reconciles the stranded running item
+        // to a terminal status. With no live work and no running sub-agents, the
+        // captured chip must NOT stay pinned on "Orchestrating…" — its turn is
+        // over. This is the path that reappears after a reconnect: hydrate
+        // replays the unbalanced started-state and the turn re-completes through
+        // the same capture, healing the residual chip.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("run the background job"),
+                    Message::assistant("Kicked off the background job."),
+                ],
+                // No live_reply → this turn is terminal / not the active turn,
+                // and no sub-agent tasks remain.
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // Leaked started-state in the turn's live activity: status never reached
+        // terminal because no `ToolCompleted` arrived.
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-leaked"),
+        );
+        // The turn went terminal: capturing it must self-heal the leaked item.
+        assert!(app.capture_completed_turn_activity(&session_id, &turn_id));
+
+        let text = rendered_text(&app);
+        assert!(
+            !text.contains("Orchestrating"),
+            "a leaked running item in a terminal turn must not pin Orchestrating: {text:?}"
+        );
+        assert!(
+            !text.contains("1 active"),
+            "the leaked item must not be counted as active once its turn is terminal: {text:?}"
+        );
+    }
+
+    #[test]
+    fn leaked_running_item_in_active_turn_still_shows_orchestrating() {
+        // Guard against over-suppression: a "running" item whose turn IS the
+        // session's currently-active turn (live_reply present) is genuine
+        // in-flight work and MUST still read as Orchestrating. The self-heal
+        // only fires when the turn is captured as terminal; an active turn's
+        // live activity is never captured/reconciled.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run the live job")],
+                tasks: vec![],
+                // Active turn: live_reply present and pointing at turn_id.
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: String::new(),
+                }),
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-live"),
+        );
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Orchestrating"),
+            "the active turn's in-flight work must still read as Orchestrating: {text:?}"
         );
     }
 

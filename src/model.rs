@@ -4930,7 +4930,7 @@ impl AppState {
         session_id: &SessionKey,
         turn_id: &TurnId,
     ) -> bool {
-        let items = self
+        let mut items = self
             .activity
             .iter()
             .filter(|item| item.turn_id.as_ref() == Some(turn_id))
@@ -4938,6 +4938,20 @@ impl AppState {
             .collect::<Vec<_>>();
         if items.is_empty() {
             return false;
+        }
+
+        // Orphan activity-chip self-heal: the turn is now terminal, so any of its
+        // items still sitting in a running-type status is a leaked started-state
+        // (a `ToolStarted` whose `ToolCompleted` never arrived — a leaked
+        // spawn_only chip / any future uncovered path). Reconcile each to a
+        // terminal display status so the archived log can no longer count it as
+        // in-flight and pin the chip on "Orchestrating…" — including after a
+        // reconnect, which re-captures the replayed unbalanced state. A genuinely
+        // settled item ("complete"/"failed"/`success`) is untouched.
+        for item in &mut items {
+            if activity_status_is_running(&item.status) {
+                item.status = ACTIVITY_STATUS_INTERRUPTED.to_string();
+            }
         }
 
         let optimistic = self
@@ -5848,6 +5862,36 @@ pub fn task_state_label(state: TaskRuntimeState) -> &'static str {
         Some("cancelled") => "cancelled",
         _ => "unknown",
     }
+}
+
+/// Terminal display status applied to an [`ActivityItem`] whose turn went
+/// terminal while the item was still in a running-type status — a leaked
+/// started-state (orphan activity-chip self-heal). Chosen over "complete"
+/// (no false success ✓) and "failed" (no real failure ✗): it renders as a
+/// settled, neutral row and is read as not-running by [`activity_status_is_running`].
+pub const ACTIVITY_STATUS_INTERRUPTED: &str = "interrupted";
+
+/// True while an [`ActivityItem`] status counts as genuinely in-flight. This is
+/// the single source of truth for the running-type status set, shared by the
+/// renderer's `is_running_activity` (the chip's "active" count) and the orphan
+/// activity-chip self-heal in [`AppState::capture_completed_turn_activity`], so
+/// the reconcile and the render agree on exactly which statuses are "running".
+///
+/// Uses an EXPLICIT set of running states rather than "anything non-terminal":
+/// a row whose status never reaches a terminal value (e.g. a diff-preview row
+/// stuck at `preview ready` / `pending_store`) must NOT pin the chip forever.
+pub fn activity_status_is_running(status: &str) -> bool {
+    let status = status.trim().to_ascii_lowercase();
+    matches!(
+        status.as_str(),
+        "running"
+            | "queued"
+            | "pending"
+            | "active"
+            | "streaming"
+            | "delivering_outputs"
+            | "in_progress"
+    ) || status.ends_with('%')
 }
 
 /// Map a durable `agent/updated` record's `status` string to the terminal
