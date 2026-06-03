@@ -6572,7 +6572,7 @@ mod tests {
     #[test]
     fn chip_header_counts_full_turn_set_and_agrees_with_footer() {
         // End-to-end render guard: a 66-action turn's chip HEADER must read the
-        // full set ("66 action(s) · ... 64 completed") and AGREE with its sibling
+        // full set ("66 action(s) · ... 66 completed") and AGREE with its sibling
         // "... +63 more" footer — not the display-capped "3 action(s) · 3
         // completed". RED on the pre-fix code: the header counted only the last
         // 3 rendered children.

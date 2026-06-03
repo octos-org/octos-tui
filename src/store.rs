@@ -149,6 +149,29 @@ fn looks_like_partial_live_answer(text: &str) -> bool {
         .is_some_and(|ch| matches!(ch, '.' | '!' | '?' | ':' | ')' | ']' | '`'))
 }
 
+/// Finalize the accumulated `live_reply` text into the assistant message body
+/// for a turn that just completed. Empty streams fall back to the summary card;
+/// non-empty streams may be appended with a partial-answer note or have their
+/// plan checkboxes completed. Shared by `commit_live_reply` (matched-turn arm)
+/// and the lazy-bind path so a continuation turn renders the same way whether
+/// or not its `TurnStarted` was delivered.
+fn finalize_live_reply_text(
+    text: String,
+    complete_live_plan: bool,
+    fallback_summary: &str,
+    partial_fallback_summary: &str,
+) -> String {
+    if text.trim().is_empty() {
+        fallback_summary.to_string()
+    } else if complete_live_plan && looks_like_partial_live_answer(&text) {
+        format!("{}\n\n{}", text.trim_end(), partial_fallback_summary)
+    } else if complete_live_plan {
+        complete_plan_steps_in_text(&text)
+    } else {
+        text
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) struct SlashCommandMatch {
@@ -4787,6 +4810,14 @@ impl Store {
                 None
             }
             UiNotification::TurnStarted(event) => {
+                // A new turn for the active session starts a fresh live_reply
+                // UNCONDITIONALLY — server-INITIATED master-continuation turns
+                // (reason=child_completed / scatter_join_complete) carry no
+                // client-side handle, yet their assistant stream must render.
+                // If a prior turn's live_reply is still bound (its TurnCompleted
+                // was missed or this turn started before it committed), commit
+                // the prior answer first so it is neither lost nor merged.
+                self.commit_pending_live_reply_for_turn_switch(&event.session_id, &event.turn_id);
                 if let Some(session) = self.find_session_mut(&event.session_id) {
                     session.live_reply = Some(LiveReply {
                         turn_id: event.turn_id,
@@ -4804,14 +4835,36 @@ impl Store {
                 ..
             }) => {
                 let follow_tail = self.state.transcript_scroll == 0;
+                // Lazy-bind: a delta whose turn_id has no current live_reply
+                // binding (None, or a binding for an OLDER turn) must still be
+                // accumulated — never dropped. This covers continuation turns
+                // whose `TurnStarted` was not delivered to this connection, so
+                // the first frame the client sees for the turn is a delta. When
+                // switching to a new turn_id, commit/close the prior turn's
+                // live_reply first so its answer is preserved.
+                let needs_bind = self
+                    .find_session(&session_id)
+                    .and_then(|session| session.live_reply.as_ref())
+                    .map(|live_reply| live_reply.turn_id != turn_id)
+                    .unwrap_or(true);
+                if needs_bind {
+                    self.commit_pending_live_reply_for_turn_switch(&session_id, &turn_id);
+                }
                 let mut reset_scroll = false;
                 if let Some(session) = self.find_session_mut(&session_id) {
-                    if let Some(live_reply) = session.live_reply.as_mut() {
-                        if live_reply.turn_id == turn_id {
-                            live_reply.text.push_str(&text);
-                            reset_scroll = true;
-                        }
+                    let live_reply = session.live_reply.get_or_insert_with(|| LiveReply {
+                        turn_id: turn_id.clone(),
+                        text: String::new(),
+                    });
+                    if live_reply.turn_id == turn_id {
+                        live_reply.text.push_str(&text);
+                        reset_scroll = true;
                     }
+                }
+                if needs_bind && reset_scroll {
+                    // A delta-first continuation turn (its TurnStarted was not
+                    // delivered) is genuinely streaming — reflect the active run.
+                    self.state.set_run_state_in_progress();
                 }
                 if reset_scroll && follow_tail {
                     self.state.scroll_transcript_to_latest();
@@ -5667,20 +5720,12 @@ impl Store {
             let title = session.title.clone();
             match session.live_reply.take() {
                 Some(live_reply) if live_reply.turn_id == event.turn_id => {
-                    let text = if live_reply.text.trim().is_empty() {
-                        fallback_summary
-                    } else if complete_live_plan && looks_like_partial_live_answer(&live_reply.text)
-                    {
-                        format!(
-                            "{}\n\n{}",
-                            live_reply.text.trim_end(),
-                            partial_fallback_summary
-                        )
-                    } else if complete_live_plan {
-                        complete_plan_steps_in_text(&live_reply.text)
-                    } else {
-                        live_reply.text
-                    };
+                    let text = finalize_live_reply_text(
+                        live_reply.text,
+                        complete_live_plan,
+                        &fallback_summary,
+                        &partial_fallback_summary,
+                    );
                     session.messages.push(Message::assistant(text));
                     (
                         format!("Turn completed in {title} at seq {seq}"),
@@ -5815,6 +5860,73 @@ impl Store {
             .sessions
             .iter_mut()
             .find(|session| &session.id == session_id)
+    }
+
+    fn find_session(&self, session_id: &octos_core::SessionKey) -> Option<&SessionView> {
+        self.state
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+    }
+
+    /// Before binding a fresh `live_reply` for `new_turn`, commit any currently
+    /// bound live_reply that belongs to a DIFFERENT turn. This is the
+    /// turn-switch boundary for the lazy-bind path: when a session's turns run
+    /// sequentially (an original user turn followed by server-initiated
+    /// master-continuation turns), each turn must produce its OWN assistant
+    /// message — the prior turn's accumulated answer is neither lost nor merged
+    /// into the next turn. A prior turn that streamed NO text is dropped
+    /// silently (its eventual `TurnCompleted`, if any, is handled by the
+    /// fallback path); we only persist a prior turn that actually produced a
+    /// visible answer.
+    fn commit_pending_live_reply_for_turn_switch(
+        &mut self,
+        session_id: &octos_core::SessionKey,
+        new_turn: &TurnId,
+    ) {
+        let prior_turn = match self.find_session(session_id).and_then(|session| {
+            session
+                .live_reply
+                .as_ref()
+                .filter(|live_reply| &live_reply.turn_id != new_turn)
+                .map(|live_reply| live_reply.turn_id.clone())
+        }) {
+            Some(turn_id) => turn_id,
+            None => return,
+        };
+        let complete_live_plan = self.turn_had_completion_activity(&prior_turn);
+        let fallback_summary = self.turn_completion_fallback_message(&prior_turn);
+        let partial_fallback_summary = self.turn_partial_completion_fallback_message(&prior_turn);
+        let follow_tail = self.state.transcript_scroll == 0;
+        let mut committed = false;
+        if let Some(session) = self.find_session_mut(session_id) {
+            // Drop a prior turn that streamed NO visible text: its eventual
+            // terminal event (if it arrives) handles the empty/fallback case;
+            // only persist a prior turn that produced a real answer.
+            if let Some(live_reply) = session
+                .live_reply
+                .take()
+                .filter(|live_reply| !live_reply.text.trim().is_empty())
+            {
+                let text = finalize_live_reply_text(
+                    live_reply.text,
+                    complete_live_plan,
+                    &fallback_summary,
+                    &partial_fallback_summary,
+                );
+                session.messages.push(Message::assistant(text));
+                committed = true;
+            }
+        }
+        if committed {
+            self.state
+                .capture_completed_turn_activity(session_id, &prior_turn);
+            if follow_tail {
+                self.state.scroll_transcript_to_latest();
+            } else {
+                self.state.preserve_transcript_position_after_append(3);
+            }
+        }
     }
 
     fn turn_completion_fallback_message(&self, turn_id: &TurnId) -> String {
@@ -6813,8 +6925,9 @@ mod tests {
         EnvelopeNotification, HydratedMessage, HydratedTurn, OutputCursor, Payload, PreviewId,
         ReplayLossyEvent, SessionHydrateResult, TaskRuntimeState, ThreadGraphEntry,
         ToolCompletedEvent, ToolStartedEvent, TurnId, TurnLifecycleState, TurnSpawnCompleteEvent,
-        UiContextState, UiCursor, UiFileMutationNotice, UiProgressMetadata, UiProtocolCapabilities,
-        UiTokenCostUpdate, approval_kinds, approval_scopes, methods, progress_kinds,
+        TurnStartedEvent, UiContextState, UiCursor, UiFileMutationNotice, UiProgressMetadata,
+        UiProtocolCapabilities, UiTokenCostUpdate, approval_kinds, approval_scopes, methods,
+        progress_kinds,
     };
 
     fn store_with_live_reply(turn_id: TurnId, text: impl Into<String>) -> Store {
@@ -10093,6 +10206,240 @@ mod tests {
     }
 
     #[test]
+    fn server_initiated_continuation_turn_with_turn_started_renders_its_answer() {
+        // Live-rendering bug (mini5): a single user prompt expanded into
+        // server-INITIATED master-continuation turns (reason=child_completed /
+        // scatter_join_complete). When the continuation turn's TurnStarted IS
+        // delivered, its deltas must accumulate and commit as a real assistant
+        // message — never the "did not receive a final assistant answer"
+        // fallback card.
+        let original_turn = TurnId::new();
+        let continuation = TurnId::new();
+        let mut store = store_with_live_reply(original_turn.clone(), "original answer");
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Original user turn completes first and clears live_reply.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: original_turn,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        // Server-initiated continuation turn: TurnStarted delivered, then deltas.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: continuation.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        for chunk in ["the ", "answer"] {
+            store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+                MessageDeltaEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: continuation.clone(),
+                    text: chunk.into(),
+                },
+            )));
+        }
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: continuation,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let contents: Vec<&str> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            contents.iter().any(|c| c.contains("the answer")),
+            "continuation answer must render: {contents:?}"
+        );
+        assert!(
+            !contents
+                .iter()
+                .any(|c| c.contains("did not receive a final assistant answer")),
+            "continuation turn with deltas must NOT show the fallback card: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn continuation_turn_without_turn_started_lazy_binds_and_renders_answer() {
+        // Decisive sub-case: the continuation turn's TurnStarted is NOT delivered
+        // to this connection, so deltas arrive against `live_reply == None`. They
+        // must LAZY-BIND a fresh live_reply for the turn and accumulate, so the
+        // turn commits its real answer instead of the fallback card.
+        let original_turn = TurnId::new();
+        let continuation = TurnId::new();
+        let mut store = store_with_live_reply(original_turn.clone(), "original answer");
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: original_turn,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(store.state.sessions[0].live_reply.is_none());
+
+        // No TurnStarted for the continuation: deltas arrive first.
+        for chunk in ["the ", "answer"] {
+            store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+                MessageDeltaEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: continuation.clone(),
+                    text: chunk.into(),
+                },
+            )));
+        }
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: continuation,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let contents: Vec<&str> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            contents.iter().any(|c| c.contains("the answer")),
+            "lazy-bound continuation answer must render: {contents:?}"
+        );
+        assert!(
+            !contents
+                .iter()
+                .any(|c| c.contains("did not receive a final assistant answer")),
+            "lazy-bound continuation must NOT show the fallback card: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn continuation_turn_with_no_deltas_keeps_fallback_summary() {
+        // Regression guard: a turn that genuinely produces NO assistant deltas
+        // must still yield the fallback "did not receive a final assistant
+        // answer" summary — lazy-binding must not swallow the legitimate
+        // empty-turn case.
+        let continuation = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: continuation.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: continuation,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let message = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("fallback assistant message for empty turn");
+        assert!(
+            message
+                .content
+                .contains("did not receive a final assistant answer"),
+            "empty turn must keep its fallback card: {}",
+            message.content
+        );
+    }
+
+    #[test]
+    fn two_sequential_continuation_turns_each_render_their_own_answer() {
+        // Two server-initiated continuation turns (e.g. child_completed then
+        // scatter_join_complete), each streaming its own deltas, must each
+        // commit a DISTINCT assistant message — neither overwritten nor lost.
+        let first = TurnId::new();
+        let second = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        for (turn, body) in [(&first, "first reply"), (&second, "second reply")] {
+            store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+                MessageDeltaEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn.clone(),
+                    text: body.into(),
+                },
+            )));
+            store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+                TurnCompletedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn.clone(),
+                    cursor: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    session_result: None,
+                },
+            )));
+        }
+
+        let contents: Vec<&str> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            contents.iter().any(|c| c.contains("first reply")),
+            "first continuation answer lost: {contents:?}"
+        );
+        assert!(
+            contents.iter().any(|c| c.contains("second reply")),
+            "second continuation answer lost: {contents:?}"
+        );
+        assert!(
+            !contents
+                .iter()
+                .any(|c| c.contains("did not receive a final assistant answer")),
+            "sequential continuations must not fall back: {contents:?}"
+        );
+    }
+
+    #[test]
     fn turn_completed_captures_activity_log_for_transcript_and_clears_live_buffer() {
         let turn_id = TurnId::new();
         let mut store = store_with_live_reply(turn_id.clone(), "done");
@@ -10375,8 +10722,15 @@ mod tests {
     }
 
     #[test]
-    fn message_delta_ignores_mismatched_turn() {
+    fn message_delta_for_new_turn_commits_prior_and_lazy_binds() {
+        // A delta whose turn_id differs from the bound live_reply is NOT a
+        // stale frame to drop — on the ordered WS stream it marks the next
+        // (e.g. server-initiated continuation) turn. The prior turn's answer is
+        // committed as its own assistant message, and a fresh live_reply binds
+        // to the new turn so its text is never lost. (Previously this delta was
+        // silently dropped — the live-rendering bug.)
         let live_turn_id = TurnId::new();
+        let next_turn_id = TurnId::new();
         let mut store = store_with_live_reply(live_turn_id, "hello");
         let session_id = store.state.sessions[0].id.clone();
 
@@ -10384,16 +10738,25 @@ mod tests {
             MessageDeltaEvent {
                 session_id,
                 topic: None,
-                turn_id: TurnId::new(),
-                text: " stale".into(),
+                turn_id: next_turn_id.clone(),
+                text: "next answer".into(),
             },
         )));
 
+        assert_eq!(
+            store.state.sessions[0]
+                .messages
+                .last()
+                .map(|m| m.content.as_str()),
+            Some("hello"),
+            "prior turn's streamed answer must be committed before the switch"
+        );
         let live_reply = store.state.sessions[0]
             .live_reply
             .as_ref()
-            .expect("live reply remains active");
-        assert_eq!(live_reply.text, "hello");
+            .expect("a fresh live reply binds to the new turn");
+        assert_eq!(live_reply.turn_id, next_turn_id);
+        assert_eq!(live_reply.text, "next answer");
     }
 
     fn envelope_notification(session_id: SessionKey, seq: u64, payload: Payload) -> UiNotification {
