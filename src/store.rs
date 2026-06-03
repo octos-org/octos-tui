@@ -10622,6 +10622,193 @@ mod tests {
         );
     }
 
+    /// Build the FLATTENED `projection/envelope` wire `params` the
+    /// server now emits (feat(envelope-wire-routing)): bare Envelope
+    /// fields at the top level PLUS `session_id` + optional `topic`.
+    fn envelope_wire_params(
+        session_id: &str,
+        thread_id: &str,
+        seq: u64,
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": session_id,
+            "thread_id": thread_id,
+            "seq": seq,
+            "payload": payload,
+        })
+    }
+
+    /// Decode a wire `projection/envelope` frame through the SAME
+    /// `from_method_and_params` path the transport uses, then apply it.
+    /// This exercises the real DECODE — not a directly-constructed
+    /// `EnvelopeNotification` — so the wire-routing contract is under
+    /// test end-to-end.
+    fn apply_envelope_wire_frame(store: &mut Store, params: serde_json::Value) {
+        let notif = UiNotification::from_method_and_params(
+            octos_core::ui_protocol::methods::PROJECTION_ENVELOPE,
+            params,
+        )
+        .expect("wire envelope frame must decode");
+        store.apply_event(AppUiEvent::Protocol(notif));
+    }
+
+    /// feat(envelope-wire-routing) — THE full-decode-path guard codex
+    /// asked for. Two sessions share `thread_id = "thread-1"`. We drive
+    /// the REAL wire path (build flattened `projection/envelope` params
+    /// → `from_method_and_params` → `apply_envelope`) and assert:
+    ///   (a) each session's envelope routes to the CORRECT session — not
+    ///       dropped on an empty `session_id` key, and
+    ///   (b) session A's `TurnCompleted` reconciles A's stranded chip but
+    ///       NOT session B's genuinely-running chip on the same thread.
+    ///
+    /// RED on the pre-change core: the wire stripped `session_id`, so
+    /// every decoded envelope arrived with an EMPTY `SessionKey`,
+    /// `find_session_mut` failed, messages were dropped, and the
+    /// session-scoped reconcile could not distinguish A from B.
+    #[test]
+    fn envelope_wire_decode_routes_to_correct_session_and_scopes_reconcile() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let session_a = store.state.sessions[0].id.clone();
+        let session_b = store.state.sessions[1].id.clone();
+        assert_eq!(session_a, SessionKey("local:a".into()));
+        assert_eq!(session_b, SessionKey("local:b".into()));
+
+        // (a) Route a user_message to each session via the wire decode.
+        apply_envelope_wire_frame(
+            &mut store,
+            envelope_wire_params(
+                "local:a",
+                "thread-1",
+                1,
+                serde_json::json!({
+                    "type": "user_message",
+                    "data": { "text": "hello from A", "files": [] }
+                }),
+            ),
+        );
+        apply_envelope_wire_frame(
+            &mut store,
+            envelope_wire_params(
+                "local:b",
+                "thread-1",
+                1,
+                serde_json::json!({
+                    "type": "user_message",
+                    "data": { "text": "hello from B", "files": [] }
+                }),
+            ),
+        );
+
+        // Each message landed in its OWN session (would be dropped on an
+        // empty session_id on the pre-change wire).
+        let a_msgs = &store.state.sessions[0].messages;
+        let b_msgs = &store.state.sessions[1].messages;
+        assert_eq!(
+            a_msgs.len(),
+            1,
+            "session A must receive exactly its message"
+        );
+        assert_eq!(a_msgs[0].content, "hello from A");
+        assert_eq!(
+            b_msgs.len(),
+            1,
+            "session B must receive exactly its message"
+        );
+        assert_eq!(b_msgs[0].content, "hello from B");
+
+        // Both sessions start a turn-less running envelope tool on the
+        // SHARED thread-1, routed via the wire decode.
+        apply_envelope_wire_frame(
+            &mut store,
+            envelope_wire_params(
+                "local:a",
+                "thread-1",
+                2,
+                serde_json::json!({
+                    "type": "tool_start",
+                    "data": { "tool_call_id": "call-a", "name": "run_pipeline" }
+                }),
+            ),
+        );
+        apply_envelope_wire_frame(
+            &mut store,
+            envelope_wire_params(
+                "local:b",
+                "thread-1",
+                2,
+                serde_json::json!({
+                    "type": "tool_start",
+                    "data": { "tool_call_id": "call-b", "name": "run_pipeline" }
+                }),
+            ),
+        );
+
+        // (b) TurnCompleted for session A's thread ONLY — routed by the
+        // decoded session_id.
+        apply_envelope_wire_frame(
+            &mut store,
+            envelope_wire_params(
+                "local:a",
+                "thread-1",
+                3,
+                serde_json::json!({
+                    "type": "turn_completed",
+                    "data": { "token_usage": {} }
+                }),
+            ),
+        );
+
+        let item_a = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-a"))
+            .expect("session A envelope tool item retained");
+        assert_eq!(
+            item_a.status,
+            crate::model::ACTIVITY_STATUS_INTERRUPTED,
+            "session A's stranded chip must reconcile via the decoded session_id",
+        );
+
+        let item_b = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-b"))
+            .expect("session B envelope tool item retained");
+        assert!(
+            crate::model::activity_status_is_running(&item_b.status),
+            "session B's chip on the SAME thread must NOT be suppressed by \
+             session A's TurnCompleted; got {:?}",
+            item_b.status
+        );
+    }
+
+    /// feat(envelope-wire-routing) backward-compat at the consumer: an
+    /// OLD bare-envelope wire frame (no `session_id`) still decodes
+    /// without error through the transport path. The routing key is
+    /// empty so it cannot match a session — but it must NOT crash the
+    /// decode (it is silently un-routed, the legacy behaviour).
+    #[test]
+    fn legacy_bare_envelope_wire_frame_decodes_without_routing() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        // No session_id key — the pre-change wire shape.
+        let legacy = serde_json::json!({
+            "thread_id": "thread-1",
+            "seq": 1,
+            "payload": {
+                "type": "assistant_delta",
+                "data": { "text": "orphaned delta" }
+            }
+        });
+        apply_envelope_wire_frame(&mut store, legacy);
+        // Un-routed (empty session_id matches no session) — neither
+        // session gains a message, and nothing panicked.
+        assert!(store.state.sessions[0].messages.is_empty());
+        assert!(store.state.sessions[1].messages.is_empty());
+    }
+
     #[test]
     fn interrupt_command_targets_active_turn() {
         let turn_id = TurnId::new();
