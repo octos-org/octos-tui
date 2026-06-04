@@ -5,11 +5,12 @@ use octos_core::ui_protocol::{
     ApprovalDecision, ApprovalId, ApprovalRenderHints, ApprovalRequestedEvent,
     ApprovalScopesListParams, ApprovalTypedDetails, DiffPreviewGetParams, OutputCursor,
     PermissionProfileListParams, PermissionProfileSelection, PermissionProfileSetParams, PreviewId,
-    SessionHydrateParams, SessionOrchestrationEvent, TaskArtifactReadParams, TaskCancelParams,
-    TaskListParams, TaskOutputReadParams, TaskRestartFromNodeParams, TaskRuntimeState,
-    ThreadGraphGetParams, ThreadGraphGetResult, TurnId, TurnInterruptParams, TurnStartParams,
-    TurnStateGetParams, TurnStateGetResult, UiPaneSnapshot, UiProtocolCapabilities, UiRetryBackoff,
-    approval_scopes,
+    QuestionId, SessionHydrateParams, SessionOrchestrationEvent, TaskArtifactReadParams,
+    TaskCancelParams, TaskListParams, TaskOutputReadParams, TaskRestartFromNodeParams,
+    TaskRuntimeState, ThreadGraphGetParams, ThreadGraphGetResult, TurnId, TurnInterruptParams,
+    TurnStartParams, TurnStateGetParams, TurnStateGetResult, UiPaneSnapshot,
+    UiProtocolCapabilities, UiRetryBackoff, UserQuestion, UserQuestionAnswer, UserQuestionOption,
+    UserQuestionRequestedEvent, UserQuestionRespondParams, approval_scopes,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -592,6 +593,7 @@ pub enum AppUiCommand {
     SubmitPrompt(TurnStartParams),
     InterruptTurn(TurnInterruptParams),
     RespondApproval(octos_core::ui_protocol::ApprovalRespondParams),
+    RespondUserQuestion(UserQuestionRespondParams),
     ListApprovalScopes(ApprovalScopesListParams),
     GetDiffPreview(DiffPreviewGetParams),
     ListTasks(TaskListParams),
@@ -664,6 +666,7 @@ impl AppUiCommand {
             Self::SubmitPrompt(_) => octos_core::ui_protocol::methods::TURN_START,
             Self::InterruptTurn(_) => octos_core::ui_protocol::methods::TURN_INTERRUPT,
             Self::RespondApproval(_) => octos_core::ui_protocol::methods::APPROVAL_RESPOND,
+            Self::RespondUserQuestion(_) => octos_core::ui_protocol::methods::USER_QUESTION_RESPOND,
             Self::ListApprovalScopes(_) => octos_core::ui_protocol::methods::APPROVAL_SCOPES_LIST,
             Self::GetDiffPreview(_) => octos_core::ui_protocol::methods::DIFF_PREVIEW_GET,
             Self::ListTasks(_) => octos_core::ui_protocol::methods::TASK_LIST,
@@ -3076,6 +3079,9 @@ pub struct AppState {
     pub run_state_started_at: Option<Instant>,
     pub approval_auto_open: bool,
     pub approval: Option<ApprovalModalState>,
+    /// Pending AskUserQuestion picker (UPCR-2026-023), mirroring `approval`.
+    pub user_question: Option<UserQuestionPickerState>,
+    pub user_question_auto_open: bool,
     pub task_output: TaskOutputDetailState,
     pub artifact_detail: ArtifactDetailState,
     pub thread_graph_detail: ThreadGraphDetailState,
@@ -3446,6 +3452,193 @@ impl ApprovalModalState {
             .as_ref()
             .and_then(|details| details.diff.as_ref())
             .map(|diff| diff.preview_id.clone())
+    }
+}
+
+/// One structured question being presented inside the AskUserQuestion picker
+/// (UPCR-2026-023). Mirrors the per-question fields of [`UserQuestion`] plus the
+/// transient selection state the picker tracks. The free-text "Other" escape
+/// hatch is always present (the server forces `allow_free_text`), so the picker
+/// always exposes a free-text row at index `options.len()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserQuestionEntry {
+    pub header: String,
+    pub question: String,
+    pub options: Vec<UserQuestionOption>,
+    pub multi_select: bool,
+    /// Per-option checked state, indexed parallel to `options`.
+    pub option_selected: Vec<bool>,
+    /// Free-text answer captured via the "Other" row.
+    pub free_text: String,
+    /// Highlighted row: `0..options.len()` is an option, `options.len()` is the
+    /// "Other" free-text row.
+    pub cursor: usize,
+    /// Whether the "Other" free-text row is currently capturing keystrokes.
+    pub editing_free_text: bool,
+}
+
+impl UserQuestionEntry {
+    fn from_question(question: UserQuestion) -> Self {
+        let option_selected = vec![false; question.options.len()];
+        Self {
+            header: question.header,
+            question: question.question,
+            options: question.options,
+            multi_select: question.multi_select,
+            option_selected,
+            free_text: String::new(),
+            cursor: 0,
+            editing_free_text: false,
+        }
+    }
+
+    /// Row index of the free-text "Other" entry (always the last row).
+    pub fn free_text_row(&self) -> usize {
+        self.options.len()
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.options.len() + 1
+    }
+
+    fn is_free_text_row(&self, row: usize) -> bool {
+        row == self.free_text_row()
+    }
+
+    /// Toggle the currently highlighted row. For an option row this flips its
+    /// checkbox; single-select clears the other options first. For the
+    /// "Other" row this enters free-text editing mode.
+    pub fn toggle_cursor(&mut self) {
+        let row = self.cursor.min(self.free_text_row());
+        if self.is_free_text_row(row) {
+            self.editing_free_text = true;
+            return;
+        }
+        if self.multi_select {
+            if let Some(slot) = self.option_selected.get_mut(row) {
+                *slot = !*slot;
+            }
+        } else {
+            let already = self.option_selected.get(row).copied().unwrap_or(false);
+            for slot in &mut self.option_selected {
+                *slot = false;
+            }
+            if let Some(slot) = self.option_selected.get_mut(row) {
+                *slot = !already;
+            }
+        }
+    }
+
+    pub fn move_cursor_down(&mut self) {
+        let last = self.free_text_row();
+        self.cursor = (self.cursor + 1).min(last);
+    }
+
+    pub fn move_cursor_up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// Selected option labels in option order.
+    pub fn selected_labels(&self) -> Vec<String> {
+        self.options
+            .iter()
+            .zip(self.option_selected.iter())
+            .filter(|(_, checked)| **checked)
+            .map(|(option, _)| option.label.clone())
+            .collect()
+    }
+
+    fn answer(&self) -> UserQuestionAnswer {
+        let trimmed = self.free_text.trim();
+        UserQuestionAnswer {
+            selected_labels: self.selected_labels(),
+            free_text: (!trimmed.is_empty()).then(|| trimmed.to_string()),
+        }
+    }
+
+    /// A question is answerable once it has at least one selected option or some
+    /// free text. Used to gate submission so an empty answer is not sent.
+    pub fn has_answer(&self) -> bool {
+        self.option_selected.iter().any(|checked| *checked) || !self.free_text.trim().is_empty()
+    }
+}
+
+/// Pending AskUserQuestion picker state (UPCR-2026-023). Mirrors
+/// [`ApprovalModalState`]: correlated by `question_id`, scoped to `session_id`,
+/// rendered while the turn is paused at the blocking-tool boundary, and cleared
+/// on answer/cancel. The mandatory `title`/`body` keep the picker actionable
+/// even when `questions` is empty or unparsed (graceful fallback).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserQuestionPickerState {
+    pub session_id: SessionKey,
+    pub question_id: QuestionId,
+    pub turn_id: TurnId,
+    pub title: String,
+    pub body: String,
+    pub questions: Vec<UserQuestionEntry>,
+    /// Which question is currently focused (for stepping through 1–4 questions).
+    pub active: usize,
+    pub visible: bool,
+}
+
+impl UserQuestionPickerState {
+    pub fn from_event(event: UserQuestionRequestedEvent) -> Self {
+        let questions = event
+            .questions
+            .into_iter()
+            .map(UserQuestionEntry::from_question)
+            .collect();
+        Self {
+            session_id: event.session_id,
+            question_id: event.question_id,
+            turn_id: event.turn_id,
+            title: event.title,
+            body: event.body,
+            questions,
+            active: 0,
+            visible: true,
+        }
+    }
+
+    pub fn active_question(&self) -> Option<&UserQuestionEntry> {
+        self.questions.get(self.active)
+    }
+
+    pub fn active_question_mut(&mut self) -> Option<&mut UserQuestionEntry> {
+        let active = self.active;
+        self.questions.get_mut(active)
+    }
+
+    pub fn focus_next_question(&mut self) {
+        if !self.questions.is_empty() {
+            self.active = (self.active + 1).min(self.questions.len() - 1);
+        }
+    }
+
+    pub fn focus_prev_question(&mut self) {
+        self.active = self.active.saturating_sub(1);
+    }
+
+    pub fn is_last_question(&self) -> bool {
+        self.questions.is_empty() || self.active + 1 >= self.questions.len()
+    }
+
+    /// Build the `user_question/respond` params: EXACTLY one
+    /// [`UserQuestionAnswer`] per structured question, in question order. A
+    /// picker with no structured questions (the garbled/protocol-violation
+    /// fallback path) yields an EMPTY `answers` vec — never a manufactured empty
+    /// answer — so the count always equals `questions.len()` and the backend
+    /// validator (`answers.len() == questions.len()`) can never reject it
+    /// (DO-NOT-SHIP #2). The 0-question case is not submittable via the picker
+    /// (see [`Store::respond_user_question_command`]); this method only
+    /// guarantees the wire shape is valid if a respond is ever formed.
+    pub fn to_respond_params(&self) -> UserQuestionRespondParams {
+        let answers = self
+            .questions
+            .iter()
+            .map(UserQuestionEntry::answer)
+            .collect();
+        UserQuestionRespondParams::new(self.session_id.clone(), self.question_id.clone(), answers)
     }
 }
 
@@ -4446,6 +4639,8 @@ impl AppState {
             run_state_started_at,
             approval_auto_open: true,
             approval: None,
+            user_question: None,
+            user_question_auto_open: true,
             task_output: TaskOutputDetailState::default(),
             artifact_detail: ArtifactDetailState::default(),
             thread_graph_detail: ThreadGraphDetailState::default(),

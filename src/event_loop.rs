@@ -248,7 +248,15 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     }
 
     if is_alt_char(&key, 'a') {
-        store.show_pending_approval();
+        // Recovery key: re-open a hidden pending modal so an accidental Esc never
+        // wedges the turn (DO-NOT-SHIP #1). Precedence is deterministic — a hidden
+        // question is re-shown FIRST, since a pending AskUserQuestion blocks the
+        // turn at the same boundary as an approval but is answered through a
+        // distinct picker; an approval is only re-shown if there is no hidden
+        // question to recover.
+        if !store.show_pending_user_question() {
+            store.show_pending_approval();
+        }
         return KeyAction::Continue;
     }
 
@@ -292,6 +300,15 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         .is_some_and(|approval| approval.visible)
     {
         return handle_approval_modal_key(store, key);
+    }
+
+    if store
+        .state
+        .user_question
+        .as_ref()
+        .is_some_and(|picker| picker.visible)
+    {
+        return handle_user_question_key(store, key);
     }
 
     if store.state.task_output.active {
@@ -684,6 +701,45 @@ fn handle_approval_modal_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     KeyAction::Continue
 }
 
+/// UPCR-2026-023: drive the AskUserQuestion picker. Keyboard model mirrors the
+/// multi-select menu (Up/Down move, Space toggle) plus typing-to-Other and
+/// Enter to step questions / submit. Esc hides the picker without answering.
+fn handle_user_question_key(store: &mut Store, key: KeyEvent) -> KeyAction {
+    match key.code {
+        KeyCode::Esc => {
+            store.close_modal();
+        }
+        KeyCode::Up => store.user_question_cursor_up(),
+        KeyCode::Down => store.user_question_cursor_down(),
+        KeyCode::Char(' ') if !store.user_question_editing_free_text() => {
+            store.user_question_toggle();
+        }
+        KeyCode::Char(']') => store.user_question_cursor_down(),
+        KeyCode::Char('[') => store.user_question_cursor_up(),
+        KeyCode::Tab => {
+            // Step forward through questions without submitting.
+            store.user_question_advance();
+        }
+        KeyCode::BackTab => store.user_question_back(),
+        KeyCode::Backspace => store.user_question_pop_free_text(),
+        KeyCode::Enter => {
+            // Stepping through questions; submit only on the final one.
+            if store.user_question_advance()
+                && let Some(command) = store.respond_user_question_command()
+            {
+                return KeyAction::Send(command);
+            }
+        }
+        KeyCode::Char(ch) => {
+            // Any other character is captured into the free-text "Other" box.
+            store.user_question_push_free_text(ch);
+        }
+        _ => {}
+    }
+
+    KeyAction::Continue
+}
+
 fn handle_task_output_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     match key.code {
         KeyCode::Esc => {
@@ -891,8 +947,9 @@ mod tests {
     use octos_core::{
         SessionKey, TaskId,
         ui_protocol::{
-            ApprovalDecision, ApprovalId, ApprovalRequestedEvent, PreviewId, TaskRuntimeState,
-            TurnId, UiNotification, UiProtocolCapabilities, approval_scopes,
+            ApprovalDecision, ApprovalId, ApprovalRequestedEvent, PreviewId, QuestionId,
+            TaskRuntimeState, TurnId, UiNotification, UiProtocolCapabilities, UserQuestion,
+            UserQuestionOption, UserQuestionRequestedEvent, approval_scopes,
         },
     };
     use std::collections::VecDeque;
@@ -967,6 +1024,93 @@ mod tests {
         )));
 
         (store, approval_id)
+    }
+
+    fn store_with_visible_user_question() -> (Store, QuestionId) {
+        let mut store = store_with_sessions(1);
+        let question_id = QuestionId::new();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::UserQuestionRequested(
+            UserQuestionRequestedEvent::new(
+                store.state.sessions[0].id.clone(),
+                question_id.clone(),
+                TurnId::new(),
+                "Pick a framework",
+                "The agent needs a framework choice to proceed.",
+                vec![UserQuestion {
+                    header: "Framework".into(),
+                    question: "Which web framework?".into(),
+                    options: vec![
+                        UserQuestionOption {
+                            label: "axum".into(),
+                            description: "tokio-native".into(),
+                        },
+                        UserQuestionOption {
+                            label: "actix".into(),
+                            description: "actor-based".into(),
+                        },
+                    ],
+                    multi_select: false,
+                    allow_free_text: true,
+                }],
+            ),
+        )));
+
+        (store, question_id)
+    }
+
+    #[test]
+    fn esc_hidden_user_question_can_be_reopened_via_recovery_key() {
+        // DO-NOT-SHIP #1: an accidental Esc hides the picker; the recovery key
+        // (Alt+a) must re-open it just like a hidden approval, route keys back
+        // to the picker, and let the user submit a valid response.
+        let (mut store, question_id) = store_with_visible_user_question();
+
+        // Esc hides the picker without answering it.
+        store.close_modal();
+        assert!(
+            !store
+                .state
+                .user_question
+                .as_ref()
+                .expect("question still pending")
+                .visible
+        );
+        assert!(!store.state.user_question_auto_open);
+
+        // The recovery key re-opens the hidden question.
+        assert!(matches!(
+            handle_key(
+                &mut store,
+                modified_key(KeyCode::Char('a'), KeyModifiers::ALT)
+            ),
+            KeyAction::Continue
+        ));
+        assert!(
+            store
+                .state
+                .user_question
+                .as_ref()
+                .expect("question still pending")
+                .visible
+        );
+        assert!(store.state.user_question_auto_open);
+        assert_eq!(store.state.focus, FocusPane::Composer);
+
+        // Keys route to the picker again: select an option, then Enter submits a
+        // valid response.
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char(' '))),
+            KeyAction::Continue
+        ));
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+        let KeyAction::Send(AppUiCommand::RespondUserQuestion(params)) = action else {
+            panic!("expected user_question respond command");
+        };
+        assert_eq!(params.question_id, question_id);
+        assert_eq!(params.answers.len(), 1);
+        assert_eq!(params.answers[0].selected_labels, vec!["axum".to_string()]);
+        assert!(store.state.user_question.is_none());
     }
 
     #[test]

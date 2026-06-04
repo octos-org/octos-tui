@@ -88,6 +88,7 @@ fn session_hydrate_result_replaces_durable_messages() {
         threads: None,
         turns: None,
         pending_approvals: None,
+        pending_questions: None,
         replayed_envelopes: None,
     };
 

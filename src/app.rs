@@ -16,8 +16,8 @@ use crate::{
         ActivityItem, ActivityKind, AppState, ApprovalModalState, ArtifactDetailState,
         ComposerPresentation, DiffPreviewPaneState, FocusPane, PlanStep as RenderedPlanStep,
         SessionAutonomyState, SessionRunState, SessionView, TaskOutputDetailState,
-        ThreadGraphDetailState, TurnActivityLog, TurnStateDetailState, extract_plan_steps,
-        task_state_label,
+        ThreadGraphDetailState, TurnActivityLog, TurnStateDetailState, UserQuestionEntry,
+        UserQuestionPickerState, extract_plan_steps, task_state_label,
     },
     theme::Palette,
 };
@@ -680,6 +680,10 @@ fn should_show_turn_flow(app: &AppState, session: &SessionView) -> bool {
     app.approval
         .as_ref()
         .is_some_and(|approval| approval.visible)
+        || app
+            .user_question
+            .as_ref()
+            .is_some_and(|picker| picker.visible)
         || should_pin_recent_user_context(app, session)
 }
 
@@ -692,6 +696,10 @@ fn push_turn_flow(
 ) {
     if let Some(approval) = app.approval.as_ref().filter(|approval| approval.visible) {
         push_inline_approval_card(lines, palette, approval);
+    }
+
+    if let Some(picker) = app.user_question.as_ref().filter(|picker| picker.visible) {
+        push_inline_user_question_card(lines, palette, picker, width);
     }
 
     if let Some(live_reply) = &session.live_reply {
@@ -1722,6 +1730,184 @@ fn approval_action_labels(_approval: &ApprovalModalState) -> [&'static str; 3] {
         "s = approve this command/scope for the session",
         "n = deny it",
     ]
+}
+
+/// UPCR-2026-023: render the pending AskUserQuestion picker inline, mirroring
+/// [`push_inline_approval_card`]. Shows the mandatory `title`/`body` fallback,
+/// the active structured question (1–4), each option as a radio/checkbox row,
+/// and the always-present free-text "Other" row.
+fn push_inline_user_question_card(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    picker: &UserQuestionPickerState,
+    width: usize,
+) {
+    lines.push(Line::from(""));
+    let header = if picker.questions.len() > 1 {
+        format!("Question {}/{}", picker.active + 1, picker.questions.len())
+    } else {
+        "Question".to_string()
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  ", palette.muted()),
+        Span::styled(
+            "Agent asked a question",
+            palette.title().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {header}"), palette.muted()),
+    ]));
+
+    // Mandatory generic fallback text keeps the card actionable even when the
+    // structured `questions` field is empty or unparsed.
+    if !picker.title.is_empty() {
+        push_prefixed_line(
+            lines,
+            "    ",
+            palette.muted(),
+            Line::from(Span::styled(picker.title.clone(), palette.text())),
+        );
+    }
+    if !picker.body.is_empty() {
+        push_prefixed_line(
+            lines,
+            "    ",
+            palette.muted(),
+            Line::from(Span::styled(picker.body.clone(), palette.muted())),
+        );
+    }
+
+    match picker.active_question() {
+        Some(entry) => push_user_question_entry(lines, palette, entry, width),
+        None => {
+            // Garbled / protocol-violation fallback: no structured questions, so
+            // there is nothing answerable. Render the title/body as an
+            // INFORMATIONAL card only — do NOT offer a "Type your answer"
+            // affordance, since any input would be discarded and a submit cannot
+            // form a valid (count-matched) respond (DO-NOT-SHIP #2). The card
+            // stays dismissible (Esc) and recoverable (Alt+a).
+            lines.push(Line::from(vec![
+                Span::styled("    ", palette.muted()),
+                Span::styled("No answerable options were provided.", palette.muted()),
+            ]));
+        }
+    }
+
+    for action in user_question_action_labels(picker) {
+        lines.push(Line::from(vec![
+            Span::styled("    ", palette.muted()),
+            Span::styled(action, palette.selected()),
+        ]));
+    }
+}
+
+fn push_user_question_entry(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    entry: &UserQuestionEntry,
+    width: usize,
+) {
+    if !entry.header.is_empty() {
+        push_prefixed_line(
+            lines,
+            "    ",
+            palette.muted(),
+            Line::from(Span::styled(
+                entry.header.clone(),
+                palette.title().add_modifier(Modifier::BOLD),
+            )),
+        );
+    }
+    push_prefixed_line(
+        lines,
+        "    ",
+        palette.muted(),
+        Line::from(Span::styled(entry.question.clone(), palette.text())),
+    );
+
+    let marker_open = if entry.multi_select { "[" } else { "(" };
+    let marker_close = if entry.multi_select { "]" } else { ")" };
+    for (idx, option) in entry.options.iter().enumerate() {
+        let highlighted = idx == entry.cursor;
+        let checked = entry.option_selected.get(idx).copied().unwrap_or(false);
+        let mark = if checked { "x" } else { " " };
+        let cursor = if highlighted { ">" } else { " " };
+        let mut text = format!(
+            "{cursor} {marker_open}{mark}{marker_close} {}",
+            option.label
+        );
+        if !option.description.is_empty() {
+            text.push_str(" - ");
+            text.push_str(&option.description);
+        }
+        let style = if highlighted {
+            palette.selected().add_modifier(Modifier::BOLD)
+        } else {
+            palette.text()
+        };
+        lines.push(Line::from(vec![
+            Span::styled("    ", palette.muted()),
+            Span::styled(fit_card_text(&text, width), style),
+        ]));
+    }
+
+    // Always-present free-text "Other" row (server forces allow_free_text).
+    let other_highlighted = entry.cursor >= entry.free_text_row();
+    let editing = entry.editing_free_text;
+    let cursor = if other_highlighted { ">" } else { " " };
+    let body = if entry.free_text.is_empty() {
+        if editing {
+            "(type your answer)".to_string()
+        } else {
+            "Other (free text)".to_string()
+        }
+    } else {
+        entry.free_text.clone()
+    };
+    let mark = if editing {
+        "*"
+    } else if !entry.free_text.trim().is_empty() {
+        "x"
+    } else {
+        " "
+    };
+    let text = format!("{cursor} {marker_open}{mark}{marker_close} Other: {body}");
+    let style = if other_highlighted {
+        palette.selected().add_modifier(Modifier::BOLD)
+    } else {
+        palette.text()
+    };
+    lines.push(Line::from(vec![
+        Span::styled("    ", palette.muted()),
+        Span::styled(fit_card_text(&text, width), style),
+    ]));
+}
+
+fn user_question_action_labels(picker: &UserQuestionPickerState) -> Vec<&'static str> {
+    // Garbled / 0-question event: nothing is answerable, so offer only a dismiss
+    // hint — never a submit affordance that would form an invalid respond
+    // (DO-NOT-SHIP #2). Alt+a re-opens it if dismissed (DO-NOT-SHIP #1).
+    if picker.questions.is_empty() {
+        return vec!["Esc = dismiss (no answer to submit)"];
+    }
+    let mut labels = vec!["Up/Down move | Space toggle | type for Other"];
+    if picker.is_last_question() {
+        labels.push("Enter = submit answer(s) | Esc = hide");
+    } else {
+        labels.push("Enter = next question | Esc = hide");
+    }
+    labels
+}
+
+fn fit_card_text(text: &str, width: usize) -> String {
+    // Reserve the 4-space prefix added by the caller.
+    let budget = width.saturating_sub(4).max(1);
+    if text.chars().count() <= budget {
+        return text.to_string();
+    }
+    text.chars()
+        .take(budget.saturating_sub(1))
+        .collect::<String>()
+        + "…"
 }
 
 fn push_prefixed_line(
@@ -4935,6 +5121,112 @@ mod tests {
         assert!(text.contains("n = deny it"));
         assert!(!text.contains("Work  sticky"));
         assert!(!text.contains("more plan item(s) | Ctrl+O expand"));
+    }
+
+    fn app_with_user_question(questions: Vec<octos_core::ui_protocol::UserQuestion>) -> AppState {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("set up a project")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let event = octos_core::ui_protocol::UserQuestionRequestedEvent::new(
+            SessionKey("local:test".into()),
+            octos_core::ui_protocol::QuestionId::new(),
+            TurnId::new(),
+            "Pick a framework",
+            "The agent needs your input.",
+            questions,
+        );
+        app.user_question = Some(UserQuestionPickerState::from_event(event));
+        app
+    }
+
+    fn user_question(
+        header: &str,
+        question: &str,
+        labels: &[&str],
+        multi_select: bool,
+    ) -> octos_core::ui_protocol::UserQuestion {
+        octos_core::ui_protocol::UserQuestion {
+            header: header.into(),
+            question: question.into(),
+            options: labels
+                .iter()
+                .map(|label| octos_core::ui_protocol::UserQuestionOption {
+                    label: (*label).into(),
+                    description: String::new(),
+                })
+                .collect(),
+            multi_select,
+            allow_free_text: true,
+        }
+    }
+
+    #[test]
+    fn render_inline_single_select_user_question_shows_radios_and_other() {
+        let app = app_with_user_question(vec![user_question(
+            "Framework",
+            "Which web framework?",
+            &["axum", "actix"],
+            false,
+        )]);
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("Agent asked a question"));
+        assert!(text.contains("Pick a framework"));
+        assert!(text.contains("Which web framework?"));
+        // Single-select uses radio parens, not checkbox brackets.
+        assert!(text.contains("( ) axum"));
+        assert!(text.contains("( ) actix"));
+        // The always-present free-text "Other" row.
+        assert!(text.contains("Other"));
+        assert!(text.contains("Enter = submit answer(s)"));
+    }
+
+    #[test]
+    fn render_inline_multi_select_user_question_shows_checkboxes() {
+        let app = app_with_user_question(vec![user_question(
+            "Targets",
+            "Which targets?",
+            &["stable", "nightly"],
+            true,
+        )]);
+
+        let text = rendered_text(&app);
+
+        // Multi-select uses checkbox brackets.
+        assert!(text.contains("[ ] stable"));
+        assert!(text.contains("[ ] nightly"));
+        assert!(text.contains("Other"));
+    }
+
+    #[test]
+    fn render_garbled_user_question_renders_info_fallback_without_submit_affordance() {
+        // No structured questions: must still render the mandatory title/body
+        // fallback as an INFORMATIONAL card, but must NOT offer a "Type your
+        // answer" affordance (input would be discarded and a submit cannot form a
+        // valid respond). Only a dismiss hint is shown (DO-NOT-SHIP #2).
+        let app = app_with_user_question(Vec::new());
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("Pick a framework"));
+        assert!(text.contains("The agent needs your input."));
+        assert!(text.contains("No answerable options were provided."));
+        assert!(text.contains("Esc = dismiss"));
+        // No input affordance is offered for the garbled fallback.
+        assert!(!text.contains("Type your answer"));
+        assert!(!text.contains("Enter = submit"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use octos_core::ui_protocol::{
     TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent, TurnId,
     TurnInterruptParams, TurnLifecycleState, TurnSpawnCompleteEvent, TurnStartParams,
     TurnStateGetParams, UiContextState, UiNotification, UiProgressEvent,
+    UserQuestionRequestedEvent,
 };
 use octos_core::{Message, MessageRole, SessionKey, TaskId, ThreadId};
 use serde_json::Value;
@@ -40,8 +41,8 @@ use crate::{
         ReviewStartParams, ReviewStartResult, SecretString, SessionMcpCatalog, SessionModelCatalog,
         SessionRuntimeStatus, SessionToolCatalog, SessionView, TaskView, ToolConfigDeleteParams,
         ToolConfigListParams, ToolConfigSetEnabledParams, ToolConfigTestParams,
-        ToolConfigUpsertParams, complete_plan_steps_in_text, task_state_label,
-        terminal_task_state_from_agent_status,
+        ToolConfigUpsertParams, UserQuestionPickerState, complete_plan_steps_in_text,
+        task_state_label, terminal_task_state_from_agent_status,
     },
 };
 
@@ -3096,6 +3097,167 @@ impl Store {
         true
     }
 
+    // ── UPCR-2026-023 AskUserQuestion picker driving ──────────────────
+    // Mirrors the approval picker driving above: option toggle/navigation,
+    // free-text capture, stepping through 1–4 questions, and submit.
+
+    /// Move the highlighted row down within the active question.
+    pub fn user_question_cursor_down(&mut self) {
+        if let Some(entry) = self
+            .state
+            .user_question
+            .as_mut()
+            .and_then(UserQuestionPickerState::active_question_mut)
+        {
+            entry.move_cursor_down();
+        }
+    }
+
+    /// Move the highlighted row up within the active question.
+    pub fn user_question_cursor_up(&mut self) {
+        if let Some(entry) = self
+            .state
+            .user_question
+            .as_mut()
+            .and_then(UserQuestionPickerState::active_question_mut)
+        {
+            entry.move_cursor_up();
+        }
+    }
+
+    /// Toggle the highlighted option (or enter free-text editing on "Other").
+    pub fn user_question_toggle(&mut self) {
+        if let Some(entry) = self
+            .state
+            .user_question
+            .as_mut()
+            .and_then(UserQuestionPickerState::active_question_mut)
+        {
+            entry.toggle_cursor();
+        }
+    }
+
+    /// Append a character into the active question's free-text "Other" box.
+    pub fn user_question_push_free_text(&mut self, ch: char) {
+        if let Some(entry) = self
+            .state
+            .user_question
+            .as_mut()
+            .and_then(UserQuestionPickerState::active_question_mut)
+        {
+            entry.editing_free_text = true;
+            entry.cursor = entry.free_text_row();
+            entry.free_text.push(ch);
+        }
+    }
+
+    /// Delete the last character from the active question's free-text box.
+    pub fn user_question_pop_free_text(&mut self) {
+        if let Some(entry) = self
+            .state
+            .user_question
+            .as_mut()
+            .and_then(UserQuestionPickerState::active_question_mut)
+        {
+            entry.free_text.pop();
+        }
+    }
+
+    /// True while the active question's "Other" box is capturing keystrokes.
+    pub fn user_question_editing_free_text(&self) -> bool {
+        self.state
+            .user_question
+            .as_ref()
+            .and_then(UserQuestionPickerState::active_question)
+            .is_some_and(|entry| entry.editing_free_text)
+    }
+
+    /// Step to the next question (Enter on a non-final question), or report that
+    /// the picker is ready to submit when on the final question. Returns `true`
+    /// when there are no more questions to step through (caller may submit).
+    pub fn user_question_advance(&mut self) -> bool {
+        let Some(picker) = self.state.user_question.as_mut() else {
+            return false;
+        };
+        if let Some(entry) = picker.active_question_mut() {
+            entry.editing_free_text = false;
+        }
+        if picker.is_last_question() {
+            true
+        } else {
+            picker.focus_next_question();
+            let active = picker.active + 1;
+            let total = picker.questions.len();
+            self.state.status = format!("Question {active}/{total}");
+            false
+        }
+    }
+
+    /// Step back to the previous question.
+    pub fn user_question_back(&mut self) {
+        if let Some(picker) = self.state.user_question.as_mut() {
+            if let Some(entry) = picker.active_question_mut() {
+                entry.editing_free_text = false;
+            }
+            picker.focus_prev_question();
+        }
+    }
+
+    /// Build and consume the `user_question/respond` command for the pending
+    /// picker, mirroring [`Self::respond_approval_command`]. Clears the picker
+    /// and unblocks the run state.
+    pub fn respond_user_question_command(&mut self) -> Option<AppUiCommand> {
+        // A garbled/protocol-violation event with NO structured questions is not
+        // submittable: any respond we form would either be rejected by the
+        // backend validator (answers.len() must equal questions.len()) or carry
+        // no answers at all. Refuse to submit WITHOUT consuming the picker so it
+        // stays Esc-dismissible and recoverable (DO-NOT-SHIP #1/#2). The user
+        // dismisses it via Esc; the turn is unblocked by the server-side
+        // terminal, not a TUI respond.
+        if self
+            .state
+            .user_question
+            .as_ref()
+            .is_some_and(|picker| picker.questions.is_empty())
+        {
+            self.state.status =
+                "This question has no answerable options; press Esc to dismiss it".into();
+            return None;
+        }
+
+        let Some(picker) = self.state.user_question.take() else {
+            self.state.status = "No active question to answer".into();
+            return None;
+        };
+
+        let params = picker.to_respond_params();
+        self.state.status = format!("Answered question: {}", picker.title);
+        if self.state.active_turn().is_some() {
+            self.state.set_run_state_in_progress();
+        } else if self.state.run_state.is_active() {
+            self.state.set_run_state_success();
+        }
+        self.state.user_question_auto_open = true;
+
+        Some(AppUiCommand::RespondUserQuestion(params))
+    }
+
+    pub fn show_pending_user_question(&mut self) -> bool {
+        let title = {
+            let Some(picker) = self.state.user_question.as_mut() else {
+                self.state.status = "No pending question to show".into();
+                return false;
+            };
+            picker.visible = true;
+            picker.title.clone()
+        };
+
+        self.state.user_question_auto_open = true;
+        self.state.focus = FocusPane::Composer;
+        self.state.status = format!("Question shown: {title}");
+        true
+    }
+
     pub fn read_task_output_command(&mut self) -> Option<AppUiCommand> {
         let Some(task) = self.state.active_task_context() else {
             self.state.status = "No selected task output to read".into();
@@ -3213,6 +3375,16 @@ impl Store {
             self.state.approval_auto_open = false;
             self.state.status =
                 "Approval pane hidden; auto-open disabled until approval is shown again".into();
+            return true;
+        }
+
+        if let Some(picker) = self.state.user_question.as_mut()
+            && picker.visible
+        {
+            picker.visible = false;
+            self.state.user_question_auto_open = false;
+            self.state.status =
+                "Question pane hidden; auto-open disabled until question is shown again".into();
             return true;
         }
 
@@ -3850,6 +4022,7 @@ impl Store {
                 let pending_messages = self.state.pending_messages.clone();
                 let optimistic_user_messages = self.state.optimistic_user_messages.clone();
                 let approval_auto_open = self.state.approval_auto_open;
+                let user_question_auto_open = self.state.user_question_auto_open;
                 let expanded_tool_outputs = self.state.expanded_tool_outputs;
                 let menu_stack = self.state.menu_stack.clone();
                 let previous_capabilities = self.state.capabilities.clone();
@@ -3875,6 +4048,7 @@ impl Store {
                 state.pending_messages = pending_messages;
                 state.optimistic_user_messages = optimistic_user_messages;
                 state.approval_auto_open = approval_auto_open;
+                state.user_question_auto_open = user_question_auto_open;
                 state.expanded_tool_outputs = expanded_tool_outputs;
                 state.menu_stack = menu_stack;
                 state.onboarding = onboarding;
@@ -4316,6 +4490,10 @@ impl Store {
             self.apply_hydrated_pending_approvals(&session_id, approvals);
         }
 
+        if let Some(questions) = result.pending_questions {
+            self.apply_hydrated_pending_questions(&session_id, questions);
+        }
+
         let mut sections = Vec::new();
         if result.messages.is_some() {
             sections.push(format!("{message_count} message(s)"));
@@ -4391,6 +4569,37 @@ impl Store {
         let mut approval = ApprovalModalState::from_event(event);
         approval.visible = self.state.approval_auto_open;
         self.state.approval = Some(approval);
+        self.state.focus = FocusPane::Composer;
+        self.state.set_run_state_blocked(title);
+    }
+
+    /// UPCR-2026-023 reconnect path: re-render a still-pending AskUserQuestion
+    /// from `session/hydrate`, mirroring [`Self::apply_hydrated_pending_approvals`].
+    fn apply_hydrated_pending_questions(
+        &mut self,
+        session_id: &SessionKey,
+        questions: Vec<UserQuestionRequestedEvent>,
+    ) {
+        let Some(event) = questions.into_iter().last() else {
+            if self
+                .state
+                .user_question
+                .as_ref()
+                .is_some_and(|picker| &picker.session_id == session_id)
+            {
+                self.state.user_question = None;
+                self.state.set_run_state_idle();
+            }
+            return;
+        };
+        let title = event.title.clone();
+        self.state.push_activity(
+            ActivityItem::new(ActivityKind::Approval, "pending question", title.clone())
+                .with_turn(event.turn_id.clone()),
+        );
+        let mut picker = UserQuestionPickerState::from_event(event);
+        picker.visible = self.state.user_question_auto_open;
+        self.state.user_question = Some(picker);
         self.state.focus = FocusPane::Composer;
         self.state.set_run_state_blocked(title);
     }
@@ -5004,6 +5213,9 @@ impl Store {
                 }
                 None
             }
+            UiNotification::UserQuestionRequested(event) => {
+                self.apply_user_question_requested(event)
+            }
             UiNotification::TaskUpdated(event) => {
                 self.apply_task_update(event);
                 None
@@ -5612,6 +5824,33 @@ impl Store {
         None
     }
 
+    /// UPCR-2026-023: surface a `user_question/requested` as an open picker,
+    /// mirroring [`Self::apply_notification`]'s `ApprovalRequested` handling. A
+    /// garbled/empty event still renders via the mandatory `title`/`body`.
+    fn apply_user_question_requested(
+        &mut self,
+        event: UserQuestionRequestedEvent,
+    ) -> Option<AppUiCommand> {
+        let title = event.title.clone();
+        let detail = if event.questions.is_empty() {
+            "free text".to_string()
+        } else {
+            format!("{} question(s)", event.questions.len())
+        };
+        self.state.push_activity(
+            ActivityItem::new(ActivityKind::Approval, "ask_user_question", title.clone())
+                .with_turn(event.turn_id.clone())
+                .with_detail(detail),
+        );
+        let mut picker = UserQuestionPickerState::from_event(event);
+        picker.visible = self.state.user_question_auto_open;
+        self.state.user_question = Some(picker);
+        self.state.focus = FocusPane::Composer;
+        self.state.set_run_state_blocked(title.clone());
+        self.state.status = format!("Question asked: {title}");
+        None
+    }
+
     fn apply_replay_lossy(&mut self, event: ReplayLossyEvent) -> Option<AppUiCommand> {
         let cursor_hint = event
             .last_durable_cursor
@@ -5730,6 +5969,12 @@ impl Store {
         // committed cleanly, or be swallowed by the `Some(mismatched)` arm —
         // either way mishandling the already-closed turn. Consume the marker so
         // a genuine future terminal for the same turn id is unaffected.
+        //
+        // A pending AskUserQuestion picker for this terminal turn is now stale —
+        // clear it BEFORE the finalized-by-switch early return, so a late
+        // terminal for an already-finalized turn still dismisses the picker
+        // instead of leaving it wedged (nit).
+        self.clear_question_for_turn(&event.session_id, &event.turn_id);
         if self
             .state
             .take_turn_finalized_by_switch(&event.session_id, &event.turn_id)
@@ -5823,6 +6068,9 @@ impl Store {
         let was_finalized_by_switch = self
             .state
             .take_turn_finalized_by_switch(&event.session_id, &event.turn_id);
+        // A turn error cancels any pending AskUserQuestion picker for this turn
+        // (design §4.2: the turn-interrupt/error path is Phase-1's cancellation).
+        self.clear_question_for_turn(&event.session_id, &event.turn_id);
         let follow_tail = self.state.transcript_scroll == 0;
         let fallback_summary =
             self.turn_error_fallback_message(&event.turn_id, &event.code, &event.message);
@@ -6143,6 +6391,21 @@ impl Store {
             .is_some_and(|approval| &approval.approval_id == approval_id);
         if matches {
             self.state.approval = None;
+        }
+        matches
+    }
+
+    /// Phase-1 AskUserQuestion has no dedicated `user_question/cancelled`
+    /// notification: a turn interrupt/error that terminates the paused turn is
+    /// the cancellation signal (design §4.2). When a turn terminates we drop any
+    /// pending picker bound to that turn so a stale question never wedges the UI.
+    fn clear_question_for_turn(&mut self, session_id: &SessionKey, turn_id: &TurnId) -> bool {
+        let matches =
+            self.state.user_question.as_ref().is_some_and(|picker| {
+                &picker.session_id == session_id && &picker.turn_id == turn_id
+            });
+        if matches {
+            self.state.user_question = None;
         }
         matches
     }
@@ -12530,6 +12793,392 @@ mod tests {
         }));
     }
 
+    // ── UPCR-2026-023 AskUserQuestion picker reducer tests ──────────────
+
+    use octos_core::ui_protocol::{
+        QuestionId, UserQuestion, UserQuestionOption, UserQuestionRequestedEvent,
+    };
+
+    fn option(label: &str, description: &str) -> UserQuestionOption {
+        UserQuestionOption {
+            label: label.into(),
+            description: description.into(),
+        }
+    }
+
+    fn single_select(
+        header: &str,
+        question: &str,
+        options: Vec<UserQuestionOption>,
+    ) -> UserQuestion {
+        UserQuestion {
+            header: header.into(),
+            question: question.into(),
+            options,
+            multi_select: false,
+            allow_free_text: true,
+        }
+    }
+
+    fn multi_select(
+        header: &str,
+        question: &str,
+        options: Vec<UserQuestionOption>,
+    ) -> UserQuestion {
+        UserQuestion {
+            header: header.into(),
+            question: question.into(),
+            options,
+            multi_select: true,
+            allow_free_text: true,
+        }
+    }
+
+    fn open_user_question(
+        store: &mut Store,
+        questions: Vec<UserQuestion>,
+    ) -> (SessionKey, QuestionId, TurnId) {
+        let session_id = store.state.sessions[0].id.clone();
+        let question_id = QuestionId::new();
+        let turn_id = TurnId::new();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::UserQuestionRequested(
+            UserQuestionRequestedEvent::new(
+                session_id.clone(),
+                question_id.clone(),
+                turn_id.clone(),
+                "Pick a framework",
+                "The agent needs a framework choice to proceed.",
+                questions,
+            ),
+        )));
+        (session_id, question_id, turn_id)
+    }
+
+    #[test]
+    fn user_question_requested_puts_picker_in_state_with_questions_and_options() {
+        let mut store = store_with_live_reply(TurnId::new(), "working");
+        let (session_id, question_id, turn_id) = open_user_question(
+            &mut store,
+            vec![single_select(
+                "Framework",
+                "Which web framework?",
+                vec![
+                    option("axum", "tokio-native"),
+                    option("actix", "actor-based"),
+                ],
+            )],
+        );
+
+        let picker = store.state.user_question.as_ref().expect("picker visible");
+        assert!(picker.visible);
+        assert_eq!(picker.session_id, session_id);
+        assert_eq!(picker.question_id, question_id);
+        assert_eq!(picker.turn_id, turn_id);
+        assert_eq!(picker.title, "Pick a framework");
+        assert_eq!(picker.questions.len(), 1);
+        let entry = picker.active_question().expect("active question");
+        assert_eq!(entry.header, "Framework");
+        assert_eq!(entry.options.len(), 2);
+        assert!(!entry.multi_select);
+        // Picker pauses the turn like an open approval.
+        assert_eq!(store.state.run_state.label(), "blocked");
+    }
+
+    #[test]
+    fn user_question_single_select_takes_at_most_one_label() {
+        let mut store = store_with_live_reply(TurnId::new(), "working");
+        let (session_id, question_id, _) = open_user_question(
+            &mut store,
+            vec![single_select(
+                "Framework",
+                "Which web framework?",
+                vec![option("axum", "tokio"), option("actix", "actor")],
+            )],
+        );
+
+        // Highlight + select the first option, then select the second: single
+        // select must drop the first.
+        store.user_question_toggle(); // axum
+        store.user_question_cursor_down(); // -> actix
+        store.user_question_toggle(); // actix (clears axum)
+
+        let command = store
+            .respond_user_question_command()
+            .expect("respond command");
+        let AppUiCommand::RespondUserQuestion(params) = command else {
+            panic!("expected user_question respond command");
+        };
+        assert_eq!(params.session_id, session_id);
+        assert_eq!(params.question_id, question_id);
+        assert_eq!(params.answers.len(), 1);
+        assert_eq!(params.answers[0].selected_labels, vec!["actix".to_string()]);
+        assert_eq!(params.answers[0].free_text, None);
+        // Picker cleared, run-state resumed.
+        assert!(store.state.user_question.is_none());
+        assert_eq!(store.state.run_state.label(), "running");
+    }
+
+    #[test]
+    fn user_question_multi_select_takes_multiple_labels() {
+        let mut store = store_with_live_reply(TurnId::new(), "working");
+        let (_, _, _) = open_user_question(
+            &mut store,
+            vec![multi_select(
+                "Targets",
+                "Which build targets?",
+                vec![
+                    option("stable", ""),
+                    option("msrv", ""),
+                    option("nightly", ""),
+                ],
+            )],
+        );
+
+        store.user_question_toggle(); // stable
+        store.user_question_cursor_down();
+        store.user_question_cursor_down();
+        store.user_question_toggle(); // nightly
+
+        let command = store
+            .respond_user_question_command()
+            .expect("respond command");
+        let AppUiCommand::RespondUserQuestion(params) = command else {
+            panic!("expected respond command");
+        };
+        assert_eq!(params.answers.len(), 1);
+        assert_eq!(
+            params.answers[0].selected_labels,
+            vec!["stable".to_string(), "nightly".to_string()]
+        );
+    }
+
+    #[test]
+    fn user_question_free_text_other_path_carries_free_text() {
+        let mut store = store_with_live_reply(TurnId::new(), "working");
+        open_user_question(
+            &mut store,
+            vec![single_select(
+                "Framework",
+                "Which?",
+                vec![option("axum", ""), option("actix", "")],
+            )],
+        );
+
+        // Type into the "Other" box without selecting any option.
+        for ch in "rocket".chars() {
+            store.user_question_push_free_text(ch);
+        }
+        assert!(store.user_question_editing_free_text());
+
+        let command = store
+            .respond_user_question_command()
+            .expect("respond command");
+        let AppUiCommand::RespondUserQuestion(params) = command else {
+            panic!("expected respond command");
+        };
+        assert!(params.answers[0].selected_labels.is_empty());
+        assert_eq!(params.answers[0].free_text.as_deref(), Some("rocket"));
+    }
+
+    #[test]
+    fn user_question_multi_question_carries_per_question_answers_in_order() {
+        let mut store = store_with_live_reply(TurnId::new(), "working");
+        open_user_question(
+            &mut store,
+            vec![
+                single_select(
+                    "Q1",
+                    "Framework?",
+                    vec![option("axum", ""), option("actix", "")],
+                ),
+                multi_select(
+                    "Q2",
+                    "Targets?",
+                    vec![option("stable", ""), option("nightly", "")],
+                ),
+            ],
+        );
+
+        // Q1: pick axum, then Enter steps to Q2 (does not submit).
+        store.user_question_toggle();
+        assert!(!store.user_question_advance());
+        assert_eq!(store.state.user_question.as_ref().unwrap().active, 1);
+
+        // Q2: pick stable + nightly.
+        store.user_question_toggle(); // stable
+        store.user_question_cursor_down();
+        store.user_question_toggle(); // nightly
+
+        // On the last question advance signals ready-to-submit.
+        assert!(store.user_question_advance());
+        let command = store
+            .respond_user_question_command()
+            .expect("respond command");
+        let AppUiCommand::RespondUserQuestion(params) = command else {
+            panic!("expected respond command");
+        };
+        assert_eq!(params.answers.len(), 2);
+        assert_eq!(params.answers[0].selected_labels, vec!["axum".to_string()]);
+        assert_eq!(
+            params.answers[1].selected_labels,
+            vec!["stable".to_string(), "nightly".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_garbled_user_question_still_renders_title_body_and_is_recoverable() {
+        // A client that gets an event with NO structured questions must still
+        // show title/body as an informational fallback card, and stay
+        // dismissible/recoverable — but it must NOT submit, since a respond for
+        // a garbled 0-question event cannot form a valid (count-matched) answer
+        // set. (DO-NOT-SHIP #2.)
+        let mut store = store_with_live_reply(TurnId::new(), "working");
+        let (_, _, _) = open_user_question(&mut store, Vec::new());
+
+        let picker = store.state.user_question.as_ref().expect("picker visible");
+        assert_eq!(picker.title, "Pick a framework");
+        assert_eq!(
+            picker.body,
+            "The agent needs a framework choice to proceed."
+        );
+        assert!(picker.questions.is_empty());
+
+        // No submit: the picker is NOT consumed and no command is produced, so
+        // we never send a mismatched respond.
+        assert!(store.respond_user_question_command().is_none());
+        assert!(
+            store.state.user_question.is_some(),
+            "picker must not be consumed on an unsubmittable garbled event"
+        );
+
+        // Still dismissible (Esc) and recoverable (#1) without submitting.
+        assert!(store.close_modal());
+        assert!(!store.state.user_question.as_ref().unwrap().visible);
+        assert!(store.show_pending_user_question());
+        assert!(store.state.user_question.as_ref().unwrap().visible);
+    }
+
+    #[test]
+    fn zero_question_event_does_not_send_invalid_respond() {
+        // DO-NOT-SHIP #2: a `user_question/requested` with empty `questions` is a
+        // protocol-violation / garbled event. `to_respond_params()` must emit
+        // EXACTLY questions.len() answers (== 0 here), never a manufactured empty
+        // answer that the backend validator (answers.len()==questions.len())
+        // would reject; and the submit path must NOT fire (no command, picker
+        // preserved + recoverable).
+        let mut store = store_with_live_reply(TurnId::new(), "working");
+        open_user_question(&mut store, Vec::new());
+
+        let picker = store.state.user_question.as_ref().expect("picker visible");
+        assert!(picker.questions.is_empty());
+        // The respond params for 0 questions carry 0 answers (never 1).
+        assert_eq!(picker.to_respond_params().answers.len(), 0);
+
+        // The submit path is a no-op: no RespondUserQuestion is produced and the
+        // picker is preserved (so it stays dismissible + recoverable).
+        assert!(store.respond_user_question_command().is_none());
+        assert!(store.state.user_question.is_some());
+        // The run-state must not be falsely resumed by a non-submit.
+        assert_eq!(store.state.run_state.label(), "blocked");
+    }
+
+    #[test]
+    fn user_question_cleared_on_finalized_by_switch_terminal() {
+        // nit: commit_live_reply() may early-return when the turn was already
+        // finalized by a turn-switch. A pending question for that terminal turn
+        // must still be cleared BEFORE that early return, so a stale terminal
+        // does not leave the picker wedged.
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "working");
+        let (session_id, _, _) = open_user_question(
+            &mut store,
+            vec![single_select(
+                "Q",
+                "?",
+                vec![option("a", ""), option("b", "")],
+            )],
+        );
+        // Bind the picker to the turn that is about to terminate.
+        store.state.user_question.as_mut().unwrap().turn_id = turn_id.clone();
+        assert!(store.state.user_question.is_some());
+
+        // Mark the turn as already-finalized-by-switch so commit_live_reply takes
+        // the early-return branch.
+        store
+            .state
+            .mark_turn_finalized_by_switch(&session_id, &turn_id);
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        // Even though the terminal early-returned, the stale picker is cleared.
+        assert!(
+            store.state.user_question.is_none(),
+            "stale picker must clear even on the finalized-by-switch early return"
+        );
+    }
+
+    #[test]
+    fn stale_user_question_clears_on_turn_error_without_wedging() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "working");
+        let (session_id, _, _) = open_user_question(
+            &mut store,
+            vec![single_select(
+                "Q",
+                "?",
+                vec![option("a", ""), option("b", "")],
+            )],
+        );
+        // Bind the picker turn to the live turn so the terminal clears it.
+        store.state.user_question.as_mut().unwrap().turn_id = turn_id.clone();
+        assert!(store.state.user_question.is_some());
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id,
+                code: "cancelled".into(),
+                message: "turn interrupted".into(),
+            },
+        )));
+
+        // No wedge: the picker is gone and a later respond is a clean no-op.
+        assert!(store.state.user_question.is_none());
+        assert!(store.respond_user_question_command().is_none());
+        assert_eq!(store.state.status, "No active question to answer");
+    }
+
+    #[test]
+    fn close_modal_hides_pending_user_question_without_responding() {
+        let mut store = store_with_empty_session();
+        open_user_question(
+            &mut store,
+            vec![single_select(
+                "Q",
+                "?",
+                vec![option("a", ""), option("b", "")],
+            )],
+        );
+        assert!(store.state.user_question.as_ref().unwrap().visible);
+
+        assert!(store.close_modal());
+        // Still present (not answered) but hidden, and auto-open disabled.
+        let picker = store.state.user_question.as_ref().expect("still pending");
+        assert!(!picker.visible);
+        assert!(!store.state.user_question_auto_open);
+    }
+
     #[test]
     fn replay_lossy_notification_surfaces_rehydrate_status() {
         let mut store = store_with_empty_session();
@@ -15480,6 +16129,7 @@ mod tests {
             threads: None,
             turns: None,
             pending_approvals: None,
+            pending_questions: None,
             replayed_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
@@ -15583,6 +16233,7 @@ mod tests {
                 thread_id: Some("thread-1".into()),
             }]),
             pending_approvals: Some(vec![approval]),
+            pending_questions: None,
             replayed_envelopes: Some(vec![TurnSpawnCompleteEvent {
                 session_id: session_id.clone(),
                 topic: None,
@@ -15665,6 +16316,7 @@ mod tests {
                 thread_id: Some("thread-1".into()),
             }]),
             pending_approvals: None,
+            pending_questions: None,
             replayed_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
@@ -15720,6 +16372,7 @@ mod tests {
                 thread_id: Some("thread-1".into()),
             }]),
             pending_approvals: None,
+            pending_questions: None,
             replayed_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
@@ -15770,6 +16423,7 @@ mod tests {
                     thread_id: Some("thread-1".into()),
                 }]),
                 pending_approvals: None,
+                pending_questions: None,
                 replayed_envelopes: None,
             };
             store.apply_client_event(ClientEvent::SessionHydrate(result));
