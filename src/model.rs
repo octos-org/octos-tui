@@ -3623,22 +3623,21 @@ impl UserQuestionPickerState {
         self.questions.is_empty() || self.active + 1 >= self.questions.len()
     }
 
-    /// Build the `user_question/respond` params: one [`UserQuestionAnswer`] per
-    /// question, in question order. A picker with no structured questions (the
-    /// generic-fallback path) still produces a single free-text answer so the
-    /// turn can be unblocked.
+    /// Build the `user_question/respond` params: EXACTLY one
+    /// [`UserQuestionAnswer`] per structured question, in question order. A
+    /// picker with no structured questions (the garbled/protocol-violation
+    /// fallback path) yields an EMPTY `answers` vec — never a manufactured empty
+    /// answer — so the count always equals `questions.len()` and the backend
+    /// validator (`answers.len() == questions.len()`) can never reject it
+    /// (DO-NOT-SHIP #2). The 0-question case is not submittable via the picker
+    /// (see [`Store::respond_user_question_command`]); this method only
+    /// guarantees the wire shape is valid if a respond is ever formed.
     pub fn to_respond_params(&self) -> UserQuestionRespondParams {
-        let answers = if self.questions.is_empty() {
-            vec![UserQuestionAnswer {
-                selected_labels: Vec::new(),
-                free_text: None,
-            }]
-        } else {
-            self.questions
-                .iter()
-                .map(UserQuestionEntry::answer)
-                .collect()
-        };
+        let answers = self
+            .questions
+            .iter()
+            .map(UserQuestionEntry::answer)
+            .collect();
         UserQuestionRespondParams::new(self.session_id.clone(), self.question_id.clone(), answers)
     }
 }

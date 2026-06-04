@@ -1779,11 +1779,15 @@ fn push_inline_user_question_card(
     match picker.active_question() {
         Some(entry) => push_user_question_entry(lines, palette, entry, width),
         None => {
-            // Graceful fallback: no structured questions. The user answers via
-            // free text; Enter submits.
+            // Garbled / protocol-violation fallback: no structured questions, so
+            // there is nothing answerable. Render the title/body as an
+            // INFORMATIONAL card only — do NOT offer a "Type your answer"
+            // affordance, since any input would be discarded and a submit cannot
+            // form a valid (count-matched) respond (DO-NOT-SHIP #2). The card
+            // stays dismissible (Esc) and recoverable (Alt+a).
             lines.push(Line::from(vec![
                 Span::styled("    ", palette.muted()),
-                Span::styled("Type your answer, then Enter to send", palette.selected()),
+                Span::styled("No answerable options were provided.", palette.muted()),
             ]));
         }
     }
@@ -1879,6 +1883,12 @@ fn push_user_question_entry(
 }
 
 fn user_question_action_labels(picker: &UserQuestionPickerState) -> Vec<&'static str> {
+    // Garbled / 0-question event: nothing is answerable, so offer only a dismiss
+    // hint — never a submit affordance that would form an invalid respond
+    // (DO-NOT-SHIP #2). Alt+a re-opens it if dismissed (DO-NOT-SHIP #1).
+    if picker.questions.is_empty() {
+        return vec!["Esc = dismiss (no answer to submit)"];
+    }
     let mut labels = vec!["Up/Down move | Space toggle | type for Other"];
     if picker.is_last_question() {
         labels.push("Enter = submit answer(s) | Esc = hide");
@@ -5201,16 +5211,22 @@ mod tests {
     }
 
     #[test]
-    fn render_garbled_user_question_still_shows_title_body_and_stays_answerable() {
+    fn render_garbled_user_question_renders_info_fallback_without_submit_affordance() {
         // No structured questions: must still render the mandatory title/body
-        // fallback and an actionable submit prompt.
+        // fallback as an INFORMATIONAL card, but must NOT offer a "Type your
+        // answer" affordance (input would be discarded and a submit cannot form a
+        // valid respond). Only a dismiss hint is shown (DO-NOT-SHIP #2).
         let app = app_with_user_question(Vec::new());
 
         let text = rendered_text(&app);
 
         assert!(text.contains("Pick a framework"));
         assert!(text.contains("The agent needs your input."));
-        assert!(text.contains("Type your answer, then Enter to send"));
+        assert!(text.contains("No answerable options were provided."));
+        assert!(text.contains("Esc = dismiss"));
+        // No input affordance is offered for the garbled fallback.
+        assert!(!text.contains("Type your answer"));
+        assert!(!text.contains("Enter = submit"));
     }
 
     #[test]

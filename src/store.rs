@@ -3207,6 +3207,24 @@ impl Store {
     /// picker, mirroring [`Self::respond_approval_command`]. Clears the picker
     /// and unblocks the run state.
     pub fn respond_user_question_command(&mut self) -> Option<AppUiCommand> {
+        // A garbled/protocol-violation event with NO structured questions is not
+        // submittable: any respond we form would either be rejected by the
+        // backend validator (answers.len() must equal questions.len()) or carry
+        // no answers at all. Refuse to submit WITHOUT consuming the picker so it
+        // stays Esc-dismissible and recoverable (DO-NOT-SHIP #1/#2). The user
+        // dismisses it via Esc; the turn is unblocked by the server-side
+        // terminal, not a TUI respond.
+        if self
+            .state
+            .user_question
+            .as_ref()
+            .is_some_and(|picker| picker.questions.is_empty())
+        {
+            self.state.status =
+                "This question has no answerable options; press Esc to dismiss it".into();
+            return None;
+        }
+
         let Some(picker) = self.state.user_question.take() else {
             self.state.status = "No active question to answer".into();
             return None;
@@ -5951,14 +5969,18 @@ impl Store {
         // committed cleanly, or be swallowed by the `Some(mismatched)` arm —
         // either way mishandling the already-closed turn. Consume the marker so
         // a genuine future terminal for the same turn id is unaffected.
+        //
+        // A pending AskUserQuestion picker for this terminal turn is now stale —
+        // clear it BEFORE the finalized-by-switch early return, so a late
+        // terminal for an already-finalized turn still dismisses the picker
+        // instead of leaving it wedged (nit).
+        self.clear_question_for_turn(&event.session_id, &event.turn_id);
         if self
             .state
             .take_turn_finalized_by_switch(&event.session_id, &event.turn_id)
         {
             return None;
         }
-        // A pending AskUserQuestion picker for this turn is now stale.
-        self.clear_question_for_turn(&event.session_id, &event.turn_id);
         let seq = event.cursor.map(|cursor| cursor.seq).unwrap_or(0);
         let follow_tail = self.state.transcript_scroll == 0;
         let complete_live_plan = self.turn_had_completion_activity(&event.turn_id);
@@ -13004,11 +13026,14 @@ mod tests {
     }
 
     #[test]
-    fn unknown_garbled_user_question_still_renders_title_body_and_is_answerable() {
+    fn unknown_garbled_user_question_still_renders_title_body_and_is_recoverable() {
         // A client that gets an event with NO structured questions must still
-        // show title/body and stay answerable via free text.
+        // show title/body as an informational fallback card, and stay
+        // dismissible/recoverable — but it must NOT submit, since a respond for
+        // a garbled 0-question event cannot form a valid (count-matched) answer
+        // set. (DO-NOT-SHIP #2.)
         let mut store = store_with_live_reply(TurnId::new(), "working");
-        let (session_id, question_id, _) = open_user_question(&mut store, Vec::new());
+        let (_, _, _) = open_user_question(&mut store, Vec::new());
 
         let picker = store.state.user_question.as_ref().expect("picker visible");
         assert_eq!(picker.title, "Pick a framework");
@@ -13018,17 +13043,88 @@ mod tests {
         );
         assert!(picker.questions.is_empty());
 
-        // Still answerable: produces a single free-text answer slot.
-        let command = store
-            .respond_user_question_command()
-            .expect("answerable fallback");
-        let AppUiCommand::RespondUserQuestion(params) = command else {
-            panic!("expected respond command");
-        };
-        assert_eq!(params.session_id, session_id);
-        assert_eq!(params.question_id, question_id);
-        assert_eq!(params.answers.len(), 1);
-        assert!(params.answers[0].selected_labels.is_empty());
+        // No submit: the picker is NOT consumed and no command is produced, so
+        // we never send a mismatched respond.
+        assert!(store.respond_user_question_command().is_none());
+        assert!(
+            store.state.user_question.is_some(),
+            "picker must not be consumed on an unsubmittable garbled event"
+        );
+
+        // Still dismissible (Esc) and recoverable (#1) without submitting.
+        assert!(store.close_modal());
+        assert!(!store.state.user_question.as_ref().unwrap().visible);
+        assert!(store.show_pending_user_question());
+        assert!(store.state.user_question.as_ref().unwrap().visible);
+    }
+
+    #[test]
+    fn zero_question_event_does_not_send_invalid_respond() {
+        // DO-NOT-SHIP #2: a `user_question/requested` with empty `questions` is a
+        // protocol-violation / garbled event. `to_respond_params()` must emit
+        // EXACTLY questions.len() answers (== 0 here), never a manufactured empty
+        // answer that the backend validator (answers.len()==questions.len())
+        // would reject; and the submit path must NOT fire (no command, picker
+        // preserved + recoverable).
+        let mut store = store_with_live_reply(TurnId::new(), "working");
+        open_user_question(&mut store, Vec::new());
+
+        let picker = store.state.user_question.as_ref().expect("picker visible");
+        assert!(picker.questions.is_empty());
+        // The respond params for 0 questions carry 0 answers (never 1).
+        assert_eq!(picker.to_respond_params().answers.len(), 0);
+
+        // The submit path is a no-op: no RespondUserQuestion is produced and the
+        // picker is preserved (so it stays dismissible + recoverable).
+        assert!(store.respond_user_question_command().is_none());
+        assert!(store.state.user_question.is_some());
+        // The run-state must not be falsely resumed by a non-submit.
+        assert_eq!(store.state.run_state.label(), "blocked");
+    }
+
+    #[test]
+    fn user_question_cleared_on_finalized_by_switch_terminal() {
+        // nit: commit_live_reply() may early-return when the turn was already
+        // finalized by a turn-switch. A pending question for that terminal turn
+        // must still be cleared BEFORE that early return, so a stale terminal
+        // does not leave the picker wedged.
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "working");
+        let (session_id, _, _) = open_user_question(
+            &mut store,
+            vec![single_select(
+                "Q",
+                "?",
+                vec![option("a", ""), option("b", "")],
+            )],
+        );
+        // Bind the picker to the turn that is about to terminate.
+        store.state.user_question.as_mut().unwrap().turn_id = turn_id.clone();
+        assert!(store.state.user_question.is_some());
+
+        // Mark the turn as already-finalized-by-switch so commit_live_reply takes
+        // the early-return branch.
+        store
+            .state
+            .mark_turn_finalized_by_switch(&session_id, &turn_id);
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        // Even though the terminal early-returned, the stale picker is cleared.
+        assert!(
+            store.state.user_question.is_none(),
+            "stale picker must clear even on the finalized-by-switch early return"
+        );
     }
 
     #[test]
