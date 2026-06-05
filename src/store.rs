@@ -953,6 +953,7 @@ impl Store {
             LocalAction::ToolConfig => self.dispatch_tools_inline(inline_args.unwrap_or_default()),
             LocalAction::SetLanguage => self.dispatch_set_language(inline_args.unwrap_or_default()),
             LocalAction::SetThinking => self.dispatch_set_thinking(inline_args.unwrap_or_default()),
+            LocalAction::SetThinkingLevel(level) => self.dispatch_set_thinking_level(level),
             LocalAction::Custom(name) => {
                 self.state.status = format!("Local menu action `{name}` is not wired yet");
                 None
@@ -994,23 +995,13 @@ impl Store {
     /// effort attached to every turn/start, or `default` to clear the override
     /// (server gateway/profile default applies). No-op for models without a
     /// reasoning style; the server decides whether the effort is honored.
+    /// `/thinking` with no arg opens the selection menu; with an arg
+    /// (`low|medium|high|max|default`) it sets the level inline as a shortcut.
     fn dispatch_set_thinking(&mut self, inline_args: &str) -> Option<AppUiCommand> {
         use octos_core::ui_protocol::ReasoningEffortLevel as L;
-        // Scope the effort to the active session (per-session, by SessionKey).
-        let Some(session_id) = self.active_session().map(|s| s.id.clone()) else {
-            self.state.status = t!("thinking.no_session").to_string();
-            return None;
-        };
         let arg = inline_args.trim().to_ascii_lowercase();
         if arg.is_empty() {
-            let current = match self.state.session_reasoning_effort.get(&session_id) {
-                Some(L::Low) => "low",
-                Some(L::Medium) => "medium",
-                Some(L::High) => "high",
-                Some(L::Max) => "max",
-                None => "default",
-            };
-            self.state.status = t!("thinking.usage", current = current).to_string();
+            self.open_menu(MenuId::from(crate::menu::registry::MENU_THINKING));
             return None;
         }
         let level = match arg.as_str() {
@@ -1024,10 +1015,31 @@ impl Store {
                 return None;
             }
         };
+        self.dispatch_set_thinking_level(level)
+    }
+
+    /// Set the active session's reasoning effort to `level` (`None` clears the
+    /// override). Shared by the inline `/thinking <level>` shortcut and the
+    /// `/thinking` selection menu.
+    fn dispatch_set_thinking_level(
+        &mut self,
+        level: Option<octos_core::ui_protocol::ReasoningEffortLevel>,
+    ) -> Option<AppUiCommand> {
+        use octos_core::ui_protocol::ReasoningEffortLevel as L;
+        let Some(session_id) = self.active_session().map(|s| s.id.clone()) else {
+            self.state.status = t!("thinking.no_session").to_string();
+            return None;
+        };
         match level {
             Some(l) => {
                 self.state.session_reasoning_effort.insert(session_id, l);
-                self.state.status = t!("thinking.set", level = arg).to_string();
+                let name = match l {
+                    L::Low => "low",
+                    L::Medium => "medium",
+                    L::High => "high",
+                    L::Max => "max",
+                };
+                self.state.status = t!("thinking.set", level = name).to_string();
             }
             None => {
                 self.state.session_reasoning_effort.remove(&session_id);
@@ -7537,13 +7549,8 @@ mod tests {
             Some(&L::High)
         );
 
-        // Empty arg shows usage without changing the level.
+        // Empty arg opens the selection menu and does NOT change the level.
         store.dispatch_set_thinking("");
-        assert!(
-            store.state.status.contains("/thinking"),
-            "empty arg should show usage, got: {}",
-            store.state.status
-        );
         assert_eq!(
             store.state.session_reasoning_effort.get(&key),
             Some(&L::High)
@@ -7552,6 +7559,25 @@ mod tests {
         // Per-session: the level is keyed by SessionKey, not global.
         let other = SessionKey("local:other".into());
         assert!(store.state.session_reasoning_effort.get(&other).is_none());
+    }
+
+    #[test]
+    fn thinking_menu_action_sets_and_clears_level() {
+        // The /thinking selection menu dispatches SetThinkingLevel directly.
+        use octos_core::ui_protocol::ReasoningEffortLevel as L;
+        let mut store = store_with_empty_session();
+        let key = store.active_session().expect("active session").id.clone();
+
+        store.dispatch_set_thinking_level(Some(L::Max));
+        assert_eq!(
+            store.state.session_reasoning_effort.get(&key),
+            Some(&L::Max)
+        );
+        assert!(store.state.status.contains("max"));
+
+        // The "Default" menu item clears the override.
+        store.dispatch_set_thinking_level(None);
+        assert!(store.state.session_reasoning_effort.get(&key).is_none());
     }
 
     #[test]

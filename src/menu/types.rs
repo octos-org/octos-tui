@@ -262,6 +262,9 @@ pub enum LocalAction {
     /// command's inline args, stored on `AppState`, and attached to every
     /// `turn/start` for the session; `default` clears the override.
     SetThinking,
+    /// Set the per-session reasoning effort to a specific level from the
+    /// `/thinking` selection menu. `None` clears the override (server default).
+    SetThinkingLevel(Option<octos_core::ui_protocol::ReasoningEffortLevel>),
     Custom(&'static str),
 }
 

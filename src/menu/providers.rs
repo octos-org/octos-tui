@@ -60,6 +60,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::OnboardRoute,
         Provider::Login,
         Provider::Theme,
+        Provider::Thinking,
         Provider::StatusLine,
         Provider::Title,
         Provider::Keymap,
@@ -88,6 +89,7 @@ enum Provider {
     OnboardRoute,
     Login,
     Theme,
+    Thinking,
     StatusLine,
     Title,
     Keymap,
@@ -111,6 +113,7 @@ impl MenuProvider for Provider {
             Self::OnboardRoute => crate::menu::registry::MENU_ONBOARD_ROUTE,
             Self::Login => MENU_LOGIN,
             Self::Theme => MENU_THEME,
+            Self::Thinking => crate::menu::registry::MENU_THINKING,
             Self::StatusLine => MENU_STATUS_LINE,
             Self::Title => MENU_TITLE,
             Self::Keymap => MENU_KEYMAP,
@@ -134,6 +137,7 @@ impl MenuProvider for Provider {
             Self::OnboardRoute => onboarding_route_menu(ctx),
             Self::Login => login_menu(ctx),
             Self::Theme => MenuBuildResult::Ready(theme_menu(ctx)),
+            Self::Thinking => MenuBuildResult::Ready(thinking_menu(ctx)),
             Self::StatusLine => MenuBuildResult::Ready(status_line_menu(ctx)),
             Self::Title => MenuBuildResult::Ready(title_menu(ctx)),
             Self::Keymap => MenuBuildResult::Ready(keymap_menu()),
@@ -193,6 +197,60 @@ fn help_menu(ctx: &MenuContext<'_>) -> MenuSpec {
         // info (not actionable) and, with the two-pane split, its text collided
         // with the command column. Each command already carries its own inline
         // description, so the list renders full-width instead.
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    }
+}
+
+fn thinking_menu(_ctx: &MenuContext<'_>) -> MenuSpec {
+    use octos_core::ui_protocol::ReasoningEffortLevel as L;
+    let items = [
+        (
+            "default",
+            "Default",
+            "Use the server default (no per-session override).",
+            None,
+        ),
+        (
+            "low",
+            "Low",
+            "Minimal reasoning — fastest, cheapest.",
+            Some(L::Low),
+        ),
+        ("medium", "Medium", "Balanced reasoning.", Some(L::Medium)),
+        ("high", "High", "Thorough reasoning.", Some(L::High)),
+        (
+            "max",
+            "Max",
+            "Maximum reasoning (DeepSeek V4; others clamp to high).",
+            Some(L::Max),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(idx, (id, label, description, level))| {
+        let mut item = MenuItem::new(
+            id,
+            label,
+            MenuAction::Local(LocalAction::SetThinkingLevel(level)),
+        )
+        .with_description(description);
+        if let Some(shortcut) = numeric_shortcut(idx) {
+            item = item.with_shortcut(shortcut);
+        }
+        item
+    })
+    .collect();
+
+    MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_THINKING),
+        title: "Thinking effort".into(),
+        subtitle: Some("Reasoning effort for thinking models (this session).".into()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some("Enter apply | Esc close".into()),
         preview: None,
         mode: MenuMode::SingleSelect,
     }
