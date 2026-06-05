@@ -38,3 +38,4 @@ thinking:
   set: "Reasoning effort set to %{level}."
   cleared: "Reasoning effort cleared — using the server default."
   unknown: "Unknown effort '%{value}'. Available: low, medium, high, max, default."
+  no_session: "No active session — open or select a session first."

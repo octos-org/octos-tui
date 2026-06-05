@@ -28,3 +28,4 @@ thinking:
   set: "推理强度已设为 %{level}。"
   cleared: "已清除推理强度，使用服务器默认值。"
   unknown: "未知强度“%{value}”。可选：low、medium、high、max、default。"
+  no_session: "没有活动会话——请先打开或选择一个会话。"

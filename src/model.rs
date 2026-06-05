@@ -3043,10 +3043,13 @@ pub struct AppState {
     /// Cleared on the session's next non-retry progress event so a settled
     /// turn doesn't linger as "retrying".
     pub session_retry: std::collections::HashMap<SessionKey, UiRetryBackoff>,
-    /// Reasoning/thinking effort chosen via the `/thinking` command, attached to
-    /// every `turn/start` for the rest of the session. `None` = use the server
+    /// Per-session reasoning/thinking effort chosen via the `/thinking` command,
+    /// keyed by `SessionKey` so each session keeps its own level. Attached to
+    /// every `turn/start` for that session; absent = use the server
     /// (gateway/profile) default. Only affects thinking-capable models.
-    pub session_reasoning_effort: Option<octos_core::ui_protocol::ReasoningEffortLevel>,
+    /// Preserved across `Snapshot` replays (see `apply_event`).
+    pub session_reasoning_effort:
+        std::collections::HashMap<SessionKey, octos_core::ui_protocol::ReasoningEffortLevel>,
     /// Per-session set of turn ids that were already finalized (committed OR
     /// dropped) by `commit_pending_live_reply_for_turn_switch` at a turn-switch
     /// boundary. A prior turn's OWN late `TurnCompleted`/`TurnError` may still
@@ -4622,7 +4625,7 @@ impl AppState {
             orchestration: std::collections::HashMap::new(),
             session_usage: std::collections::HashMap::new(),
             session_retry: std::collections::HashMap::new(),
-            session_reasoning_effort: None,
+            session_reasoning_effort: std::collections::HashMap::new(),
             finalized_by_switch: std::collections::HashMap::new(),
             selected_session,
             selected_task: 0,
