@@ -34,6 +34,20 @@ ratatui = "0.29"
 unicode-width = "0.2"
 unicode-segmentation = "1"
 rust-i18n = "3"
+# `update`/`doctor` use a blocking HTTPS client for the GitHub release check.
+# Pure-rustls to keep the no-OpenSSL convention.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
+semver = "1"
+# In-place self-update for the cargo-dist (shell/PowerShell) installer method.
+# Optional + default-on via the `update` feature; with the feature OFF, `update`
+# still works as a pure advisor (detect method + print command + `--check`).
+axoupdater = { version = "0.6", default-features = false, features = ["github_releases", "blocking"], optional = true }
+
+[features]
+default = ["update"]
+# Enables axoupdater-backed in-place self-update for cargo-dist installs.
+# Distro/package builds can disable it (matches rustup's `no-self-update`).
+update = ["dep:axoupdater"]
 
 [lints.rust]
 unsafe_code = "deny"
