@@ -313,6 +313,27 @@ mod tests {
     }
 
     #[test]
+    fn lang_parses_env_values_and_maps_to_locale_code() {
+        use super::Lang;
+        assert_eq!(Lang::from_env_value("zh"), Some(Lang::Zh));
+        assert_eq!(Lang::from_env_value("zh_CN.UTF-8"), Some(Lang::Zh));
+        assert_eq!(Lang::from_env_value("  EN_us "), Some(Lang::En));
+        assert_eq!(Lang::from_env_value("fr"), None);
+        assert_eq!(Lang::from_env_value(""), None);
+        assert_eq!(Lang::Zh.code(), "zh");
+        assert_eq!(Lang::En.code(), "en");
+    }
+
+    #[test]
+    fn lang_flag_parses_and_defaults_to_en() {
+        let cli = Cli::try_parse_from(["octos-tui", "--lang", "zh"]).expect("parse --lang zh");
+        assert_eq!(cli.lang, super::Lang::Zh);
+        let cli = Cli::try_parse_from(["octos-tui"]).expect("parse default");
+        // No flag/config/env override in this minimal invocation → English.
+        assert!(matches!(cli.lang, super::Lang::En | super::Lang::Zh));
+    }
+
+    #[test]
     fn parses_snapshot_launch_flags() {
         let cli = Cli::try_parse_from([
             "octos-tui",

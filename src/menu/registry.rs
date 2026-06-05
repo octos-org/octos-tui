@@ -562,6 +562,15 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_THEME)),
         },
         CommandSpec {
+            name: "lang",
+            aliases: &["language"],
+            description: "Switch the UI display language, e.g. /lang zh (en, zh).",
+            category: CommandCategory::Settings,
+            availability: CommandAvailability::always(),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::SetLanguage),
+        },
+        CommandSpec {
             name: "statusline",
             aliases: &["status-line"],
             description: "Configure bottom status line items.",

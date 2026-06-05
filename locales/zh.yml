@@ -18,3 +18,8 @@ onboarding:
     continue: "继续"
     create_action: "创建档案"
     footer: "上/下 选择 | 回车 编辑或继续 | 输入后回车保存"
+
+lang:
+  switched: "已切换到中文。"
+  usage: "当前语言：%{current}。用法：/lang <en|zh>。"
+  unknown: "未知语言“%{value}”。可选：en、zh。"

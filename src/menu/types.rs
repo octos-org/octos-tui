@@ -253,6 +253,10 @@ pub enum LocalAction {
     Skills,
     McpConfig,
     ToolConfig,
+    /// Switch the UI language at runtime (`/lang <code>`). The locale code is
+    /// taken from the command's inline args; the handler calls
+    /// `rust_i18n::set_locale` and the next frame repaints in the new language.
+    SetLanguage,
     Custom(&'static str),
 }
 

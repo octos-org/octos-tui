@@ -951,8 +951,39 @@ impl Store {
             LocalAction::Skills => self.dispatch_skills_inline(inline_args.unwrap_or_default()),
             LocalAction::McpConfig => self.dispatch_mcp_inline(inline_args.unwrap_or_default()),
             LocalAction::ToolConfig => self.dispatch_tools_inline(inline_args.unwrap_or_default()),
+            LocalAction::SetLanguage => self.dispatch_set_language(inline_args.unwrap_or_default()),
             LocalAction::Custom(name) => {
                 self.state.status = format!("Local menu action `{name}` is not wired yet");
+                None
+            }
+        }
+    }
+
+    /// `/lang <code>` — switch the UI display language at runtime. Empty arg
+    /// shows the current locale + usage; an unknown code is reported without
+    /// changing the locale. On success `rust_i18n::set_locale` flips the
+    /// process-global locale and the next render repaints the UI; the
+    /// confirmation is itself rendered in the newly-selected language.
+    fn dispatch_set_language(&mut self, inline_args: &str) -> Option<AppUiCommand> {
+        let arg = inline_args.trim();
+        if arg.is_empty() {
+            self.state.status =
+                t!("lang.usage", current = rust_i18n::locale().to_string()).to_string();
+            return None;
+        }
+        match crate::cli::Lang::from_env_value(arg) {
+            Some(lang) => {
+                rust_i18n::set_locale(lang.code());
+                // Rebuild any open menu so it repaints in the new language now;
+                // the cached `active_menu` spec was built under the old locale.
+                // (The status line + composer placeholder are rebuilt every
+                // frame, so they switch without this.)
+                self.refresh_active_menu_if_open();
+                self.state.status = t!("lang.switched").to_string();
+                None
+            }
+            None => {
+                self.state.status = t!("lang.unknown", value = arg.to_string()).to_string();
                 None
             }
         }
@@ -7385,6 +7416,32 @@ mod tests {
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
         }
+    }
+
+    /// `/lang` with no/unknown code must NOT mutate the process-global locale
+    /// (which would flake every other test that renders English). The success
+    /// path (which calls `set_locale`) is covered by the lib's i18n_tests +
+    /// the live `--lang`/`/lang` smoke, not here, to keep tests isolated.
+    #[test]
+    fn lang_command_usage_and_unknown_do_not_switch_locale() {
+        let before = rust_i18n::locale().to_string();
+        let mut store = store_with_empty_session();
+
+        store.dispatch_set_language("");
+        assert!(
+            store.state.status.contains("/lang"),
+            "empty arg should show usage, got: {}",
+            store.state.status
+        );
+        assert_eq!(rust_i18n::locale().to_string(), before);
+
+        store.dispatch_set_language("klingon");
+        assert!(
+            store.state.status.contains("klingon"),
+            "unknown code should be echoed, got: {}",
+            store.state.status
+        );
+        assert_eq!(rust_i18n::locale().to_string(), before);
     }
 
     fn store_with_two_sessions(first: &str, second: &str) -> Store {

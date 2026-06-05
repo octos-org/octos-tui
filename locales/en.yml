@@ -5,9 +5,10 @@
 #   status.turn_completed: "Turn completed in Protocol session at seq %{seq}"
 # referenced as `t!("status.turn_completed", seq = seq)`.
 #
-# Coverage so far: composer placeholder + the onboarding welcome / local-solo
-# profile entry screen. Other menus + the status bar are converted
-# incrementally (the `t!()` pattern + these files are the template).
+# Coverage so far: composer placeholder, the onboarding welcome / local-solo
+# profile entry screen, and the /lang command. Other menus + the status bar
+# are converted incrementally (the `t!()` pattern + these files are the
+# template).
 composer:
   placeholder: "Ask Octos to change code..."
 
@@ -26,3 +27,9 @@ onboarding:
     continue: "Continue"
     create_action: "Create profile"
     footer: "Up/Down choose | Enter edit or continue | type value, Enter save"
+
+lang:
+  # `switched` renders in the NEWLY-selected locale, so it names itself.
+  switched: "Language switched to English."
+  usage: "Current language: %{current}. Usage: /lang <en|zh>."
+  unknown: "Unknown language '%{value}'. Available: en, zh."
