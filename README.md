@@ -11,32 +11,34 @@ Architecture and ownership boundaries are documented in
 
 ## Repository Layout
 
-For source builds, keep `octos` and `octos-tui` as sibling directories. The
-currently verified source pair is:
+For source builds, keep `octos` and `octos-tui` as sibling directories and
+build both from their `main` branches:
 
 ```text
-octos:     origin/feat/m9-client-hello-capability-handshake @ f32c6e9a
-octos-tui: origin/feat/m9-tui-capability-menus @ 50d8240
+octos:     origin/main
+octos-tui: origin/main
 ```
 
-Clone that pair with:
+Clone the pair with:
 
 ```bash
-mkdir octos-m9-test
-cd octos-m9-test
+mkdir octos-workspace
+cd octos-workspace
 
-git clone -b feat/m9-client-hello-capability-handshake https://github.com/octos-org/octos.git
-git clone -b feat/m9-tui-capability-menus https://github.com/octos-org/octos-tui.git
+git clone https://github.com/octos-org/octos.git
+git clone https://github.com/octos-org/octos-tui.git
 ```
 
-This pair was verified from the `octos-tui` checkout with sibling `../octos`
-using `cargo +stable check` and `cargo +stable test`.
-
-The sibling layout is required while `octos-tui` depends on:
+The sibling layout is required because `octos-tui` depends on the path
+dependency declared in `Cargo.toml`:
 
 ```text
-../octos/crates/octos-core
+octos-core = { path = "../octos/crates/octos-core" }
 ```
+
+If the sibling `../octos` checkout is missing, `cargo build`/`cargo test`
+fail early with `failed to load manifest for dependency octos-core`. Verify
+the pair from the `octos-tui` checkout with `cargo check` and `cargo test`.
 
 For release packaging, pin `octos-core` to the matching Octos git tag or
 published crate version.
@@ -55,6 +57,30 @@ Useful terminal defaults:
 export TERM=xterm-256color
 export RUST_LOG=off
 ```
+
+## Build and Install
+
+`octos-tui` is a single binary named `octos-tui`. Build it from the
+`octos-tui` checkout with its sibling `../octos` present:
+
+```bash
+cd octos-tui
+
+cargo build --release
+# produces ./target/release/octos-tui
+```
+
+Install it onto `PATH` from the same checkout:
+
+```bash
+cargo install --path . --root ~/.local
+# installs ~/.local/bin/octos-tui
+```
+
+There are no Cargo feature flags to choose: the default build includes both
+the WebSocket and stdio AppUI transports. The release binary is what the tmux
+harnesses run; point a harness at a specific build with `OCTOS_TUI_BIN`, for
+example `OCTOS_TUI_BIN="$PWD/target/release/octos-tui"`.
 
 ## Quick Local Smoke Test
 
@@ -210,6 +236,58 @@ tracked in `docs/M9_33_VISUAL_PARITY_HARNESS.md`.
 The coding-agent prompt shape that supports clean plan and summary rendering is
 documented in `docs/CODING_UX_PROMPT_CONTRACT.md`. The TUI renders defensively,
 but this contract belongs in the server profile or harness prompt.
+
+## Onboarding (First Launch)
+
+When you connect to a backend that has no usable profile yet, `octos-tui` opens
+the onboarding wizard automatically on first launch. It auto-opens only when
+the server advertises a profile-creation surface (local solo, or legacy email
+OTP); a provider/model-only catalog does not trigger it. You can also open it
+on demand with the `/setup` slash command.
+
+A clean first launch needs a fresh, empty server data directory and no
+`--profile-id`. Against a spawned `octos serve --stdio` backend that is the
+common solo path:
+
+```bash
+cargo run -- \
+  --mode protocol \
+  --stdio-command "octos serve --stdio --solo --data-dir /tmp/octos-tui-fresh-data --cwd $PWD/../octos/e2e/fixtures/coding-agent-compare-multifile"
+```
+
+`--solo` and `--data-dir` are arguments to the spawned `octos serve --stdio`
+child, not `octos-tui` flags. If you pass `--profile-id`, the TUI uses that
+profile and skips the welcome screen, so omit it for a true first-run flow.
+
+The first-launch flow has three steps:
+
+1. **Welcome screen.** The wizard opens on a screen titled "Welcome to Octos"
+   with the subtitle "Set up a local solo profile to continue." The OCTOS ASCII
+   wordmark renders in the main window above the menu (it is not in a
+   right-side preview pane), and collapses to a one-line tagline on short
+   terminals so the menu and its Continue action are never clipped. Fill in
+   **Full name**, **Username**, and **Email** (email is local metadata only;
+   no OTP is sent for a local solo profile), then choose **Continue** to create
+   the profile via `profile/local/create`. You can type each field inline with
+   `/onboard name <…>`, `/onboard username <…>`, and `/onboard email <…>`.
+2. **Set Up LLM Provider.** After the profile is created the same screen (now
+   titled "Set Up LLM Provider") lets you load the dashboard provider catalog,
+   choose a model family, model, and route, enter the masked API key, optionally
+   test the provider, and save it to the profile JSON via `profile/llm/upsert`.
+   The catalog and provider schema are owned by `octos`/the dashboard; the TUI
+   never hard-codes provider/model truth.
+3. **Open coding session.** Once a provider is saved, choose **Open coding
+   session** to call `session/open` with the resolved profile and drop into the
+   normal coding UI.
+
+The onboarding/auth/provider methods (`auth/*`, `profile/local/create`,
+`profile/llm/*`, `config/capabilities/list`) are server-owned AppUI methods
+consumed over the WebSocket or stdio transport, governed by `UPCR-2026-016` in
+the `octos` repo.
+
+The reference end-to-end flow lives in `scripts/run-onboarding-tmux-soak.sh`
+(it starts a server, launches the TUI, and waits for the "Welcome to Octos"
+splash); see `docs/ONBOARDING_TMUX_SOAK.md`.
 
 ## Dashboard and Server Startup
 
