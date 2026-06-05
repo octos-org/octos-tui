@@ -202,8 +202,9 @@ fn help_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     }
 }
 
-fn thinking_menu(_ctx: &MenuContext<'_>) -> MenuSpec {
+fn thinking_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     use octos_core::ui_protocol::ReasoningEffortLevel as L;
+    let current = ctx.app.reasoning_effort;
     let items = [
         (
             "default",
@@ -229,12 +230,15 @@ fn thinking_menu(_ctx: &MenuContext<'_>) -> MenuSpec {
     .into_iter()
     .enumerate()
     .map(|(idx, (id, label, description, level))| {
+        let mut state = MenuItemState::default();
+        state.current = level == current;
         let mut item = MenuItem::new(
             id,
             label,
             MenuAction::Local(LocalAction::SetThinkingLevel(level)),
         )
-        .with_description(description);
+        .with_description(description)
+        .with_state(state);
         if let Some(shortcut) = numeric_shortcut(idx) {
             item = item.with_shortcut(shortcut);
         }

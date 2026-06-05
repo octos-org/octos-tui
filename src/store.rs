@@ -2959,6 +2959,12 @@ impl Store {
             cwd,
             current_model,
             current_profile,
+            reasoning_effort: selected_session.and_then(|session| {
+                self.state
+                    .session_reasoning_effort
+                    .get(&session.id)
+                    .copied()
+            }),
             permission_profile: selected_session
                 .and_then(|session| self.state.permission_profile_for(&session.id)),
             runtime_status,

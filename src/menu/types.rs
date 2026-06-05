@@ -540,6 +540,9 @@ pub struct MenuAppSnapshot<'a> {
     pub cwd: Option<&'a str>,
     pub current_model: Option<&'a str>,
     pub current_profile: Option<&'a str>,
+    /// Active session's reasoning effort, for marking the current `/thinking`
+    /// menu item. `None` = server default (no per-session override).
+    pub reasoning_effort: Option<octos_core::ui_protocol::ReasoningEffortLevel>,
     pub permission_profile: Option<octos_core::ui_protocol::PermissionProfileSelection>,
     pub runtime_status: Option<&'a SessionRuntimeStatus>,
     pub model_catalog: Option<&'a SessionModelCatalog>,
