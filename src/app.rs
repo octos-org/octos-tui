@@ -1,6 +1,6 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Position, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, LineGauge, List, ListItem, Paragraph, Wrap},
@@ -104,6 +104,67 @@ fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
     frame.render_widget(render_status(app, palette), root[5]);
 }
 
+/// OCTOS figlet wordmark shown in the MAIN window on the first-launch
+/// onboarding entry screen (it used to live in a right-side preview pane).
+const ONBOARDING_LOGO_ART: &str = "\
+ ██████╗  ██████╗████████╗ ██████╗ ███████╗
+██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔════╝
+██║   ██║██║        ██║   ██║   ██║███████╗
+██║   ██║██║        ██║   ██║   ██║╚════██║
+╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
+ ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝";
+const ONBOARDING_LOGO_TAGLINE: &str = "Welcome to Octos — Your Coding Buddy";
+
+/// True only on the onboarding WELCOME / local-profile entry screen, where the
+/// splash logo takes over the main window. Gated on the rendered spec's title:
+/// the welcome menu is "Welcome to Octos", whereas the post-profile-creation
+/// provider-setup screen — which shares the `MENU_ONBOARD` id — is titled
+/// "Set Up LLM Provider", and the child family/model/route menus carry their
+/// own ids/titles. So the logo never displaces required actions on later steps.
+fn onboarding_welcome_active(app: &AppState) -> bool {
+    matches!(
+        app.active_menu.as_ref(),
+        Some(crate::menu::MenuBuildResult::Ready(spec)) if spec.title == "Welcome to Octos"
+    )
+}
+
+/// Rows to spend on the onboarding logo, taken ONLY from the surplus above what
+/// the menu itself needs (`menu_needed`) — so the entry menu and its Continue
+/// action are never clipped on short terminals. Full figlet when there is room,
+/// else a one-line tagline, else nothing.
+fn onboarding_logo_height(area_height: u16, area_width: u16, menu_needed: u16) -> u16 {
+    const ART_WIDTH: u16 = 43;
+    let surplus = area_height.saturating_sub(menu_needed);
+    if area_width >= ART_WIDTH + 2 && surplus >= 9 {
+        9 // 1 pad + 6 art rows + 1 blank + 1 tagline
+    } else if surplus >= 2 {
+        2 // tagline only (figlet would crowd the menu)
+    } else {
+        0
+    }
+}
+
+fn render_onboarding_logo(height: u16, palette: Palette) -> Paragraph<'static> {
+    let mut lines: Vec<Line> = Vec::new();
+    if height >= 9 {
+        lines.push(Line::from(""));
+        for art in ONBOARDING_LOGO_ART.lines() {
+            lines.push(Line::from(Span::styled(
+                art,
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        ONBOARDING_LOGO_TAGLINE,
+        Style::default().fg(palette.highlight),
+    )));
+    Paragraph::new(Text::from(lines)).alignment(Alignment::Center)
+}
+
 fn render_onboarding_first_launch_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
     let composer_height = composer_height_for_size(app, frame.area().width, frame.area().height);
     let root = Layout::default()
@@ -115,8 +176,33 @@ fn render_onboarding_first_launch_layout(frame: &mut Frame<'_>, app: &AppState, 
         ])
         .split(frame.area());
 
-    if let Some(menu) = active_menu_surface(app).as_ref() {
-        menu_render::render_menu_surface(frame, root[0], menu, palette);
+    let menu = active_menu_surface(app);
+    // On the onboarding WELCOME screen, show the OCTOS logo in the main window
+    // above the menu. The splash no longer lives in a right-side preview pane
+    // (the onboarding menu carries no `preview`), so the right side stays clean.
+    // Logo rows come only from the surplus above the menu's own needs, so the
+    // menu is never clipped — and only on the welcome step, not provider setup.
+    let menu_area = if onboarding_welcome_active(app) {
+        let menu_needed = menu
+            .as_ref()
+            .map_or(0, |m| menu_render::height_hint(m, root[0].width));
+        let logo_height = onboarding_logo_height(root[0].height, root[0].width, menu_needed);
+        if logo_height > 0 {
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(logo_height), Constraint::Min(0)])
+                .split(root[0]);
+            frame.render_widget(render_onboarding_logo(logo_height, palette), split[0]);
+            split[1]
+        } else {
+            root[0]
+        }
+    } else {
+        root[0]
+    };
+
+    if let Some(menu) = menu.as_ref() {
+        menu_render::render_menu_surface(frame, menu_area, menu, palette);
     }
     frame.render_widget(render_composer(app, palette, root[1]), root[1]);
     set_composer_cursor(frame, app, root[1]);
@@ -5786,10 +5872,10 @@ mod tests {
         assert!(!text.contains("Ask Octos to change code"));
     }
 
-    /// M22 (#58): the first-run onboarding surface renders an
-    /// ASCII OCTOS wordmark in the preview pane. This pins the
-    /// splash so a future refactor cannot quietly drop the
-    /// distinctive identity.
+    /// M22 (#58): the first-run onboarding surface renders the ASCII OCTOS
+    /// wordmark in the MAIN window (not a right-side preview pane). This pins
+    /// the splash so a future refactor cannot quietly drop the distinctive
+    /// identity.
     #[test]
     fn render_first_launch_onboarding_includes_ascii_octos_splash() {
         let mut store = Store {
@@ -5811,14 +5897,51 @@ mod tests {
 
         let text = rendered_text(&store.state);
 
-        // ASCII wordmark — at least one characteristic letterform
-        // line plus the human-readable label live in the preview.
+        // ASCII figlet wordmark (a characteristic block-letter row) plus the
+        // human-readable tagline render in the MAIN window.
         assert!(
-            text.contains("OCTOS"),
-            "expected OCTOS label/wordmark in splash, got:\n{text}"
+            text.contains("██████╗"),
+            "expected OCTOS figlet art in the main window, got:\n{text}"
         );
-        assert!(text.contains("Welcome to Octos"));
+        assert!(text.contains("Welcome to Octos — Your Coding Buddy"));
     }
+
+    /// At the soak's narrow 80x24 first-launch size, the OCTOS logo shows in the
+    /// main window AND the onboarding menu — through its Continue action — stays
+    /// fully visible (codex P2: the logo must never clip the menu).
+    #[test]
+    fn render_first_launch_onboarding_80x24_shows_logo_without_clipping_menu() {
+        let mut store = Store {
+            state: AppState::new(vec![], 0, "AppUI connected".into(), Some("stdio:octos serve --stdio".into()), false),
+        };
+        store.state.set_capabilities(UiProtocolCapabilities::new(
+            &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE], &[],
+        ));
+        store.open_menu(crate::menu::MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        let text = rendered_buffer_with_size(&store.state, Palette::for_theme(ThemeName::Slate), 80, 24)
+            .content.iter().map(|c| c.symbol()).collect::<String>();
+        assert!(text.contains("Welcome to Octos — Your Coding Buddy"), "logo/tagline must render at 80x24");
+        assert!(text.contains("Continue - Create profile"), "menu Continue must not be clipped at 80x24");
+    }
+
+    /// The onboarding logo only consumes rows ABOVE what the menu needs, so the
+    /// entry menu (incl. its Continue action) is never clipped — the regression
+    /// codex flagged for short terminals. Figlet only when there is real
+    /// surplus AND it fits the width; otherwise tagline-only, then nothing.
+    #[test]
+    fn onboarding_logo_height_takes_only_menu_surplus() {
+        // Tall terminal, menu needs 14 rows → ample surplus → full figlet.
+        assert_eq!(onboarding_logo_height(37, 120, 14), 9);
+        // Short terminal (root[0] ~16-17 rows, menu needs 14): surplus 2-3 →
+        // tagline only, so the menu keeps all 14 of its rows.
+        assert_eq!(onboarding_logo_height(16, 120, 14), 2);
+        assert_eq!(onboarding_logo_height(17, 120, 14), 2);
+        // No surplus → no logo at all (the menu takes everything).
+        assert_eq!(onboarding_logo_height(14, 120, 14), 0);
+        // Narrow terminal → never the wide figlet; tagline at most.
+        assert_eq!(onboarding_logo_height(40, 40, 5), 2);
+    }
+
 
     #[test]
     fn render_first_launch_onboarding_child_menu_stays_on_onboarding_surface() {

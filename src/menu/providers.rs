@@ -996,31 +996,13 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
         footer_hint: Some(
             "Up/Down choose | Enter edit or continue | type value, Enter save".into(),
         ),
-        // M22 (#58): ASCII splash. The preview pane carries the
-        // `OCTOS` wordmark and a stylised logo so the first-run
-        // screen has a memorable identity. Keep the art tight so
-        // it fits in the preview column at 80x24.
-        preview: Some(MenuPreview::Text {
-            title: Some("OCTOS".into()),
-            body: ONBOARDING_SPLASH_ASCII.into(),
-        }),
+        // The first-run OCTOS splash now renders in the MAIN window (see
+        // `render_onboarding_first_launch_layout` in app.rs), so the onboarding
+        // entry screen carries NO right-side preview pane — keeping it clean.
+        preview: None,
         mode: MenuMode::SingleSelect,
     })
 }
-
-/// M22 (#58): first-run ASCII splash, shown in the onboarding preview
-/// pane — a one-line tagline above the OCTOS figlet wordmark. The title
-/// line "OCTOS" is rendered separately by the preview frame.
-const ONBOARDING_SPLASH_ASCII: &str = "\
-  Welcome to Octos — Your Coding Buddy
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-~ ██████╗  ██████╗████████╗ ██████╗ ███████╗~
-~██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔════╝~
-~██║   ██║██║        ██║   ██║   ██║███████╗~
-~██║   ██║██║        ██║   ██║   ██║╚════██║~
-~╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║~
-~ ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝~
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~";
 
 fn onboarding_family_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let Some(catalog) = ctx.app.profile_llm_catalog else {
@@ -5091,18 +5073,13 @@ mod tests {
                 .any(|item| item.id == "onboard.auth.verify")
         );
         assert_eq!(spec.title, "Welcome to Octos");
-        // M22 (#58): splash now carries an ASCII preview pane.
-        match spec.preview.as_ref().expect("splash preview present") {
-            MenuPreview::Text { title, body } => {
-                assert_eq!(title.as_deref(), Some("OCTOS"));
-                assert!(body.contains("Welcome to Octos"));
-                assert!(
-                    body.contains("____") || body.contains("OCTOS"),
-                    "expected ASCII wordmark in splash body, got:\n{body}"
-                );
-            }
-            other => panic!("expected Text preview, got: {other:?}"),
-        }
+        // The first-run splash now renders in the MAIN window (app.rs
+        // render_onboarding_first_launch_layout); the onboarding entry menu
+        // carries NO right-side preview pane.
+        assert!(
+            spec.preview.is_none(),
+            "onboarding menu should have no preview pane (splash moved to the main window)"
+        );
         assert!(
             !spec
                 .items

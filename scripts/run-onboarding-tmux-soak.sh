@@ -2241,7 +2241,7 @@ verify_first_launch() {
   for required_text in \
     "Welcome to Octos" \
     "Create your local Octos profile" \
-    "OCTOS"
+    "Your Coding Buddy"
   do
     grep --fixed-strings -- "$required_text" "$capture_file" >/dev/null 2>&1 \
       || die "first-launch capture missing required text: $required_text"
@@ -3465,7 +3465,8 @@ JSON
 Welcome to Octos
 Set up a local solo profile to continue.
 > Create your local Octos profile - This stays on this machine; no email OTP is sent.
-OCTOS
+ ██████╗  ██████╗████████╗ ██████╗ ███████╗
+Welcome to Octos — Your Coding Buddy
 Welcome to Octos - local solo onboarding
 CAPTURE
   env "${child_env[@]}" "$0" verify-first-launch >/dev/null
