@@ -89,7 +89,11 @@ fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
         ])
         .split(frame.area());
 
-    frame.render_widget(render_transcript(app, palette, root[0]), root[0]);
+    if launch_banner_active(app) {
+        render_launch_banner(frame, app, palette, root[0]);
+    } else {
+        frame.render_widget(render_transcript(app, palette, root[0]), root[0]);
+    }
     if let Some(menu) = active_menu.as_ref() {
         menu_render::render_menu_surface(frame, root[1], menu, palette);
     }
@@ -574,6 +578,102 @@ fn render_artifacts(app: &AppState, palette: Palette) -> Paragraph<'static> {
             .border_style(palette.border()),
         )
         .wrap(Wrap { trim: false })
+}
+
+/// True for a fresh session that has no messages yet — where we show the launch
+/// banner at the top of the transcript area (it scrolls away on the first turn).
+fn launch_banner_active(app: &AppState) -> bool {
+    app.pending_messages.is_empty()
+        && app
+            .active_session()
+            .is_some_and(|session| session.messages.is_empty() && session.live_reply.is_none())
+}
+
+/// Claude-Code-style launch banner: a rounded box with the OCTOS logo, a
+/// greeting, and the workspace path. No right-hand panel (per product call).
+/// Rendered at the TOP of the transcript area for an empty session.
+fn render_launch_banner(frame: &mut Frame<'_>, app: &AppState, palette: Palette, area: Rect) {
+    let width = area.width as usize;
+    if width < 12 || area.height < 6 {
+        return;
+    }
+    let inner_w = width - 2;
+    let show_figlet = area.width >= 48 && area.height >= 14;
+    let border = Style::default().fg(palette.frame);
+    let accent = Style::default()
+        .fg(palette.accent)
+        .add_modifier(Modifier::BOLD);
+    let highlight = Style::default()
+        .fg(palette.highlight)
+        .add_modifier(Modifier::BOLD);
+
+    // A content row: `│` + centered content (display width `content_w`) + `│`.
+    let centered = |content: Vec<Span<'static>>, content_w: usize| -> Line<'static> {
+        let pad = inner_w.saturating_sub(content_w);
+        let left = pad / 2;
+        let right = pad - left;
+        let mut spans = vec![Span::styled("│", border), Span::raw(" ".repeat(left))];
+        spans.extend(content);
+        spans.push(Span::raw(" ".repeat(right)));
+        spans.push(Span::styled("│", border));
+        Line::from(spans)
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Top border with an embedded title.
+    let title = "─ octos ─";
+    let top_dashes = inner_w.saturating_sub(title.chars().count());
+    lines.push(Line::from(vec![
+        Span::styled("╭", border),
+        Span::styled(title, accent),
+        Span::styled(format!("{}╮", "─".repeat(top_dashes)), border),
+    ]));
+    lines.push(centered(vec![], 0));
+    if show_figlet {
+        let fig_w = ONBOARDING_LOGO_ART
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0);
+        for art in ONBOARDING_LOGO_ART.lines() {
+            lines.push(centered(
+                vec![Span::styled(format!("{art:<fig_w$}"), accent)],
+                fig_w,
+            ));
+        }
+        lines.push(centered(vec![], 0));
+    }
+    let greeting = match app
+        .active_session()
+        .and_then(|session| session.profile_id.as_deref())
+    {
+        Some(profile) => format!("Welcome back — {profile}"),
+        None => "Welcome to Octos".to_string(),
+    };
+    let greeting_w = greeting.width();
+    lines.push(centered(vec![Span::styled(greeting, highlight)], greeting_w));
+    let cwd = short_path(app.workspace.root.as_str());
+    let cwd_w = cwd.width();
+    lines.push(centered(vec![Span::styled(cwd, palette.muted())], cwd_w));
+    lines.push(centered(vec![], 0));
+    let hint = "Ask Octos anything to begin.";
+    lines.push(centered(
+        vec![Span::styled(hint, palette.muted())],
+        hint.chars().count(),
+    ));
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(inner_w)),
+        border,
+    )));
+
+    let banner_height = (lines.len() as u16).min(area.height);
+    let banner_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: banner_height,
+    };
+    frame.render_widget(Paragraph::new(Text::from(lines)), banner_area);
 }
 
 fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
@@ -5350,6 +5450,51 @@ mod tests {
         assert!(!text.contains("Work  sticky"));
         assert!(text.contains("› also list queued user questions"));
         assert!(text.contains("› check the sticky pane height"));
+    }
+
+    #[test]
+    fn render_launch_banner_shows_box_logo_and_greeting_on_empty_session() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("dspfac".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        assert!(launch_banner_active(&app), "empty session must show the launch banner");
+        let text = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Slate), 100, 30)
+            .content.iter().map(|c| c.symbol()).collect::<String>();
+        assert!(text.contains("╭"), "banner must draw a top-left rounded corner");
+        assert!(text.contains("╯"), "banner must draw a bottom-right rounded corner");
+        assert!(text.contains("octos"), "banner box title");
+        assert!(text.contains("██████╗"), "banner must show the OCTOS figlet");
+        assert!(text.contains("Welcome back — dspfac"), "banner greeting names the profile");
+    }
+
+    #[test]
+    fn launch_banner_hidden_once_session_has_messages() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("dspfac".into()),
+                messages: vec![Message::user("hi")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        assert!(!launch_banner_active(&app), "banner must disappear once the conversation starts");
     }
 
     #[test]
