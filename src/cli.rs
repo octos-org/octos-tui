@@ -23,6 +23,38 @@ pub enum ThemeName {
     Solarized,
 }
 
+/// UI display language (i18n). English is the source/fallback locale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Lang {
+    En,
+    Zh,
+}
+
+impl Lang {
+    /// The rust-i18n locale code passed to `rust_i18n::set_locale`.
+    pub fn code(self) -> &'static str {
+        match self {
+            Lang::En => "en",
+            Lang::Zh => "zh",
+        }
+    }
+
+    /// Best-effort parse of a `LANG`/`OCTOS_LANG`-style value (e.g.
+    /// `zh_CN.UTF-8`, `zh`, `en_US`) into a supported UI language; `None` if
+    /// unrecognized so the caller can fall through to the default.
+    pub fn from_env_value(value: &str) -> Option<Self> {
+        let v = value.trim().to_ascii_lowercase();
+        if v.starts_with("zh") {
+            Some(Lang::Zh)
+        } else if v.starts_with("en") {
+            Some(Lang::En)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cli {
     /// JSON config file used as launch defaults.
@@ -45,6 +77,8 @@ pub struct Cli {
     pub readonly: bool,
     /// Color palette.
     pub theme: ThemeName,
+    /// UI display language (i18n).
+    pub lang: Lang,
 }
 
 #[derive(Debug, Parser)]
@@ -108,6 +142,10 @@ struct CliArgs {
     /// Color palette.
     #[arg(long, value_enum)]
     pub theme: Option<ThemeName>,
+
+    /// UI display language (e.g. `en`, `zh`). Falls back to OCTOS_LANG/LANG.
+    #[arg(long, value_enum)]
+    pub lang: Option<Lang>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -138,6 +176,7 @@ pub struct CliFileConfig {
 
     pub readonly: Option<bool>,
     pub theme: Option<ThemeName>,
+    pub lang: Option<Lang>,
 }
 
 impl Cli {
@@ -199,6 +238,20 @@ impl Cli {
             auth_token: args.auth_token.or(file_config.auth_token),
             readonly,
             theme: args.theme.or(file_config.theme).unwrap_or(ThemeName::Codex),
+            lang: args
+                .lang
+                .or(file_config.lang)
+                .or_else(|| {
+                    std::env::var("OCTOS_LANG")
+                        .ok()
+                        .and_then(|v| Lang::from_env_value(&v))
+                })
+                .or_else(|| {
+                    std::env::var("LANG")
+                        .ok()
+                        .and_then(|v| Lang::from_env_value(&v))
+                })
+                .unwrap_or(Lang::En),
         })
     }
 }

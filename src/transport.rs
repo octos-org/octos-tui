@@ -5470,6 +5470,7 @@ mod tests {
             auth_token: Some("ignored-for-stdio".into()),
             readonly: false,
             theme: crate::cli::ThemeName::Codex,
+            lang: crate::cli::Lang::En,
         };
 
         let launch = launch_from_cli(&cli);
@@ -6523,6 +6524,7 @@ mod tests {
             auth_token: None,
             readonly: false,
             theme: crate::cli::ThemeName::Codex,
+            lang: crate::cli::Lang::En,
         };
 
         let launch = launch_from_cli(&cli);

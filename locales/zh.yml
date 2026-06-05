@@ -1,0 +1,20 @@
+# octos-tui UI strings — 简体中文 (Simplified Chinese).
+# Mirror the key structure of en.yml. Native-speaker review welcome.
+composer:
+  placeholder: "让 Octos 帮你改代码……"
+
+onboarding:
+  welcome_title: "欢迎使用 Octos"
+  value_not_set: "未设置"
+  action_edit: "回车编辑"
+  field:
+    full_name: "姓名"
+    username: "用户名"
+    email: "邮箱"
+  local:
+    title: "创建你的本地 Octos 档案"
+    description: "仅保存在本机；不会发送邮箱验证码。"
+    subtitle: "设置本地单人档案以继续。"
+    continue: "继续"
+    create_action: "创建档案"
+    footer: "上/下 选择 | 回车 编辑或继续 | 输入后回车保存"

@@ -340,7 +340,7 @@ fn item_row(
         spans.push(Span::styled(
             fit_text(
                 &format!(" ({reason})"),
-                width.saturating_sub(text.chars().count()),
+                width.saturating_sub(unicode_width::UnicodeWidthStr::width(text.as_str())),
             ),
             reason_style,
         ));
@@ -405,9 +405,19 @@ fn fit_text(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
+    // `width` is a COLUMN budget, not a char count: CJK glyphs occupy 2
+    // display columns. Accumulate unicode display width so translated/CJK
+    // labels truncate on a column boundary instead of overflowing the row.
+    use unicode_width::UnicodeWidthChar;
     let mut out = String::new();
-    for ch in text.chars().take(width) {
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > width {
+            break;
+        }
         out.push(ch);
+        used += w;
     }
     out
 }
