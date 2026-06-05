@@ -5089,6 +5089,19 @@ impl Store {
         match notification {
             UiNotification::SessionOpened(event) => {
                 let session_id = event.session_id.clone();
+                // Restore the server-persisted per-session reasoning effort so
+                // /thinking + its menu reflect it after a full restart (the server
+                // is the source of truth; `None` means no override is stored).
+                match event.reasoning_effort {
+                    Some(level) => {
+                        self.state
+                            .session_reasoning_effort
+                            .insert(session_id.clone(), level);
+                    }
+                    None => {
+                        self.state.session_reasoning_effort.remove(&session_id);
+                    }
+                }
                 if let Some(panes) = event.panes {
                     self.state.apply_pane_snapshot(panes);
                 }
@@ -9796,6 +9809,32 @@ mod tests {
         };
         assert_eq!(params.update.mode, Some(PermissionProfileMode::ReadOnly));
         assert_eq!(params.update.approval_policy.as_deref(), Some("on-request"));
+    }
+
+    #[test]
+    fn session_opened_restores_persisted_reasoning_effort() {
+        use octos_core::ui_protocol::{ReasoningEffortLevel as L, SessionOpened};
+        let mut store = store_with_empty_session();
+        let sid = SessionKey("alice:local:tui#coding".into());
+
+        // Server surfaces a persisted effort on open -> client restores it.
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": sid,
+            "active_profile_id": "alice",
+            "reasoning_effort": "high",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+        assert_eq!(store.state.session_reasoning_effort.get(&sid), Some(&L::High));
+
+        // Reopening with no persisted effort clears the client override.
+        let opened2: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": sid,
+            "active_profile_id": "alice",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened2)));
+        assert!(store.state.session_reasoning_effort.get(&sid).is_none());
     }
 
     /// M22-D: when `permission/profile/set` is NOT advertised, the
