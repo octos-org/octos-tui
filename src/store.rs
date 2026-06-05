@@ -192,6 +192,34 @@ impl Store {
         }
     }
 
+    /// Seed the first-launch onboarding workspace candidate from the launch
+    /// `--cwd`, when explicitly provided.
+    ///
+    /// The onboarding workspace probe resolves its target via
+    /// [`OnboardingWizardState::workspace_target`], which prefers
+    /// `workspace_candidate` over `workspace.root`. For a stdio launch,
+    /// `workspace.root` is seeded from the transport target LABEL (e.g.
+    /// `stdio:octos serve --stdio --solo --data-dir ...`), not from `--cwd` —
+    /// so without this the probe can only validate a `--cwd` that the user
+    /// also embedded inside the `--stdio-command` string. The top-level
+    /// `--cwd` is otherwise wired only into `session/open`; the onboarding
+    /// probe never sees it, so `/onboard finish` stays blocked on
+    /// "workspace not validated" and the profile runtime never bootstraps.
+    ///
+    /// Seeding the candidate from the explicit `--cwd` (the same path
+    /// `session/open` uses) lets the probe validate it. `get_or_insert` keeps
+    /// a later explicit `/onboard workspace <path>` authoritative, and an
+    /// empty/absent cwd is a no-op — preserving the prior label-based behavior
+    /// for launches without `--cwd` (e.g. remote/WS workspaces whose root
+    /// lives on the server, not the local cwd).
+    pub fn seed_onboarding_workspace_cwd(&mut self, cwd: Option<String>) {
+        if let Some(cwd) = cwd {
+            if !cwd.trim().is_empty() {
+                self.state.onboarding.workspace_candidate.get_or_insert(cwd);
+            }
+        }
+    }
+
     pub fn active_session(&self) -> Option<&SessionView> {
         self.state.active_session()
     }
@@ -7850,6 +7878,69 @@ mod tests {
 
         assert_eq!(params.profile_id.as_deref(), Some("alice"));
         assert!(params.session_id.0.starts_with("alice:local:tui#coding"));
+    }
+
+    /// Regression (mini4 solo-onboarding "can't activate the workspace"): an
+    /// explicit launch `--cwd` must seed the onboarding workspace candidate so
+    /// the first-launch probe validates the real cwd, not the bogus stdio
+    /// transport label. Pre-fix, `workspace.root` was the `stdio:...` label and
+    /// the candidate stayed `None`, so `workspace_target` returned the label →
+    /// the probe could never validate → `/onboard finish` never sent
+    /// `session/open` → the profile runtime never bootstrapped.
+    #[test]
+    fn launch_cwd_seeds_onboarding_workspace_candidate() {
+        let stdio_label = "stdio:/abs/octos serve --stdio --solo --data-dir /d";
+        let mut store = Store::from_snapshot(AppUiSnapshot {
+            sessions: vec![],
+            selected_session: 0,
+            status: "ready".into(),
+            target: Some(stdio_label.into()),
+            readonly: false,
+        });
+
+        // No candidate yet → the onboarding target falls back to the (bogus)
+        // transport label that backs `workspace.root`.
+        assert!(store.state.onboarding.workspace_candidate.is_none());
+        let root = store.state.workspace.root.clone();
+        assert_eq!(store.state.onboarding.workspace_target(&root), root.trim());
+
+        // Seeding from the explicit --cwd makes the onboarding target the cwd.
+        store.seed_onboarding_workspace_cwd(Some("/Users/cloud/proj".into()));
+        assert_eq!(
+            store.state.onboarding.workspace_candidate.as_deref(),
+            Some("/Users/cloud/proj"),
+        );
+        let root = store.state.workspace.root.clone();
+        assert_eq!(
+            store.state.onboarding.workspace_target(&root),
+            "/Users/cloud/proj",
+        );
+
+        // `get_or_insert`: a second seed does NOT clobber an existing choice
+        // (so a later explicit `/onboard workspace <path>` stays authoritative).
+        store.seed_onboarding_workspace_cwd(Some("/other".into()));
+        assert_eq!(
+            store.state.onboarding.workspace_candidate.as_deref(),
+            Some("/Users/cloud/proj"),
+        );
+    }
+
+    /// Absent/empty `--cwd` is a no-op: the candidate stays `None`, so launches
+    /// without `--cwd` keep the prior label/root-based workspace behavior
+    /// (important for remote/WS workspaces whose root lives on the server).
+    #[test]
+    fn absent_launch_cwd_leaves_onboarding_candidate_unset() {
+        let mut store = Store::from_snapshot(AppUiSnapshot {
+            sessions: vec![],
+            selected_session: 0,
+            status: "ready".into(),
+            target: Some("wss://example.test/ui-protocol".into()),
+            readonly: false,
+        });
+        store.seed_onboarding_workspace_cwd(None);
+        assert!(store.state.onboarding.workspace_candidate.is_none());
+        store.seed_onboarding_workspace_cwd(Some("   ".into()));
+        assert!(store.state.onboarding.workspace_candidate.is_none());
     }
 
     #[test]

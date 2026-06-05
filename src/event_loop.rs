@@ -46,6 +46,16 @@ pub fn run(cli: Cli) -> Result<()> {
     let mut backend = build_backend(&cli);
     let snapshot = backend.bootstrap()?;
     let mut store = Store::from_snapshot(snapshot);
+    // Seed the onboarding workspace candidate from an explicit `--cwd` so the
+    // first-launch workspace probe validates the launch cwd. Without this the
+    // top-level `--cwd` reaches `session/open` but never the onboarding probe
+    // (which reads the transport label), so `/onboard finish` stays blocked on
+    // an unvalidated workspace and the profile runtime never bootstraps.
+    store.seed_onboarding_workspace_cwd(
+        cli.cwd
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string()),
+    );
     let mut input_state = TerminalInputState::default();
 
     loop {
