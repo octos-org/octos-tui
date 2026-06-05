@@ -257,6 +257,11 @@ pub enum LocalAction {
     /// taken from the command's inline args; the handler calls
     /// `rust_i18n::set_locale` and the next frame repaints in the new language.
     SetLanguage,
+    /// Set the per-session reasoning/thinking effort
+    /// (`/thinking <low|medium|high|max|default>`). The level is taken from the
+    /// command's inline args, stored on `AppState`, and attached to every
+    /// `turn/start` for the session; `default` clears the override.
+    SetThinking,
     Custom(&'static str),
 }
 

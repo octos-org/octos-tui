@@ -571,6 +571,15 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             entry: CommandEntry::LocalAction(LocalAction::SetLanguage),
         },
         CommandSpec {
+            name: "thinking",
+            aliases: &["think"],
+            description: "Set reasoning effort for thinking models: /thinking low|medium|high|max|default.",
+            category: CommandCategory::Settings,
+            availability: CommandAvailability::always(),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::SetThinking),
+        },
+        CommandSpec {
             name: "statusline",
             aliases: &["status-line"],
             description: "Configure bottom status line items.",

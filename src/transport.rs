@@ -4301,6 +4301,7 @@ mod tests {
                 media: Vec::new(),
                 topic: None,
                 rewrite_for: None,
+                reasoning_effort: None,
             }),
         )
         .expect("request encodes");
@@ -4332,6 +4333,7 @@ mod tests {
                 media: Vec::new(),
                 topic: None,
                 rewrite_for: None,
+                reasoning_effort: None,
             }),
         )
         .expect("request encodes");
@@ -5251,6 +5253,7 @@ mod tests {
                 media: Vec::new(),
                 topic: None,
                 rewrite_for: None,
+                reasoning_effort: None,
             }),
             AppUiCommand::InterruptTurn(TurnInterruptParams {
                 session_id: session_id.clone(),
@@ -5817,6 +5820,7 @@ mod tests {
                 media: Vec::new(),
                 topic: None,
                 rewrite_for: None,
+                reasoning_effort: None,
             }))
             .expect("request builds");
 
@@ -6853,6 +6857,7 @@ mod tests {
                 media: Vec::new(),
                 topic: None,
                 rewrite_for: None,
+                reasoning_effort: None,
             }))
             .expect("readonly send is local");
         backend
@@ -6913,6 +6918,7 @@ mod tests {
                 media: Vec::new(),
                 topic: None,
                 rewrite_for: None,
+                reasoning_effort: None,
             }))
             .expect("send");
 
@@ -6944,6 +6950,7 @@ mod tests {
                 media: Vec::new(),
                 topic: None,
                 rewrite_for: None,
+                reasoning_effort: None,
             }))
             .expect("submit prompt");
 
@@ -7094,6 +7101,7 @@ mod tests {
                 media: Vec::new(),
                 topic: None,
                 rewrite_for: None,
+                reasoning_effort: None,
             }))
             .expect("send");
 

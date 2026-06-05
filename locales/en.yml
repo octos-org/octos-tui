@@ -33,3 +33,8 @@ lang:
   switched: "Language switched to English."
   usage: "Current language: %{current}. Usage: /lang <en|zh>."
   unknown: "Unknown language '%{value}'. Available: en, zh."
+thinking:
+  usage: "Reasoning effort: %{current}. Usage: /thinking <low|medium|high|max|default>."
+  set: "Reasoning effort set to %{level}."
+  cleared: "Reasoning effort cleared — using the server default."
+  unknown: "Unknown effort '%{value}'. Available: low, medium, high, max, default."

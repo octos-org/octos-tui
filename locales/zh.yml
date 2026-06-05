@@ -23,3 +23,8 @@ lang:
   switched: "已切换到中文。"
   usage: "当前语言：%{current}。用法：/lang <en|zh>。"
   unknown: "未知语言“%{value}”。可选：en、zh。"
+thinking:
+  usage: "推理强度：%{current}。用法：/thinking <low|medium|high|max|default>。"
+  set: "推理强度已设为 %{level}。"
+  cleared: "已清除推理强度，使用服务器默认值。"
+  unknown: "未知强度“%{value}”。可选：low、medium、high、max、default。"

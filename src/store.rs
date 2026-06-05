@@ -952,6 +952,7 @@ impl Store {
             LocalAction::McpConfig => self.dispatch_mcp_inline(inline_args.unwrap_or_default()),
             LocalAction::ToolConfig => self.dispatch_tools_inline(inline_args.unwrap_or_default()),
             LocalAction::SetLanguage => self.dispatch_set_language(inline_args.unwrap_or_default()),
+            LocalAction::SetThinking => self.dispatch_set_thinking(inline_args.unwrap_or_default()),
             LocalAction::Custom(name) => {
                 self.state.status = format!("Local menu action `{name}` is not wired yet");
                 None
@@ -987,6 +988,43 @@ impl Store {
                 None
             }
         }
+    }
+
+    /// `/thinking <low|medium|high|max|default>` — set the per-session reasoning
+    /// effort attached to every turn/start, or `default` to clear the override
+    /// (server gateway/profile default applies). No-op for models without a
+    /// reasoning style; the server decides whether the effort is honored.
+    fn dispatch_set_thinking(&mut self, inline_args: &str) -> Option<AppUiCommand> {
+        use octos_core::ui_protocol::ReasoningEffortLevel as L;
+        let arg = inline_args.trim().to_ascii_lowercase();
+        if arg.is_empty() {
+            let current = match self.state.session_reasoning_effort {
+                Some(L::Low) => "low",
+                Some(L::Medium) => "medium",
+                Some(L::High) => "high",
+                Some(L::Max) => "max",
+                None => "default",
+            };
+            self.state.status = t!("thinking.usage", current = current).to_string();
+            return None;
+        }
+        let level = match arg.as_str() {
+            "low" => Some(L::Low),
+            "medium" | "med" => Some(L::Medium),
+            "high" => Some(L::High),
+            "max" => Some(L::Max),
+            "default" | "reset" => None,
+            other => {
+                self.state.status = t!("thinking.unknown", value = other.to_string()).to_string();
+                return None;
+            }
+        };
+        self.state.session_reasoning_effort = level;
+        self.state.status = match level {
+            Some(_) => t!("thinking.set", level = arg).to_string(),
+            None => t!("thinking.cleared").to_string(),
+        };
+        None
     }
 
     fn dispatch_mcp_inline(&mut self, inline_args: &str) -> Option<AppUiCommand> {
@@ -3027,6 +3065,7 @@ impl Store {
             media: Vec::new(),
             topic: None,
             rewrite_for: None,
+            reasoning_effort: self.state.session_reasoning_effort,
         }))
     }
 
@@ -7442,6 +7481,41 @@ mod tests {
             store.state.status
         );
         assert_eq!(rust_i18n::locale().to_string(), before);
+    }
+
+    #[test]
+    fn thinking_command_sets_clears_and_rejects_unknown() {
+        use octos_core::ui_protocol::ReasoningEffortLevel as L;
+        let mut store = store_with_empty_session();
+        assert_eq!(store.state.session_reasoning_effort, None);
+
+        store.dispatch_set_thinking("high");
+        assert_eq!(store.state.session_reasoning_effort, Some(L::High));
+        store.dispatch_set_thinking("max");
+        assert_eq!(store.state.session_reasoning_effort, Some(L::Max));
+
+        // `default` clears the override (server default applies).
+        store.dispatch_set_thinking("default");
+        assert_eq!(store.state.session_reasoning_effort, None);
+
+        // Unknown arg is echoed and does not change the current level.
+        store.dispatch_set_thinking("high");
+        store.dispatch_set_thinking("bogus");
+        assert!(
+            store.state.status.contains("bogus"),
+            "unknown effort should be echoed, got: {}",
+            store.state.status
+        );
+        assert_eq!(store.state.session_reasoning_effort, Some(L::High));
+
+        // Empty arg shows usage without changing the level.
+        store.dispatch_set_thinking("");
+        assert!(
+            store.state.status.contains("/thinking"),
+            "empty arg should show usage, got: {}",
+            store.state.status
+        );
+        assert_eq!(store.state.session_reasoning_effort, Some(L::High));
     }
 
     fn store_with_two_sessions(first: &str, second: &str) -> Store {
