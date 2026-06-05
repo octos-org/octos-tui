@@ -23,6 +23,8 @@ pub const MENU_MODEL: &str = "model";
 pub const MENU_COST: &str = "cost";
 pub const MENU_STATUS: &str = "status";
 pub const MENU_THEME: &str = "theme";
+/// Reasoning/thinking effort selection menu (opened by `/thinking` with no arg).
+pub const MENU_THINKING: &str = "thinking";
 pub const MENU_STATUS_LINE: &str = "statusline";
 pub const MENU_TITLE: &str = "title";
 pub const MENU_KEYMAP: &str = "keymap";
