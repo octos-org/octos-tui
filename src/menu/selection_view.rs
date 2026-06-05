@@ -350,7 +350,7 @@ fn selection_row(
         spans.push(Span::styled(
             fit_text(
                 &format!(" ({reason})"),
-                width.saturating_sub(text.chars().count()),
+                width.saturating_sub(unicode_width::UnicodeWidthStr::width(text.as_str())),
             ),
             reason_style,
         ));
@@ -416,9 +416,19 @@ fn fit_text(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
+    // `width` is a COLUMN budget, not a char count: CJK glyphs occupy 2
+    // display columns. Accumulate unicode display width so translated/CJK
+    // labels truncate on a column boundary instead of overflowing the row.
+    use unicode_width::UnicodeWidthChar;
     let mut out = String::new();
-    for ch in text.chars().take(width) {
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > width {
+            break;
+        }
         out.push(ch);
+        used += w;
     }
     out
 }
@@ -428,6 +438,18 @@ mod tests {
     use super::*;
     use crate::cli::ThemeName;
     use ratatui::{Terminal, backend::TestBackend};
+
+    /// i18n/CJK: `fit_text`'s `width` is a column budget. CJK glyphs are
+    /// double-width, so truncation must count display columns, not chars —
+    /// otherwise translated menu labels overflow the row and misalign.
+    #[test]
+    fn fit_text_truncates_on_column_width_not_char_count() {
+        assert_eq!(fit_text("hello", 3), "hel"); // ASCII: 1 col/char
+        assert_eq!(fit_text("中文测试", 4), "中文"); // each CJK = 2 cols → 2 glyphs
+        assert_eq!(fit_text("中文测试", 5), "中文"); // 3rd glyph would be col 6 > 5
+        assert_eq!(fit_text("a中b", 3), "a中"); // 1 + 2 = 3 cols exactly
+        assert_eq!(fit_text("中", 1), ""); // a 2-col glyph cannot fit in 1 col
+    }
 
     fn render_buffer(view: &SelectionView, width: u16, height: u16, palette: Palette) -> Buffer {
         let backend = TestBackend::new(width, height);

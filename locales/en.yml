@@ -1,0 +1,28 @@
+# octos-tui UI strings — English (source / fallback locale).
+#
+# Keys are dotted via nested YAML. Add a key here and its translation in
+# zh.yml (and any future locale). Use `%{var}` for interpolation, e.g.
+#   status.turn_completed: "Turn completed in Protocol session at seq %{seq}"
+# referenced as `t!("status.turn_completed", seq = seq)`.
+#
+# Coverage so far: composer placeholder + the onboarding welcome / local-solo
+# profile entry screen. Other menus + the status bar are converted
+# incrementally (the `t!()` pattern + these files are the template).
+composer:
+  placeholder: "Ask Octos to change code..."
+
+onboarding:
+  welcome_title: "Welcome to Octos"
+  value_not_set: "not set"
+  action_edit: "Enter edit"
+  field:
+    full_name: "Full name"
+    username: "Username"
+    email: "Email"
+  local:
+    title: "Create your local Octos profile"
+    description: "This stays on this machine; no email OTP is sent."
+    subtitle: "Set up a local solo profile to continue."
+    continue: "Continue"
+    create_action: "Create profile"
+    footer: "Up/Down choose | Enter edit or continue | type value, Enter save"

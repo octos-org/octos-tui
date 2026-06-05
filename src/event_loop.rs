@@ -42,6 +42,11 @@ pub fn run(cli: Cli) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     let guard = TerminalGuard;
 
+    // i18n: select the UI language before the first render. `t!()` reads this
+    // process-global locale, fixed at launch via --lang / OCTOS_LANG / LANG.
+    // (A runtime `/lang <code>` command could re-set it + repaint on the next
+    // frame — not wired yet.)
+    rust_i18n::set_locale(cli.lang.code());
     let palette = Palette::for_theme(cli.theme);
     let mut backend = build_backend(&cli);
     let snapshot = backend.bootstrap()?;

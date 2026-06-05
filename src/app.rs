@@ -116,15 +116,17 @@ const ONBOARDING_LOGO_ART: &str = "\
 const ONBOARDING_LOGO_TAGLINE: &str = "Welcome to Octos — Your Coding Buddy";
 
 /// True only on the onboarding WELCOME / local-profile entry screen, where the
-/// splash logo takes over the main window. Gated on the rendered spec's title:
-/// the welcome menu is "Welcome to Octos", whereas the post-profile-creation
-/// provider-setup screen — which shares the `MENU_ONBOARD` id — is titled
-/// "Set Up LLM Provider", and the child family/model/route menus carry their
-/// own ids/titles. So the logo never displaces required actions on later steps.
+/// splash logo takes over the main window. Discriminated by the welcome menu's
+/// stable first-item id (`onboard.local.status`) rather than the display title:
+/// the post-profile-creation provider-setup screen shares the `MENU_ONBOARD`
+/// id but leads with `onboard.provider.*` items. Keying on the id (not the
+/// title) keeps this correct once titles are translated (i18n) — a title-text
+/// comparison would silently break under a non-English locale.
 fn onboarding_welcome_active(app: &AppState) -> bool {
     matches!(
         app.active_menu.as_ref(),
-        Some(crate::menu::MenuBuildResult::Ready(spec)) if spec.title == "Welcome to Octos"
+        Some(crate::menu::MenuBuildResult::Ready(spec))
+            if spec.items.first().map(|item| item.id.as_str()) == Some("onboard.local.status")
     )
 }
 
@@ -3535,7 +3537,7 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
         ComposerPresentation::Empty => lines.push(Line::from(vec![
             Span::styled(" › ", palette.selected().bg(palette.surface)),
             Span::styled(
-                " Ask Octos to change code...",
+                format!(" {}", t!("composer.placeholder")),
                 palette.muted().bg(palette.surface),
             ),
         ])),
@@ -5912,16 +5914,35 @@ mod tests {
     #[test]
     fn render_first_launch_onboarding_80x24_shows_logo_without_clipping_menu() {
         let mut store = Store {
-            state: AppState::new(vec![], 0, "AppUI connected".into(), Some("stdio:octos serve --stdio".into()), false),
+            state: AppState::new(
+                vec![],
+                0,
+                "AppUI connected".into(),
+                Some("stdio:octos serve --stdio".into()),
+                false,
+            ),
         };
         store.state.set_capabilities(UiProtocolCapabilities::new(
-            &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE], &[],
+            &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            &[],
         ));
-        store.open_menu(crate::menu::MenuId::from(crate::menu::registry::MENU_ONBOARD));
-        let text = rendered_buffer_with_size(&store.state, Palette::for_theme(ThemeName::Slate), 80, 24)
-            .content.iter().map(|c| c.symbol()).collect::<String>();
-        assert!(text.contains("Welcome to Octos — Your Coding Buddy"), "logo/tagline must render at 80x24");
-        assert!(text.contains("Continue - Create profile"), "menu Continue must not be clipped at 80x24");
+        store.open_menu(crate::menu::MenuId::from(
+            crate::menu::registry::MENU_ONBOARD,
+        ));
+        let text =
+            rendered_buffer_with_size(&store.state, Palette::for_theme(ThemeName::Slate), 80, 24)
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+        assert!(
+            text.contains("Welcome to Octos — Your Coding Buddy"),
+            "logo/tagline must render at 80x24"
+        );
+        assert!(
+            text.contains("Continue - Create profile"),
+            "menu Continue must not be clipped at 80x24"
+        );
     }
 
     /// The onboarding logo only consumes rows ABOVE what the menu needs, so the
@@ -5941,7 +5962,6 @@ mod tests {
         // Narrow terminal → never the wide figlet; tagline at most.
         assert_eq!(onboarding_logo_height(40, 40, 5), 2);
     }
-
 
     #[test]
     fn render_first_launch_onboarding_child_menu_stays_on_onboarding_surface() {

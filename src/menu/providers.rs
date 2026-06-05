@@ -949,53 +949,51 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
     let items = vec![
         MenuItem::new(
             "onboard.local.status",
-            "Create your local Octos profile",
+            t!("onboarding.local.title"),
             MenuAction::Noop,
         )
-        .with_description("This stays on this machine; no email OTP is sent."),
+        .with_description(t!("onboarding.local.description")),
         onboarding_edit_item(
             "onboard.local.name",
-            "Full name",
+            t!("onboarding.field.full_name"),
             state.has_name().then_some(state.name.as_str()),
             "/onboard name ",
         )
         .with_state(MenuItemState::required(state.has_name())),
         onboarding_edit_item(
             "onboard.local.username",
-            "Username",
+            t!("onboarding.field.username"),
             state.has_username().then_some(state.username.as_str()),
             "/onboard username ",
         )
         .with_state(MenuItemState::required(state.has_username())),
         onboarding_edit_item(
             "onboard.local.email",
-            "Email",
+            t!("onboarding.field.email"),
             state.has_email().then_some(state.email.as_str()),
             "/onboard email ",
         )
         .with_state(MenuItemState::required(state.has_email())),
         MenuItem::new(
             "onboard.local.create",
-            "Continue",
+            t!("onboarding.local.continue"),
             MenuAction::Local(LocalAction::Onboarding(
                 OnboardingAction::CreateLocalProfile,
             )),
         )
-        .with_description("Create profile")
+        .with_description(t!("onboarding.local.create_action"))
         .maybe_disabled(onboarding_local_profile_disabled_reason(state)),
     ];
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_ONBOARD),
-        title: "Welcome to Octos".into(),
-        subtitle: Some("Set up a local solo profile to continue.".into()),
+        title: t!("onboarding.welcome_title").into(),
+        subtitle: Some(t!("onboarding.local.subtitle").into()),
         items,
         tabs: Vec::new(),
         searchable: false,
         search_placeholder: None,
-        footer_hint: Some(
-            "Up/Down choose | Enter edit or continue | type value, Enter save".into(),
-        ),
+        footer_hint: Some(t!("onboarding.local.footer").into()),
         // The first-run OCTOS splash now renders in the MAIN window (see
         // `render_onboarding_first_launch_layout` in app.rs), so the onboarding
         // entry screen carries NO right-side preview pane — keeping it clean.
@@ -1211,19 +1209,20 @@ fn onboarding_route_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 
 fn onboarding_edit_item(
     id: &'static str,
-    label: &'static str,
+    label: impl AsRef<str>,
     value: Option<&str>,
     draft: &'static str,
 ) -> MenuItem {
+    let not_set = t!("onboarding.value_not_set");
     let rendered_value = value
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("not set");
+        .unwrap_or(not_set.as_ref());
     MenuItem::new(
         id,
-        format!("{label}: {rendered_value}"),
+        format!("{}: {rendered_value}", label.as_ref()),
         MenuAction::Local(LocalAction::EditComposer(draft.into())),
     )
-    .with_description("Enter edit")
+    .with_description(t!("onboarding.action_edit"))
 }
 
 fn onboarding_family_label(state: &OnboardingWizardState) -> &str {
