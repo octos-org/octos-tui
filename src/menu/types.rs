@@ -268,6 +268,11 @@ pub enum LocalAction {
     /// Set the per-session reasoning effort to a specific level from the
     /// `/thinking` selection menu. `None` clears the override (server default).
     SetThinkingLevel(Option<octos_core::ui_protocol::ReasoningEffortLevel>),
+    /// Copy the last assistant reply for the active session to the system
+    /// clipboard (`/copy`). The store stages the text on
+    /// `AppState::pending_clipboard`; the event loop emits the OSC 52 escape
+    /// sequence so the copy works over SSH against the fleet minis.
+    CopyLastReply,
     Custom(&'static str),
 }
 

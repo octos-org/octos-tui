@@ -3145,6 +3145,14 @@ pub struct AppState {
     /// clears the goal.
     pub pending_goal_transition: Option<PendingGoalTransition>,
     pub exit_requested: bool,
+    /// One-shot clipboard write request produced by the `/copy` command or the
+    /// `Ctrl+Y` keybinding. The store records the text to copy here; the event
+    /// loop (which owns the terminal/stdout) drains it on the next tick and
+    /// emits the OSC 52 escape sequence, then clears it. OSC 52 is the only
+    /// SSH-safe clipboard path — a copy on a remote fleet mini lands in the
+    /// operator's *local* clipboard — and the store has no terminal handle, so
+    /// the work is split across this field.
+    pub pending_clipboard: Option<String>,
 }
 
 /// M16-G2 per-session lifecycle ledger entry. The TUI keeps these in
@@ -4684,6 +4692,7 @@ impl AppState {
             pending_autonomy_hydration: std::collections::VecDeque::new(),
             pending_goal_transition: None,
             exit_requested: false,
+            pending_clipboard: None,
         }
     }
 

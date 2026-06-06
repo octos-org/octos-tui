@@ -10,6 +10,7 @@ pub mod app;
 pub mod autonomy;
 pub mod cli;
 pub mod client_event;
+pub mod clipboard;
 pub mod cmd;
 pub mod event_loop;
 pub mod keymap;

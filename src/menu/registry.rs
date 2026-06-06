@@ -482,6 +482,17 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             inline_args: InlineArgMode::Optional,
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_HELP)),
         },
+        // Ordered after the `ps`/`stop`/`help` trio so the unknown-command
+        // "Try ..." hint (first 3 visible commands) is unchanged.
+        CommandSpec {
+            name: "copy",
+            aliases: &["yank"],
+            description: "Copy the last assistant reply to your clipboard (works over SSH).",
+            category: CommandCategory::Runtime,
+            availability: CommandAvailability::always(),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::LocalAction(LocalAction::CopyLastReply),
+        },
         CommandSpec {
             name: "exit",
             aliases: &["quit"],
