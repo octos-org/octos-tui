@@ -5287,7 +5287,12 @@ impl Store {
             self.state
                 .diff_preview
                 .open_loading_for_turn(preview_id.clone(), event.turn_id.clone());
-            self.state.status = format!("Opening diff preview: {operation} {path}");
+            self.state.status = t!(
+                "status.opening_diff_preview",
+                operation = operation,
+                path = path
+            )
+            .into_owned();
             if !request_already_in_flight {
                 return Some(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
                     session_id: event.session_id,
@@ -5487,8 +5492,12 @@ impl Store {
                 }
                 self.state.push_activity(item);
                 self.state.set_run_state_in_progress();
-                self.state.status =
-                    format!("Tool started: {} ({})", event.tool_name, event.tool_call_id);
+                self.state.status = t!(
+                    "status.tool_started",
+                    name = event.tool_name,
+                    id = event.tool_call_id
+                )
+                .into_owned();
                 None
             }
             UiNotification::ToolProgress(event) => {
@@ -5570,7 +5579,7 @@ impl Store {
                 self.state.approval = Some(approval);
                 self.state.focus = FocusPane::Composer;
                 self.state.set_run_state_blocked(title.clone());
-                self.state.status = format!("Approval requested: {title}");
+                self.state.status = t!("status.approval_requested", title = title).into_owned();
                 if let Some(preview_id) = diff_preview_id {
                     let request_already_in_flight = self.state.diff_preview.loading
                         && self.state.diff_preview.requested_preview_id.as_ref()
@@ -5578,7 +5587,8 @@ impl Store {
                     self.state
                         .diff_preview
                         .open_loading_for_turn(preview_id.clone(), Some(diff_preview_turn_id));
-                    self.state.status = format!("Opening inline diff preview: {title}");
+                    self.state.status =
+                        t!("status.opening_inline_diff_preview", title = title).into_owned();
                     if !request_already_in_flight {
                         return Some(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
                             session_id,
@@ -5979,7 +5989,8 @@ impl Store {
                         .with_detail(AppState::envelope_tool_detail_for_thread(&thread_id)),
                 );
                 self.state.set_run_state_in_progress();
-                self.state.status = format!("Tool started: {name} ({tool_call_id})");
+                self.state.status =
+                    t!("status.tool_started", name = name, id = tool_call_id).into_owned();
                 None
             }
             Payload::ToolProgress {
@@ -6222,7 +6233,7 @@ impl Store {
         self.state.user_question = Some(picker);
         self.state.focus = FocusPane::Composer;
         self.state.set_run_state_blocked(title.clone());
-        self.state.status = format!("Question asked: {title}");
+        self.state.status = t!("status.question_asked", title = title).into_owned();
         None
     }
 
@@ -6377,7 +6388,7 @@ impl Store {
                     );
                     session.messages.push(Message::assistant(text));
                     (
-                        format!("Turn completed in {title} at seq {seq}"),
+                        t!("status.turn_completed", title = title, seq = seq).into_owned(),
                         true,
                         true,
                     )
@@ -6385,7 +6396,7 @@ impl Store {
                 Some(live_reply) => {
                     session.live_reply = Some(live_reply);
                     (
-                        format!("Ignored completed stale turn in {title}"),
+                        t!("status.turn_completed_stale", title = title).into_owned(),
                         false,
                         false,
                     )
@@ -6393,7 +6404,7 @@ impl Store {
                 None => (
                     {
                         session.messages.push(Message::assistant(fallback_summary));
-                        format!("Turn completed in {title} at seq {seq}")
+                        t!("status.turn_completed", title = title, seq = seq).into_owned()
                     },
                     true,
                     true,

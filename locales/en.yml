@@ -291,6 +291,13 @@ thinking:
   no_session: "No active session — open or select a session first."
 
 status:
+  opening_diff_preview: "Opening diff preview: %{operation} %{path}"
+  opening_inline_diff_preview: "Opening inline diff preview: %{title}"
+  approval_requested: "Approval requested: %{title}"
+  tool_started: "Tool started: %{name} (%{id})"
+  question_asked: "Question asked: %{title}"
+  turn_completed: "Turn completed in %{title} at seq %{seq}"
+  turn_completed_stale: "Ignored completed stale turn in %{title}"
   # Read-only mode feedback
   readonly_turn_disabled: "Read-only mode: turn/start disabled"
   # /stop when no active turn

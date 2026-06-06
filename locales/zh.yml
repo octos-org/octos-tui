@@ -755,6 +755,13 @@ menu:
     title: 工具设置
     unavailable_title: 工具设置不可用
 status:
+  opening_diff_preview: "正在打开差异预览：%{operation} %{path}"
+  opening_inline_diff_preview: "正在打开内联差异预览：%{title}"
+  approval_requested: "请求审批：%{title}"
+  tool_started: "工具已启动：%{name}（%{id}）"
+  question_asked: "提出问题：%{title}"
+  turn_completed: "轮次已完成于 %{title}，序号 %{seq}"
+  turn_completed_stale: "已忽略 %{title} 中的过期完成轮次"
   edit_field_prompt: 编辑字段后按 Enter 确认
   keymap_save_not_wired: 快捷键保存尚未实现
   local_action_not_wired: 本地菜单操作 `%{name}` 尚未实现
