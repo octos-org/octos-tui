@@ -4190,6 +4190,10 @@ impl Store {
                 // Local-only: the server doesn't know the per-session /thinking
                 // level, so preserve it across snapshot replays (reconnect/refresh).
                 let session_reasoning_effort = self.state.session_reasoning_effort.clone();
+                // Local-only: the active /theme palette is a client setting the
+                // server never echoes, so preserve it across snapshot replays
+                // (otherwise a launch --theme or a runtime /theme reverts to Codex).
+                let theme = self.state.theme;
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
@@ -4216,6 +4220,7 @@ impl Store {
                 state.mcp_config_catalog = mcp_config_catalog;
                 state.tool_config_catalog = tool_config_catalog;
                 state.session_reasoning_effort = session_reasoning_effort;
+                state.theme = theme;
                 state.restore_optimistic_user_messages();
                 self.state = state;
                 None
@@ -7594,6 +7599,22 @@ mod tests {
             "active theme should be marked current"
         );
         assert!(!current_of("codex"), "non-active theme not current");
+
+        // The active theme survives a snapshot replay (reconnect/refresh): the
+        // server never echoes it, so the client must preserve it locally.
+        let sessions = store.state.sessions.clone();
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions,
+            selected_session: 0,
+            status: "snapshot replay".into(),
+            target: None,
+            readonly: false,
+        }));
+        assert_eq!(
+            store.state.theme,
+            ThemeName::Claude,
+            "theme must survive snapshot replay"
+        );
     }
 
     #[test]
