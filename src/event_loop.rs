@@ -1402,7 +1402,10 @@ mod tests {
         // `/t` -> `/`: popup stays open over the bare slash.
         handle_key(&mut store, key(KeyCode::Backspace));
         assert_eq!(store.state.composer, "/");
-        assert!(store.state.menu_stack.is_active(), "popup stays open on `/`");
+        assert!(
+            store.state.menu_stack.is_active(),
+            "popup stays open on `/`"
+        );
 
         // `/` -> empty: the slash draft is gone, so the popup closes.
         handle_key(&mut store, key(KeyCode::Backspace));

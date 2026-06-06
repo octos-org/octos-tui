@@ -938,8 +938,11 @@ impl Store {
                 None
             }
             LocalAction::SaveStatusLine(items) => {
-                self.state.status =
-                    t!("status.statusline_layout_selected", items = items.join(", ")).into_owned();
+                self.state.status = t!(
+                    "status.statusline_layout_selected",
+                    items = items.join(", ")
+                )
+                .into_owned();
                 None
             }
             LocalAction::SaveTerminalTitle(items) => {

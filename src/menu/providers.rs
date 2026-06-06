@@ -4117,14 +4117,22 @@ fn status_runtime_items(ctx: &MenuContext<'_>) -> Vec<MenuItem> {
     let mut items = Vec::new();
     if let Some(health) = status_health_value(status) {
         items.push(
-            MenuItem::new("status.health", t!("menu.statusline.item.health"), MenuAction::Noop)
-                .with_description(health),
+            MenuItem::new(
+                "status.health",
+                t!("menu.statusline.item.health"),
+                MenuAction::Noop,
+            )
+            .with_description(health),
         );
     }
     if let Some(usage) = status_usage_value(status) {
         items.push(
-            MenuItem::new("status.usage", t!("menu.statusline.item.usage"), MenuAction::Noop)
-                .with_description(usage),
+            MenuItem::new(
+                "status.usage",
+                t!("menu.statusline.item.usage"),
+                MenuAction::Noop,
+            )
+            .with_description(usage),
         );
     }
     items.extend(runtime_policy_items(status));
@@ -4203,10 +4211,26 @@ fn runtime_policy_items(status: &crate::model::SessionRuntimeStatus) -> Vec<Menu
             "menu.statusline.item.tool_discovery",
             status_tool_discovery_value(status),
         ),
-        ("status.mcp", "menu.statusline.item.mcp", status_mcp_value(status)),
-        ("status.memory", "menu.statusline.item.memory", status_memory_value(status)),
-        ("status.qoe", "menu.statusline.item.qoe", status_qoe_value(status)),
-        ("status.queue", "menu.statusline.item.queue", status_queue_value(status)),
+        (
+            "status.mcp",
+            "menu.statusline.item.mcp",
+            status_mcp_value(status),
+        ),
+        (
+            "status.memory",
+            "menu.statusline.item.memory",
+            status_memory_value(status),
+        ),
+        (
+            "status.qoe",
+            "menu.statusline.item.qoe",
+            status_qoe_value(status),
+        ),
+        (
+            "status.queue",
+            "menu.statusline.item.queue",
+            status_queue_value(status),
+        ),
     ];
     rows.iter()
         .filter_map(|(id, key, value)| {
@@ -4566,7 +4590,11 @@ fn command_description(description: &str, aliases: &[&str]) -> String {
     if aliases.is_empty() {
         desc
     } else {
-        format!("{desc} {}: {}", t!("command.aliases_label"), aliases.join(", "))
+        format!(
+            "{desc} {}: {}",
+            t!("command.aliases_label"),
+            aliases.join(", ")
+        )
     }
 }
 
@@ -4574,19 +4602,29 @@ fn status_line_items(app: MenuAppSnapshot<'_>) -> [(&'static str, String, bool);
     [
         (
             "state",
-            t!("menu.statusline.item.state_label", value = app.status.unwrap_or("idle"))
-                .into_owned(),
+            t!(
+                "menu.statusline.item.state_label",
+                value = app.status.unwrap_or("idle")
+            )
+            .into_owned(),
             true,
         ),
         (
             "target",
-            t!("menu.statusline.item.target_label", value = app.target.unwrap_or("local"))
-                .into_owned(),
+            t!(
+                "menu.statusline.item.target_label",
+                value = app.target.unwrap_or("local")
+            )
+            .into_owned(),
             true,
         ),
         (
             "cwd",
-            t!("menu.statusline.item.cwd_label", value = app.cwd.unwrap_or("unknown")).into_owned(),
+            t!(
+                "menu.statusline.item.cwd_label",
+                value = app.cwd.unwrap_or("unknown")
+            )
+            .into_owned(),
             true,
         ),
         (

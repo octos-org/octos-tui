@@ -141,24 +141,513 @@ onboarding:
       local_continue: "继续创建档案"
       local_fill_fields: "填写姓名、用户名和邮箱"
 
+# --- runtime feedback + menu chrome + command descriptions (full i18n pass) ---
+command:
+  agents:
+    desc: 查看或中断后端智能体
+  aliases_label: 别名：
+  cost:
+    desc: 显示服务器报告的 token 和费用用量
+  exit:
+    desc: 退出 TUI
+  goal:
+    desc: 查看、设置、暂停/恢复或清除持久化的会话目标
+  help:
+    desc: 显示可用命令
+  keymap:
+    desc: 查看并编辑 TUI 按键绑定
+  lang:
+    desc: 切换 UI 显示语言，例如 /lang zh（en、zh）
+  login:
+    desc: 使用邮件 OTP 登录或查看当前认证状态
+  loop:
+    desc: 创建、列出、暂停/恢复、立即触发或删除后端定时任务循环
+  mcp:
+    desc: 列出或配置服务器支持的 MCP 条目
+  model:
+    desc: 选择服务器返回的档案 LLM 模型
+  onboard:
+    desc: 打开设置向导以配置或重新配置您的档案、供应商、模型和工作区
+  permissions:
+    desc: 查看或更改审批、文件系统和网络权限
+  provider:
+    desc: 配置档案专属的 LLM 供应商和路由
+  ps:
+    desc: 显示后台任务和进程状态
+  review:
+    desc: 启动后端代码审查工作流
+  skills:
+    desc: 列出、搜索、安装或删除档案技能
+  status:
+    desc: 显示基于快照的会话、运行时和连接状态
+  statusline:
+    desc: 配置底部状态栏项目
+  stop:
+    desc: 中断当前轮次或停止受支持的后台工作
+  task:
+    desc: 读取后端任务产物
+  theme:
+    desc: 选择本地 TUI 主题
+  thinking:
+    desc: 设置思考模型的思考强度：/thinking low|medium|high|max|default
+  threads:
+    desc: 查看后端线程图
+  title:
+    desc: 配置终端标题项目
+  tools:
+    desc: 列出或配置服务器支持的工具设置
+  turn:
+    desc: 查看后端轮次生命周期状态
 lang:
-  switched: “已切换到中文。”
-  usage: “当前语言：%{current}。用法：/lang <en|zh>。”
-  unknown: “未知语言”%{value}”。可选：en、zh。”
-thinking:
-  usage: “推理强度：%{current}。用法：/thinking <low|medium|high|max|default>。”
-  set: “推理强度已设为 %{level}。”
-  cleared: “已清除推理强度，使用服务器默认值。”
-  unknown: “未知强度”%{value}”。可选：low、medium、high、max、default。”
-  no_session: “没有活动会话——请先打开或选择一个会话。”
-
+  switched: 已切换到中文。
+  unknown: 未知语言 '%{value}'。可选：en、zh。
+  usage: 当前语言：%{current}。用法：/lang <en|zh>。
+menu:
+  component:
+    footer: 空格 切换 | 回车 保存 | Esc 关闭
+    preview_title: 预览
+    search: 筛选组件
+  cost:
+    footer: 回车 刷新 | Esc 关闭
+    item:
+      cached:
+        label: 服务器用量统计
+      cached_input:
+        label: 缓存输入
+      cached_output:
+        label: 缓存输出
+      empty:
+        label: 无用量统计
+      estimated:
+        label: 预估费用
+      input_tokens:
+        label: 输入 Token
+      output_tokens:
+        label: 输出 Token
+      refresh:
+        label: 刷新用量
+    subtitle: 服务器报告的 Token 和费用用量。
+    title: 费用
+    unavailable_no_session: 用量统计需要一个打开的 AppUI 会话。
+    unavailable_title: 费用不可用
+  footer:
+    enter_apply_esc_close: 回车 应用 | Esc 关闭
+    enter_run_esc_close: 回车 执行 | Esc 关闭
+    esc_back: Esc 返回
+    esc_close: Esc 关闭
+  help:
+    footer: 回车 打开/运行 | Esc 关闭
+    search: 筛选命令
+    subtitle: 命令由共享注册表解析。
+    title: 斜杠命令
+  keymap:
+    item:
+      composer_delete_word:
+        desc: 删除光标前一个单词。
+      composer_kill_line:
+        desc: 删除光标到行尾的文本。
+      composer_move_char:
+        desc: 向左/右移动光标一个字符。
+      composer_move_line:
+        desc: 移动光标到行首/行尾。
+      composer_move_word:
+        desc: 按词移动光标。
+      composer_submit:
+        desc: 提交输入框或精确斜杠命令。
+      global_interrupt:
+        desc: 中断当前活动轮次。
+      global_quit:
+        desc: 退出 TUI。
+      menu_accept:
+        desc: 确认高亮菜单行。
+      menu_cancel:
+        desc: 关闭当前菜单。
+      menu_next:
+        desc: 移动到下一行。
+      menu_previous:
+        desc: 移动到上一行。
+    preview_body: 此视图展示菜单层面的按键。持久化按键编辑将在后续版本提供。
+    preview_title: 编辑
+    search: 筛选按键绑定
+    subtitle: 当前 TUI 按键绑定。
+    tab:
+      approval: 审批
+      composer: 输入框
+      global: 全局
+      menu: 菜单
+      task: 任务
+    title: 按键映射
+  lang:
+    subtitle: 界面显示语言。
+    title: 语言
+  login:
+    item:
+      auth_status:
+        label: 认证状态
+      current_account:
+        label: 当前账号
+      email:
+        desc: 使用 /login email <地址>。
+      logout:
+        label: 退出登录
+      otp_code:
+        desc: 使用 /login code <验证码>。
+      otp_code_set:
+        label: OTP 验证码：已设置
+      otp_code_unset:
+        label: OTP 验证码：未设置
+      otp_send:
+        label: 邮箱 OTP：发送验证码
+      otp_verify:
+        label: 邮箱 OTP：验证验证码
+    preview_title: 登录状态
+    subtitle: 服务器端认证方式。
+    title: 登录
+    unavailable_title: 登录不可用
+  mcp:
+    item:
+      cached:
+        label: 服务器 MCP 配置
+      config_refresh:
+        label: 刷新 MCP 配置
+      empty:
+        label: 无 MCP 服务器
+      status_refresh:
+        label: 刷新 MCP 状态
+      upsert:
+        label: 添加/更新 MCP 配置
+    search: 筛选 MCP 条目
+    subtitle: 服务器端 MCP 配置和状态。
+    title: MCP
+    unavailable_title: MCP 不可用
+  model:
+    footer: 回车 选择或刷新 | Esc 关闭
+    item:
+      cached:
+        label: 服务器模型列表
+      empty:
+        label: 无服务器模型
+      refresh:
+        label: 刷新模型
+    search: 筛选模型
+    subtitle: 服务器返回的档案 LLM 模型。
+    title: 模型
+  onboard:
+    family:
+      footer: 回车 选择系列 | Esc 返回
+      search: 筛选系列
+      subtitle: 仪表盘模型系列。
+      title: 选择模型系列
+    footer: /onboard <字段> <值> 文本输入 | 回车 执行 | Esc 关闭
+    item:
+      api_key:
+        desc: 使用 /onboard key <密钥>。密钥在状态、日志和快照中均被遮蔽。
+        label: API 密钥
+      auth_me:
+        label: 刷新账号
+      auth_refresh:
+        label: 刷新认证状态
+      auth_send:
+        label: 发送邮箱验证码
+      auth_status:
+        desc: 使用 /onboard email、/onboard send-code、/onboard code、/onboard verify 完成验证。
+      auth_verify:
+        desc: 使用 auth/verify。令牌保存在内存中，不会显示。
+        label: 验证 OTP
+      catalog_load:
+        desc: 加载仪表盘模型系列和供应商线路
+        label: 加载供应商目录
+      catalog_refresh:
+        desc: 使用 profile/llm/catalog。目录结构由 octos/dashboard 管理。
+        label: 刷新仪表盘供应商目录
+      catalog_reload:
+        label: 重新加载供应商目录
+      fallback_provider:
+        desc: 追加或替换 config.llm.fallbacks 中的此线路
+      family:
+        desc: 选择系列
+        label: 模型系列
+      fetch_models:
+        desc: 使用 profile/llm/fetch_models 获取自定义 OpenAI 兼容线路的模型。
+        label: 获取线路模型
+      finish:
+        desc: 使用 session/open 打开已解析的档案。
+        label: 完成并打开编码会话
+      local_create:
+        desc: 使用 profile/local/create；不发送验证码。
+        label: 创建本地档案
+      local_email:
+        desc: 使用 /onboard email <地址>。邮箱仅为本地元数据。
+      local_name:
+        desc: 使用 /onboard name <显示名称>。
+      local_status:
+        desc: 使用 /onboard name、/onboard username 和 /onboard email。
+      local_username:
+        desc: 使用 /onboard username <本地用户名>。
+      model:
+        desc: 选择模型
+        label: 模型
+      permissions_staged:
+        desc: 使用 /onboard permissions <模式> 暂存权限配置。
+      persist_provider:
+        desc: 将供应商持久化到档案 JSON
+      profile:
+        desc: 本地档案已就绪
+        label: 档案
+      provider_current:
+        desc: 使用 /onboard family、/onboard model 等命令配置自定义供应商。
+        label: 供应商
+      providers_refresh:
+        label: 刷新已配置的供应商
+      reset:
+        label: 重置向导状态
+      route:
+        desc: 选择官方或备用供应商
+        label: 供应商线路
+      save_provider:
+        desc: 使用 profile/llm/upsert 持久化到与仪表盘相同的档案 JSON。
+        label: 保存供应商到档案
+      saved_provider:
+        desc: 上次成功保存的主要或备用供应商
+      selected_provider:
+        desc: 请在上方选择一条供应商线路
+        label: 已选供应商
+      test_provider:
+        desc: 使用 profile/llm/test 测试所选仪表盘架构线路。
+        label: 测试供应商
+      verify_provider:
+        desc: 验证所选供应商线路
+      workspace:
+        desc: 使用 /onboard workspace <路径> 暂存；默认为当前工作区根目录。
+        label: 工作区
+      workspace_status:
+        desc: 本地探测器的验证状态（后续可替换为后端 workspace/probe）。
+      workspace_validate:
+        desc: 探测暂存路径；/onboard finish 之前必须执行。
+        label: 验证工作区
+    model:
+      footer: 回车 选择模型 | Esc 返回
+      search: 筛选模型
+      title: 选择模型
+    preview_title: 向导状态
+    route:
+      footer: 回车 选择线路 | Esc 返回
+      search: 筛选供应商线路
+      title: 选择供应商线路
+    search: 筛选引导操作
+    subtitle: 登录，选择仪表盘目录中的模型线路，保存到档案 JSON，然后打开会话。
+    title: 引导设置
+    unavailable_catalog_msg: 请先加载供应商目录。
+    unavailable_family_msg: 请先选择模型系列。
+    unavailable_model_msg: 请先选择系列和模型。
+    unavailable_title: 引导不可用
+  permissions:
+    footer: 回车 应用或刷新 | Esc 关闭
+    item:
+      default:
+        desc: 工作区编辑；网络/外部操作需请求审批。
+        label: 默认
+      full_access:
+        desc: 无沙箱或网络审批。
+        label: 完全访问
+      network_allow:
+        desc: 启用互联网访问。
+        label: 允许网络
+      network_block:
+        desc: 禁用互联网访问。
+        label: 阻断网络
+      profile_refresh:
+        label: 刷新权限档案
+      read_only:
+        desc: 无审批不允许写入。
+        label: 只读
+      scopes_clear:
+        label: 清除持久化审批范围
+      scopes_refresh:
+        label: 刷新持久化审批范围
+      workspace_write:
+        desc: 工作区内可读写。
+        label: 工作区写入
+      workspace_write_never:
+        desc: 工作区内可读写；审批门控命令直接拒绝而不询问。
+        label: 工作区写入，不询问
+    preview_title: 能力状态
+    search: 筛选权限
+    subtitle: 会话权限预设；变更受能力门控。
+    title: 更新模型权限
+    unavailable_no_session: 权限功能需要一个打开的 AppUI 会话。
+    unavailable_title: 权限不可用
+  provider:
+    item:
+      catalog_refresh:
+        label: 刷新供应商目录
+      list_refresh:
+        label: 刷新已配置供应商
+      saved_fallback:
+        prefix: 已保存备用供应商 %{n}
+      saved_fallback_empty:
+        desc: 使用添加备用模型持久化备用线路。
+        label: 已保存备用供应商：无
+      saved_primary:
+        prefix: 已保存主要供应商
+      saved_primary_empty:
+        desc: 在打开编码会话前，请先将测试通过的供应商保存为主要供应商。
+        label: 已保存主要供应商：未设置
+      saved_unloaded:
+        desc: 请运行刷新已配置供应商以读取 profile/llm/list。
+        label: 已保存供应商：未加载
+      staged:
+        desc: 使用 /provider select 命令或在目录中选择行。
+        label: 暂存供应商
+    preview_title: 供应商状态
+    search: 筛选供应商
+    subtitle: 档案级 LLM 配置；目录和状态来自 AppUI。
+    title: 供应商
+    unavailable_title: 供应商不可用
+  runtime_preview_title: 运行时
+  skills:
+    item:
+      cache_empty:
+        label: 已安装技能未加载
+      install:
+        desc: 支持 GitHub 简写、完整 Git URL 或本地技能路径。
+        label: 安装包或仓库
+        prefix: 安装
+      none:
+        label: 无已安装技能
+      refresh:
+        label: 刷新已安装技能
+      remove:
+        prefix: 移除
+      search:
+        desc: 输入注册表查询内容，然后按回车。
+        label: 搜索注册表
+    preview_title: 档案
+    search: 筛选技能
+    subtitle: 通过 AppUI 管理的档案级自定义技能。
+    title: 技能
+    unavailable_title: 技能不可用
+  status:
+    item:
+      capabilities:
+        label: 能力
+      connection:
+        label: 连接
+      refresh:
+        label: 刷新服务器状态
+      server:
+        label: 服务器运行时状态
+      snapshot:
+        label: 快照状态
+    preview_title: 快照
+    subtitle: 基于快照的状态；服务器字段受能力门控。
+    title: 状态
+  statusline:
+    item:
+      approval_label: 审批状态
+      approval_policy: 审批策略
+      background_label: 后台任务：%{value}
+      cwd_label: 工作目录：%{value}
+      dangerous_access: 危险访问
+      filesystem_scope: 文件系统范围
+      health: 健康
+      mcp: MCP
+      memory: 记忆
+      model: 模型
+      model_label: 模型：%{value}
+      model_toolset: 模型工具集
+      network: 网络
+      permissions: 权限
+      profile: 档案
+      profile_label: 档案：%{value}
+      provider: 供应商
+      qoe: QoE
+      queue: 队列
+      runtime_mode: 运行模式
+      sandbox_mode: 沙箱模式
+      session_label: 会话：%{value}
+      state_label: 状态：%{value}
+      target_label: 目标：%{value}
+      task_label: 任务：%{value}
+      tool_contract: 工具契约
+      tool_discovery: 工具发现
+      tool_policy: 工具策略
+      usage: 用量
+    subtitle: 选择底部状态栏组件。
+    title: 状态栏
+  theme:
+    item:
+      claude:
+        desc: 暖色暗色配色。
+      codex:
+        desc: 中性暗色配色，蓝色点缀。
+      slate:
+        desc: 冷色暗色配色。
+      solarized:
+        desc: Solarized 暗色配色。
+      terminal:
+        desc: 使用终端默认配色。
+    preview_title: 当前
+    search: 筛选主题
+    subtitle: 本地 TUI 配色，不依赖 AppUI。
+    title: 主题
+  thinking:
+    item:
+      default:
+        desc: 使用服务器默认值（不覆盖本次会话）。
+        label: 默认
+      high:
+        desc: 深度推理。
+        label: 高
+      low:
+        desc: 最低推理强度——最快、最省钱。
+        label: 低
+      max:
+        desc: 最强推理（DeepSeek V4；其他模型上限为高）。
+        label: 最大
+      medium:
+        desc: 均衡推理。
+        label: 中
+    subtitle: 思考模型的推理强度（本次会话）。
+    title: 思考强度
+  title:
+    subtitle: 选择终端标题组件。
+    title: 终端标题
+  tools:
+    item:
+      cached:
+        label: 服务器工具配置
+      config_refresh:
+        label: 刷新工具配置
+      contract:
+        label: 编码工具契约
+      contract_missing:
+        prefix: 缺少 P0 工具
+      empty:
+        label: 无工具设置
+      status_empty:
+        label: 无工具
+      status_refresh:
+        label: 刷新工具状态
+      upsert:
+        label: 添加/更新工具配置
+    search: 筛选工具
+    subtitle: 服务器端搜索、网页、浏览器和 MCP 工具设置。
+    title: 工具设置
+    unavailable_title: 工具设置不可用
 status:
-  readonly_turn_disabled: “只读模式：回合/启动已禁用”
-  no_active_turn: “无活动回合可中断”
-  theme_set: “主题：%{theme}”
-  theme_unknown: “未知主题：%{theme}”
-  statusline_layout_selected: “已选择状态栏布局：%{items}”
-  terminal_title_layout_selected: “已选择终端标题布局：%{items}”
-  keymap_save_not_wired: “快捷键保存尚未实现”
-  edit_field_prompt: “编辑字段后按 Enter 确认”
-  local_action_not_wired: “本地菜单操作 `%{name}` 尚未实现”
+  edit_field_prompt: 编辑字段后按 Enter 确认
+  keymap_save_not_wired: 快捷键保存尚未实现
+  local_action_not_wired: 本地菜单操作 `%{name}` 尚未实现
+  no_active_turn: 无活动回合可中断
+  readonly_turn_disabled: 只读模式：回合/启动已禁用
+  statusline_layout_selected: 已选择状态栏布局：%{items}
+  terminal_title_layout_selected: 已选择终端标题布局：%{items}
+  theme_set: 主题：%{theme}
+  theme_unknown: 未知主题：%{theme}
+thinking:
+  cleared: 已清除推理强度，使用服务器默认值。
+  no_session: 没有活动会话——请先打开或选择一个会话。
+  set: 推理强度已设为 %{level}。
+  unknown: 未知强度 '%{value}'。可选：low、medium、high、max、default。
+  usage: 推理强度：%{current}。用法：/thinking <low|medium|high|max|default>。

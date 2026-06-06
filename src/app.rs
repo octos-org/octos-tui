@@ -654,17 +654,17 @@ fn render_launch_banner(frame: &mut Frame<'_>, app: &AppState, palette: Palette,
         None => t!("app.banner.greeting_default").to_string(),
     };
     let greeting_w = greeting.width();
-    lines.push(centered(vec![Span::styled(greeting, highlight)], greeting_w));
+    lines.push(centered(
+        vec![Span::styled(greeting, highlight)],
+        greeting_w,
+    ));
     let cwd = short_path(app.workspace.root.as_str());
     let cwd_w = cwd.width();
     lines.push(centered(vec![Span::styled(cwd, palette.muted())], cwd_w));
     lines.push(centered(vec![], 0));
     let hint = t!("app.banner.hint").to_string();
     let hint_w = hint.width();
-    lines.push(centered(
-        vec![Span::styled(hint, palette.muted())],
-        hint_w,
-    ));
+    lines.push(centered(vec![Span::styled(hint, palette.muted())], hint_w));
     lines.push(Line::from(Span::styled(
         format!("╰{}╯", "─".repeat(inner_w)),
         border,
@@ -1911,7 +1911,10 @@ fn push_inline_approval_card(
     if approval.diff_preview_id().is_some() {
         lines.push(Line::from(vec![
             Span::styled("    ", palette.muted()),
-            Span::styled(t!("app.approval.action_diff").to_string(), palette.selected()),
+            Span::styled(
+                t!("app.approval.action_diff").to_string(),
+                palette.selected(),
+            ),
         ]));
     }
 }
@@ -1984,10 +1987,7 @@ fn push_inline_user_question_card(
             // stays dismissible (Esc) and recoverable (Alt+a).
             lines.push(Line::from(vec![
                 Span::styled("    ", palette.muted()),
-                Span::styled(
-                    t!("app.question.no_options").to_string(),
-                    palette.muted(),
-                ),
+                Span::styled(t!("app.question.no_options").to_string(), palette.muted()),
             ]));
         }
     }
@@ -2456,10 +2456,7 @@ fn push_agent_task_group(
             Span::styled(prefix, palette.border()),
             Span::styled("◻ ", palette.selected()),
             Span::styled(title.clone(), palette.text()),
-            Span::styled(
-                format!("  {}", t!("app.activity.running")),
-                palette.muted(),
-            ),
+            Span::styled(format!("  {}", t!("app.activity.running")), palette.muted()),
         ]));
     }
 }
@@ -3971,7 +3968,11 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
     let turn = app
         .active_turn()
         .map(|(_, turn_id)| {
-            t!("app.status.turn_active", id = short_id(&turn_id.0.to_string())).to_string()
+            t!(
+                "app.status.turn_active",
+                id = short_id(&turn_id.0.to_string())
+            )
+            .to_string()
         })
         .unwrap_or_else(|| t!("app.status.turn_idle").to_string());
     let profile = app
@@ -5533,14 +5534,32 @@ mod tests {
             None,
             false,
         );
-        assert!(launch_banner_active(&app), "empty session must show the launch banner");
+        assert!(
+            launch_banner_active(&app),
+            "empty session must show the launch banner"
+        );
         let text = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Slate), 100, 30)
-            .content.iter().map(|c| c.symbol()).collect::<String>();
-        assert!(text.contains("╭"), "banner must draw a top-left rounded corner");
-        assert!(text.contains("╯"), "banner must draw a bottom-right rounded corner");
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(
+            text.contains("╭"),
+            "banner must draw a top-left rounded corner"
+        );
+        assert!(
+            text.contains("╯"),
+            "banner must draw a bottom-right rounded corner"
+        );
         assert!(text.contains("octos"), "banner box title");
-        assert!(text.contains("██████╗"), "banner must show the OCTOS figlet");
-        assert!(text.contains("Welcome back — dspfac"), "banner greeting names the profile");
+        assert!(
+            text.contains("██████╗"),
+            "banner must show the OCTOS figlet"
+        );
+        assert!(
+            text.contains("Welcome back — dspfac"),
+            "banner greeting names the profile"
+        );
     }
 
     #[test]
@@ -5559,7 +5578,10 @@ mod tests {
             None,
             false,
         );
-        assert!(!launch_banner_active(&app), "banner must disappear once the conversation starts");
+        assert!(
+            !launch_banner_active(&app),
+            "banner must disappear once the conversation starts"
+        );
     }
 
     #[test]

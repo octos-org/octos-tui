@@ -185,3 +185,494 @@ status:
   edit_field_prompt: "Edit the field, then press Enter"
   # Unimplemented local menu action
   local_action_not_wired: "Local menu action `%{name}` is not wired yet"
+
+# --- menu chrome + command descriptions (full i18n pass) ---
+command:
+  agents:
+    desc: Inspect or interrupt backend-owned subagents.
+  aliases_label: 'Aliases:'
+  cost:
+    desc: Show server-reported token and cost usage.
+  exit:
+    desc: Quit the TUI.
+  goal:
+    desc: View, set, pause, resume, or clear the persisted session goal.
+  help:
+    desc: Show available commands.
+  keymap:
+    desc: Inspect and edit TUI key bindings.
+  lang:
+    desc: Switch the UI display language, e.g. /lang zh (en, zh).
+  login:
+    desc: Sign in with email OTP or inspect current auth state.
+  loop:
+    desc: Create, list, pause, resume, fire-now, or delete backend loops.
+  mcp:
+    desc: List or configure server-owned MCP entries when supported.
+  model:
+    desc: Choose a server-returned profile LLM model.
+  onboard:
+    desc: Open the setup wizard to configure or reconfigure your profile, provider, model, and workspace.
+  permissions:
+    desc: Review or change approval, filesystem, and network permissions.
+  provider:
+    desc: Configure profile-owned LLM providers and routes.
+  ps:
+    desc: Show background task and process status.
+  review:
+    desc: Start the backend-owned code review workflow.
+  skills:
+    desc: List, search, install, or remove profile skills.
+  status:
+    desc: Show snapshot-backed session, runtime, and connection status.
+  statusline:
+    desc: Configure bottom status line items.
+  stop:
+    desc: Interrupt the active turn or stop supported background work.
+  task:
+    desc: Read backend task artifacts.
+  theme:
+    desc: Choose the local TUI theme.
+  thinking:
+    desc: 'Set reasoning effort for thinking models: /thinking low|medium|high|max|default.'
+  threads:
+    desc: Inspect the backend thread graph.
+  title:
+    desc: Configure terminal title items.
+  tools:
+    desc: List or configure server-owned tool settings when supported.
+  turn:
+    desc: Inspect backend turn lifecycle state.
+menu:
+  component:
+    footer: Space toggle | Enter save | Esc close
+    preview_title: Preview
+    search: Filter components
+  cost:
+    footer: Enter refresh | Esc close
+    item:
+      cached:
+        label: Server usage totals
+      cached_input:
+        label: Cached Input
+      cached_output:
+        label: Cached Output
+      empty:
+        label: No usage totals
+      estimated:
+        label: Estimated Cost
+      input_tokens:
+        label: Input Tokens
+      output_tokens:
+        label: Output Tokens
+      refresh:
+        label: Refresh usage
+    subtitle: Server-reported token and cost usage.
+    title: Cost
+    unavailable_no_session: Usage totals require an open AppUI session.
+    unavailable_title: Cost unavailable
+  footer:
+    enter_apply_esc_close: Enter apply | Esc close
+    enter_run_esc_close: Enter run | Esc close
+    esc_back: Esc back
+    esc_close: Esc close
+  help:
+    footer: Enter open/run | Esc close
+    search: Filter commands
+    subtitle: Commands are resolved by the shared registry.
+    title: Slash Commands
+  keymap:
+    item:
+      composer_delete_word:
+        desc: Delete previous composer word.
+      composer_kill_line:
+        desc: Delete composer text to line end.
+      composer_move_char:
+        desc: Move composer cursor left/right.
+      composer_move_line:
+        desc: Move composer cursor to line start/end.
+      composer_move_word:
+        desc: Move composer cursor by word.
+      composer_submit:
+        desc: Submit composer or exact slash command.
+      global_interrupt:
+        desc: Interrupt the active turn.
+      global_quit:
+        desc: Quit the TUI.
+      menu_accept:
+        desc: Accept highlighted menu row.
+      menu_cancel:
+        desc: Close the active menu.
+      menu_next:
+        desc: Move to next row.
+      menu_previous:
+        desc: Move to previous row.
+    preview_body: This slice exposes the menu surface. Persisted keymap editing remains a follow-up provider action.
+    preview_title: Editing
+    search: Filter key bindings
+    subtitle: Current TUI key bindings.
+    tab:
+      approval: Approval
+      composer: Composer
+      global: Global
+      menu: Menu
+      task: Task
+    title: Keymap
+  lang:
+    subtitle: UI display language.
+    title: Language
+  login:
+    item:
+      auth_status:
+        label: Auth status
+      current_account:
+        label: Current account
+      email:
+        desc: Use /login email <address>.
+      logout:
+        label: Logout
+      otp_code:
+        desc: Use /login code <otp>.
+      otp_code_set:
+        label: 'OTP code: set'
+      otp_code_unset:
+        label: 'OTP code: not set'
+      otp_send:
+        label: 'Email OTP: send code'
+      otp_verify:
+        label: 'Email OTP: verify code'
+    preview_title: Login State
+    subtitle: Server-owned authentication methods.
+    title: Login
+    unavailable_title: Login unavailable
+  mcp:
+    item:
+      cached:
+        label: Server MCP config
+      config_refresh:
+        label: Refresh MCP config
+      empty:
+        label: No MCP servers
+      status_refresh:
+        label: Refresh MCP status
+      upsert:
+        label: Add/update MCP config
+    search: Filter MCP entries
+    subtitle: Server-owned MCP configuration and status.
+    title: MCP
+    unavailable_title: MCP unavailable
+  model:
+    footer: Enter select or refresh | Esc close
+    item:
+      cached:
+        label: Server model list
+      empty:
+        label: No server models
+      refresh:
+        label: Refresh models
+    search: Filter models
+    subtitle: Server-returned profile LLM models.
+    title: Model
+  onboard:
+    family:
+      footer: Enter choose family | Esc back
+      search: Filter families
+      subtitle: Dashboard model families.
+      title: Choose Model Family
+    footer: Use /onboard <field> <value> for text input | Enter run | Esc close
+    item:
+      api_key:
+        desc: Use /onboard key <secret>. The secret is masked in state, logs, and snapshots.
+        label: API key
+      auth_me:
+        label: Refresh account
+      auth_refresh:
+        label: Refresh auth status
+      auth_send:
+        label: Send email OTP
+      auth_status:
+        desc: Use /onboard email <address>, /onboard send-code, /onboard code <otp>, then /onboard verify.
+      auth_verify:
+        desc: Uses auth/verify. The token is held in memory and never rendered.
+        label: Verify OTP
+      catalog_load:
+        desc: Load dashboard model families and provider routes
+        label: Load provider catalog
+      catalog_refresh:
+        desc: Uses profile/llm/catalog. The catalog schema is owned by octos/dashboard.
+        label: Refresh dashboard provider catalog
+      catalog_reload:
+        label: Reload provider catalog
+      fallback_provider:
+        desc: Append or replace this route under config.llm.fallbacks
+      family:
+        desc: Choose family
+        label: Model family
+      fetch_models:
+        desc: Uses profile/llm/fetch_models for custom OpenAI-compatible routes.
+        label: Fetch route models
+      finish:
+        desc: Uses session/open with the resolved profile.
+        label: Finish and open coding session
+      local_create:
+        desc: Uses profile/local/create; no OTP is sent.
+        label: Create local profile
+      local_email:
+        desc: Use /onboard email <address>. Email is local metadata only.
+      local_name:
+        desc: Use /onboard name <display name>.
+      local_status:
+        desc: Use /onboard name, /onboard username, and /onboard email.
+      local_username:
+        desc: Use /onboard username <local handle>.
+      model:
+        desc: Choose model
+        label: Model
+      permissions_staged:
+        desc: Stage with /onboard permissions <default|read-only|workspace-write|workspace-write-never|full-access|clear>.
+      persist_provider:
+        desc: Persist provider to the profile JSON
+      profile:
+        desc: Local profile ready
+        label: Profile
+      provider_current:
+        desc: Use /onboard family, /onboard model, /onboard route, /onboard base-url, and /onboard api-key-env for custom providers.
+        label: Provider
+      providers_refresh:
+        label: Refresh configured providers
+      reset:
+        label: Reset wizard state
+      route:
+        desc: Choose official or alternative provider
+        label: Provider route
+      save_provider:
+        desc: Uses profile/llm/upsert and persists to the same profile JSON as the dashboard.
+        label: Save provider to profile
+      saved_provider:
+        desc: Last successful primary or fallback save
+      selected_provider:
+        desc: Choose one provider route above
+        label: Selected provider
+      test_provider:
+        desc: Uses profile/llm/test with the selected dashboard schema route.
+        label: Test provider
+      verify_provider:
+        desc: Verify the selected provider route
+      workspace:
+        desc: Stage with /onboard workspace <path>; default is the active workspace root.
+        label: Workspace
+      workspace_status:
+        desc: Validation status from the local probe (replaceable with backend workspace/probe when added).
+      workspace_validate:
+        desc: Probe the staged path; required before /onboard finish.
+        label: Validate workspace
+    model:
+      footer: Enter choose model | Esc back
+      search: Filter models
+      title: Choose Model
+    preview_title: Wizard State
+    route:
+      footer: Enter choose route | Esc back
+      search: Filter provider routes
+      title: Choose Provider Route
+    search: Filter onboarding actions
+    subtitle: Login, select a dashboard-catalog model route, save it to the profile JSON, then open a session.
+    title: Onboarding
+    unavailable_catalog_msg: Load provider catalog first.
+    unavailable_family_msg: Choose a model family first.
+    unavailable_model_msg: Choose a family and model first.
+    unavailable_title: Onboarding unavailable
+  permissions:
+    footer: Enter apply or refresh | Esc close
+    item:
+      default:
+        desc: Workspace edits; ask for network/outside.
+        label: Default
+      full_access:
+        desc: No sandbox or network approvals.
+        label: Full Access
+      network_allow:
+        desc: Enable internet access.
+        label: Allow Network
+      network_block:
+        desc: Deny internet access.
+        label: Block Network
+      profile_refresh:
+        label: Refresh permission profiles
+      read_only:
+        desc: No writes without approval.
+        label: Read Only
+      scopes_clear:
+        label: Clear persisted approval scopes
+      scopes_refresh:
+        label: Refresh persisted approval scopes
+      workspace_write:
+        desc: Read/write inside workspace.
+        label: Workspace Write
+      workspace_write_never:
+        desc: Read/write inside workspace; deny approval-gated commands instead of prompting.
+        label: Workspace Write, Never Ask
+    preview_title: Capability Status
+    search: Filter permissions
+    subtitle: Session permission presets; mutation is capability gated.
+    title: Update Model Permissions
+    unavailable_no_session: Permissions require an open AppUI session.
+    unavailable_title: Permissions unavailable
+  provider:
+    item:
+      catalog_refresh:
+        label: Refresh provider catalog
+      list_refresh:
+        label: Refresh configured providers
+      saved_fallback:
+        prefix: Saved fallback %{n}
+      saved_fallback_empty:
+        desc: Use Add fallback model to persist secondary routes.
+        label: 'Saved fallbacks: none'
+      saved_primary:
+        prefix: Saved primary
+      saved_primary_empty:
+        desc: Save a tested provider as primary before opening a coding session.
+        label: 'Saved primary: not set'
+      saved_unloaded:
+        desc: Run Refresh configured providers to read profile/llm/list.
+        label: 'Saved providers: not loaded'
+      staged:
+        desc: Use /provider select <family> <model> <route> [base_url] [api_key_env], or choose a catalog row.
+        label: Staged provider
+    preview_title: Provider State
+    search: Filter providers
+    subtitle: Profile-owned LLM setup; catalog and state come from AppUI.
+    title: Provider
+    unavailable_title: Providers unavailable
+  runtime_preview_title: Runtime
+  skills:
+    item:
+      cache_empty:
+        label: Installed skills not loaded
+      install:
+        desc: Accepts GitHub shorthand, full Git URL, or local skill path.
+        label: Install package or repo
+        prefix: Install
+      none:
+        label: No installed skills
+      refresh:
+        label: Refresh installed skills
+      remove:
+        prefix: Remove
+      search:
+        desc: Type a registry query, then press Enter.
+        label: Search registry
+    preview_title: Profile
+    search: Filter skills
+    subtitle: Profile-owned customer skills over AppUI.
+    title: Skills
+    unavailable_title: Skills unavailable
+  status:
+    item:
+      capabilities:
+        label: Capabilities
+      connection:
+        label: Connection
+      refresh:
+        label: Refresh server status
+      server:
+        label: Server runtime status
+      snapshot:
+        label: Snapshot status
+    preview_title: Snapshot
+    subtitle: Snapshot-backed status; server-owned fields are capability gated.
+    title: Status
+  statusline:
+    item:
+      approval_label: Approval state
+      approval_policy: Approval Policy
+      background_label: 'Background: %{value}'
+      cwd_label: 'Cwd: %{value}'
+      dangerous_access: Dangerous Access
+      filesystem_scope: Filesystem Scope
+      health: Health
+      mcp: MCP
+      memory: Memory
+      model: Model
+      model_label: 'Model: %{value}'
+      model_toolset: Model Toolset
+      network: Network
+      permissions: Permissions
+      profile: Profile
+      profile_label: 'Profile: %{value}'
+      provider: Provider
+      qoe: QoE
+      queue: Queue
+      runtime_mode: Runtime Mode
+      sandbox_mode: Sandbox Mode
+      session_label: 'Session: %{value}'
+      state_label: 'State: %{value}'
+      target_label: 'Target: %{value}'
+      task_label: 'Task: %{value}'
+      tool_contract: Tool Contract
+      tool_discovery: Tool Discovery
+      tool_policy: Tool Policy
+      usage: Usage
+    subtitle: Choose bottom status line components.
+    title: Status Line
+  theme:
+    item:
+      claude:
+        desc: Warm dark palette.
+      codex:
+        desc: Neutral dark palette with blue accents.
+      slate:
+        desc: Cool dark palette.
+      solarized:
+        desc: Solarized dark palette.
+      terminal:
+        desc: Use terminal defaults.
+    preview_title: Current
+    search: Filter themes
+    subtitle: Local TUI palette. Does not require AppUI.
+    title: Theme
+  thinking:
+    item:
+      default:
+        desc: Use the server default (no per-session override).
+        label: Default
+      high:
+        desc: Thorough reasoning.
+        label: High
+      low:
+        desc: Minimal reasoning — fastest, cheapest.
+        label: Low
+      max:
+        desc: Maximum reasoning (DeepSeek V4; others clamp to high).
+        label: Max
+      medium:
+        desc: Balanced reasoning.
+        label: Medium
+    subtitle: Reasoning effort for thinking models (this session).
+    title: Thinking effort
+  title:
+    subtitle: Choose terminal title components.
+    title: Terminal Title
+  tools:
+    item:
+      cached:
+        label: Server tool config
+      config_refresh:
+        label: Refresh tool config
+      contract:
+        label: Coding tool contract
+      contract_missing:
+        prefix: Missing P0 tool
+      empty:
+        label: No tool settings
+      status_empty:
+        label: No tools
+      status_refresh:
+        label: Refresh tool status
+      upsert:
+        label: Add/update tool config
+    search: Filter tools
+    subtitle: Server-owned search, web, browser, and MCP tool settings.
+    title: Tool Settings
+    unavailable_title: Tool settings unavailable
