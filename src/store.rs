@@ -981,6 +981,10 @@ impl Store {
             LocalAction::SetLanguageCode(lang) => self.dispatch_set_language_code(lang),
             LocalAction::SetThinking => self.dispatch_set_thinking(inline_args.unwrap_or_default()),
             LocalAction::SetThinkingLevel(level) => self.dispatch_set_thinking_level(level),
+            LocalAction::CopyLastReply => {
+                self.copy_last_reply();
+                None
+            }
             LocalAction::Custom(name) => {
                 self.state.status = format!("Local menu action `{name}` is not wired yet");
                 None
@@ -3262,6 +3266,26 @@ impl Store {
         }
 
         self.state.status = "No composer draft or staged message to clear".into();
+    }
+
+    /// `/copy` (and the `Ctrl+Y` keybinding): stage the last assistant reply
+    /// for a clipboard write. The store can't touch the terminal, so it parks
+    /// the text on `state.pending_clipboard`; the event loop drains it and
+    /// emits the OSC 52 escape sequence on the next tick. OSC 52 is used (vs a
+    /// local clipboard crate) because the TUI commonly runs over SSH against
+    /// the fleet minis — the copy must reach the *operator's* clipboard, not
+    /// the remote host's.
+    pub fn copy_last_reply(&mut self) {
+        match crate::clipboard::copyable_assistant_text(&self.state) {
+            Some(text) => {
+                let chars = text.chars().count();
+                self.state.pending_clipboard = Some(text);
+                self.state.status = format!("Copied last reply to clipboard ({chars} chars)");
+            }
+            None => {
+                self.state.status = "Nothing to copy yet (no assistant reply)".into();
+            }
+        }
     }
 
     pub fn show_pending_approval(&mut self) -> bool {
@@ -7601,6 +7625,66 @@ mod tests {
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
         }
+    }
+
+    fn store_with_assistant_message(text: &str) -> Store {
+        let session = SessionView {
+            id: SessionKey("local:test".into()),
+            title: "test".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![Message::user("prompt"), Message::assistant(text)],
+            tasks: vec![],
+            live_reply: None,
+        };
+        Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        }
+    }
+
+    #[test]
+    fn copy_last_reply_stages_assistant_text_for_clipboard() {
+        let mut store = store_with_assistant_message("the deep-research report");
+        assert!(store.state.pending_clipboard.is_none());
+
+        store.copy_last_reply();
+
+        assert_eq!(
+            store.state.pending_clipboard.as_deref(),
+            Some("the deep-research report")
+        );
+        assert!(
+            store.state.status.contains("Copied"),
+            "status should confirm the copy, got: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn copy_last_reply_reports_when_there_is_nothing_to_copy() {
+        let mut store = store_with_empty_session();
+
+        store.copy_last_reply();
+
+        assert!(store.state.pending_clipboard.is_none());
+        assert!(
+            store.state.status.contains("Nothing to copy"),
+            "status should explain the no-op, got: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn copy_command_dispatch_stages_clipboard() {
+        let mut store = store_with_assistant_message("final answer");
+
+        let command =
+            store.dispatch_local_action(crate::menu::types::LocalAction::CopyLastReply, None);
+
+        assert!(command.is_none(), "/copy is local-only, sends no command");
+        assert_eq!(
+            store.state.pending_clipboard.as_deref(),
+            Some("final answer")
+        );
     }
 
     /// `/lang` with no/unknown code must NOT mutate the process-global locale

@@ -93,11 +93,35 @@ pub fn run(cli: Cli) -> Result<()> {
             }
         }
 
+        flush_pending_clipboard(&mut store);
+
         drain_backend_events(backend.as_mut(), &mut store)?;
     }
 
     drop(guard);
     Ok(())
+}
+
+/// Drain a pending clipboard request by emitting the OSC 52 escape sequence to
+/// the terminal. The store stages the text (via `/copy` or `Ctrl+Y`) because it
+/// has no terminal handle; this is the one spot that owns stdout. OSC 52 is an
+/// out-of-band terminal command (it sets the clipboard, not screen cells) so it
+/// does not disturb the ratatui-rendered frame, and it travels in-band over the
+/// PTY/SSH channel — the only clipboard path that reaches the operator's local
+/// machine when the TUI runs against a remote fleet mini.
+///
+/// A failed write (e.g. a closed stdout during teardown) is intentionally
+/// swallowed: the copy is best-effort UX, never load-bearing, and the status
+/// line already reflected the attempt.
+fn flush_pending_clipboard(store: &mut Store) {
+    let Some(text) = store.state.pending_clipboard.take() else {
+        return;
+    };
+    let sequence = crate::clipboard::osc52_copy_sequence(&text);
+    let mut stdout = io::stdout();
+    if io::Write::write_all(&mut stdout, sequence.as_bytes()).is_ok() {
+        let _ = io::Write::flush(&mut stdout);
+    }
 }
 
 fn drain_backend_events(backend: &mut dyn AppUiBackend, store: &mut Store) -> Result<()> {
@@ -260,6 +284,15 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
 
     if is_control_char(&key, 'o') {
         store.state.toggle_tool_output_expansion();
+        return KeyAction::Continue;
+    }
+
+    if is_control_char(&key, 'y') {
+        // Yank: copy the last assistant reply to the clipboard. The store
+        // stages the text; `flush_pending_clipboard` (called each tick from the
+        // run loop) emits the OSC 52 escape sequence so the copy reaches the
+        // operator's local clipboard even over SSH.
+        store.copy_last_reply();
         return KeyAction::Continue;
     }
 
@@ -1057,6 +1090,51 @@ mod tests {
         Store {
             state: AppState::new(sessions, 0, "ready".into(), None, false),
         }
+    }
+
+    fn store_with_live_reply_text(text: &str) -> Store {
+        let session = SessionView {
+            id: SessionKey("local:test".into()),
+            title: "test".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: Some(LiveReply {
+                turn_id: TurnId::new(),
+                text: text.into(),
+            }),
+        };
+        Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        }
+    }
+
+    #[test]
+    fn ctrl_y_stages_last_reply_for_clipboard() {
+        let mut store = store_with_live_reply_text("answer to copy");
+
+        let action = handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        );
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(
+            store.state.pending_clipboard.as_deref(),
+            Some("answer to copy")
+        );
+    }
+
+    #[test]
+    fn flush_pending_clipboard_clears_the_request() {
+        // The OSC 52 bytes go to stdout; here we only assert the one-shot field
+        // is drained so a copy cannot re-fire on every subsequent tick.
+        let mut store = store_with_live_reply_text("answer");
+        store.state.pending_clipboard = Some("answer".into());
+
+        flush_pending_clipboard(&mut store);
+
+        assert!(store.state.pending_clipboard.is_none());
     }
 
     fn store_with_visible_approval() -> (Store, ApprovalId) {
