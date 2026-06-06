@@ -3859,6 +3859,18 @@ impl Store {
                 ));
                 self.state.status = event.message;
                 self.refresh_active_menu_if_open();
+                // Creating the profile flips the wizard from the local-profile
+                // (Step 1) screen to the provider (LLM config) step, which is
+                // rebuilt in place on the SAME menu frame. The frame still holds
+                // the `selected_index` of the local-profile "Continue" row, and
+                // that index lines up with "API key" in the provider menu — so
+                // without repositioning, the fresh provider step would open with
+                // the cursor on API key instead of the first config row. Drop
+                // the cursor onto the Model family row (the first thing the user
+                // fills in here). A no-op when the menu didn't transition (e.g.
+                // the auto-finish open-session path below), since the row id is
+                // absent there.
+                self.focus_provider_start_row();
                 let follow_up = open_session
                     .then(|| self.onboarding_finish_command())
                     .flatten();
@@ -8664,6 +8676,82 @@ mod tests {
         assert_eq!(
             store.state.onboarding.profile_id.as_deref(),
             Some("ada-server")
+        );
+    }
+
+    #[test]
+    fn provider_step_opens_on_model_family_after_local_profile_create() {
+        // First launch advertises local-solo profile create, which auto-opens
+        // the onboarding wizard on the local-profile (Step 1) screen.
+        let mut store = protocol_store_without_sessions();
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[
+                        crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+                        crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+                    ],
+                    &[],
+                ),
+            },
+            message: "AppUI capabilities refreshed".into(),
+        }));
+
+        // The user fills the fields and lands the cursor on the final
+        // "Continue" row (the create action) before pressing Enter. That row's
+        // index in the local-profile menu happens to line up with "API key" in
+        // the provider menu — which is the bug we are guarding against.
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected local-profile onboarding menu");
+        };
+        let create_index = spec
+            .items
+            .iter()
+            .position(|item| item.id == "onboard.local.create")
+            .expect("local create row");
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("active menu")
+            .selected_index = create_index;
+
+        // The server confirms the profile; the wizard transitions in-place to
+        // the provider (LLM config) step.
+        store.apply_client_event(ClientEvent::ProfileLocalCreate(
+            crate::client_event::ProfileLocalCreateClientEvent {
+                result: ProfileLocalCreateResult {
+                    profile_id: "ada-server".into(),
+                    user_id: "ada-user".into(),
+                    name: "Ada Lovelace".into(),
+                    username: "ada".into(),
+                    email: "ada@example.com".into(),
+                    created: true,
+                    runtime_mode: "solo".into(),
+                },
+                message: "Local solo profile created: ada-server".into(),
+            },
+        ));
+
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected provider setup menu after local profile create");
+        };
+        // Sanity: this really is the provider step, not the local-profile step.
+        assert!(
+            spec.items
+                .iter()
+                .any(|item| item.id == "onboard.provider.family"),
+            "expected provider step with the Model family row"
+        );
+        let selected = store
+            .state
+            .menu_stack
+            .active()
+            .expect("active menu")
+            .selected_index;
+        assert_eq!(
+            spec.items[selected].id, "onboard.provider.family",
+            "fresh provider step must land on Model family, not the stale row carried over from the local-profile Continue button"
         );
     }
 
