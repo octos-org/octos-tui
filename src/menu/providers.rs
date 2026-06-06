@@ -3288,8 +3288,8 @@ fn permission_profile_items(
     let mut items = vec![
         permission_mode_item(
             "permissions.default",
-            "Default",
-            "Workspace edits; ask for network/outside.",
+            t!("menu.permissions.item.default.label"),
+            t!("menu.permissions.item.default.desc"),
             permission_set_action(
                 session_id.clone(),
                 PermissionProfileUpdate {
@@ -3303,8 +3303,8 @@ fn permission_profile_items(
         ),
         permission_mode_item(
             "permissions.read_only",
-            "Read Only",
-            "No writes without approval.",
+            t!("menu.permissions.item.read_only.label"),
+            t!("menu.permissions.item.read_only.desc"),
             permission_set_action(
                 session_id.clone(),
                 PermissionProfileUpdate {
@@ -3322,8 +3322,8 @@ fn permission_profile_items(
         ),
         permission_mode_item(
             "permissions.workspace_write",
-            "Workspace Write",
-            "Read/write inside workspace.",
+            t!("menu.permissions.item.workspace_write.label"),
+            t!("menu.permissions.item.workspace_write.desc"),
             permission_set_action(
                 session_id.clone(),
                 PermissionProfileUpdate {
@@ -3337,8 +3337,8 @@ fn permission_profile_items(
         ),
         permission_mode_item(
             "permissions.workspace_write_never",
-            "Workspace Write, Never Ask",
-            "Read/write inside workspace; deny approval-gated commands instead of prompting.",
+            t!("menu.permissions.item.workspace_write_never.label"),
+            t!("menu.permissions.item.workspace_write_never.desc"),
             permission_set_action(
                 session_id.clone(),
                 PermissionProfileUpdate {
@@ -3352,8 +3352,8 @@ fn permission_profile_items(
         ),
         permission_mode_item(
             "permissions.full_access",
-            "Full Access",
-            "No sandbox or network approvals.",
+            t!("menu.permissions.item.full_access.label"),
+            t!("menu.permissions.item.full_access.desc"),
             permission_set_action(
                 session_id.clone(),
                 PermissionProfileUpdate {
@@ -3372,7 +3372,7 @@ fn permission_profile_items(
         ),
         MenuItem::new(
             "permissions.profile.refresh",
-            "Refresh permission profiles",
+            t!("menu.permissions.item.profile_refresh.label"),
             MenuAction::SendAppUi(AppUiCommand::ListPermissionProfiles(
                 PermissionProfileListParams { session_id },
             )),
@@ -3391,8 +3391,8 @@ fn permission_profile_items(
 
 fn permission_mode_item(
     id: &'static str,
-    label: &'static str,
-    description: &'static str,
+    label: impl Into<String>,
+    description: impl Into<String>,
     action: MenuAction,
     state: MenuItemState,
     disabled_reason: Option<String>,
@@ -3481,7 +3481,7 @@ fn permission_network_items(
     vec![
         MenuItem::new(
             "permissions.network.allow",
-            "Allow Network",
+            t!("menu.permissions.item.network_allow.label"),
             permission_set_action(
                 session_id.clone(),
                 PermissionProfileUpdate {
@@ -3491,7 +3491,7 @@ fn permission_network_items(
                 },
             ),
         )
-        .with_description("Enable internet access.")
+        .with_description(t!("menu.permissions.item.network_allow.desc"))
         .with_state(MenuItemState::checked(
             ctx.app.permission_profile.is_some_and(|current| {
                 current.normalized().network == PermissionNetworkPolicy::Allow
@@ -3500,7 +3500,7 @@ fn permission_network_items(
         .maybe_disabled(mutation_reason.clone()),
         MenuItem::new(
             "permissions.network.block",
-            "Block Network",
+            t!("menu.permissions.item.network_block.label"),
             permission_set_action(
                 session_id,
                 PermissionProfileUpdate {
@@ -3510,7 +3510,7 @@ fn permission_network_items(
                 },
             ),
         )
-        .with_description("Deny internet access.")
+        .with_description(t!("menu.permissions.item.network_block.desc"))
         .with_state(MenuItemState::checked(
             ctx.app.permission_profile.is_some_and(|current| {
                 current.normalized().network == PermissionNetworkPolicy::Deny
@@ -3539,7 +3539,7 @@ fn approval_scopes_refresh_item(
 ) -> MenuItem {
     let item = MenuItem::new(
         "permissions.scopes.refresh",
-        "Refresh persisted approval scopes",
+        t!("menu.permissions.item.scopes_refresh.label"),
         MenuAction::SendAppUi(AppUiCommand::ListApprovalScopes(ApprovalScopesListParams {
             session_id,
         })),
@@ -3562,7 +3562,7 @@ fn approval_scopes_refresh_item(
 fn approval_scopes_clear_item(ctx: &MenuContext<'_>) -> MenuItem {
     MenuItem::new(
         "permissions.scopes.clear",
-        "Clear persisted approval scopes",
+        t!("menu.permissions.item.scopes_clear.label"),
         MenuAction::Noop,
     )
     .with_description("Requires scopes/clear.")
@@ -4088,8 +4088,12 @@ fn capability_summary_item(ctx: &MenuContext<'_>) -> MenuItem {
         ),
         None => "No AppUI capabilities have been advertised yet".into(),
     };
-    MenuItem::new("status.capabilities", "Capabilities", MenuAction::Noop)
-        .with_description(description)
+    MenuItem::new(
+        "status.capabilities",
+        t!("menu.status.item.capabilities.label"),
+        MenuAction::Noop,
+    )
+    .with_description(description)
 }
 
 fn status_runtime_items(ctx: &MenuContext<'_>) -> Vec<MenuItem> {
@@ -4099,8 +4103,12 @@ fn status_runtime_items(ctx: &MenuContext<'_>) -> Vec<MenuItem> {
             .supports_method(AppUiActionKind::SessionStatusRead.method())
         {
             return vec![
-                MenuItem::new("status.server", "Server runtime status", MenuAction::Noop)
-                    .disabled("session/status/read is advertised but no result is cached yet"),
+                MenuItem::new(
+                    "status.server",
+                    t!("menu.status.item.server.label"),
+                    MenuAction::Noop,
+                )
+                .disabled("session/status/read is advertised but no result is cached yet"),
             ];
         }
         return Vec::new();
@@ -4109,83 +4117,104 @@ fn status_runtime_items(ctx: &MenuContext<'_>) -> Vec<MenuItem> {
     let mut items = Vec::new();
     if let Some(health) = status_health_value(status) {
         items.push(
-            MenuItem::new("status.health", "Health", MenuAction::Noop).with_description(health),
+            MenuItem::new("status.health", t!("menu.statusline.item.health"), MenuAction::Noop)
+                .with_description(health),
         );
     }
     if let Some(usage) = status_usage_value(status) {
-        items
-            .push(MenuItem::new("status.usage", "Usage", MenuAction::Noop).with_description(usage));
+        items.push(
+            MenuItem::new("status.usage", t!("menu.statusline.item.usage"), MenuAction::Noop)
+                .with_description(usage),
+        );
     }
     items.extend(runtime_policy_items(status));
     items
 }
 
 fn runtime_policy_items(status: &crate::model::SessionRuntimeStatus) -> Vec<MenuItem> {
-    [
+    let rows: &[(&'static str, &str, Option<String>)] = &[
         (
             "status.runtime_mode",
-            "Runtime Mode",
+            "menu.statusline.item.runtime_mode",
             status_runtime_mode_value(status),
         ),
-        ("status.profile", "Profile", status_profile_value(status)),
-        ("status.model", "Model", status_model_value(status)),
-        ("status.provider", "Provider", status_provider_value(status)),
+        (
+            "status.profile",
+            "menu.statusline.item.profile",
+            status_profile_value(status),
+        ),
+        (
+            "status.model",
+            "menu.statusline.item.model",
+            status_model_value(status),
+        ),
+        (
+            "status.provider",
+            "menu.statusline.item.provider",
+            status_provider_value(status),
+        ),
         (
             "status.approval_policy",
-            "Approval Policy",
+            "menu.statusline.item.approval_policy",
             status_approval_policy_value(status),
         ),
         (
             "status.sandbox",
-            "Sandbox Mode",
+            "menu.statusline.item.sandbox_mode",
             status_sandbox_value(status),
         ),
         (
             "status.filesystem_scope",
-            "Filesystem Scope",
+            "menu.statusline.item.filesystem_scope",
             status_filesystem_scope_value(status),
         ),
-        ("status.network", "Network", status_network_value(status)),
+        (
+            "status.network",
+            "menu.statusline.item.network",
+            status_network_value(status),
+        ),
         (
             "status.permission_profile",
-            "Permissions",
+            "menu.statusline.item.permissions",
             status_permission_value(status),
         ),
         (
             "status.dangerous",
-            "Dangerous Access",
+            "menu.statusline.item.dangerous_access",
             status_dangerous_access_value(status),
         ),
         (
             "status.tool_policy",
-            "Tool Policy",
+            "menu.statusline.item.tool_policy",
             status_tool_policy_value(status),
         ),
         (
             "status.tool_contract",
-            "Tool Contract",
+            "menu.statusline.item.tool_contract",
             status_tool_contract_value(status),
         ),
         (
             "status.model_toolset",
-            "Model Toolset",
+            "menu.statusline.item.model_toolset",
             status_model_toolset_value(status),
         ),
         (
             "status.tool_discovery",
-            "Tool Discovery",
+            "menu.statusline.item.tool_discovery",
             status_tool_discovery_value(status),
         ),
-        ("status.mcp", "MCP", status_mcp_value(status)),
-        ("status.memory", "Memory", status_memory_value(status)),
-        ("status.qoe", "QoE", status_qoe_value(status)),
-        ("status.queue", "Queue", status_queue_value(status)),
-    ]
-    .into_iter()
-    .filter_map(|(id, label, value)| {
-        value.map(|value| MenuItem::new(id, label, MenuAction::Noop).with_description(value))
-    })
-    .collect()
+        ("status.mcp", "menu.statusline.item.mcp", status_mcp_value(status)),
+        ("status.memory", "menu.statusline.item.memory", status_memory_value(status)),
+        ("status.qoe", "menu.statusline.item.qoe", status_qoe_value(status)),
+        ("status.queue", "menu.statusline.item.queue", status_queue_value(status)),
+    ];
+    rows.iter()
+        .filter_map(|(id, key, value)| {
+            value
+                .as_ref()
+                .map(|v| MenuItem::new(*id, t!(*key), MenuAction::Noop).with_description(v))
+        })
+        .collect()
 }
 
 fn status_preview_rows(ctx: &MenuContext<'_>) -> Vec<MenuPreviewRow> {
@@ -4533,10 +4562,11 @@ fn action_for_command_entry(entry: &CommandEntry) -> MenuAction {
 }
 
 fn command_description(description: &str, aliases: &[&str]) -> String {
+    let desc = t!(description).into_owned();
     if aliases.is_empty() {
-        description.to_owned()
+        desc
     } else {
-        format!("{description} Aliases: {}", aliases.join(", "))
+        format!("{desc} {}: {}", t!("command.aliases_label"), aliases.join(", "))
     }
 }
 
@@ -4544,45 +4574,71 @@ fn status_line_items(app: MenuAppSnapshot<'_>) -> [(&'static str, String, bool);
     [
         (
             "state",
-            format!("State: {}", app.status.unwrap_or("idle")),
+            t!("menu.statusline.item.state_label", value = app.status.unwrap_or("idle"))
+                .into_owned(),
             true,
         ),
         (
             "target",
-            format!("Target: {}", app.target.unwrap_or("local")),
+            t!("menu.statusline.item.target_label", value = app.target.unwrap_or("local"))
+                .into_owned(),
             true,
         ),
         (
             "cwd",
-            format!("Cwd: {}", app.cwd.unwrap_or("unknown")),
+            t!("menu.statusline.item.cwd_label", value = app.cwd.unwrap_or("unknown")).into_owned(),
             true,
         ),
         (
             "model",
-            format!("Model: {}", app.current_model.unwrap_or("not supplied")),
+            t!(
+                "menu.statusline.item.model_label",
+                value = app.current_model.unwrap_or("not supplied")
+            )
+            .into_owned(),
             true,
         ),
         (
             "profile",
-            format!("Profile: {}", app.current_profile.unwrap_or("default")),
+            t!(
+                "menu.statusline.item.profile_label",
+                value = app.current_profile.unwrap_or("default")
+            )
+            .into_owned(),
             true,
         ),
         (
             "session",
-            format!("Session: {}", app.selected_session_title.unwrap_or("none")),
+            t!(
+                "menu.statusline.item.session_label",
+                value = app.selected_session_title.unwrap_or("none")
+            )
+            .into_owned(),
             true,
         ),
         (
             "task",
-            format!("Task: {}", app.selected_task_title.unwrap_or("none")),
+            t!(
+                "menu.statusline.item.task_label",
+                value = app.selected_task_title.unwrap_or("none")
+            )
+            .into_owned(),
             false,
         ),
         (
             "background_tasks",
-            format!("Background: {}", app.background_task_count),
+            t!(
+                "menu.statusline.item.background_label",
+                value = app.background_task_count
+            )
+            .into_owned(),
             true,
         ),
-        ("approval", "Approval state".into(), true),
+        (
+            "approval",
+            t!("menu.statusline.item.approval_label").into_owned(),
+            true,
+        ),
     ]
 }
 
@@ -4635,16 +4691,22 @@ fn app_snapshot_rows(app: MenuAppSnapshot<'_>) -> Vec<MenuPreviewRow> {
 }
 
 fn keymap_tabs() -> Vec<MenuTab> {
-    ["Global", "Composer", "Menu", "Task", "Approval"]
-        .into_iter()
-        .enumerate()
-        .map(|(idx, label)| MenuTab {
-            id: label.to_ascii_lowercase(),
-            label: label.into(),
-            active: idx == 0,
-            count: None,
-        })
-        .collect()
+    [
+        ("global", t!("menu.keymap.tab.global")),
+        ("composer", t!("menu.keymap.tab.composer")),
+        ("menu", t!("menu.keymap.tab.menu")),
+        ("task", t!("menu.keymap.tab.task")),
+        ("approval", t!("menu.keymap.tab.approval")),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(idx, (id, label))| MenuTab {
+        id: id.to_owned(),
+        label: label.into_owned(),
+        active: idx == 0,
+        count: None,
+    })
+    .collect()
 }
 
 fn numeric_shortcut(index: usize) -> Option<KeyBinding> {
