@@ -12,6 +12,91 @@
 composer:
   placeholder: "Ask Octos to change code..."
 
+app:
+  banner:
+    title: "Welcome to Octos — Your Coding Buddy"
+    greeting_named: "Welcome back — %{profile}"
+    greeting_default: "Welcome to Octos"
+    hint: "Ask Octos anything to begin."
+    onboarding_setup: "Onboarding setup..."
+  pane:
+    sessions: "Sessions"
+    tasks: "Tasks"
+    artifacts: "Artifacts"
+    plan: "Plan"
+    workspace: "Workspace"
+    git: "Git"
+    composer: "Composer"
+    transcript: "Transcript"
+    task_output: "Task Output"
+    artifact_modal: "Artifact"
+    threads: "Threads"
+    turn: "Turn"
+  empty:
+    no_tasks: "No tasks yet"
+    no_artifacts: "No artifacts in snapshot"
+    no_session: "No session selected"
+    no_plan: "No active plan"
+    no_plan_hint: "Plan text is inferred from assistant/live replies."
+    no_task_output: "No output loaded for this task yet"
+    no_diff: "No diff preview loaded"
+    no_file_changes: "No file changes"
+  approval:
+    title: "Approval Requested"
+    action_once: "y = approve this command once"
+    action_session: "s = approve this command/scope for the session"
+    action_deny: "n = deny it"
+    action_diff: "d = view diff"
+  question:
+    header_multi: "Question %{n}/%{total}"
+    header_single: "Question"
+    card_title: "Agent asked a question"
+    no_options: "No answerable options were provided."
+    free_text_row: "Other (free text)"
+    other_prefix: "Other"
+    action_toggle: "Up/Down move | Space toggle | type for Other"
+    action_submit: "Enter = submit answer(s) | Esc = hide"
+    action_next: "Enter = next question | Esc = hide"
+    action_dismiss: "Esc = dismiss (no answer to submit)"
+  activity:
+    orchestrating: "Orchestrating..."
+    re_entering: "Re-entering (continuing)..."
+    finished_errors: "Agent task finished with errors"
+    completed: "Agent task completed"
+    running: "running"
+    preview_ready: "preview ready"
+    older_actions: "... +%{count} older action(s)"
+  diff:
+    title: "Diff Preview"
+    inline_patch: "Inline patch"
+    loading: "Loading diff preview..."
+  autonomy:
+    goal_prefix: "Goal: "
+    loops_running: "Loops: %{count} running"
+  status:
+    state_label: "state"
+    idle: "Idle"
+    working: "Working"
+    blocked: "Blocked"
+    done: "Done"
+    error: "Error"
+    interactive: "interactive"
+    read_only: "read-only"
+    approval_gated: "approval gated"
+    sends_disabled: "sends disabled"
+    no_session: "no session"
+    turn_active: "active %{id}"
+    turn_idle: "idle"
+  harness:
+    orchestrating: "Orchestrating"
+    re_entering: "Re-entering"
+    working: "Working"
+  composer_hint:
+    queued_messages: "Queued messages (%{count}) after active turn | Esc interrupt/send | Ctrl+U clear"
+    large_paste: "Large paste collapsed | Enter sends full text | Ctrl+U clear"
+    multiline_tail_lines: "Multiline input | showing tail, %{count} earlier line(s) hidden | Enter sends full text | Ctrl+U clear"
+    multiline_tail_line: "Multiline input | showing tail of long line | Enter sends full text | Ctrl+U clear"
+
 onboarding:
   welcome_title: "Welcome to Octos"
   value_not_set: "not set"
@@ -82,3 +167,21 @@ thinking:
   cleared: "Reasoning effort cleared — using the server default."
   unknown: "Unknown effort '%{value}'. Available: low, medium, high, max, default."
   no_session: "No active session — open or select a session first."
+
+status:
+  # Read-only mode feedback
+  readonly_turn_disabled: "Read-only mode: turn/start disabled"
+  # /stop when no active turn
+  no_active_turn: "No active turn to interrupt"
+  # /theme feedback
+  theme_set: "Theme: %{theme}"
+  theme_unknown: "Unknown theme: %{theme}"
+  # Status-line / terminal-title layout picks
+  statusline_layout_selected: "Status line layout selected: %{items}"
+  terminal_title_layout_selected: "Terminal title layout selected: %{items}"
+  # Keymap save placeholder
+  keymap_save_not_wired: "Keymap save is not wired yet"
+  # Menu field-edit prompt
+  edit_field_prompt: "Edit the field, then press Enter"
+  # Unimplemented local menu action
+  local_action_not_wired: "Local menu action `%{name}` is not wired yet"

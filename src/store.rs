@@ -231,7 +231,7 @@ impl Store {
         }
 
         if self.state.readonly {
-            self.state.status = "Read-only mode: turn/start disabled".into();
+            self.state.status = t!("status.readonly_turn_disabled").into_owned();
             self.state.clear_current_composer_draft();
             return None;
         }
@@ -907,7 +907,7 @@ impl Store {
                     self.push_local_activity(
                         ActivityKind::Warning,
                         "local /stop",
-                        "No active turn to interrupt",
+                        t!("status.no_active_turn").into_owned(),
                         Some("Nothing was sent to the backend."),
                     );
                 }
@@ -929,24 +929,29 @@ impl Store {
                         // to the just-selected theme; the palette itself updates
                         // on the next frame (event loop reads `state.theme`).
                         self.refresh_active_menu_if_open();
-                        self.state.status = format!("Theme: {theme}");
+                        self.state.status = t!("status.theme_set", theme = theme).into_owned();
                     }
                     None => {
-                        self.state.status = format!("Unknown theme: {theme}");
+                        self.state.status = t!("status.theme_unknown", theme = theme).into_owned();
                     }
                 }
                 None
             }
             LocalAction::SaveStatusLine(items) => {
-                self.state.status = format!("Status line layout selected: {}", items.join(", "));
+                self.state.status =
+                    t!("status.statusline_layout_selected", items = items.join(", ")).into_owned();
                 None
             }
             LocalAction::SaveTerminalTitle(items) => {
-                self.state.status = format!("Terminal title layout selected: {}", items.join(", "));
+                self.state.status = t!(
+                    "status.terminal_title_layout_selected",
+                    items = items.join(", ")
+                )
+                .into_owned();
                 None
             }
             LocalAction::SaveKeymap => {
-                self.state.status = "Keymap save is not wired yet".into();
+                self.state.status = t!("status.keymap_save_not_wired").into_owned();
                 None
             }
             LocalAction::RefreshMenu(id) => {
@@ -956,7 +961,7 @@ impl Store {
             LocalAction::EditComposer(draft) => {
                 self.state.set_composer_text(draft);
                 self.state.focus = FocusPane::Composer;
-                self.state.status = "Edit the field, then press Enter".into();
+                self.state.status = t!("status.edit_field_prompt").into_owned();
                 None
             }
             LocalAction::Onboarding(action) => self.dispatch_onboarding_action(action, inline_args),
@@ -968,7 +973,7 @@ impl Store {
             LocalAction::SetThinking => self.dispatch_set_thinking(inline_args.unwrap_or_default()),
             LocalAction::SetThinkingLevel(level) => self.dispatch_set_thinking_level(level),
             LocalAction::Custom(name) => {
-                self.state.status = format!("Local menu action `{name}` is not wired yet");
+                self.state.status = t!("status.local_action_not_wired", name = name).into_owned();
                 None
             }
         }

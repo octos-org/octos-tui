@@ -3,6 +3,91 @@
 composer:
   placeholder: "让 Octos 帮你改代码……"
 
+app:
+  banner:
+    title: "欢迎使用 Octos — 你的编程伙伴"
+    greeting_named: "欢迎回来 — %{profile}"
+    greeting_default: "欢迎使用 Octos"
+    hint: "向 Octos 提问，即可开始。"
+    onboarding_setup: "正在配置……"
+  pane:
+    sessions: "会话"
+    tasks: "任务"
+    artifacts: "制品"
+    plan: "计划"
+    workspace: "工作区"
+    git: "Git"
+    composer: "输入框"
+    transcript: "对话记录"
+    task_output: "任务输出"
+    artifact_modal: "制品"
+    threads: "线程"
+    turn: "回合"
+  empty:
+    no_tasks: "暂无任务"
+    no_artifacts: "快照中无制品"
+    no_session: "未选择会话"
+    no_plan: "暂无活动计划"
+    no_plan_hint: "计划文本从助手/实时回复中推断。"
+    no_task_output: "此任务暂无输出"
+    no_diff: "未加载差异预览"
+    no_file_changes: "无文件更改"
+  approval:
+    title: "请求审批"
+    action_once: "y = 本次批准此命令"
+    action_session: "s = 本会话内批准此命令/范围"
+    action_deny: "n = 拒绝"
+    action_diff: "d = 查看差异"
+  question:
+    header_multi: "问题 %{n}/%{total}"
+    header_single: "问题"
+    card_title: "智能体提出了问题"
+    no_options: "未提供可回答的选项。"
+    free_text_row: "其他（自由填写）"
+    other_prefix: "其他"
+    action_toggle: "上/下 移动 | 空格 选中 | 输入填写其他"
+    action_submit: "Enter = 提交答案 | Esc = 隐藏"
+    action_next: "Enter = 下一问题 | Esc = 隐藏"
+    action_dismiss: "Esc = 关闭（无可提交答案）"
+  activity:
+    orchestrating: "编排中……"
+    re_entering: "重新进入（继续中）……"
+    finished_errors: "智能体任务完成（有错误）"
+    completed: "智能体任务已完成"
+    running: "运行中"
+    preview_ready: "预览就绪"
+    older_actions: "... +%{count} 条更早操作"
+  diff:
+    title: "差异预览"
+    inline_patch: "内联补丁"
+    loading: "正在加载差异预览……"
+  autonomy:
+    goal_prefix: "目标："
+    loops_running: "循环：%{count} 个运行中"
+  status:
+    state_label: "状态"
+    idle: "空闲"
+    working: "运行中"
+    blocked: "已阻塞"
+    done: "已完成"
+    error: "错误"
+    interactive: "交互式"
+    read_only: "只读"
+    approval_gated: "审批管控"
+    sends_disabled: "发送已禁用"
+    no_session: "无会话"
+    turn_active: "活动 %{id}"
+    turn_idle: "空闲"
+  harness:
+    orchestrating: "编排中"
+    re_entering: "重新进入"
+    working: "运行中"
+  composer_hint:
+    queued_messages: "已排队 %{count} 条消息（当前任务结束后发送）| Esc 中断/发送 | Ctrl+U 清空"
+    large_paste: "大段粘贴已折叠 | Enter 发送全文 | Ctrl+U 清空"
+    multiline_tail_lines: "多行输入 | 显示末尾，已隐藏 %{count} 行 | Enter 发送全文 | Ctrl+U 清空"
+    multiline_tail_line: "多行输入 | 显示超长行末尾 | Enter 发送全文 | Ctrl+U 清空"
+
 onboarding:
   welcome_title: "欢迎使用 Octos"
   value_not_set: "未设置"
@@ -57,12 +142,23 @@ onboarding:
       local_fill_fields: "填写姓名、用户名和邮箱"
 
 lang:
-  switched: "已切换到中文。"
-  usage: "当前语言：%{current}。用法：/lang <en|zh>。"
-  unknown: "未知语言“%{value}”。可选：en、zh。"
+  switched: “已切换到中文。”
+  usage: “当前语言：%{current}。用法：/lang <en|zh>。”
+  unknown: “未知语言”%{value}”。可选：en、zh。”
 thinking:
-  usage: "推理强度：%{current}。用法：/thinking <low|medium|high|max|default>。"
-  set: "推理强度已设为 %{level}。"
-  cleared: "已清除推理强度，使用服务器默认值。"
-  unknown: "未知强度“%{value}”。可选：low、medium、high、max、default。"
-  no_session: "没有活动会话——请先打开或选择一个会话。"
+  usage: “推理强度：%{current}。用法：/thinking <low|medium|high|max|default>。”
+  set: “推理强度已设为 %{level}。”
+  cleared: “已清除推理强度，使用服务器默认值。”
+  unknown: “未知强度”%{value}”。可选：low、medium、high、max、default。”
+  no_session: “没有活动会话——请先打开或选择一个会话。”
+
+status:
+  readonly_turn_disabled: “只读模式：回合/启动已禁用”
+  no_active_turn: “无活动回合可中断”
+  theme_set: “主题：%{theme}”
+  theme_unknown: “未知主题：%{theme}”
+  statusline_layout_selected: “已选择状态栏布局：%{items}”
+  terminal_title_layout_selected: “已选择终端标题布局：%{items}”
+  keymap_save_not_wired: “快捷键保存尚未实现”
+  edit_field_prompt: “编辑字段后按 Enter 确认”
+  local_action_not_wired: “本地菜单操作 `%{name}` 尚未实现”
