@@ -117,8 +117,6 @@ const ONBOARDING_LOGO_ART: &str = "\
 ██║   ██║██║        ██║   ██║   ██║╚════██║
 ╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
  ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝";
-const ONBOARDING_LOGO_TAGLINE: &str = "Welcome to Octos — Your Coding Buddy";
-
 /// True only on the onboarding WELCOME / local-profile entry screen, where the
 /// splash logo takes over the main window. Discriminated by the welcome menu's
 /// stable first-item id (`onboard.local.status`) rather than the display title:
@@ -165,7 +163,7 @@ fn render_onboarding_logo(height: u16, palette: Palette) -> Paragraph<'static> {
         lines.push(Line::from(""));
     }
     lines.push(Line::from(Span::styled(
-        ONBOARDING_LOGO_TAGLINE,
+        t!("app.banner.title").to_string(),
         Style::default().fg(palette.highlight),
     )));
     Paragraph::new(Text::from(lines)).alignment(Alignment::Center)
@@ -462,7 +460,7 @@ fn render_sessions(app: &AppState, palette: Palette) -> List<'static> {
 
     List::new(items).block(
         titled_block(
-            "Sessions",
+            t!("app.pane.sessions").to_string(),
             palette,
             app.focus == FocusPane::Sessions,
             Some("Tab"),
@@ -475,7 +473,10 @@ fn render_tasks(app: &AppState, palette: Palette) -> Paragraph<'static> {
     let mut lines = Vec::new();
     if let Some(session) = app.active_session() {
         if session.tasks.is_empty() {
-            lines.push(Line::from(Span::styled("No tasks yet", palette.muted())));
+            lines.push(Line::from(Span::styled(
+                t!("app.empty.no_tasks").to_string(),
+                palette.muted(),
+            )));
         } else {
             for (idx, task) in session.tasks.iter().enumerate() {
                 let marker = if idx == app.selected_task { "›" } else { " " };
@@ -521,7 +522,7 @@ fn render_tasks(app: &AppState, palette: Palette) -> Paragraph<'static> {
     Paragraph::new(Text::from(lines))
         .block(
             titled_block(
-                "Tasks",
+                t!("app.pane.tasks").to_string(),
                 palette,
                 app.focus == FocusPane::Tasks,
                 Some("j/k or Up/Down"),
@@ -536,7 +537,7 @@ fn render_artifacts(app: &AppState, palette: Palette) -> Paragraph<'static> {
 
     if app.artifacts.items.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No artifacts in snapshot",
+            t!("app.empty.no_artifacts").to_string(),
             palette.muted(),
         )));
     } else {
@@ -572,7 +573,7 @@ fn render_artifacts(app: &AppState, palette: Palette) -> Paragraph<'static> {
     Paragraph::new(Text::from(lines))
         .block(
             titled_block(
-                "Artifacts",
+                t!("app.pane.artifacts").to_string(),
                 palette,
                 app.focus == FocusPane::Artifacts,
                 Some("j/k"),
@@ -649,8 +650,8 @@ fn render_launch_banner(frame: &mut Frame<'_>, app: &AppState, palette: Palette,
         .active_session()
         .and_then(|session| session.profile_id.as_deref())
     {
-        Some(profile) => format!("Welcome back — {profile}"),
-        None => "Welcome to Octos".to_string(),
+        Some(profile) => t!("app.banner.greeting_named", profile = profile).to_string(),
+        None => t!("app.banner.greeting_default").to_string(),
     };
     let greeting_w = greeting.width();
     lines.push(centered(vec![Span::styled(greeting, highlight)], greeting_w));
@@ -658,10 +659,11 @@ fn render_launch_banner(frame: &mut Frame<'_>, app: &AppState, palette: Palette,
     let cwd_w = cwd.width();
     lines.push(centered(vec![Span::styled(cwd, palette.muted())], cwd_w));
     lines.push(centered(vec![], 0));
-    let hint = "Ask Octos anything to begin.";
+    let hint = t!("app.banner.hint").to_string();
+    let hint_w = hint.width();
     lines.push(centered(
         vec![Span::styled(hint, palette.muted())],
-        hint.chars().count(),
+        hint_w,
     ));
     lines.push(Line::from(Span::styled(
         format!("╰{}╯", "─".repeat(inner_w)),
@@ -745,7 +747,7 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
         }
     } else {
         lines.push(Line::from(Span::styled(
-            "No session selected",
+            t!("app.empty.no_session").to_string(),
             palette.muted(),
         )));
     }
@@ -1892,7 +1894,7 @@ fn push_inline_approval_card(
     lines.push(Line::from(vec![
         Span::styled("  ", palette.muted()),
         Span::styled(
-            "Approval Requested",
+            t!("app.approval.title").to_string(),
             palette.title().add_modifier(Modifier::BOLD),
         ),
         Span::styled("  inline", palette.muted()),
@@ -1909,16 +1911,16 @@ fn push_inline_approval_card(
     if approval.diff_preview_id().is_some() {
         lines.push(Line::from(vec![
             Span::styled("    ", palette.muted()),
-            Span::styled("d = view diff", palette.selected()),
+            Span::styled(t!("app.approval.action_diff").to_string(), palette.selected()),
         ]));
     }
 }
 
-fn approval_action_labels(_approval: &ApprovalModalState) -> [&'static str; 3] {
+fn approval_action_labels(_approval: &ApprovalModalState) -> [String; 3] {
     [
-        "y = approve this command once",
-        "s = approve this command/scope for the session",
-        "n = deny it",
+        t!("app.approval.action_once").to_string(),
+        t!("app.approval.action_session").to_string(),
+        t!("app.approval.action_deny").to_string(),
     ]
 }
 
@@ -1934,14 +1936,19 @@ fn push_inline_user_question_card(
 ) {
     lines.push(Line::from(""));
     let header = if picker.questions.len() > 1 {
-        format!("Question {}/{}", picker.active + 1, picker.questions.len())
+        t!(
+            "app.question.header_multi",
+            n = picker.active + 1,
+            total = picker.questions.len()
+        )
+        .to_string()
     } else {
-        "Question".to_string()
+        t!("app.question.header_single").to_string()
     };
     lines.push(Line::from(vec![
         Span::styled("  ", palette.muted()),
         Span::styled(
-            "Agent asked a question",
+            t!("app.question.card_title").to_string(),
             palette.title().add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("  {header}"), palette.muted()),
@@ -1977,7 +1984,10 @@ fn push_inline_user_question_card(
             // stays dismissible (Esc) and recoverable (Alt+a).
             lines.push(Line::from(vec![
                 Span::styled("    ", palette.muted()),
-                Span::styled("No answerable options were provided.", palette.muted()),
+                Span::styled(
+                    t!("app.question.no_options").to_string(),
+                    palette.muted(),
+                ),
             ]));
         }
     }
@@ -2048,7 +2058,7 @@ fn push_user_question_entry(
         if editing {
             "(type your answer)".to_string()
         } else {
-            "Other (free text)".to_string()
+            t!("app.question.free_text_row").to_string()
         }
     } else {
         entry.free_text.clone()
@@ -2060,7 +2070,8 @@ fn push_user_question_entry(
     } else {
         " "
     };
-    let text = format!("{cursor} {marker_open}{mark}{marker_close} Other: {body}");
+    let other_prefix = t!("app.question.other_prefix").to_string();
+    let text = format!("{cursor} {marker_open}{mark}{marker_close} {other_prefix}: {body}");
     let style = if other_highlighted {
         palette.selected().add_modifier(Modifier::BOLD)
     } else {
@@ -2072,18 +2083,18 @@ fn push_user_question_entry(
     ]));
 }
 
-fn user_question_action_labels(picker: &UserQuestionPickerState) -> Vec<&'static str> {
+fn user_question_action_labels(picker: &UserQuestionPickerState) -> Vec<String> {
     // Garbled / 0-question event: nothing is answerable, so offer only a dismiss
     // hint — never a submit affordance that would form an invalid respond
     // (DO-NOT-SHIP #2). Alt+a re-opens it if dismissed (DO-NOT-SHIP #1).
     if picker.questions.is_empty() {
-        return vec!["Esc = dismiss (no answer to submit)"];
+        return vec![t!("app.question.action_dismiss").to_string()];
     }
-    let mut labels = vec!["Up/Down move | Space toggle | type for Other"];
+    let mut labels = vec![t!("app.question.action_toggle").to_string()];
     if picker.is_last_question() {
-        labels.push("Enter = submit answer(s) | Esc = hide");
+        labels.push(t!("app.question.action_submit").to_string());
     } else {
-        labels.push("Enter = next question | Esc = hide");
+        labels.push(t!("app.question.action_next").to_string());
     }
     labels
 }
@@ -2178,10 +2189,11 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
         lines.push(Line::from(vec![
             Span::styled("     ", palette.muted()),
             Span::styled(
-                format!(
-                    "... +{} older action(s)",
-                    flow_activity.len() - recent.len()
-                ),
+                t!(
+                    "app.activity.older_actions",
+                    count = flow_activity.len() - recent.len()
+                )
+                .to_string(),
                 palette.muted(),
             ),
         ]));
@@ -2355,15 +2367,15 @@ fn agent_task_group_title(
     failed: usize,
     pending_continuations: u32,
     is_active_group: bool,
-) -> &'static str {
+) -> String {
     if in_progress {
-        "Orchestrating..."
+        t!("app.activity.orchestrating").to_string()
     } else if is_active_group && pending_continuations > 0 {
-        "Re-entering (continuing)..."
+        t!("app.activity.re_entering").to_string()
     } else if failed > 0 {
-        "Agent task finished with errors"
+        t!("app.activity.finished_errors").to_string()
     } else {
-        "Agent task completed"
+        t!("app.activity.completed").to_string()
     }
 }
 
@@ -2444,7 +2456,10 @@ fn push_agent_task_group(
             Span::styled(prefix, palette.border()),
             Span::styled("◻ ", palette.selected()),
             Span::styled(title.clone(), palette.text()),
-            Span::styled("  running", palette.muted()),
+            Span::styled(
+                format!("  {}", t!("app.activity.running")),
+                palette.muted(),
+            ),
         ]));
     }
 }
@@ -2483,7 +2498,10 @@ fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'st
             Span::styled(format!("  {}", mutation.operation), palette.muted()),
         ];
         if mutation.preview_ready {
-            spans.push(Span::styled("  preview ready", palette.selected()));
+            spans.push(Span::styled(
+                format!("  {}", t!("app.activity.preview_ready")),
+                palette.selected(),
+            ));
         }
         return spans;
     }
@@ -2674,7 +2692,10 @@ fn push_inline_diff_preview(
     }
     lines.push(Line::from(vec![
         Span::styled("  ", palette.muted()),
-        Span::styled("Diff Preview", palette.title().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            t!("app.diff.title").to_string(),
+            palette.title().add_modifier(Modifier::BOLD),
+        ),
     ]));
 
     if let Some(preview) = &diff.preview {
@@ -2684,7 +2705,7 @@ fn push_inline_diff_preview(
                 preview
                     .title
                     .clone()
-                    .unwrap_or_else(|| "Inline patch".into()),
+                    .unwrap_or_else(|| t!("app.diff.inline_patch").to_string()),
                 palette.text().add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ", palette.muted()),
@@ -2702,7 +2723,7 @@ fn push_inline_diff_preview(
         if preview.files.is_empty() {
             lines.push(Line::from(vec![
                 Span::styled("    ", palette.muted()),
-                Span::styled("No file changes", palette.muted()),
+                Span::styled(t!("app.empty.no_file_changes").to_string(), palette.muted()),
             ]));
         }
 
@@ -2741,7 +2762,7 @@ fn push_inline_diff_preview(
     } else if diff.loading {
         lines.push(Line::from(vec![
             Span::styled("    ", palette.muted()),
-            Span::styled("Loading diff preview...", palette.selected()),
+            Span::styled(t!("app.diff.loading").to_string(), palette.selected()),
         ]));
     } else if let Some(error) = &diff.error {
         lines.push(Line::from(vec![
@@ -2751,7 +2772,7 @@ fn push_inline_diff_preview(
     } else {
         lines.push(Line::from(vec![
             Span::styled("    ", palette.muted()),
-            Span::styled("No diff preview loaded", palette.muted()),
+            Span::styled(t!("app.empty.no_diff").to_string(), palette.muted()),
         ]));
     }
 }
@@ -2913,9 +2934,12 @@ fn render_plan(app: &AppState, palette: Palette) -> Paragraph<'static> {
     let plan = extract_plan_lines(app);
     let lines = if plan.is_empty() {
         vec![
-            Line::from(Span::styled("No active plan", palette.muted())),
             Line::from(Span::styled(
-                "Plan text is inferred from assistant/live replies.",
+                t!("app.empty.no_plan").to_string(),
+                palette.muted(),
+            )),
+            Line::from(Span::styled(
+                t!("app.empty.no_plan_hint").to_string(),
                 palette.muted(),
             )),
         ]
@@ -2934,7 +2958,15 @@ fn render_plan(app: &AppState, palette: Palette) -> Paragraph<'static> {
     };
 
     Paragraph::new(Text::from(lines))
-        .block(titled_block("Plan", palette, false, Some("live")).border_style(palette.border()))
+        .block(
+            titled_block(
+                t!("app.pane.plan").to_string(),
+                palette,
+                false,
+                Some("live"),
+            )
+            .border_style(palette.border()),
+        )
         .wrap(Wrap { trim: false })
 }
 
@@ -3140,7 +3172,7 @@ fn render_workspace(app: &AppState, palette: Palette, area_height: u16) -> Parag
     Paragraph::new(Text::from(lines))
         .block(
             titled_block(
-                "Workspace",
+                t!("app.pane.workspace").to_string(),
                 palette,
                 app.focus == FocusPane::Workspace,
                 Some("contract"),
@@ -3218,7 +3250,7 @@ fn render_git(app: &AppState, palette: Palette, area_height: u16) -> Paragraph<'
     Paragraph::new(Text::from(lines))
         .block(
             titled_block(
-                "Git",
+                t!("app.pane.git").to_string(),
                 palette,
                 app.focus == FocusPane::Git,
                 Some("status/history"),
@@ -3338,7 +3370,10 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
                     .add_modifier(Modifier::BOLD)
                     .bg(palette.surface),
             ),
-            Span::styled("Goal: ", palette.title().bg(palette.surface)),
+            Span::styled(
+                t!("app.autonomy.goal_prefix").to_string(),
+                palette.title().bg(palette.surface),
+            ),
             Span::styled(objective, palette.text().bg(palette.surface)),
             Span::styled(parenthetical, palette.muted().bg(palette.surface)),
         ]));
@@ -3358,7 +3393,7 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
                 .bg(palette.surface),
         ));
         spans.push(Span::styled(
-            format!("Loops: {running} running"),
+            t!("app.autonomy.loops_running", count = running).to_string(),
             palette.title().bg(palette.surface),
         ));
         spans.push(Span::styled("   ", palette.text().bg(palette.surface)));
@@ -3454,11 +3489,11 @@ fn harness_status_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> 
     let status = app.orchestration.get(&session_id);
 
     let phase = match status.and_then(|s| s.phase.as_deref()) {
-        Some("orchestrating") => "Orchestrating",
-        Some("re-entering") => "Re-entering",
-        Some("working") => "Working",
-        Some(other) if !other.is_empty() => other,
-        _ => "Working",
+        Some("orchestrating") => t!("app.harness.orchestrating").to_string(),
+        Some("re-entering") => t!("app.harness.re_entering").to_string(),
+        Some("working") => t!("app.harness.working").to_string(),
+        Some(other) if !other.is_empty() => other.to_string(),
+        _ => t!("app.harness.working").to_string(),
     };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -3600,27 +3635,32 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
     };
     if !app.pending_messages.is_empty() {
         lines.push(Line::from(vec![Span::styled(
-            format!(
-                "Queued messages ({}) after active turn | Esc interrupt/send | Ctrl+U clear",
-                app.pending_messages.len()
-            ),
+            t!(
+                "app.composer_hint.queued_messages",
+                count = app.pending_messages.len()
+            )
+            .to_string(),
             palette.muted().bg(palette.surface),
         )]));
     } else if matches!(&composer, ComposerPresentation::Collapsed(_)) {
         lines.push(Line::from(vec![Span::styled(
-            "Large paste collapsed | Enter sends full text | Ctrl+U clear",
+            t!("app.composer_hint.large_paste").to_string(),
             palette.muted().bg(palette.surface),
         )]));
     } else if let Some(view) = &input_view
         && (view.hidden_lines > 0 || view.hidden_prefix)
     {
-        let hidden = if view.hidden_lines > 0 {
-            format!("showing tail, {} earlier line(s) hidden", view.hidden_lines)
+        let hint = if view.hidden_lines > 0 {
+            t!(
+                "app.composer_hint.multiline_tail_lines",
+                count = view.hidden_lines
+            )
+            .to_string()
         } else {
-            "showing tail of long line".to_string()
+            t!("app.composer_hint.multiline_tail_line").to_string()
         };
         lines.push(Line::from(vec![Span::styled(
-            format!("Multiline input | {hidden} | Enter sends full text | Ctrl+U clear"),
+            hint,
             palette.muted().bg(palette.surface),
         )]));
     } else {
@@ -3633,7 +3673,10 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
         ComposerPresentation::Empty if onboarding_first_launch_active(app) => {
             lines.push(Line::from(vec![
                 Span::styled(" › ", palette.selected().bg(palette.surface)),
-                Span::styled(" Onboarding setup...", palette.muted().bg(palette.surface)),
+                Span::styled(
+                    format!(" {}", t!("app.banner.onboarding_setup")),
+                    palette.muted().bg(palette.surface),
+                ),
             ]))
         }
         ComposerPresentation::Empty => lines.push(Line::from(vec![
@@ -3687,7 +3730,7 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
     }
 
     let block = titled_block(
-        "Composer",
+        t!("app.pane.composer").to_string(),
         palette,
         app.focus == FocusPane::Composer,
         Some("Enter send | Tab inspector"),
@@ -3921,23 +3964,25 @@ fn cursor_width_for_text(text: &str, width: usize) -> usize {
 
 fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
     let mode = if app.readonly {
-        "read-only"
+        t!("app.status.read_only").to_string()
     } else {
-        "interactive"
+        t!("app.status.interactive").to_string()
     };
     let turn = app
         .active_turn()
-        .map(|(_, turn_id)| format!("active {}", short_id(&turn_id.0.to_string())))
-        .unwrap_or_else(|| "idle".into());
+        .map(|(_, turn_id)| {
+            t!("app.status.turn_active", id = short_id(&turn_id.0.to_string())).to_string()
+        })
+        .unwrap_or_else(|| t!("app.status.turn_idle").to_string());
     let profile = app
         .active_session()
         .and_then(|session| session.profile_id.as_deref())
         .unwrap_or("default");
     let cwd = app.workspace.root.as_str();
     let policy = if app.readonly {
-        "sends disabled"
+        t!("app.status.sends_disabled").to_string()
     } else {
-        "approval gated"
+        t!("app.status.approval_gated").to_string()
     };
     let context = app
         .active_session()
@@ -3948,11 +3993,14 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
                 session.tasks.len()
             )
         })
-        .unwrap_or_else(|| "no session".into());
+        .unwrap_or_else(|| t!("app.status.no_session").to_string());
     let work = status_bar_work_text(app);
 
     Paragraph::new(Line::from(vec![
-        Span::styled(" state ", palette.title().bg(palette.surface_alt)),
+        Span::styled(
+            format!(" {} ", t!("app.status.state_label")),
+            palette.title().bg(palette.surface_alt),
+        ),
         Span::styled(
             run_state_marker(&app.run_state).to_string(),
             run_state_style(&app.run_state, palette).bg(palette.surface_alt),
@@ -4019,13 +4067,13 @@ fn status_bar_work_text(app: &AppState) -> String {
     }
 }
 
-fn run_state_status_label(state: &SessionRunState) -> &'static str {
+fn run_state_status_label(state: &SessionRunState) -> String {
     match state {
-        SessionRunState::Idle => "Idle",
-        SessionRunState::InProgress => "Working",
-        SessionRunState::Blocked { .. } => "Blocked",
-        SessionRunState::Success => "Done",
-        SessionRunState::Error { .. } => "Error",
+        SessionRunState::Idle => t!("app.status.idle").to_string(),
+        SessionRunState::InProgress => t!("app.status.working").to_string(),
+        SessionRunState::Blocked { .. } => t!("app.status.blocked").to_string(),
+        SessionRunState::Success => t!("app.status.done").to_string(),
+        SessionRunState::Error { .. } => t!("app.status.error").to_string(),
     }
 }
 
@@ -4313,7 +4361,7 @@ fn render_task_output_modal(
 
     if output.output.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No output loaded for this task yet",
+            t!("app.empty.no_task_output").to_string(),
             palette.muted(),
         )));
     } else {
@@ -4333,7 +4381,7 @@ fn render_task_output_modal(
     let pane = Paragraph::new(Text::from(lines))
         .block(
             titled_block(
-                "Task Output",
+                t!("app.pane.task_output").to_string(),
                 palette,
                 true,
                 Some("o read more | PgUp/PgDn | Esc close"),
@@ -4373,8 +4421,13 @@ fn render_artifact_detail_modal(
 
     let pane = Paragraph::new(Text::from(lines))
         .block(
-            titled_block("Artifact", palette, true, Some("PgUp/PgDn | Esc close"))
-                .border_style(palette.selected()),
+            titled_block(
+                t!("app.pane.artifact_modal").to_string(),
+                palette,
+                true,
+                Some("PgUp/PgDn | Esc close"),
+            )
+            .border_style(palette.selected()),
         )
         .scroll((scroll_top, 0))
         .wrap(Wrap { trim: false });
@@ -4409,8 +4462,13 @@ fn render_thread_graph_detail_modal(
 
     let pane = Paragraph::new(Text::from(lines))
         .block(
-            titled_block("Threads", palette, true, Some("PgUp/PgDn | Esc close"))
-                .border_style(palette.selected()),
+            titled_block(
+                t!("app.pane.threads").to_string(),
+                palette,
+                true,
+                Some("PgUp/PgDn | Esc close"),
+            )
+            .border_style(palette.selected()),
         )
         .scroll((scroll_top, 0))
         .wrap(Wrap { trim: false });
@@ -4444,8 +4502,13 @@ fn render_turn_state_detail_modal(
 
     let pane = Paragraph::new(Text::from(lines))
         .block(
-            titled_block("Turn", palette, true, Some("PgUp/PgDn | Esc close"))
-                .border_style(palette.selected()),
+            titled_block(
+                t!("app.pane.turn").to_string(),
+                palette,
+                true,
+                Some("PgUp/PgDn | Esc close"),
+            )
+            .border_style(palette.selected()),
         )
         .scroll((scroll_top, 0))
         .wrap(Wrap { trim: false });
@@ -4536,12 +4599,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 fn titled_block<'a>(
-    title: &'a str,
+    title: impl Into<String>,
     palette: Palette,
     focused: bool,
     suffix: Option<&'a str>,
 ) -> Block<'a> {
-    let mut spans = vec![Span::styled(title.to_string(), palette.title())];
+    let mut spans = vec![Span::styled(title.into(), palette.title())];
     if let Some(suffix) = suffix {
         spans.push(Span::styled(format!("  {suffix}"), palette.muted()));
     }
