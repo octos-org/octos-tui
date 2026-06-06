@@ -3027,6 +3027,11 @@ impl Default for SessionRunState {
 
 #[derive(Debug, Clone)]
 pub struct AppState {
+    /// Active TUI palette, chosen at launch (`--theme`/config) and switchable
+    /// at runtime via `/theme`. The event loop derives the per-frame `Palette`
+    /// from this field, so a `/theme` change repaints on the next frame; it
+    /// also drives the `*` current marker in the `/theme` menu.
+    pub theme: crate::cli::ThemeName,
     pub sessions: Vec<SessionView>,
     /// Latest whole-job orchestration status per session (`session/orchestration`).
     /// Drives the composer top-border job indicator; absent/`active:false` hides it.
@@ -4621,6 +4626,7 @@ impl AppState {
         let run_state_started_at = run_state.is_active().then(Instant::now);
 
         Self {
+            theme: crate::cli::ThemeName::default(),
             sessions,
             orchestration: std::collections::HashMap::new(),
             session_usage: std::collections::HashMap::new(),

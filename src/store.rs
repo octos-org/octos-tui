@@ -922,7 +922,19 @@ impl Store {
                 None
             }
             LocalAction::SetTheme(theme) => {
-                self.state.status = format!("Theme selected: {theme}");
+                match crate::cli::ThemeName::from_id(&theme) {
+                    Some(name) => {
+                        self.state.theme = name;
+                        // Repaint the open menu so the `*` current marker moves
+                        // to the just-selected theme; the palette itself updates
+                        // on the next frame (event loop reads `state.theme`).
+                        self.refresh_active_menu_if_open();
+                        self.state.status = format!("Theme: {theme}");
+                    }
+                    None => {
+                        self.state.status = format!("Unknown theme: {theme}");
+                    }
+                }
                 None
             }
             LocalAction::SaveStatusLine(items) => {
@@ -2881,7 +2893,7 @@ impl Store {
             availability,
             app,
             terminal: TerminalSize::default(),
-            theme_name: None,
+            theme_name: Some(self.state.theme.as_str()),
             selected_path: &path,
         };
         let result = filter_menu_result_for_search(
@@ -7533,6 +7545,55 @@ mod tests {
             store.state.status
         );
         assert_eq!(rust_i18n::locale().to_string(), before);
+    }
+
+    #[test]
+    fn set_theme_applies_and_marks_current() {
+        use crate::cli::ThemeName;
+        let mut store = store_with_empty_session();
+
+        // Default runtime theme is Codex (the event loop derives the per-frame
+        // palette from `state.theme`, so this is what actually paints).
+        assert_eq!(store.state.theme, ThemeName::Codex);
+
+        // Selecting a theme applies it to runtime state and echoes the choice.
+        store.dispatch_local_action(LocalAction::SetTheme("claude".into()), None);
+        assert_eq!(store.state.theme, ThemeName::Claude);
+        assert!(
+            store.state.status.contains("claude"),
+            "status should echo the theme, got: {}",
+            store.state.status
+        );
+
+        // An unknown id leaves the active theme intact and reports it.
+        store.dispatch_local_action(LocalAction::SetTheme("nope".into()), None);
+        assert_eq!(store.state.theme, ThemeName::Claude);
+        assert!(
+            store.state.status.to_lowercase().contains("unknown"),
+            "unknown theme should be reported, got: {}",
+            store.state.status
+        );
+
+        // The /theme menu marks the active theme as current (drives the `*`).
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_THEME));
+        let MenuBuildResult::Ready(spec) =
+            store.state.active_menu.as_ref().expect("theme menu open")
+        else {
+            panic!("theme menu should build Ready");
+        };
+        let current_of = |id: &str| {
+            spec.items
+                .iter()
+                .find(|item| item.id == id)
+                .unwrap_or_else(|| panic!("{id} item present"))
+                .state
+                .current
+        };
+        assert!(
+            current_of("claude"),
+            "active theme should be marked current"
+        );
+        assert!(!current_of("codex"), "non-active theme not current");
     }
 
     #[test]

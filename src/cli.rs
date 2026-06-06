@@ -13,14 +13,43 @@ pub enum Mode {
     Protocol,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ThemeName {
     Terminal,
     Slate,
+    #[default]
     Codex,
     Claude,
     Solarized,
+}
+
+impl ThemeName {
+    /// Stable kebab id used by the `/theme` menu items and the runtime
+    /// theme marker. Must match the ids emitted by `theme_menu` so the
+    /// active palette round-trips through `from_id`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThemeName::Terminal => "terminal",
+            ThemeName::Slate => "slate",
+            ThemeName::Codex => "codex",
+            ThemeName::Claude => "claude",
+            ThemeName::Solarized => "solarized",
+        }
+    }
+
+    /// Parse a `/theme` menu id back into a `ThemeName`. Returns `None`
+    /// for an unknown id so the caller can leave the active theme intact.
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "terminal" => Some(ThemeName::Terminal),
+            "slate" => Some(ThemeName::Slate),
+            "codex" => Some(ThemeName::Codex),
+            "claude" => Some(ThemeName::Claude),
+            "solarized" => Some(ThemeName::Solarized),
+            _ => None,
+        }
+    }
 }
 
 /// UI display language (i18n). English is the source/fallback locale.

@@ -47,10 +47,13 @@ pub fn run(cli: Cli) -> Result<()> {
     // and switchable at runtime by the `/lang <code>` command (which re-sets
     // the locale + rebuilds the open menu; the next frame repaints).
     rust_i18n::set_locale(cli.lang.code());
-    let palette = Palette::for_theme(cli.theme);
     let mut backend = build_backend(&cli);
     let snapshot = backend.bootstrap()?;
     let mut store = Store::from_snapshot(snapshot);
+    // Seed the runtime palette from the launch theme (`--theme`/config). The
+    // `/theme` menu mutates this field, so the palette below is recomputed each
+    // frame from `store.state.theme` rather than captured once at startup.
+    store.state.theme = cli.theme;
     // Seed the onboarding workspace candidate from an explicit `--cwd` so the
     // first-launch workspace probe validates the launch cwd. Without this the
     // top-level `--cwd` reaches `session/open` but never the onboarding probe
@@ -66,6 +69,7 @@ pub fn run(cli: Cli) -> Result<()> {
     loop {
         drain_backend_events(backend.as_mut(), &mut store)?;
 
+        let palette = Palette::for_theme(store.state.theme);
         terminal.draw(|frame| app::render(frame, &store.state, palette))?;
 
         if event::poll(UI_EVENT_POLL_INTERVAL)? {
