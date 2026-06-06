@@ -402,7 +402,7 @@ mod tests {
         assert!(text.contains("Settings / Status Line"));
         assert!(text.contains("Search work"));
         assert!(text.contains("[x] 01 Ctrl+s State - runtime state"));
-        assert!(text.contains("> [ ] -- Working directory"));
+        assert!(text.contains(">  [ ] -- Working directory"));
         assert!(text.contains("not available"));
         assert!(text.contains("status: idle"));
     }

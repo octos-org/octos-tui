@@ -315,7 +315,9 @@ fn item_row(
         String::new()
     };
 
-    let mut text = format!("{marker} {checkbox} {order}");
+    // `*` marks the active/current selection (clearer than a trailing "current").
+    let current_marker = if item.current { "*" } else { " " };
+    let mut text = format!("{marker}{current_marker} {checkbox} {order}");
     if let Some(shortcut) = &item.shortcut {
         text.push_str(shortcut);
         text.push(' ');
@@ -327,9 +329,6 @@ fn item_row(
     if let Some(description) = &item.description {
         text.push_str(" - ");
         text.push_str(description);
-    }
-    if item.current {
-        text.push_str(" current");
     }
     if item.default {
         text.push_str(" default");
@@ -462,7 +461,7 @@ mod tests {
         let text = render_view(&view, 90, 10);
 
         assert!(text.contains("[x] 01 State"));
-        assert!(text.contains("> [ ] 02 Working directory"));
+        assert!(text.contains(">  [ ] 02 Working directory"));
         assert!(text.contains("Alt+Up/Alt+Down reorder"));
     }
 

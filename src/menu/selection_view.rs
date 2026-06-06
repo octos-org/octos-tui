@@ -322,7 +322,11 @@ fn selection_row(
     };
 
     let marker = if selected { ">" } else { " " };
-    let mut text = format!("{marker} ");
+    // A `*` column marks the active/current selection (e.g. the active model,
+    // theme, or thinking level) — clearer than a trailing "current" word. It is
+    // a separate column from the `>` navigation cursor so both can show at once.
+    let current_marker = if item.current { "*" } else { " " };
+    let mut text = format!("{marker}{current_marker} ");
     if let Some(checked) = item.toggle {
         text.push_str(if checked { "[x] " } else { "[ ] " });
     }
@@ -337,9 +341,6 @@ fn selection_row(
     if let Some(description) = &item.description {
         text.push_str(" - ");
         text.push_str(description);
-    }
-    if item.current {
-        text.push_str(" current");
     }
     if item.default {
         text.push_str(" default");
@@ -503,9 +504,10 @@ mod tests {
 
         let text = render_view(&view, 80, 10);
 
-        assert!(text.contains("> Disabled model"));
+        assert!(text.contains(">  Disabled model"));
         assert!(text.contains("server unavailable"));
-        assert!(text.contains("Current model current"));
+        // The active selection is marked with a leading `*` (not a trailing word).
+        assert!(text.contains("* Current model"));
         assert!(text.contains("Default model default"));
     }
 
