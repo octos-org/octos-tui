@@ -20,9 +20,10 @@ tap = "octos-org/homebrew-tap"
 install-updater = true
 # Push the generated formula to the Homebrew tap on release.
 publish-jobs = ["homebrew", "npm"]
-# Publish prereleases (rc/beta tags) to npm + the Homebrew tap too, so they can
-# be installed/tested before promoting to a stable tag. (npm prereleases don't
-# take the `latest` dist-tag, and Homebrew prerelease formulae land in the tap.)
-publish-prereleases = true
+# Prereleases (rc/beta tags) get a GitHub prerelease + installers but are NOT
+# pushed to npm/Homebrew, so they don't take the npm `latest` tag or move the
+# stable formula. (Flip to true temporarily when you want to test an rc's
+# npm/brew one-liners before a stable tag.)
+publish-prereleases = false
 # Only dry-run ("plan") on PRs; full release artifacts run on tag pushes.
 pr-run-mode = "plan"
