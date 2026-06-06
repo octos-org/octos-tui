@@ -286,7 +286,9 @@ impl Store {
                 } else if names
                     .clone()
                     .any(|name| name.to_ascii_lowercase().contains(&query))
-                    || command.description.to_ascii_lowercase().contains(&query)
+                    || t!(command.description)
+                        .to_ascii_lowercase()
+                        .contains(&query)
                 {
                     Some(2)
                 } else {
@@ -296,7 +298,7 @@ impl Store {
                     rank,
                     SlashCommandMatch {
                         name: command.slash_name(),
-                        description: command.description.into(),
+                        description: t!(command.description).into_owned(),
                         available: visible.availability.is_available(),
                     },
                 ))
