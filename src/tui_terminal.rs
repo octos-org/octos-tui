@@ -223,8 +223,15 @@ where
             // the escapes directly so we don't depend on ratatui's optional
             // `scrolling-regions` Backend feature.
             scroll_region_up(&mut self.backend, area.top(), scroll_by)?;
-            area.y = size.height - area.height;
         }
+        // Always re-pin the viewport to the bottom `height` rows. When the live
+        // UI SHRINKS (a turn completes, a menu closes) the old bottom no longer
+        // overflows the screen, so without this the smaller viewport would
+        // repaint at the old (higher) top and leave blank rows below the
+        // composer until later history shifted it down (codex P2). `clear()`
+        // below clears from the OLD viewport top to end-of-screen, so the rows
+        // the viewport vacates are blanked rather than left stale.
+        area.y = size.height - area.height;
         if area != self.viewport_area {
             self.clear()?;
             self.set_viewport_area(area);
