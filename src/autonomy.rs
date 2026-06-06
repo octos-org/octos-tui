@@ -1,10 +1,10 @@
 //! M15-E autonomy command parsing for `/agents`, `/goal`, and `/loop`.
 //!
 //! Parses user-typed slash commands into typed intents the TUI can
-//! dispatch as backend AppUI calls. The parser is the source of truth
+//! dispatch as backend Octos UI calls. The parser is the source of truth
 //! for syntax shape — actual dispatch (issuing `agent/list`,
 //! `session/goal/set`, `loop/create`, …) is wired in a later PR once
-//! the backend exposes those AppUI methods.
+//! the backend exposes those Octos UI methods.
 //!
 //! Contract reference: octos-tui#47 (M15-E) and upstream
 //! `UPCR-2026-021` (Agent / Goal / Loop autonomy). The canonical spec

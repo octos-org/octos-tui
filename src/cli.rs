@@ -235,7 +235,7 @@ impl Cli {
         let stdio_command = args.stdio_command.or(file_config.stdio_command);
         if base_url.is_some() && stdio_command.is_some() {
             return Err(eyre!(
-                "endpoint and stdio-command cannot both be configured; choose one AppUI transport"
+                "endpoint and stdio-command cannot both be configured; choose one Octos UI transport"
             ));
         }
 
@@ -573,7 +573,7 @@ mod tests {
         let err = Cli::try_parse_from(["octos-tui", "--config", path.to_str().unwrap()])
             .expect_err("conflicting config should fail");
 
-        assert!(err.to_string().contains("choose one AppUI transport"));
+        assert!(err.to_string().contains("choose one Octos UI transport"));
     }
 
     #[test]

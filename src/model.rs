@@ -207,7 +207,7 @@ pub const APPUI_METHOD_LOOP_UPDATED: &str = "loop/updated";
 pub const APPUI_METHOD_LOOP_FIRED: &str = "loop/fired";
 pub const APPUI_METHOD_LOOP_COMPLETED: &str = "loop/completed";
 
-// ---------- M15-E AppUI param + result types ----------
+// ---------- M15-E Octos UI param + result types ----------
 //
 // These params types model the request side of the autonomy surface
 // (`/agents`, `/goal`, `/loop`). Upstream `octos-core` already owns
@@ -2217,7 +2217,7 @@ impl OnboardingWizardState {
         // M22-E: a fresh selection invalidates the last test
         // failure — the user is implicitly retrying.
         self.provider_test_failure_reason = None;
-        self.last_message = Some("Provider selection updated from AppUI catalog".into());
+        self.last_message = Some("Provider selection updated from Octos UI catalog".into());
     }
 
     pub fn reset_staged_provider(&mut self) {
@@ -3130,7 +3130,7 @@ pub struct AppState {
     /// notifications. Hydration on reconnect re-requests these and
     /// REPLACES the local mirror — local config never fills this in.
     pub session_autonomy: Vec<SessionAutonomyState>,
-    /// Reconnect hydration queue. The store enqueues follow-up AppUI
+    /// Reconnect hydration queue. The store enqueues follow-up Octos UI
     /// commands (e.g. `session/hydrate`, `agent/list`,
     /// `session/goal/get`, `loop/list`) when a session opens or after
     /// reconnect, and the event loop drains them one per tick. The
@@ -4344,7 +4344,7 @@ fn seed_artifacts(
     source: SnapshotSource,
 ) -> ArtifactPaneState {
     let mut items = vec![ArtifactItem {
-        title: "AppUi bootstrap snapshot".into(),
+        title: "Octos UI bootstrap snapshot".into(),
         kind: "snapshot".into(),
         source: target.unwrap_or_else(|| source.label()).to_string(),
         status: if readonly {
@@ -6364,7 +6364,7 @@ mod tests {
         let state = AppState::from_snapshot(snapshot);
 
         assert!(state.artifacts.items.iter().any(|item| {
-            item.title == "AppUi bootstrap snapshot" && item.source == "local mock snapshot"
+            item.title == "Octos UI bootstrap snapshot" && item.source == "local mock snapshot"
         }));
         assert!(
             state
@@ -6454,7 +6454,7 @@ mod tests {
                 live_reply: None,
             }],
             0,
-            "AppUI capabilities refreshed: 24 methods".into(),
+            "Octos UI capabilities refreshed: 24 methods".into(),
             Some("stdio:octos serve --stdio".into()),
             false,
         );

@@ -71,7 +71,7 @@ use crate::{
     },
 };
 
-// AppUI can emit large terminal bursts (`message/persisted`, tool summaries,
+// Octos UI can emit large terminal bursts (`message/persisted`, tool summaries,
 // replay/lifecycle frames) at turn completion. Keep the transport reader well
 // ahead of rendering so stdio stdout does not back up into the backend writer.
 const PROTOCOL_TRANSPORT_QUEUE_CAPACITY: usize = 4096;
@@ -1584,7 +1584,7 @@ fn rpc_request_from_command(
         | AppUiCommand::FireLoopNow(params) => serde_json::to_value(params),
         _ => {
             return Err(eyre!(
-                "unsupported AppUI command for first-server transport: {method}"
+                "unsupported Octos UI command for first-server transport: {method}"
             ));
         }
     }
@@ -2376,7 +2376,7 @@ fn decode_task_output_read_result(mut result: Value) -> serde_json::Result<TaskO
 
 fn capabilities_event(result: ConfigCapabilitiesListResult) -> ClientEvent {
     let message = format!(
-        "AppUI capabilities refreshed: {} methods",
+        "Octos UI capabilities refreshed: {} methods",
         result.capabilities.supported_methods.len()
     );
     ClientEvent::Capabilities(CapabilitiesClientEvent { result, message })
@@ -5540,7 +5540,7 @@ mod tests {
     }
 
     /// Guard: when `data` is absent the legacy fallback still kicks
-    /// in. Existing AppUI callers that do not emit structured errors
+    /// in. Existing Octos UI callers that do not emit structured errors
     /// keep working.
     #[test]
     fn rpc_error_falls_back_to_top_level_code_when_data_kind_absent() {

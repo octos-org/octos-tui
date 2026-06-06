@@ -347,7 +347,7 @@ status:
   cannot_verb_goal_state: "Cannot %{verb} goal in `%{state}` state (model-owned)."
   cannot_verb_no_goal_get: "Cannot %{verb}: backend does not advertise session/goal/get for refresh."
   refreshing_goal_before: "Refreshing goal before %{verb}"
-  appui_not_wired: "AppUI command `%{method}` is advertised but not wired yet"
+  appui_not_wired: "Octos UI command `%{method}` is advertised but not wired yet"
   queued_prompt_template: "Queued prompt template"
   nothing_sent_to_backend: "Nothing was sent to the backend."
   usage_skills: "Usage: /skills [list|search <query>|install <repo> [--branch <branch>] [--force]|remove <name>]"
@@ -459,8 +459,8 @@ status:
   invalid_task_id: "Invalid task id `%{id}`"
   reading_task_artifact: "Reading task artifact %{label} for %{id}"
   upserting_tool_config: "Upserting tool config `%{tool}`"
-  appui_method_not_advertised: "AppUI method `%{method}` is not advertised"
-  appui_feature_not_advertised: "AppUI feature `%{feature}` is not advertised"
+  appui_method_not_advertised: "Octos UI method `%{method}` is not advertised"
+  appui_feature_not_advertised: "Octos UI feature `%{feature}` is not advertised"
   readonly_method_disabled: "Read-only mode: %{method} disabled"
   menu_label: "Menu: %{id}"
   queued_menu_prompt: "Queued menu prompt"
@@ -480,10 +480,10 @@ status:
   doctor_workspace_unusable: "workspace cwd is `%{root}` (not a usable path)"
   doctor_workspace_unusable_recovery: "Restart Octos with `--cwd <path>` or set workspace.root via the transport launch."
   doctor_methods_advertised: "%{advertised}/%{total} onboarding methods advertised"
-  doctor_caps_not_received: "AppUI capabilities not yet received"
+  doctor_caps_not_received: "Octos UI capabilities not yet received"
   doctor_caps_not_received_recovery: "Wait for `config/capabilities/list` or reconnect the transport."
-  doctor_appui_target: "AppUI target: %{target}"
-  doctor_no_transport: "no AppUI transport configured"
+  doctor_appui_target: "Octos UI target: %{target}"
+  doctor_no_transport: "no Octos UI transport configured"
   doctor_no_transport_recovery: "Start the TUI with `octos tui --target <stdio:...|ws://...>`."
   onboarding_doctor_summary: "Onboarding doctor — %{summary}"
   ps_active_turn: "active turn %{id}"
@@ -711,7 +711,7 @@ menu:
         label: Refresh usage
     subtitle: Server-reported token and cost usage.
     title: Cost
-    unavailable_no_session: Usage totals require an open AppUI session.
+    unavailable_no_session: Usage totals require an open Octos UI session.
     unavailable_title: Cost unavailable
   footer:
     enter_apply_esc_close: Enter apply | Esc close
@@ -958,7 +958,7 @@ menu:
     search: Filter permissions
     subtitle: Session permission presets; mutation is capability gated.
     title: Update Model Permissions
-    unavailable_no_session: Permissions require an open AppUI session.
+    unavailable_no_session: Permissions require an open Octos UI session.
     unavailable_title: Permissions unavailable
   provider:
     item:
@@ -984,7 +984,7 @@ menu:
         label: Staged provider
     preview_title: Provider State
     search: Filter providers
-    subtitle: Profile-owned LLM setup; catalog and state come from AppUI.
+    subtitle: Profile-owned LLM setup; catalog and state come from Octos UI.
     title: Provider
     unavailable_title: Providers unavailable
   runtime_preview_title: Runtime
@@ -1007,7 +1007,7 @@ menu:
         label: Search registry
     preview_title: Profile
     search: Filter skills
-    subtitle: Profile-owned customer skills over AppUI.
+    subtitle: Profile-owned customer skills over Octos UI.
     title: Skills
     unavailable_title: Skills unavailable
   status:
@@ -1072,7 +1072,7 @@ menu:
         desc: Use terminal defaults.
     preview_title: Current
     search: Filter themes
-    subtitle: Local TUI palette. Does not require AppUI.
+    subtitle: Local TUI palette. Does not require Octos UI.
     title: Theme
   thinking:
     item:

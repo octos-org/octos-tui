@@ -353,7 +353,7 @@ impl Store {
 
     /// M15-E: parse `/agents`, `/goal`, `/loop` through
     /// [`crate::autonomy::parse_autonomy_slash`] and dispatch one
-    /// AppUI command per parsed intent. Capability checks are enforced
+    /// Octos UI command per parsed intent. Capability checks are enforced
     /// at the dispatch site (and via the registry's
     /// `coding.autonomy.v1` gate), so old servers see the slash
     /// command rendered as `Unsupported` rather than getting probed.
@@ -2292,7 +2292,7 @@ impl Store {
         }))
     }
 
-    /// M22-C: true when the AppUI target is a non-local network
+    /// M22-C: true when the Octos UI target is a non-local network
     /// transport (e.g. `wss://remote.example/...`). Local stdio
     /// and `ws://localhost` are treated as same-host, so the
     /// filesystem probe is meaningful.
@@ -2817,7 +2817,7 @@ impl Store {
             checks: vec![
                 OnboardingDoctorCheck {
                     id: "transport",
-                    title: "AppUI transport",
+                    title: "Octos UI transport",
                     outcome: transport_check,
                 },
                 OnboardingDoctorCheck {
@@ -7959,7 +7959,7 @@ mod tests {
             state: AppState::new(
                 vec![],
                 0,
-                "AppUI connected".into(),
+                "Octos UI connected".into(),
                 Some("stdio:octos serve --stdio".into()),
                 false,
             ),
@@ -8607,7 +8607,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 1 methods".into(),
+            message: "Octos UI capabilities refreshed: 1 methods".into(),
         }));
 
         assert!(store.state.sessions.is_empty());
@@ -9375,7 +9375,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 3 methods".into(),
+            message: "Octos UI capabilities refreshed: 3 methods".into(),
         }));
 
         assert!(store.state.sessions.is_empty());
@@ -9404,7 +9404,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 3 methods".into(),
+            message: "Octos UI capabilities refreshed: 3 methods".into(),
         }));
 
         let Some(menu) = store.state.active_menu.as_ref() else {
@@ -9434,7 +9434,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 1 method".into(),
+            message: "Octos UI capabilities refreshed: 1 method".into(),
         }));
 
         assert!(
@@ -9461,7 +9461,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 2 methods".into(),
+            message: "Octos UI capabilities refreshed: 2 methods".into(),
         }));
 
         assert!(
@@ -10730,7 +10730,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 1 methods".into(),
+            message: "Octos UI capabilities refreshed: 1 methods".into(),
         }));
         let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
             panic!("expected onboarding menu");
@@ -10764,7 +10764,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 1 methods".into(),
+            message: "Octos UI capabilities refreshed: 1 methods".into(),
         }));
         let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
             panic!("expected onboarding menu");
@@ -10843,7 +10843,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 1 methods".into(),
+            message: "Octos UI capabilities refreshed: 1 methods".into(),
         }));
 
         assert!(!store.state.menu_stack.is_active());

@@ -347,7 +347,7 @@ menu:
         label: 刷新用量
     subtitle: 服务器报告的 Token 和费用用量。
     title: 费用
-    unavailable_no_session: 用量统计需要一个打开的 AppUI 会话。
+    unavailable_no_session: 用量统计需要一个打开的 Octos UI 会话。
     unavailable_title: 费用不可用
   footer:
     enter_apply_esc_close: 回车 应用 | Esc 关闭
@@ -594,7 +594,7 @@ menu:
     search: 筛选权限
     subtitle: 会话权限预设；变更受能力门控。
     title: 更新模型权限
-    unavailable_no_session: 权限功能需要一个打开的 AppUI 会话。
+    unavailable_no_session: 权限功能需要一个打开的 Octos UI 会话。
     unavailable_title: 权限不可用
   provider:
     item:
@@ -620,7 +620,7 @@ menu:
         label: 暂存供应商
     preview_title: 供应商状态
     search: 筛选供应商
-    subtitle: 档案级 LLM 配置；目录和状态来自 AppUI。
+    subtitle: 档案级 LLM 配置；目录和状态来自 Octos UI。
     title: 供应商
     unavailable_title: 供应商不可用
   runtime_preview_title: 运行时
@@ -643,7 +643,7 @@ menu:
         label: 搜索注册表
     preview_title: 档案
     search: 筛选技能
-    subtitle: 通过 AppUI 管理的档案级自定义技能。
+    subtitle: 通过 Octos UI 管理的档案级自定义技能。
     title: 技能
     unavailable_title: 技能不可用
   status:
@@ -708,7 +708,7 @@ menu:
         desc: 使用终端默认配色。
     preview_title: 当前
     search: 筛选主题
-    subtitle: 本地 TUI 配色，不依赖 AppUI。
+    subtitle: 本地 TUI 配色，不依赖 Octos UI。
     title: 主题
   thinking:
     item:
@@ -804,7 +804,7 @@ status:
   cannot_verb_goal_state: "无法在 `%{state}` 状态下 %{verb} 目标（由模型管控）。"
   cannot_verb_no_goal_get: "无法 %{verb}：后端未公布 session/goal/get 以供刷新。"
   refreshing_goal_before: "%{verb} 前正在刷新目标"
-  appui_not_wired: "AppUI 命令 `%{method}` 已公布但尚未接入"
+  appui_not_wired: "Octos UI 命令 `%{method}` 已公布但尚未接入"
   queued_prompt_template: "已排队提示模板"
   nothing_sent_to_backend: "未向后端发送任何内容。"
   usage_skills: "用法：/skills [list|search <query>|install <repo> [--branch <branch>] [--force]|remove <name>]"
@@ -916,8 +916,8 @@ status:
   invalid_task_id: "无效的任务 id `%{id}`"
   reading_task_artifact: "正在读取 %{id} 的任务制品 %{label}"
   upserting_tool_config: "正在更新工具配置 `%{tool}`"
-  appui_method_not_advertised: "AppUI 方法 `%{method}` 未公布"
-  appui_feature_not_advertised: "AppUI 特性 `%{feature}` 未公布"
+  appui_method_not_advertised: "Octos UI 方法 `%{method}` 未公布"
+  appui_feature_not_advertised: "Octos UI 特性 `%{feature}` 未公布"
   readonly_method_disabled: "只读模式：%{method} 已禁用"
   menu_label: "菜单：%{id}"
   queued_menu_prompt: "已排队菜单提示"
@@ -937,10 +937,10 @@ status:
   doctor_workspace_unusable: "工作区 cwd 为 `%{root}`（不是可用路径）"
   doctor_workspace_unusable_recovery: "使用 `--cwd <path>` 重启 Octos，或通过传输启动设置 workspace.root。"
   doctor_methods_advertised: "已公布 %{advertised}/%{total} 个引导方法"
-  doctor_caps_not_received: "尚未收到 AppUI 能力"
+  doctor_caps_not_received: "尚未收到 Octos UI 能力"
   doctor_caps_not_received_recovery: "请等待 `config/capabilities/list` 或重新连接传输。"
-  doctor_appui_target: "AppUI 目标：%{target}"
-  doctor_no_transport: "未配置 AppUI 传输"
+  doctor_appui_target: "Octos UI 目标：%{target}"
+  doctor_no_transport: "未配置 Octos UI 传输"
   doctor_no_transport_recovery: "使用 octos tui --target <stdio:...|ws://...> 启动 TUI。"
   onboarding_doctor_summary: "引导诊断 — %{summary}"
   ps_active_turn: "活动回合 %{id}"

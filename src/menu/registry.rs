@@ -463,7 +463,11 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         },
         CommandSpec {
             name: "stop",
-            aliases: &["interrupt"],
+            // `esc` is an alias so a user who types `/esc` (a natural guess for
+            // "escape/cancel this turn") hits the same interrupt path as the
+            // Esc key, Ctrl-C, and `/stop`. Without it `/esc` was an unknown
+            // command and the turn kept running.
+            aliases: &["interrupt", "esc"],
             description: "command.stop.desc",
             category: CommandCategory::Runtime,
             availability: stop_availability,
@@ -788,6 +792,27 @@ mod tests {
         };
         assert_eq!(command.name, "help");
         assert_eq!(invocation.args, "theme");
+    }
+
+    #[test]
+    fn slash_esc_resolves_to_the_stop_interrupt_command() {
+        // The user complaint: typing `/esc` did nothing because `esc` was not
+        // a registered command/alias — only the Esc KEY, Ctrl-C, and `/stop`
+        // emitted the interrupt. `/esc` now aliases the `stop` command so it
+        // routes to the same `StopActiveTurn` → `InterruptTurn` path.
+        let registry = CommandRegistry::with_core_commands();
+        assert_eq!(
+            registry.find("/esc").map(|command| command.name),
+            Some("stop"),
+            "/esc must alias the stop/interrupt command"
+        );
+        assert_eq!(
+            registry.find("esc").map(|command| command.name),
+            Some("stop")
+        );
+        // The pre-existing names/aliases still resolve to the same command.
+        assert_eq!(registry.find("/stop").map(|c| c.name), Some("stop"));
+        assert_eq!(registry.find("/interrupt").map(|c| c.name), Some("stop"));
     }
 
     #[test]
