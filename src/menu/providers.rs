@@ -857,13 +857,11 @@ fn onboarding_provider_setup_menu(
     state: &OnboardingWizardState,
     current_profile: Option<&str>,
 ) -> MenuBuildResult {
+    // UX2 feedback: read-only status rows (Profile / Selected provider / Saved
+    // provider) are `Noop` — the user can't act on them by selecting — so they
+    // move to the right info pane (`onboarding_provider_preview`) and the left
+    // list holds only the actionable provider-config rows.
     let mut items = vec![
-        MenuItem::new(
-            "onboard.provider.profile",
-            format!("Profile: {}", state.profile_label(current_profile)),
-            MenuAction::Noop,
-        )
-        .with_description("Local profile ready"),
         MenuItem::new(
             "onboard.catalog.refresh",
             if ctx.app.profile_llm_catalog.is_some() {
@@ -919,20 +917,6 @@ fn onboarding_provider_setup_menu(
     ]);
 
     items.extend([
-        MenuItem::new(
-            "onboard.provider.current",
-            format!("Selected provider: {}", state.provider_label()),
-            MenuAction::Noop,
-        )
-        .with_description("Choose one provider route above")
-        .with_state(MenuItemState::required(state.selection_ready())),
-        MenuItem::new(
-            "onboard.provider.saved",
-            onboarding_provider_saved_status_label(state),
-            MenuAction::Noop,
-        )
-        .with_description("Last successful primary or fallback save")
-        .with_state(onboarding_provider_saved_status_state(state)),
         onboarding_edit_item(
             "onboard.provider.key",
             "API key",
@@ -1025,9 +1009,42 @@ fn onboarding_provider_setup_menu(
         searchable: true,
         search_placeholder: Some("Filter setup actions".into()),
         footer_hint: Some(progress.footer_hint(&next_action)),
-        preview: Some(progress.explanation_preview()),
+        preview: Some(onboarding_provider_preview(
+            &progress,
+            state,
+            current_profile,
+        )),
         mode: MenuMode::SingleSelect,
     })
+}
+
+/// Right-pane preview for the Provider (LLM config) step. Like the Workspace
+/// step, it surfaces the read-only status the user can't act on by selecting —
+/// the local profile, the currently-selected provider route, and the last
+/// saved provider — so the left list holds only the actionable config rows.
+fn onboarding_provider_preview(
+    progress: &crate::menu::wizard::WizardProgress,
+    state: &OnboardingWizardState,
+    current_profile: Option<&str>,
+) -> MenuPreview {
+    let mut preview = progress.explanation_preview();
+    if let MenuPreview::Text { body, .. } = &mut preview {
+        body.push_str("\n\nConfigured (read-only here):");
+        body.push_str(&format!(
+            "\n• Profile: {}",
+            state.profile_label(current_profile)
+        ));
+        body.push_str(&format!(
+            "\n• Selected provider: {}",
+            state.provider_label()
+        ));
+        // `onboarding_provider_saved_status_label` already carries its own prefix.
+        body.push_str(&format!(
+            "\n• {}",
+            onboarding_provider_saved_status_label(state)
+        ));
+    }
+    preview
 }
 
 /// UX2 B.2: the WORKSPACE step screen, split out of the provider-setup menu so
@@ -5248,6 +5265,27 @@ mod tests {
             .expect("api key row");
         assert_eq!(key_item.disabled_reason, None);
         assert_eq!(key_item.state.required_valid, Some(true));
+
+        // UX2 feedback: the read-only `Noop` status rows are NOT in the left
+        // list — they moved to the right info pane.
+        for id in [
+            "onboard.provider.profile",
+            "onboard.provider.current",
+            "onboard.provider.saved",
+        ] {
+            assert!(
+                !spec.items.iter().any(|item| item.id == id),
+                "read-only `{id}` must move to the info pane, not the left list"
+            );
+        }
+        // ...and that status now rides in the right-side teaching pane.
+        let Some(crate::menu::types::MenuPreview::Text { body, .. }) = &spec.preview else {
+            panic!("provider step must keep a Text teaching pane");
+        };
+        assert!(
+            body.contains("Selected provider:") && body.contains("Profile:"),
+            "info pane should surface the read-only provider/profile status: {body:?}"
+        );
     }
 
     #[test]
