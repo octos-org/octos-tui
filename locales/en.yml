@@ -572,6 +572,54 @@ status:
   session_hydrated: "Session hydrated: %{summary}"
   review_started: "Review started: %{count} specialist(s) via %{backend}"
   review_not_accepted: "Review request was not accepted"
+  # Activity-log titles (the title column of the activity feed)
+  activity_code_review: "code review"
+  activity_local_profile: "local profile"
+  activity_mcp_config: "mcp config"
+  activity_pending_approvals: "pending approvals"
+  activity_pending_question: "pending question"
+  activity_provider_catalog: "provider catalog"
+  activity_skill_registry: "skill registry"
+  activity_permission_profile_mismatch: "permission profile mismatch"
+  activity_runtime_status: "runtime status"
+  activity_tool_config: "tool config"
+  activity_recovery_suggestion: "Recovery suggestion"
+  activity_agent_output: "agent output"
+  activity_agent_artifacts: "agent artifacts"
+  activity_session_goal: "session goal"
+  activity_context_compacted: "context compacted"
+  # Local-command activity titles (slash-name kept literal)
+  local_stop: "local /stop"
+  local_ps: "local /ps"
+  local_slash_command: "local slash command"
+  # Review / goal / staged-message status lines
+  cannot_start_review_active_turn: "Cannot start review while a turn is active"
+  server_clamped_onboarding_choice: "Server clamped or rejected the staged onboarding choice."
+  goal_clear_requested: "Goal clear requested"
+  submitted_staged_message: "Submitted staged message"
+  hint_registered_command: "a registered command"
+  provider_test_in_progress: "Provider test already in progress"
+  provider_save_in_progress: "Provider save already in progress"
+  # Usage help for slash commands
+  usage_onboard: "Usage: /onboard [name|username|email|create-profile|profile|select|family|model|route|base-url|api-key-env|key|send-code|verify|catalog|save|test|finish|reset]"
+  usage_login: "Usage: /login [email <address>|send-code [email]|code <otp>|verify [otp]|status|me|logout]"
+  usage_provider: "Usage: /provider [catalog|list|select <family_id> <model_id> <route_id> [base_url] [api_key_env]|family|model|route|base-url|api-key-env|api-type|key|test|save|add-fallback]"
+  unknown_permission_profile_mode: "Unknown permission profile mode '%{mode}'. Use: default, read-only, workspace-write, workspace-write-never, full-access, or clear."
+  # Tool-failure recovery hints (shown in the status line + activity feed)
+  recovery_npm_dns: "npm registry DNS failed; retry with an alternate registry, fix DNS/network, or use a local scaffold"
+  recovery_command_timeout: "command timed out; narrow the command, add a timeout, or ask for missing context"
+  recovery_permission_blocked: "permission blocked; ask for the exact permission/escalation or choose a writable path"
+  recovery_network_failed: "network access failed; ask for network/proxy/registry permission or use an offline fallback"
+  recovery_search_restricted: "search/fetch is restricted; ask for provider configuration or proceed with an explicit offline caveat"
+  # Staged diff-hunk context prompt (inserted into the composer / sent to the agent)
+  diff_hunk_prompt: "Use this selected diff hunk as context for the next coding turn.\nfile: %{path}\nstatus: %{status}\nhunk: %{hunk}\n```diff\n"
+  # Turn-completion fallback "Session Summary" assistant cards
+  summary_completed_no_answer: "Session Summary\n- Result: Turn completed, but the TUI did not receive a final assistant answer.\n- Activity: %{count} action(s) recorded.\n- Files changed: %{files}.\n- Validation: %{validation}.\n- Risks / follow-up: Review the activity above and continue the turn if the requested answer is incomplete."
+  summary_partial_answer: "Session Summary\n- Result: Turn completed, but the TUI only received a partial live answer.\n- Activity: %{count} action(s) recorded.\n- Files changed: %{files}.\n- Validation: %{validation}.\n- Risks / follow-up: The server may have persisted a fuller answer; continue if the visible answer is incomplete."
+  summary_failed: "Session Summary\n- Result: Turn failed before producing a final answer.\n- Error: %{code}: %{message}\n- Activity: %{count} action(s) recorded.\n- Failures: %{failed}.\n- Risks / follow-up: Fix the error above or continue the turn with a more specific instruction."
+  summary_none_observed: "none observed"
+  summary_not_reported: "not reported"
+  summary_none_recorded: "none recorded"
 
 # --- menu chrome + command descriptions (full i18n pass) ---
 command:

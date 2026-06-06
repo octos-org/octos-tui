@@ -912,7 +912,7 @@ impl Store {
                 if !had_active_turn {
                     self.push_local_activity(
                         ActivityKind::Warning,
-                        "local /stop",
+                        t!("status.local_stop").into_owned(),
                         t!("status.no_active_turn").into_owned(),
                         Some(t!("status.nothing_sent_to_backend").into_owned()),
                     );
@@ -3135,7 +3135,12 @@ impl Store {
         self.state.focus = FocusPane::Tasks;
         self.state.status = status.clone();
         self.state.scroll_transcript_to_latest();
-        self.push_local_activity(ActivityKind::Progress, "local /ps", status, Some(detail));
+        self.push_local_activity(
+            ActivityKind::Progress,
+            t!("status.local_ps").into_owned(),
+            status,
+            Some(detail),
+        );
     }
 
     fn show_unknown_slash_command(&mut self, command: &str, draft: &str) {
@@ -3149,7 +3154,7 @@ impl Store {
         self.state.status = status.clone();
         self.push_local_activity(
             ActivityKind::Warning,
-            "local slash command",
+            t!("status.local_slash_command").into_owned(),
             status,
             Some(t!("status.ignored_input", draft = draft).into_owned()),
         );
@@ -3165,7 +3170,7 @@ impl Store {
         self.state.status = status.clone();
         self.push_local_activity(
             ActivityKind::Warning,
-            "local slash command",
+            t!("status.local_slash_command").into_owned(),
             status,
             Some(t!("status.command_gate_failed").into_owned()),
         );
@@ -3218,7 +3223,7 @@ impl Store {
 
     fn review_start_command(&mut self, inline_args: &str) -> Option<AppUiCommand> {
         if self.state.active_turn().is_some() {
-            self.state.status = "Cannot start review while a turn is active".into();
+            self.state.status = t!("status.cannot_start_review_active_turn").into_owned();
             return None;
         }
         if !self.require_appui_feature(crate::model::APPUI_FEATURE_REVIEW_START_V1) {
@@ -3238,7 +3243,7 @@ impl Store {
         self.state.push_activity(
             ActivityItem::new(
                 ActivityKind::Progress,
-                "code review",
+                t!("status.activity_code_review").into_owned(),
                 t!("status.review_requested").into_owned(),
             )
             .with_turn(turn_id.clone()),
@@ -3877,7 +3882,7 @@ impl Store {
                 self.state.onboarding.last_message = Some(event.message.clone());
                 self.state.push_activity(ActivityItem::new(
                     ActivityKind::Progress,
-                    "local profile",
+                    t!("status.activity_local_profile").into_owned(),
                     event.message.clone(),
                 ));
                 self.state.status = event.message;
@@ -4689,7 +4694,7 @@ impl Store {
         self.state.mcp_config_catalog = Some(event.result);
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
-            "mcp config",
+            t!("status.activity_mcp_config").into_owned(),
             event.message.clone(),
         ));
         self.state.status = event.message;
@@ -4698,7 +4703,7 @@ impl Store {
     fn apply_mcp_config_mutation_event(&mut self, event: McpConfigMutationClientEvent) {
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
-            "mcp config",
+            t!("status.activity_mcp_config").into_owned(),
             event.message.clone(),
         ));
         self.state.status = event.message;
@@ -4865,12 +4870,16 @@ impl Store {
             t!("status.review_not_accepted").into_owned()
         };
         self.state.push_activity(
-            ActivityItem::new(ActivityKind::Progress, "code review", status.clone())
-                .with_turn(result.turn_id.clone())
-                .with_detail(format!(
-                    "workflow={workflow}, session={}",
-                    result.session_id
-                )),
+            ActivityItem::new(
+                ActivityKind::Progress,
+                t!("status.activity_code_review").into_owned(),
+                status.clone(),
+            )
+            .with_turn(result.turn_id.clone())
+            .with_detail(format!(
+                "workflow={workflow}, session={}",
+                result.session_id
+            )),
         );
         if result.accepted {
             self.state.set_run_state_in_progress();
@@ -4900,7 +4909,7 @@ impl Store {
         self.state.push_activity(
             ActivityItem::new(
                 ActivityKind::Approval,
-                "pending approvals",
+                t!("status.activity_pending_approvals").into_owned(),
                 t!("status.pending_approval_count", count = count).into_owned(),
             )
             .with_turn(event.turn_id.clone())
@@ -4934,8 +4943,12 @@ impl Store {
         };
         let title = event.title.clone();
         self.state.push_activity(
-            ActivityItem::new(ActivityKind::Approval, "pending question", title.clone())
-                .with_turn(event.turn_id.clone()),
+            ActivityItem::new(
+                ActivityKind::Approval,
+                t!("status.activity_pending_question").into_owned(),
+                title.clone(),
+            )
+            .with_turn(event.turn_id.clone()),
         );
         let mut picker = UserQuestionPickerState::from_event(event);
         picker.visible = self.state.user_question_auto_open;
@@ -4948,7 +4961,7 @@ impl Store {
         self.state.profile_llm_catalog = Some(event.result);
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
-            "provider catalog",
+            t!("status.activity_provider_catalog").into_owned(),
             event.message.clone(),
         ));
         self.state.status = event.message;
@@ -5104,7 +5117,7 @@ impl Store {
         self.state.profile_skill_registry = Some(event.result);
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
-            "skill registry",
+            t!("status.activity_skill_registry").into_owned(),
             event.message.clone(),
         ));
         self.state.status = event.message;
@@ -5149,16 +5162,16 @@ impl Store {
                 self.state.push_activity(
                     ActivityItem::new(
                         ActivityKind::Warning,
-                        "permission profile mismatch",
+                        t!("status.activity_permission_profile_mismatch").into_owned(),
                         reason.clone(),
                     )
-                    .with_detail("Server clamped or rejected the staged onboarding choice."),
+                    .with_detail(t!("status.server_clamped_onboarding_choice").into_owned()),
                 );
             }
         }
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
-            "runtime status",
+            t!("status.activity_runtime_status").into_owned(),
             message.clone(),
         ));
         self.state.status = message;
@@ -5184,7 +5197,7 @@ impl Store {
         self.state.tool_config_catalog = Some(event.result);
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
-            "tool config",
+            t!("status.activity_tool_config").into_owned(),
             event.message.clone(),
         ));
         self.state.status = event.message;
@@ -5193,7 +5206,7 @@ impl Store {
     fn apply_tool_config_mutation_event(&mut self, event: ToolConfigMutationClientEvent) {
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
-            "tool config",
+            t!("status.activity_tool_config").into_owned(),
             event.message.clone(),
         ));
         self.state.status = event.message;
@@ -5518,7 +5531,7 @@ impl Store {
                         self.state.push_activity(
                             ActivityItem::new(
                                 ActivityKind::Warning,
-                                "Recovery suggestion",
+                                t!("status.activity_recovery_suggestion").into_owned(),
                                 recovery.clone(),
                             )
                             .with_turn(event.turn_id)
@@ -5683,7 +5696,7 @@ impl Store {
                 self.state.push_activity(
                     ActivityItem::new(
                         ActivityKind::Progress,
-                        "agent output",
+                        t!("status.activity_agent_output").into_owned(),
                         format!("Agent output refreshed: {} ({bytes} bytes)", event.agent_id),
                     )
                     .with_detail(compact_preview(&event.text)),
@@ -5699,7 +5712,7 @@ impl Store {
                 );
                 self.state.push_activity(ActivityItem::new(
                     ActivityKind::Tool,
-                    "agent artifacts",
+                    t!("status.activity_agent_artifacts").into_owned(),
                     format!("{count} artifact(s) refreshed for {}", event.agent_id),
                 ));
                 None
@@ -5714,7 +5727,7 @@ impl Store {
                 );
                 self.state.push_activity(ActivityItem::new(
                     ActivityKind::Progress,
-                    "session goal",
+                    t!("status.activity_session_goal").into_owned(),
                     status_label,
                 ));
                 self.state.status = format!("Goal updated: {objective}");
@@ -5727,9 +5740,9 @@ impl Store {
                         .set_session_goal(&event.session_id, None, Some(actor));
                 }
                 self.state.status = if event.cleared {
-                    "Goal cleared".into()
+                    t!("status.goal_cleared").into_owned()
                 } else {
-                    "Goal clear requested".into()
+                    t!("status.goal_clear_requested").into_owned()
                 };
                 None
             }
@@ -5842,7 +5855,7 @@ impl Store {
                     });
                     let mut notice = ActivityItem::new(
                         ActivityKind::Progress,
-                        "context compacted",
+                        t!("status.activity_context_compacted").into_owned(),
                         format!(
                             "{} → {} tokens",
                             humanize_token_count(before),
@@ -6529,7 +6542,8 @@ impl Store {
         }
 
         let prompt = self.state.pending_messages[0].clone();
-        let command = self.start_prompt_turn(prompt, "Submitted staged message");
+        let command =
+            self.start_prompt_turn(prompt, t!("status.submitted_staged_message").into_owned());
         if command.is_some() {
             self.state.pending_messages.remove(0);
         }
@@ -6641,31 +6655,41 @@ impl Store {
 
     fn turn_completion_fallback_message(&self, turn_id: &TurnId) -> String {
         let summary = self.summarize_turn_activity(turn_id);
-        format!(
-            "Session Summary\n- Result: Turn completed, but the TUI did not receive a final assistant answer.\n- Activity: {} action(s) recorded.\n- Files changed: {}.\n- Validation: {}.\n- Risks / follow-up: Review the activity above and continue the turn if the requested answer is incomplete.",
-            summary.action_count,
-            format_limited_list(&summary.files_changed, "none observed"),
-            format_limited_list(&summary.validation, "not reported"),
+        t!(
+            "status.summary_completed_no_answer",
+            count = summary.action_count,
+            files =
+                format_limited_list(&summary.files_changed, &t!("status.summary_none_observed")),
+            validation =
+                format_limited_list(&summary.validation, &t!("status.summary_not_reported")),
         )
+        .into_owned()
     }
 
     fn turn_partial_completion_fallback_message(&self, turn_id: &TurnId) -> String {
         let summary = self.summarize_turn_activity(turn_id);
-        format!(
-            "Session Summary\n- Result: Turn completed, but the TUI only received a partial live answer.\n- Activity: {} action(s) recorded.\n- Files changed: {}.\n- Validation: {}.\n- Risks / follow-up: The server may have persisted a fuller answer; continue if the visible answer is incomplete.",
-            summary.action_count,
-            format_limited_list(&summary.files_changed, "none observed"),
-            format_limited_list(&summary.validation, "not reported"),
+        t!(
+            "status.summary_partial_answer",
+            count = summary.action_count,
+            files =
+                format_limited_list(&summary.files_changed, &t!("status.summary_none_observed")),
+            validation =
+                format_limited_list(&summary.validation, &t!("status.summary_not_reported")),
         )
+        .into_owned()
     }
 
     fn turn_error_fallback_message(&self, turn_id: &TurnId, code: &str, message: &str) -> String {
         let summary = self.summarize_turn_activity(turn_id);
-        let failed = format_limited_list(&summary.failures, "none recorded");
-        format!(
-            "Session Summary\n- Result: Turn failed before producing a final answer.\n- Error: {code}: {message}\n- Activity: {} action(s) recorded.\n- Failures: {failed}.\n- Risks / follow-up: Fix the error above or continue the turn with a more specific instruction.",
-            summary.action_count,
+        let failed = format_limited_list(&summary.failures, &t!("status.summary_none_recorded"));
+        t!(
+            "status.summary_failed",
+            code = code,
+            message = message,
+            count = summary.action_count,
+            failed = failed,
         )
+        .into_owned()
     }
 
     fn summarize_turn_activity(&self, turn_id: &TurnId) -> TurnActivitySummary {
@@ -6793,7 +6817,7 @@ fn slash_command_try_hint(ctx: &crate::menu::AvailabilityContext<'_>) -> String 
         .map(|visible| visible.command.slash_name())
         .collect::<Vec<_>>();
     match names.len() {
-        0 => "a registered command".into(),
+        0 => t!("status.hint_registered_command").into_owned(),
         1 => names[0].clone(),
         2 => format!("{} or {}", names[0], names[1]),
         _ => {
@@ -6895,9 +6919,7 @@ fn parse_onboarding_permission_mode(
             }
         }
         other => {
-            return Err(format!(
-                "Unknown permission profile mode '{other}'. Use: default, read-only, workspace-write, workspace-write-never, full-access, or clear."
-            ));
+            return Err(t!("status.unknown_permission_profile_mode", mode = other).into_owned());
         }
     };
     Ok(Some(update))
@@ -6978,8 +7000,8 @@ fn permission_profile_stamp_mismatch(
 
 fn onboarding_pending_status(pending: OnboardingProviderPending) -> String {
     match pending {
-        OnboardingProviderPending::Test => "Provider test already in progress".into(),
-        OnboardingProviderPending::Save => "Provider save already in progress".into(),
+        OnboardingProviderPending::Test => t!("status.provider_test_in_progress").into_owned(),
+        OnboardingProviderPending::Save => t!("status.provider_save_in_progress").into_owned(),
     }
 }
 
@@ -7057,16 +7079,15 @@ fn stdio_command_cwd(command: &str) -> Option<String> {
 }
 
 fn onboarding_usage() -> String {
-    "Usage: /onboard [name|username|email|create-profile|profile|select|family|model|route|base-url|api-key-env|key|send-code|verify|catalog|save|test|finish|reset]".into()
+    t!("status.usage_onboard").into_owned()
 }
 
 fn login_usage() -> String {
-    "Usage: /login [email <address>|send-code [email]|code <otp>|verify [otp]|status|me|logout]"
-        .into()
+    t!("status.usage_login").into_owned()
 }
 
 fn provider_usage() -> String {
-    "Usage: /provider [catalog|list|select <family_id> <model_id> <route_id> [base_url] [api_key_env]|family|model|route|base-url|api-key-env|api-type|key|test|save|add-fallback]".into()
+    t!("status.usage_provider").into_owned()
 }
 
 fn skills_usage() -> String {
@@ -7130,12 +7151,12 @@ fn parse_skill_install_args(input: &str) -> Result<(String, Option<String>, bool
         } else if repo.is_none() {
             repo = Some(part.to_owned());
         } else {
-            return Err("Usage: /skills install <repo> [--branch <branch>] [--force]".into());
+            return Err(t!("status.usage_skills_install").into_owned());
         }
     }
 
     let Some(repo) = repo.and_then(non_empty_string) else {
-        return Err("Usage: /skills install <repo> [--branch <branch>] [--force]".into());
+        return Err(t!("status.usage_skills_install").into_owned());
     };
     Ok((repo, branch, force))
 }
@@ -7444,27 +7465,18 @@ fn tool_invocation_detail(tool_name: &str, arguments: &Value) -> Option<String> 
 fn tool_failure_recovery_hint(tool_name: &str, output_preview: Option<&str>) -> Option<String> {
     let output = output_preview?.to_ascii_lowercase();
     if output.contains("enotfound") && output.contains("registry.npmjs.org") {
-        return Some(
-            "npm registry DNS failed; retry with an alternate registry, fix DNS/network, or use a local scaffold"
-                .into(),
-        );
+        return Some(t!("status.recovery_npm_dns").into_owned());
     }
 
     if output.contains("command timed out") {
-        return Some(
-            "command timed out; narrow the command, add a timeout, or ask for missing context"
-                .into(),
-        );
+        return Some(t!("status.recovery_command_timeout").into_owned());
     }
 
     if output.contains("permission denied")
         || output.contains("operation not permitted")
         || output.contains("eacces")
     {
-        return Some(
-            "permission blocked; ask for the exact permission/escalation or choose a writable path"
-                .into(),
-        );
+        return Some(t!("status.recovery_permission_blocked").into_owned());
     }
 
     if output.contains("could not resolve host")
@@ -7472,19 +7484,13 @@ fn tool_failure_recovery_hint(tool_name: &str, output_preview: Option<&str>) -> 
         || output.contains("network request")
         || output.contains("timeout")
     {
-        return Some(
-            "network access failed; ask for network/proxy/registry permission or use an offline fallback"
-                .into(),
-        );
+        return Some(t!("status.recovery_network_failed").into_owned());
     }
 
     if matches!(tool_name, "web_search" | "web_fetch" | "deep_search")
         && (output.contains("restricted") || output.contains("not configured"))
     {
-        return Some(
-            "search/fetch is restricted; ask for provider configuration or proceed with an explicit offline caveat"
-                .into(),
-        );
+        return Some(t!("status.recovery_search_restricted").into_owned());
     }
 
     None
@@ -7511,10 +7517,13 @@ fn diff_hunk_context_prompt(context: &DiffHunkContext) -> String {
         Some(old_path) if old_path != &context.path => format!("{old_path} -> {}", context.path),
         _ => context.path.clone(),
     };
-    let mut text = format!(
-        "Use this selected diff hunk as context for the next coding turn.\nfile: {path}\nstatus: {}\nhunk: {}\n```diff\n",
-        context.file_status, context.hunk_header
-    );
+    let mut text = t!(
+        "status.diff_hunk_prompt",
+        path = path,
+        status = context.file_status,
+        hunk = context.hunk_header
+    )
+    .into_owned();
     for line in &context.lines {
         text.push_str(diff_context_line_prefix(&line.kind));
         text.push_str(&line.content);
