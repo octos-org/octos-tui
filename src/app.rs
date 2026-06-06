@@ -3629,6 +3629,12 @@ fn render_harness_status_row(frame: &mut Frame<'_>, app: &AppState, palette: Pal
         let percent = (ratio * 100.0).round() as u16;
         let gauge = LineGauge::default()
             .ratio(ratio)
+            // Base style backs the label cells: `LineGauge` paints the whole
+            // area with `self.style` before writing the (unstyled) label, so
+            // without a surface bg here the `ctx ~N%` label renders on the raw
+            // terminal background — a mismatched block to the right of the
+            // harness row, just above the composer. Keep it on `surface`.
+            .style(Style::default().fg(palette.muted).bg(palette.surface))
             .label(format!("ctx ~{percent}%"))
             .filled_style(Style::default().fg(palette.accent).bg(palette.surface))
             .unfilled_style(Style::default().fg(palette.frame).bg(palette.surface));
@@ -6380,6 +6386,67 @@ mod tests {
             cursor,
             composer_cursor_position(&app, Rect::new(0, 36, 120, 5)).expect("cursor")
         );
+    }
+
+    /// Regression: the harness-row context `LineGauge` label (`ctx ~N%`) must
+    /// inherit the theme `surface` background. `LineGauge` paints its whole
+    /// area with the widget base style *before* writing the (unstyled) label,
+    /// so without `.style(bg: surface)` the label cells fall back to the raw
+    /// terminal background — a mismatched solid block on the right of the
+    /// harness row, directly above the composer.
+    #[test]
+    fn harness_gauge_label_inherits_surface_background() {
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let mut app = autonomy_app_state();
+        let session_id = SessionKey("local:test".into());
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 1,
+                pending_continuations: 0,
+                phase: Some("orchestrating".into()),
+            },
+        );
+        app.context_lifecycle_mut(&session_id).state = Some(crate::model::ContextLifecycleState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: String::new(),
+            item_count: 10,
+            token_estimate: 15_360,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        });
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let buffer = rendered_buffer_with_size(&app, palette, 120, 42);
+
+        // The gauge label is rendered on the harness row (the `ctx ~N%` text).
+        let label_style = style_for_text(&buffer, "ctx ~").expect("gauge label rendered");
+        assert_eq!(
+            label_style.bg,
+            Some(palette.surface),
+            "gauge label must use the surface bg, not the raw terminal background"
+        );
+
+        // The whole gauge column (label + filled/unfilled line) must be a single
+        // contiguous surface-backed band — no stray bg=Reset cells.
+        let rows = rendered_rows(&buffer);
+        let gauge_row = row_index_containing(&rows, "ctx ~");
+        let width = usize::from(buffer.area.width);
+        let row_start = gauge_row * width;
+        let first_label_col = rows[gauge_row].find("ctx ~").expect("label col");
+        for x in first_label_col..width {
+            let cell = &buffer.content[row_start + x];
+            assert_eq!(
+                cell.bg,
+                palette.surface,
+                "gauge cell at x={x} (sym {:?}) leaked a non-surface background",
+                cell.symbol()
+            );
+        }
     }
 
     #[test]
