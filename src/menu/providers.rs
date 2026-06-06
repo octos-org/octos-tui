@@ -61,6 +61,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::Login,
         Provider::Theme,
         Provider::Thinking,
+        Provider::Lang,
         Provider::StatusLine,
         Provider::Title,
         Provider::Keymap,
@@ -90,6 +91,7 @@ enum Provider {
     Login,
     Theme,
     Thinking,
+    Lang,
     StatusLine,
     Title,
     Keymap,
@@ -114,6 +116,7 @@ impl MenuProvider for Provider {
             Self::Login => MENU_LOGIN,
             Self::Theme => MENU_THEME,
             Self::Thinking => crate::menu::registry::MENU_THINKING,
+            Self::Lang => crate::menu::registry::MENU_LANG,
             Self::StatusLine => MENU_STATUS_LINE,
             Self::Title => MENU_TITLE,
             Self::Keymap => MENU_KEYMAP,
@@ -138,6 +141,7 @@ impl MenuProvider for Provider {
             Self::Login => login_menu(ctx),
             Self::Theme => MenuBuildResult::Ready(theme_menu(ctx)),
             Self::Thinking => MenuBuildResult::Ready(thinking_menu(ctx)),
+            Self::Lang => MenuBuildResult::Ready(lang_menu(ctx)),
             Self::StatusLine => MenuBuildResult::Ready(status_line_menu(ctx)),
             Self::Title => MenuBuildResult::Ready(title_menu(ctx)),
             Self::Keymap => MenuBuildResult::Ready(keymap_menu()),
@@ -197,6 +201,45 @@ fn help_menu(ctx: &MenuContext<'_>) -> MenuSpec {
         // info (not actionable) and, with the two-pane split, its text collided
         // with the command column. Each command already carries its own inline
         // description, so the list renders full-width instead.
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    }
+}
+
+fn lang_menu(_ctx: &MenuContext<'_>) -> MenuSpec {
+    use crate::cli::Lang;
+    let current = rust_i18n::locale().to_string();
+    let items = [
+        ("en", "English", Lang::En),
+        ("zh", "中文 (Chinese)", Lang::Zh),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(idx, (id, label, lang))| {
+        let mut state = MenuItemState::default();
+        state.current = current.as_str() == lang.code();
+        let mut item = MenuItem::new(
+            id,
+            label,
+            MenuAction::Local(LocalAction::SetLanguageCode(lang)),
+        )
+        .with_state(state);
+        if let Some(shortcut) = numeric_shortcut(idx) {
+            item = item.with_shortcut(shortcut);
+        }
+        item
+    })
+    .collect();
+
+    MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_LANG),
+        title: "Language".into(),
+        subtitle: Some("UI display language.".into()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some("Enter apply | Esc close".into()),
         preview: None,
         mode: MenuMode::SingleSelect,
     }

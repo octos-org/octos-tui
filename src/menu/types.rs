@@ -253,10 +253,13 @@ pub enum LocalAction {
     Skills,
     McpConfig,
     ToolConfig,
-    /// Switch the UI language at runtime (`/lang <code>`). The locale code is
-    /// taken from the command's inline args; the handler calls
-    /// `rust_i18n::set_locale` and the next frame repaints in the new language.
+    /// Switch the UI language at runtime (`/lang <code>` inline, or `/lang` with
+    /// no arg to open the language selection menu). The locale code is taken from
+    /// the command's inline args; the handler calls `rust_i18n::set_locale` and
+    /// the next frame repaints in the new language.
     SetLanguage,
+    /// Set the UI language to a specific value from the `/lang` selection menu.
+    SetLanguageCode(crate::cli::Lang),
     /// Set the per-session reasoning/thinking effort
     /// (`/thinking <low|medium|high|max|default>`). The level is taken from the
     /// command's inline args, stored on `AppState`, and attached to every

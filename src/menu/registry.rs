@@ -25,6 +25,8 @@ pub const MENU_STATUS: &str = "status";
 pub const MENU_THEME: &str = "theme";
 /// Reasoning/thinking effort selection menu (opened by `/thinking` with no arg).
 pub const MENU_THINKING: &str = "thinking";
+/// UI language selection menu (opened by `/lang` with no arg).
+pub const MENU_LANG: &str = "lang";
 pub const MENU_STATUS_LINE: &str = "statusline";
 pub const MENU_TITLE: &str = "title";
 pub const MENU_KEYMAP: &str = "keymap";

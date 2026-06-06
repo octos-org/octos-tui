@@ -952,6 +952,7 @@ impl Store {
             LocalAction::McpConfig => self.dispatch_mcp_inline(inline_args.unwrap_or_default()),
             LocalAction::ToolConfig => self.dispatch_tools_inline(inline_args.unwrap_or_default()),
             LocalAction::SetLanguage => self.dispatch_set_language(inline_args.unwrap_or_default()),
+            LocalAction::SetLanguageCode(lang) => self.dispatch_set_language_code(lang),
             LocalAction::SetThinking => self.dispatch_set_thinking(inline_args.unwrap_or_default()),
             LocalAction::SetThinkingLevel(level) => self.dispatch_set_thinking_level(level),
             LocalAction::Custom(name) => {
@@ -966,29 +967,34 @@ impl Store {
     /// changing the locale. On success `rust_i18n::set_locale` flips the
     /// process-global locale and the next render repaints the UI; the
     /// confirmation is itself rendered in the newly-selected language.
+    /// `/lang` with no arg opens the language selection menu; with an arg
+    /// (`en`/`zh`/a `LANG`-style value) it sets the locale inline as a shortcut.
     fn dispatch_set_language(&mut self, inline_args: &str) -> Option<AppUiCommand> {
         let arg = inline_args.trim();
         if arg.is_empty() {
-            self.state.status =
-                t!("lang.usage", current = rust_i18n::locale().to_string()).to_string();
+            self.open_menu(MenuId::from(crate::menu::registry::MENU_LANG));
             return None;
         }
         match crate::cli::Lang::from_env_value(arg) {
-            Some(lang) => {
-                rust_i18n::set_locale(lang.code());
-                // Rebuild any open menu so it repaints in the new language now;
-                // the cached `active_menu` spec was built under the old locale.
-                // (The status line + composer placeholder are rebuilt every
-                // frame, so they switch without this.)
-                self.refresh_active_menu_if_open();
-                self.state.status = t!("lang.switched").to_string();
-                None
-            }
+            Some(lang) => self.dispatch_set_language_code(lang),
             None => {
                 self.state.status = t!("lang.unknown", value = arg.to_string()).to_string();
                 None
             }
         }
+    }
+
+    /// Apply a specific UI language. Shared by the inline `/lang <code>` shortcut
+    /// and the `/lang` selection menu.
+    fn dispatch_set_language_code(&mut self, lang: crate::cli::Lang) -> Option<AppUiCommand> {
+        rust_i18n::set_locale(lang.code());
+        // Rebuild any open menu so it repaints in the new language now; the
+        // cached `active_menu` spec was built under the old locale. (The status
+        // line + composer placeholder are rebuilt every frame, so they switch
+        // without this.)
+        self.refresh_active_menu_if_open();
+        self.state.status = t!("lang.switched").to_string();
+        None
     }
 
     /// `/thinking <low|medium|high|max|default>` — set the per-session reasoning
@@ -7516,12 +7522,8 @@ mod tests {
         let before = rust_i18n::locale().to_string();
         let mut store = store_with_empty_session();
 
+        // Empty arg now opens the language selection menu (no inline switch).
         store.dispatch_set_language("");
-        assert!(
-            store.state.status.contains("/lang"),
-            "empty arg should show usage, got: {}",
-            store.state.status
-        );
         assert_eq!(rust_i18n::locale().to_string(), before);
 
         store.dispatch_set_language("klingon");
@@ -9825,7 +9827,10 @@ mod tests {
         }))
         .expect("session/opened payload");
         store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
-        assert_eq!(store.state.session_reasoning_effort.get(&sid), Some(&L::High));
+        assert_eq!(
+            store.state.session_reasoning_effort.get(&sid),
+            Some(&L::High)
+        );
 
         // Reopening with no persisted effort clears the client override.
         let opened2: SessionOpened = serde_json::from_value(serde_json::json!({
