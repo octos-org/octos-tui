@@ -247,6 +247,9 @@ codex, claude, slate, solarized, terminal
 `terminal` keeps foreground/background on your terminal defaults where ratatui
 allows it, using only restrained ANSI colors for borders, accents, and errors.
 
+Set the palette at launch with `--theme <name>`, or switch live with `/theme`
+(a `*`-marked menu; the change repaints immediately and survives reconnects).
+
 ### In-session keys and slash commands
 
 ```text
@@ -255,17 +258,31 @@ c       stage the selected hunk as next-turn context
 ```
 
 ```text
-/help    local slash-command help
-/ps      show local task/process status and focus the Tasks pane
-/stop    interrupt the active turn (or report locally if none is active)
-/setup   reopen the onboarding wizard
-/model   browse the server-returned profile models / catalog
-/lang    switch the UI language at runtime (e.g. /lang zh)
-/onboard set onboarding fields inline (name, username, email, key, ...)
+/help     local slash-command help
+/ps       show local task/process status and focus the Tasks pane
+/stop     interrupt the active turn (or report locally if none is active)
+/setup    reopen the onboarding wizard
+/model    browse the server-returned profile models / catalog
+/theme    switch the TUI palette at runtime (menu, or /theme claude)
+/lang     switch the UI language (menu, or /lang zh) — English / 中文
+/thinking set reasoning effort for thinking models, per session (menu, or /thinking high)
+/onboard  set onboarding fields inline (name, username, email, key, ...)
 ```
+
+`/model`, `/theme`, `/lang`, and `/thinking` open a selection menu when run with
+no argument (or apply inline with an arg). In every selection menu the **active
+choice is marked with a leading `*`** (distinct from the `>` navigation cursor).
 
 Unknown slash commands are handled locally with a warning and are not sent to
 the model.
+
+### Languages (i18n)
+
+The UI is fully localized in **English** and **Simplified Chinese (中文)** — menus,
+the command palette, the onboarding wizard, transcript/status surfaces. Pick the
+language at launch with `--lang {en,zh}` (or `OCTOS_LANG` / `LANG`), or switch at
+runtime with `/lang` (a `*`-marked menu) — no restart needed. English is the
+source/fallback locale, so any untranslated string falls back to English.
 
 ### Environment variables
 
