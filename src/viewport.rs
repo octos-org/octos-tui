@@ -16,7 +16,7 @@
 
 use ratatui::text::Line;
 
-use crate::app::{self, CommittedFingerprint};
+use crate::app::{self, CommittedFingerprint, LiveTurnFinalization};
 use crate::model::AppState;
 use crate::theme::Palette;
 
@@ -28,6 +28,11 @@ pub struct ScrollbackTracker {
     last: CommittedFingerprint,
     /// Number of committed messages already flushed for `last.session_id`.
     flushed_messages: usize,
+    /// Active-turn content already streamed to scrollback while still live.
+    active_live: Option<LiveTurnFinalization>,
+    /// Recently completed live-turn watermarks kept long enough to dedupe the
+    /// eventual committed assistant message / archived activity log.
+    completed_live: Vec<LiveTurnFinalization>,
 }
 
 /// What the event loop should do with scrollback before drawing the viewport.
@@ -40,6 +45,8 @@ pub struct ScrollbackUpdate {
     /// scrollback, but it should treat `lines_to_insert` as a fresh full
     /// re-flush of the (now-current) committed history rather than an append.
     pub reset: bool,
+    /// Watermark to use when rendering the inline live tail for this draw.
+    pub live_tail_finalization: Option<LiveTurnFinalization>,
 }
 
 impl ScrollbackTracker {
@@ -56,46 +63,159 @@ impl ScrollbackTracker {
         wrap_width: usize,
     ) -> ScrollbackUpdate {
         let fingerprint = app::committed_messages_fingerprint(app);
+        let (previous_live, next_live) = self.reconcile_active_live(app);
+        let mut lines_to_insert = Vec::new();
+        let mut reset = false;
 
-        // No active session, or no committed messages yet → nothing to flush.
+        // No active session, or no committed messages yet → no committed
+        // history to flush. Live-turn deltas below may still insert lines.
         if fingerprint.message_count == 0 {
             // Keep the session id so a later first message is treated as an
             // append, not a reset (avoids a spurious reset on the first flush).
             self.last = fingerprint;
             self.flushed_messages = 0;
-            return ScrollbackUpdate::default();
+        } else {
+            // A fresh tracker (nothing flushed yet) treats its first flush as an
+            // append of the whole current history, not a reset — there is no
+            // prior scrollback to invalidate.
+            let first_flush = self.flushed_messages == 0 && self.last.session_id.is_empty();
+            let is_extension = first_flush
+                || (fingerprint.session_id == self.last.session_id
+                    && fingerprint.message_count >= self.flushed_messages
+                    && is_prefix_preserved(&self.last, &fingerprint, self.flushed_messages));
+            let covered_late_activity = self.covered_late_activity_arrived(app, &fingerprint);
+
+            if is_extension {
+                // Append only the messages we have not flushed yet. If a live
+                // turn was already streamed into scrollback, skip the covered
+                // prefix when the committed assistant/log catches up.
+                let committed_start = self.flushed_messages;
+                lines_to_insert.extend(app::finalized_history_lines_range_dedup_live(
+                    app,
+                    palette,
+                    wrap_width,
+                    committed_start,
+                    &self.completed_live,
+                ));
+                self.flushed_messages = fingerprint.message_count;
+                self.last = fingerprint;
+                self.refresh_completed_live_coverage(app, Some(committed_start));
+            } else if covered_late_activity {
+                lines_to_insert.extend(app::finalized_late_activity_lines_for_coverages(
+                    app,
+                    palette,
+                    wrap_width,
+                    &self.completed_live,
+                ));
+                self.last = fingerprint;
+                self.refresh_completed_live_coverage(app, None);
+            } else {
+                // Discontinuity: session switch or hydrate replaced history. We
+                // cannot remove already-written scrollback, but we re-flush the
+                // full current history so the up-to-date content is selectable
+                // below the (now-stale) prior block. Rare (reconnect / session
+                // switch).
+                lines_to_insert.extend(app::finalized_history_lines(app, palette, wrap_width));
+                self.flushed_messages = fingerprint.message_count;
+                self.last = fingerprint;
+                self.completed_live.clear();
+                reset = true;
+            }
         }
 
-        // A fresh tracker (nothing flushed yet) treats its first flush as an
-        // append of the whole current history, not a reset — there is no prior
-        // scrollback to invalidate.
-        let first_flush = self.flushed_messages == 0 && self.last.session_id.is_empty();
-        let is_extension = first_flush
-            || (fingerprint.session_id == self.last.session_id
-                && fingerprint.message_count >= self.flushed_messages
-                && is_prefix_preserved(&self.last, &fingerprint, self.flushed_messages));
+        if let Some(next) = next_live.as_ref() {
+            let baseline = previous_live
+                .clone()
+                .unwrap_or_else(|| LiveTurnFinalization {
+                    session_id: next.session_id.clone(),
+                    turn_id: next.turn_id.clone(),
+                    reply_flushed_text: String::new(),
+                    activity_flushed_items: 0,
+                    activity_flushed_keys: Vec::new(),
+                });
+            lines_to_insert.extend(app::finalized_live_turn_lines_between(
+                app, palette, wrap_width, &baseline, next,
+            ));
+        }
+        self.active_live = next_live.filter(LiveTurnFinalization::has_flushed_content);
 
-        if is_extension {
-            // Append only the messages we have not flushed yet.
-            let new_lines =
-                app::finalized_history_lines_range(app, palette, wrap_width, self.flushed_messages);
-            self.flushed_messages = fingerprint.message_count;
-            self.last = fingerprint;
-            ScrollbackUpdate {
-                lines_to_insert: new_lines,
-                reset: false,
+        ScrollbackUpdate {
+            lines_to_insert,
+            reset,
+            live_tail_finalization: self.active_live.clone(),
+        }
+    }
+
+    fn reconcile_active_live(
+        &mut self,
+        app: &AppState,
+    ) -> (Option<LiveTurnFinalization>, Option<LiveTurnFinalization>) {
+        let previous = self.active_live.take();
+        let matching_previous = match (previous, app.active_turn()) {
+            (Some(previous), Some((session_id, turn_id)))
+                if previous.matches_turn(session_id, turn_id) =>
+            {
+                Some(previous)
             }
+            (Some(previous), _) => {
+                self.archive_completed_live(previous);
+                None
+            }
+            (None, _) => None,
+        };
+        let next = app::next_live_turn_finalization(app, matching_previous.as_ref());
+        (matching_previous, next)
+    }
+
+    fn archive_completed_live(&mut self, finalization: LiveTurnFinalization) {
+        if !finalization.has_flushed_content() {
+            return;
+        }
+        if let Some(existing) = self.completed_live.iter_mut().find(|existing| {
+            existing.session_id == finalization.session_id
+                && existing.turn_id == finalization.turn_id
+        }) {
+            *existing = finalization;
         } else {
-            // Discontinuity: session switch or hydrate replaced history. We
-            // cannot remove already-written scrollback, but we re-flush the full
-            // current history so the up-to-date content is selectable below the
-            // (now-stale) prior block. Rare (reconnect / session switch).
-            let all_lines = app::finalized_history_lines(app, palette, wrap_width);
-            self.flushed_messages = fingerprint.message_count;
-            self.last = fingerprint;
-            ScrollbackUpdate {
-                lines_to_insert: all_lines,
-                reset: true,
+            self.completed_live.push(finalization);
+        }
+        const MAX_COMPLETED_LIVE_TURNS: usize = 8;
+        if self.completed_live.len() > MAX_COMPLETED_LIVE_TURNS {
+            let excess = self.completed_live.len() - MAX_COMPLETED_LIVE_TURNS;
+            self.completed_live.drain(0..excess);
+        }
+    }
+
+    fn covered_late_activity_arrived(
+        &self,
+        app: &AppState,
+        fingerprint: &CommittedFingerprint,
+    ) -> bool {
+        fingerprint.session_id == self.last.session_id
+            && fingerprint.message_count == self.flushed_messages
+            && fingerprint.message_count == self.last.message_count
+            && fingerprint.activity_log_count > self.last.activity_log_count
+            && self.completed_live.iter().any(|coverage| {
+                app::committed_activity_keys_for_live_finalization(app, coverage).is_some()
+            })
+    }
+
+    fn refresh_completed_live_coverage(&mut self, app: &AppState, reply_start: Option<usize>) {
+        for coverage in &mut self.completed_live {
+            if let Some(start) = reply_start
+                && app::committed_reply_matches_live_finalization(app, start, coverage)
+            {
+                coverage.reply_flushed_text.clear();
+            }
+            if let Some(committed_keys) =
+                app::committed_activity_keys_for_live_finalization(app, coverage)
+            {
+                for key in committed_keys {
+                    if !coverage.activity_flushed_keys.contains(&key) {
+                        coverage.activity_flushed_keys.push(key);
+                    }
+                }
+                coverage.activity_flushed_items = coverage.activity_flushed_keys.len();
             }
         }
     }

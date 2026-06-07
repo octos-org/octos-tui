@@ -7,7 +7,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use octos_core::ui_protocol::approval_kinds;
+use octos_core::{SessionKey, ui_protocol::approval_kinds};
 
 use crate::{
     menu::render as menu_render,
@@ -89,10 +89,57 @@ pub fn wants_fullscreen_overlay(app: &AppState) -> bool {
         || app.turn_state_detail.active
 }
 
+/// Watermarks for active-turn content that has already been written into native
+/// scrollback while the turn is still running. The inline viewport uses this to
+/// hide the same stable prefix so spinner ticks only repaint the live tail.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveTurnFinalization {
+    pub(crate) session_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) reply_flushed_text: String,
+    pub(crate) activity_flushed_items: usize,
+    pub(crate) activity_flushed_keys: Vec<String>,
+}
+
+impl LiveTurnFinalization {
+    fn new(session_id: &SessionKey, turn_id: &octos_core::ui_protocol::TurnId) -> Self {
+        Self {
+            session_id: session_id.0.clone(),
+            turn_id: turn_id.0.to_string(),
+            reply_flushed_text: String::new(),
+            activity_flushed_items: 0,
+            activity_flushed_keys: Vec::new(),
+        }
+    }
+
+    pub(crate) fn matches_turn(
+        &self,
+        session_id: &SessionKey,
+        turn_id: &octos_core::ui_protocol::TurnId,
+    ) -> bool {
+        self.session_id == session_id.0 && self.turn_id == turn_id.0.to_string()
+    }
+
+    pub(crate) fn has_flushed_content(&self) -> bool {
+        !self.reply_flushed_text.is_empty()
+            || self.activity_flushed_items > 0
+            || !self.activity_flushed_keys.is_empty()
+    }
+}
+
 /// Height (rows) the live inline viewport needs for the current chat state:
 /// the live transcript tail + menu + indicators + composer + status. Bounded so
 /// it never consumes the whole screen (history must stay visible in scrollback).
 pub fn live_ui_height(app: &AppState, width: u16, height: u16) -> u16 {
+    live_ui_height_with_finalization(app, width, height, None)
+}
+
+pub fn live_ui_height_with_finalization(
+    app: &AppState,
+    width: u16,
+    height: u16,
+    live_finalization: Option<&LiveTurnFinalization>,
+) -> u16 {
     let composer_height = composer_height_for_size(app, width, height);
     let active_menu = active_menu_surface(app);
     let menu_height = menu_height_hint(active_menu.as_ref(), width, height);
@@ -100,7 +147,7 @@ pub fn live_ui_height(app: &AppState, width: u16, height: u16) -> u16 {
     let harness_height = harness_status_height(app);
     let chrome = menu_height + autonomy_height + harness_height + composer_height + 1; // +1 status
 
-    let tail_height = live_tail_height(app, width, height);
+    let tail_height = live_tail_height_with_finalization(app, width, height, live_finalization);
     let total = chrome.saturating_add(tail_height);
 
     // Never let the live UI eat the whole screen: leave at least a few rows of
@@ -117,13 +164,23 @@ const LIVE_VIEWPORT_MIN_SCROLLBACK: u16 = 4;
 
 /// Desired height of the live transcript tail (in-flight / uncommitted content
 /// shown inside the viewport). Bounded; the bulk of history lives in scrollback.
-fn live_tail_height(app: &AppState, width: u16, height: u16) -> u16 {
+fn live_tail_height_with_finalization(
+    app: &AppState,
+    width: u16,
+    height: u16,
+    live_finalization: Option<&LiveTurnFinalization>,
+) -> u16 {
     if launch_banner_active(app) {
         // The empty-session launch banner wants a generous block.
         return height.saturating_sub(8).clamp(6, 16);
     }
     let wrap_width = usize::from(width.saturating_sub(2)).max(1);
-    let lines = live_tail_lines(app, Palette::for_theme(app.theme), wrap_width);
+    let lines = live_tail_lines_with_finalization(
+        app,
+        Palette::for_theme(app.theme),
+        wrap_width,
+        live_finalization,
+    );
     let rows = transcript_visual_rows(&lines, wrap_width) as u16;
     // Cap the tail so it can't dominate the viewport; the rest is in scrollback.
     let max_tail = height.saturating_sub(10).clamp(3, 18);
@@ -134,6 +191,15 @@ fn live_tail_height(app: &AppState, width: u16, height: u16) -> u16 {
 /// Mirrors `render_chat_layout` but the top pane shows only the live transcript
 /// tail (finalized history is in scrollback, not here).
 pub fn render_viewport(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
+    render_viewport_with_finalization(frame, app, palette, None);
+}
+
+pub fn render_viewport_with_finalization(
+    frame: &mut impl FrameLike,
+    app: &AppState,
+    palette: Palette,
+    live_finalization: Option<&LiveTurnFinalization>,
+) {
     let area = frame.area();
     let composer_height = composer_height_for_size(app, area.width, area.height);
     let active_menu = active_menu_surface(app);
@@ -157,7 +223,10 @@ pub fn render_viewport(frame: &mut impl FrameLike, app: &AppState, palette: Pale
     if launch_banner_active(app) {
         render_launch_banner(frame, app, palette, root[0]);
     } else {
-        frame.render_widget(render_live_tail(app, palette, root[0]), root[0]);
+        frame.render_widget(
+            render_live_tail_with_finalization(app, palette, root[0], live_finalization),
+            root[0],
+        );
     }
     if let Some(menu) = active_menu.as_ref() {
         menu_render::render_menu_surface(frame, root[1], menu, palette);
@@ -176,9 +245,14 @@ pub fn render_viewport(frame: &mut impl FrameLike, app: &AppState, palette: Pale
 /// The live (uncommitted / in-flight) transcript tail rendered inside the
 /// viewport: recent-user context, turn-flow, the streaming reply, activity, and
 /// pending messages. Committed messages are NOT here — they are in scrollback.
-fn render_live_tail(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
+fn render_live_tail_with_finalization(
+    app: &AppState,
+    palette: Palette,
+    area: Rect,
+    live_finalization: Option<&LiveTurnFinalization>,
+) -> Paragraph<'static> {
     let wrap_width = transcript_wrap_width(area);
-    let lines = live_tail_lines(app, palette, wrap_width);
+    let lines = live_tail_lines_with_finalization(app, palette, wrap_width, live_finalization);
 
     let visible_height = transcript_visible_height(area);
     let total_rows = transcript_visual_rows(&lines, wrap_width);
@@ -211,19 +285,50 @@ fn render_live_tail(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'
 /// history): recent-user context pinned for the active turn, turn-flow
 /// (approvals / questions / streaming reply / activity / diff preview), and
 /// pending queued messages.
-fn live_tail_lines(app: &AppState, palette: Palette, wrap_width: usize) -> Vec<Line<'static>> {
+fn active_live_finalization<'a>(
+    app: &AppState,
+    live_finalization: Option<&'a LiveTurnFinalization>,
+) -> Option<&'a LiveTurnFinalization> {
+    let (session_id, turn_id) = app.active_turn()?;
+    live_finalization.filter(|finalization| finalization.matches_turn(session_id, turn_id))
+}
+
+fn live_tail_lines_with_finalization(
+    app: &AppState,
+    palette: Palette,
+    wrap_width: usize,
+    live_finalization: Option<&LiveTurnFinalization>,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let Some(session) = app.active_session() else {
         return lines;
     };
+    let active_finalization = active_live_finalization(app, live_finalization);
 
     // `should_show_turn_flow` already covers the visible-approval and
     // visible-question cases (it ORs them in), so a single branch suffices.
     if should_show_turn_flow(app, session) {
-        if let Some(prompt) = latest_user_message(session) {
+        let interactive_context_visible = app
+            .approval
+            .as_ref()
+            .is_some_and(|approval| approval.visible)
+            || app
+                .user_question
+                .as_ref()
+                .is_some_and(|picker| picker.visible);
+        let show_recent_context = interactive_context_visible
+            || !active_finalization.is_some_and(LiveTurnFinalization::has_flushed_content);
+        if show_recent_context && let Some(prompt) = latest_user_message(session) {
             push_recent_user_context(&mut lines, palette, prompt, wrap_width);
         }
-        push_turn_flow(&mut lines, palette, app, session, wrap_width);
+        push_turn_flow(
+            &mut lines,
+            palette,
+            app,
+            session,
+            wrap_width,
+            active_finalization,
+        );
     }
 
     if !app.pending_messages.is_empty() {
@@ -294,6 +399,254 @@ pub fn finalized_history_lines_range(
     // render path is untouched, so it still shows the theme surface).
     strip_lines_background(&mut lines);
     lines
+}
+
+/// Render newly committed messages while skipping active-turn content that was
+/// already streamed into scrollback before the turn settled.
+pub fn finalized_history_lines_range_dedup_live(
+    app: &AppState,
+    palette: Palette,
+    wrap_width: usize,
+    start: usize,
+    live_coverages: &[LiveTurnFinalization],
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some(session) = app.active_session() else {
+        return lines;
+    };
+    let anchored_activity_logs = anchored_turn_activity_logs(app, session);
+    for (idx, message) in session.messages.iter().enumerate().skip(start) {
+        let reply_coverage = live_coverages.iter().find(|coverage| {
+            !coverage.reply_flushed_text.is_empty()
+                && message.role.as_str() == "assistant"
+                && message
+                    .content
+                    .starts_with(coverage.reply_flushed_text.as_str())
+        });
+        if let Some(coverage) = reply_coverage {
+            let suffix = &message.content[coverage.reply_flushed_text.len()..];
+            if !suffix.trim().is_empty() {
+                push_live_reply_block(&mut lines, palette, suffix, wrap_width);
+            }
+        } else {
+            push_message_block(
+                &mut lines,
+                palette,
+                message.role.as_str(),
+                &message.content,
+                wrap_width,
+            );
+        }
+        if let Some(reasoning) = message.reasoning_content.as_deref() {
+            push_message_block(&mut lines, palette, "reasoning", reasoning, wrap_width);
+        }
+        if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("         tool_call ", palette.muted()),
+                Span::styled(tool_call_id.to_string(), palette.text()),
+            ]));
+        }
+
+        for (_, log) in anchored_activity_logs
+            .iter()
+            .filter(|(anchor_idx, _)| *anchor_idx == idx)
+        {
+            if let Some(coverage) = live_coverages
+                .iter()
+                .find(|coverage| coverage.matches_turn(&log.session_id, &log.turn_id))
+            {
+                push_turn_activity_log_section_unflushed(&mut lines, palette, log, app, coverage);
+            } else {
+                push_turn_activity_log_section(&mut lines, palette, log, app);
+            }
+        }
+    }
+    strip_lines_background(&mut lines);
+    lines
+}
+
+/// Return the next active-turn watermark by extending the previous one with any
+/// newly settled live reply lines and any non-running activity rows.
+pub fn next_live_turn_finalization(
+    app: &AppState,
+    previous: Option<&LiveTurnFinalization>,
+) -> Option<LiveTurnFinalization> {
+    let (session_id, turn_id) = app.active_turn()?;
+    let session = app.active_session()?;
+    let mut next = previous
+        .filter(|finalization| finalization.matches_turn(session_id, turn_id))
+        .cloned()
+        .unwrap_or_else(|| LiveTurnFinalization::new(session_id, turn_id));
+
+    if let Some(live_reply) = session
+        .live_reply
+        .as_ref()
+        .filter(|live_reply| &live_reply.turn_id == turn_id)
+        && live_reply
+            .text
+            .starts_with(next.reply_flushed_text.as_str())
+    {
+        let stable_end = stable_live_reply_prefix_len(&live_reply.text);
+        if stable_end > next.reply_flushed_text.len() {
+            next.reply_flushed_text = live_reply.text[..stable_end].to_string();
+        }
+    }
+
+    let mut existing_activity = next
+        .activity_flushed_keys
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    for (idx, item) in flow_activity_items(app).iter().enumerate() {
+        let key = activity_finalization_key(item, idx);
+        if !existing_activity.contains(&key) && !is_running_activity(item) {
+            existing_activity.insert(key.clone());
+            next.activity_flushed_keys.push(key);
+        }
+    }
+    next.activity_flushed_items = next.activity_flushed_keys.len();
+
+    Some(next)
+}
+
+/// Render the delta between two active-turn watermarks for insertion into
+/// native scrollback.
+pub fn finalized_live_turn_lines_between(
+    app: &AppState,
+    palette: Palette,
+    wrap_width: usize,
+    previous: &LiveTurnFinalization,
+    next: &LiveTurnFinalization,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some((session_id, turn_id)) = app.active_turn() else {
+        return lines;
+    };
+    if !next.matches_turn(session_id, turn_id) {
+        return lines;
+    }
+
+    if next
+        .reply_flushed_text
+        .starts_with(previous.reply_flushed_text.as_str())
+    {
+        let new_reply = &next.reply_flushed_text[previous.reply_flushed_text.len()..];
+        if !new_reply.trim().is_empty() {
+            push_live_reply_block(&mut lines, palette, new_reply, wrap_width);
+        }
+    }
+
+    let previous_activity = previous
+        .activity_flushed_keys
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let new_activity = flow_activity_items(app)
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, item)| {
+            let key = activity_finalization_key(item, *idx);
+            next.activity_flushed_keys.contains(&key) && !previous_activity.contains(&key)
+        })
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
+    if !new_activity.is_empty() {
+        push_finalized_activity_items_section(
+            &mut lines,
+            palette,
+            app,
+            Some(turn_id),
+            &new_activity,
+        );
+    }
+
+    strip_lines_background(&mut lines);
+    lines
+}
+
+/// Render late archived activity for turns whose live activity rows were
+/// already streamed to scrollback. This handles the common race where the final
+/// assistant message commits first and `turn_activity_logs` catches up on a
+/// later frame.
+pub fn finalized_late_activity_lines_for_coverages(
+    app: &AppState,
+    palette: Palette,
+    _wrap_width: usize,
+    live_coverages: &[LiveTurnFinalization],
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some(session) = app.active_session() else {
+        return lines;
+    };
+    for log in app
+        .turn_activity_logs
+        .iter()
+        .filter(|log| log.session_id == session.id)
+    {
+        if let Some(coverage) = live_coverages
+            .iter()
+            .find(|coverage| coverage.matches_turn(&log.session_id, &log.turn_id))
+        {
+            push_turn_activity_log_section_unflushed(&mut lines, palette, log, app, coverage);
+        }
+    }
+    strip_lines_background(&mut lines);
+    lines
+}
+
+pub fn committed_activity_keys_for_live_finalization(
+    app: &AppState,
+    coverage: &LiveTurnFinalization,
+) -> Option<Vec<String>> {
+    app.turn_activity_logs
+        .iter()
+        .find(|log| {
+            log.session_id.0 == coverage.session_id && log.turn_id.0.to_string() == coverage.turn_id
+        })
+        .map(|log| {
+            log.items
+                .iter()
+                .enumerate()
+                .map(|(idx, item)| activity_finalization_key(item, idx))
+                .collect()
+        })
+}
+
+fn activity_finalization_key(item: &ActivityItem, ordinal: usize) -> String {
+    if let Some(tool_call_id) = item.tool_call_id.as_deref() {
+        return format!("tool:{tool_call_id}");
+    }
+    if let Some(turn_id) = item.turn_id.as_ref() {
+        return format!(
+            "turn:{}:{ordinal}:{}:{}",
+            turn_id.0,
+            item.kind.label(),
+            item.title
+        );
+    }
+    format!("activity:{ordinal}:{}:{}", item.kind.label(), item.title)
+}
+
+pub fn committed_reply_matches_live_finalization(
+    app: &AppState,
+    start: usize,
+    coverage: &LiveTurnFinalization,
+) -> bool {
+    !coverage.reply_flushed_text.is_empty()
+        && app.active_session().is_some_and(|session| {
+            session.messages.iter().skip(start).any(|message| {
+                message.role.as_str() == "assistant"
+                    && message
+                        .content
+                        .starts_with(coverage.reply_flushed_text.as_str())
+            })
+        })
+}
+
+fn stable_live_reply_prefix_len(text: &str) -> usize {
+    text.rfind('\n')
+        .map(|idx| idx + '\n'.len_utf8())
+        .unwrap_or(0)
 }
 
 fn strip_lines_background(lines: &mut [Line<'static>]) {
@@ -1095,7 +1448,7 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
 
             if turn_flow_visible && Some(idx) == latest_user_index {
                 approval_context_start = Some(message_start);
-                push_turn_flow(&mut lines, palette, app, session, wrap_width);
+                push_turn_flow(&mut lines, palette, app, session, wrap_width, None);
                 turn_flow_rendered = true;
             }
         }
@@ -1106,9 +1459,9 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
         {
             approval_context_start = Some(lines.len());
             push_recent_user_context(&mut lines, palette, prompt, wrap_width);
-            push_turn_flow(&mut lines, palette, app, session, wrap_width);
+            push_turn_flow(&mut lines, palette, app, session, wrap_width, None);
         } else if !turn_flow_rendered {
-            push_turn_flow(&mut lines, palette, app, session, wrap_width);
+            push_turn_flow(&mut lines, palette, app, session, wrap_width, None);
         }
 
         if !app.pending_messages.is_empty() {
@@ -1254,6 +1607,7 @@ fn push_turn_flow(
     app: &AppState,
     session: &SessionView,
     width: usize,
+    live_finalization: Option<&LiveTurnFinalization>,
 ) {
     if let Some(approval) = app.approval.as_ref().filter(|approval| approval.visible) {
         push_inline_approval_card(lines, palette, approval);
@@ -1264,10 +1618,20 @@ fn push_turn_flow(
     }
 
     if let Some(live_reply) = &session.live_reply {
-        push_live_reply_block(lines, palette, &live_reply.text, width);
+        let reply_text = if let Some(finalization) = live_finalization {
+            live_reply
+                .text
+                .strip_prefix(finalization.reply_flushed_text.as_str())
+                .unwrap_or(live_reply.text.as_str())
+        } else {
+            live_reply.text.as_str()
+        };
+        if !reply_text.trim().is_empty() {
+            push_live_reply_block(lines, palette, reply_text, width);
+        }
     }
 
-    push_activity_section(lines, palette, app);
+    push_activity_section_with_finalization(lines, palette, app, live_finalization);
 
     if live_turn_diff_preview_visible(app) {
         push_inline_diff_preview(lines, palette, &app.diff_preview);
@@ -2482,8 +2846,25 @@ fn push_prefixed_line(
     lines.push(Line::from(spans));
 }
 
-fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: &AppState) {
-    let flow_activity = flow_activity_items(app);
+fn push_activity_section_with_finalization(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    app: &AppState,
+    live_finalization: Option<&LiveTurnFinalization>,
+) {
+    let mut flow_activity = flow_activity_items(app);
+    if let Some(finalization) = active_live_finalization(app, live_finalization) {
+        flow_activity = flow_activity
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, item)| {
+                !finalization
+                    .activity_flushed_keys
+                    .contains(&activity_finalization_key(item, *idx))
+            })
+            .map(|(_, item)| item)
+            .collect();
+    }
     if flow_activity.is_empty() {
         return;
     }
@@ -2686,6 +3067,53 @@ fn push_turn_activity_log_section(
     if app.diff_preview.active && app.diff_preview.turn_id.as_ref() == Some(&log.turn_id) {
         push_inline_diff_preview(lines, palette, &app.diff_preview);
     }
+}
+
+fn push_turn_activity_log_section_unflushed(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    log: &TurnActivityLog,
+    app: &AppState,
+    coverage: &LiveTurnFinalization,
+) {
+    let items = log
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(idx, item)| {
+            !coverage
+                .activity_flushed_keys
+                .contains(&activity_finalization_key(item, *idx))
+        })
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
+    push_finalized_activity_items_section(lines, palette, app, Some(&log.turn_id), &items);
+}
+
+fn push_finalized_activity_items_section(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    app: &AppState,
+    turn_id: Option<&octos_core::ui_protocol::TurnId>,
+    items: &[&ActivityItem],
+) {
+    if items.is_empty() {
+        return;
+    }
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    push_agent_task_group(
+        lines,
+        palette,
+        turn_id,
+        items,
+        items,
+        &[],
+        0,
+        false,
+        app.expanded_tool_outputs,
+    );
 }
 
 /// "Tentacle pulse" octopus spinner frames (braille blob, all single-width).
@@ -4961,6 +5389,7 @@ mod tests {
             DiffPreviewHunk, DiffPreviewLine, SessionView,
         },
         store::Store,
+        viewport::ScrollbackTracker,
     };
     use octos_core::{
         Message, SessionKey,
@@ -9486,13 +9915,36 @@ mod tests {
     /// into a `Buffer` (no escape-emitting backend needed) so the test does not
     /// require a `Write` backend.
     fn viewport_rows(app: &AppState, width: u16, height: u16) -> Vec<String> {
+        viewport_rows_with_finalization(app, width, height, None)
+    }
+
+    fn viewport_rows_with_finalization(
+        app: &AppState,
+        width: u16,
+        height: u16,
+        live_finalization: Option<&LiveTurnFinalization>,
+    ) -> Vec<String> {
         let palette = Palette::for_theme(ThemeName::Slate);
-        let live_height = super::live_ui_height(app, width, height);
+        let live_height =
+            super::live_ui_height_with_finalization(app, width, height, live_finalization);
         let area = Rect::new(0, 0, width, live_height);
         let mut buffer = Buffer::empty(area);
         let mut frame = crate::tui_terminal::Frame::for_test(area, &mut buffer);
-        render_viewport(&mut frame, app, palette);
+        render_viewport_with_finalization(&mut frame, app, palette, live_finalization);
         rendered_rows(&buffer)
+    }
+
+    fn lines_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -9533,6 +9985,201 @@ mod tests {
         assert!(
             text.contains("answer one"),
             "missing assistant msg: {text:?}"
+        );
+    }
+
+    #[test]
+    fn active_turn_completed_activity_flushes_to_scrollback_and_leaves_live_tail() {
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run the checks")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: "Still checking the last item".into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-running")
+                .with_detail("cargo clippy --all-targets"),
+        );
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_turn(turn_id)
+                .with_tool_call("call-complete")
+                .with_detail("cargo test")
+                .with_success(true),
+        );
+
+        let mut tracker = ScrollbackTracker::new();
+        let update = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
+        let inserted = lines_text(&update.lines_to_insert);
+        assert!(
+            inserted.contains("Agent task completed") && inserted.contains("$ cargo test"),
+            "completed activity should be inserted into scrollback mid-turn: {inserted:?}"
+        );
+        assert!(
+            !inserted.contains("cargo clippy --all-targets"),
+            "running activity must stay in the live tail: {inserted:?}"
+        );
+
+        let rows =
+            viewport_rows_with_finalization(&app, 100, 40, update.live_tail_finalization.as_ref());
+        let live = rows.join("\n");
+        assert!(
+            !live.contains("cargo test"),
+            "flushed activity must not remain in the repainting viewport:\n{live}"
+        );
+        assert!(
+            live.contains("cargo clippy --all-targets") && live.contains("Orchestrating"),
+            "running activity should remain as the small live tail:\n{live}"
+        );
+    }
+
+    #[test]
+    fn active_turn_completed_reply_lines_flush_to_scrollback_and_leave_only_suffix_live() {
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("summarize")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id,
+                    text: "finalized assistant line\nstreaming suffix still live".into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+
+        let mut tracker = ScrollbackTracker::new();
+        let update = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
+        let inserted = lines_text(&update.lines_to_insert);
+        assert!(
+            inserted.contains("finalized assistant line"),
+            "completed reply line should be inserted into scrollback mid-turn: {inserted:?}"
+        );
+        assert!(
+            !inserted.contains("streaming suffix still live"),
+            "unterminated reply suffix must stay live: {inserted:?}"
+        );
+
+        let rows =
+            viewport_rows_with_finalization(&app, 100, 40, update.live_tail_finalization.as_ref());
+        let live = rows.join("\n");
+        assert!(
+            !live.contains("finalized assistant line"),
+            "flushed reply line must not remain in the repainting viewport:\n{live}"
+        );
+        assert!(
+            live.contains("streaming suffix still live"),
+            "only the active reply suffix should remain live:\n{live}"
+        );
+    }
+
+    #[test]
+    fn committed_turn_does_not_duplicate_live_flushed_reply_or_activity() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let first_activity = ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+            .with_turn(turn_id.clone())
+            .with_detail("cargo test")
+            .with_success(true);
+        let second_activity_running = ActivityItem::new(ActivityKind::Tool, "shell", "running")
+            .with_turn(turn_id.clone())
+            .with_detail("cargo clippy --all-targets");
+        let second_activity_done = ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+            .with_turn(turn_id.clone())
+            .with_detail("cargo clippy --all-targets")
+            .with_success(true);
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("finish the turn")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: "already flushed line\nfinal answer tail".into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+        app.push_activity(first_activity.clone());
+        app.push_activity(second_activity_running);
+
+        let mut tracker = ScrollbackTracker::new();
+        let first = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
+        let first_text = lines_text(&first.lines_to_insert);
+        assert!(first_text.contains("already flushed line"));
+        assert!(first_text.contains("$ cargo test"));
+
+        app.sessions[0].live_reply = None;
+        app.sessions[0].messages.push(Message::assistant(
+            "already flushed line\nfinal answer tail",
+        ));
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id,
+            request: Some("finish the turn".into()),
+            anchor_index: Some(0),
+            items: vec![first_activity, second_activity_done],
+        });
+        app.activity.clear();
+        app.set_run_state_success();
+
+        let second = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
+        let second_text = lines_text(&second.lines_to_insert);
+        assert!(
+            !second_text.contains("already flushed line"),
+            "committed assistant must not duplicate the live-flushed prefix: {second_text:?}"
+        );
+        assert!(
+            second_text.contains("final answer tail"),
+            "committed assistant should flush the unflushed suffix: {second_text:?}"
+        );
+        assert!(
+            !second_text.contains("$ cargo test"),
+            "committed activity log must not duplicate the live-flushed action: {second_text:?}"
+        );
+        assert!(
+            second_text.contains("cargo clippy --all-targets"),
+            "committed activity log should flush the previously-running action: {second_text:?}"
+        );
+
+        app.sessions[0].messages.push(Message::user("new turn"));
+        app.sessions[0].messages.push(Message::assistant(
+            "already flushed line\nunrelated later answer",
+        ));
+        let third = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
+        let third_text = lines_text(&third.lines_to_insert);
+        assert!(
+            third_text.contains("already flushed line")
+                && third_text.contains("unrelated later answer"),
+            "stale live-prefix coverage must not suppress a later assistant message: {third_text:?}"
         );
     }
 

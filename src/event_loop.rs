@@ -212,13 +212,19 @@ where
 
     let size = terminal.size()?;
     let width = size.width;
-    let height = app::live_ui_height(&store.state, width, size.height);
 
     // The scrollback flush must wrap to the SAME width `insert_history_lines`
     // uses (the full viewport width), so the line accounting stays consistent.
     let wrap_width = usize::from(width).max(1);
 
     let update = scrollback.sync(&store.state, palette, wrap_width);
+    let live_tail_finalization = update.live_tail_finalization.clone();
+    let height = app::live_ui_height_with_finalization(
+        &store.state,
+        width,
+        size.height,
+        live_tail_finalization.as_ref(),
+    );
     let needs_history_insert = !update.lines_to_insert.is_empty();
     let needs_resize = terminal.viewport_resize_needed(height, size);
 
@@ -235,6 +241,7 @@ where
                 palette,
                 height,
                 update.lines_to_insert,
+                live_tail_finalization,
             )
         })
     } else {
@@ -244,6 +251,7 @@ where
             palette,
             height,
             update.lines_to_insert,
+            live_tail_finalization,
         )
     }
 }
@@ -254,6 +262,7 @@ fn draw_inline_frame<B>(
     palette: Palette,
     height: u16,
     lines_to_insert: Vec<ratatui::text::Line<'static>>,
+    live_tail_finalization: Option<app::LiveTurnFinalization>,
 ) -> Result<()>
 where
     B: Backend + io::Write,
@@ -263,7 +272,14 @@ where
         insert_history_lines(terminal, lines_to_insert)?;
         terminal.invalidate_viewport();
     }
-    terminal.draw(|frame| app::render_viewport(frame, state, palette))?;
+    terminal.draw(|frame| {
+        app::render_viewport_with_finalization(
+            frame,
+            state,
+            palette,
+            live_tail_finalization.as_ref(),
+        );
+    })?;
     Ok(())
 }
 
@@ -1250,7 +1266,7 @@ mod tests {
     use crate::model::{ActivityKind, AppState, LiveReply, SessionView, TaskView};
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use octos_core::{
-        SessionKey, TaskId,
+        Message, SessionKey, TaskId,
         ui_protocol::{
             ApprovalDecision, ApprovalId, ApprovalRequestedEvent, PreviewId, QuestionId,
             TaskRuntimeState, TurnId, UiNotification, UiProtocolCapabilities, UserQuestion,
@@ -1629,6 +1645,66 @@ mod tests {
         assert!(
             written.contains("Welcome to Octos"),
             "onboarding should render before the first frame; wrote {written:?}"
+        );
+    }
+
+    #[test]
+    fn active_turn_completed_activity_is_history_only_in_raw_draw_bytes() {
+        let turn_id = TurnId::new();
+        let mut store = Store {
+            state: AppState::new(
+                vec![SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "test".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::user("run the checks")],
+                    tasks: vec![],
+                    live_reply: Some(LiveReply {
+                        turn_id: turn_id.clone(),
+                        text: "Still working".into(),
+                    }),
+                }],
+                0,
+                "Thinking".into(),
+                None,
+                false,
+            ),
+        };
+        store.state.set_run_state_in_progress();
+        store.state.push_activity(
+            crate::model::ActivityItem::new(ActivityKind::Tool, "shell", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-running")
+                .with_detail("cargo clippy --all-targets"),
+        );
+        store.state.push_activity(
+            crate::model::ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_turn(turn_id)
+                .with_tool_call("call-complete")
+                .with_detail("cargo test")
+                .with_success(true),
+        );
+
+        let mut terminal =
+            InlineTerminal::new(RecordingBackend::new(100, 30)).expect("recording terminal");
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+        };
+        let mut scrollback = ScrollbackTracker::new();
+
+        draw(&mut terminal, &mut guard, &mut store, &mut scrollback)
+            .expect("draw active inline frame");
+
+        let written = String::from_utf8_lossy(&terminal.backend().buf);
+        assert_eq!(
+            written.matches("cargo test").count(),
+            1,
+            "completed activity should be emitted once via history insertion, not repainted in the live viewport: {written:?}"
+        );
+        assert!(
+            written.contains("cargo clippy --all-targets"),
+            "running activity should remain in the live viewport bytes: {written:?}"
         );
     }
 
