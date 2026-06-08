@@ -8965,7 +8965,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed".into(),
+            message: "Octos UI capabilities refreshed".into(),
         }));
 
         // The user fills the fields and lands the cursor on the final
