@@ -7,3 +7,4 @@
 # Generated tmux/UX soak artifacts.
 e2e/test-results*/
 .octos-workspace.toml
+octos-data/
