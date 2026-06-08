@@ -697,6 +697,12 @@ status:
   local_stop: "local /stop"
   local_ps: "local /ps"
   local_slash_command: "local slash command"
+  # `!`-bang client-local shell (runs on this machine, not the server)
+  bang_running: "running"
+  bang_complete: "complete"
+  bang_failed: "failed"
+  bang_usage: "usage: !<command>"
+  bang_no_output: "(no output)"
   # Review / goal / staged-message status lines
   cannot_start_review_active_turn: "Cannot start review while a turn is active"
   server_clamped_onboarding_choice: "Server clamped or rejected the staged onboarding choice."

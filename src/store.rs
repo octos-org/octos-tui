@@ -244,6 +244,13 @@ impl Store {
             return self.dispatch_slash_command(&prompt);
         }
 
+        // `!`-bang client-local shell (Claude Code's `!` model). Intercepted
+        // before the backend/empty/readonly path: it runs on the local
+        // machine, not the server, and is allowed even during an active turn.
+        if let Some(cmd) = prompt.strip_prefix('!') {
+            return self.dispatch_bang_command(cmd.trim());
+        }
+
         if self.state.readonly {
             self.state.status = t!("status.readonly_turn_disabled").into_owned();
             self.state.clear_current_composer_draft();
@@ -3238,6 +3245,73 @@ impl Store {
         self.state.push_activity(item);
     }
 
+    /// Dispatch a `!`-bang client-local shell command (Claude Code's `!`
+    /// model). Pushes a "running" Tool activity chip immediately — stamped
+    /// with a process-unique `local_id` so the completion event can find it —
+    /// clears the composer draft, and returns the [`AppUiCommand::LocalShellExec`]
+    /// the transport runs locally off the render loop. An empty `!` is a usage
+    /// warning with no exec.
+    ///
+    /// The command runs on the machine octos-tui runs on, NOT the agent's
+    /// sandboxed server `shell` tool, and its output is ephemeral — shown in
+    /// the chip only, never injected into the next turn's context.
+    fn dispatch_bang_command(&mut self, cmd: &str) -> Option<AppUiCommand> {
+        self.state.clear_current_composer_draft();
+
+        if cmd.is_empty() {
+            let usage = t!("status.bang_usage").into_owned();
+            self.state.status = usage.clone();
+            self.push_local_activity(
+                ActivityKind::Warning,
+                "!",
+                usage,
+                Some(t!("status.bang_usage").into_owned()),
+            );
+            return None;
+        }
+
+        // Process-unique local id (a fresh UUID via TurnId) so the completion
+        // result reconciles against the right chip even with concurrent bangs.
+        let local_id = format!("local-shell:{}", TurnId::new().0);
+        let running = t!("status.bang_running").into_owned();
+        self.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "!", running.clone())
+                .with_detail(cmd.to_string())
+                .with_tool_call(local_id.clone()),
+        );
+        self.state.focus = FocusPane::Tasks;
+        self.state.status = format!("! {cmd}");
+        self.state.scroll_transcript_to_latest();
+
+        Some(AppUiCommand::LocalShellExec {
+            cmd: cmd.to_string(),
+            local_id,
+        })
+    }
+
+    /// Fold a completed `!`-bang local shell result back into its "running"
+    /// activity chip, completing it in place with the captured output.
+    fn apply_local_shell_result(&mut self, event: crate::client_event::LocalShellResultEvent) {
+        let success = matches!(event.exit_code, Some(0));
+        let status = if success {
+            t!("status.bang_complete").into_owned()
+        } else {
+            t!("status.bang_failed").into_owned()
+        };
+
+        let output = local_shell_output_preview(&event);
+        self.state.update_tool_activity(
+            &event.local_id,
+            status.clone(),
+            Some(format!("! {}", event.cmdline)),
+            Some(output),
+            Some(success),
+            Some(event.duration_ms),
+        );
+        self.state.status = format!("! {} ({status})", event.cmdline);
+        self.state.scroll_transcript_to_latest();
+    }
+
     fn start_prompt_turn(
         &mut self,
         prompt: String,
@@ -4027,6 +4101,10 @@ impl Store {
                 self.tool_config_list_command()
             }
             ClientEvent::Autonomy(event) => self.apply_autonomy_result(event),
+            ClientEvent::LocalShellResult(event) => {
+                self.apply_local_shell_result(event);
+                None
+            }
         }
     }
 
@@ -6897,6 +6975,24 @@ impl Store {
             .iter_mut()
             .find(|task| &task.id == task_id)
     }
+}
+
+/// Compose the displayed output for a completed `!`-bang shell result: stdout
+/// then stderr (both already truncated by the transport against the 10 KB
+/// combined cap). Empty output renders a `(no output)` placeholder so the chip
+/// still reads as complete rather than blank.
+fn local_shell_output_preview(event: &crate::client_event::LocalShellResultEvent) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if !event.stdout.is_empty() {
+        parts.push(event.stdout.as_str());
+    }
+    if !event.stderr.is_empty() {
+        parts.push(event.stderr.as_str());
+    }
+    if parts.is_empty() {
+        return t!("status.bang_no_output").into_owned();
+    }
+    parts.join("\n")
 }
 
 fn slash_command_try_hint(ctx: &crate::menu::AvailabilityContext<'_>) -> String {
@@ -11528,6 +11624,157 @@ mod tests {
         let activity = store.state.activity.last().expect("local warning activity");
         assert_eq!(activity.kind, ActivityKind::Warning);
         assert_eq!(activity.title, "local slash command");
+    }
+
+    #[test]
+    fn bang_command_dispatches_local_shell_exec_and_pushes_running_card() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "!echo hi".into();
+
+        let command = store.compose_command().expect("dispatch returns command");
+
+        let local_id = match command {
+            AppUiCommand::LocalShellExec { cmd, local_id } => {
+                assert_eq!(cmd, "echo hi");
+                assert!(local_id.starts_with("local-shell:"));
+                local_id
+            }
+            other => panic!("expected LocalShellExec, got {other:?}"),
+        };
+
+        // Composer cleared.
+        assert!(store.state.composer.is_empty());
+        // A "running" Tool chip stamped with the local id.
+        let chip = store.state.activity.last().expect("running activity chip");
+        assert_eq!(chip.kind, ActivityKind::Tool);
+        assert_eq!(chip.title, "!");
+        assert_eq!(chip.status, "running");
+        assert_eq!(chip.detail.as_deref(), Some("echo hi"));
+        assert_eq!(chip.tool_call_id.as_deref(), Some(local_id.as_str()));
+        assert!(chip.success.is_none());
+    }
+
+    #[test]
+    fn empty_bang_is_local_warning_with_no_exec() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "!".into();
+
+        let command = store.compose_command();
+
+        assert!(command.is_none());
+        assert!(store.state.composer.is_empty());
+        let activity = store.state.activity.last().expect("local warning activity");
+        assert_eq!(activity.kind, ActivityKind::Warning);
+        assert_eq!(activity.title, "!");
+        assert_eq!(activity.status, "usage: !<command>");
+    }
+
+    #[test]
+    fn bang_command_allowed_during_active_turn() {
+        // A `!`-bang is a local action, not a backend turn, so it must NOT be
+        // staged as a pending message the way a plain prompt would be.
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "working");
+        store.state.composer = "!ls".into();
+
+        let command = store.compose_command();
+
+        assert!(matches!(command, Some(AppUiCommand::LocalShellExec { .. })));
+        assert!(store.state.pending_messages.is_empty());
+    }
+
+    #[test]
+    fn local_shell_result_completes_matching_chip_in_place() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "!echo hi".into();
+        let local_id = match store.compose_command().expect("dispatch") {
+            AppUiCommand::LocalShellExec { local_id, .. } => local_id,
+            other => panic!("expected LocalShellExec, got {other:?}"),
+        };
+        let chips_before = store.state.activity.len();
+
+        // Feed a synthetic completion event (no real process is run here).
+        let follow_up = store.apply_client_event(ClientEvent::LocalShellResult(
+            crate::client_event::LocalShellResultEvent {
+                local_id: local_id.clone(),
+                cmdline: "echo hi".into(),
+                stdout: "hi\n".into(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                duration_ms: 12,
+                truncated: false,
+            },
+        ));
+
+        assert!(follow_up.is_none());
+        // Completed in place — no new chip was pushed.
+        assert_eq!(store.state.activity.len(), chips_before);
+        let chip = store
+            .state
+            .activity
+            .iter()
+            .rev()
+            .find(|item| item.tool_call_id.as_deref() == Some(local_id.as_str()))
+            .expect("completed chip");
+        assert_eq!(chip.status, "complete");
+        assert_eq!(chip.success, Some(true));
+        assert_eq!(chip.duration_ms, Some(12));
+        assert_eq!(chip.output_preview.as_deref(), Some("hi\n"));
+    }
+
+    #[test]
+    fn local_shell_result_nonzero_exit_marks_failed() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "!false".into();
+        let local_id = match store.compose_command().expect("dispatch") {
+            AppUiCommand::LocalShellExec { local_id, .. } => local_id,
+            other => panic!("expected LocalShellExec, got {other:?}"),
+        };
+
+        store.apply_client_event(ClientEvent::LocalShellResult(
+            crate::client_event::LocalShellResultEvent {
+                local_id: local_id.clone(),
+                cmdline: "false".into(),
+                stdout: String::new(),
+                stderr: "boom\n".into(),
+                exit_code: Some(1),
+                duration_ms: 3,
+                truncated: false,
+            },
+        ));
+
+        let chip = store
+            .state
+            .activity
+            .iter()
+            .rev()
+            .find(|item| item.tool_call_id.as_deref() == Some(local_id.as_str()))
+            .expect("completed chip");
+        assert_eq!(chip.status, "failed");
+        assert_eq!(chip.success, Some(false));
+        // stderr surfaces in the preview.
+        assert_eq!(chip.output_preview.as_deref(), Some("boom\n"));
+    }
+
+    #[test]
+    fn local_shell_output_preview_combines_stdout_then_stderr() {
+        let event = crate::client_event::LocalShellResultEvent {
+            local_id: "local-shell:x".into(),
+            cmdline: "cmd".into(),
+            stdout: "out".into(),
+            stderr: "err".into(),
+            exit_code: Some(0),
+            duration_ms: 1,
+            truncated: false,
+        };
+        assert_eq!(local_shell_output_preview(&event), "out\nerr");
+
+        let empty = crate::client_event::LocalShellResultEvent {
+            stdout: String::new(),
+            stderr: String::new(),
+            ..event
+        };
+        assert_eq!(local_shell_output_preview(&empty), "(no output)");
     }
 
     #[test]
