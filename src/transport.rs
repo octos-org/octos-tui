@@ -1479,6 +1479,12 @@ const LOCAL_SHELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// and a `[truncated: N bytes]` marker is appended (see [`truncate_local_shell_output`]).
 const LOCAL_SHELL_MAX_OUTPUT_BYTES: usize = 10 * 1024;
 
+/// Hard per-stream READ cap so a chatty command can't balloon memory before the
+/// 10 KB display truncation. We stop reading each pipe at this many bytes; a
+/// command that exceeds it then blocks on the full pipe and is reaped by the
+/// timeout. Larger than the display cap so the captured slice is honest.
+const LOCAL_SHELL_READ_CAP: u64 = 256 * 1024;
+
 /// Build the cross-platform `(program, args)` for running `cmd` through the
 /// system shell, mirroring octos conventions: `sh -c <cmd>` on unix,
 /// `cmd /C <cmd>` on windows. The command string is passed as a single
@@ -1531,7 +1537,10 @@ async fn run_local_shell_command(
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Reap the child if the task/future is dropped (e.g. on timeout):
+        // tokio does NOT kill child processes on drop unless this is set.
+        .kill_on_drop(true);
     if let Some(cwd) = cwd {
         builder.current_dir(cwd);
     }
@@ -1553,14 +1562,41 @@ async fn run_local_shell_command(
         }
     };
 
-    let wait = child.wait_with_output();
+    let mut child = child;
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+
+    // Read stdout+stderr concurrently, each BOUNDED at LOCAL_SHELL_READ_CAP so a
+    // runaway command can't balloon memory before the 10 KB display truncation;
+    // then wait for exit. The whole thing runs under the timeout. (If output
+    // exceeds the cap, reading stops, the child blocks on the full pipe, and the
+    // timeout reaps it via kill_on_drop.)
+    let collect = async {
+        use tokio::io::AsyncReadExt;
+        let mut so = Vec::new();
+        let mut se = Vec::new();
+        let read_out = async {
+            if let Some(p) = stdout_pipe.as_mut() {
+                let _ = p.take(LOCAL_SHELL_READ_CAP).read_to_end(&mut so).await;
+            }
+        };
+        let read_err = async {
+            if let Some(p) = stderr_pipe.as_mut() {
+                let _ = p.take(LOCAL_SHELL_READ_CAP).read_to_end(&mut se).await;
+            }
+        };
+        tokio::join!(read_out, read_err);
+        let status = child.wait().await;
+        (so, se, status)
+    };
+
     let timed_out;
-    let output = match tokio::time::timeout(LOCAL_SHELL_TIMEOUT, wait).await {
-        Ok(Ok(output)) => {
+    let captured = match tokio::time::timeout(LOCAL_SHELL_TIMEOUT, collect).await {
+        Ok((so, se, Ok(status))) => {
             timed_out = false;
-            Some(output)
+            Some((so, se, status.code()))
         }
-        Ok(Err(err)) => {
+        Ok((_so, _se, Err(err))) => {
             return LocalShellResultEvent {
                 local_id,
                 cmdline: cmd,
@@ -1572,21 +1608,21 @@ async fn run_local_shell_command(
             };
         }
         Err(_elapsed) => {
-            // `wait_with_output` took ownership of the child, so the timeout
-            // future dropping the child handle is what reaps it. On drop tokio
-            // kills the process (SIGKILL on unix / TerminateProcess on
-            // windows). We surface a clear timeout marker.
+            // The `collect` future (and its borrow of `child`) is now dropped;
+            // kill + reap the still-running process promptly. `kill_on_drop`
+            // is the backstop; this makes the kill immediate + awaited.
+            let _ = child.kill().await;
             timed_out = true;
             None
         }
     };
 
     let duration_ms = started.elapsed().as_millis() as u64;
-    let (raw_stdout, raw_stderr, exit_code) = match output {
-        Some(output) => (
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-            output.status.code(),
+    let (raw_stdout, raw_stderr, exit_code) = match captured {
+        Some((so, se, code)) => (
+            String::from_utf8_lossy(&so).into_owned(),
+            String::from_utf8_lossy(&se).into_owned(),
+            code,
         ),
         None => (
             String::new(),
