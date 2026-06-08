@@ -47,10 +47,10 @@ use crate::{
     client_event::{
         AuthLogoutClientEvent, AuthMeClientEvent, AuthSendCodeClientEvent, AuthStatusClientEvent,
         AuthVerifyClientEvent, AutonomyClientEvent, AutonomyResult, CapabilitiesClientEvent,
-        ClientEvent, McpConfigListClientEvent, McpConfigMutationClientEvent, McpStatusClientEvent,
-        ModelListClientEvent, ModelSelectClientEvent, PermissionProfileClientEvent,
-        ProfileLlmCatalogClientEvent, ProfileLlmListClientEvent, ProfileLlmMutationClientEvent,
-        ProfileLocalCreateClientEvent, ProfileSkillsListClientEvent,
+        ClientEvent, LocalShellResultEvent, McpConfigListClientEvent, McpConfigMutationClientEvent,
+        McpStatusClientEvent, ModelListClientEvent, ModelSelectClientEvent,
+        PermissionProfileClientEvent, ProfileLlmCatalogClientEvent, ProfileLlmListClientEvent,
+        ProfileLlmMutationClientEvent, ProfileLocalCreateClientEvent, ProfileSkillsListClientEvent,
         ProfileSkillsMutationClientEvent, ProfileSkillsRegistrySearchClientEvent,
         SessionStatusClientEvent, ToolConfigListClientEvent, ToolConfigMutationClientEvent,
         ToolStatusClientEvent,
@@ -205,6 +205,12 @@ pub struct ProtocolAppUiBackend {
     refresh_capabilities_on_reconnect: bool,
     queue: VecDeque<ClientEvent>,
     protocol: ProtocolExchange,
+    /// Completion channel for `!`-bang client-local shell commands. The
+    /// command runs as a detached tokio task on `runtime` and sends its
+    /// result here; `next_event` drains it (try_recv) into the `queue` so the
+    /// synchronous render loop never blocks on a running command.
+    local_shell_tx: mpsc::UnboundedSender<LocalShellResultEvent>,
+    local_shell_rx: mpsc::UnboundedReceiver<LocalShellResultEvent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -893,6 +899,8 @@ impl ProtocolAppUiBackend {
             Err(err) => (None, Some(err.to_string())),
         };
 
+        let (local_shell_tx, local_shell_rx) = mpsc::unbounded_channel();
+
         Self {
             launch,
             runtime,
@@ -903,6 +911,8 @@ impl ProtocolAppUiBackend {
             refresh_capabilities_on_reconnect: false,
             queue: VecDeque::new(),
             protocol: ProtocolExchange::default(),
+            local_shell_tx,
+            local_shell_rx,
         }
     }
 
@@ -912,6 +922,46 @@ impl ProtocolAppUiBackend {
             .as_ref()
             .map(|endpoint| endpoint.label().to_string())
             .ok_or_else(|| eyre!("--mode protocol requires --endpoint <ws://...|wss://...> or --stdio-command <CMD>"))
+    }
+
+    /// Spawn a `!`-bang client-local shell command on the tokio runtime and
+    /// arrange for its result to flow back through `local_shell_tx`.
+    ///
+    /// This intentionally bypasses every server-side guard (no SafePolicy /
+    /// blocklist, no sandbox, no `BLOCKED_ENV_VARS` scrub) — that is the
+    /// Claude Code `!` model: the command runs on the machine octos-tui runs
+    /// on, with the TUI launch dir as cwd and the inherited environment. The
+    /// activity card labels it as a local shell command (the mitigation).
+    ///
+    /// Non-blocking: the synchronous render loop returns immediately; the
+    /// detached task drives the child, enforces the 30 s timeout (killing the
+    /// child on expiry), captures stdout+stderr, and truncates the combined
+    /// output at the 10 KB cap before emitting the result.
+    fn spawn_local_shell(&mut self, cmd: String, local_id: String) {
+        let tx = self.local_shell_tx.clone();
+        let cwd = std::env::current_dir().ok();
+
+        let Some(runtime) = self.runtime.as_ref() else {
+            // No tokio runtime: report a synthetic failure so the chip still
+            // completes rather than spinning forever on "running".
+            let _ = tx.send(LocalShellResultEvent {
+                local_id,
+                cmdline: cmd,
+                stdout: String::new(),
+                stderr: runtime_unavailable(self.runtime_error.as_deref()).to_string(),
+                exit_code: None,
+                duration_ms: 0,
+                truncated: false,
+            });
+            return;
+        };
+
+        runtime.spawn(async move {
+            let event = run_local_shell_command(cmd, cwd, local_id).await;
+            // Receiver lives as long as the backend; a send error only means
+            // the TUI is shutting down, so there is nothing to recover.
+            let _ = tx.send(event);
+        });
     }
 
     fn ensure_driver(&mut self) -> Result<()> {
@@ -1317,6 +1367,15 @@ impl AppUiBackend for ProtocolAppUiBackend {
     }
 
     fn send(&mut self, command: AppUiCommand) -> Result<()> {
+        // `!`-bang local exec is a client-local action, not a backend turn:
+        // intercept it before the readonly gate and before any JSON-RPC
+        // encoding. It runs the command on the tokio runtime and reports back
+        // via the local-shell channel that `next_event` drains.
+        if let AppUiCommand::LocalShellExec { cmd, local_id } = command {
+            self.spawn_local_shell(cmd, local_id);
+            return Ok(());
+        }
+
         if self.launch.readonly && !Self::readonly_allows_command(&command) {
             self.enqueue_readonly_blocked_response(command);
             return Ok(());
@@ -1379,6 +1438,13 @@ impl AppUiBackend for ProtocolAppUiBackend {
     }
 
     fn next_event(&mut self) -> Result<Option<ClientEvent>> {
+        // Drain any completed `!`-bang local shell results first so a finished
+        // command surfaces promptly even while the transport is quiet. These
+        // are pushed into `queue` so the existing pop-first ordering holds.
+        while let Ok(result) = self.local_shell_rx.try_recv() {
+            self.queue.push_back(ClientEvent::LocalShellResult(result));
+        }
+
         if let Some(event) = self.queue.pop_front() {
             return Ok(Some(event));
         }
@@ -1403,6 +1469,162 @@ fn runtime_unavailable(error: Option<&str>) -> eyre::Report {
         "failed to create tokio runtime for UI protocol backend: {}",
         error.unwrap_or("unknown runtime initialization error")
     )
+}
+
+/// Wall-clock budget for a `!`-bang local shell command. On expiry the child
+/// is killed (SIGTERM → SIGKILL on unix, `taskkill /F` on windows).
+const LOCAL_SHELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Combined stdout+stderr cap for `!`-bang output. Output past this is dropped
+/// and a `[truncated: N bytes]` marker is appended (see [`truncate_local_shell_output`]).
+const LOCAL_SHELL_MAX_OUTPUT_BYTES: usize = 10 * 1024;
+
+/// Build the cross-platform `(program, args)` for running `cmd` through the
+/// system shell, mirroring octos conventions: `sh -c <cmd>` on unix,
+/// `cmd /C <cmd>` on windows. The command string is passed as a single
+/// argument so the shell — not us — does the word splitting.
+fn local_shell_command_args(cmd: &str) -> (&'static str, Vec<String>) {
+    if cfg!(windows) {
+        ("cmd", vec!["/C".to_string(), cmd.to_string()])
+    } else {
+        ("sh", vec!["-c".to_string(), cmd.to_string()])
+    }
+}
+
+/// Truncate `output` to at most [`LOCAL_SHELL_MAX_OUTPUT_BYTES`], on a UTF-8
+/// boundary, appending a `[truncated: N bytes]` marker recording how many
+/// bytes were dropped. Returns `(text, truncated)`.
+fn truncate_local_shell_output(output: &str) -> (String, bool) {
+    if output.len() <= LOCAL_SHELL_MAX_OUTPUT_BYTES {
+        return (output.to_string(), false);
+    }
+    // Find the largest char boundary at or below the cap so we never split a
+    // multi-byte codepoint.
+    let mut cut = LOCAL_SHELL_MAX_OUTPUT_BYTES;
+    while cut > 0 && !output.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let dropped = output.len() - cut;
+    let mut text = output[..cut].to_string();
+    text.push_str(&format!("\n[truncated: {dropped} bytes]"));
+    (text, true)
+}
+
+/// Run a `!`-bang client-local shell command to completion (or timeout) and
+/// build its [`LocalShellResultEvent`]. Captures stdout and stderr separately,
+/// truncating each against the shared 10 KB combined cap. On timeout the child
+/// is killed (tokio's `Child::kill` sends SIGKILL on unix; on windows tokio
+/// maps `kill` to `TerminateProcess`, the same effect as `taskkill /F`).
+///
+/// Interactive commands (vim, ssh, …) get no TTY and so are unsupported; they
+/// will typically read EOF on stdin and exit, or hit the timeout.
+async fn run_local_shell_command(
+    cmd: String,
+    cwd: Option<std::path::PathBuf>,
+    local_id: String,
+) -> LocalShellResultEvent {
+    let started = std::time::Instant::now();
+    let (program, args) = local_shell_command_args(&cmd);
+
+    let mut builder = Command::new(program);
+    builder
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        builder.current_dir(cwd);
+    }
+    // Environment is inherited (no BLOCKED_ENV_VARS scrub — that is a
+    // server-side concern; this is a client-local action by design).
+
+    let child = match builder.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            return LocalShellResultEvent {
+                local_id,
+                cmdline: cmd,
+                stdout: String::new(),
+                stderr: format!("failed to spawn local shell command: {err}"),
+                exit_code: None,
+                duration_ms: started.elapsed().as_millis() as u64,
+                truncated: false,
+            };
+        }
+    };
+
+    let wait = child.wait_with_output();
+    let timed_out;
+    let output = match tokio::time::timeout(LOCAL_SHELL_TIMEOUT, wait).await {
+        Ok(Ok(output)) => {
+            timed_out = false;
+            Some(output)
+        }
+        Ok(Err(err)) => {
+            return LocalShellResultEvent {
+                local_id,
+                cmdline: cmd,
+                stdout: String::new(),
+                stderr: format!("local shell command failed: {err}"),
+                exit_code: None,
+                duration_ms: started.elapsed().as_millis() as u64,
+                truncated: false,
+            };
+        }
+        Err(_elapsed) => {
+            // `wait_with_output` took ownership of the child, so the timeout
+            // future dropping the child handle is what reaps it. On drop tokio
+            // kills the process (SIGKILL on unix / TerminateProcess on
+            // windows). We surface a clear timeout marker.
+            timed_out = true;
+            None
+        }
+    };
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let (raw_stdout, raw_stderr, exit_code) = match output {
+        Some(output) => (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status.code(),
+        ),
+        None => (
+            String::new(),
+            format!(
+                "local shell command timed out after {}s and was killed",
+                LOCAL_SHELL_TIMEOUT.as_secs()
+            ),
+            None,
+        ),
+    };
+
+    // Truncate against the combined cap: budget stdout first, then give the
+    // remainder to stderr, so a chatty stdout cannot starve stderr entirely
+    // while the total still honours the 10 KB limit.
+    let (stdout, stdout_trunc) = truncate_local_shell_output(&raw_stdout);
+    let remaining = LOCAL_SHELL_MAX_OUTPUT_BYTES.saturating_sub(stdout.len());
+    let (stderr, stderr_trunc) = if raw_stderr.len() <= remaining {
+        (raw_stderr, false)
+    } else {
+        let mut cut = remaining;
+        while cut > 0 && !raw_stderr.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let dropped = raw_stderr.len() - cut;
+        let mut text = raw_stderr[..cut].to_string();
+        text.push_str(&format!("\n[truncated: {dropped} bytes]"));
+        (text, true)
+    };
+
+    LocalShellResultEvent {
+        local_id,
+        cmdline: cmd,
+        stdout,
+        stderr,
+        exit_code,
+        duration_ms,
+        truncated: timed_out || stdout_trunc || stderr_trunc,
+    }
 }
 
 fn websocket_request(
@@ -3649,6 +3871,11 @@ impl AppUiBackend for MockAppUiBackend {
             AppUiCommand::StartReview(_) => Err(eyre!(
                 "mock app-ui backend does not implement review start yet"
             )),
+            // `!`-bang local exec is a client-local action; the mock backend
+            // does not run real processes, so it is a no-op here. Tests drive
+            // the completion path by feeding a synthetic LocalShellResult into
+            // the store directly.
+            AppUiCommand::LocalShellExec { .. } => Ok(()),
             _ => Err(eyre!(
                 "mock app-ui backend does not implement unsupported command {method} yet"
             )),
@@ -4200,6 +4427,57 @@ mod tests {
             panic!("expected app event");
         };
         *event
+    }
+
+    #[test]
+    fn local_shell_args_are_cross_platform() {
+        let (program, args) = local_shell_command_args("echo hi");
+        if cfg!(windows) {
+            assert_eq!(program, "cmd");
+            assert_eq!(args, vec!["/C".to_string(), "echo hi".to_string()]);
+        } else {
+            assert_eq!(program, "sh");
+            assert_eq!(args, vec!["-c".to_string(), "echo hi".to_string()]);
+        }
+    }
+
+    #[test]
+    fn local_shell_output_short_is_not_truncated() {
+        let (text, truncated) = truncate_local_shell_output("hello world");
+        assert_eq!(text, "hello world");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn local_shell_output_over_cap_is_truncated_with_marker() {
+        let big = "x".repeat(LOCAL_SHELL_MAX_OUTPUT_BYTES + 500);
+        let (text, truncated) = truncate_local_shell_output(&big);
+        assert!(truncated);
+        // Kept bytes are at or below the cap (plus the appended marker).
+        assert!(text.contains("[truncated: 500 bytes]"));
+        assert!(text.starts_with(&"x".repeat(LOCAL_SHELL_MAX_OUTPUT_BYTES)));
+    }
+
+    #[test]
+    fn local_shell_truncation_respects_utf8_boundary() {
+        // Fill with a 3-byte codepoint so the cap lands mid-character; the
+        // helper must back off to a boundary and never panic.
+        let snowman = "\u{2603}"; // 3 bytes
+        let big = snowman.repeat(LOCAL_SHELL_MAX_OUTPUT_BYTES); // ~30 KB
+        let (text, truncated) = truncate_local_shell_output(&big);
+        assert!(truncated);
+        // The kept prefix must still be valid UTF-8 (no split codepoint).
+        assert!(text.contains("[truncated:"));
+    }
+
+    #[tokio::test]
+    async fn run_local_shell_echo_completes_with_output() {
+        // Deterministic cross-platform: `echo hi` via the shell wrapper.
+        let event = run_local_shell_command("echo hi".into(), None, "local-shell:t1".into()).await;
+        assert_eq!(event.local_id, "local-shell:t1");
+        assert_eq!(event.exit_code, Some(0));
+        assert!(event.stdout.contains("hi"));
+        assert!(!event.truncated);
     }
 
     struct ProtocolCaptureServer {
