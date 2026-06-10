@@ -53,6 +53,13 @@ pub enum ClientEvent {
     /// typed result from one of the `/agents`, `/goal`, or `/loop`
     /// RPCs so the store can update its per-session autonomy mirror.
     Autonomy(AutonomyClientEvent),
+    /// `!`-bang local-shell completion. Carries the captured output of a
+    /// client-local shell command (run where octos-tui runs, NOT the
+    /// agent's sandboxed server `shell` tool). Surfaced into the same
+    /// `queue` that `next_event()` drains, so the synchronous render loop
+    /// never blocks on a running command. The store folds this back into
+    /// the matching "running" activity chip via its `local_id`.
+    LocalShellResult(LocalShellResultEvent),
 }
 
 impl From<AppUiEvent> for ClientEvent {
@@ -232,4 +239,32 @@ pub enum AutonomyResult {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AutonomyClientEvent {
     pub result: AutonomyResult,
+}
+
+/// Result of a `!`-bang client-local shell command. The transport spawns the
+/// command on its tokio runtime and emits one of these on completion (or on
+/// timeout / spawn failure), keyed by the `local_id` the store stamped on the
+/// "running" activity chip so the store can complete that chip in place.
+///
+/// Output is captured (stdout then stderr) and already truncated by the
+/// transport at the 10 KB combined cap; `truncated` records whether the cap
+/// fired. The output is shown locally only and is NOT injected into the next
+/// turn's context (ephemeral, by design).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalShellResultEvent {
+    /// Local chip id stamped by `Store::dispatch_bang_command`.
+    pub local_id: String,
+    /// The command line as typed (after the `!`), for display.
+    pub cmdline: String,
+    /// Captured stdout (already truncated to fit the combined 10 KB cap).
+    pub stdout: String,
+    /// Captured stderr (already truncated to fit the combined 10 KB cap).
+    pub stderr: String,
+    /// Process exit code, or `None` if it was killed (e.g. timeout) or never
+    /// produced one.
+    pub exit_code: Option<i32>,
+    /// Wall-clock duration of the command, in milliseconds.
+    pub duration_ms: u64,
+    /// Whether the combined output was truncated at the 10 KB cap.
+    pub truncated: bool,
 }

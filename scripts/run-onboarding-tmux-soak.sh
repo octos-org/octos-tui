@@ -103,7 +103,13 @@ Environment:
                                  and verify-solo-transport-closure.
   OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR Stdio artifact dir for transport parity
                                  and verify-solo-transport-closure.
-  OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE sequence or set, default sequence.
+  OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE sequence, set, or autonomy-required;
+                                 default sequence. autonomy-required normalizes
+                                 UI-Protocol §14 superseded/projection methods
+                                 and asserts every required autonomy category is
+                                 present in both transports (used by
+                                 verify-autonomy-closure); sequence/set keep
+                                 exact comparison for deterministic fixtures.
   OCTOS_TUI_SOAK_TASK_RECONNECT_ARTIFACT_DIR Optional reconnect artifact dir
                                  used by verify-task-subagent-closure.
   OCTOS_TUI_SOAK_TASK_OLD_SERVER_ARTIFACT_DIR Optional old-server fallback
@@ -1035,23 +1041,58 @@ verify_transport_dir_kind() {
 
 extract_appui_method_sequence() {
   local transcript="$1"
+  # normalize=1 collapses UI-Protocol §14 superseded / projection-wrapped
+  # notifications onto the canonical method the receiving client acts on, so
+  # two transports that surface the same semantic event through different
+  # wire shapes (top-level frame vs projection/envelope) compare equal. Off
+  # by default to preserve the strict sequence/set fixture lanes.
+  local normalize="${2:-0}"
   if command -v jq >/dev/null 2>&1; then
-    jq -Rr '
+    jq -Rr --argjson normalize "$normalize" '
       def norm_dir($d):
         if $d == "client_to_server" then "tx"
         elif $d == "server_to_client" then "rx"
         elif $d == null or $d == "" then "unknown"
         else $d
         end;
+      # UI-Protocol §14: the WS transport advertises and (when present) wraps
+      # these superseded notifications inside projection/envelope, while stdio
+      # emits them top-level. Collapse both shapes onto the canonical method so
+      # the §14 difference never registers as a parity divergence. loop/fired is
+      # folded into the loop activity category (loop/updated) it co-emits with.
+      # Note: superseded methods map to distinct canonical sentinels rather than
+      # onto load-bearing required categories, EXCEPT loop/fired which genuinely
+      # IS a loop activity event and folds into loop/updated. turn/spawn_complete
+      # is a child-spawn signal, NOT the final turn answer, so it must not be
+      # mistaken for turn/completed.
+      def norm_method($m):
+        if $m == "projection/envelope" then "projection/_envelope"
+        elif $m == "message/persisted" then "message/_persisted"
+        elif $m == "turn/spawn_complete" then "turn/_spawn_completed"
+        elif $m == "context/normalization_reported" then "context/_normalized"
+        elif $m == "loop/fired" then "loop/updated"
+        else $m
+        end;
       fromjson?
       | select(type == "object")
-      | (.frame.method // .method // empty) as $method
-      | select($method != "")
+      | (.frame.method // .method // empty) as $rawmethod
+      | select($rawmethod != "")
+      | (if $normalize == 1 then norm_method($rawmethod) else $rawmethod end) as $method
       | norm_dir(.direction // .frame.direction // .dir // null) + "\t" + $method
     ' "$transcript"
   else
     sed -n -E 's/.*"direction"[[:space:]]*:[[:space:]]*"([^"]+)".*"method"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1	\2/p' "$transcript" \
-      | sed -e 's/^client_to_server	/tx	/' -e 's/^server_to_client	/rx	/'
+      | sed -e 's/^client_to_server	/tx	/' -e 's/^server_to_client	/rx	/' \
+      | if [ "$normalize" = "1" ]; then
+          sed -E \
+            -e 's#	projection/envelope$#	projection/_envelope#' \
+            -e 's#	message/persisted$#	message/_persisted#' \
+            -e 's#	turn/spawn_complete$#	turn/_spawn_completed#' \
+            -e 's#	context/normalization_reported$#	context/_normalized#' \
+            -e 's#	loop/fired$#	loop/updated#'
+        else
+          cat
+        fi
   fi
 }
 
@@ -1273,16 +1314,31 @@ restart_stdio_child() {
     kill "$pid" 2>/dev/null || true
   done
 
+  # Wait for the ORIGINAL backend process(es) to exit. The TUI's stdio
+  # transport auto-relaunches a fresh backend after the child dies — that
+  # relaunch is exactly the reconnect behavior under test, so a NEW pid
+  # appearing is expected and must NOT be treated as "did not exit". Only
+  # the pids we signalled need to be gone.
   local shutdown_deadline=$((SECONDS + ${OCTOS_TUI_SOAK_STDIO_SHUTDOWN_WAIT_SECS:-10}))
-  local remaining
+  local still_alive
   while [ "$SECONDS" -le "$shutdown_deadline" ]; do
-    remaining="$(stdio_backend_pids | sort -u)"
-    [ -z "$remaining" ] && break
+    still_alive=""
+    for pid in $pids; do
+      if kill -0 "$pid" 2>/dev/null; then
+        still_alive="$still_alive $pid"
+      fi
+    done
+    [ -z "$still_alive" ] && break
     sleep 0.2
   done
-  remaining="$(stdio_backend_pids | sort -u)"
-  if [ -n "$remaining" ]; then
-    die "Scoped stdio backend did not exit after SIGTERM: $remaining"
+  still_alive=""
+  for pid in $pids; do
+    if kill -0 "$pid" 2>/dev/null; then
+      still_alive="$still_alive $pid"
+    fi
+  done
+  if [ -n "$still_alive" ]; then
+    die "Scoped stdio backend did not exit after SIGTERM:$still_alive"
   fi
 
   {
@@ -3053,7 +3109,15 @@ verify_autonomy_closure() {
   artifact_dir="$original_artifact_dir"
   require_matching_summary_source_commits_for_dir "$original_artifact_dir" "${OCTOS_TUI_SOAK_WS_ARTIFACT_DIR:-}" "M15 WebSocket parity closure"
   require_matching_summary_source_commits_for_dir "$original_artifact_dir" "${OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR:-}" "M15 stdio parity closure"
+  # Two REAL deepseek runs cannot emit byte-identical AppUI sequences, so the
+  # closure gate asserts autonomy-contract parity (every required category
+  # present in both transports after §14 normalization) rather than exact
+  # identity. This stays a real gate: a genuinely missing autonomy category in
+  # either transport still fails loudly.
+  local saved_parity_mode="$transport_parity_mode"
+  transport_parity_mode="autonomy-required"
   verify_transport_parity
+  transport_parity_mode="$saved_parity_mode"
 
   write_ux_validation "autonomy-closure" "passed" "M15 autonomy closure bundle verified"
   echo "Verified M15 autonomy closure bundle in $original_artifact_dir"
@@ -3080,8 +3144,16 @@ verify_transport_parity() {
   tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/octos-tui-transport-parity.XXXXXX")"
   trap 'rm -rf "$tmp_dir"; trap - RETURN' RETURN
 
-  extract_appui_method_sequence "$ws_transcript" > "$tmp_dir/ws.methods"
-  extract_appui_method_sequence "$stdio_transcript" > "$tmp_dir/stdio.methods"
+  # autonomy-required normalizes §14 superseded/projection methods before
+  # comparing so two real (non-deterministic) model runs are not forced to
+  # emit byte-identical wire shapes; sequence/set keep exact comparison.
+  local normalize=0
+  if [ "$transport_parity_mode" = "autonomy-required" ]; then
+    normalize=1
+  fi
+
+  extract_appui_method_sequence "$ws_transcript" "$normalize" > "$tmp_dir/ws.methods"
+  extract_appui_method_sequence "$stdio_transcript" "$normalize" > "$tmp_dir/stdio.methods"
   [ -s "$tmp_dir/ws.methods" ] || die "WebSocket transcript contains no AppUI methods: $ws_transcript"
   [ -s "$tmp_dir/stdio.methods" ] || die "stdio transcript contains no AppUI methods: $stdio_transcript"
 
@@ -3091,7 +3163,12 @@ verify_transport_parity() {
       sort -u "$tmp_dir/ws.methods" -o "$tmp_dir/ws.methods"
       sort -u "$tmp_dir/stdio.methods" -o "$tmp_dir/stdio.methods"
       ;;
-    *) die "OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE must be sequence or set, got: $transport_parity_mode" ;;
+    autonomy-required)
+      verify_autonomy_required_parity "$tmp_dir/ws.methods" "$tmp_dir/stdio.methods" "$ws_dir" "$stdio_dir"
+      echo "Verified autonomy-required transport parity between $ws_dir and $stdio_dir"
+      return 0
+      ;;
+    *) die "OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE must be sequence, set, or autonomy-required, got: $transport_parity_mode" ;;
   esac
 
   if ! diff -u "$tmp_dir/ws.methods" "$tmp_dir/stdio.methods" > "$tmp_dir/diff"; then
@@ -3100,6 +3177,62 @@ verify_transport_parity() {
   fi
 
   echo "Verified $transport_parity_mode transport parity between $ws_dir and $stdio_dir"
+}
+
+# Autonomy-aware parity: instead of demanding identical method sets between two
+# non-deterministic model runs, assert that every REQUIRED autonomy category
+# (the same evidence verify_autonomy_live proves) appears in BOTH transports
+# after §14 normalization. Run-variant optional methods (user_question/*,
+# context normalization, manual loop pause/resume) MUST NOT fail parity.
+#
+# Each required category is a "dir<TAB>pattern" pair matched against the
+# normalized method lines. Patterns are extended regex anchored on the line.
+verify_autonomy_required_parity() {
+  local ws_methods="$1"
+  local stdio_methods="$2"
+  local ws_dir="$3"
+  local stdio_dir="$4"
+
+  # Required autonomy contract categories (derived from verify_autonomy_live):
+  #   child agent lifecycle/updates ........ rx agent/(updated|output/delta|artifact/updated)
+  #   goal continuation .................... rx session/goal/(updated|cleared)
+  #   loop activity (loop fired category) .. rx loop/(updated|fired|completed|resume|pause)
+  #                                          (loop/fired is normalized to loop/updated)
+  #   supervised task updates .............. rx task/updated
+  #   final joined-answer delivery ......... rx turn/completed
+  local -a required_labels=(
+    "child agent lifecycle/updates"
+    "goal continuation"
+    "loop activity"
+    "supervised task updates"
+    "final joined-answer delivery"
+  )
+  local -a required_patterns=(
+    $'^rx\t(agent/updated|agent/output/delta|agent/artifact/updated)$'
+    $'^rx\tsession/goal/(updated|cleared)$'
+    $'^rx\t(loop/updated|loop/completed|loop/resume|loop/pause)$'
+    $'^rx\ttask/updated$'
+    $'^rx\tturn/completed$'
+  )
+
+  local missing=0
+  local i
+  for i in "${!required_patterns[@]}"; do
+    local label="${required_labels[$i]}"
+    local pat="${required_patterns[$i]}"
+    if ! grep -Eq "$pat" "$ws_methods"; then
+      echo "autonomy-required parity: WebSocket transport missing required category '$label' ($pat) in $ws_dir" >&2
+      missing=1
+    fi
+    if ! grep -Eq "$pat" "$stdio_methods"; then
+      echo "autonomy-required parity: stdio transport missing required category '$label' ($pat) in $stdio_dir" >&2
+      missing=1
+    fi
+  done
+
+  if [ "$missing" -ne 0 ]; then
+    die "autonomy-required transport parity failed: a required autonomy category is missing from one transport"
+  fi
 }
 
 verify_ux_run() {
@@ -3225,6 +3358,11 @@ JSON
 }
 
 self_test() {
+  # Hermetic: child invocations below assume the default sequence parity mode
+  # unless a test explicitly sets OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE. Clearing
+  # any inherited value keeps the strict-parity assertions deterministic even
+  # when the harness is run with the env var preset (e.g. autonomy-required).
+  unset OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE
   local tmp_root
   tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/octos-tui-soak-self-test.XXXXXX")"
   local self_test_server_session="octos-tui-soak-selftest-server-$$"
@@ -4344,22 +4482,97 @@ JSONL
   mkdir -p "$tmp_root/parity-ws/m15-evidence" "$tmp_root/parity-stdio/m15-evidence"
   write_self_test_summary_env "$tmp_root/parity-ws" parity-ws-selftest ws
   write_self_test_summary_env "$tmp_root/parity-stdio" parity-stdio-selftest stdio
+  # Method-set-identical fixtures: pass strict sequence parity AND carry every
+  # required autonomy category so autonomy-required parity passes too.
   cat > "$tmp_root/parity-ws/m15-evidence/appui-transcript.jsonl" <<'JSONL'
 {"direction":"client_to_server","frame":{"method":"session/open"}}
 {"direction":"client_to_server","frame":{"method":"agent/list"}}
 {"direction":"server_to_client","frame":{"method":"agent/updated"}}
+{"direction":"server_to_client","frame":{"method":"session/goal/updated"}}
+{"direction":"server_to_client","frame":{"method":"loop/updated"}}
+{"direction":"server_to_client","frame":{"method":"task/updated"}}
+{"direction":"server_to_client","frame":{"method":"turn/completed"}}
 {"direction":"client_to_server","frame":{"method":"loop/list"}}
 JSONL
   cat > "$tmp_root/parity-stdio/m15-evidence/appui-transcript.jsonl" <<'JSONL'
 {"direction":"tx","frame":{"method":"session/open"}}
 {"direction":"tx","frame":{"method":"agent/list"}}
 {"direction":"rx","frame":{"method":"agent/updated"}}
+{"direction":"rx","frame":{"method":"session/goal/updated"}}
+{"direction":"rx","frame":{"method":"loop/updated"}}
+{"direction":"rx","frame":{"method":"task/updated"}}
+{"direction":"rx","frame":{"method":"turn/completed"}}
 {"direction":"tx","frame":{"method":"loop/list"}}
 JSONL
   env \
+    "OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE=sequence" \
     "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/parity-ws" \
     "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/parity-stdio" \
     "$0" verify-transport-parity >/dev/null
+
+  # autonomy-required parity passes on an envelope-different but semantically
+  # equal pair: stdio surfaces §14 superseded methods (message/persisted,
+  # turn/spawn_complete, loop/fired, context/normalization_reported) top-level
+  # plus a run-variant user_question, while WS folds the same loop activity into
+  # loop/updated and hit a manual loop/resume. Normalization + required-category
+  # checks must accept both.
+  mkdir -p "$tmp_root/parity-autonomy-ws/m15-evidence" "$tmp_root/parity-autonomy-stdio/m15-evidence"
+  write_self_test_summary_env "$tmp_root/parity-autonomy-ws" parity-autonomy-ws-selftest ws
+  write_self_test_summary_env "$tmp_root/parity-autonomy-stdio" parity-autonomy-stdio-selftest stdio
+  cat > "$tmp_root/parity-autonomy-ws/m15-evidence/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"session/open"}}
+{"direction":"client_to_server","frame":{"method":"agent/list"}}
+{"direction":"server_to_client","frame":{"method":"agent/updated"}}
+{"direction":"server_to_client","frame":{"method":"session/goal/updated"}}
+{"direction":"server_to_client","frame":{"method":"loop/updated"}}
+{"direction":"client_to_server","frame":{"method":"loop/resume"}}
+{"direction":"server_to_client","frame":{"method":"user_question/requested"}}
+{"direction":"client_to_server","frame":{"method":"user_question/respond"}}
+{"direction":"server_to_client","frame":{"method":"task/updated"}}
+{"direction":"server_to_client","frame":{"method":"turn/completed"}}
+JSONL
+  cat > "$tmp_root/parity-autonomy-stdio/m15-evidence/appui-transcript.jsonl" <<'JSONL'
+{"direction":"tx","frame":{"method":"session/open"}}
+{"direction":"tx","frame":{"method":"agent/list"}}
+{"direction":"rx","frame":{"method":"agent/updated"}}
+{"direction":"rx","frame":{"method":"session/goal/updated"}}
+{"direction":"rx","frame":{"method":"message/persisted"}}
+{"direction":"rx","frame":{"method":"turn/spawn_complete"}}
+{"direction":"rx","frame":{"method":"context/normalization_reported"}}
+{"direction":"rx","frame":{"method":"loop/fired"}}
+{"direction":"rx","frame":{"method":"task/updated"}}
+{"direction":"rx","frame":{"method":"turn/completed"}}
+JSONL
+  env \
+    "OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE=autonomy-required" \
+    "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/parity-autonomy-ws" \
+    "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/parity-autonomy-stdio" \
+    "$0" verify-transport-parity >/dev/null \
+    || die "self-test expected autonomy-required parity to pass on envelope-different equal pair"
+  # The same pair must FAIL the strict sequence gate (proves the new mode is not
+  # a relaxed default; only autonomy-required tolerates the §14/optional diff).
+  if env \
+    "OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE=sequence" \
+    "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/parity-autonomy-ws" \
+    "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/parity-autonomy-stdio" \
+    "$0" verify-transport-parity >/dev/null 2>&1; then
+    die "self-test expected strict sequence parity to fail on envelope-different pair"
+  fi
+
+  # autonomy-required parity FAILS when a required category is genuinely absent
+  # from one transport: drop task/updated (supervised task updates) from stdio.
+  # task/updated has no §14 superseded alias, so normalization cannot resynth it.
+  mkdir -p "$tmp_root/parity-autonomy-missing/m15-evidence"
+  write_self_test_summary_env "$tmp_root/parity-autonomy-missing" parity-autonomy-missing-selftest stdio
+  grep -v 'task/updated' "$tmp_root/parity-autonomy-stdio/m15-evidence/appui-transcript.jsonl" \
+    > "$tmp_root/parity-autonomy-missing/m15-evidence/appui-transcript.jsonl"
+  if env \
+    "OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE=autonomy-required" \
+    "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/parity-autonomy-ws" \
+    "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/parity-autonomy-missing" \
+    "$0" verify-transport-parity >/dev/null 2>&1; then
+    die "self-test expected autonomy-required parity to fail when a required category is missing"
+  fi
 
   env \
     "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/autonomy-live" \
@@ -4384,6 +4597,7 @@ JSONL
   printf '{"direction":"tx","frame":{"method":"session/goal/get"}}\n' \
     >> "$tmp_root/bad-parity-stdio/m15-evidence/appui-transcript.jsonl"
   if env \
+    "OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE=sequence" \
     "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/parity-ws" \
     "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/bad-parity-stdio" \
     "$0" verify-transport-parity >/dev/null 2>&1; then
@@ -4394,6 +4608,7 @@ JSONL
   cp "$tmp_root/parity-ws/m15-evidence/appui-transcript.jsonl" "$tmp_root/bad-parity-wrong-kind/m15-evidence/"
   printf 'transport=stdio\n' > "$tmp_root/bad-parity-wrong-kind/summary.env"
   if env \
+    "OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE=sequence" \
     "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/bad-parity-wrong-kind" \
     "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/parity-stdio" \
     "$0" verify-transport-parity >/dev/null 2>&1; then
@@ -4405,6 +4620,7 @@ JSONL
   cp "$tmp_root/parity-ws/summary.env" "$tmp_root/bad-parity-secret/summary.env"
   printf 'retained secret: selftest-secret\n' > "$tmp_root/bad-parity-secret/leak.txt"
   if env \
+    "OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE=sequence" \
     "OCTOS_TUI_SOAK_API_KEY=selftest-secret" \
     "OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=$tmp_root/bad-parity-secret" \
     "OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=$tmp_root/parity-stdio" \

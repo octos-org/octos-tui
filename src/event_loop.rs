@@ -1438,7 +1438,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 1 method".into(),
+            message: "Octos UI capabilities refreshed: 1 method".into(),
         })
     }
 

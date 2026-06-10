@@ -333,8 +333,8 @@ fn binary_checks(_args: &DoctorArgs) -> Vec<Check> {
     // separately from extra known-install prefixes so "on PATH" reflects what
     // can actually be run *by name*, not merely what exists on disk.
     let located = locate_octos_tui();
-    checks.push(on_path_check(&located, current_exe.as_deref()));
-    checks.push(shadow_check(&located));
+    checks.push(on_path_check(&located, current_exe.as_deref(), &method));
+    checks.push(shadow_check(&located, &method));
 
     // Newer release (best-effort; network failure → warn, not fail).
     checks.push(release_check(&method));
@@ -366,10 +366,31 @@ impl LocatedBinaries {
 /// running executable's directory is not on `$PATH`, warn that it was launched
 /// by path and won't be found by name — folding the cargo-bin/brew prefixes in
 /// would mask exactly this case.
-fn on_path_check(located: &LocatedBinaries, current_exe: Option<&Path>) -> Check {
+fn on_path_check(
+    located: &LocatedBinaries,
+    current_exe: Option<&Path>,
+    method: &InstallMethod,
+) -> Check {
     if let Some(first) = located.on_path.first() {
         return Check::pass(CAT_BINARY, "octos-tui on PATH", "resolvable by name")
             .with_value(first.display().to_string());
+    }
+    // npm global (esp. Windows): the launcher shim (octos-tui.ps1/.cmd) IS on
+    // PATH and runnable by name, but `current_exe()` resolves to the real binary
+    // deep under `node_modules/.bin_real`, whose dir is NOT on PATH and whose
+    // basename isn't `octos-tui[.exe]` — so the PATH scan finds nothing. Don't
+    // false-warn, and never suggest adding an internal node_modules dir. (#189)
+    if matches!(method, InstallMethod::Npm) {
+        return Check::pass(
+            CAT_BINARY,
+            "octos-tui on PATH",
+            "runnable by name via the npm global shim",
+        )
+        .with_value(
+            current_exe
+                .map(|e| e.display().to_string())
+                .unwrap_or_default(),
+        );
     }
     // Not on $PATH at all. If we know where this exe lives, point at its dir.
     match current_exe.and_then(|e| e.parent()) {
@@ -392,9 +413,17 @@ fn on_path_check(located: &LocatedBinaries, current_exe: Option<&Path>) -> Check
 /// Build the shadowing-install check from the located binaries. Shadowing
 /// considers both `$PATH` hits and off-PATH known-install locations (>1 total
 /// is the Claude Code #22415 failure mode), labelling which is which.
-fn shadow_check(located: &LocatedBinaries) -> Check {
+fn shadow_check(located: &LocatedBinaries, method: &InstallMethod) -> Check {
     let all = located.all();
     match all.len() {
+        // npm puts the real binary under node_modules/.bin_real (off PATH, and
+        // not in the unix known-dir list), so the locator finds nothing — but
+        // that's exactly one healthy install, not a missing one. (#189)
+        0 if matches!(method, InstallMethod::Npm) => Check::pass(
+            CAT_BINARY,
+            "no shadowing installs",
+            "exactly one (npm global)",
+        ),
         0 => Check::warn(
             CAT_BINARY,
             "no shadowing installs",
@@ -1126,17 +1155,23 @@ mod tests {
 
     #[test]
     fn shadow_check_passes_for_single_and_warns_for_multiple() {
-        let one = shadow_check(&LocatedBinaries {
-            on_path: vec![PathBuf::from("/usr/local/bin/octos-tui")],
-            off_path: vec![],
-        });
+        let one = shadow_check(
+            &LocatedBinaries {
+                on_path: vec![PathBuf::from("/usr/local/bin/octos-tui")],
+                off_path: vec![],
+            },
+            &InstallMethod::Homebrew,
+        );
         assert_eq!(one.status, CheckStatus::Pass);
         assert!(one.detail.contains("on PATH"));
 
-        let two = shadow_check(&LocatedBinaries {
-            on_path: vec![PathBuf::from("/opt/homebrew/bin/octos-tui")],
-            off_path: vec![PathBuf::from("/home/u/.cargo/bin/octos-tui")],
-        });
+        let two = shadow_check(
+            &LocatedBinaries {
+                on_path: vec![PathBuf::from("/opt/homebrew/bin/octos-tui")],
+                off_path: vec![PathBuf::from("/home/u/.cargo/bin/octos-tui")],
+            },
+            &InstallMethod::Homebrew,
+        );
         assert_eq!(two.status, CheckStatus::Warn);
         assert!(two.detail.contains("2 octos-tui binaries"));
         let fix = two.fix.unwrap();
@@ -1147,8 +1182,29 @@ mod tests {
 
     #[test]
     fn shadow_check_warns_when_nothing_found() {
-        let none = shadow_check(&LocatedBinaries::default());
+        let none = shadow_check(&LocatedBinaries::default(), &InstallMethod::Homebrew);
         assert_eq!(none.status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn npm_install_does_not_false_warn_on_path_or_shadow() {
+        // #189: npm-global (esp. Windows) — the locator finds no `octos-tui`
+        // on PATH (the shim is .ps1/.cmd; the real .exe is under
+        // node_modules/.bin_real). Both checks must PASS, not warn.
+        let located = LocatedBinaries::default();
+        let exe = PathBuf::from(
+            "C:/Users/u/AppData/Roaming/npm/node_modules/@octos-org/octos-tui/node_modules/.bin_real/octos-tui.exe",
+        );
+        let on_path = on_path_check(&located, Some(exe.as_path()), &InstallMethod::Npm);
+        assert_eq!(on_path.status, CheckStatus::Pass);
+        assert!(
+            on_path.fix.is_none(),
+            "npm on-PATH check must not suggest a fix"
+        );
+
+        let shadow = shadow_check(&located, &InstallMethod::Npm);
+        assert_eq!(shadow.status, CheckStatus::Pass);
+        assert!(shadow.detail.contains("npm"));
     }
 
     #[test]
@@ -1157,7 +1213,11 @@ mod tests {
             on_path: vec![PathBuf::from("/usr/local/bin/octos-tui")],
             off_path: vec![],
         };
-        let check = on_path_check(&located, Some(Path::new("/usr/local/bin/octos-tui")));
+        let check = on_path_check(
+            &located,
+            Some(Path::new("/usr/local/bin/octos-tui")),
+            &InstallMethod::Homebrew,
+        );
         assert_eq!(check.status, CheckStatus::Pass);
     }
 
@@ -1171,7 +1231,7 @@ mod tests {
             off_path: vec![PathBuf::from("/home/u/.cargo/bin/octos-tui")],
         };
         let exe = PathBuf::from("/home/u/.cargo/bin/octos-tui");
-        let check = on_path_check(&located, Some(&exe));
+        let check = on_path_check(&located, Some(&exe), &InstallMethod::CargoGit);
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(check.detail.contains("isn't on $PATH"));
         // The fix points at the running exe's directory.
