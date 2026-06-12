@@ -30,18 +30,22 @@ fn syntax_set() -> &'static SyntaxSet {
     SET.get_or_init(SyntaxSet::load_defaults_newlines)
 }
 
-fn theme() -> &'static Theme {
-    static THEME: OnceLock<Theme> = OnceLock::new();
-    THEME.get_or_init(|| {
-        // Dark-friendly defaults; foregrounds read well on dark AND light
-        // terminal backgrounds since we never paint our own background.
-        let mut themes = ThemeSet::load_defaults();
-        themes
-            .themes
-            .remove("base16-eighties.dark")
-            .or_else(|| themes.themes.remove("base16-ocean.dark"))
-            .unwrap_or_default()
-    })
+const FALLBACK_THEME: &str = "base16-eighties.dark";
+
+fn theme_set() -> &'static ThemeSet {
+    static SET: OnceLock<ThemeSet> = OnceLock::new();
+    SET.get_or_init(ThemeSet::load_defaults)
+}
+
+/// Resolve a syntect theme by name (the UI palette maps each `/theme` choice
+/// to one); unknown names fall back rather than panic.
+fn theme(name: &str) -> &'static Theme {
+    let themes = &theme_set().themes;
+    themes
+        .get(name)
+        .or_else(|| themes.get(FALLBACK_THEME))
+        .or_else(|| themes.values().next())
+        .expect("syntect default theme set is never empty")
 }
 
 /// Per-block highlighter: holds syntect's line-to-line state so multi-line
@@ -55,7 +59,7 @@ impl CodeHighlighter {
     /// Resolve the fence's language token (`rust`, `py`, `json`, …). An empty
     /// or unrecognized token yields a pass-through highlighter — never a
     /// guess, never a panic.
-    pub fn for_language(token: &str) -> Self {
+    pub fn for_language(token: &str, theme_name: &str) -> Self {
         let token = token.trim();
         let syntax: Option<&'static SyntaxReference> = if token.is_empty() || token == "code" {
             None
@@ -63,7 +67,7 @@ impl CodeHighlighter {
             syntax_set().find_syntax_by_token(token)
         };
         Self {
-            inner: syntax.map(|syntax| HighlightLines::new(syntax, theme())),
+            inner: syntax.map(|syntax| HighlightLines::new(syntax, theme(theme_name))),
         }
     }
 
@@ -124,9 +128,10 @@ pub fn highlight_block(
     body: &[String],
     fallback: Style,
     cacheable: bool,
+    theme_name: &str,
 ) -> Rc<Vec<Vec<Span<'static>>>> {
     let render = |language: &str, body: &[String]| -> Vec<Vec<Span<'static>>> {
-        let mut highlighter = CodeHighlighter::for_language(language);
+        let mut highlighter = CodeHighlighter::for_language(language, theme_name);
         body.iter()
             .enumerate()
             .map(|(idx, line)| {
@@ -146,8 +151,10 @@ pub fn highlight_block(
     let mut hasher = DefaultHasher::new();
     language.hash(&mut hasher);
     body.hash(&mut hasher);
-    // The fallback fg participates: theme switches must not serve stale colors.
+    // The fallback fg AND theme name participate: /theme switches must not
+    // serve stale colors from the previous theme.
     fallback.fg.hash(&mut hasher);
+    theme_name.hash(&mut hasher);
     let key = hasher.finish();
 
     BLOCK_CACHE.with(|cache| {

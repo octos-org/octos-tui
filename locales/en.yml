@@ -386,6 +386,11 @@ lang:
   switched: "Language switched to English."
   usage: "Current language: %{current}. Usage: /lang <en|zh>."
   unknown: "Unknown language '%{value}'. Available: en, zh."
+scrollmode:
+  current: "(current: %{mode})"
+  set_pinned: "Scroll mode: pinned — the wheel scrolls the transcript, composer stays at the bottom (Shift+drag to select)."
+  set_native: "Scroll mode: native — the wheel belongs to the terminal again (Ctrl+T opens the pager)."
+  unknown: "Unknown scroll mode '%{value}'. Available: native, pinned."
 thinking:
   usage: "Reasoning effort: %{current}. Usage: /thinking <low|medium|high|max|default>."
   set: "Reasoning effort set to %{level}."
@@ -786,6 +791,8 @@ command:
     desc: Read backend task artifacts.
   theme:
     desc: Choose the local TUI theme.
+  scrollmode:
+    desc: 'Switch wheel-scroll behavior: /scrollmode [native|pinned] (bare toggles).'
   thinking:
     desc: 'Set reasoning effort for thinking models: /thinking low|medium|high|max|default.'
   threads:

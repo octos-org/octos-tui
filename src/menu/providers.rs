@@ -177,12 +177,28 @@ fn help_menu(ctx: &MenuContext<'_>) -> MenuSpec {
         .enumerate()
         .map(|(idx, visible)| {
             let command = visible.command;
-            let mut item = MenuItem::new(
-                command.name,
-                command.slash_name(),
-                action_for_command_entry(&command.entry),
-            )
-            .with_description(command_description(command.description, command.aliases));
+            // Commands that take inline arguments COMPLETE into the composer
+            // on Enter (codex's flow: pick `/scrollmode`, type the argument,
+            // Enter again to run). Argument-less commands keep executing /
+            // opening their menu directly.
+            let action = if command.inline_args == crate::menu::types::InlineArgMode::None {
+                action_for_command_entry(&command.entry)
+            } else {
+                MenuAction::Local(LocalAction::EditComposer(format!("/{} ", command.name)))
+            };
+            let mut description = command_description(command.description, command.aliases);
+            if command.name == "scrollmode" {
+                // Surface the CURRENT mode so the user knows what a toggle
+                // would do before running it.
+                let mode = if ctx.app.pinned_scroll {
+                    "pinned"
+                } else {
+                    "native"
+                };
+                description = format!("{description} {}", t!("scrollmode.current", mode = mode));
+            }
+            let mut item = MenuItem::new(command.name, command.slash_name(), action)
+                .with_description(description);
             if let Some(shortcut) = numeric_shortcut(idx) {
                 item = item.with_shortcut(shortcut);
             }

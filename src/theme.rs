@@ -16,6 +16,9 @@ pub struct Palette {
     pub danger: Color,
     pub danger_bg: Color,
     pub diff_context_bg: Color,
+    /// syntect theme (from the default theme set) used for fenced-code
+    /// highlighting under this UI theme. Foreground-only at render time.
+    pub code_theme: &'static str,
 }
 
 impl Palette {
@@ -34,6 +37,7 @@ impl Palette {
                 danger: Color::Red,
                 danger_bg: Color::Reset,
                 diff_context_bg: Color::Reset,
+                code_theme: "base16-eighties.dark",
             },
             ThemeName::Slate => Self {
                 surface: Color::Rgb(20, 25, 35),
@@ -48,6 +52,7 @@ impl Palette {
                 danger: Color::Rgb(232, 95, 95),
                 danger_bg: Color::Rgb(58, 28, 32),
                 diff_context_bg: Color::Rgb(24, 31, 43),
+                code_theme: "base16-ocean.dark",
             },
             ThemeName::Codex => Self {
                 surface: Color::Rgb(15, 18, 24),
@@ -62,6 +67,7 @@ impl Palette {
                 danger: Color::Rgb(248, 113, 113),
                 danger_bg: Color::Rgb(64, 27, 32),
                 diff_context_bg: Color::Rgb(22, 26, 34),
+                code_theme: "base16-eighties.dark",
             },
             ThemeName::Claude => Self {
                 surface: Color::Rgb(38, 31, 26),
@@ -76,6 +82,7 @@ impl Palette {
                 danger: Color::Rgb(235, 111, 106),
                 danger_bg: Color::Rgb(70, 38, 34),
                 diff_context_bg: Color::Rgb(45, 37, 31),
+                code_theme: "base16-mocha.dark",
             },
             ThemeName::Solarized => Self {
                 surface: Color::Rgb(0, 43, 54),
@@ -90,6 +97,7 @@ impl Palette {
                 danger: Color::Rgb(220, 50, 47),
                 danger_bg: Color::Rgb(75, 44, 48),
                 diff_context_bg: Color::Rgb(5, 50, 61),
+                code_theme: "Solarized (dark)",
             },
         }
     }

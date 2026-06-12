@@ -938,7 +938,7 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             append_active_menu_search_char(store, ch);
         }
         KeyCode::Enter => {
-            if slash_help_query_active(store) {
+            if slash_help_query_active(store) && slash_help_enter_executes(store) {
                 return handle_composer_enter(store);
             }
             let command = store.accept_active_menu_item();
@@ -986,6 +986,39 @@ fn slash_help_capture_active(store: &Store) -> bool {
 
 fn slash_help_query_active(store: &Store) -> bool {
     slash_help_capture_active(store) && store.state.composer.len() > 1
+}
+
+/// With the slash popup filtering, Enter EXECUTES the draft only when it
+/// already names a command exactly (optionally with arguments) or matches
+/// nothing at all; while the name is still a partial prefix, Enter falls
+/// through to `accept_active_menu_item` and COMPLETES the highlighted command
+/// into the composer (codex's two-step flow: pick, add arguments, run).
+fn slash_help_enter_executes(store: &Store) -> bool {
+    let draft = store.state.composer.trim();
+    let Some(stripped) = draft.strip_prefix('/') else {
+        return true;
+    };
+    if stripped.contains(char::is_whitespace) {
+        // Arguments present: the command name part is final — run it.
+        return true;
+    }
+    let registry = crate::menu::CommandRegistry::with_core_commands();
+    if matches!(
+        registry.resolve(draft),
+        crate::menu::CommandResolution::Found { .. }
+    ) {
+        // Exact command (or alias) name: run it directly.
+        return true;
+    }
+    // Partial name: execute only if the popup has nothing left to offer.
+    store
+        .state
+        .active_menu
+        .as_ref()
+        .is_none_or(|menu| match menu {
+            crate::menu::MenuBuildResult::Ready(spec) => spec.items.is_empty(),
+            _ => true,
+        })
 }
 
 fn slash_help_should_capture_char(store: &Store, ch: char) -> bool {

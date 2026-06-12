@@ -603,6 +603,15 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             entry: CommandEntry::LocalAction(LocalAction::SetThinking),
         },
         CommandSpec {
+            name: "scrollmode",
+            aliases: &["scroll-mode"],
+            description: "command.scrollmode.desc",
+            category: CommandCategory::Settings,
+            availability: CommandAvailability::always(),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::SetScrollMode),
+        },
+        CommandSpec {
             name: "statusline",
             aliases: &["status-line"],
             description: "command.statusline.desc",

@@ -1001,6 +1001,14 @@ impl Store {
             LocalAction::SetLanguage => self.dispatch_set_language(inline_args.unwrap_or_default()),
             LocalAction::SetLanguageCode(lang) => self.dispatch_set_language_code(lang),
             LocalAction::SetThinking => self.dispatch_set_thinking(inline_args.unwrap_or_default()),
+            LocalAction::SetScrollMode => {
+                self.dispatch_set_scrollmode(inline_args.unwrap_or_default());
+                // Executing from the slash popup must close it: the toggle's
+                // only visible feedback is the status row, and a popup that
+                // stays open reads as "Enter did nothing".
+                self.close_all_menus();
+                None
+            }
             LocalAction::SetThinkingLevel(level) => self.dispatch_set_thinking_level(level),
             LocalAction::CopyLastReply => {
                 self.copy_last_reply();
@@ -1054,6 +1062,29 @@ impl Store {
     /// reasoning style; the server decides whether the effort is honored.
     /// `/thinking` with no arg opens the selection menu; with an arg
     /// (`low|medium|high|max|default`) it sets the level inline as a shortcut.
+    /// `/scrollmode` — runtime switch of the wheel-scroll model. Bare command
+    /// toggles; `native`/`pinned` set explicitly. Mouse capture follows on the
+    /// next frame (the draw loop re-syncs capture from `wants_mouse_capture`).
+    fn dispatch_set_scrollmode(&mut self, inline_args: &str) {
+        let arg = inline_args.trim().to_ascii_lowercase();
+        let pinned = match arg.as_str() {
+            "" => !self.state.pinned_scroll,
+            "pinned" | "pin" => true,
+            "native" | "default" => false,
+            other => {
+                self.state.status =
+                    t!("scrollmode.unknown", value = other.to_string()).into_owned();
+                return;
+            }
+        };
+        self.state.pinned_scroll = pinned;
+        self.state.status = if pinned {
+            t!("scrollmode.set_pinned").into_owned()
+        } else {
+            t!("scrollmode.set_native").into_owned()
+        };
+    }
+
     fn dispatch_set_thinking(&mut self, inline_args: &str) -> Option<AppUiCommand> {
         use octos_core::ui_protocol::ReasoningEffortLevel as L;
         let arg = inline_args.trim().to_ascii_lowercase();
@@ -3170,6 +3201,7 @@ impl Store {
                     )
                 })
                 .count(),
+            pinned_scroll: self.state.pinned_scroll,
         }
     }
 

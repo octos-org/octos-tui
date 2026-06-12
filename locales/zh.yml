@@ -404,6 +404,8 @@ command:
     desc: 读取后端任务产物
   theme:
     desc: 选择本地 TUI 主题
+  scrollmode:
+    desc: "切换滚轮滚动模式：/scrollmode [native|pinned]（不带参数为切换）。"
   thinking:
     desc: 设置思考模型的思考强度：/thinking low|medium|high|max|default
   threads:
@@ -1191,6 +1193,11 @@ status:
   summary_none_observed: "未观察到"
   summary_not_reported: "未报告"
   summary_none_recorded: "未记录"
+scrollmode:
+  current: "（当前：%{mode}）"
+  set_pinned: "滚动模式：pinned —— 滚轮滚动会话内容，输入框钉在底部（选择文本用 Shift+拖选）。"
+  set_native: "滚动模式：native —— 滚轮归还终端（Ctrl+T 进入回看）。"
+  unknown: "未知滚动模式 '%{value}'。可用：native、pinned。"
 thinking:
   cleared: 已清除推理强度，使用服务器默认值。
   no_session: 没有活动会话——请先打开或选择一个会话。

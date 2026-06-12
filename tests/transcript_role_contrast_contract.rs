@@ -161,6 +161,8 @@ fn activity_rows_are_muted_without_bold() {
         &mut store,
         Event::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
     );
+    // Settled groups collapse by default now; expand to inspect child styling.
+    store.state.expanded_tool_outputs = true;
     let frame = rendered(&store.state, 90, 24);
 
     let palette = Palette::for_theme(ThemeName::default());

@@ -268,6 +268,10 @@ pub enum LocalAction {
     /// Set the per-session reasoning effort to a specific level from the
     /// `/thinking` selection menu. `None` clears the override (server default).
     SetThinkingLevel(Option<octos_core::ui_protocol::ReasoningEffortLevel>),
+    /// Switch the wheel-scroll behavior at runtime (`/scrollmode` toggles,
+    /// `/scrollmode <native|pinned>` sets). Only flips the runtime
+    /// `AppState.pinned_scroll`; the launch config stays the default source.
+    SetScrollMode,
     /// Copy the last assistant reply for the active session to the system
     /// clipboard (`/copy`). The store stages the text on
     /// `AppState::pending_clipboard`; the event loop emits the OSC 52 escape
@@ -567,6 +571,9 @@ pub struct MenuAppSnapshot<'a> {
     pub selected_session_title: Option<&'a str>,
     pub selected_task_title: Option<&'a str>,
     pub background_task_count: usize,
+    /// Current wheel-scroll mode, so the `/scrollmode` help entry can show
+    /// which mode is active before the user toggles blindly.
+    pub pinned_scroll: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

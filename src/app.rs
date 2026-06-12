@@ -213,8 +213,11 @@ pub fn render_viewport_with_finalization(
     let area = frame.area();
     let composer_height = composer_height_for_size(app, area.width, area.height);
     let active_menu = active_menu_surface(app);
-    let menu_height = menu_height_hint(active_menu.as_ref(), area.width, area.height)
-        .min(area.height.saturating_sub(composer_height + 1));
+    let menu_height = menu_height_for_viewport(
+        active_menu.as_ref(),
+        area.width,
+        area.height.saturating_sub(composer_height + 1),
+    );
     let autonomy_height = autonomy_indicator_height(app);
     let harness_height = harness_status_height(app);
 
@@ -397,7 +400,7 @@ pub fn finalized_history_lines_range(
             .iter()
             .filter(|(anchor_idx, _)| *anchor_idx == idx)
         {
-            push_turn_activity_log_section(&mut lines, palette, log, app);
+            push_turn_activity_log_section(&mut lines, palette, log, app, false);
         }
     }
     // Scrollback content must render on the terminal's NATIVE background, not the
@@ -470,7 +473,7 @@ pub fn finalized_history_lines_range_dedup_live(
             {
                 push_turn_activity_log_section_unflushed(&mut lines, palette, log, app, coverage);
             } else {
-                push_turn_activity_log_section(&mut lines, palette, log, app);
+                push_turn_activity_log_section(&mut lines, palette, log, app, false);
             }
         }
     }
@@ -1121,6 +1124,29 @@ fn menu_height_hint(
         .max(4.min(max_height))
 }
 
+/// Menu height for the INLINE VIEWPORT render pass. `menu_height_hint` budgets
+/// against the full TERMINAL height (its `-15` heuristic reserves scrollback
+/// rows) and sizes the viewport accordingly; re-applying that heuristic to the
+/// viewport's own (much smaller) height collapsed the menu to zero rows — the
+/// slash popup's space was reserved but rendered blank once the activity
+/// collapse made viewports short. Here the menu simply takes its desired
+/// height, clamped to the room the viewport actually has.
+fn menu_height_for_viewport(
+    menu: Option<&menu_render::MenuSurface>,
+    viewport_width: u16,
+    available: u16,
+) -> u16 {
+    let Some(menu) = menu else {
+        return 0;
+    };
+    if available == 0 {
+        return 0;
+    }
+    menu_render::height_hint(menu, viewport_width)
+        .min(available)
+        .max(4.min(available))
+}
+
 const COMPOSER_CHROME_ROWS: u16 = 4;
 const COMPOSER_MIN_HEIGHT: u16 = 5;
 const COMPOSER_MAX_INPUT_ROWS: u16 = 12;
@@ -1503,7 +1529,7 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
                 .iter()
                 .filter(|(anchor_idx, _)| *anchor_idx == idx)
             {
-                push_turn_activity_log_section(&mut lines, palette, log, app);
+                push_turn_activity_log_section(&mut lines, palette, log, app, true);
             }
 
             if turn_flow_visible && Some(idx) == latest_user_index {
@@ -1897,7 +1923,13 @@ fn push_code_block_lines(
     body: &[String],
     complete: bool,
 ) {
-    let rendered = crate::highlight::highlight_block(language, body, palette.muted(), complete);
+    let rendered = crate::highlight::highlight_block(
+        language,
+        body,
+        palette.muted(),
+        complete,
+        palette.code_theme,
+    );
     for row in rendered.iter() {
         let mut spans = vec![
             Span::styled(indent, style_bg(palette.border(), bg)),
@@ -3069,6 +3101,7 @@ fn push_activity_section_with_finalization(
                     pending_continuations,
                     is_active_group(app, last_turn),
                     app.expanded_tool_outputs,
+                    true,
                 );
                 group.clear();
             }
@@ -3087,6 +3120,7 @@ fn push_activity_section_with_finalization(
             pending_continuations,
             is_active_group(app, last_turn),
             app.expanded_tool_outputs,
+            true,
         );
     }
     if flow_activity.len() > recent.len() {
@@ -3188,6 +3222,7 @@ fn push_turn_activity_log_section(
     palette: Palette,
     log: &TurnActivityLog,
     app: &AppState,
+    collapse_settled: bool,
 ) {
     if log.items.is_empty() {
         return;
@@ -3216,6 +3251,7 @@ fn push_turn_activity_log_section(
         active_session_pending_continuations(app),
         is_active_group(app, Some(&log.turn_id)),
         app.expanded_tool_outputs,
+        collapse_settled,
     );
     if full.len() > shown.len() {
         let hidden = full.len() - shown.len();
@@ -3283,6 +3319,8 @@ fn push_finalized_activity_items_section(
         0,
         false,
         app.expanded_tool_outputs,
+        // Scrollback flush path: the archive never collapses.
+        false,
     );
 }
 
@@ -3356,6 +3394,7 @@ fn push_agent_task_group(
     pending_continuations: u32,
     is_active_group: bool,
     expanded: bool,
+    collapse_settled: bool,
 ) {
     let active_subagents = subagent_titles.len();
     if items.is_empty() && subagent_titles.is_empty() {
@@ -3406,6 +3445,15 @@ fn push_agent_task_group(
         Span::styled(format!(" ({})", metadata.join(" · ")), palette.muted()),
     ];
     lines.push(Line::from(spans));
+
+    // Settled groups collapse to their one-line summary in the repainting
+    // views (Ctrl+O expands); the scrollback flush path never collapses (the
+    // archive stays complete). A group is NOT settled while it is the active
+    // turn OR while it is still in progress on its own — a finished turn with
+    // sub-agents still running keeps its spinner AND its children visible.
+    if collapse_settled && !is_active_group && !in_progress && !expanded {
+        return;
+    }
 
     for (idx, item) in items.iter().enumerate() {
         push_agent_task_child(lines, palette, item, idx == 0, expanded);
@@ -6323,6 +6371,7 @@ mod tests {
                 .with_success(true),
         );
 
+        app.expanded_tool_outputs = true;
         let buffer = rendered_buffer(&app, Palette::for_theme(ThemeName::Codex));
         let rows = rendered_rows(&buffer);
         let activity = row_index_containing(&rows, "Read");
@@ -7964,6 +8013,7 @@ mod tests {
                 .with_success(true),
         );
 
+        app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
         let first_prompt = text.find("what is the status").expect("first prompt");
         let latest_prompt = text.find("are you working").expect("latest prompt");
@@ -8009,6 +8059,7 @@ mod tests {
             ],
         });
 
+        app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
         let prompt = text.find("build the site").expect("user prompt");
         let work_log = text.find("Agent task completed").expect("agent task");
@@ -9026,6 +9077,7 @@ mod tests {
                 .with_duration_ms(18),
         );
 
+        app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
 
         assert!(text.contains("Waited"));
@@ -9061,6 +9113,7 @@ mod tests {
             .with_detail("modify /tmp/work/blue-origin/src/pages/index.astro | diff preview ready"),
         );
 
+        app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
 
         assert!(text.contains("Changed"));
@@ -9340,6 +9393,7 @@ mod tests {
                 .with_success(true),
         );
 
+        app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
 
         assert!(text.contains("failed"));
@@ -9378,8 +9432,11 @@ mod tests {
         );
 
         let collapsed = rendered_text(&app);
-        assert!(collapsed.contains("9 more line(s) hidden (Ctrl+O expand)"));
+        // New contract: a settled group collapses to its one-line header — no
+        // child rows, no per-tool preview hint, until Ctrl+O expands.
         assert!(!collapsed.contains("line10"));
+        assert!(!collapsed.contains("cargo test"));
+        assert!(collapsed.contains("(1"));
 
         app.expanded_tool_outputs = true;
         let expanded = rendered_text(&app);

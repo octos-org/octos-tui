@@ -150,15 +150,24 @@ serve 取密钥顺序（`octos config.rs get_api_key`）：
 | `native`（默认） | 滚轮走终端原生 scrollback，**输入框会随屏滚走**；按 **Ctrl+T 或 PageUp** 进入全屏回看（pager），此时输入框钉底、PgUp/PgDn/滚轮/方向键滚动内容，Esc 退出 | 保留终端原生鼠标选择/复制 |
 | `pinned` | 鼠标滚轮被 App 接管：**上滚自动进入 pager（输入框始终钉在底部），滚回底部自动退回实时视图**——体感即"无论怎么滚输入框都不动" | 原生鼠标选择文本需改用 **Shift+拖选** |
 
-设置方式（CLI 优先于 config 文件）：
+设置方式（按优先级）：
 
 ```bash
-octos-tui --scroll-mode pinned ...      # 命令行
-# 或 config 文件里：
-{ "scroll-mode": "pinned" }
+/scrollmode                # 运行时切换（toggle），即时生效，无需重启
+/scrollmode pinned|native  # 运行时显式设置；弹窗条目会显示（当前：xxx）
+octos-tui --scroll-mode pinned ...   # 启动参数
+{ "scroll-mode": "pinned" }          # config 文件
 ```
 
 pager 内输入不受影响：照常打字、Enter 发送。
+
+## 7.6 斜杠命令补全（两段式，新）
+
+输入 `/` 后弹出命令面板，继续输入过滤（子串匹配 id/名称/描述）：
+
+- **名字未打全**时回车 = 把选中命令**补全进输入框**（如 `/scroll` → 回车 → 输入框变 `/scrollmode `），接着输参数再回车执行
+- **名字精确**（如 `/scrollmode`）或**带参数**时回车 = 直接执行
+- 无任何匹配时回车 = 按原文执行（提示未知命令）
 
 ## 8. 常用命令 / 快捷键
 
@@ -169,7 +178,9 @@ pager 内输入不受影响：照常打字、Enter 发送。
 | 重开 setup 向导 | `/setup` |
 | setup 里直接进会话 | `Validate workspace` → `Open coding session` |
 | 换模型 | `/setup` → 重选 family/model → Save provider |
-| 切主题 | `/theme` |
+| 切主题 | `/theme`（代码块高亮配色随主题联动） |
+| 切滚动模式 | `/scrollmode [native\|pinned]`（无参 toggle，条目显示当前模式） |
+| 展开/折叠工具日志 | Ctrl+O（已完成的活动组默认折叠为单行摘要） |
 | 设思考强度 | `/thinking <low\|medium\|high\|max\|default>` |
 | 复制上一条回复 | `/copy` 或 `Ctrl+Y`（OSC52，新版支持终端原生选择/复制） |
 | 发消息 | Composer 输入 → Enter |
