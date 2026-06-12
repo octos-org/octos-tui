@@ -91,6 +91,7 @@ octos-tui 是经典的 **单向数据流 + reducer**:键盘/后端事件 → `St
 - **[A5] 错误处理收敛**:536 处 `.expect(`、68 处非测试 `.unwrap()`,部分在启动期 "不变量" 路径(如 `CommandRegistry::register` 的 `.expect("unique")`)。缺统一收敛策略。
 - **[A6] 命令面膨胀**:`AppUiCommand` 已 67 变体,远超 ARCHITECTURE.md:107-117 宣称的 7 个 "稳定核心";契约表面增长快,缺收口纪律。
 - **[A7] 陷阱:`autonomy.rs` stale 注释**(已核实):autonomy.rs:5-6 称 `agent/list`/`session/goal/set`/`loop/create` 的 dispatch "wired in a later PR",但 `store.rs:368-388` **早已解析并 dispatch** `/agents //goal //loop`。读注释会误判实现状态——接手前先清理这类 stale 注释。
+- **[A8] composer 随原生滚动消失(活跃用户痛点,方案已定,spec 已落)**:inline + 原生 scrollback 模型下,用户用终端滚轮/滚动条回看历史时,底部 composer 必然随整屏滚出可视区——终端查看自身 scrollback 时**没有任何转义序列能固定屏幕区域**,inline 模式架构上不可修(DECSTBM 只影响程序输出时的滚动)。已定方案:**alt-screen 全屏 transcript pager**(codex CLI Ctrl+T 同款),复用现成的 `wants_fullscreen_overlay`(app.rs:83)切换机制 + `render_chat_layout`(app.rs:736,composer 本就钉底)+ `render_transcript` 内部滚动(app.rs:1408);完整 transcript 数据一直在 `AppState`(scrollback 只是渲染去向,不是数据去向)。**spec:`specs/task-transcript-pager.spec`(8 场景,lint 100%);已于 2026-06-10 按 spec 实现并通过全部门禁(lifecycle 9/9、全量 cargo test 零回归)**。刻意不选 "普通 chat 改常驻 alt-screen 内部滚动"——那会撤销 inline+scrollback 这笔刻意投资(event_loop.rs:38-41 记录了旧 alt-screen 模型 "定频重绘抹选区" 的病根),且滚轮要 `EnableMouseCapture` 会杀掉原生选择/复制。
 
 #### B. 服务器阻塞(等后端广告 method/feature 才能解门)
 
@@ -218,6 +219,13 @@ octos-tui/
 ```
 `project.spec.md` 一次性编码:**"TUI 渲染服务器真相、永不作 policy 权威"**;"无正当理由不加新 crate 依赖";"每个里程碑场景必须绑显式 `Test:` selector";model 选择事实(profile 驱动、`_main` 被拒、`turn_id` 必须 UUID,来自项目记忆)。task spec 全部 `inherits: project`。
 
+> **状态更新(2026-06-10,全链路已实跑)**:`specs/` 已落地——`project.spec`(全仓不变量 + 3 个绑既有测试的不变量冒烟场景,lint 76%)+ 首个试点 `specs/task-transcript-pager.spec`([A8],lint 100%、lifecycle 9/9 含 worktree 边界检查、guard 2 specs passed、stamp `Spec-Passing: true`,**已按 spec 实现并落地 8 个契约测试**);`.agent-spec/runs/` 已入 `.gitignore`。**0.2.7 实测勘误与陷阱(读自 `~/.cargo/registry/.../agent-spec-0.2.7` 源码并实跑验证,部分修正本文上方 §5.1/§5.3 的 `.spec.md` 表述)**:
+> 1. **扩展名契约:`guard` 只扫描 `*.spec` 裸后缀**(`main.rs:661` 按 `extension == "spec"` 过滤),`inherits:` 也只按 `{name}.spec` 文件名解析(`resolver.rs`)。`.spec.md` 文件对 parse/lint/lifecycle 直接调用有效,但**对 guard 不可见、也无法被继承**——本仓 specs 因此用 `.spec` 后缀(octos 先例的 `.spec.md` 是孤立 spec,不走 guard/继承,故未暴露)。
+> 2. **project 级 spec 会被 guard 正常 lint+verify,无级别豁免**:零场景 → lint 0 分 + "0 passed" 双挂。解法 = 给 project spec 加少量绑定**既有**确定性测试的不变量冒烟场景(本仓绑了 m12 权限真相、i18n 双语解析、inline 鼠标捕获三条)。
+> 3. **BoundariesVerifier 两个坑**:`--code` 必须传**绝对路径**(传 `.` 时 worktree 改动会整组误判 "not covered");不含 `/` 或 `*` 的条目(如 `.gitignore`)被 `looks_like_path_boundary` 整行忽略,要写成 `**/.gitignore`。Allowed Changes 应包含 `specs/**` 与本文档自身——spec-first 工作流的 diff 天然含 spec/文档。
+> 4. frontmatter 可不带开头 `---` 围栏(以 `spec:` 开行、仅尾部 `---`,parse 正常)。
+> 5. 测注意:管道后 `$?` 取到的是 tail/grep 的退出码——验证 agent-spec 退出码时不要接管道。
+
 **粒度:一个 gap → 一个 spec**(3–8 场景;更大的拆多个用 `depends:` 串)。octos-tui 的 `m<NN>` 里程碑天然映射:如 `specs/task-solo-permissions.spec.md` 绑 `tests/m12_solo_permissions_contract.rs` 的测试函数。`### Allowed Changes` 保持收紧(octos 的 matrix spec 用了单文件 Allowed Changes)以让边界机械可验。
 
 **每个 gap 的配方**:
@@ -335,12 +343,13 @@ estimate: 1d
 **R4 — 完整性批判发现的遗漏点(已逐一核实)**:
 - **stale-comment 陷阱**([A7]):`autonomy.rs:5-6` 称 dispatch "wired in a later PR",但 `store.rs:368-388` 早已 dispatch ——读注释会误判实现状态。**接手前清理此类 stale 注释**,避免基于过期注释的误工。
 - **最活跃子系统是终端渲染、非协议**:近期 churn 集中在 inline viewport + scrollback(`viewport.rs`/`insert_history.rs`/`tui_terminal.rs`,纯终端关切:native-bg scrollback、cursor 重放、OSC52),容易被 "协议/里程碑" 视角漏掉——若接手要碰渲染,这是真实热点。
+- **inline "滚动已接好" 是误读**([A8] 配套陷阱,已核实):`MouseEventKind::ScrollUp/Down` 的处理(event_loop.rs:479)在 inline 模式是**死代码**——全仓无任何 `EnableMouseCapture` 调用,crossterm 根本收不到鼠标事件,只有测试在走它;且 inline 渲染路径的 `transcript_scroll` 只作用于 live tail(app.rs:260),已提交历史不在渲染树里,**键盘 PageUp 也滚不到历史**。读这两处代码易误判 "App 内滚动已可用"。
 - **`.octos-workspace.toml` 是后端契约**:已核实存在于 octos-tui,带 `[spawn_tasks.*]`/`[validation]`/`[artifacts]` 验证面,但**由后端 runtime 执行**,**不是 TUI 待办**——写 spec 时勿误纳。
 
 **R5 — agent-spec 自身风险**:
-- **版本 skew**:已装 0.2.7 vs 源码 0.3.0;退出码/字段以 **0.2.7 实测为准**(本文 §5.1),0.2.7↔0.3.0 行为差异**未逐一 diff,需核实**。CI 须 pin 明确版本。
-- **未亲手验证项(需核实)**:未在 octos-tui 实跑过 `explain --format markdown`/`stamp --dry-run`/`graph`(因 specs/ 尚不存在);`--ai-mode caller`/`resolve-ai`/`--resume` 仅据 SKILL 文档;**未确认 octos-tui 全量 `cargo test`(lifecycle 会调)在 agent-spec 验证环境干净编译/运行**。**第一步落地动作**:scaffold `specs/project.spec.md` + 一个从现有 M-里程碑改写的 task spec,**实跑一次完整 lifecycle 验证 `Test:` selector 真能解析到目标测试函数**,再铺开。
+- **版本 skew**:已装 0.2.7 vs 源码 0.3.0;退出码/字段以 **0.2.7 实测为准**(本文 §5.1)。**修正(2026-06-10 核实):`~/Work/Projects/FW/rust-agents/agent-spec` 源码路径已不存在,本机仅余已装的 0.2.7 二进制**——CI 应直接 pin 0.2.7,或先找回 0.3.0 源码仓再决定升级。
+- **未亲手验证项(需核实)**:未在 octos-tui 实跑过 `explain --format markdown`/`stamp --dry-run`/`graph`(specs/ 已存在,现在可跑);`--ai-mode caller`/`resolve-ai`/`--resume` 仅据 SKILL 文档;**未确认 octos-tui 全量 `cargo test`(lifecycle 会调)在 agent-spec 验证环境干净编译/运行**。**第一步落地动作已完成**(见 §5.3 状态更新):[A8] spec 已实现、`tests/transcript_pager_contract.rs` 8 个测试函数已落地,完整 lifecycle(含 worktree 边界检查)9/9 通过,`Test:` selector → cargo 测试函数的绑定链路已验证可用。
 - **flaky 测试不可绑场景**:M18 stdio-live 测试有 flake budget,**绝不**把 `Scenario:` 绑到 flaky 测试(否则 lifecycle 非确定),只绑确定性 fixture/契约测试(`appui_ux_fixture.rs`、`turn_state_contract.rs`、`m1*_*_contract.rs`)。
 - **codex review 不可被 agent-spec 替换**:guard 只验 "契约行为被测",不评代码质量;codex/人审 diff 仍是承重环节,二者叠加。
 
-**建议落地顺序**:① scaffold `specs/project.spec.md`(编码 TUI 全仓不变量)+ 1 个试点 spec(选 [B1] 权限门控,§5.4 骨架),实跑 lifecycle 打通 selector 绑定;② 新建 `ci.yml` 把 cargo test/clippy/fmt + `agent-spec guard` 一起补上(填 R3);③ 把 [C1]/R2 的 "bump pin → diff 协议头 → 跑契约测试" 固化为流程并加 CI 告警;④ 再按 §3.2 的 A/B/C 分组,A 类(god-reducer 拆分、keymap 持久化、doctor live-WS、错误收敛)逐个写 spec 推进,B 类等后端解门,C 类排进跨仓协调。
+**建议落地顺序**:① **已完成(2026-06-10)**:`specs/project.spec` + 试点 spec 已落地并实现,实际试点选了 **[A8] transcript pager** 而非 [B1]——纯 TUI 本地、零服务器依赖、活跃用户痛点;spec→实现→契约测试→lifecycle/guard 全链路已打通(见 §5.3 状态更新,含 0.2.7 勘误)。[B1] 按 §5.4 骨架作第二个 spec;② 新建 `ci.yml` 把 cargo test/clippy/fmt + `agent-spec guard` 一起补上(填 R3);③ 把 [C1]/R2 的 "bump pin → diff 协议头 → 跑契约测试" 固化为流程并加 CI 告警;④ 再按 §3.2 的 A/B/C 分组,A 类(god-reducer 拆分、keymap 持久化、doctor live-WS、错误收敛)逐个写 spec 推进,B 类等后端解门,C 类排进跨仓协调。
