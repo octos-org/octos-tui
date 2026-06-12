@@ -1688,13 +1688,36 @@ fn push_recent_user_context(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
     content: &str,
-    width: usize,
+    _width: usize,
 ) {
+    push_user_message_block(lines, palette, content);
+}
+
+/// User input gets the role-contrast treatment: an accent-colored `▌` gutter
+/// on every logical line plus a bold body. It is the single strongest visual
+/// anchor in the transcript (scanning for "what did I say" is the most common
+/// review motion), works without any background color (backgrounds are
+/// unreliable in the pager, the terminal theme, and native scrollback), and
+/// echoes the input verbatim — user text is a quote, not a markdown document.
+fn push_user_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, content: &str) {
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
-    let bg = chat_message_bg(palette, "user");
-    push_formatted_body(lines, palette, content, "› ", Some(bg), width);
+    let gutter = Style::default().fg(palette.accent);
+    let body = palette.text().add_modifier(Modifier::BOLD);
+    if content.trim().is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("▌ ", gutter),
+            Span::styled("<empty>", palette.muted()),
+        ]));
+        return;
+    }
+    for raw_line in content.lines() {
+        lines.push(Line::from(vec![
+            Span::styled("▌ ", gutter),
+            Span::styled(raw_line.trim_end().to_string(), body),
+        ]));
+    }
 }
 
 fn push_message_block(
@@ -1708,13 +1731,17 @@ fn push_message_block(
         return;
     }
 
+    if role == "user" {
+        push_user_message_block(lines, palette, content);
+        return;
+    }
+
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
 
     let bg = chat_message_bg(palette, role);
     let indent = match role {
-        "user" => "› ",
         "tool" => "$ ",
         "reasoning" => "· ",
         _ => "",
@@ -3286,9 +3313,12 @@ fn push_agent_task_group(
     // a settled chip keeps the static bullet. Both are 1 col wide so the title
     // stays aligned whether running or done.
     let icon = if in_progress { spinner_frame() } else { "•" };
+    // Role-contrast: runtime/tool activity is the LOW tier of the transcript's
+    // visual hierarchy — muted header (bold kept for grouping), status icons
+    // keep their state colors (spinner/✓/✗ carry information).
     let spans = vec![
         Span::styled(format!("{icon} "), palette.selected()),
-        Span::styled(title, palette.title().add_modifier(Modifier::BOLD)),
+        Span::styled(title, palette.muted().add_modifier(Modifier::BOLD)),
         Span::styled(format!(" ({})", metadata.join(" · ")), palette.muted()),
     ];
     lines.push(Line::from(spans));
@@ -3307,7 +3337,7 @@ fn push_agent_task_group(
         lines.push(Line::from(vec![
             Span::styled(prefix, palette.border()),
             Span::styled("◻ ", palette.selected()),
-            Span::styled(title.clone(), palette.text()),
+            Span::styled(title.clone(), palette.muted()),
             Span::styled(format!("  {}", t!("app.activity.running")), palette.muted()),
         ]));
     }
@@ -3337,13 +3367,15 @@ fn push_agent_task_child(
 
 fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'static>> {
     if let Some(mutation) = FileMutationActivity::from_item(item) {
+        // Activity rows render uniformly muted, no bold: the runtime log must
+        // never outweigh the reply prose or the user's own words.
         let mut spans = vec![
             Span::styled(
                 file_mutation_action_label(&mutation.operation),
-                palette.text().add_modifier(Modifier::BOLD),
+                palette.muted(),
             ),
             Span::styled(" ", palette.muted()),
-            Span::styled(compact_file_path(&mutation.path), palette.text()),
+            Span::styled(compact_file_path(&mutation.path), palette.muted()),
             Span::styled(format!("  {}", mutation.operation), palette.muted()),
         ];
         if mutation.preview_ready {
@@ -3358,19 +3390,16 @@ fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'st
     if item.kind == ActivityKind::Tool {
         let running = is_running_activity(item);
         let mut spans = vec![
-            Span::styled(
-                tool_action_label(item, running),
-                palette.text().add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(tool_action_label(item, running), palette.muted()),
             Span::styled(" ", palette.muted()),
-            Span::styled(item.title.clone(), palette.text()),
+            Span::styled(item.title.clone(), palette.muted()),
         ];
         if let Some(invocation) = tool_invocation_text(item) {
             let prompt = if item.title == "shell" { "$ " } else { "" };
             spans.push(Span::styled(": ", palette.muted()));
             spans.push(Span::styled(
                 format!("{prompt}{}", truncate_terminal_line(&invocation, 96)),
-                palette.text(),
+                palette.muted(),
             ));
         }
         push_compact_metadata_spans(&mut spans, palette, item);
@@ -3378,10 +3407,7 @@ fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'st
     }
 
     let mut spans = vec![
-        Span::styled(
-            item.title.clone(),
-            palette.text().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(item.title.clone(), palette.muted()),
         Span::styled(format!("  {}", item.status), palette.muted()),
     ];
     if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
@@ -5910,7 +5936,7 @@ mod tests {
     }
 
     #[test]
-    fn render_chat_bubbles_hide_role_titles_and_use_distinct_backgrounds() {
+    fn render_chat_roles_use_gutter_anchor_and_distinct_styles() {
         let app = AppState::new(
             vec![SessionView {
                 id: SessionKey("local:test".into()),
@@ -5948,9 +5974,15 @@ mod tests {
         let assistant_style =
             style_for_text(&buffer, "done with bubble colors").expect("assistant style");
 
-        assert_eq!(user_style.bg, Some(palette.diff_context_bg));
+        // Role-contrast contract: the user's words are the transcript's anchor
+        // — accent gutter + bold body, NO bubble background (backgrounds are
+        // unreliable in the pager / terminal theme / native scrollback).
+        assert!(text.contains("▌ please fix bubble colors"));
+        assert!(user_style.add_modifier.contains(Modifier::BOLD));
+        assert_ne!(user_style.bg, Some(palette.diff_context_bg));
+        // Assistant prose keeps its existing baseline rendering.
         assert_eq!(assistant_style.bg, Some(palette.surface));
-        assert_ne!(user_style.bg, assistant_style.bg);
+        assert!(!text.contains("▌ done with bubble colors"));
     }
 
     #[test]
@@ -6294,7 +6326,7 @@ mod tests {
         let buffer = rendered_buffer(&app, Palette::for_theme(ThemeName::Codex));
         let rows = rendered_rows(&buffer);
         let diff = row_index_containing(&rows, "Diff Preview");
-        let latest_prompt = row_index_containing(&rows, "› done?");
+        let latest_prompt = row_index_containing(&rows, "▌ done?");
         let composer = row_index_containing(&rows, "Composer");
 
         assert!(
