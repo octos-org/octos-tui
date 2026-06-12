@@ -33,6 +33,10 @@ crossterm = "0.28"
 ratatui = "0.29"
 unicode-width = "0.2"
 unicode-segmentation = "1"
+# Syntax highlighting for fenced code blocks in the transcript. `default-fancy`
+# keeps the regex engine pure-Rust (no onig C toolchain), matching the repo's
+# no-C-deps convention (see the rustls-only note below).
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 rust-i18n = "3"
 # `update`/`doctor` use a blocking HTTPS client for the GitHub release check.
 # Pure-rustls to keep the no-OpenSSL convention.
@@ -59,3 +63,20 @@ resolver = "3"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# Syntax highlighting must stay interactive in DEBUG builds too: the pager
+# re-highlights visible history on every scroll frame, and unoptimized
+# fancy-regex is 10-50x slower. Optimize just the hot highlight dependencies;
+# the workspace's own code keeps fast incremental debug compiles.
+[profile.dev.package.syntect]
+opt-level = 3
+[profile.dev.package.fancy-regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.regex-syntax]
+opt-level = 3
+[profile.dev.package.bit-set]
+opt-level = 3
+[profile.dev.package.bit-vec]
+opt-level = 3

@@ -13,6 +13,7 @@ pub mod client_event;
 pub mod clipboard;
 pub mod cmd;
 pub mod event_loop;
+pub mod highlight;
 pub mod insert_history;
 pub mod keymap;
 pub mod menu;

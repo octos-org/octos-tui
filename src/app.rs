@@ -104,11 +104,11 @@ pub fn wants_mouse_capture(app: &AppState) -> bool {
 /// hide the same stable prefix so spinner ticks only repaint the live tail.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LiveTurnFinalization {
-    pub(crate) session_id: String,
-    pub(crate) turn_id: String,
-    pub(crate) reply_flushed_text: String,
-    pub(crate) activity_flushed_items: usize,
-    pub(crate) activity_flushed_keys: Vec<String>,
+    pub session_id: String,
+    pub turn_id: String,
+    pub reply_flushed_text: String,
+    pub activity_flushed_items: usize,
+    pub activity_flushed_keys: Vec<String>,
 }
 
 impl LiveTurnFinalization {
@@ -436,7 +436,10 @@ pub fn finalized_history_lines_range_dedup_live(
         if let Some(coverage) = reply_coverage {
             let suffix = &message.content[coverage.reply_flushed_text.len()..];
             if !suffix.trim().is_empty() {
-                push_live_reply_block(&mut lines, palette, suffix, wrap_width);
+                // Continuation of a reply whose prefix is already in
+                // scrollback (coverage is only matched when non-empty) —
+                // never re-issue the bullet.
+                push_live_reply_block(&mut lines, palette, suffix, wrap_width, false);
             }
         } else {
             push_message_block(
@@ -542,7 +545,8 @@ pub fn finalized_live_turn_lines_between(
     {
         let new_reply = &next.reply_flushed_text[previous.reply_flushed_text.len()..];
         if !new_reply.trim().is_empty() {
-            push_live_reply_block(&mut lines, palette, new_reply, wrap_width);
+            let first = previous.reply_flushed_text.is_empty();
+            push_live_reply_block(&mut lines, palette, new_reply, wrap_width, first);
         }
     }
 
@@ -653,10 +657,53 @@ pub fn committed_reply_matches_live_finalization(
         })
 }
 
+/// Largest prefix of the streaming reply that is safe to flush into the
+/// IMMUTABLE terminal scrollback (codex's markdown-stream model): the cut may
+/// only land on a *completed block* boundary — a closed code fence, or a blank
+/// line ending a paragraph/table/list run. Completed blocks are self-contained,
+/// so rendering each flushed batch as an independent document stays correct;
+/// an unclosed fence or a still-accumulating paragraph is held back (it keeps
+/// re-rendering in the live tail) rather than written out half-parsed and
+/// frozen wrong forever. The state machine is line-oriented: only lines
+/// terminated by `\n` are considered at all.
 fn stable_live_reply_prefix_len(text: &str) -> usize {
-    text.rfind('\n')
-        .map(|idx| idx + '\n'.len_utf8())
-        .unwrap_or(0)
+    let mut safe_end = 0;
+    let mut offset = 0;
+    let mut in_fence = false;
+    let mut fence_start = 0;
+    for segment in text.split_inclusive('\n') {
+        if !segment.ends_with('\n') {
+            // Trailing partial line: never flushable.
+            break;
+        }
+        let line_start = offset;
+        offset += segment.len();
+        let trimmed = segment.trim();
+        if trimmed.starts_with("```") {
+            if in_fence {
+                // Fence closed → the whole fenced block just completed.
+                in_fence = false;
+                safe_end = offset;
+            } else {
+                in_fence = true;
+                fence_start = line_start;
+            }
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if trimmed.is_empty() {
+            // Blank line ends any open paragraph / table / list run.
+            safe_end = offset;
+        }
+    }
+    if in_fence {
+        // An unclosed fence pins the watermark before the fence opener, even
+        // if blank lines were seen inside the fence body.
+        safe_end = safe_end.min(fence_start);
+    }
+    safe_end
 }
 
 fn strip_lines_background(lines: &mut [Line<'static>]) {
@@ -1662,7 +1709,11 @@ fn push_turn_flow(
             live_reply.text.as_str()
         };
         if !reply_text.trim().is_empty() {
-            push_live_reply_block(lines, palette, reply_text, width);
+            // The live-tail view shows the not-yet-flushed remainder; the
+            // bullet belongs to it only while nothing was flushed yet.
+            let first = live_finalization
+                .is_none_or(|finalization| finalization.reply_flushed_text.is_empty());
+            push_live_reply_block(lines, palette, reply_text, width, first);
         }
     }
 
@@ -1770,18 +1821,24 @@ fn push_message_block(
     );
 }
 
+/// Render a (chunk of a) streaming reply. `first` controls the `• ` prose
+/// marker: a reply flushed across several scrollback batches must carry the
+/// bullet exactly once — on its first batch — or the transcript reads as
+/// several separate replies.
 fn push_live_reply_block(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
     content: &str,
     width: usize,
+    first: bool,
 ) {
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
 
     let bg = chat_message_bg(palette, "assistant");
-    push_formatted_body_marked(lines, palette, content, "", Some("• "), Some(bg), width);
+    let marker = first.then_some("• ");
+    push_formatted_body_marked(lines, palette, content, "", marker, Some(bg), width);
 }
 
 fn push_pending_messages_block(
@@ -1827,6 +1884,30 @@ fn push_pending_messages_block(
     }
 }
 
+/// Emit the framed body rows of a fenced code block, highlighted via the
+/// memoizing block cache. `complete` marks a closed fence (cacheable);
+/// still-streaming blocks render uncached. The fallback style is fg-only —
+/// the row background stays line-level (`chat_line`) per the no-span-bg rule.
+fn push_code_block_lines(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    indent: &'static str,
+    bg: Option<Color>,
+    language: &str,
+    body: &[String],
+    complete: bool,
+) {
+    let rendered = crate::highlight::highlight_block(language, body, palette.muted(), complete);
+    for row in rendered.iter() {
+        let mut spans = vec![
+            Span::styled(indent, style_bg(palette.border(), bg)),
+            Span::styled("│ ", style_bg(palette.border(), bg)),
+        ];
+        spans.extend(row.iter().cloned());
+        lines.push(chat_line(spans, bg));
+    }
+}
+
 fn chat_message_bg(palette: Palette, role: &str) -> Color {
     match role {
         "user" => palette.diff_context_bg,
@@ -1857,7 +1938,11 @@ fn push_formatted_body_marked(
     bg: Option<Color>,
     width: usize,
 ) {
-    let mut in_code = false;
+    // `Some((language, collected body))` while inside a fenced block: the body
+    // is rendered as ONE unit when the fence closes (or at end of input for a
+    // still-streaming block) so highlighting can be memoized per block — the
+    // pager re-renders all history every scroll frame.
+    let mut in_code: Option<(String, Vec<String>)> = None;
     let mut last_blank = false;
     let mut prose = Vec::new();
     let mut table = Vec::new();
@@ -1865,12 +1950,16 @@ fn push_formatted_body_marked(
     let normalized = content.trim_matches(|ch: char| ch.is_whitespace() && ch != '\n');
 
     for raw_line in normalized.lines() {
-        let line = if in_code { raw_line } else { raw_line.trim() };
+        let line = if in_code.is_some() {
+            raw_line
+        } else {
+            raw_line.trim()
+        };
         if let Some(rest) = line.trim_start().strip_prefix("```") {
             flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
-            if in_code {
-                in_code = false;
+            if let Some((language, body)) = in_code.take() {
+                push_code_block_lines(lines, palette, indent, bg, &language, &body, true);
                 lines.push(chat_line(
                     vec![
                         Span::styled(indent, style_bg(palette.border(), bg)),
@@ -1879,7 +1968,6 @@ fn push_formatted_body_marked(
                     bg,
                 ));
             } else {
-                in_code = true;
                 let language = rest
                     .split_whitespace()
                     .next()
@@ -1890,28 +1978,18 @@ fn push_formatted_body_marked(
                     vec![
                         Span::styled(indent, style_bg(palette.border(), bg)),
                         Span::styled("┌─ ", style_bg(palette.border(), bg)),
-                        Span::styled(language, style_bg(palette.selected(), bg)),
+                        Span::styled(language.clone(), style_bg(palette.selected(), bg)),
                     ],
                     bg,
                 ));
+                in_code = Some((language, Vec::new()));
             }
             last_blank = false;
             continue;
         }
 
-        if in_code {
-            flush_markdown_table(lines, palette, &mut table, indent, bg, width);
-            lines.push(chat_line(
-                vec![
-                    Span::styled(indent, style_bg(palette.border(), bg)),
-                    Span::styled("│ ", style_bg(palette.border(), bg)),
-                    Span::styled(
-                        truncate_terminal_line(line, CODE_BLOCK_LINE_LIMIT),
-                        style_bg(palette.muted(), bg),
-                    ),
-                ],
-                bg,
-            ));
+        if let Some((_, body)) = in_code.as_mut() {
+            body.push(truncate_terminal_line(line, CODE_BLOCK_LINE_LIMIT));
             last_blank = false;
             continue;
         }
@@ -2041,6 +2119,12 @@ fn push_formatted_body_marked(
         prose.push(line.to_string());
     }
 
+    if let Some((language, body)) = in_code.take() {
+        // Fence still open at end of input (streaming): render it too so the
+        // live tail shows the in-flight code — uncached, the body grows every
+        // frame.
+        push_code_block_lines(lines, palette, indent, bg, &language, &body, false);
+    }
     flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
     flush_markdown_table(lines, palette, &mut table, indent, bg, width);
 }
@@ -10300,7 +10384,7 @@ mod tests {
                 tasks: vec![],
                 live_reply: Some(crate::model::LiveReply {
                     turn_id,
-                    text: "finalized assistant line\nstreaming suffix still live".into(),
+                    text: "finalized assistant line\n\nstreaming suffix still live".into(),
                 }),
             }],
             0,
@@ -10359,7 +10443,7 @@ mod tests {
                 tasks: vec![],
                 live_reply: Some(crate::model::LiveReply {
                     turn_id: turn_id.clone(),
-                    text: "already flushed line\nfinal answer tail".into(),
+                    text: "already flushed line\n\nfinal answer tail".into(),
                 }),
             }],
             0,
@@ -10379,7 +10463,7 @@ mod tests {
 
         app.sessions[0].live_reply = None;
         app.sessions[0].messages.push(Message::assistant(
-            "already flushed line\nfinal answer tail",
+            "already flushed line\n\nfinal answer tail",
         ));
         app.turn_activity_logs.push(TurnActivityLog {
             session_id,
