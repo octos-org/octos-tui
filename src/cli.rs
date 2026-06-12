@@ -52,6 +52,23 @@ impl ThemeName {
     }
 }
 
+/// How scrolling interacts with the chat composer.
+///
+/// `Native` (default) keeps the terminal's own scrollback authoritative: the
+/// wheel scrolls the terminal, native selection/copy work untouched, and the
+/// composer scrolls away with the screen (the transcript pager via Ctrl+T /
+/// PageUp is the pinned view). `Pinned` opts into app-side mouse capture so
+/// the wheel scrolls the transcript pager instead — the composer stays pinned
+/// to the bottom no matter how you scroll, at the cost of native mouse
+/// selection (use Shift+drag in most terminals).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScrollMode {
+    #[default]
+    Native,
+    Pinned,
+}
+
 /// UI display language (i18n). English is the source/fallback locale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -108,6 +125,8 @@ pub struct Cli {
     pub theme: ThemeName,
     /// UI display language (i18n).
     pub lang: Lang,
+    /// Wheel-scroll behavior for the chat flow.
+    pub scroll_mode: ScrollMode,
 }
 
 #[derive(Debug, Parser)]
@@ -175,6 +194,13 @@ struct CliArgs {
     /// UI display language (e.g. `en`, `zh`). Falls back to OCTOS_LANG/LANG.
     #[arg(long, value_enum)]
     pub lang: Option<Lang>,
+
+    /// Wheel-scroll behavior: `native` keeps terminal scrollback + native
+    /// selection (default); `pinned` captures the mouse so the wheel scrolls
+    /// the transcript pager and the composer stays pinned to the bottom
+    /// (native selection then needs Shift+drag).
+    #[arg(long = "scroll-mode", value_enum)]
+    pub scroll_mode: Option<ScrollMode>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -206,6 +232,9 @@ pub struct CliFileConfig {
     pub readonly: Option<bool>,
     pub theme: Option<ThemeName>,
     pub lang: Option<Lang>,
+
+    #[serde(alias = "scroll_mode")]
+    pub scroll_mode: Option<ScrollMode>,
 }
 
 impl Cli {
@@ -281,6 +310,10 @@ impl Cli {
                         .and_then(|v| Lang::from_env_value(&v))
                 })
                 .unwrap_or(Lang::En),
+            scroll_mode: args
+                .scroll_mode
+                .or(file_config.scroll_mode)
+                .unwrap_or_default(),
         })
     }
 }

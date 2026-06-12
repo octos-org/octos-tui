@@ -9,8 +9,8 @@ use crossterm::{
 };
 use crossterm::{
     event::{
-        self, EnableBracketedPaste, EnableFocusChange, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEvent, MouseEventKind,
+        self, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{
@@ -27,7 +27,7 @@ use crate::{
     cli::Cli,
     client_event::ClientEvent,
     insert_history::insert_history_lines,
-    model::{AppUiCommand, ApprovalModalAction, FocusPane},
+    model::{AppState, AppUiCommand, ApprovalModalAction, FocusPane},
     store::Store,
     theme::Palette,
     transport::{AppUiBackend, build_backend},
@@ -45,6 +45,10 @@ const INITIAL_CAPABILITIES_HANDSHAKE_POLL: Duration = Duration::from_millis(10);
 /// a fixed-rate repaint when nothing is happening.
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(120);
 const MAX_BACKEND_EVENTS_PER_TICK: usize = 512;
+/// Cap on queued terminal input events handled per frame. High enough that a
+/// momentum-scroll burst coalesces into one repaint, low enough that a
+/// pathological event stream cannot starve rendering.
+const MAX_INPUT_EVENTS_PER_TICK: usize = 64;
 
 /// Which screen model the terminal is currently in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +76,7 @@ pub fn run(cli: Cli) -> Result<()> {
     let mut guard = TerminalGuard {
         mode: RenderMode::Inline,
         saved_inline_viewport: None,
+        mouse_captured: false,
     };
 
     // i18n: select the UI language before the first render. `t!()` reads this
@@ -86,6 +91,10 @@ pub fn run(cli: Cli) -> Result<()> {
     // `/theme` menu mutates this field, so the palette below is recomputed each
     // frame from `store.state.theme` rather than captured once at startup.
     store.state.theme = cli.theme;
+    // `--scroll-mode pinned` opts into app-side wheel handling (composer stays
+    // pinned); the default `native` keeps the wheel on the terminal so native
+    // selection/copy survive. Seeded once at launch, read-only afterwards.
+    store.state.pinned_scroll = cli.scroll_mode == crate::cli::ScrollMode::Pinned;
     // Seed the onboarding workspace candidate so the first-launch workspace
     // probe validates a real directory. The explicit `--cwd` wins; when it is
     // absent the store falls back to the process working directory (for
@@ -134,25 +143,42 @@ pub fn run(cli: Cli) -> Result<()> {
             UI_EVENT_POLL_INTERVAL
         };
         if event::poll(poll)? {
-            let raw_event = event::read()?;
-            let next_event_waiting = event::poll(Duration::from_millis(0))?;
-            let is_resize = matches!(raw_event, Event::Resize(_, _));
-            match handle_terminal_event_with_input_state(
-                &mut store,
-                raw_event,
-                &mut input_state,
-                next_event_waiting,
-                Instant::now(),
-            ) {
-                KeyAction::Continue => {}
-                KeyAction::Quit => break,
-                KeyAction::Send(command) => send_command(backend.as_mut(), &mut store, command),
-            }
-            // A resize invalidates the inline viewport layout; force a repaint.
-            if is_resize {
-                terminal.invalidate_viewport();
+            // Drain every already-queued input event before the next redraw:
+            // momentum scrolling delivers dozens of wheel events per second,
+            // and repainting the full alt-screen after EACH one is what makes
+            // pager scrolling feel laggy. One frame per batch, with a cap so
+            // a pathological event stream can never starve rendering.
+            let mut quit = false;
+            for _ in 0..MAX_INPUT_EVENTS_PER_TICK {
+                let raw_event = event::read()?;
+                let next_event_waiting = event::poll(Duration::from_millis(0))?;
+                let is_resize = matches!(raw_event, Event::Resize(_, _));
+                match handle_terminal_event_with_input_state(
+                    &mut store,
+                    raw_event,
+                    &mut input_state,
+                    next_event_waiting,
+                    Instant::now(),
+                ) {
+                    KeyAction::Continue => {}
+                    KeyAction::Quit => {
+                        quit = true;
+                        break;
+                    }
+                    KeyAction::Send(command) => send_command(backend.as_mut(), &mut store, command),
+                }
+                // A resize invalidates the inline viewport layout; force a repaint.
+                if is_resize {
+                    terminal.invalidate_viewport();
+                }
+                if !next_event_waiting {
+                    break;
+                }
             }
             dirty = true;
+            if quit {
+                break;
+            }
         }
 
         if flush_pending_clipboard(&mut store) {
@@ -189,6 +215,7 @@ where
     if app::wants_fullscreen_overlay(&store.state) {
         // Transient overlay → alternate screen, full legacy render.
         guard.enter_alt_screen(terminal)?;
+        guard.sync_mouse_capture(terminal, app::wants_mouse_capture(&store.state))?;
         let size = terminal.size()?;
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
         let resized = size != terminal.last_known_screen_size || terminal.viewport_area != area;
@@ -207,7 +234,11 @@ where
         return Ok(());
     }
 
-    // Inline chat flow.
+    // Inline chat flow. In native scroll-mode capture is released BEFORE the
+    // screen switch so native selection works the instant the user is back on
+    // scrollback; pinned scroll-mode keeps capture on so the next wheel-up can
+    // re-enter the pager.
+    guard.sync_mouse_capture(terminal, app::wants_mouse_capture(&store.state))?;
     guard.leave_alt_screen(terminal)?;
 
     let size = terminal.size()?;
@@ -431,7 +462,9 @@ impl TerminalInputState {
     }
 }
 
-pub(crate) enum KeyAction {
+/// Public so contract tests (`tests/*.rs`) can drive the key/mouse pipeline
+/// exactly as the run loop does and assert on the resulting action.
+pub enum KeyAction {
     Continue,
     Quit,
     Send(AppUiCommand),
@@ -464,7 +497,7 @@ fn handle_terminal_event_with_input_state(
     handle_terminal_event(store, event)
 }
 
-pub(crate) fn handle_terminal_event(store: &mut Store, event: Event) -> KeyAction {
+pub fn handle_terminal_event(store: &mut Store, event: Event) -> KeyAction {
     match event {
         Event::Key(key) => handle_key(store, key),
         Event::Paste(text) => handle_paste(store, &text),
@@ -475,9 +508,19 @@ pub(crate) fn handle_terminal_event(store: &mut Store, event: Event) -> KeyActio
 
 fn handle_mouse(store: &mut Store, mouse: MouseEvent) -> KeyAction {
     const MOUSE_SCROLL_LINES: usize = 4;
+    // Inside the pager the wheel steps a single line: macOS trackpads deliver
+    // dozens of fine-grained scroll events per second during momentum
+    // scrolling, and multiplying each by 4 makes the transcript jump instead
+    // of glide. Other surfaces (modals, workspace/git panes) keep the coarser
+    // step that suits clicky wheel mice.
+    let lines = if store.state.transcript_pager_active {
+        1
+    } else {
+        MOUSE_SCROLL_LINES
+    };
     match mouse.kind {
-        MouseEventKind::ScrollUp => scroll_current_surface_up(store, MOUSE_SCROLL_LINES),
-        MouseEventKind::ScrollDown => scroll_current_surface_down(store, MOUSE_SCROLL_LINES),
+        MouseEventKind::ScrollUp => scroll_current_surface_up(store, lines),
+        MouseEventKind::ScrollDown => scroll_current_surface_down(store, lines),
         _ => {}
     }
     KeyAction::Continue
@@ -527,6 +570,11 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         // run loop) emits the OSC 52 escape sequence so the copy reaches the
         // operator's local clipboard even over SSH.
         store.copy_last_reply();
+        return KeyAction::Continue;
+    }
+
+    if is_control_char(&key, 't') {
+        toggle_transcript_pager(store);
         return KeyAction::Continue;
     }
 
@@ -626,6 +674,9 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::Tab => {
             store.state.focus = store.state.focus.next();
         }
+        KeyCode::Esc if store.state.transcript_pager_active => {
+            store.state.exit_transcript_pager();
+        }
         KeyCode::Esc => {
             if store.state.active_turn().is_some() {
                 let command = if store.state.has_pending_messages() {
@@ -648,6 +699,12 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::Char('k') if store.state.focus != FocusPane::Composer => {
             move_up(&mut store.state);
         }
+        KeyCode::Down if store.state.transcript_pager_active => {
+            store.state.scroll_transcript_down(1);
+        }
+        KeyCode::Up if store.state.transcript_pager_active => {
+            store.state.scroll_transcript_up(1);
+        }
         KeyCode::Down => {
             move_down(&mut store.state);
         }
@@ -662,7 +719,17 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::PageUp => match store.state.focus {
             FocusPane::Workspace => store.state.workspace.scroll_up(8),
             FocusPane::Git => store.state.git.scroll_up(8),
-            _ => store.state.scroll_transcript_up(8),
+            // In the inline chat flow PageUp can only reach the live tail —
+            // committed history lives in native scrollback — so the first
+            // press opens the pager (at the bottom) instead; inside the pager
+            // it pages through the full transcript.
+            _ => {
+                if transcript_pager_available(&store.state) {
+                    store.state.enter_transcript_pager();
+                } else {
+                    store.state.scroll_transcript_up(8);
+                }
+            }
         },
         KeyCode::End => match store.state.focus {
             FocusPane::Workspace => store.state.workspace.scroll = 0,
@@ -1192,6 +1259,32 @@ fn move_up(state: &mut crate::model::AppState) {
     }
 }
 
+/// The transcript pager opens only from the plain chat flow. Any full-screen
+/// surface (inspector, onboarding, detail modals — covered by
+/// `wants_fullscreen_overlay`), an open menu, or a visible approval/question
+/// modal keeps the toggle inert so Ctrl+T can't rip the screen out from under
+/// an interaction that owns the keyboard.
+pub fn transcript_pager_available(state: &AppState) -> bool {
+    !app::wants_fullscreen_overlay(state)
+        && !state.menu_stack.is_active()
+        && !state
+            .approval
+            .as_ref()
+            .is_some_and(|approval| approval.visible)
+        && !state
+            .user_question
+            .as_ref()
+            .is_some_and(|picker| picker.visible)
+}
+
+fn toggle_transcript_pager(store: &mut Store) {
+    if store.state.transcript_pager_active {
+        store.state.exit_transcript_pager();
+    } else if transcript_pager_available(&store.state) {
+        store.state.enter_transcript_pager();
+    }
+}
+
 fn scroll_current_surface_down(store: &mut Store, lines: usize) {
     if store.state.task_output.active {
         store.state.task_output.scroll_down(lines);
@@ -1213,7 +1306,20 @@ fn scroll_current_surface_down(store: &mut Store, lines: usize) {
     match store.state.focus {
         FocusPane::Workspace => store.state.workspace.scroll_down(lines),
         FocusPane::Git => store.state.git.scroll_down(lines),
-        _ => store.state.scroll_transcript_down(lines),
+        // Pinned scroll-mode: wheeling down past the pager bottom drops back
+        // to the inline tail-following view, completing the "the composer is
+        // always pinned, the wheel just moves the content" illusion. A pager
+        // opened manually in native mode keeps its position instead.
+        _ => {
+            if store.state.pinned_scroll
+                && store.state.transcript_pager_active
+                && store.state.transcript_scroll == 0
+            {
+                store.state.exit_transcript_pager();
+            } else {
+                store.state.scroll_transcript_down(lines);
+            }
+        }
     }
 }
 
@@ -1238,7 +1344,17 @@ fn scroll_current_surface_up(store: &mut Store, lines: usize) {
     match store.state.focus {
         FocusPane::Workspace => store.state.workspace.scroll_up(lines),
         FocusPane::Git => store.state.git.scroll_up(lines),
-        _ => store.state.scroll_transcript_up(lines),
+        // Pinned scroll-mode: the first wheel-up in the chat flow opens the
+        // pager at the bottom (committed history is unreachable inline), the
+        // wheel then scrolls inside it. Native mode keeps the wheel on the
+        // terminal, so this arm only sees synthetic/test events there.
+        _ => {
+            if store.state.pinned_scroll && transcript_pager_available(&store.state) {
+                store.state.enter_transcript_pager();
+            } else {
+                store.state.scroll_transcript_up(lines);
+            }
+        }
     }
 }
 
@@ -1636,6 +1752,7 @@ mod tests {
         let mut guard = TerminalGuard {
             mode: RenderMode::Inline,
             saved_inline_viewport: None,
+            mouse_captured: false,
         };
         let mut scrollback = ScrollbackTracker::new();
         draw(&mut terminal, &mut guard, &mut store, &mut scrollback)
@@ -1690,6 +1807,7 @@ mod tests {
         let mut guard = TerminalGuard {
             mode: RenderMode::Inline,
             saved_inline_viewport: None,
+            mouse_captured: false,
         };
         let mut scrollback = ScrollbackTracker::new();
 
@@ -1717,6 +1835,7 @@ mod tests {
         let mut guard = TerminalGuard {
             mode: RenderMode::Inline,
             saved_inline_viewport: None,
+            mouse_captured: false,
         };
 
         guard
@@ -2807,9 +2926,32 @@ mod tests {
 struct TerminalGuard {
     mode: RenderMode,
     saved_inline_viewport: Option<ratatui::layout::Rect>,
+    /// Mouse capture is on ONLY while the transcript pager is up (so the wheel
+    /// scrolls the pager). It must never be on in the inline chat flow, where
+    /// it would defeat native terminal selection/copy.
+    mouse_captured: bool,
 }
 
 impl TerminalGuard {
+    /// Bring the terminal's mouse-capture state in line with the policy
+    /// (`app::wants_mouse_capture`). Idempotent: only writes the escape
+    /// sequence on an actual transition.
+    fn sync_mouse_capture<B>(&mut self, terminal: &mut InlineTerminal<B>, want: bool) -> Result<()>
+    where
+        B: Backend + io::Write,
+    {
+        if want == self.mouse_captured {
+            return Ok(());
+        }
+        if want {
+            execute!(terminal.backend_mut(), EnableMouseCapture)?;
+        } else {
+            execute!(terminal.backend_mut(), DisableMouseCapture)?;
+        }
+        self.mouse_captured = want;
+        Ok(())
+    }
+
     /// Switch into the alternate screen for a full-screen overlay (if not
     /// already there). The viewport is resized to the full screen by the caller.
     fn enter_alt_screen<B>(&mut self, terminal: &mut InlineTerminal<B>) -> Result<()>
@@ -2856,6 +2998,9 @@ impl Drop for TerminalGuard {
         #[cfg(not(test))]
         {
             let mut stdout = io::stdout();
+            if self.mouse_captured {
+                let _ = execute!(stdout, DisableMouseCapture);
+            }
             if self.mode == RenderMode::AltScreen {
                 let _ = execute!(stdout, LeaveAlternateScreen);
             }

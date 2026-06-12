@@ -6014,6 +6014,7 @@ mod tests {
             readonly: false,
             theme: crate::cli::ThemeName::Codex,
             lang: crate::cli::Lang::En,
+            scroll_mode: crate::cli::ScrollMode::Native,
         };
 
         let launch = launch_from_cli(&cli);
@@ -7125,6 +7126,7 @@ mod tests {
             readonly: false,
             theme: crate::cli::ThemeName::Codex,
             lang: crate::cli::Lang::En,
+            scroll_mode: crate::cli::ScrollMode::Native,
         };
 
         let launch = launch_from_cli(&cli);

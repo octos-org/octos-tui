@@ -3096,6 +3096,16 @@ pub struct AppState {
     pub selected_session: usize,
     pub selected_task: usize,
     pub transcript_scroll: usize,
+    /// Full-screen transcript pager (alt-screen). While active the complete
+    /// committed transcript scrolls in the upper pane and the composer stays
+    /// pinned to the bottom row — the inline chat flow cannot offer that
+    /// because committed history lives in the terminal's own scrollback.
+    pub transcript_pager_active: bool,
+    /// `--scroll-mode pinned`: capture the mouse in the chat flow so wheel-up
+    /// auto-enters the pager (composer stays pinned) and wheel-down at the
+    /// pager bottom drops back to the inline tail. False = `native` (default):
+    /// the wheel belongs to the terminal and native selection/copy stay intact.
+    pub pinned_scroll: bool,
     pub focus: FocusPane,
     pub artifacts: ArtifactPaneState,
     pub workspace: WorkspacePaneState,
@@ -4666,6 +4676,8 @@ impl AppState {
             selected_session,
             selected_task: 0,
             transcript_scroll: 0,
+            transcript_pager_active: false,
+            pinned_scroll: false,
             focus: FocusPane::Composer,
             artifacts: panes.artifacts,
             workspace: panes.workspace,
@@ -5505,6 +5517,20 @@ impl AppState {
 
     pub fn select_prev_git_entry(&mut self) {
         self.git.select_prev();
+    }
+
+    /// Open the transcript pager at the bottom (latest content visible).
+    pub fn enter_transcript_pager(&mut self) {
+        self.transcript_pager_active = true;
+        self.transcript_scroll = 0;
+    }
+
+    /// Close the transcript pager. The scroll offset is reset so the inline
+    /// live tail follows the newest output again instead of inheriting the
+    /// pager's read position.
+    pub fn exit_transcript_pager(&mut self) {
+        self.transcript_pager_active = false;
+        self.transcript_scroll = 0;
     }
 
     pub fn scroll_transcript_up(&mut self, lines: usize) {

@@ -83,10 +83,20 @@ fn inspector_visible(app: &AppState) -> bool {
 pub fn wants_fullscreen_overlay(app: &AppState) -> bool {
     inspector_visible(app)
         || onboarding_first_launch_active(app)
+        || app.transcript_pager_active
         || app.task_output.active
         || app.artifact_detail.active
         || app.thread_graph_detail.active
         || app.turn_state_detail.active
+}
+
+/// Mouse capture policy. In the default `native` scroll-mode, capture is on
+/// ONLY while the transcript pager is up, so the wheel scrolls the pager and
+/// the inline chat flow keeps native terminal selection/copy untouched. In
+/// `pinned` scroll-mode the user explicitly trades native selection for a
+/// wheel that always scrolls the app (composer pinned), so capture stays on.
+pub fn wants_mouse_capture(app: &AppState) -> bool {
+    app.transcript_pager_active || app.pinned_scroll
 }
 
 /// Watermarks for active-turn content that has already been written into native
@@ -1493,10 +1503,32 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
     }
     let scroll_top = scroll_top as u16;
 
+    // In the pager the transcript blends with the terminal's DEFAULT
+    // background, exactly like the inline live tail: pinned-mode wheel
+    // scrolling enters the pager seamlessly, and painting `surface_alt` here
+    // would flip the whole screen to the theme color mid-scroll (the
+    // user-reported "screen went black"). Other full-screen surfaces
+    // (inspector, detail-modal backdrops) keep `surface_alt`.
+    let block_style = if app.transcript_pager_active {
+        // Span-level backgrounds (message-block "bubbles") must go too:
+        // committed history in native scrollback renders without them, so
+        // keeping them here paints text-shaped theme-color stripes over the
+        // terminal background the moment the user scrolls into the pager.
+        for line in &mut lines {
+            line.style.bg = None;
+            for span in &mut line.spans {
+                span.style.bg = None;
+            }
+        }
+        Style::default().fg(palette.text)
+    } else {
+        Style::default().fg(palette.text).bg(palette.surface_alt)
+    };
+
     Paragraph::new(Text::from(lines))
         .block(
             Block::default()
-                .style(Style::default().fg(palette.text).bg(palette.surface_alt))
+                .style(block_style)
                 .border_style(palette.border()),
         )
         .scroll((scroll_top, 0))
@@ -4875,6 +4907,16 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
         })
         .unwrap_or_else(|| t!("app.status.no_session").to_string());
     let work = status_bar_work_text(app);
+    // The pager has no native scrollbar (alt-screen has no terminal
+    // scrollback), so the hint doubles as the position indicator: scrolled up
+    // → "reviewing" with the way back; at the bottom → the plain key hints.
+    let key_hint = if app.transcript_pager_active && app.transcript_scroll > 0 {
+        t!("app.hint.pager_reviewing").into_owned()
+    } else if app.transcript_pager_active {
+        t!("app.hint.pager_keys").into_owned()
+    } else {
+        t!("app.hint.statusbar_keys").into_owned()
+    };
 
     Paragraph::new(Line::from(vec![
         Span::styled(
@@ -4907,10 +4949,7 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
         Span::styled(short_path(cwd), palette.muted().bg(palette.surface_alt)),
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
-        Span::styled(
-            t!("app.hint.statusbar_keys").into_owned(),
-            palette.selected().bg(palette.surface_alt),
-        ),
+        Span::styled(key_hint, palette.selected().bg(palette.surface_alt)),
     ]))
     .style(Style::default().fg(palette.text).bg(palette.surface_alt))
 }

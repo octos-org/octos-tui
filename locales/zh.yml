@@ -120,6 +120,8 @@ app:
     list_nav: "j/k 或 Up/Down"
     composer_send: "Enter 发送 | Tab 检查器"
     statusbar_keys: "Tab 检查器 | Ctrl+O 展开"
+    pager_keys: "会话回看 | PgUp/PgDn 滚动 | Esc 或 Ctrl+T 退出"
+    pager_reviewing: "回看中 ↑ | End 回到底部 | Esc 退出"
     ctrl_o_collapse: "Ctrl+O 折叠"
     ctrl_o_expand: "Ctrl+O 展开"
     task_output_modal: "o 查看更多 | PgUp/PgDn | Esc 关闭"
@@ -209,12 +211,15 @@ app:
 
 onboarding:
   welcome_title: "欢迎使用 Octos"
+  value_saved: "%{value}（已保存）"
+  api_key_saved: "已保存于档案"
   value_not_set: "未设置"
   action_edit: "回车编辑"
   field:
     full_name: "姓名"
     username: "用户名"
     email: "邮箱"
+    existing_profile: "使用已有档案（输入 ID）"
   local:
     title: "创建你的本地 Octos 档案"
     description: "仅保存在本机；不会发送邮箱验证码。"
@@ -594,6 +599,9 @@ menu:
       local_create:
         desc: 使用 profile/local/create；不发送验证码。
         label: 创建本地档案
+      exit:
+        desc: "不创建档案直接退出。提示：启动时加 --profile-id <id> 可跳过此界面。"
+        label: "退出 octos-tui"
       local_email:
         desc: 使用 /onboard email <地址>。邮箱仅为本地元数据。
       local_name:
