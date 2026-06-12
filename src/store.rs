@@ -1499,7 +1499,9 @@ impl Store {
         match action {
             OnboardingAction::Open => {
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
-                None
+                // A profile that already has a saved provider must not read as
+                // "not set" — fetch the server-saved LLM state for display.
+                self.onboarding_hydrate_saved_provider_command()
             }
             OnboardingAction::OpenLogin => {
                 if inline_args.is_some_and(|args| !args.trim().is_empty()) {
@@ -1562,7 +1564,9 @@ impl Store {
                     Some(t!("status.profile_updated").into_owned());
                 self.state.status = t!("status.onboarding_profile_updated").into_owned();
                 self.refresh_active_menu_and_advance();
-                None
+                // The wizard just advanced to provider setup for this profile;
+                // hydrate its saved provider so the rows reflect server truth.
+                self.onboarding_hydrate_saved_provider_command()
             }
             OnboardingAction::SetProviderSelection(selection) => {
                 if self.block_onboarding_provider_edit_if_pending() {
@@ -2134,6 +2138,33 @@ impl Store {
         Some(AppUiCommand::ProfileLlmList(ProfileLlmListParams {
             profile_id: self.current_profile_for_onboarding(),
         }))
+    }
+
+    /// Hydrate the wizard's saved-provider view from server truth: when a
+    /// profile is resolved but `profile_llm_state` is missing (or belongs to a
+    /// different profile), fetch `profile/llm/list` so the provider-setup step
+    /// shows what is already saved instead of "not set". Quiet and idempotent —
+    /// no status noise, no re-request once the state matches.
+    fn onboarding_hydrate_saved_provider_command(&self) -> Option<AppUiCommand> {
+        let supported = self
+            .state
+            .capabilities
+            .as_ref()
+            .is_some_and(|caps| caps.supports_method(crate::model::APPUI_METHOD_MODEL_LIST));
+        if !supported {
+            return None;
+        }
+        let profile_id = self.current_profile_for_onboarding()?;
+        let stale = self
+            .state
+            .profile_llm_state
+            .as_ref()
+            .is_none_or(|llm| llm.profile_id.as_deref() != Some(profile_id.as_str()));
+        stale.then(|| {
+            AppUiCommand::ProfileLlmList(ProfileLlmListParams {
+                profile_id: Some(profile_id),
+            })
+        })
     }
 
     fn onboarding_fetch_models_command(&mut self) -> Option<AppUiCommand> {
@@ -3882,9 +3913,9 @@ impl Store {
         match event {
             ClientEvent::App(event) => self.apply_event(*event),
             ClientEvent::Capabilities(event) => {
-                self.apply_capabilities_event(event);
+                let follow_up = self.apply_capabilities_event(event);
                 self.refresh_active_menu_if_open();
-                None
+                follow_up
             }
             ClientEvent::DiffPreview(result) => {
                 self.apply_diff_preview_result(result);
@@ -4749,7 +4780,7 @@ impl Store {
         .into_owned();
     }
 
-    fn apply_capabilities_event(&mut self, event: CapabilitiesClientEvent) {
+    fn apply_capabilities_event(&mut self, event: CapabilitiesClientEvent) -> Option<AppUiCommand> {
         self.state.set_capabilities(event.result.capabilities);
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
@@ -4758,6 +4789,14 @@ impl Store {
         ));
         self.state.status = event.message;
         self.maybe_open_onboarding_on_first_launch();
+        // When the wizard auto-opened (e.g. launched with --profile-id but no
+        // session yet), hydrate the saved provider for the resolved profile so
+        // the provider-setup step shows server truth instead of "not set".
+        if self.active_menu_is_onboarding() {
+            self.onboarding_hydrate_saved_provider_command()
+        } else {
+            None
+        }
     }
 
     fn maybe_open_onboarding_on_first_launch(&mut self) {

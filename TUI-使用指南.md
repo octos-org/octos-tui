@@ -117,6 +117,10 @@ profile 已就绪，**两步进会话**（方向键移 `>`，Enter）：
 
 进会话后 Composer 打字、Enter 发送。**不用重输 family / model / API key**。
 
+> **新增（onboarding 逃生门）**：如果误入"创建档案"表单（多半是忘了传 `--profile-id`），表单里现在有两行可用：
+> - **使用已有档案（输入 ID）** —— 回车编辑，输入已有 profile id（如 `alex`）后向导直接跳到 provider 设置，不再要求新建；等价命令 `/onboard profile alex`
+> - **退出 octos-tui** —— 不创建任何东西直接退出（Esc 在此界面被刻意屏蔽以防误触，Ctrl+Q 也始终可退）
+
 ---
 
 ## 6. 密钥（MOONSHOT_API_KEY）三种来源与优先级
@@ -138,6 +142,23 @@ serve 取密钥顺序（`octos config.rs get_api_key`）：
 `--data-dir ./octos-data` 相对**启动时的当前目录**解析（透传给 serve 子进程）。从别的目录启动同样命令 → 指向别处空目录 → 找不到 alexz → 这才会真的“从头配”。§4 的 config 已用**绝对路径**根除此隐患。
 
 ---
+
+## 7.5 滚动与输入框钉底（scroll-mode，新）
+
+| 模式 | 行为 | 取舍 |
+|---|---|---|
+| `native`（默认） | 滚轮走终端原生 scrollback，**输入框会随屏滚走**；按 **Ctrl+T 或 PageUp** 进入全屏回看（pager），此时输入框钉底、PgUp/PgDn/滚轮/方向键滚动内容，Esc 退出 | 保留终端原生鼠标选择/复制 |
+| `pinned` | 鼠标滚轮被 App 接管：**上滚自动进入 pager（输入框始终钉在底部），滚回底部自动退回实时视图**——体感即"无论怎么滚输入框都不动" | 原生鼠标选择文本需改用 **Shift+拖选** |
+
+设置方式（CLI 优先于 config 文件）：
+
+```bash
+octos-tui --scroll-mode pinned ...      # 命令行
+# 或 config 文件里：
+{ "scroll-mode": "pinned" }
+```
+
+pager 内输入不受影响：照常打字、Enter 发送。
 
 ## 8. 常用命令 / 快捷键
 

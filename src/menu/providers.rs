@@ -1046,13 +1046,15 @@ fn onboarding_provider_setup_menu(
         .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG)),
     ];
 
+    let saved_primary = onboarding_saved_primary(ctx, state, current_profile);
+
     items.extend([
         MenuItem::new(
             "onboard.provider.family",
             format!(
                 "{}: {}",
                 t!("menu.onboard.item.family.label"),
-                onboarding_family_label(state)
+                onboarding_family_label(state, saved_primary)
             ),
             MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY)),
         )
@@ -1065,7 +1067,7 @@ fn onboarding_provider_setup_menu(
             format!(
                 "{}: {}",
                 t!("menu.onboard.item.model.label"),
-                onboarding_model_label(state)
+                onboarding_model_label(state, saved_primary)
             ),
             MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL)),
         )
@@ -1086,7 +1088,7 @@ fn onboarding_provider_setup_menu(
             format!(
                 "{}: {}",
                 t!("menu.onboard.item.route.label"),
-                onboarding_route_label(state)
+                onboarding_route_label(state, saved_primary)
             ),
             MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE)),
         )
@@ -1100,14 +1102,25 @@ fn onboarding_provider_setup_menu(
         ),
     ]);
 
+    // Draft-first, saved-fallback for the API key row: a key already saved in
+    // the profile (server-confirmed `has_api_key`) must not read as "not set".
+    let api_key_display = if state.has_api_key() {
+        Some(state.api_key_label().to_string())
+    } else if saved_primary.is_some_and(|provider| provider.has_api_key) {
+        Some(t!("onboarding.api_key_saved").into_owned())
+    } else {
+        None
+    };
+    let api_key_present = api_key_display.is_some();
+
     items.extend([
         onboarding_edit_item(
             "onboard.provider.key",
             t!("menu.onboard.item.api_key.label").as_ref(),
-            state.has_api_key().then_some(state.api_key_label()),
+            api_key_display.as_deref(),
             "/onboard key ",
         )
-        .with_state(MenuItemState::required(state.has_api_key()))
+        .with_state(MenuItemState::required(api_key_present))
         .maybe_disabled(
             (!state.selection_ready())
                 .then(|| t!("onboarding.disabled.choose_provider_first").into_owned()),
@@ -1170,6 +1183,18 @@ fn onboarding_provider_setup_menu(
             .maybe_disabled(blocked)
         },
     ]);
+
+    // Same escape hatch as the create-profile step: this menu also lives under
+    // the root MENU_ONBOARD id, where Esc is swallowed while no session is
+    // open — without a visible Exit row the user would be trapped here.
+    items.push(
+        MenuItem::new(
+            "onboard.local.exit",
+            t!("menu.onboard.item.exit.label"),
+            MenuAction::Local(LocalAction::Exit),
+        )
+        .with_description(t!("menu.onboard.item.exit.desc")),
+    );
 
     for (idx, item) in items.iter_mut().enumerate() {
         if let Some(shortcut) = numeric_shortcut(idx) {
@@ -1452,6 +1477,22 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
         )
         .with_description(t!("onboarding.local.create_action"))
         .maybe_disabled(onboarding_local_profile_disabled_reason(state)),
+        // Escape hatches (issue: the wizard auto-opens and swallows Esc, so it
+        // MUST offer visible ways out). An existing profile id routes the
+        // wizard straight to provider setup via the same `/onboard profile`
+        // path; Exit quits without creating anything.
+        onboarding_edit_item(
+            "onboard.local.profile_id",
+            t!("onboarding.field.existing_profile"),
+            state.profile_id.as_deref(),
+            "/onboard profile ",
+        ),
+        MenuItem::new(
+            "onboard.local.exit",
+            t!("menu.onboard.item.exit.label"),
+            MenuAction::Local(LocalAction::Exit),
+        )
+        .with_description(t!("menu.onboard.item.exit.desc")),
     ];
 
     // Wizard framing: the language step is already satisfied by the default
@@ -1707,34 +1748,101 @@ fn onboarding_edit_item(
     .with_description(t!("onboarding.action_edit"))
 }
 
-fn onboarding_family_label(state: &OnboardingWizardState) -> String {
-    if state.provider.family_id.trim().is_empty() {
-        t!("onboarding.value_not_set").into_owned()
-    } else {
-        state.provider.family_id.clone()
-    }
+/// The server-saved primary provider for the wizard's effective profile, read
+/// from `profile_llm_state` (server truth via `profile/llm/list`). `None` when
+/// no state was hydrated yet or it belongs to a different profile.
+fn onboarding_saved_primary<'a>(
+    ctx: &MenuContext<'a>,
+    state: &OnboardingWizardState,
+    current_profile: Option<&str>,
+) -> Option<&'a LlmConfiguredProvider> {
+    let effective = state.effective_profile_id(current_profile);
+    ctx.app
+        .profile_llm_state
+        .filter(
+            |llm| match (llm.profile_id.as_deref(), effective.as_deref()) {
+                (Some(saved), Some(wanted)) => saved == wanted,
+                _ => true,
+            },
+        )
+        .and_then(|llm| llm.primary_provider())
 }
 
-fn onboarding_model_label(state: &OnboardingWizardState) -> String {
-    if state.provider.model_id.trim().is_empty() {
-        t!("onboarding.value_not_set").into_owned()
-    } else {
-        state.provider.model_id.clone()
-    }
+fn non_empty(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
-fn onboarding_route_label(state: &OnboardingWizardState) -> String {
-    if state.provider.route.route_id.trim().is_empty() {
-        t!("onboarding.value_not_set").into_owned()
-    } else {
-        state
+fn saved_family_id(provider: &LlmConfiguredProvider) -> Option<&str> {
+    provider
+        .family_id
+        .as_deref()
+        .and_then(non_empty)
+        .or_else(|| non_empty(&provider.provider))
+}
+
+fn saved_model_id(provider: &LlmConfiguredProvider) -> Option<&str> {
+    provider
+        .model_id
+        .as_deref()
+        .and_then(non_empty)
+        .or_else(|| non_empty(&provider.model))
+}
+
+fn saved_route_id(provider: &LlmConfiguredProvider) -> Option<&str> {
+    provider
+        .route_id
+        .as_deref()
+        .and_then(non_empty)
+        .or_else(|| provider.route.as_ref().and_then(|r| non_empty(&r.route_id)))
+}
+
+/// Draft-first, saved-fallback display: the wizard's local draft always wins;
+/// when it is empty the server-saved value shows with a "(saved)" marker so a
+/// configured profile never reads as "not set".
+fn onboarding_family_label(
+    state: &OnboardingWizardState,
+    saved: Option<&LlmConfiguredProvider>,
+) -> String {
+    if let Some(family) = non_empty(&state.provider.family_id) {
+        return family.to_owned();
+    }
+    if let Some(family) = saved.and_then(saved_family_id) {
+        return t!("onboarding.value_saved", value = family).into_owned();
+    }
+    t!("onboarding.value_not_set").into_owned()
+}
+
+fn onboarding_model_label(
+    state: &OnboardingWizardState,
+    saved: Option<&LlmConfiguredProvider>,
+) -> String {
+    if let Some(model) = non_empty(&state.provider.model_id) {
+        return model.to_owned();
+    }
+    if let Some(model) = saved.and_then(saved_model_id) {
+        return t!("onboarding.value_saved", value = model).into_owned();
+    }
+    t!("onboarding.value_not_set").into_owned()
+}
+
+fn onboarding_route_label(
+    state: &OnboardingWizardState,
+    saved: Option<&LlmConfiguredProvider>,
+) -> String {
+    if non_empty(&state.provider.route.route_id).is_some() {
+        return state
             .provider
             .route
             .label
             .as_deref()
             .map(|label| format!("{label} ({})", state.provider.route.route_id))
-            .unwrap_or_else(|| state.provider.route.route_id.clone())
+            .unwrap_or_else(|| state.provider.route.route_id.clone());
     }
+    if let Some(route) = saved.and_then(saved_route_id) {
+        return t!("onboarding.value_saved", value = route).into_owned();
+    }
+    t!("onboarding.value_not_set").into_owned()
 }
 
 fn onboarding_model_selected(state: &OnboardingWizardState) -> bool {
