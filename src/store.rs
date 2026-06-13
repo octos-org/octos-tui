@@ -2191,11 +2191,9 @@ impl Store {
             .profile_llm_state
             .as_ref()
             .is_none_or(|llm| llm.profile_id.as_deref() != Some(profile_id.as_str()));
-        stale.then(|| {
-            AppUiCommand::ProfileLlmList(ProfileLlmListParams {
-                profile_id: Some(profile_id),
-            })
-        })
+        stale.then_some(AppUiCommand::ProfileLlmList(ProfileLlmListParams {
+            profile_id: Some(profile_id),
+        }))
     }
 
     fn onboarding_fetch_models_command(&mut self) -> Option<AppUiCommand> {

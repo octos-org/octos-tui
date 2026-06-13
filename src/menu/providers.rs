@@ -1225,6 +1225,7 @@ fn onboarding_provider_setup_menu(
         state,
         current_profile,
         local_profile_create_supported(ctx),
+        onboarding_saved_guidance_ready(ctx, state, current_profile),
     );
     let next_action = onboarding_next_action_hint(ctx, state, current_profile);
 
@@ -1348,6 +1349,7 @@ fn onboarding_workspace_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         state,
         current_profile,
         local_profile_create_supported(ctx),
+        onboarding_saved_guidance_ready(ctx, state, current_profile),
     );
     let next_action = onboarding_next_action_hint(ctx, state, current_profile);
 
@@ -1411,39 +1413,59 @@ fn onboarding_workspace_preview(
 /// Compute the single next concrete action for the provider/setup phase of the
 /// wizard, in dependency order. This drives the `Next: ...` footer so the user
 /// always knows the immediate thing to do.
+/// #203 guidance short-circuit: the hint and progress must agree with the row
+/// labels. While the provider draft is untouched, the rows display the
+/// server-hydrated saved primary (the "(saved)" fallback) — if that provider
+/// also has a key, the provider/connect/save steps are satisfied by server
+/// truth and guidance must move past them. Any staged draft input restores
+/// draft-first guidance (the user is re-configuring).
+fn onboarding_saved_guidance_ready(
+    ctx: &MenuContext<'_>,
+    state: &OnboardingWizardState,
+    current_profile: Option<&str>,
+) -> bool {
+    state.provider_draft_empty()
+        && onboarding_saved_primary(ctx, state, current_profile)
+            .is_some_and(|provider| provider.has_api_key)
+}
+
 fn onboarding_next_action_hint(
     ctx: &MenuContext<'_>,
     state: &OnboardingWizardState,
     current_profile: Option<&str>,
 ) -> String {
-    if ctx.app.profile_llm_catalog.is_none() {
-        return t!("onboarding.wizard.next.load_catalog").into_owned();
-    }
-    if state.provider.family_id.trim().is_empty() {
-        return t!("onboarding.wizard.next.choose_family").into_owned();
-    }
-    if state.provider.model_id.trim().is_empty() {
-        return t!("onboarding.wizard.next.choose_model").into_owned();
-    }
-    if !state.selection_ready() {
-        return t!("onboarding.wizard.next.choose_route").into_owned();
-    }
-    if !state.has_api_key() {
-        return t!("onboarding.wizard.next.paste_key").into_owned();
-    }
-    if !state.provider_tested
-        && !matches!(
+    // The provider-section checks (catalog through save) judge the draft;
+    // skip them entirely when the saved provider already covers the section.
+    if !onboarding_saved_guidance_ready(ctx, state, current_profile) {
+        if ctx.app.profile_llm_catalog.is_none() {
+            return t!("onboarding.wizard.next.load_catalog").into_owned();
+        }
+        if state.provider.family_id.trim().is_empty() {
+            return t!("onboarding.wizard.next.choose_family").into_owned();
+        }
+        if state.provider.model_id.trim().is_empty() {
+            return t!("onboarding.wizard.next.choose_model").into_owned();
+        }
+        if !state.selection_ready() {
+            return t!("onboarding.wizard.next.choose_route").into_owned();
+        }
+        if !state.has_api_key() {
+            return t!("onboarding.wizard.next.paste_key").into_owned();
+        }
+        if !state.provider_tested
+            && !matches!(
+                state.provider_status(),
+                OnboardingProviderStatus::SavedPrimary
+            )
+        {
+            return t!("onboarding.wizard.next.test_provider").into_owned();
+        }
+        if !matches!(
             state.provider_status(),
-            OnboardingProviderStatus::SavedPrimary
-        )
-    {
-        return t!("onboarding.wizard.next.test_provider").into_owned();
-    }
-    if !matches!(
-        state.provider_status(),
-        OnboardingProviderStatus::SavedPrimary | OnboardingProviderStatus::SavedFallback
-    ) {
-        return t!("onboarding.wizard.next.save_provider").into_owned();
+            OnboardingProviderStatus::SavedPrimary | OnboardingProviderStatus::SavedFallback
+        ) {
+            return t!("onboarding.wizard.next.save_provider").into_owned();
+        }
     }
     if onboarding_workspace_disabled_reason(state).is_some() {
         return t!("onboarding.wizard.next.validate_workspace").into_owned();
@@ -1515,8 +1537,9 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
     // English locale, so this screen is the first required profile input step.
     // The local-create branch is only reached when `profile/local/create` is
     // supported AND no profile is resolved yet, so progress is computed with
-    // `local_create_supported = true` and `current_profile = None`.
-    let progress = crate::menu::wizard::WizardProgress::from_state(state, None, true);
+    // `local_create_supported = true`, `current_profile = None`, and no saved
+    // provider (no profile means nothing can be hydrated).
+    let progress = crate::menu::wizard::WizardProgress::from_state(state, None, true, false);
     let next_action = if state.local_profile_ready() {
         t!("onboarding.wizard.next.local_continue")
     } else {

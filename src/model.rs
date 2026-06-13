@@ -2153,6 +2153,23 @@ impl OnboardingWizardState {
                     .is_some_and(|url| !url.trim().is_empty()))
     }
 
+    /// True while the provider draft has no user input staged — no
+    /// family/model/route picked and no API key pasted. While this holds, the
+    /// provider rows display server-saved values (the "(saved)" fallback), so
+    /// guidance must judge the saved provider rather than the empty draft.
+    pub fn provider_draft_empty(&self) -> bool {
+        self.provider.family_id.trim().is_empty()
+            && self.provider.model_id.trim().is_empty()
+            && self.provider.route.route_id.trim().is_empty()
+            && self
+                .provider
+                .route
+                .base_url
+                .as_deref()
+                .is_none_or(|url| url.trim().is_empty())
+            && !self.has_api_key()
+    }
+
     pub fn profile_label(&self, current_profile: Option<&str>) -> String {
         self.effective_profile_id(current_profile)
             .unwrap_or_else(|| "<server authenticated profile>".into())

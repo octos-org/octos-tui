@@ -114,24 +114,31 @@ impl WizardProgress {
     /// Derive progress from the wizard state. `local_create_supported` selects
     /// whether the Profile step is part of the flow (solo/local mode) or
     /// implicitly satisfied by an already-resolved server profile.
+    /// `saved_primary_ready` is the server-truth short-circuit (#203): a
+    /// hydrated primary provider with a key while the draft is untouched —
+    /// exactly the state the provider rows render as "(saved)" — satisfies
+    /// the Provider/Connect/Save steps without any draft input.
     pub fn from_state(
         state: &OnboardingWizardState,
         current_profile: Option<&str>,
         local_create_supported: bool,
+        saved_primary_ready: bool,
     ) -> Self {
         let language_done = true;
         let profile_done = state.effective_profile_id(current_profile).is_some()
             || (!local_create_supported && current_profile.is_some());
-        let provider_done = state.selection_ready();
+        let provider_done = state.selection_ready() || saved_primary_ready;
         let connect_done = state.provider_tested
+            || saved_primary_ready
             || matches!(
                 state.provider_status(),
                 OnboardingProviderStatus::SavedPrimary
             );
-        let save_done = matches!(
-            state.provider_status(),
-            OnboardingProviderStatus::SavedPrimary | OnboardingProviderStatus::SavedFallback
-        );
+        let save_done = saved_primary_ready
+            || matches!(
+                state.provider_status(),
+                OnboardingProviderStatus::SavedPrimary | OnboardingProviderStatus::SavedFallback
+            );
         let workspace_done = matches!(
             state.workspace_validation,
             OnboardingWorkspaceValidation::Valid { .. }
@@ -297,7 +304,7 @@ mod tests {
     #[test]
     fn fresh_state_defaults_language_and_starts_on_profile_step() {
         let state = OnboardingWizardState::default();
-        let progress = WizardProgress::from_state(&state, None, true);
+        let progress = WizardProgress::from_state(&state, None, true, false);
         assert_eq!(progress.current, WizardStep::Profile);
         assert_eq!(progress.current.number(), 2);
         // Assert via the same i18n key (NOT a hardcoded English literal) so the
@@ -319,14 +326,14 @@ mod tests {
 
     #[test]
     fn resolved_profile_advances_to_provider_step() {
-        let progress = WizardProgress::from_state(&state_with_profile(), None, true);
+        let progress = WizardProgress::from_state(&state_with_profile(), None, true, false);
         assert_eq!(progress.current, WizardStep::Provider);
         assert!(progress.done[1]);
     }
 
     #[test]
     fn ready_selection_advances_to_connect_step() {
-        let progress = WizardProgress::from_state(&state_with_selection(), None, true);
+        let progress = WizardProgress::from_state(&state_with_selection(), None, true, false);
         assert_eq!(progress.current, WizardStep::Connect);
         assert!(progress.done[2], "provider step complete");
     }
@@ -338,7 +345,7 @@ mod tests {
         state.provider_saved = true;
         state.workspace_validation = valid_workspace();
 
-        let progress = WizardProgress::from_state(&state, None, true);
+        let progress = WizardProgress::from_state(&state, None, true, false);
         assert_eq!(progress.current, WizardStep::Activate);
         assert!(progress.done[..6].iter().all(|done| *done));
         assert!(!progress.done[6], "activate never self-marks complete");
@@ -346,7 +353,7 @@ mod tests {
 
     #[test]
     fn checklist_marks_current_completed_and_pending() {
-        let progress = WizardProgress::from_state(&state_with_profile(), None, true);
+        let progress = WizardProgress::from_state(&state_with_profile(), None, true, false);
         let MenuPreview::KeyValues { rows, .. } = progress.checklist_preview() else {
             panic!("expected key-value checklist");
         };
@@ -362,7 +369,7 @@ mod tests {
     /// and the current step's multi-line explanation body.
     #[test]
     fn explanation_preview_is_prose_with_progress_and_current_step() {
-        let progress = WizardProgress::from_state(&state_with_profile(), None, true);
+        let progress = WizardProgress::from_state(&state_with_profile(), None, true, false);
         let MenuPreview::Text { title, body } = progress.explanation_preview() else {
             panic!("expected free-text teaching panel");
         };
@@ -386,11 +393,23 @@ mod tests {
     #[test]
     fn server_profile_without_local_create_skips_profile_step() {
         let state = OnboardingWizardState::default();
-        let progress = WizardProgress::from_state(&state, Some("server-prof"), false);
+        let progress = WizardProgress::from_state(&state, Some("server-prof"), false, false);
         assert!(
             progress.done[1],
             "server-authenticated profile satisfies step 1"
         );
         assert_eq!(progress.current, WizardStep::Provider);
+    }
+
+    /// #203: a server-hydrated saved primary (untouched draft) satisfies the
+    /// Provider/Connect/Save steps, so progress agrees with the "(saved)" row
+    /// labels and lands on Workspace instead of demanding draft input.
+    #[test]
+    fn saved_primary_ready_completes_provider_steps() {
+        let progress = WizardProgress::from_state(&state_with_profile(), None, true, true);
+        assert!(progress.done[2], "provider satisfied by server truth");
+        assert!(progress.done[3], "connect satisfied by server truth");
+        assert!(progress.done[4], "save satisfied by server truth");
+        assert_eq!(progress.current, WizardStep::Workspace);
     }
 }
