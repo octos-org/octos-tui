@@ -1419,14 +1419,22 @@ fn onboarding_workspace_preview(
 /// also has a key, the provider/connect/save steps are satisfied by server
 /// truth and guidance must move past them. Any staged draft input restores
 /// draft-first guidance (the user is re-configuring).
+///
+/// This MUST key on the same predicate that unlocks the Workspace/Activate
+/// rows (`onboarding_has_saved_primary_provider`, which filters on
+/// `current_profile`), NOT on `onboarding_saved_primary` (which keys on the
+/// staged `effective_profile_id`). Otherwise, with an active session on
+/// profile A and a staged `/onboard profile B`, guidance could advance to the
+/// Workspace step from B's hydrated state while the Workspace row stays
+/// disabled with "save a provider first" against A — contradictory progress
+/// (codex P2 on #204). Sharing one predicate keeps them in lock-step.
 fn onboarding_saved_guidance_ready(
     ctx: &MenuContext<'_>,
     state: &OnboardingWizardState,
     current_profile: Option<&str>,
 ) -> bool {
     state.provider_draft_empty()
-        && onboarding_saved_primary(ctx, state, current_profile)
-            .is_some_and(|provider| provider.has_api_key)
+        && onboarding_has_saved_primary_provider(ctx, state, current_profile)
 }
 
 fn onboarding_next_action_hint(
