@@ -41,7 +41,6 @@ transcript pager 落地后，滚轮上滚仍走终端原生 scrollback，compose
 - tests/pinned_scroll_mode_contract.rs
 - specs/**
 - TUI-使用指南.md
-- docs/AGENTSPEC_HANDOVER.md
 
 ### Forbidden
 - 不修改 `src/insert_history.rs` 与 `src/viewport.rs` 的 scrollback 写入机制。

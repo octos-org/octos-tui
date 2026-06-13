@@ -4,7 +4,7 @@
 # Local dev override for octos-core (see .cargo/config.toml.example).
 /.cargo/config.toml
 
-# agent-spec lifecycle run logs (see docs/AGENTSPEC_HANDOVER.md §5.3).
+# agent-spec lifecycle run logs.
 .agent-spec/runs/
 
 # Generated tmux/UX soak artifacts.
