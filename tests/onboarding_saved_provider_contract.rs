@@ -268,6 +268,34 @@ fn draft_input_overrides_saved_guidance() {
     );
 }
 
+/// The draft is "touched" by ANY staged provider edit, not just family/model.
+/// Route metadata (`/onboard label`, `/onboard env`, `/onboard api-type`)
+/// flows through the same `mark_onboarding_provider_dirty` path, so it must
+/// also restore draft-first guidance — otherwise the saved short-circuit
+/// silently swallows the user's edit (codex P2 on #204).
+#[test]
+fn route_metadata_edit_overrides_saved_guidance() {
+    // `api-type` is seeded to "openai" in an untouched draft, so the divergent
+    // value here is "anthropic" — setting it back to "openai" is a genuine
+    // no-op and correctly does NOT count as a touch.
+    for edit in [
+        "/onboard label my-route",
+        "/onboard env MOONSHOT_API_KEY",
+        "/onboard api-type anthropic",
+    ] {
+        let mut store = first_launch_store();
+        run_command(&mut store, "/onboard profile alex");
+        apply_llm_state(&mut store, saved_moonshot_state("alex"));
+        run_command(&mut store, edit);
+
+        let footer = menu_footer(&store);
+        assert!(
+            !footer.contains("validate the workspace"),
+            "staging `{edit}` must restore draft-first guidance; footer: {footer:?}"
+        );
+    }
+}
+
 #[test]
 fn saved_provider_without_key_keeps_draft_guidance() {
     let mut store = first_launch_store();

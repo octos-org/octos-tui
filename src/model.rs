@@ -2154,20 +2154,24 @@ impl OnboardingWizardState {
     }
 
     /// True while the provider draft has no user input staged — no
-    /// family/model/route picked and no API key pasted. While this holds, the
-    /// provider rows display server-saved values (the "(saved)" fallback), so
-    /// guidance must judge the saved provider rather than the empty draft.
+    /// family/model picked, no route field edited, and no API key pasted.
+    /// While this holds, the provider rows display server-saved values (the
+    /// "(saved)" fallback), so guidance must judge the saved provider rather
+    /// than the empty draft.
+    ///
+    /// "Untouched" is defined as equality with [`empty_llm_selection_config`],
+    /// the exact seed a fresh draft starts from — note that seed is NOT
+    /// all-default: it carries `route.api_type = "openai"`. Every onboarding
+    /// provider edit routes through `mark_onboarding_provider_dirty` and
+    /// mutates one of these fields (family/model/route_id/label/base_url/
+    /// api_key_env/api_type, via `/onboard family|model|route|label|base-url|
+    /// env|api-type`), so any of them moves the draft away from the seed.
+    /// Comparing against the seed covers every field — including the ones a
+    /// hand-rolled check missed (`label`, `api_key_env`) — and stays correct
+    /// if the draft schema grows. The API key lives on the wizard state, not
+    /// the selection, so it is checked separately.
     pub fn provider_draft_empty(&self) -> bool {
-        self.provider.family_id.trim().is_empty()
-            && self.provider.model_id.trim().is_empty()
-            && self.provider.route.route_id.trim().is_empty()
-            && self
-                .provider
-                .route
-                .base_url
-                .as_deref()
-                .is_none_or(|url| url.trim().is_empty())
-            && !self.has_api_key()
+        self.provider == empty_llm_selection_config() && !self.has_api_key()
     }
 
     pub fn profile_label(&self, current_profile: Option<&str>) -> String {
