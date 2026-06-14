@@ -69,6 +69,17 @@ pub enum ScrollMode {
     Pinned,
 }
 
+impl ScrollMode {
+    /// Kebab id symmetric with the `scroll-mode` config key / `--scroll-mode`
+    /// flag, so a saved value round-trips back through the loader.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScrollMode::Native => "native",
+            ScrollMode::Pinned => "pinned",
+        }
+    }
+}
+
 /// UI display language (i18n). English is the source/fallback locale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -323,6 +334,61 @@ pub fn load_config_file(path: &Path) -> Result<CliFileConfig> {
         .wrap_err_with(|| format!("failed to read TUI config {}", path.display()))?;
     serde_json::from_str(&contents)
         .wrap_err_with(|| format!("failed to parse TUI config {}", path.display()))
+}
+
+/// Default config path used by `/saveconfig` when the session was launched
+/// without an explicit `--config`. Follows the XDG/CLI convention the backend
+/// adopted (`~/.config/octos-tui/config.json`).
+pub fn default_config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+    Some(
+        PathBuf::from(home)
+            .join(".config")
+            .join("octos-tui")
+            .join("config.json"),
+    )
+}
+
+/// Persist the runtime UI settings (theme / lang / scroll-mode) back into the
+/// config file, MERGING into whatever is already there: the existing JSON is
+/// read as a generic object and only these three keys are patched, so transport
+/// keys (stdio-command, profile-id, session, endpoint, …) and any unknown keys
+/// survive untouched. A missing or empty file starts from an empty object.
+/// Returns the path actually written.
+pub fn save_ui_settings(
+    path: &Path,
+    theme: ThemeName,
+    lang: Lang,
+    scroll_mode: ScrollMode,
+) -> Result<()> {
+    let mut root = match fs::read_to_string(path) {
+        Ok(contents) if !contents.trim().is_empty() => {
+            serde_json::from_str::<serde_json::Value>(&contents)
+                .wrap_err_with(|| format!("failed to parse TUI config {}", path.display()))?
+        }
+        _ => serde_json::Value::Object(serde_json::Map::new()),
+    };
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| eyre!("TUI config {} is not a JSON object", path.display()))?;
+    object.insert("theme".into(), theme.as_str().into());
+    object.insert("lang".into(), lang.code().into());
+    object.insert("scroll-mode".into(), scroll_mode.as_str().into());
+    // Drop any legacy snake_case alias so the canonical key is authoritative.
+    object.remove("scroll_mode");
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("failed to create config dir {}", parent.display()))?;
+    }
+    let mut serialized =
+        serde_json::to_string_pretty(&root).wrap_err("failed to serialize TUI config")?;
+    serialized.push('\n');
+    fs::write(path, serialized)
+        .wrap_err_with(|| format!("failed to write TUI config {}", path.display()))
 }
 
 pub fn parse_websocket_url(value: &str) -> std::result::Result<String, String> {

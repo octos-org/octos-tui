@@ -1009,6 +1009,11 @@ impl Store {
                 self.close_all_menus();
                 None
             }
+            LocalAction::SaveConfig => {
+                self.dispatch_save_config();
+                self.close_all_menus();
+                None
+            }
             LocalAction::SetThinkingLevel(level) => self.dispatch_set_thinking_level(level),
             LocalAction::CopyLastReply => {
                 self.copy_last_reply();
@@ -1062,6 +1067,37 @@ impl Store {
     /// reasoning style; the server decides whether the effort is honored.
     /// `/thinking` with no arg opens the selection menu; with an arg
     /// (`low|medium|high|max|default`) it sets the level inline as a shortcut.
+    /// `/saveconfig` — persist the runtime UI settings (theme/lang/scroll-mode)
+    /// back to the launch config file (or the default path when launched without
+    /// `--config`), merging so transport/unknown keys survive. Status-row only.
+    fn dispatch_save_config(&mut self) {
+        let path = self
+            .state
+            .config_path
+            .clone()
+            .or_else(crate::cli::default_config_path);
+        let Some(path) = path else {
+            self.state.status = t!("saveconfig.no_path").into_owned();
+            return;
+        };
+        let scroll_mode = if self.state.pinned_scroll {
+            crate::cli::ScrollMode::Pinned
+        } else {
+            crate::cli::ScrollMode::Native
+        };
+        let lang =
+            crate::cli::Lang::from_env_value(&rust_i18n::locale()).unwrap_or(crate::cli::Lang::En);
+        match crate::cli::save_ui_settings(&path, self.state.theme, lang, scroll_mode) {
+            Ok(()) => {
+                self.state.status =
+                    t!("saveconfig.saved", path = path.display().to_string()).into_owned();
+            }
+            Err(err) => {
+                self.state.status = t!("saveconfig.failed", error = err.to_string()).into_owned();
+            }
+        }
+    }
+
     /// `/scrollmode` — runtime switch of the wheel-scroll model. Bare command
     /// toggles; `native`/`pinned` set explicitly. Mouse capture follows on the
     /// next frame (the draw loop re-syncs capture from `wants_mouse_capture`).
