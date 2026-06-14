@@ -2078,6 +2078,20 @@ fn push_formatted_body_marked(
             continue;
         }
 
+        if markdown_hr(line) {
+            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_markdown_table(lines, palette, &mut table, indent, bg, width);
+            let rule_width = width.saturating_sub(indent.chars().count()).clamp(1, 40);
+            lines.push(chat_line(
+                vec![
+                    Span::styled(indent, style_bg(palette.border(), bg)),
+                    Span::styled("─".repeat(rule_width), style_bg(palette.muted(), bg)),
+                ],
+                bg,
+            ));
+            continue;
+        }
+
         if let Some(heading) = markdown_heading(line) {
             flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
@@ -2444,6 +2458,23 @@ fn line_is_blank(line: Option<&Line<'static>>) -> bool {
         .unwrap_or(false)
 }
 
+/// True when a line is a thematic break (`---`, `***`, `___`): ≥3 of a single
+/// marker char once spaces are removed. Table separators (which contain `|`)
+/// are handled earlier and never reach here.
+fn markdown_hr(line: &str) -> bool {
+    let stripped: String = line
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    if stripped.len() < 3 {
+        return false;
+    }
+    let mut chars = stripped.chars();
+    let first = chars.next().unwrap();
+    matches!(first, '-' | '*' | '_') && chars.all(|ch| ch == first)
+}
+
 fn markdown_heading(line: &str) -> Option<&str> {
     let trimmed = line.trim_start();
     let hash_count = trimmed.chars().take_while(|ch| *ch == '#').count();
@@ -2547,6 +2578,40 @@ fn inline_markdown_spans(
     let mut rest = text;
 
     while !rest.is_empty() {
+        // Link `[text](url)`: text in the highlight (code) style, url appended
+        // dimmed. NOT a real OSC 8 hyperlink — ratatui renders cell-by-cell, so
+        // a raw escape would be counted as width and corrupt the layout.
+        if let Some(after_lb) = rest.strip_prefix('[')
+            && let Some(mid) = after_lb.find("](")
+            && let Some(rel_close) = after_lb[mid + 2..].find(')')
+        {
+            let link_text = &after_lb[..mid];
+            let url = &after_lb[mid + 2..mid + 2 + rel_close];
+            if !link_text.is_empty() && !url.is_empty() {
+                spans.push(Span::styled(link_text.to_string(), code_style));
+                spans.push(Span::styled(
+                    format!(" ({})", truncate_terminal_line(url, 60)),
+                    normal_style.add_modifier(Modifier::DIM),
+                ));
+                rest = &after_lb[mid + 2 + rel_close + 1..];
+                continue;
+            }
+        }
+
+        if let Some(after_open) = rest.strip_prefix("~~")
+            && let Some(close) = after_open.find("~~")
+        {
+            let struck = &after_open[..close];
+            if !struck.is_empty() {
+                spans.push(Span::styled(
+                    struck.to_string(),
+                    normal_style.add_modifier(Modifier::CROSSED_OUT),
+                ));
+            }
+            rest = &after_open[close + 2..];
+            continue;
+        }
+
         if let Some(after_open) = rest.strip_prefix("**")
             && let Some(close) = after_open.find("**")
         {
@@ -2580,12 +2645,16 @@ fn inline_markdown_spans(
 
         let next_bold = rest.find("**");
         let next_code = rest.find('`');
+        // Stop a plain-text run before a link/strike opener so the next loop
+        // iteration can parse it (otherwise the run would swallow `[` / `~~`).
+        let next_link = rest.find('[');
+        let next_strike = rest.find("~~");
         let next_emphasis = rest
             .char_indices()
             .skip(1)
             .find(|(_, ch)| matches!(ch, '*' | '_'))
             .map(|(idx, _)| idx);
-        let next = [next_bold, next_code, next_emphasis]
+        let next = [next_bold, next_code, next_link, next_strike, next_emphasis]
             .into_iter()
             .flatten()
             .min();
