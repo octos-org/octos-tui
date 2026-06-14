@@ -11396,7 +11396,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(labels, vec!["/keymap"]);
 
+        // Uniform completion: accepting the filtered item completes it into the
+        // composer (it does NOT open the menu yet) — consistent across all
+        // commands, argful or not.
         assert!(store.accept_active_menu_item().is_none());
+        assert_eq!(store.state.composer, "/keymap");
+        // The follow-up Enter resolves the now-complete command and opens it.
+        assert!(store.compose_command().is_none());
         assert_eq!(
             store
                 .state

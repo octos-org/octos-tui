@@ -133,3 +133,46 @@ fn default_config_path_resolves_under_config_dir() {
         "default path {path:?} must end with {suffix:?}"
     );
 }
+
+#[test]
+fn partial_prefix_completes_into_composer_then_executes() {
+    // The user's report: typing a partial name and pressing Enter must COMPLETE
+    // the full command into the composer (consistent with argful commands), not
+    // execute immediately. A no-arg command like /saveconfig is the case that
+    // used to diverge.
+    let path = unique_dir("complete").join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    let mut store = chat_store();
+    store.state.config_path = Some(path.clone());
+
+    // Type a unique partial prefix; the popup filters to /saveconfig.
+    for ch in "/savec".chars() {
+        handle_terminal_event(
+            &mut store,
+            Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
+        );
+    }
+    // First Enter: completes into the composer, does NOT run yet.
+    handle_terminal_event(
+        &mut store,
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    assert_eq!(
+        store.state.composer, "/saveconfig",
+        "partial prefix + Enter completes the full command into the composer"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap().trim(),
+        "{}",
+        "completion must not execute the command yet"
+    );
+
+    // Second Enter: now it runs.
+    handle_terminal_event(
+        &mut store,
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(raw.get("theme").is_some(), "second Enter executes the save");
+}

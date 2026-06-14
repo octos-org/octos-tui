@@ -12,10 +12,10 @@ use octos_core::ui_protocol::{
 use serde_json::Value;
 
 use crate::menu::{
-    AppUiActionKind, AvailabilityStatus, ClientEffect, CommandEntry, CommandRegistry, KeyBinding,
-    LocalAction, MenuAction, MenuAppSnapshot, MenuBuildResult, MenuContext, MenuId, MenuItem,
-    MenuItemState, MenuMode, MenuPreview, MenuPreviewRow, MenuProvider, MenuRegistry, MenuSpec,
-    MenuStatusSpec, MenuTab,
+    AppUiActionKind, AvailabilityStatus, ClientEffect, CommandRegistry, KeyBinding, LocalAction,
+    MenuAction, MenuAppSnapshot, MenuBuildResult, MenuContext, MenuId, MenuItem, MenuItemState,
+    MenuMode, MenuPreview, MenuPreviewRow, MenuProvider, MenuRegistry, MenuSpec, MenuStatusSpec,
+    MenuTab,
     registry::{
         APPUI_MCP_MENU_METHODS_ANY, APPUI_METHOD_APPROVAL_SCOPES_CLEAR, APPUI_METHOD_AUTH_LOGOUT,
         APPUI_METHOD_AUTH_ME, APPUI_METHOD_AUTH_SEND_CODE, APPUI_METHOD_AUTH_STATUS,
@@ -177,15 +177,19 @@ fn help_menu(ctx: &MenuContext<'_>) -> MenuSpec {
         .enumerate()
         .map(|(idx, visible)| {
             let command = visible.command;
-            // Commands that take inline arguments COMPLETE into the composer
-            // on Enter (codex's flow: pick `/scrollmode`, type the argument,
-            // Enter again to run). Argument-less commands keep executing /
-            // opening their menu directly.
-            let action = if command.inline_args == crate::menu::types::InlineArgMode::None {
-                action_for_command_entry(&command.entry)
+            // EVERY command completes into the composer on Enter (codex's flow:
+            // pick from the popup, the full `/name` lands in the box, Enter
+            // again runs it). This is uniform across all commands — argful or
+            // not — so behavior is consistent and new commands need no special
+            // wiring. Argful commands get a trailing space (type the arg next);
+            // argument-less ones complete to the exact name so the next Enter
+            // resolves and executes directly.
+            let completed = if command.inline_args == crate::menu::types::InlineArgMode::None {
+                format!("/{}", command.name)
             } else {
-                MenuAction::Local(LocalAction::EditComposer(format!("/{} ", command.name)))
+                format!("/{} ", command.name)
             };
+            let action = MenuAction::Local(LocalAction::EditComposer(completed));
             let mut description = command_description(command.description, command.aliases);
             if command.name == "scrollmode" {
                 // Surface the CURRENT mode so the user knows what a toggle
@@ -5098,15 +5102,6 @@ fn status_cursor_value(status: &crate::model::SessionRuntimeStatus) -> Option<St
         parts.push(detail.into());
     }
     Some(parts.join(" | "))
-}
-
-fn action_for_command_entry(entry: &CommandEntry) -> MenuAction {
-    match entry {
-        CommandEntry::OpenMenu(id) => MenuAction::OpenMenu(id.clone()),
-        CommandEntry::LocalAction(action) => MenuAction::Local(action.clone()),
-        CommandEntry::AppUiAction(_) => MenuAction::Noop,
-        CommandEntry::PromptTemplate(template) => MenuAction::SubmitPrompt((*template).into()),
-    }
 }
 
 fn command_description(description: &str, aliases: &[&str]) -> String {
