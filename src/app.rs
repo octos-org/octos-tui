@@ -192,8 +192,12 @@ fn live_tail_height_with_finalization(
         live_finalization,
     );
     let rows = transcript_visual_rows(&lines, wrap_width) as u16;
-    // Cap the tail so it can't dominate the viewport; the rest is in scrollback.
-    let max_tail = height.saturating_sub(10).clamp(3, 18);
+    // Cap the tail so it can't dominate the viewport; the rest stays in
+    // scrollback. Scale with the terminal (at most half its height) rather than
+    // a fixed 18 — a tall terminal shouldn't strand the live tail at 18 while a
+    // short one over-reserves. The outer `live_ui_height` clamp still guarantees
+    // `LIVE_VIEWPORT_MIN_SCROLLBACK` rows of scrollback remain visible.
+    let max_tail = (height / 2).max(3);
     rows.clamp(0, max_tail)
 }
 
@@ -348,7 +352,22 @@ fn live_tail_lines_with_finalization(
         push_pending_messages_block(&mut lines, palette, &app.pending_messages, wrap_width);
     }
 
+    // Trailing spacer rows inflate the inline viewport height; once the turn
+    // settles and the tail shrinks they become permanent blank rows in the
+    // append-only scrollback (the "scar"). Trimming here shrinks the viewport
+    // to hug real content, and since BOTH the height calc and the render read
+    // this same builder, the two stay in lock-step (no off-by gap).
+    trim_trailing_blank_lines(&mut lines);
+
     lines
+}
+
+/// Drop blank lines from the end of a line set (a line is blank when every
+/// span is whitespace). Interior blanks — paragraph separators — are kept.
+fn trim_trailing_blank_lines(lines: &mut Vec<Line<'static>>) {
+    while lines.last().is_some_and(|line| line_is_blank(Some(line))) {
+        lines.pop();
+    }
 }
 
 /// The finalized transcript lines to push into scrollback: committed
@@ -10731,5 +10750,164 @@ mod tests {
         assert_ne!(fp1, fp2, "appending a message must change the fingerprint");
         assert_eq!(fp1.session_id, fp2.session_id);
         assert_eq!(fp2.message_count, 2);
+    }
+
+    // ===== scrollback scar mitigation (specs/task-scrollback-scar.spec) =====
+
+    fn active_turn_app(reply: &str) -> AppState {
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:scar".into()),
+                title: "scar".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("go")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id,
+                    text: reply.into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+        app
+    }
+
+    #[test]
+    fn live_tail_trims_trailing_blank_rows() {
+        // Direct unit: trailing blanks popped, interior blanks kept.
+        let mut lines = vec![
+            Line::from("a"),
+            Line::from(""),
+            Line::from("b"),
+            Line::from("   "),
+            Line::from(""),
+        ];
+        trim_trailing_blank_lines(&mut lines);
+        assert_eq!(lines.len(), 3);
+        assert!(
+            !line_is_blank(lines.last()),
+            "tail must end on real content"
+        );
+
+        // End-to-end: the live-tail builder never returns a trailing blank.
+        let app = active_turn_app("a streamed answer line");
+        let tail =
+            live_tail_lines_with_finalization(&app, Palette::for_theme(ThemeName::Slate), 80, None);
+        assert!(!tail.is_empty());
+        assert!(
+            !line_is_blank(tail.last()),
+            "live tail must not end on a spacer row (scar source)"
+        );
+    }
+
+    #[test]
+    fn tail_height_cap_scales_with_terminal() {
+        // Blank-separated paragraphs (each its own block) so the content is a
+        // tall stack of rows that overruns any cap — not one wrapped paragraph.
+        let huge = (1..=80)
+            .map(|i| format!("para {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let app = active_turn_app(&huge);
+        let tall = live_tail_height_with_finalization(&app, 80, 50, None);
+        let short = live_tail_height_with_finalization(&app, 80, 24, None);
+        assert!(
+            tall <= 25,
+            "tall cap must not exceed half the terminal: {tall}"
+        );
+        assert_ne!(tall, 18, "cap must no longer be the fixed 18");
+        assert!(
+            tall > short,
+            "the cap scales with terminal height: {tall} vs {short}"
+        );
+    }
+
+    #[test]
+    fn live_ui_height_matches_rendered_tail() {
+        // The height path must reflect exactly the builder the render path uses:
+        // live_tail_height == capped visual rows of live_tail_lines (same source
+        // render reads), so there is no off-by blank gap between them.
+        let app = active_turn_app("one short answer line");
+        let (w, h) = (80u16, 40u16);
+        let wrap = usize::from(w.saturating_sub(2)).max(1);
+        let lines = live_tail_lines_with_finalization(
+            &app,
+            Palette::for_theme(ThemeName::Slate),
+            wrap,
+            None,
+        );
+        let raw_rows = transcript_visual_rows(&lines, wrap) as u16;
+        let cap = (h / 2).max(3);
+        let expected = raw_rows.min(cap);
+        assert_eq!(
+            live_tail_height_with_finalization(&app, w, h, None),
+            expected,
+            "height path must equal capped rows of the shared live-tail builder"
+        );
+    }
+
+    #[test]
+    fn settled_turn_leaves_bounded_blank_rows() {
+        // Active turn → settle: once idle with no live reply, the live tail is
+        // empty (no trailing blanks carried over), so the viewport collapses to
+        // chrome and no fresh blank rows are emitted.
+        let mut app = active_turn_app("answer body");
+        let _ =
+            live_tail_lines_with_finalization(&app, Palette::for_theme(ThemeName::Slate), 80, None);
+        // Settle the turn.
+        app.set_run_state_idle();
+        app.sessions[0].live_reply = None;
+        app.sessions[0]
+            .messages
+            .push(Message::assistant("answer body"));
+
+        let tail =
+            live_tail_lines_with_finalization(&app, Palette::for_theme(ThemeName::Slate), 80, None);
+        assert!(
+            tail.iter().all(|line| line_is_blank(Some(line))) || tail.is_empty(),
+            "a settled turn must not strand content-bearing tail rows: {}",
+            lines_text(&tail)
+        );
+        assert!(
+            !tail.last().is_some_and(|line| line_is_blank(Some(line))),
+            "and never a trailing blank row"
+        );
+    }
+
+    #[test]
+    fn committed_history_stays_in_scrollback() {
+        // Non-pager inline render must not repaint committed history into the
+        // viewport (it lives in native scrollback) — the invariant the scar
+        // mitigation must not regress.
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:scar".into()),
+                title: "scar".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("earlier question"),
+                    Message::assistant("COMMITTED_HISTORY_MARKER reply"),
+                ],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        assert!(!app.transcript_pager_active);
+        let rows = viewport_rows(&app, 80, 24);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("COMMITTED_HISTORY_MARKER")),
+            "committed history must stay in scrollback, not the inline viewport: {rows:#?}"
+        );
     }
 }
