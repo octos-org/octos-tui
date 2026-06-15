@@ -216,6 +216,7 @@ given.
 --readonly / --no-readonly   open as a view-only session, or force read-write
 --theme <name>           codex | claude | slate | solarized | terminal
 --lang en|zh             UI language; falls back to OCTOS_LANG / LANG. Default: en
+--scroll-mode <mode>     native (terminal scrollback, default) | pinned (composer pinned)
 ```
 
 `--endpoint` and `--stdio-command` are mutually exclusive — pick one transport.
@@ -234,9 +235,15 @@ settings loaded by `octos serve`, and the TUI config rejects them.
   "profile_id": "coding",
   "cwd": "/path/to/project",
   "readonly": false,
-  "theme": "codex"
+  "theme": "codex",
+  "lang": "en",
+  "scroll-mode": "native"
 }
 ```
+
+`/saveconfig` writes the active `theme` / `lang` / `scroll-mode` back into this
+file (merging — it never clobbers transport keys like `stdio_command`); without
+`--config` it falls back to `~/.config/octos-tui/config.json`.
 
 ### Themes
 
@@ -258,23 +265,52 @@ c       stage the selected hunk as next-turn context
 ```
 
 ```text
-/help     local slash-command help
-/ps       show local task/process status and focus the Tasks pane
-/stop     interrupt the active turn (or report locally if none is active)
-/setup    reopen the onboarding wizard
-/model    browse the server-returned profile models / catalog
-/theme    switch the TUI palette at runtime (menu, or /theme claude)
-/lang     switch the UI language (menu, or /lang zh) — English / 中文
-/thinking set reasoning effort for thinking models, per session (menu, or /thinking high)
-/onboard  set onboarding fields inline (name, username, email, key, ...)
+/help       local slash-command help
+/ps         show local task/process status and focus the Tasks pane
+/stop       interrupt the active turn (or report locally if none is active)
+/setup      reopen the onboarding wizard
+/model      browse the server-returned profile models / catalog
+/theme      switch the TUI palette at runtime (menu, or /theme claude)
+/lang       switch the UI language (menu, or /lang zh) — English / 中文
+/thinking   set reasoning effort for thinking models, per session (menu, or /thinking high)
+/scrollmode switch wheel-scroll behavior (toggle, or /scrollmode native|pinned)
+/saveconfig persist the active theme / language / scroll-mode to the config file
+/onboard    set onboarding fields inline (name, username, email, key, ...)
 ```
 
 `/model`, `/theme`, `/lang`, and `/thinking` open a selection menu when run with
 no argument (or apply inline with an arg). In every selection menu the **active
 choice is marked with a leading `*`** (distinct from the `>` navigation cursor).
 
+**Slash-command completion is two-step**, like Codex: pick an entry from the `/`
+popup (or type a prefix and press Enter) and the full `/command` lands in the
+composer; press Enter again to run it (or type an argument first). Typing a
+command's exact name and pressing Enter runs it directly. This is uniform for
+every command.
+
 Unknown slash commands are handled locally with a warning and are not sent to
 the model.
+
+### Scrolling and the transcript pager
+
+By default (`native` scroll-mode) the wheel scrolls the terminal's own
+scrollback, so native selection/copy stay intact and the composer scrolls away
+with the screen. Press **Ctrl+T** (or **PageUp**) to open a full-screen
+**transcript pager** where history scrolls in the upper pane while the composer
+stays pinned to the bottom; **Esc** (or Ctrl+T again) closes it.
+
+`--scroll-mode pinned` (or `/scrollmode pinned`) opts into app-side wheel
+handling: the wheel always scrolls the transcript and the composer never moves,
+at the cost of native mouse selection (use Shift+drag). Settled tool-activity
+groups collapse to a one-line summary; **Ctrl+O** expands them.
+
+### Markdown rendering
+
+Assistant replies render markdown live as they stream: headings, lists,
+checkboxes, blockquotes, tables, fenced code blocks with **syntax highlighting**
+(theme-matched, following `/theme`), inline bold/italic/code, `~~strikethrough~~`,
+`---` rules, and `[links](url)`. Link urls render in full so the terminal can
+make them cmd/ctrl+clickable in the native scroll flow.
 
 ### Languages (i18n)
 
