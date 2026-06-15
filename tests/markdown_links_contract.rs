@@ -101,6 +101,22 @@ fn horizontal_rule_renders_divider() {
 }
 
 #[test]
+fn long_url_is_not_truncated() {
+    let long = format!("https://example.com/{}", "segment/".repeat(12));
+    let lines = render(&format!("[doc]({long})"));
+    let joined: String = lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| s.content.to_string())
+        .collect();
+    assert!(
+        joined.contains(&long),
+        "the full url must survive (no truncation) for terminal auto-linkification"
+    );
+    assert!(!joined.contains(" ..."), "no truncation ellipsis");
+}
+
+#[test]
 fn non_link_brackets_render_plain() {
     let palette = Palette::for_theme(ThemeName::Slate);
     let lines = render("just [some brackets] here");

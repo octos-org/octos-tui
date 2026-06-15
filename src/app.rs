@@ -2581,6 +2581,10 @@ fn inline_markdown_spans(
         // Link `[text](url)`: text in the highlight (code) style, url appended
         // dimmed. NOT a real OSC 8 hyperlink — ratatui renders cell-by-cell, so
         // a raw escape would be counted as width and corrupt the layout.
+        // The url is rendered IN FULL and unbroken (no truncation) so the
+        // terminal's native URL detector can linkify it for cmd/ctrl+click in
+        // the native-scrollback flow. (When the link text already IS the url,
+        // we show it once instead of duplicating.)
         if let Some(after_lb) = rest.strip_prefix('[')
             && let Some(mid) = after_lb.find("](")
             && let Some(rel_close) = after_lb[mid + 2..].find(')')
@@ -2588,11 +2592,15 @@ fn inline_markdown_spans(
             let link_text = &after_lb[..mid];
             let url = &after_lb[mid + 2..mid + 2 + rel_close];
             if !link_text.is_empty() && !url.is_empty() {
-                spans.push(Span::styled(link_text.to_string(), code_style));
-                spans.push(Span::styled(
-                    format!(" ({})", truncate_terminal_line(url, 60)),
-                    normal_style.add_modifier(Modifier::DIM),
-                ));
+                if link_text == url {
+                    spans.push(Span::styled(url.to_string(), code_style));
+                } else {
+                    spans.push(Span::styled(link_text.to_string(), code_style));
+                    spans.push(Span::styled(
+                        format!(" ({url})"),
+                        normal_style.add_modifier(Modifier::DIM),
+                    ));
+                }
                 rest = &after_lb[mid + 2 + rel_close + 1..];
                 continue;
             }

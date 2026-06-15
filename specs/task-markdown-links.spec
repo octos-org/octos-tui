@@ -15,7 +15,9 @@ estimate: 0.5d
 
 - 链接 `[text](url)`：在行内扫描循环加分支，链接文字用 accent/selected 色，其后
   追加 ` (url)` 用 muted 色。不走真 OSC8 超链接——ratatui 按 Cell 渲染，原始转义
-  会被计入宽度破坏布局。过长 url 用既有 `truncate_terminal_line` 截断。
+  会被计入宽度破坏布局。url **完整渲染、不截断**，使终端的裸 URL 自动识别能在
+  native-scrollback 流里 linkify（cmd/ctrl+click）；当 link text 本身即 url 时
+  只渲染一次，不重复。
 - 删除线 `~~text~~`：行内加 CROSSED_OUT modifier。
 - 水平分割线：整行 `---` / `***` / `___`（≥3 个、去空白后纯重复符号）在块级
   渲染为一条 muted 横线（仿 `markdown_heading` 加 `markdown_hr` 判定）。
@@ -64,6 +66,12 @@ estimate: 0.5d
   假设 一整行为 ---
   当 渲染该段落
   那么 产出一条 muted 横线行而非字面三连字符
+
+场景: 长 url 完整保留以便终端识别
+  测试: long_url_is_not_truncated
+  假设 正文含一个超过 60 字符的 markdown 链接
+  当 渲染行内 span
+  那么 完整 url 出现在 span 中、不含截断省略号（终端可自动 linkify）
 
 场景: 普通方括号文本不被误判为链接
   测试: non_link_brackets_render_plain
