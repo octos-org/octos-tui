@@ -130,8 +130,13 @@ app:
     list_nav: "j/k or Up/Down"
     composer_send: "Enter send | Tab inspector"
     statusbar_keys: "Tab inspector | Ctrl+O expand"
+    menu: "Menu | j/k move | Enter accept | Esc close"
+    onboarding: "Onboarding | Enter continue | type to edit fields"
+    approval: "Approval | y once | s session | n deny | d diff"
+    user_question: "Question | Up/Down move | Space toggle | Enter submit | Esc hide"
     pager_keys: "Transcript | PgUp/PgDn scroll | Esc or Ctrl+T close"
     pager_reviewing: "Reviewing history ↑ | End latest | Esc close"
+    activity_navigator: "j/k move | / search | f filter | Enter select session | Esc close"
     ctrl_o_collapse: "Ctrl+O collapse"
     ctrl_o_expand: "Ctrl+O expand"
     task_output_modal: "o read more | PgUp/PgDn | Esc close"
@@ -422,6 +427,8 @@ status:
   terminal_title_layout_selected: "Terminal title layout selected: %{items}"
   # Keymap save placeholder
   keymap_save_not_wired: "Keymap save is not wired yet"
+  activity_navigator_opened: "Activity navigator opened"
+  activity_navigator_selected_session: "Selected session: %{title}"
   # Menu field-edit prompt
   edit_field_prompt: "Edit the field, then press Enter"
   # Unimplemented local menu action
@@ -750,6 +757,8 @@ status:
 
 # --- menu chrome + command descriptions (full i18n pass) ---
 command:
+  activity:
+    desc: Search and filter sessions, tasks, and activity.
   agents:
     desc: Inspect or interrupt backend-owned subagents.
   aliases_label: 'Aliases:'

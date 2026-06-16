@@ -120,8 +120,13 @@ app:
     list_nav: "j/k 或 Up/Down"
     composer_send: "Enter 发送 | Tab 检查器"
     statusbar_keys: "Tab 检查器 | Ctrl+O 展开"
+    menu: "菜单 | j/k 移动 | Enter 确认 | Esc 关闭"
+    onboarding: "引导 | Enter 继续 | 输入可编辑字段"
+    approval: "审批 | y 本次 | s 本会话 | n 拒绝 | d 差异"
+    user_question: "问题 | 上/下 移动 | 空格 选择 | Enter 提交 | Esc 隐藏"
     pager_keys: "会话回看 | PgUp/PgDn 滚动 | Esc 或 Ctrl+T 退出"
     pager_reviewing: "回看中 ↑ | End 回到底部 | Esc 退出"
+    activity_navigator: "j/k 移动 | / 搜索 | f 过滤 | Enter 选择会话 | Esc 关闭"
     ctrl_o_collapse: "Ctrl+O 折叠"
     ctrl_o_expand: "Ctrl+O 展开"
     task_output_modal: "o 查看更多 | PgUp/PgDn | Esc 关闭"
@@ -359,6 +364,8 @@ onboarding:
 
 # --- runtime feedback + menu chrome + command descriptions (full i18n pass) ---
 command:
+  activity:
+    desc: 搜索并过滤会话、任务和活动
   agents:
     desc: 查看或中断后端智能体
   aliases_label: 别名：
@@ -875,6 +882,8 @@ status:
   turn_completed_stale: "已忽略 %{title} 中的过期完成轮次"
   edit_field_prompt: 编辑字段后按 Enter 确认
   keymap_save_not_wired: 快捷键保存尚未实现
+  activity_navigator_opened: Activity navigator 已打开
+  activity_navigator_selected_session: 已选择会话：%{title}
   local_action_not_wired: 本地菜单操作 `%{name}` 尚未实现
   no_active_turn: 无活动回合可中断
   readonly_turn_disabled: 只读模式：回合/启动已禁用

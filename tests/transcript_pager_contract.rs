@@ -332,7 +332,10 @@ fn pager_with_empty_transcript_renders_safely() {
     handle_terminal_event(&mut store, key(KeyCode::Char('i')));
     let action = handle_terminal_event(&mut store, key(KeyCode::Enter));
     assert!(
-        matches!(action, KeyAction::Send(AppUiCommand::SubmitPrompt(_))),
+        matches!(
+            action,
+            KeyAction::Send(command) if matches!(*command, AppUiCommand::SubmitPrompt(_))
+        ),
         "the pinned composer must still submit prompts from inside the pager"
     );
 }

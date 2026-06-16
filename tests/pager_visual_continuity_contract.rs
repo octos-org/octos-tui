@@ -3,8 +3,8 @@
 //!
 //! Pinned-mode wheel scrolling enters the pager seamlessly, so the pager must
 //! not flip the screen to the theme surface color ("screen went black") and
-//! must signal the read position in the status row, since the alt-screen has
-//! no native scrollbar.
+//! must signal the read position in the status row and right-side scrollbar
+//! lane, since the alt-screen has no native scrollbar.
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use octos_core::{Message, SessionKey};
@@ -89,6 +89,21 @@ fn status_row(state: &AppState, width: u16, height: u16) -> String {
     (0..width)
         .map(|x| frame.buffer[(x, height - 1)].symbol())
         .collect()
+}
+
+fn scrollbar_lane_symbols(state: &AppState, width: u16, height: u16) -> Vec<String> {
+    let frame = rendered_frame(state, width, height);
+    let layout = app::chat_layout_areas(state, Rect::new(0, 0, width, height));
+    let x = layout.transcript.x + layout.transcript.width - 1;
+    (layout.transcript.y..layout.transcript.y + layout.transcript.height)
+        .map(|y| frame.buffer[(x, y)].symbol().to_string())
+        .collect()
+}
+
+fn scrollbar_thumb_top(state: &AppState, width: u16, height: u16) -> Option<usize> {
+    scrollbar_lane_symbols(state, width, height)
+        .iter()
+        .position(|symbol| symbol == "█")
 }
 
 fn key(code: KeyCode) -> Event {
@@ -183,4 +198,54 @@ fn pager_message_blocks_have_no_span_background() {
             );
         }
     }
+}
+
+#[test]
+fn pager_scrollbar_renders_when_transcript_overflows() {
+    let mut store = chat_store(50);
+    handle_terminal_event(&mut store, ctrl_t());
+    assert!(store.state.transcript_pager_active);
+
+    let lane = scrollbar_lane_symbols(&store.state, 80, 24);
+
+    assert!(
+        lane.iter().any(|symbol| symbol == "│"),
+        "overflowing pager should render a scrollbar track; lane: {lane:?}"
+    );
+    assert!(
+        lane.iter().any(|symbol| symbol == "█"),
+        "overflowing pager should render a scrollbar thumb; lane: {lane:?}"
+    );
+}
+
+#[test]
+fn pager_scrollbar_thumb_moves_when_scrolled_up() {
+    let mut store = chat_store(60);
+    handle_terminal_event(&mut store, ctrl_t());
+    let bottom_top = scrollbar_thumb_top(&store.state, 80, 24).expect("bottom state renders thumb");
+
+    for _ in 0..2 {
+        handle_terminal_event(&mut store, key(KeyCode::PageUp));
+    }
+    assert!(store.state.transcript_scroll > 0);
+    let scrolled_top =
+        scrollbar_thumb_top(&store.state, 80, 24).expect("scrolled state renders thumb");
+
+    assert!(
+        scrolled_top < bottom_top,
+        "scrolling up should move thumb upward; bottom={bottom_top}, scrolled={scrolled_top}"
+    );
+}
+
+#[test]
+fn pager_scrollbar_hidden_without_overflow() {
+    let mut store = chat_store(1);
+    handle_terminal_event(&mut store, ctrl_t());
+
+    let lane = scrollbar_lane_symbols(&store.state, 80, 24);
+
+    assert!(
+        !lane.iter().any(|symbol| symbol == "│" || symbol == "█"),
+        "non-overflowing pager must not draw a scrollbar; lane: {lane:?}"
+    );
 }

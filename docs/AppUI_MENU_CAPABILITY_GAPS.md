@@ -10,87 +10,56 @@ a capability-missing or snapshot-limited state and stop there.
 
 ## Existing AppUI Hooks
 
-Current app-facing commands in `../octos/crates/octos-core/src/app_ui.rs`:
+Current TUI app-facing commands cover the original session/turn/approval/task
+surface plus the menu-backed runtime surface:
 
-- `OpenSession` -> `session/open`
-- `SubmitPrompt` -> `turn/start`
-- `InterruptTurn` -> `turn/interrupt`
-- `RespondApproval` -> `approval/respond`
-- `ListApprovalScopes` -> `approval/scopes/list`
-- `GetDiffPreview` -> `diff/preview/get`
-- `ReadTaskOutput` -> `task/output/read`
+- `config/capabilities/list`
+- `session/status/read`
+- `profile/llm/list`, `profile/llm/select`
+- `permission/profile/list`, `permission/profile/set`
+- `mcp/status/list`
+- `mcp/config/list`, `mcp/config/upsert`, `mcp/config/set_enabled`,
+  `mcp/config/delete`, `mcp/config/test`
+- `tool/status/list`
+- `tool/config/list`, `tool/config/upsert`, `tool/config/set_enabled`,
+  `tool/config/delete`, `tool/config/test`
+- `profile/skills/list`, `profile/skills/install`,
+  `profile/skills/remove`, `profile/skills/registry/search`
 
-Current capability metadata in
-`../octos/crates/octos-core/src/ui_protocol.rs`:
-
-- `UiProtocolCapabilities`
-- `supported_methods`
-- `supported_notifications`
-- `supported_features`
-- `unsupported`
-
-The TUI transport currently requests feature tokens and maps known command
-results, but it does not expose a live capability map to menu providers yet.
-There is also no `AppUiCommand` variant for `config/capabilities/list`.
+`config/capabilities/list` hydrates `UiProtocolCapabilities` into TUI state.
+The registry, exact slash dispatch, help menu, and providers share that
+capability map for gating. `octos-tui doctor --endpoint ...` also probes the
+same method live before falling back to the structural local skew check.
 
 ## Menu Gap Matrix
 
 | Menu | Existing hook usable now | Missing AppUI contract | Provider behavior until added |
 |---|---|---|---|
-| `/model` | None for menu data or mutation. Internal Octos model catalogs/tools exist outside AppUI and must not be used as TUI truth. | `model/list`, `model/select`, and result fields for provider id, display name, supported reasoning efforts, defaults, current selection, and unavailable reason. | Show capability-missing state. Do not build a model list locally. |
-| `/status` | `AppUiSnapshot`; `session/open` / `session/opened` expose session id, active profile id, workspace root, cursor, optional panes. TUI state also has readonly, target, run state, task counts, and `APP_UI_API_V1`. `progress/updated` can carry token/cost updates, but current TUI state only turns them into status/activity text. | `session/status/read` for refreshable authoritative status; `config/capabilities/list` for runtime capability display; explicit fields for current model/provider, usage totals, server version/build, connection state, and replay/cursor health. | Render snapshot-limited status only where data already exists; mark server-owned fields unavailable. |
-| `/permissions` | `approval/respond`; `approval/scopes/list`; typed approval notifications; `permission_denied` errors. These support active approval decisions and inspection of recorded approval scopes. | `permission/profile/list`, `permission/profile/set`, `approval/scopes/clear`, and read fields for approval policy, permission mode/profile, sandbox mode, supported scopes, persisted scopes, and readonly state. | Render Codex-style permission rows for Default, Read Only, Workspace Write, Full Access, network allow/block, and persisted approval scopes. Enable scope refresh when `approval/scopes/list` is advertised; keep profile/network mutations and scope clearing disabled with explicit missing-method reasons until typed AppUI commands exist. |
-| `/mcp` | None through AppUI. MCP clients, server configs, and tool registration exist in `octos-agent`, but are not exposed over `AppUiCommand`. | `mcp/status/list`, `mcp/config/upsert`, `mcp/config/set_enabled`, `mcp/config/delete`, `mcp/config/test`, `tool/config/set_enabled`; result fields for configured servers, per-server state, tools/resources, and last error/status detail. | Show capability-missing state. Do not inspect agent internals or edit JSON from the TUI. |
+| `/model` | `profile/llm/list`, `profile/llm/select`, provider catalog and provider mutation methods. | Richer server fields for supported reasoning efforts, unavailable reasons, and current/default reasoning effort per model. | Render server-provided models only; keep selection disabled unless `profile/llm/select` is advertised and readonly permits mutation. |
+| `/status` | `AppUiSnapshot`, `config/capabilities/list`, `session/status/read`, progress metadata for token/cost/retry state. | Optional server version/build, richer replay/cursor health, and any runtime fields not yet present in `SessionStatusReadResult`. | Render cached snapshot immediately, refresh authoritative status when advertised, and mark absent server-owned fields unavailable. |
+| `/permissions` | `approval/respond`, `approval/scopes/list`, typed approval notifications, `permission/profile/list`, `permission/profile/set`, runtime policy stamps. | `approval/scopes/clear` remains separate from profile selection; richer persisted-scope details may still require server fields. | Render Codex-style permission rows and gate each mutation on advertised methods plus readonly state. |
+| `/mcp` | `mcp/status/list`, `mcp/config/list`, `mcp/config/upsert`, `mcp/config/set_enabled`, `mcp/config/delete`, `mcp/config/test`, `tool/status/list`, `tool/config/list`, `tool/config/set_enabled`, `tool/config/upsert`, `tool/config/delete`, `tool/config/test`. | Optional `mcp/status/refresh` or reload command if the server can make refresh/reload safe and explicit. | Render status/config truth from AppUI only. Do not inspect agent internals or edit profile JSON directly. |
 
 ## Concrete AppUI Follow-Ups
 
-1. Add capability discovery to AppUI:
-   - `config/capabilities/list`
-   - Result should carry `UiProtocolCapabilities` or an app-facing equivalent.
-   - TUI follow-up: store the capability map in menu context so registry,
-     exact slash dispatch, help, and providers share the same gating.
+1. Extend model/status result fields where needed:
+   - model unavailable reasons
+   - supported/default/current reasoning effort
+   - server version/build
+   - explicit replay/cursor health
 
-2. Add model menu contract:
-   - `model/list`
-   - `model/select`
-   - Include model id, display name, provider id, supported reasoning efforts,
-     default reasoning effort, current model, current reasoning effort, and
-     disabled/unavailable reason.
-   - Mutating actions must be blocked in readonly mode.
-
-3. Add status menu contract:
-   - `session/status/read`
-   - Include session id, profile id, cwd/workspace root, server state, current
-     model/provider, token/cost totals, task counts, approval state, AppUI/UI
-     protocol version, server version/build, and replay/cursor health.
-   - Keep current snapshot rendering as a fast first frame, then refresh when
-     the method is advertised.
-
-4. Add permission menu contract:
-   - `permission/profile/list`
-   - `permission/profile/set`
+2. Add persisted approval-scope management if the server supports it:
    - `approval/scopes/clear`
-   - Include approval policy, permission mode/profile, sandbox mode,
-     supported approval scopes, persisted approval scopes, and readonly state.
-   - `approval/scopes/list` can be reused for inspect-only persisted scopes.
+   - richer persisted-scope read fields beyond `approval/scopes/list`
 
-5. Add MCP menu contract:
-   - `mcp/status/list`
-   - `mcp/config/upsert`
-   - `mcp/config/set_enabled`
-   - `mcp/config/delete`
-   - `mcp/config/test`
-   - `tool/config/set_enabled`
-   - Optional `mcp/status/refresh` or reload command only if the server can make
-     refresh/reload safe and explicit.
-   - Include configured MCP servers, transport/status per server, exposed
-     tools/resources, and last error/status detail.
-   - Keep config profile-scoped and server-owned. The TUI must never edit MCP
-     or profile JSON directly.
+3. Consider explicit MCP refresh/reload only if the server can make it safe:
+   - optional `mcp/status/refresh`
+   - optional reload command with clear side-effect semantics
+   - keep config profile-scoped and server-owned
 
 ## Current TUI State
 
-`src/menu/` now contains the menu framework and concrete providers. For
-`/permissions`, the TUI intentionally renders the desired controls before the
-server mutation contract exists, but it keeps those controls disabled instead of
-inventing local permission state.
+`src/menu/` now contains the menu framework and concrete providers. Providers
+use only AppUI snapshots, cached AppUI command results, and advertised
+capabilities. They must continue to render explicit unavailable states rather
+than inventing local truth for server-owned runtime data.

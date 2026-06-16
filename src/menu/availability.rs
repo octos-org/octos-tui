@@ -388,9 +388,7 @@ impl<'a> AvailabilityContext<'a> {
     }
 
     pub fn has_feature_flag(&self, flag: &str) -> bool {
-        self.feature_flags
-            .iter()
-            .any(|candidate| *candidate == flag)
+        self.feature_flags.contains(&flag)
     }
 
     pub fn supports_method(&self, method: &str) -> bool {

@@ -490,6 +490,15 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         // Ordered after the `ps`/`stop`/`help` trio so the unknown-command
         // "Try ..." hint (first 3 visible commands) is unchanged.
         CommandSpec {
+            name: "activity",
+            aliases: &["act"],
+            description: "command.activity.desc",
+            category: CommandCategory::Runtime,
+            availability: CommandAvailability::always(),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::LocalAction(LocalAction::ActivityNavigator),
+        },
+        CommandSpec {
             name: "copy",
             aliases: &["yank"],
             description: "Copy the last assistant reply to your clipboard (works over SSH).",

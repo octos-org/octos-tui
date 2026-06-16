@@ -7,23 +7,29 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use octos_core::{SessionKey, ui_protocol::approval_kinds};
+use octos_core::{
+    Message, SessionKey, TaskId, ui_protocol::TaskRuntimeState, ui_protocol::approval_kinds,
+};
 
 use crate::{
     menu::render as menu_render,
     model::{
-        ActivityItem, ActivityKind, AppState, ApprovalModalState, ArtifactDetailState,
-        ComposerPresentation, DiffPreviewPaneState, FocusPane, PlanStep as RenderedPlanStep,
-        SessionAutonomyState, SessionRunState, SessionView, TaskOutputDetailState,
-        ThreadGraphDetailState, TurnActivityLog, TurnStateDetailState, UserQuestionEntry,
-        UserQuestionPickerState, extract_plan_steps, task_state_label,
+        ActivityItem, ActivityKind, ActivityNavigatorFilter, AppState, ApprovalModalState,
+        ArtifactDetailState, ComposerPresentation, DiffPreviewPaneState, FocusPane,
+        PlanStep as RenderedPlanStep, SessionAutonomyState, SessionRunState, SessionView,
+        TaskOutputDetailState, TaskView, ThreadGraphDetailState, TurnActivityLog,
+        TurnStateDetailState, UserQuestionEntry, UserQuestionPickerState, extract_plan_steps,
+        task_state_label,
     },
     theme::Palette,
     tui_terminal::FrameLike,
 };
 
 pub fn render(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
-    if inspector_visible(app) {
+    if app.activity_navigator.active {
+        render_activity_navigator_overlay(frame, app, palette);
+        return;
+    } else if inspector_visible(app) {
         render_inspector_layout(frame, app, palette);
     } else {
         render_chat_layout(frame, app, palette);
@@ -81,7 +87,8 @@ fn inspector_visible(app: &AppState) -> bool {
 /// rather than the inline-viewport + scrollback chat flow. Mirrors codex using
 /// alt-screen only for transient overlays (transcript pager, resume picker).
 pub fn wants_fullscreen_overlay(app: &AppState) -> bool {
-    inspector_visible(app)
+    app.activity_navigator.active
+        || inspector_visible(app)
         || onboarding_first_launch_active(app)
         || app.transcript_pager_active
         || app.task_output.active
@@ -818,21 +825,721 @@ fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palet
         return;
     }
 
-    let composer_height = composer_height_for_size(app, frame.area().width, frame.area().height);
     let active_menu = active_menu_surface(app);
-    let desired_menu_height = menu_height_hint(
-        active_menu.as_ref(),
-        frame.area().width,
-        frame.area().height,
+    let areas = chat_layout_areas_for_menu(app, frame.area(), active_menu.as_ref());
+
+    if launch_banner_active(app) {
+        render_launch_banner(frame, app, palette, areas.transcript);
+    } else {
+        let transcript = transcript_render_model(app, palette, areas.transcript);
+        let metrics = transcript.metrics;
+        frame.render_widget(transcript.paragraph, areas.transcript);
+        if app.transcript_pager_active {
+            render_pager_scrollbar(frame, metrics, areas.transcript, palette);
+        }
+    }
+    if let Some(menu) = active_menu.as_ref() {
+        menu_render::render_menu_surface(frame, areas.menu, menu, palette);
+    }
+    if areas.autonomy.height > 0 {
+        frame.render_widget(render_autonomy_indicator(app, palette), areas.autonomy);
+    }
+    if areas.harness.height > 0 {
+        render_harness_status_row(frame, app, palette, areas.harness);
+    }
+    frame.render_widget(
+        render_composer(app, palette, areas.composer),
+        areas.composer,
     );
+    set_composer_cursor(frame, app, areas.composer);
+    frame.render_widget(render_status(app, palette), areas.status);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatLayoutAreas {
+    pub transcript: Rect,
+    pub menu: Rect,
+    pub autonomy: Rect,
+    pub harness: Rect,
+    pub composer: Rect,
+    pub status: Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptScrollMetrics {
+    pub visible_rows: usize,
+    pub total_rows: usize,
+    pub scroll_from_bottom: usize,
+    pub max_scroll_from_bottom: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollbarThumb {
+    pub top: u16,
+    pub height: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintBarMode {
+    StatusbarKeys,
+    Menu,
+    Onboarding,
+    Approval,
+    UserQuestion,
+    PagerKeys,
+    PagerReviewing,
+    ActivityNavigator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HintBarModel {
+    pub mode: HintBarMode,
+}
+
+pub fn hint_bar_model(app: &AppState) -> HintBarModel {
+    let mode = if app.activity_navigator.active {
+        HintBarMode::ActivityNavigator
+    } else if app
+        .approval
+        .as_ref()
+        .is_some_and(|approval| approval.visible)
+    {
+        HintBarMode::Approval
+    } else if app
+        .user_question
+        .as_ref()
+        .is_some_and(|question| question.visible)
+    {
+        HintBarMode::UserQuestion
+    } else if onboarding_first_launch_active(app) {
+        HintBarMode::Onboarding
+    } else if app.menu_stack.is_active() {
+        HintBarMode::Menu
+    } else if app.transcript_pager_active && app.transcript_scroll > 0 {
+        HintBarMode::PagerReviewing
+    } else if app.transcript_pager_active {
+        HintBarMode::PagerKeys
+    } else {
+        HintBarMode::StatusbarKeys
+    };
+    HintBarModel { mode }
+}
+
+pub fn scrollbar_thumb(metrics: TranscriptScrollMetrics, track: Rect) -> Option<ScrollbarThumb> {
+    if track.height == 0 || metrics.max_scroll_from_bottom == 0 || metrics.visible_rows == 0 {
+        return None;
+    }
+
+    let track_height = usize::from(track.height);
+    let thumb_height = metrics
+        .visible_rows
+        .saturating_mul(track_height)
+        .div_ceil(metrics.total_rows.max(1))
+        .clamp(1, track_height);
+    let max_top_offset = track_height.saturating_sub(thumb_height);
+    let scrolled_from_top = metrics
+        .max_scroll_from_bottom
+        .saturating_sub(metrics.scroll_from_bottom);
+    let top_offset = if max_top_offset == 0 {
+        0
+    } else {
+        scrolled_from_top
+            .saturating_mul(max_top_offset)
+            .div_ceil(metrics.max_scroll_from_bottom)
+            .min(max_top_offset)
+    };
+
+    Some(ScrollbarThumb {
+        top: track.y.saturating_add(top_offset as u16),
+        height: thumb_height as u16,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityNavigatorRowKind {
+    Session,
+    Message,
+    Orchestration,
+    Task,
+    FileChange,
+    Activity,
+    Approval,
+}
+
+impl ActivityNavigatorRowKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Message => "message",
+            Self::Orchestration => "orchestration",
+            Self::Task => "task",
+            Self::FileChange => "change",
+            Self::Activity => "activity",
+            Self::Approval => "approval",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityNavigatorStatus {
+    Running,
+    Blocked,
+    Failed,
+    Done,
+}
+
+impl ActivityNavigatorStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+            Self::Done => "done",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivityNavigatorCounts {
+    pub all: usize,
+    pub running: usize,
+    pub blocked: usize,
+    pub failed: usize,
+    pub done: usize,
+    pub changes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityNavigatorRow {
+    pub kind: ActivityNavigatorRowKind,
+    pub status: ActivityNavigatorStatus,
+    pub title: String,
+    pub subtitle: String,
+    pub detail_lines: Vec<String>,
+    pub session_id: Option<SessionKey>,
+    pub task_id: Option<TaskId>,
+    pub turn_id: Option<String>,
+    search_text: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ActivityNavigatorRowLinks {
+    session_id: Option<SessionKey>,
+    task_id: Option<TaskId>,
+    turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityNavigatorModel {
+    pub rows: Vec<ActivityNavigatorRow>,
+    pub counts: ActivityNavigatorCounts,
+    pub selected: usize,
+    pub query: String,
+    pub filter: ActivityNavigatorFilter,
+    pub search_active: bool,
+}
+
+impl ActivityNavigatorModel {
+    pub fn selected_row(&self) -> Option<&ActivityNavigatorRow> {
+        self.rows.get(self.selected)
+    }
+}
+
+pub fn activity_navigator_model(app: &AppState) -> ActivityNavigatorModel {
+    let mut rows = activity_navigator_all_rows(app);
+    let query = app.activity_navigator.query.trim().to_ascii_lowercase();
+    if !query.is_empty() {
+        rows.retain(|row| row.search_text.contains(&query));
+    }
+    let counts = activity_navigator_counts(&rows);
+    rows.retain(|row| activity_navigator_filter_matches(app.activity_navigator.filter, row.status));
+    let selected = app
+        .activity_navigator
+        .selected
+        .min(rows.len().saturating_sub(1));
+
+    ActivityNavigatorModel {
+        rows,
+        counts,
+        selected,
+        query: app.activity_navigator.query.clone(),
+        filter: app.activity_navigator.filter,
+        search_active: app.activity_navigator.search_active,
+    }
+}
+
+pub fn selected_activity_navigator_session(app: &AppState) -> Option<SessionKey> {
+    activity_navigator_model(app)
+        .selected_row()
+        .and_then(|row| row.session_id.clone())
+}
+
+fn activity_navigator_filter_matches(
+    filter: ActivityNavigatorFilter,
+    status: ActivityNavigatorStatus,
+) -> bool {
+    match filter {
+        ActivityNavigatorFilter::All => true,
+        ActivityNavigatorFilter::Running => status == ActivityNavigatorStatus::Running,
+        ActivityNavigatorFilter::Blocked => status == ActivityNavigatorStatus::Blocked,
+        ActivityNavigatorFilter::Failed => status == ActivityNavigatorStatus::Failed,
+        ActivityNavigatorFilter::Done => status == ActivityNavigatorStatus::Done,
+    }
+}
+
+fn activity_navigator_counts(rows: &[ActivityNavigatorRow]) -> ActivityNavigatorCounts {
+    let mut counts = ActivityNavigatorCounts {
+        all: rows.len(),
+        ..ActivityNavigatorCounts::default()
+    };
+    for row in rows {
+        match row.status {
+            ActivityNavigatorStatus::Running => counts.running += 1,
+            ActivityNavigatorStatus::Blocked => counts.blocked += 1,
+            ActivityNavigatorStatus::Failed => counts.failed += 1,
+            ActivityNavigatorStatus::Done => counts.done += 1,
+        }
+        if row.kind == ActivityNavigatorRowKind::FileChange {
+            counts.changes += 1;
+        }
+    }
+    counts
+}
+
+fn activity_navigator_all_rows(app: &AppState) -> Vec<ActivityNavigatorRow> {
+    let mut rows = Vec::new();
+    if let Some(row) = activity_navigator_run_state_row(app) {
+        rows.push(row);
+    }
+    if let Some(row) = activity_navigator_approval_row(app) {
+        rows.push(row);
+    }
+    if let Some(row) = activity_navigator_question_row(app) {
+        rows.push(row);
+    }
+
+    for session_idx in activity_navigator_session_order(app) {
+        let Some(session) = app.sessions.get(session_idx) else {
+            continue;
+        };
+        if let Some(orchestration) = app.orchestration.get(&session.id)
+            && orchestration.active
+        {
+            rows.push(activity_navigator_row(
+                ActivityNavigatorRowKind::Orchestration,
+                ActivityNavigatorStatus::Running,
+                session.title.clone(),
+                "orchestration active".to_string(),
+                vec![
+                    format!("session: {}", session.id.0),
+                    format!(
+                        "phase: {}",
+                        orchestration.phase.as_deref().unwrap_or("active")
+                    ),
+                    format!("running agents: {}", orchestration.running_agents),
+                    format!(
+                        "pending continuations: {}",
+                        orchestration.pending_continuations
+                    ),
+                ],
+                ActivityNavigatorRowLinks {
+                    session_id: Some(session.id.clone()),
+                    ..ActivityNavigatorRowLinks::default()
+                },
+            ));
+        }
+        for task in &session.tasks {
+            rows.push(activity_navigator_task_row(session, task));
+        }
+        rows.extend(
+            app.activity
+                .iter()
+                .filter(|item| activity_belongs_to_session(app, item, &session.id))
+                .map(|item| activity_navigator_activity_row(session, item, None)),
+        );
+        for log in app
+            .turn_activity_logs
+            .iter()
+            .filter(|log| log.session_id == session.id)
+        {
+            for item in &log.items {
+                rows.push(activity_navigator_activity_row(
+                    session,
+                    item,
+                    Some(log.turn_id.0.to_string()),
+                ));
+            }
+        }
+        rows.extend(
+            session
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message.role.as_str() != "system")
+                .map(|(idx, message)| activity_navigator_message_row(session, idx, message)),
+        );
+    }
+
+    rows
+}
+
+fn activity_navigator_session_order(app: &AppState) -> Vec<usize> {
+    let mut order = Vec::with_capacity(app.sessions.len());
+    if app.selected_session < app.sessions.len() {
+        order.push(app.selected_session);
+    }
+    order.extend((0..app.sessions.len()).filter(|idx| *idx != app.selected_session));
+    order
+}
+
+fn activity_navigator_run_state_row(app: &AppState) -> Option<ActivityNavigatorRow> {
+    let (status, title) = match &app.run_state {
+        SessionRunState::Idle => return None,
+        SessionRunState::InProgress => (ActivityNavigatorStatus::Running, "session running"),
+        SessionRunState::Blocked { .. } => (ActivityNavigatorStatus::Blocked, "session blocked"),
+        SessionRunState::Success => (ActivityNavigatorStatus::Done, "session done"),
+        SessionRunState::Error { .. } => (ActivityNavigatorStatus::Failed, "session error"),
+    };
+    let session = app.active_session();
+    let detail = app.run_state.detail().unwrap_or(app.status.as_str());
+    Some(activity_navigator_row(
+        ActivityNavigatorRowKind::Session,
+        status,
+        title.to_string(),
+        session
+            .map(|session| session.title.clone())
+            .unwrap_or_else(|| "no active session".to_string()),
+        vec![
+            format!("state: {}", app.run_state.label()),
+            format!("status: {}", app.status),
+            format!("detail: {detail}"),
+        ],
+        ActivityNavigatorRowLinks {
+            session_id: session.map(|session| session.id.clone()),
+            ..ActivityNavigatorRowLinks::default()
+        },
+    ))
+}
+
+fn activity_navigator_approval_row(app: &AppState) -> Option<ActivityNavigatorRow> {
+    let approval = app.approval.as_ref().filter(|approval| approval.visible)?;
+    let session = app.active_session();
+    Some(activity_navigator_row(
+        ActivityNavigatorRowKind::Approval,
+        ActivityNavigatorStatus::Blocked,
+        approval.title.clone(),
+        "approval required".to_string(),
+        vec![
+            format!("tool: {}", approval.tool_name),
+            format!(
+                "kind: {}",
+                approval.approval_kind.as_deref().unwrap_or("unknown")
+            ),
+            format!("body: {}", approval.body),
+        ],
+        ActivityNavigatorRowLinks {
+            session_id: session.map(|session| session.id.clone()),
+            ..ActivityNavigatorRowLinks::default()
+        },
+    ))
+}
+
+fn activity_navigator_question_row(app: &AppState) -> Option<ActivityNavigatorRow> {
+    let question = app
+        .user_question
+        .as_ref()
+        .filter(|question| question.visible)?;
+    let session = app.active_session();
+    Some(activity_navigator_row(
+        ActivityNavigatorRowKind::Approval,
+        ActivityNavigatorStatus::Blocked,
+        question.title.clone(),
+        "question pending".to_string(),
+        vec![
+            format!("question id: {}", question.question_id.0),
+            format!("questions: {}", question.questions.len()),
+        ],
+        ActivityNavigatorRowLinks {
+            session_id: session.map(|session| session.id.clone()),
+            ..ActivityNavigatorRowLinks::default()
+        },
+    ))
+}
+
+fn activity_navigator_message_row(
+    session: &SessionView,
+    idx: usize,
+    message: &Message,
+) -> ActivityNavigatorRow {
+    let role = message.role.as_str();
+    let content = message.content.trim();
+    let title = if content.is_empty() {
+        format!("{role}: empty message")
+    } else {
+        format!(
+            "{role}: {}",
+            truncate_terminal_line(&content.replace('\n', " "), 80)
+        )
+    };
+    let mut detail = vec![
+        format!("session: {}", session.id.0),
+        format!("message: {}", idx + 1),
+        format!("role: {role}"),
+    ];
+    if !content.is_empty() {
+        detail.push("content:".to_string());
+        detail.extend(content.lines().take(10).map(|line| format!("  {line}")));
+    }
+    if let Some(reasoning) = message.reasoning_content.as_deref() {
+        detail.push("reasoning:".to_string());
+        detail.extend(reasoning.lines().take(6).map(|line| format!("  {line}")));
+    }
+    if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+        detail.push(format!("tool call: {tool_call_id}"));
+    }
+
+    activity_navigator_row(
+        ActivityNavigatorRowKind::Message,
+        ActivityNavigatorStatus::Done,
+        title,
+        format!("{} · message {}", session.title, idx + 1),
+        detail,
+        ActivityNavigatorRowLinks {
+            session_id: Some(session.id.clone()),
+            ..ActivityNavigatorRowLinks::default()
+        },
+    )
+}
+
+fn activity_navigator_task_row(session: &SessionView, task: &TaskView) -> ActivityNavigatorRow {
+    let status = match task.state {
+        TaskRuntimeState::Pending | TaskRuntimeState::Running => ActivityNavigatorStatus::Running,
+        TaskRuntimeState::Completed => ActivityNavigatorStatus::Done,
+        TaskRuntimeState::Failed | TaskRuntimeState::Cancelled => ActivityNavigatorStatus::Failed,
+    };
+    let mut detail = vec![
+        format!("session: {}", session.id.0),
+        format!("task: {}", task.id.0),
+        format!("state: {}", task_state_label(task.state)),
+    ];
+    if let Some(runtime_detail) = task.runtime_detail.as_ref() {
+        detail.push(format!("detail: {runtime_detail}"));
+    }
+    if !task.output_tail.trim().is_empty() {
+        detail.push("output tail:".to_string());
+        detail.extend(
+            task.output_tail
+                .lines()
+                .take(8)
+                .map(|line| format!("  {line}")),
+        );
+    }
+
+    activity_navigator_row(
+        ActivityNavigatorRowKind::Task,
+        status,
+        task.title.clone(),
+        format!("{} · {}", session.title, task_state_label(task.state)),
+        detail,
+        ActivityNavigatorRowLinks {
+            session_id: Some(session.id.clone()),
+            task_id: Some(task.id.clone()),
+            turn_id: task.turn_id.as_ref().map(|turn| turn.0.to_string()),
+        },
+    )
+}
+
+fn activity_navigator_activity_row(
+    session: &SessionView,
+    item: &ActivityItem,
+    archived_turn_id: Option<String>,
+) -> ActivityNavigatorRow {
+    if let Some(mutation) = FileMutationActivity::from_item(item) {
+        return activity_navigator_file_change_row(session, item, mutation, archived_turn_id);
+    }
+
+    let status = activity_navigator_activity_status(item);
+    let turn_id = archived_turn_id.or_else(|| item.turn_id.as_ref().map(|turn| turn.0.to_string()));
+    let mut detail = vec![
+        format!("session: {}", session.id.0),
+        format!("kind: {}", item.kind.label()),
+        format!("status: {}", item.status),
+    ];
+    if let Some(turn_id) = turn_id.as_ref() {
+        detail.push(format!("turn: {turn_id}"));
+    }
+    if let Some(tool_call_id) = item.tool_call_id.as_ref() {
+        detail.push(format!("tool call: {tool_call_id}"));
+    }
+    if let Some(item_detail) = item.detail.as_ref() {
+        detail.push(format!("detail: {item_detail}"));
+    }
+    if let Some(output) = item
+        .output_preview
+        .as_ref()
+        .filter(|output| !output.is_empty())
+    {
+        detail.push("output preview:".to_string());
+        detail.extend(output.lines().take(8).map(|line| format!("  {line}")));
+    }
+
+    activity_navigator_row(
+        ActivityNavigatorRowKind::Activity,
+        status,
+        item.title.clone(),
+        format!("{} · {}", session.title, item.status),
+        detail,
+        ActivityNavigatorRowLinks {
+            session_id: Some(session.id.clone()),
+            task_id: None,
+            turn_id,
+        },
+    )
+}
+
+fn activity_navigator_file_change_row(
+    session: &SessionView,
+    item: &ActivityItem,
+    mutation: FileMutationActivity,
+    archived_turn_id: Option<String>,
+) -> ActivityNavigatorRow {
+    let status = activity_navigator_activity_status(item);
+    let turn_id = archived_turn_id.or_else(|| item.turn_id.as_ref().map(|turn| turn.0.to_string()));
+    let badge = diff_file_type_badge(&mutation.path);
+    let preview = if mutation.preview_ready {
+        "diff preview ready"
+    } else {
+        "diff preview pending"
+    };
+    let mut detail = vec![
+        format!("session: {}", session.id.0),
+        format!("file: {}", mutation.path),
+        format!("type: {badge}"),
+        format!("operation: {}", mutation.operation),
+        format!("preview: {preview}"),
+        format!("status: {}", item.status),
+    ];
+    if let Some(turn_id) = turn_id.as_ref() {
+        detail.push(format!("turn: {turn_id}"));
+    }
+    if let Some(item_detail) = item.detail.as_ref() {
+        detail.push(format!("detail: {item_detail}"));
+    }
+
+    activity_navigator_row(
+        ActivityNavigatorRowKind::FileChange,
+        status,
+        format!(
+            "{badge} {} {}",
+            mutation.operation,
+            compact_file_path(&mutation.path)
+        ),
+        format!("{badge} · {} · {preview}", mutation.operation),
+        detail,
+        ActivityNavigatorRowLinks {
+            session_id: Some(session.id.clone()),
+            task_id: None,
+            turn_id,
+        },
+    )
+}
+
+fn activity_navigator_activity_status(item: &ActivityItem) -> ActivityNavigatorStatus {
+    let status = item.status.to_ascii_lowercase();
+    if item.kind == ActivityKind::Approval {
+        ActivityNavigatorStatus::Blocked
+    } else if item.kind == ActivityKind::Error
+        || item.success == Some(false)
+        || matches!(
+            status.as_str(),
+            "failed" | "error" | "cancelled" | "canceled"
+        )
+    {
+        ActivityNavigatorStatus::Failed
+    } else if crate::model::activity_status_is_running(&item.status) {
+        ActivityNavigatorStatus::Running
+    } else {
+        ActivityNavigatorStatus::Done
+    }
+}
+
+fn activity_belongs_to_session(
+    app: &AppState,
+    item: &ActivityItem,
+    session_id: &SessionKey,
+) -> bool {
+    if item.session_id.as_ref() == Some(session_id) {
+        return true;
+    }
+    if let Some(turn_id) = item.turn_id.as_ref() {
+        return app
+            .turn_activity_logs
+            .iter()
+            .any(|log| &log.session_id == session_id && log.turn_id == *turn_id)
+            || app
+                .active_session()
+                .is_some_and(|session| &session.id == session_id);
+    }
+    app.active_session()
+        .is_some_and(|session| &session.id == session_id)
+}
+
+fn activity_navigator_row(
+    kind: ActivityNavigatorRowKind,
+    status: ActivityNavigatorStatus,
+    title: String,
+    subtitle: String,
+    detail_lines: Vec<String>,
+    links: ActivityNavigatorRowLinks,
+) -> ActivityNavigatorRow {
+    let mut search_text = format!("{} {} {} {}", kind.label(), status.label(), title, subtitle);
+    for detail in &detail_lines {
+        search_text.push(' ');
+        search_text.push_str(detail);
+    }
+    if let Some(session_id) = links.session_id.as_ref() {
+        search_text.push(' ');
+        search_text.push_str(&session_id.0);
+    }
+    if let Some(task_id) = links.task_id.as_ref() {
+        search_text.push(' ');
+        search_text.push_str(&task_id.0.to_string());
+    }
+    if let Some(turn_id) = links.turn_id.as_ref() {
+        search_text.push(' ');
+        search_text.push_str(turn_id);
+    }
+    search_text = search_text.to_ascii_lowercase();
+
+    ActivityNavigatorRow {
+        kind,
+        status,
+        title,
+        subtitle,
+        detail_lines,
+        session_id: links.session_id,
+        task_id: links.task_id,
+        turn_id: links.turn_id,
+        search_text: search_text.to_ascii_lowercase(),
+    }
+}
+
+pub fn chat_layout_areas(app: &AppState, area: Rect) -> ChatLayoutAreas {
+    let active_menu = active_menu_surface(app);
+    chat_layout_areas_for_menu(app, area, active_menu.as_ref())
+}
+
+fn chat_layout_areas_for_menu(
+    app: &AppState,
+    area: Rect,
+    active_menu: Option<&menu_render::MenuSurface>,
+) -> ChatLayoutAreas {
+    let composer_height = composer_height_for_size(app, area.width, area.height);
+    let desired_menu_height = menu_height_hint(active_menu, area.width, area.height);
     let autonomy_height = autonomy_indicator_height(app);
     let harness_height = harness_status_height(app);
-    let surface_budget = frame.area().height.saturating_sub(
-        min_transcript_height(frame.area().height)
-            + composer_height
-            + autonomy_height
-            + harness_height
-            + 1,
+    let surface_budget = area.height.saturating_sub(
+        min_transcript_height(area.height) + composer_height + autonomy_height + harness_height + 1,
     );
     let menu_height = desired_menu_height.min(surface_budget);
     let root = Layout::default()
@@ -845,25 +1552,16 @@ fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palet
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
-        .split(frame.area());
+        .split(area);
 
-    if launch_banner_active(app) {
-        render_launch_banner(frame, app, palette, root[0]);
-    } else {
-        frame.render_widget(render_transcript(app, palette, root[0]), root[0]);
+    ChatLayoutAreas {
+        transcript: root[0],
+        menu: root[1],
+        autonomy: root[2],
+        harness: root[3],
+        composer: root[4],
+        status: root[5],
     }
-    if let Some(menu) = active_menu.as_ref() {
-        menu_render::render_menu_surface(frame, root[1], menu, palette);
-    }
-    if autonomy_height > 0 {
-        frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
-    }
-    if harness_height > 0 {
-        render_harness_status_row(frame, app, palette, root[3]);
-    }
-    frame.render_widget(render_composer(app, palette, root[4]), root[4]);
-    set_composer_cursor(frame, app, root[4]);
-    frame.render_widget(render_status(app, palette), root[5]);
 }
 
 /// OCTOS figlet wordmark shown in the MAIN window on the first-launch
@@ -1104,6 +1802,206 @@ fn render_inspector_layout(frame: &mut impl FrameLike, app: &AppState, palette: 
     frame.render_widget(render_composer(app, palette, root[4]), root[4]);
     set_composer_cursor(frame, app, root[4]);
     frame.render_widget(render_status(app, palette), root[5]);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivityNavigatorAreas {
+    pub toolbar: Rect,
+    pub list: Rect,
+    pub detail: Rect,
+    pub hint: Rect,
+}
+
+pub fn activity_navigator_areas(area: Rect) -> ActivityNavigatorAreas {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(vertical[1]);
+
+    ActivityNavigatorAreas {
+        toolbar: vertical[0],
+        list: body[0],
+        detail: body[1],
+        hint: vertical[2],
+    }
+}
+
+fn render_activity_navigator_overlay(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
+    let areas = activity_navigator_areas(frame.area());
+    let model = activity_navigator_model(app);
+    frame.render_widget(Clear, frame.area());
+    frame.render_widget(
+        render_activity_navigator_toolbar(&model, palette),
+        areas.toolbar,
+    );
+    frame.render_widget(render_activity_navigator_list(&model, palette), areas.list);
+    frame.render_widget(
+        render_activity_navigator_detail(&model, palette),
+        areas.detail,
+    );
+    frame.render_widget(
+        Paragraph::new(hint_bar_text(HintBarModel {
+            mode: HintBarMode::ActivityNavigator,
+        }))
+        .style(Style::default().fg(palette.text).bg(palette.surface_alt)),
+        areas.hint,
+    );
+}
+
+fn render_activity_navigator_toolbar(
+    model: &ActivityNavigatorModel,
+    palette: Palette,
+) -> Paragraph<'static> {
+    let search_label = if model.search_active {
+        "search*: "
+    } else {
+        "query: "
+    };
+    let query = if model.query.is_empty() {
+        "(empty)".to_string()
+    } else {
+        model.query.clone()
+    };
+    let counts = format!(
+        "all {} | changes {} | running {} | blocked {} | failed {} | done {}",
+        model.counts.all,
+        model.counts.changes,
+        model.counts.running,
+        model.counts.blocked,
+        model.counts.failed,
+        model.counts.done
+    );
+    Paragraph::new(Text::from(vec![
+        Line::from(vec![
+            Span::styled("Activity", palette.title()),
+            Span::styled(" navigator", palette.text()),
+            Span::styled(
+                format!("  filter: {}", model.filter.label()),
+                palette.muted(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(search_label, palette.muted()),
+            Span::styled(query, palette.text()),
+            Span::styled("  |  ", palette.muted()),
+            Span::styled(counts, palette.muted()),
+        ]),
+    ]))
+    .block(Block::default().style(Style::default().bg(palette.surface_alt)))
+}
+
+fn render_activity_navigator_list(
+    model: &ActivityNavigatorModel,
+    palette: Palette,
+) -> List<'static> {
+    let items = if model.rows.is_empty() {
+        let detail = if model.query.trim().is_empty() {
+            format!("filter: {}", model.filter.label())
+        } else {
+            format!("query: {}  filter: {}", model.query, model.filter.label())
+        };
+        vec![ListItem::new(Text::from(vec![
+            Line::from(Span::styled("No activity rows match", palette.muted())),
+            Line::from(Span::styled(detail, palette.muted())),
+        ]))]
+    } else {
+        model
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                let selected = idx == model.selected;
+                let style = if selected {
+                    palette.selected()
+                } else {
+                    palette.text()
+                };
+                let marker = if selected { "›" } else { " " };
+                let kind_style = if row.kind == ActivityNavigatorRowKind::FileChange {
+                    palette.selected()
+                } else {
+                    palette.muted()
+                };
+                ListItem::new(Text::from(vec![
+                    Line::from(vec![
+                        Span::styled(format!("{marker} "), style),
+                        Span::styled(
+                            format!("[{}] ", row.status.label()),
+                            status_style(row.status, palette),
+                        ),
+                        Span::styled(row.title.clone(), style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  ", palette.muted()),
+                        Span::styled(row.kind.label(), kind_style),
+                        Span::styled(" · ", palette.muted()),
+                        Span::styled(row.subtitle.clone(), palette.muted()),
+                    ]),
+                ]))
+            })
+            .collect()
+    };
+
+    List::new(items).block(
+        titled_block(
+            "Results".to_string(),
+            palette,
+            true,
+            Some("j/k".to_string()),
+        )
+        .border_style(palette.border()),
+    )
+}
+
+fn render_activity_navigator_detail(
+    model: &ActivityNavigatorModel,
+    palette: Palette,
+) -> Paragraph<'static> {
+    let lines = if let Some(row) = model.selected_row() {
+        let mut lines = vec![
+            Line::from(Span::styled(row.title.clone(), palette.title())),
+            Line::from(vec![
+                Span::styled(row.kind.label(), palette.muted()),
+                Span::styled(" · ", palette.muted()),
+                Span::styled(row.status.label(), status_style(row.status, palette)),
+            ]),
+            Line::from(Span::raw("")),
+        ];
+        lines.extend(
+            row.detail_lines
+                .iter()
+                .map(|line| Line::from(Span::styled(line.clone(), palette.text()))),
+        );
+        lines
+    } else {
+        vec![Line::from(Span::styled(
+            "No activity selected",
+            palette.muted(),
+        ))]
+    };
+
+    Paragraph::new(Text::from(lines))
+        .block(
+            titled_block("Detail".to_string(), palette, false, None).border_style(palette.border()),
+        )
+        .wrap(Wrap { trim: false })
+}
+
+fn status_style(status: ActivityNavigatorStatus, palette: Palette) -> Style {
+    match status {
+        ActivityNavigatorStatus::Running => palette.selected(),
+        ActivityNavigatorStatus::Blocked => Style::default().fg(palette.highlight),
+        ActivityNavigatorStatus::Failed => Style::default().fg(palette.danger),
+        ActivityNavigatorStatus::Done => Style::default().fg(palette.success),
+    }
 }
 
 fn active_menu_surface(app: &AppState) -> Option<menu_render::MenuSurface> {
@@ -1507,7 +2405,16 @@ fn render_launch_banner(frame: &mut impl FrameLike, app: &AppState, palette: Pal
     frame.render_widget(Paragraph::new(Text::from(lines)), banner_area);
 }
 
+struct TranscriptRenderModel {
+    paragraph: Paragraph<'static>,
+    metrics: TranscriptScrollMetrics,
+}
+
 fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
+    transcript_render_model(app, palette, area).paragraph
+}
+
+fn transcript_render_model(app: &AppState, palette: Palette, area: Rect) -> TranscriptRenderModel {
     let mut lines = Vec::new();
     let mut approval_context_start = None;
     let wrap_width = transcript_wrap_width(area);
@@ -1583,6 +2490,12 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
     let total_rows = transcript_visual_rows(&lines, wrap_width);
     let max_scroll = total_rows.saturating_sub(visible_height);
     let scroll_from_bottom = app.transcript_scroll.min(max_scroll);
+    let metrics = TranscriptScrollMetrics {
+        visible_rows: visible_height,
+        total_rows,
+        scroll_from_bottom,
+        max_scroll_from_bottom: max_scroll,
+    };
     let mut scroll_top = max_scroll.saturating_sub(scroll_from_bottom);
     if scroll_from_bottom == 0
         && let Some(context_start) = approval_context_start
@@ -1617,14 +2530,60 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
         Style::default().fg(palette.text).bg(palette.surface_alt)
     };
 
-    Paragraph::new(Text::from(lines))
+    let paragraph = Paragraph::new(Text::from(lines))
         .block(
             Block::default()
                 .style(block_style)
                 .border_style(palette.border()),
         )
         .scroll((scroll_top, 0))
-        .wrap(Wrap { trim: false })
+        .wrap(Wrap { trim: false });
+
+    TranscriptRenderModel { paragraph, metrics }
+}
+
+const PAGER_SCROLLBAR_TRACK: &str = "│";
+const PAGER_SCROLLBAR_THUMB: &str = "█";
+
+fn render_pager_scrollbar(
+    frame: &mut impl FrameLike,
+    metrics: TranscriptScrollMetrics,
+    area: Rect,
+    palette: Palette,
+) {
+    let Some(track) = pager_scrollbar_track(area) else {
+        return;
+    };
+    let Some(thumb) = scrollbar_thumb(metrics, track) else {
+        return;
+    };
+
+    let buffer = frame.buffer_mut();
+    let thumb_bottom = thumb.top.saturating_add(thumb.height);
+    for y in track.y..track.y.saturating_add(track.height) {
+        let in_thumb = y >= thumb.top && y < thumb_bottom;
+        let cell = &mut buffer[(track.x, y)];
+        if in_thumb {
+            cell.set_symbol(PAGER_SCROLLBAR_THUMB);
+            cell.set_style(palette.title());
+        } else {
+            cell.set_symbol(PAGER_SCROLLBAR_TRACK);
+            cell.set_style(palette.muted());
+        }
+    }
+}
+
+fn pager_scrollbar_track(area: Rect) -> Option<Rect> {
+    if area.width < 2 || area.height == 0 {
+        return None;
+    }
+
+    Some(Rect::new(
+        area.x + area.width.saturating_sub(1),
+        area.y,
+        1,
+        area.height,
+    ))
 }
 
 fn transcript_visible_height(area: Rect) -> usize {
@@ -1942,6 +2901,12 @@ fn push_code_block_lines(
     body: &[String],
     complete: bool,
 ) {
+    if code_block_is_unified_diff(language, body) {
+        retitle_last_code_block_header_as_diff(lines);
+        push_unified_diff_code_block_lines(lines, palette, indent, bg, body);
+        return;
+    }
+
     let rendered = crate::highlight::highlight_block(
         language,
         body,
@@ -1955,6 +2920,146 @@ fn push_code_block_lines(
             Span::styled("│ ", style_bg(palette.border(), bg)),
         ];
         spans.extend(row.iter().cloned());
+        lines.push(chat_line(spans, bg));
+    }
+}
+
+fn code_block_is_unified_diff(language: &str, body: &[String]) -> bool {
+    let language = language.trim().to_ascii_lowercase();
+    if matches!(
+        language.as_str(),
+        "diff" | "patch" | "udiff" | "unidiff" | "gitdiff"
+    ) {
+        return true;
+    }
+
+    if !language.is_empty() && language != "code" {
+        return false;
+    }
+
+    let mut has_hunk_or_file_header = false;
+    let mut has_added = false;
+    let mut has_removed = false;
+
+    for line in body {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("@@")
+            || trimmed.starts_with("diff --git")
+            || trimmed.starts_with("index ")
+            || trimmed.starts_with("--- ")
+            || trimmed.starts_with("+++ ")
+        {
+            has_hunk_or_file_header = true;
+        }
+        if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
+            has_added = true;
+        } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {
+            has_removed = true;
+        }
+    }
+
+    has_hunk_or_file_header && (has_added || has_removed)
+}
+
+fn retitle_last_code_block_header_as_diff(lines: &mut [Line<'static>]) {
+    let Some(line) = lines.last_mut() else {
+        return;
+    };
+    let Some(label) = line.spans.last_mut() else {
+        return;
+    };
+    if label.content.as_ref() == "code" {
+        label.content = "diff".into();
+    }
+}
+
+fn push_unified_diff_code_block_lines(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    indent: &'static str,
+    bg: Option<Color>,
+    body: &[String],
+) {
+    for raw_line in body {
+        let line = raw_line.trim_end_matches(['\r', '\n']);
+        let mut spans = vec![
+            Span::styled(indent, style_bg(palette.border(), bg)),
+            Span::styled("│ ", style_bg(palette.border(), bg)),
+        ];
+
+        if line.starts_with("@@") {
+            spans.push(Span::styled(
+                line.to_string(),
+                diff_hunk_style(palette).remove_modifier(Modifier::BOLD),
+            ));
+            lines.push(chat_line(spans, bg));
+            continue;
+        }
+
+        if line.starts_with("+++ ") {
+            spans.push(Span::styled(
+                line.to_string(),
+                Style::default()
+                    .fg(palette.success)
+                    .bg(palette.success_bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            lines.push(chat_line(spans, bg));
+            continue;
+        }
+
+        if line.starts_with("--- ") {
+            spans.push(Span::styled(
+                line.to_string(),
+                Style::default()
+                    .fg(palette.danger)
+                    .bg(palette.danger_bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            lines.push(chat_line(spans, bg));
+            continue;
+        }
+
+        if line.starts_with("diff --git") || line.starts_with("index ") {
+            spans.push(Span::styled(
+                line.to_string(),
+                style_bg(palette.selected().add_modifier(Modifier::BOLD), bg),
+            ));
+            lines.push(chat_line(spans, bg));
+            continue;
+        }
+
+        if let Some(content) = line.strip_prefix('+') {
+            spans.push(Span::styled("+ ", diff_line_marker_style("added", palette)));
+            spans.push(Span::styled(
+                content.to_string(),
+                diff_line_style("added", palette),
+            ));
+        } else if let Some(content) = line.strip_prefix('-') {
+            spans.push(Span::styled(
+                "- ",
+                diff_line_marker_style("removed", palette),
+            ));
+            spans.push(Span::styled(
+                content.to_string(),
+                diff_line_style("removed", palette),
+            ));
+        } else if let Some(content) = line.strip_prefix(' ') {
+            spans.push(Span::styled(
+                "  ",
+                diff_line_gutter_style("context", palette),
+            ));
+            spans.push(Span::styled(
+                content.to_string(),
+                diff_line_style("context", palette),
+            ));
+        } else {
+            spans.push(Span::styled(
+                line.to_string(),
+                style_bg(palette.muted(), bg),
+            ));
+        }
+
         lines.push(chat_line(spans, bg));
     }
 }
@@ -3848,15 +4953,20 @@ fn push_inline_diff_preview(
             ]));
         }
 
-        for (file_idx, file) in preview.files.iter().take(1).enumerate() {
-            push_diff_file_lines(
-                lines,
-                palette,
-                file_idx,
-                diff.selected_file,
-                diff.selected_hunk,
-                file,
-            );
+        if !preview.files.is_empty() {
+            let file_idx = diff
+                .selected_file
+                .min(preview.files.len().saturating_sub(1));
+            if let Some(file) = preview.files.get(file_idx) {
+                push_diff_file_lines(
+                    lines,
+                    palette,
+                    file_idx,
+                    diff.selected_file,
+                    diff.selected_hunk,
+                    file,
+                );
+            }
         }
         if preview.files.len() > 1 {
             lines.push(Line::from(vec![
@@ -3901,13 +5011,23 @@ fn push_diff_file_lines(
         Some(old_path) if old_path != &file.path => format!("{old_path} -> {}", file.path),
         _ => file.path.clone(),
     };
+    let (added, removed) = diff_file_line_counts(file);
+    let badge = diff_file_type_badge(&file.path);
     lines.push(Line::from(vec![
         Span::styled("    ", palette.muted()),
+        Span::styled(
+            format!(" {badge:<5} "),
+            diff_file_badge_style(badge, palette),
+        ),
+        Span::styled(" ", palette.muted()),
         Span::styled(
             file.status.clone(),
             diff_file_status_style(&file.status, palette),
         ),
         Span::styled("  ", palette.muted()),
+        Span::styled(format!("+{added} "), Style::default().fg(palette.success)),
+        Span::styled(format!("-{removed} "), Style::default().fg(palette.danger)),
+        Span::styled(" ", palette.muted()),
         Span::styled(path, palette.text().add_modifier(Modifier::BOLD)),
     ]));
 
@@ -3921,9 +5041,20 @@ fn push_diff_file_lines(
         ]));
     }
 
-    for (hunk_idx, hunk) in file.hunks.iter().take(1).enumerate() {
+    let hunk_idx = selected_hunk.min(file.hunks.len().saturating_sub(1));
+    if hunk_idx > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("    ", palette.muted()),
+            Span::styled(
+                t!("app.diff.more_hunks_hidden", count = hunk_idx).into_owned(),
+                palette.muted(),
+            ),
+        ]));
+    }
+    for (rendered_hunk_idx, hunk) in file.hunks.iter().enumerate().skip(hunk_idx).take(1) {
+        let hunk_idx = rendered_hunk_idx;
         let selected = file_idx == selected_file && hunk_idx == selected_hunk;
-        let marker = if selected { "  › " } else { "    " };
+        let marker = if selected { "  › " } else { "  ├ " };
         lines.push(Line::from(vec![
             Span::styled(marker, palette.selected()),
             Span::styled(hunk.header.clone(), diff_hunk_style(palette)),
@@ -3959,14 +5090,66 @@ fn push_diff_file_lines(
         }
     }
     if file.hunks.len() > 1 {
+        let hidden_after = file.hunks.len().saturating_sub(hunk_idx.saturating_add(1));
+        if hidden_after == 0 {
+            return;
+        }
         lines.push(Line::from(vec![
             Span::styled("    ", palette.muted()),
             Span::styled(
-                t!("app.diff.more_hunks_hidden", count = file.hunks.len() - 1).into_owned(),
+                t!("app.diff.more_hunks_hidden", count = hidden_after).into_owned(),
                 palette.muted(),
             ),
         ]));
     }
+}
+
+fn diff_file_line_counts(file: &crate::model::DiffPreviewFile) -> (usize, usize) {
+    file.hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .fold((0, 0), |(added, removed), line| match line.kind.as_str() {
+            "added" | "insert" | "inserted" => (added + 1, removed),
+            "removed" | "delete" | "deleted" => (added, removed + 1),
+            _ => (added, removed),
+        })
+}
+
+fn diff_file_type_badge(path: &str) -> &'static str {
+    let extension = path
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "rs" => "RUST",
+        "toml" => "TOML",
+        "json" => "JSON",
+        "yaml" | "yml" => "YAML",
+        "md" | "markdown" => "MD",
+        "js" | "jsx" => "JS",
+        "ts" | "tsx" => "TS",
+        "css" | "scss" | "sass" => "CSS",
+        "html" | "htm" => "HTML",
+        "sh" | "bash" | "zsh" => "SH",
+        "py" => "PY",
+        _ => "FILE",
+    }
+}
+
+fn diff_file_badge_style(badge: &str, palette: Palette) -> Style {
+    let fg = match badge {
+        "RUST" => palette.danger,
+        "TOML" | "JSON" | "YAML" => palette.highlight,
+        "MD" => palette.text,
+        "JS" | "TS" => palette.accent,
+        "CSS" | "HTML" => palette.accent,
+        "SH" | "PY" => palette.success,
+        _ => palette.muted,
+    };
+    Style::default()
+        .fg(fg)
+        .bg(palette.diff_context_bg)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn shell_command_from_line(line: &str) -> Option<&str> {
@@ -5161,16 +6344,7 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
         })
         .unwrap_or_else(|| t!("app.status.no_session").to_string());
     let work = status_bar_work_text(app);
-    // The pager has no native scrollbar (alt-screen has no terminal
-    // scrollback), so the hint doubles as the position indicator: scrolled up
-    // → "reviewing" with the way back; at the bottom → the plain key hints.
-    let key_hint = if app.transcript_pager_active && app.transcript_scroll > 0 {
-        t!("app.hint.pager_reviewing").into_owned()
-    } else if app.transcript_pager_active {
-        t!("app.hint.pager_keys").into_owned()
-    } else {
-        t!("app.hint.statusbar_keys").into_owned()
-    };
+    let key_hint = hint_bar_text(hint_bar_model(app));
 
     Paragraph::new(Line::from(vec![
         Span::styled(
@@ -5206,6 +6380,19 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
         Span::styled(key_hint, palette.selected().bg(palette.surface_alt)),
     ]))
     .style(Style::default().fg(palette.text).bg(palette.surface_alt))
+}
+
+fn hint_bar_text(model: HintBarModel) -> String {
+    match model.mode {
+        HintBarMode::StatusbarKeys => t!("app.hint.statusbar_keys").into_owned(),
+        HintBarMode::Menu => t!("app.hint.menu").into_owned(),
+        HintBarMode::Onboarding => t!("app.hint.onboarding").into_owned(),
+        HintBarMode::Approval => t!("app.hint.approval").into_owned(),
+        HintBarMode::UserQuestion => t!("app.hint.user_question").into_owned(),
+        HintBarMode::PagerKeys => t!("app.hint.pager_keys").into_owned(),
+        HintBarMode::PagerReviewing => t!("app.hint.pager_reviewing").into_owned(),
+        HintBarMode::ActivityNavigator => t!("app.hint.activity_navigator").into_owned(),
+    }
 }
 
 fn status_bar_work_text(app: &AppState) -> String {
@@ -5855,7 +7042,9 @@ mod tests {
     };
     use octos_core::{
         Message, SessionKey,
-        ui_protocol::{ApprovalId, PreviewId, TaskRuntimeState, TurnId, UiProtocolCapabilities},
+        ui_protocol::{
+            ApprovalId, PreviewId, QuestionId, TaskRuntimeState, TurnId, UiProtocolCapabilities,
+        },
     };
     use ratatui::{
         Terminal,
@@ -7174,7 +8363,7 @@ mod tests {
             .map(|i| format!("Col{i}"))
             .collect::<Vec<_>>()
             .join(" | ");
-        let sep = vec!["---"; 8].join("|");
+        let sep = ["---"; 8].join("|");
         let row = (1..=8)
             .map(|i| format!("value {i} text"))
             .collect::<Vec<_>>()
@@ -7284,6 +8473,67 @@ mod tests {
         assert!(!text.contains("end code"));
         assert!(text.contains("┌─"));
         assert!(text.contains("└─"));
+    }
+
+    #[test]
+    fn render_diff_code_fence_highlights_added_removed_and_hunks() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant(
+                    "```diff\n--- before.json\n+++ after.json\n@@ -2,6 +2,6 @@\n-  \"scroll-mode\": \"pinned\",\n+  \"scroll-mode\": \"native\",\n```",
+                )],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let buffer = rendered_buffer(&app, palette);
+
+        let removed_style = style_for_text(&buffer, "pinned").expect("removed diff style");
+        let added_style = style_for_text(&buffer, "native").expect("added diff style");
+        let hunk_style = style_for_text(&buffer, "@@ -2,6 +2,6 @@").expect("hunk diff style");
+
+        assert_eq!(removed_style.fg, Some(palette.danger));
+        assert_eq!(removed_style.bg, Some(palette.danger_bg));
+        assert_eq!(added_style.fg, Some(palette.success));
+        assert_eq!(added_style.bg, Some(palette.success_bg));
+        assert_eq!(hunk_style.fg, Some(palette.accent));
+        assert_eq!(hunk_style.bg, Some(palette.diff_context_bg));
+    }
+
+    #[test]
+    fn render_unlabeled_unified_diff_fence_is_reclassified_from_code() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant(
+                    "```\n--- before.json\n+++ after.json\n@@ -1 +1 @@\n-  \"scroll-mode\": \"pinned\"\n+  \"scroll-mode\": \"native\"\n```",
+                )],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let buffer = rendered_buffer(&app, palette);
+        let rows = rendered_rows(&buffer);
+
+        assert!(row_containing(&rows, "┌─ diff").contains("diff"));
+        let added_style = style_for_text(&buffer, "native").expect("added diff style");
+        assert_eq!(added_style.fg, Some(palette.success));
+        assert_eq!(added_style.bg, Some(palette.success_bg));
     }
 
     #[test]
@@ -9897,6 +11147,141 @@ mod tests {
     }
 
     #[test]
+    fn render_inline_diff_header_shows_file_badge_and_counts() {
+        let app = app_with_diff(DiffPreviewGetResult {
+            status: "ready".into(),
+            source: "pending_store".into(),
+            preview: DiffPreview {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+                title: Some("Header patch".into()),
+                files: vec![DiffPreviewFile {
+                    path: "src/lib.rs".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    hunks: vec![DiffPreviewHunk {
+                        header: "@@ -1 +1 @@".into(),
+                        lines: vec![
+                            DiffPreviewLine {
+                                kind: "removed".into(),
+                                content: "old_value()".into(),
+                                old_line: Some(1),
+                                new_line: None,
+                            },
+                            DiffPreviewLine {
+                                kind: "added".into(),
+                                content: "new_value()".into(),
+                                old_line: None,
+                                new_line: Some(1),
+                            },
+                            DiffPreviewLine {
+                                kind: "added".into(),
+                                content: "another_value()".into(),
+                                old_line: None,
+                                new_line: Some(2),
+                            },
+                        ],
+                    }],
+                }],
+            },
+        });
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("RUST"));
+        assert!(text.contains("modified"));
+        assert!(text.contains("+2"));
+        assert!(text.contains("-1"));
+        assert!(text.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn render_inline_diff_shows_selected_hunk_not_always_first() {
+        let mut app = app_with_diff(DiffPreviewGetResult {
+            status: "ready".into(),
+            source: "pending_store".into(),
+            preview: DiffPreview {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+                title: Some("Selected hunk patch".into()),
+                files: vec![DiffPreviewFile {
+                    path: "src/lib.rs".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    hunks: vec![
+                        DiffPreviewHunk {
+                            header: "@@ -1 +1 @@".into(),
+                            lines: vec![DiffPreviewLine {
+                                kind: "added".into(),
+                                content: "first_change()".into(),
+                                old_line: None,
+                                new_line: Some(1),
+                            }],
+                        },
+                        DiffPreviewHunk {
+                            header: "@@ -20 +20 @@".into(),
+                            lines: vec![DiffPreviewLine {
+                                kind: "added".into(),
+                                content: "second_change()".into(),
+                                old_line: None,
+                                new_line: Some(20),
+                            }],
+                        },
+                    ],
+                }],
+            },
+        });
+        app.diff_preview.selected_hunk = 1;
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("@@ -20 +20 @@"));
+        assert!(text.contains("second_change()"));
+        assert!(!text.contains("first_change()"));
+    }
+
+    #[test]
+    fn diff_preview_result_selects_first_changed_hunk() {
+        let app = app_with_diff(DiffPreviewGetResult {
+            status: "ready".into(),
+            source: "pending_store".into(),
+            preview: DiffPreview {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+                title: Some("Default hunk patch".into()),
+                files: vec![DiffPreviewFile {
+                    path: "src/lib.rs".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    hunks: vec![
+                        DiffPreviewHunk {
+                            header: "@@ metadata @@".into(),
+                            lines: vec![DiffPreviewLine {
+                                kind: "context".into(),
+                                content: "unchanged metadata".into(),
+                                old_line: Some(1),
+                                new_line: Some(1),
+                            }],
+                        },
+                        DiffPreviewHunk {
+                            header: "@@ -20 +20 @@".into(),
+                            lines: vec![DiffPreviewLine {
+                                kind: "added".into(),
+                                content: "first_real_change()".into(),
+                                old_line: None,
+                                new_line: Some(20),
+                            }],
+                        },
+                    ],
+                }],
+            },
+        });
+
+        assert_eq!(app.diff_preview.selected_file, 0);
+        assert_eq!(app.diff_preview.selected_hunk, 1);
+    }
+
+    #[test]
     fn render_inline_diff_and_approval_share_chat_flow() {
         let mut app = app_with_diff(DiffPreviewGetResult {
             status: "ready".into(),
@@ -10385,6 +11770,242 @@ mod tests {
             None,
             false,
         )
+    }
+
+    fn app_with_large_menu() -> AppState {
+        let mut app = chat_app(vec![Message::user("hi")]);
+        app.menu_stack.open("geometry.test");
+        let items = (0..20)
+            .map(|idx| {
+                crate::menu::MenuItem::new(
+                    format!("geometry.item.{idx}"),
+                    format!("Geometry item {idx}"),
+                    crate::menu::MenuAction::Noop,
+                )
+            })
+            .collect();
+        app.active_menu = Some(crate::menu::MenuBuildResult::ready(
+            crate::menu::MenuSpec::new(
+                "geometry.test",
+                "Geometry test",
+                crate::menu::MenuMode::SingleSelect,
+            )
+            .with_items(items),
+        ));
+        app
+    }
+
+    #[test]
+    fn chat_layout_areas_keep_composer_and_status_at_bottom() {
+        let app = chat_app(vec![Message::user("hi"), Message::assistant("ready")]);
+        let area = Rect::new(0, 0, 80, 24);
+
+        let layout = chat_layout_areas(&app, area);
+
+        assert_eq!(layout.status.y, area.y + area.height - 1);
+        assert_eq!(layout.status.height, 1);
+        assert_eq!(
+            layout.composer.y + layout.composer.height,
+            layout.status.y,
+            "composer must sit immediately above the status row"
+        );
+        assert_eq!(layout.transcript.y, area.y);
+        assert!(
+            layout.transcript.y + layout.transcript.height <= layout.menu.y,
+            "transcript and menu areas must not overlap"
+        );
+    }
+
+    #[test]
+    fn chat_layout_areas_clamp_menu_to_transcript_budget() {
+        let app = app_with_large_menu();
+        let area = Rect::new(0, 0, 80, 19);
+
+        let layout = chat_layout_areas(&app, area);
+
+        assert_eq!(
+            layout.menu.height, 4,
+            "large menus are clamped by the available surface budget"
+        );
+        assert!(
+            layout.transcript.height >= min_transcript_height(area.height),
+            "menu must not steal the transcript's minimum height"
+        );
+        assert_eq!(layout.status.y, area.y + area.height - 1);
+        assert_eq!(layout.composer.y + layout.composer.height, layout.status.y);
+    }
+
+    #[test]
+    fn render_chat_layout_matches_chat_layout_areas() {
+        let mut app = chat_app(vec![
+            Message::user("ask number 01"),
+            Message::assistant("history message 01"),
+        ]);
+        app.transcript_pager_active = true;
+        let area = Rect::new(0, 0, 80, 20);
+        let layout = chat_layout_areas(&app, area);
+
+        let buffer = rendered_buffer_with_size(
+            &app,
+            Palette::for_theme(ThemeName::default()),
+            area.width,
+            area.height,
+        );
+        let rows = rendered_rows(&buffer);
+        let composer_row = row_index_containing(&rows, "Composer") as u16;
+        assert!(
+            composer_row >= layout.composer.y
+                && composer_row < layout.composer.y + layout.composer.height,
+            "composer title row {composer_row} must be inside {:?}",
+            layout.composer
+        );
+        for y in layout.composer.y..layout.composer.y + layout.composer.height {
+            assert!(
+                !rows[usize::from(y)].contains("history message"),
+                "transcript text must not render inside composer area at row {y}: {:?}",
+                rows[usize::from(y)]
+            );
+        }
+    }
+
+    #[test]
+    fn scrollbar_thumb_hidden_without_overflow() {
+        let track = Rect::new(79, 0, 1, 10);
+        let metrics = TranscriptScrollMetrics {
+            visible_rows: 20,
+            total_rows: 20,
+            scroll_from_bottom: 0,
+            max_scroll_from_bottom: 0,
+        };
+
+        assert_eq!(scrollbar_thumb(metrics, track), None);
+    }
+
+    #[test]
+    fn scrollbar_thumb_places_bottom_at_track_end() {
+        let track = Rect::new(79, 5, 1, 10);
+        let metrics = TranscriptScrollMetrics {
+            visible_rows: 20,
+            total_rows: 100,
+            scroll_from_bottom: 0,
+            max_scroll_from_bottom: 80,
+        };
+
+        let thumb = scrollbar_thumb(metrics, track).expect("overflow thumb");
+
+        assert_eq!(thumb.height, 2);
+        assert_eq!(thumb.top + thumb.height, track.y + track.height);
+    }
+
+    #[test]
+    fn scrollbar_thumb_moves_toward_top_when_scrolled_up() {
+        let track = Rect::new(79, 5, 1, 10);
+        let bottom = scrollbar_thumb(
+            TranscriptScrollMetrics {
+                visible_rows: 20,
+                total_rows: 100,
+                scroll_from_bottom: 0,
+                max_scroll_from_bottom: 80,
+            },
+            track,
+        )
+        .expect("bottom thumb");
+        let scrolled = scrollbar_thumb(
+            TranscriptScrollMetrics {
+                visible_rows: 20,
+                total_rows: 100,
+                scroll_from_bottom: 40,
+                max_scroll_from_bottom: 80,
+            },
+            track,
+        )
+        .expect("scrolled thumb");
+
+        assert!(
+            scrolled.top < bottom.top,
+            "scrolling up should move the thumb toward the top"
+        );
+    }
+
+    #[test]
+    fn hint_bar_model_defaults_to_statusbar_keys() {
+        let app = chat_app(vec![Message::user("hi")]);
+
+        assert_eq!(hint_bar_model(&app).mode, HintBarMode::StatusbarKeys);
+    }
+
+    #[test]
+    fn hint_bar_model_uses_pager_keys_at_bottom() {
+        let mut app = chat_app(vec![Message::user("hi")]);
+        app.transcript_pager_active = true;
+        app.transcript_scroll = 0;
+
+        assert_eq!(hint_bar_model(&app).mode, HintBarMode::PagerKeys);
+    }
+
+    #[test]
+    fn hint_bar_model_uses_reviewing_when_pager_scrolled() {
+        let mut app = chat_app(vec![Message::user("hi")]);
+        app.transcript_pager_active = true;
+        app.transcript_scroll = 3;
+
+        assert_eq!(hint_bar_model(&app).mode, HintBarMode::PagerReviewing);
+    }
+
+    #[test]
+    fn hint_bar_model_uses_menu_when_menu_is_active() {
+        let mut app = chat_app(vec![Message::user("hi")]);
+        app.menu_stack
+            .open(crate::menu::MenuId::from(crate::menu::registry::MENU_HELP));
+
+        assert_eq!(hint_bar_model(&app).mode, HintBarMode::Menu);
+    }
+
+    #[test]
+    fn hint_bar_model_uses_onboarding_for_first_launch_menu() {
+        let mut app = AppState::new(vec![], 0, "ready".into(), None, false);
+        app.menu_stack.open(crate::menu::MenuId::from(
+            crate::menu::registry::MENU_ONBOARD,
+        ));
+
+        assert_eq!(hint_bar_model(&app).mode, HintBarMode::Onboarding);
+    }
+
+    #[test]
+    fn hint_bar_model_uses_approval_when_visible() {
+        let mut app = chat_app(vec![Message::user("hi")]);
+        app.approval = Some(ApprovalModalState {
+            session_id: SessionKey("local:test".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            title: "Run command?".into(),
+            body: "cargo test".into(),
+            approval_kind: Some(approval_kinds::COMMAND.into()),
+            risk: None,
+            typed_details: None,
+            render_hints: None,
+            visible: true,
+        });
+
+        assert_eq!(hint_bar_model(&app).mode, HintBarMode::Approval);
+    }
+
+    #[test]
+    fn hint_bar_model_uses_user_question_when_visible() {
+        let mut app = chat_app(vec![Message::user("hi")]);
+        app.user_question = Some(UserQuestionPickerState {
+            session_id: SessionKey("local:test".into()),
+            question_id: QuestionId::new(),
+            turn_id: TurnId::new(),
+            title: "Choose path".into(),
+            body: "Which option?".into(),
+            questions: vec![],
+            active: 0,
+            visible: true,
+        });
+
+        assert_eq!(hint_bar_model(&app).mode, HintBarMode::UserQuestion);
     }
 
     /// Render `render_viewport` into a buffer via the custom inline `Frame`, at

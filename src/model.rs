@@ -1750,7 +1750,7 @@ pub enum OnboardingAction {
     SetEmail(String),
     SetOtpCode(String),
     SetProfileId(String),
-    SetProviderSelection(LlmSelectionConfig),
+    SetProviderSelection(Box<LlmSelectionConfig>),
     SetFamilyId(String),
     SetModelId(String),
     SetRouteId(String),
@@ -2595,7 +2595,7 @@ pub struct ProfileLlmListParams {
     pub profile_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LlmRouteConfig {
     #[serde(
         default,
@@ -2613,18 +2613,6 @@ pub struct LlmRouteConfig {
     pub api_type: Option<String>,
 }
 
-impl Default for LlmRouteConfig {
-    fn default() -> Self {
-        Self {
-            route_id: String::new(),
-            label: None,
-            base_url: None,
-            api_key_env: None,
-            api_type: None,
-        }
-    }
-}
-
 impl LlmRouteConfig {
     pub fn is_empty(&self) -> bool {
         self.route_id.trim().is_empty()
@@ -2635,7 +2623,7 @@ impl LlmRouteConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LlmSelectionConfig {
     #[serde(
         default,
@@ -2661,19 +2649,6 @@ pub struct LlmSelectionConfig {
     pub cost_per_m: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strong: Option<bool>,
-}
-
-impl Default for LlmSelectionConfig {
-    fn default() -> Self {
-        Self {
-            family_id: String::new(),
-            model_id: String::new(),
-            route: LlmRouteConfig::default(),
-            model_hints: None,
-            cost_per_m: None,
-            strong: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3030,13 +3005,113 @@ impl FocusPane {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ActivityNavigatorFilter {
+    #[default]
+    All,
+    Running,
+    Blocked,
+    Failed,
+    Done,
+}
+
+impl ActivityNavigatorFilter {
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Running,
+            Self::Running => Self::Blocked,
+            Self::Blocked => Self::Failed,
+            Self::Failed => Self::Done,
+            Self::Done => Self::All,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+            Self::Done => "done",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivityNavigatorState {
+    pub active: bool,
+    pub query: String,
+    pub filter: ActivityNavigatorFilter,
+    pub selected: usize,
+    pub search_active: bool,
+}
+
+impl ActivityNavigatorState {
+    pub fn open(&mut self) {
+        self.active = true;
+        self.search_active = false;
+        self.query.clear();
+        self.filter = ActivityNavigatorFilter::All;
+        self.selected = 0;
+    }
+
+    pub fn close(&mut self) {
+        self.active = false;
+        self.search_active = false;
+    }
+
+    pub fn clear_query(&mut self) {
+        self.query.clear();
+        self.selected = 0;
+    }
+
+    pub fn push_query_char(&mut self, ch: char) {
+        self.query.push(ch);
+        self.selected = 0;
+    }
+
+    pub fn start_search_with_char(&mut self, ch: char) {
+        self.search_active = true;
+        self.query.clear();
+        self.query.push(ch);
+        self.selected = 0;
+    }
+
+    pub fn pop_query_char(&mut self) {
+        self.query.pop();
+        self.selected = 0;
+    }
+
+    pub fn cycle_filter(&mut self) {
+        self.filter = self.filter.next();
+        self.selected = 0;
+    }
+
+    pub fn select_next(&mut self, len: usize) {
+        if len == 0 {
+            self.selected = 0;
+        } else {
+            self.selected = (self.selected + 1).min(len - 1);
+        }
+    }
+
+    pub fn select_prev(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SessionRunState {
+    #[default]
     Idle,
     InProgress,
-    Blocked { message: String },
+    Blocked {
+        message: String,
+    },
     Success,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 impl SessionRunState {
@@ -3062,11 +3137,7 @@ impl SessionRunState {
     }
 }
 
-impl Default for SessionRunState {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
+type SessionUsage = (Option<u64>, Option<u64>, Option<f64>);
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -3083,8 +3154,7 @@ pub struct AppState {
     /// USD) — merged from `token_cost` progress updates. `session_cost` is
     /// cumulative; in/out reflect the most recent update. Rendered on the job
     /// indicator.
-    pub session_usage:
-        std::collections::HashMap<SessionKey, (Option<u64>, Option<u64>, Option<f64>)>,
+    pub session_usage: std::collections::HashMap<SessionKey, SessionUsage>,
     /// Latest retry/backoff status per session — the `UiRetryBackoff` carried
     /// on `metadata.retry` progress updates that the TUI previously ignored.
     /// Drives the "retrying (attempt N)" surface in the harness status row.
@@ -3131,6 +3201,7 @@ pub struct AppState {
     /// `/saveconfig` can persist runtime UI settings back. `None` when launched
     /// without `--config` (saving then falls back to the default path).
     pub config_path: Option<std::path::PathBuf>,
+    pub activity_navigator: ActivityNavigatorState,
     pub focus: FocusPane,
     pub artifacts: ArtifactPaneState,
     pub workspace: WorkspacePaneState,
@@ -4238,13 +4309,32 @@ impl DiffPreviewPaneState {
 
     fn clamp_selection(&mut self) {
         let hunks = self.hunk_locations();
-        if let Some((file_idx, hunk_idx)) = hunks.first().copied() {
+        if let Some((file_idx, hunk_idx)) = self
+            .first_changed_hunk_location()
+            .or_else(|| hunks.first().copied())
+        {
             self.selected_file = file_idx;
             self.selected_hunk = hunk_idx;
         } else {
             self.selected_file = 0;
             self.selected_hunk = 0;
         }
+    }
+
+    fn first_changed_hunk_location(&self) -> Option<(usize, usize)> {
+        self.preview.as_ref().and_then(|preview| {
+            preview
+                .files
+                .iter()
+                .enumerate()
+                .find_map(|(file_idx, file)| {
+                    file.hunks
+                        .iter()
+                        .enumerate()
+                        .find(|(_, hunk)| hunk.lines.iter().any(diff_preview_line_is_change))
+                        .map(|(hunk_idx, _)| (file_idx, hunk_idx))
+                })
+        })
     }
 
     fn hunk_locations(&self) -> Vec<(usize, usize)> {
@@ -4271,6 +4361,13 @@ impl DiffPreviewPaneState {
             *file_idx == self.selected_file && *hunk_idx == self.selected_hunk
         })
     }
+}
+
+fn diff_preview_line_is_change(line: &DiffPreviewLine) -> bool {
+    matches!(
+        line.kind.as_str(),
+        "added" | "removed" | "insert" | "delete" | "inserted" | "deleted"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4704,6 +4801,7 @@ impl AppState {
             transcript_pager_active: false,
             pinned_scroll: false,
             config_path: None,
+            activity_navigator: ActivityNavigatorState::default(),
             focus: FocusPane::Composer,
             artifacts: panes.artifacts,
             workspace: panes.workspace,
@@ -7059,10 +7157,12 @@ mod tests {
 
     #[test]
     fn validate_local_profile_rejects_whitespace_in_username() {
-        let mut state = OnboardingWizardState::default();
-        state.name = "Ada Lovelace".into();
-        state.username = "ada lovelace".into();
-        state.email = "ada@example.com".into();
+        let state = OnboardingWizardState {
+            name: "Ada Lovelace".into(),
+            username: "ada lovelace".into(),
+            email: "ada@example.com".into(),
+            ..OnboardingWizardState::default()
+        };
         let err = state
             .validate_local_profile()
             .expect_err("username must reject whitespace");
@@ -7078,28 +7178,34 @@ mod tests {
     fn validate_local_profile_accepts_single_label_domain() {
         // The backend accepts `ada@localhost` and `dev@corp`; the
         // TUI must NOT be stricter than the server.
-        let mut state = OnboardingWizardState::default();
-        state.name = "Ada".into();
-        state.username = "ada".into();
-        state.email = "ada@localhost".into();
+        let state = OnboardingWizardState {
+            name: "Ada".into(),
+            username: "ada".into(),
+            email: "ada@localhost".into(),
+            ..OnboardingWizardState::default()
+        };
         assert!(state.validate_local_profile().is_ok());
     }
 
     #[test]
     fn validate_local_profile_rejects_malformed_email() {
-        let mut state = OnboardingWizardState::default();
-        state.name = "Ada".into();
-        state.username = "ada".into();
-        state.email = "not-an-email".into();
+        let state = OnboardingWizardState {
+            name: "Ada".into(),
+            username: "ada".into(),
+            email: "not-an-email".into(),
+            ..OnboardingWizardState::default()
+        };
         let err = state.validate_local_profile().expect_err("bad email");
         assert_eq!(err.focus_field, OnboardingLocalProfileField::Email);
     }
 
     #[test]
     fn validate_local_profile_requires_email_to_match_backend_contract() {
-        let mut state = OnboardingWizardState::default();
-        state.name = "Ada".into();
-        state.username = "ada".into();
+        let state = OnboardingWizardState {
+            name: "Ada".into(),
+            username: "ada".into(),
+            ..OnboardingWizardState::default()
+        };
         // Empty email is rejected: the current backend
         // implementation of `profile/local/create` returns
         // `profile_local_invalid_email` for `""`. The contract
@@ -7113,10 +7219,12 @@ mod tests {
 
     #[test]
     fn apply_local_profile_error_routes_collision_to_username() {
-        let mut state = OnboardingWizardState::default();
-        state.username = "ada".into();
-        state.local_profile_create_pending = true;
-        state.local_profile_create_pending_username = Some("ada".into());
+        let mut state = OnboardingWizardState {
+            username: "ada".into(),
+            local_profile_create_pending: true,
+            local_profile_create_pending_username: Some("ada".into()),
+            ..OnboardingWizardState::default()
+        };
         state.apply_local_profile_error("profile_local_collision", "username already taken");
         let recovery = state.local_profile_recovery.expect("recovery");
         assert_eq!(recovery.kind, OnboardingLocalProfileErrorKind::Collision);
@@ -7173,13 +7281,15 @@ mod tests {
 
     #[test]
     fn apply_profile_local_create_success_clears_pending_and_recovery() {
-        let mut state = OnboardingWizardState::default();
-        state.local_profile_create_pending = true;
-        state.local_profile_recovery = Some(OnboardingLocalProfileRecovery {
-            kind: OnboardingLocalProfileErrorKind::Collision,
-            focus_field: OnboardingLocalProfileField::Username,
-            message: "stale".into(),
-        });
+        let mut state = OnboardingWizardState {
+            local_profile_create_pending: true,
+            local_profile_recovery: Some(OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::Collision,
+                focus_field: OnboardingLocalProfileField::Username,
+                message: "stale".into(),
+            }),
+            ..OnboardingWizardState::default()
+        };
         state.apply_profile_local_create(&ProfileLocalCreateResult {
             profile_id: "ada".into(),
             user_id: "ada-user".into(),

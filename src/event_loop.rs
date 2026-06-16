@@ -168,7 +168,9 @@ pub fn run(cli: Cli) -> Result<()> {
                         quit = true;
                         break;
                     }
-                    KeyAction::Send(command) => send_command(backend.as_mut(), &mut store, command),
+                    KeyAction::Send(command) => {
+                        send_command(backend.as_mut(), &mut store, *command)
+                    }
                 }
                 // A resize invalidates the inline viewport layout; force a repaint.
                 if is_resize {
@@ -470,7 +472,13 @@ impl TerminalInputState {
 pub enum KeyAction {
     Continue,
     Quit,
-    Send(AppUiCommand),
+    Send(Box<AppUiCommand>),
+}
+
+impl KeyAction {
+    fn send(command: AppUiCommand) -> Self {
+        Self::Send(Box::new(command))
+    }
 }
 
 fn handle_terminal_event_with_input_state(
@@ -554,7 +562,7 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     if is_control_char(&key, 'c') {
         return store
             .interrupt_command()
-            .map_or(KeyAction::Continue, KeyAction::Send);
+            .map_or(KeyAction::Continue, KeyAction::send);
     }
 
     if is_control_char(&key, 'u') {
@@ -635,6 +643,10 @@ fn handle_paste(store: &mut Store, text: &str) -> KeyAction {
 }
 
 fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
+    if store.state.activity_navigator.active {
+        return handle_activity_navigator_key(store, key);
+    }
+
     if store
         .state
         .approval
@@ -688,7 +700,7 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
                     store.interrupt_command()
                 };
                 if let Some(command) = command {
-                    return KeyAction::Send(command);
+                    return KeyAction::send(command);
                 }
             }
             store.state.focus = FocusPane::Composer;
@@ -760,17 +772,17 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         }
         KeyCode::Char('o') if store.state.focus == FocusPane::Tasks => {
             if let Some(command) = store.read_task_output_command() {
-                return KeyAction::Send(command);
+                return KeyAction::send(command);
             }
         }
         KeyCode::Char('x') if store.state.focus == FocusPane::Tasks => {
             if let Some(command) = store.cancel_task_command() {
-                return KeyAction::Send(command);
+                return KeyAction::send(command);
             }
         }
         KeyCode::Char('d') if store.state.focus != FocusPane::Composer => {
             if let Some(command) = store.read_diff_preview_command() {
-                return KeyAction::Send(command);
+                return KeyAction::send(command);
             }
         }
         KeyCode::Char(']') if store.state.focus != FocusPane::Composer => {
@@ -791,6 +803,61 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             if opens_slash_popup {
                 store.open_menu(crate::menu::MenuId::from(crate::menu::registry::MENU_HELP));
             }
+        }
+        _ => {}
+    }
+
+    KeyAction::Continue
+}
+
+fn handle_activity_navigator_key(store: &mut Store, key: KeyEvent) -> KeyAction {
+    match key.code {
+        KeyCode::Esc if store.state.activity_navigator.search_active => {
+            store.state.activity_navigator.search_active = false;
+        }
+        KeyCode::Esc => {
+            store.state.activity_navigator.close();
+        }
+        KeyCode::Down | KeyCode::Char('j') if !store.state.activity_navigator.search_active => {
+            let len = app::activity_navigator_model(&store.state).rows.len();
+            store.state.activity_navigator.select_next(len);
+        }
+        KeyCode::Up | KeyCode::Char('k') if !store.state.activity_navigator.search_active => {
+            store.state.activity_navigator.select_prev();
+        }
+        KeyCode::Tab | KeyCode::Char('f') if !store.state.activity_navigator.search_active => {
+            store.state.activity_navigator.cycle_filter();
+        }
+        KeyCode::Char('/') if !store.state.activity_navigator.search_active => {
+            store.state.activity_navigator.search_active = true;
+        }
+        KeyCode::Backspace if store.state.activity_navigator.search_active => {
+            store.state.activity_navigator.pop_query_char();
+        }
+        KeyCode::Delete if store.state.activity_navigator.search_active => {
+            store.state.activity_navigator.clear_query();
+        }
+        KeyCode::Enter => {
+            if let Some(session_id) = app::selected_activity_navigator_session(&store.state)
+                && let Some(idx) = store
+                    .state
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == session_id)
+            {
+                store.state.selected_session = idx;
+                store.state.status = t!(
+                    "status.activity_navigator_selected_session",
+                    title = store.state.sessions[idx].title.clone()
+                )
+                .into_owned();
+            }
+        }
+        KeyCode::Char(ch) if store.state.activity_navigator.search_active => {
+            store.state.activity_navigator.push_query_char(ch);
+        }
+        KeyCode::Char(ch) if !ch.is_control() => {
+            store.state.activity_navigator.start_search_with_char(ch);
         }
         _ => {}
     }
@@ -867,7 +934,7 @@ fn handle_composer_enter(store: &mut Store) -> KeyAction {
     if store.state.exit_requested {
         KeyAction::Quit
     } else {
-        command.map_or(KeyAction::Continue, KeyAction::Send)
+        command.map_or(KeyAction::Continue, KeyAction::send)
     }
 }
 
@@ -949,7 +1016,7 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
                 return KeyAction::Quit;
             }
             if let Some(command) = command {
-                return KeyAction::Send(command);
+                return KeyAction::send(command);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -1098,25 +1165,25 @@ fn handle_approval_modal_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             if let Some(command) =
                 store.respond_approval_command(ApprovalModalAction::ApproveRequest)
             {
-                return KeyAction::Send(command);
+                return KeyAction::send(command);
             }
         }
         KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'s') => {
             if let Some(command) =
                 store.respond_approval_command(ApprovalModalAction::ApproveSession)
             {
-                return KeyAction::Send(command);
+                return KeyAction::send(command);
             }
         }
         KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'n') => {
             if let Some(command) = store.respond_approval_command(ApprovalModalAction::DenyRequest)
             {
-                return KeyAction::Send(command);
+                return KeyAction::send(command);
             }
         }
         KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'d') => {
             if let Some(command) = store.read_diff_preview_command() {
-                return KeyAction::Send(command);
+                return KeyAction::send(command);
             }
         }
         _ => {}
@@ -1151,7 +1218,7 @@ fn handle_user_question_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             if store.user_question_advance()
                 && let Some(command) = store.respond_user_question_command()
             {
-                return KeyAction::Send(command);
+                return KeyAction::send(command);
             }
         }
         KeyCode::Char(ch) => {
@@ -1171,7 +1238,7 @@ fn handle_task_output_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         }
         KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'o') => {
             if let Some(command) = store.read_task_output_command() {
-                return KeyAction::Send(command);
+                return KeyAction::send(command);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -1412,6 +1479,94 @@ fn is_alt_char(key: &KeyEvent, expected: char) -> bool {
     )
 }
 
+/// Tracks the current screen model and restores terminal state on drop.
+struct TerminalGuard {
+    mode: RenderMode,
+    saved_inline_viewport: Option<ratatui::layout::Rect>,
+    /// Mouse capture is on ONLY while the transcript pager is up (so the wheel
+    /// scrolls the pager). It must never be on in the inline chat flow, where
+    /// it would defeat native terminal selection/copy.
+    mouse_captured: bool,
+}
+
+impl TerminalGuard {
+    /// Bring the terminal's mouse-capture state in line with the policy
+    /// (`app::wants_mouse_capture`). Idempotent: only writes the escape
+    /// sequence on an actual transition.
+    fn sync_mouse_capture<B>(&mut self, terminal: &mut InlineTerminal<B>, want: bool) -> Result<()>
+    where
+        B: Backend + io::Write,
+    {
+        if want == self.mouse_captured {
+            return Ok(());
+        }
+        if want {
+            execute!(terminal.backend_mut(), EnableMouseCapture)?;
+        } else {
+            execute!(terminal.backend_mut(), DisableMouseCapture)?;
+        }
+        self.mouse_captured = want;
+        Ok(())
+    }
+
+    /// Switch into the alternate screen for a full-screen overlay (if not
+    /// already there). The viewport is resized to the full screen by the caller.
+    fn enter_alt_screen<B>(&mut self, terminal: &mut InlineTerminal<B>) -> Result<()>
+    where
+        B: Backend + io::Write,
+    {
+        if self.mode == RenderMode::AltScreen {
+            return Ok(());
+        }
+        self.saved_inline_viewport = Some(terminal.viewport_area);
+        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+        let size = terminal.size()?;
+        terminal.set_viewport_area(ratatui::layout::Rect::new(0, 0, size.width, size.height));
+        terminal.clear_visible_screen()?;
+        terminal.invalidate_viewport();
+        terminal.last_known_screen_size = size;
+        self.mode = RenderMode::AltScreen;
+        Ok(())
+    }
+
+    /// Return to the inline-viewport model (normal scrollback). On the way back
+    /// we force the next inline draw to repaint the whole viewport.
+    fn leave_alt_screen<B>(&mut self, terminal: &mut InlineTerminal<B>) -> Result<()>
+    where
+        B: Backend + io::Write,
+    {
+        if self.mode == RenderMode::Inline {
+            return Ok(());
+        }
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        let fallback = {
+            let size = terminal.size()?;
+            ratatui::layout::Rect::new(0, size.height.saturating_sub(1), size.width, 1)
+        };
+        terminal.set_viewport_area(self.saved_inline_viewport.take().unwrap_or(fallback));
+        terminal.invalidate_viewport();
+        self.mode = RenderMode::Inline;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        {
+            let mut stdout = io::stdout();
+            if self.mouse_captured {
+                let _ = execute!(stdout, DisableMouseCapture);
+            }
+            if self.mode == RenderMode::AltScreen {
+                let _ = execute!(stdout, LeaveAlternateScreen);
+            }
+            let _ = disable_raw_mode();
+            let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1431,6 +1586,13 @@ mod tests {
     };
     use std::collections::VecDeque;
     use std::io::Write;
+
+    fn sent_command(action: KeyAction) -> AppUiCommand {
+        let KeyAction::Send(command) = action else {
+            panic!("expected command action");
+        };
+        *command
+    }
 
     struct FakeBackend {
         events: VecDeque<ClientEvent>,
@@ -1740,8 +1902,8 @@ mod tests {
             KeyAction::Continue
         ));
         let action = handle_key(&mut store, key(KeyCode::Enter));
-        let KeyAction::Send(AppUiCommand::RespondUserQuestion(params)) = action else {
-            panic!("expected user_question respond command");
+        let AppUiCommand::RespondUserQuestion(params) = sent_command(action) else {
+            panic!("expected RespondUserQuestion command");
         };
         assert_eq!(params.question_id, question_id);
         assert_eq!(params.answers.len(), 1);
@@ -2644,8 +2806,8 @@ mod tests {
 
         let action = handle_key(&mut store, key(KeyCode::Enter));
 
-        let KeyAction::Send(AppUiCommand::InterruptTurn(params)) = action else {
-            panic!("expected interrupt command");
+        let AppUiCommand::InterruptTurn(params) = sent_command(action) else {
+            panic!("expected InterruptTurn command");
         };
         assert_eq!(params.turn_id, turn_id);
         assert!(store.state.composer.is_empty());
@@ -2724,8 +2886,8 @@ mod tests {
             modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
         );
 
-        let KeyAction::Send(AppUiCommand::InterruptTurn(params)) = action else {
-            panic!("expected interrupt command");
+        let AppUiCommand::InterruptTurn(params) = sent_command(action) else {
+            panic!("expected InterruptTurn command");
         };
         assert_eq!(params.turn_id, turn_id);
         assert_eq!(store.state.status, "Interrupt requested for active turn");
@@ -2743,8 +2905,8 @@ mod tests {
 
         let action = handle_key(&mut store, key(KeyCode::Esc));
 
-        let KeyAction::Send(AppUiCommand::InterruptTurn(params)) = action else {
-            panic!("expected interrupt command");
+        let AppUiCommand::InterruptTurn(params) = sent_command(action) else {
+            panic!("expected InterruptTurn command");
         };
         assert_eq!(params.turn_id, turn_id);
         assert_eq!(
@@ -2765,8 +2927,8 @@ mod tests {
 
         let action = handle_key(&mut store, key(KeyCode::Esc));
 
-        let KeyAction::Send(AppUiCommand::InterruptTurn(params)) = action else {
-            panic!("expected interrupt command");
+        let AppUiCommand::InterruptTurn(params) = sent_command(action) else {
+            panic!("expected InterruptTurn command");
         };
         assert_eq!(params.turn_id, turn_id);
         assert_eq!(store.state.status, "Interrupt requested for active turn");
@@ -2800,8 +2962,8 @@ mod tests {
 
         let action = handle_key(&mut store, key(KeyCode::Char('d')));
 
-        let KeyAction::Send(AppUiCommand::GetDiffPreview(params)) = action else {
-            panic!("expected diff preview command");
+        let AppUiCommand::GetDiffPreview(params) = sent_command(action) else {
+            panic!("expected GetDiffPreview command");
         };
         assert_eq!(params.preview_id, preview_id);
         assert!(store.state.diff_preview.active);
@@ -2873,8 +3035,8 @@ mod tests {
 
         let action = handle_key(&mut store, key(KeyCode::Char('y')));
 
-        let KeyAction::Send(AppUiCommand::RespondApproval(params)) = action else {
-            panic!("expected approval response command");
+        let AppUiCommand::RespondApproval(params) = sent_command(action) else {
+            panic!("expected RespondApproval command");
         };
         assert_eq!(params.approval_id, approval_id);
         assert!(store.state.diff_preview.active);
@@ -2920,8 +3082,8 @@ mod tests {
 
         let action = handle_key(&mut store, key(KeyCode::Char('y')));
 
-        let KeyAction::Send(AppUiCommand::RespondApproval(params)) = action else {
-            panic!("expected approval response command");
+        let AppUiCommand::RespondApproval(params) = sent_command(action) else {
+            panic!("expected RespondApproval command");
         };
         assert_eq!(params.approval_id, approval_id);
         assert_eq!(params.decision, ApprovalDecision::Approve);
@@ -2933,8 +3095,8 @@ mod tests {
         let (mut store, approval_id) = store_with_visible_approval();
         let action = handle_key(&mut store, key(KeyCode::Char('s')));
 
-        let KeyAction::Send(AppUiCommand::RespondApproval(params)) = action else {
-            panic!("expected approval response command");
+        let AppUiCommand::RespondApproval(params) = sent_command(action) else {
+            panic!("expected RespondApproval command");
         };
         assert_eq!(params.approval_id, approval_id);
         assert_eq!(params.decision, ApprovalDecision::Approve);
@@ -2946,8 +3108,8 @@ mod tests {
         let (mut store, approval_id) = store_with_visible_approval();
         let action = handle_key(&mut store, key(KeyCode::Char('n')));
 
-        let KeyAction::Send(AppUiCommand::RespondApproval(params)) = action else {
-            panic!("expected approval response command");
+        let AppUiCommand::RespondApproval(params) = sent_command(action) else {
+            panic!("expected RespondApproval command");
         };
         assert_eq!(params.approval_id, approval_id);
         assert_eq!(params.decision, ApprovalDecision::Deny);
@@ -2955,93 +3117,5 @@ mod tests {
             params.approval_scope.as_deref(),
             Some(approval_scopes::REQUEST)
         );
-    }
-}
-
-/// Tracks the current screen model and restores terminal state on drop.
-struct TerminalGuard {
-    mode: RenderMode,
-    saved_inline_viewport: Option<ratatui::layout::Rect>,
-    /// Mouse capture is on ONLY while the transcript pager is up (so the wheel
-    /// scrolls the pager). It must never be on in the inline chat flow, where
-    /// it would defeat native terminal selection/copy.
-    mouse_captured: bool,
-}
-
-impl TerminalGuard {
-    /// Bring the terminal's mouse-capture state in line with the policy
-    /// (`app::wants_mouse_capture`). Idempotent: only writes the escape
-    /// sequence on an actual transition.
-    fn sync_mouse_capture<B>(&mut self, terminal: &mut InlineTerminal<B>, want: bool) -> Result<()>
-    where
-        B: Backend + io::Write,
-    {
-        if want == self.mouse_captured {
-            return Ok(());
-        }
-        if want {
-            execute!(terminal.backend_mut(), EnableMouseCapture)?;
-        } else {
-            execute!(terminal.backend_mut(), DisableMouseCapture)?;
-        }
-        self.mouse_captured = want;
-        Ok(())
-    }
-
-    /// Switch into the alternate screen for a full-screen overlay (if not
-    /// already there). The viewport is resized to the full screen by the caller.
-    fn enter_alt_screen<B>(&mut self, terminal: &mut InlineTerminal<B>) -> Result<()>
-    where
-        B: Backend + io::Write,
-    {
-        if self.mode == RenderMode::AltScreen {
-            return Ok(());
-        }
-        self.saved_inline_viewport = Some(terminal.viewport_area);
-        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-        let size = terminal.size()?;
-        terminal.set_viewport_area(ratatui::layout::Rect::new(0, 0, size.width, size.height));
-        terminal.clear_visible_screen()?;
-        terminal.invalidate_viewport();
-        terminal.last_known_screen_size = size;
-        self.mode = RenderMode::AltScreen;
-        Ok(())
-    }
-
-    /// Return to the inline-viewport model (normal scrollback). On the way back
-    /// we force the next inline draw to repaint the whole viewport.
-    fn leave_alt_screen<B>(&mut self, terminal: &mut InlineTerminal<B>) -> Result<()>
-    where
-        B: Backend + io::Write,
-    {
-        if self.mode == RenderMode::Inline {
-            return Ok(());
-        }
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-        let fallback = {
-            let size = terminal.size()?;
-            ratatui::layout::Rect::new(0, size.height.saturating_sub(1), size.width, 1)
-        };
-        terminal.set_viewport_area(self.saved_inline_viewport.take().unwrap_or(fallback));
-        terminal.invalidate_viewport();
-        self.mode = RenderMode::Inline;
-        Ok(())
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        #[cfg(not(test))]
-        {
-            let mut stdout = io::stdout();
-            if self.mouse_captured {
-                let _ = execute!(stdout, DisableMouseCapture);
-            }
-            if self.mode == RenderMode::AltScreen {
-                let _ = execute!(stdout, LeaveAlternateScreen);
-            }
-            let _ = disable_raw_mode();
-            let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
-        }
     }
 }

@@ -29,8 +29,8 @@ transcript 改用默认背景（与 inline 视觉连续），并在 pager 回看
   才按内容高度钳制，直接显示行数会在过滚时虚高误导。pager 内已上滚
   （`transcript_scroll > 0`）时状态行显示"回看中"提示（含回到底部的键位），
   回到底部即消失。
-- 不在 alt-screen 里模拟原生滚动条（FrameLike 无 StatefulWidget 通道，
-  且 pager 滚动有键位/滚轮，文字指示已闭环）。
+- 本任务第一阶段只做状态行文字指示；alt-screen 内的轻量可视位置条由
+  `task-pager-scrollbar-model` 单独负责，且不改变本任务的背景/状态行契约。
 
 ## 边界
 
@@ -48,7 +48,7 @@ transcript 改用默认背景（与 inline 视觉连续），并在 pager 回看
 
 ## 排除范围
 
-- alt-screen 内的图形滚动条。
+- pager scrollbar 的拖拽、点击、鼠标 hit-testing。
 - 主题系统改造或新主题。
 - inline 模式的任何视觉变化。
 

@@ -70,7 +70,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::Status,
         Provider::Cost,
         Provider::Model,
-        Provider::Provider,
+        Provider::Llm,
         Provider::Permissions,
         Provider::Mcp,
         Provider::ToolSettings,
@@ -102,7 +102,7 @@ enum Provider {
     Status,
     Cost,
     Model,
-    Provider,
+    Llm,
     Permissions,
     Mcp,
     ToolSettings,
@@ -129,7 +129,7 @@ impl MenuProvider for Provider {
             Self::Status => MENU_STATUS,
             Self::Cost => MENU_COST,
             Self::Model => MENU_MODEL,
-            Self::Provider => MENU_PROVIDER,
+            Self::Llm => MENU_PROVIDER,
             Self::Permissions => MENU_PERMISSIONS,
             Self::Mcp => MENU_MCP,
             Self::ToolSettings => MENU_TOOL_SETTINGS,
@@ -156,7 +156,7 @@ impl MenuProvider for Provider {
             Self::Status => MenuBuildResult::Ready(status_menu(ctx)),
             Self::Cost => cost_menu(ctx),
             Self::Model => model_menu(ctx),
-            Self::Provider => provider_menu(ctx),
+            Self::Llm => provider_menu(ctx),
             Self::Permissions => permissions_menu(ctx),
             Self::Mcp => mcp_menu(ctx),
             Self::ToolSettings => tool_settings_menu(ctx),
@@ -385,8 +385,10 @@ fn thinking_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     .into_iter()
     .enumerate()
     .map(|(idx, (id, label, description, level))| {
-        let mut state = MenuItemState::default();
-        state.current = level == current;
+        let state = MenuItemState {
+            current: level == current,
+            ..MenuItemState::default()
+        };
         let mut item = MenuItem::new(
             id,
             label,
@@ -431,8 +433,10 @@ fn theme_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     .into_iter()
     .enumerate()
     .map(|(idx, (id, label, description))| {
-        let mut state = MenuItemState::default();
-        state.current = id == current;
+        let state = MenuItemState {
+            current: id == current,
+            ..MenuItemState::default()
+        };
         let mut item = MenuItem::new(
             id,
             label,
@@ -642,7 +646,7 @@ fn status_menu(ctx: &MenuContext<'_>) -> MenuSpec {
                 MenuItem::new(
                     "status.refresh",
                     t!("menu.status.item.refresh.label"),
-                    MenuAction::SendAppUi(AppUiCommand::ReadSessionStatus(
+                    MenuAction::send_appui(AppUiCommand::ReadSessionStatus(
                         SessionStatusReadParams { session_id },
                     )),
                 )
@@ -717,7 +721,7 @@ fn cost_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         MenuItem::new(
             "cost.refresh",
             t!("menu.cost.item.refresh.label"),
-            MenuAction::SendAppUi(AppUiCommand::ReadSessionStatus(SessionStatusReadParams {
+            MenuAction::send_appui(AppUiCommand::ReadSessionStatus(SessionStatusReadParams {
                 session_id,
             })),
         )
@@ -889,7 +893,7 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             MenuItem::new(
                 "onboard.auth.status",
                 t!("menu.onboard.item.auth_refresh.label"),
-                MenuAction::SendAppUi(AppUiCommand::AuthStatus(AuthStatusParams::default())),
+                MenuAction::send_appui(AppUiCommand::AuthStatus(AuthStatusParams::default())),
             )
             .with_description("Uses auth/status.")
             .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_AUTH_STATUS)),
@@ -914,7 +918,7 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             MenuItem::new(
                 "onboard.auth.me",
                 t!("menu.onboard.item.auth_me.label"),
-                MenuAction::SendAppUi(AppUiCommand::AuthMe(AuthMeParams {
+                MenuAction::send_appui(AppUiCommand::AuthMe(AuthMeParams {
                     token: state.auth_token.clone(),
                 })),
             )
@@ -1753,7 +1757,7 @@ fn onboarding_route_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 choice.id,
                 format!("{route_label} ({})", route.route_id),
                 MenuAction::Local(LocalAction::Onboarding(
-                    OnboardingAction::SetProviderSelection(choice.selection.clone()),
+                    OnboardingAction::SetProviderSelection(Box::new(choice.selection.clone())),
                 )),
             )
             .with_description(choice.description);
@@ -2401,7 +2405,7 @@ fn catalog_menu_items(
                 item_id,
                 choice.label,
                 MenuAction::Local(LocalAction::Onboarding(
-                    OnboardingAction::SetProviderSelection(choice.selection.clone()),
+                    OnboardingAction::SetProviderSelection(Box::new(choice.selection.clone())),
                 )),
             )
             .with_description(choice.description);
@@ -2566,14 +2570,14 @@ fn login_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         MenuItem::new(
             "login.status",
             t!("menu.login.item.auth_status.label"),
-            MenuAction::SendAppUi(AppUiCommand::AuthStatus(AuthStatusParams::default())),
+            MenuAction::send_appui(AppUiCommand::AuthStatus(AuthStatusParams::default())),
         )
         .with_description("Uses auth/status.")
         .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_AUTH_STATUS)),
         MenuItem::new(
             "login.me",
             t!("menu.login.item.current_account.label"),
-            MenuAction::SendAppUi(AppUiCommand::AuthMe(AuthMeParams {
+            MenuAction::send_appui(AppUiCommand::AuthMe(AuthMeParams {
                 token: state.auth_token.clone(),
             })),
         )
@@ -2582,7 +2586,7 @@ fn login_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         MenuItem::new(
             "login.logout",
             t!("menu.login.item.logout.label"),
-            MenuAction::SendAppUi(AppUiCommand::AuthLogout(AuthLogoutParams {
+            MenuAction::send_appui(AppUiCommand::AuthLogout(AuthLogoutParams {
                 token: state.auth_token.clone(),
             })),
         )
@@ -2721,7 +2725,7 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     };
 
     let refresh_action = if can_list {
-        MenuAction::SendAppUi(AppUiCommand::ProfileLlmList(ProfileLlmListParams {
+        MenuAction::send_appui(AppUiCommand::ProfileLlmList(ProfileLlmListParams {
             profile_id: profile_id.clone(),
         }))
     } else {
@@ -2751,14 +2755,16 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         } else {
             for (idx, model) in models.iter().enumerate() {
                 let id = format!("model.select.{idx}");
-                let mut state = MenuItemState::default();
-                state.current = model.selected
-                    || ctx
-                        .app
-                        .current_model
-                        .is_some_and(|current| current == model.model);
+                let state = MenuItemState {
+                    current: model.selected
+                        || ctx
+                            .app
+                            .current_model
+                            .is_some_and(|current| current == model.model),
+                    ..MenuItemState::default()
+                };
                 let action = if can_select {
-                    MenuAction::SendAppUi(AppUiCommand::ProfileLlmSelect(ProfileLlmSelectParams {
+                    MenuAction::send_appui(AppUiCommand::ProfileLlmSelect(ProfileLlmSelectParams {
                         profile_id: profile_id.clone(),
                         family_id: model
                             .family
@@ -2839,7 +2845,7 @@ fn provider_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         MenuItem::new(
             "provider.catalog",
             t!("menu.provider.item.catalog_refresh.label"),
-            MenuAction::SendAppUi(AppUiCommand::ProfileLlmCatalog(
+            MenuAction::send_appui(AppUiCommand::ProfileLlmCatalog(
                 ProfileLlmCatalogParams::default(),
             )),
         )
@@ -2848,7 +2854,7 @@ fn provider_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         MenuItem::new(
             "provider.list",
             t!("menu.provider.item.list_refresh.label"),
-            MenuAction::SendAppUi(AppUiCommand::ProfileLlmList(ProfileLlmListParams {
+            MenuAction::send_appui(AppUiCommand::ProfileLlmList(ProfileLlmListParams {
                 profile_id: profile_id.clone(),
             })),
         )
@@ -2944,7 +2950,7 @@ fn provider_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 MenuItem::new(
                     format!("provider.test.{family_id}.{}.{}", model.model, route_id),
                     format!("Test {} / {}", model.provider, model.model),
-                    MenuAction::SendAppUi(AppUiCommand::ProfileLlmTest(ProfileLlmTestParams {
+                    MenuAction::send_appui(AppUiCommand::ProfileLlmTest(ProfileLlmTestParams {
                         profile_id: profile_id.clone(),
                         selection: LlmSelectionConfig {
                             family_id: family_id.clone(),
@@ -3180,7 +3186,7 @@ fn mcp_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         MenuItem::new(
             "mcp.config.refresh",
             t!("menu.mcp.item.config_refresh.label"),
-            MenuAction::SendAppUi(AppUiCommand::ListMcpConfig(McpConfigListParams {
+            MenuAction::send_appui(AppUiCommand::ListMcpConfig(McpConfigListParams {
                 session_id: session_id.clone(),
                 profile_id: profile_id.clone(),
                 include_disabled: true,
@@ -3195,7 +3201,7 @@ fn mcp_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             MenuItem::new(
                 "mcp.refresh",
                 t!("menu.mcp.item.status_refresh.label"),
-                MenuAction::SendAppUi(AppUiCommand::ListMcpStatus(McpStatusListParams {
+                MenuAction::send_appui(AppUiCommand::ListMcpStatus(McpStatusListParams {
                     session_id,
                     include_disabled: true,
                 })),
@@ -3240,7 +3246,7 @@ fn mcp_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                     MenuItem::new(
                         format!("mcp.server.{server_name}.toggle"),
                         mcp_config_label(server),
-                        MenuAction::SendAppUi(AppUiCommand::SetMcpConfigEnabled(
+                        MenuAction::send_appui(AppUiCommand::SetMcpConfigEnabled(
                             McpConfigSetEnabledParams {
                                 profile_id: profile_id.clone(),
                                 server: server_name.clone(),
@@ -3259,7 +3265,7 @@ fn mcp_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                     MenuItem::new(
                         format!("mcp.server.{server_name}.test"),
                         format!("Test {server_name}"),
-                        MenuAction::SendAppUi(AppUiCommand::TestMcpConfig(McpConfigTestParams {
+                        MenuAction::send_appui(AppUiCommand::TestMcpConfig(McpConfigTestParams {
                             session_id: session_id.clone(),
                             profile_id: profile_id.clone(),
                             server: server_name.clone(),
@@ -3271,13 +3277,15 @@ fn mcp_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                         APPUI_METHOD_MCP_CONFIG_TEST,
                     )),
                 );
-                let mut delete_state = MenuItemState::default();
-                delete_state.destructive = true;
+                let delete_state = MenuItemState {
+                    destructive: true,
+                    ..MenuItemState::default()
+                };
                 items.push(
                     MenuItem::new(
                         format!("mcp.server.{server_name}.delete"),
                         format!("Delete {server_name}"),
-                        MenuAction::SendAppUi(AppUiCommand::DeleteMcpConfig(
+                        MenuAction::send_appui(AppUiCommand::DeleteMcpConfig(
                             McpConfigDeleteParams {
                                 profile_id: profile_id.clone(),
                                 server: server_name,
@@ -3366,7 +3374,7 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         MenuItem::new(
             "tools.config.refresh",
             t!("menu.tools.item.config_refresh.label"),
-            MenuAction::SendAppUi(AppUiCommand::ListToolConfig(ToolConfigListParams {
+            MenuAction::send_appui(AppUiCommand::ListToolConfig(ToolConfigListParams {
                 session_id: session_id.clone(),
                 profile_id: profile_id.clone(),
                 include_disabled: true,
@@ -3381,7 +3389,7 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             MenuItem::new(
                 "tools.status.refresh",
                 t!("menu.tools.item.status_refresh.label"),
-                MenuAction::SendAppUi(AppUiCommand::ListToolStatus(ToolStatusListParams {
+                MenuAction::send_appui(AppUiCommand::ListToolStatus(ToolStatusListParams {
                     session_id,
                     include_denied: true,
                 })),
@@ -3467,7 +3475,7 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                     MenuItem::new(
                         format!("tools.tool.{tool_name}.toggle"),
                         tool_config_label(tool),
-                        MenuAction::SendAppUi(AppUiCommand::SetToolConfigEnabled(
+                        MenuAction::send_appui(AppUiCommand::SetToolConfigEnabled(
                             ToolConfigSetEnabledParams {
                                 profile_id: profile_id.clone(),
                                 tool: tool_name.clone(),
@@ -3486,11 +3494,13 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                     MenuItem::new(
                         format!("tools.tool.{tool_name}.test"),
                         format!("Test {tool_name}"),
-                        MenuAction::SendAppUi(AppUiCommand::TestToolConfig(ToolConfigTestParams {
-                            session_id: session_id.clone(),
-                            profile_id: profile_id.clone(),
-                            tool: tool_name.clone(),
-                        })),
+                        MenuAction::send_appui(AppUiCommand::TestToolConfig(
+                            ToolConfigTestParams {
+                                session_id: session_id.clone(),
+                                profile_id: profile_id.clone(),
+                                tool: tool_name.clone(),
+                            },
+                        )),
                     )
                     .with_description("Uses tool/config/test.")
                     .maybe_disabled(mutating_action_missing_reason(
@@ -3498,13 +3508,15 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                         APPUI_METHOD_TOOL_CONFIG_TEST,
                     )),
                 );
-                let mut delete_state = MenuItemState::default();
-                delete_state.destructive = true;
+                let delete_state = MenuItemState {
+                    destructive: true,
+                    ..MenuItemState::default()
+                };
                 items.push(
                     MenuItem::new(
                         format!("tools.tool.{tool_name}.delete"),
                         format!("Delete {tool_name}"),
-                        MenuAction::SendAppUi(AppUiCommand::DeleteToolConfig(
+                        MenuAction::send_appui(AppUiCommand::DeleteToolConfig(
                             ToolConfigDeleteParams {
                                 profile_id: profile_id.clone(),
                                 tool: tool_name,
@@ -3532,9 +3544,11 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             );
         } else {
             for tool in &catalog.tools {
-                let mut state = MenuItemState::default();
-                state.checked = Some(tool.enabled);
-                state.destructive = tool.denial.is_some();
+                let state = MenuItemState {
+                    checked: Some(tool.enabled),
+                    destructive: tool.denial.is_some(),
+                    ..MenuItemState::default()
+                };
                 items.push(
                     MenuItem::new(
                         format!("tools.status.{}", tool.tool),
@@ -3597,7 +3611,7 @@ fn skills_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         MenuItem::new(
             "skills.refresh",
             t!("menu.skills.item.refresh.label"),
-            MenuAction::SendAppUi(AppUiCommand::ProfileSkillsList(ProfileSkillsListParams {
+            MenuAction::send_appui(AppUiCommand::ProfileSkillsList(ProfileSkillsListParams {
                 profile_id: profile_id.clone(),
             })),
         )
@@ -3637,13 +3651,15 @@ fn skills_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             );
         } else {
             for skill in &skills.skills {
-                let mut state = MenuItemState::default();
-                state.destructive = true;
+                let state = MenuItemState {
+                    destructive: true,
+                    ..MenuItemState::default()
+                };
                 items.push(
                     MenuItem::new(
                         format!("skills.remove.{}", skill.name),
                         format!("{} {}", t!("menu.skills.item.remove.prefix"), skill.name),
-                        MenuAction::SendAppUi(AppUiCommand::ProfileSkillsRemove(
+                        MenuAction::send_appui(AppUiCommand::ProfileSkillsRemove(
                             ProfileSkillsRemoveParams {
                                 profile_id: profile_id.clone(),
                                 name: skill.name.clone(),
@@ -3672,13 +3688,15 @@ fn skills_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 
     if let Some(registry) = ctx.app.profile_skill_registry {
         for package in &registry.packages {
-            let mut state = MenuItemState::default();
-            state.checked = package.installed.then_some(true);
+            let state = MenuItemState {
+                checked: package.installed.then_some(true),
+                ..MenuItemState::default()
+            };
             items.push(
                 MenuItem::new(
                     format!("skills.registry.{}", package.name),
                     format!("{} {}", t!("menu.skills.item.install.prefix"), package.name),
-                    MenuAction::SendAppUi(AppUiCommand::ProfileSkillsInstall(
+                    MenuAction::send_appui(AppUiCommand::ProfileSkillsInstall(
                         ProfileSkillsInstallParams {
                             profile_id: profile_id.clone(),
                             repo: package.repo.clone(),
@@ -3928,7 +3946,7 @@ fn permission_profile_items(
         MenuItem::new(
             "permissions.profile.refresh",
             t!("menu.permissions.item.profile_refresh.label"),
-            MenuAction::SendAppUi(AppUiCommand::ListPermissionProfiles(
+            MenuAction::send_appui(AppUiCommand::ListPermissionProfiles(
                 PermissionProfileListParams { session_id },
             )),
         )
@@ -4079,7 +4097,7 @@ fn permission_set_action(
     session_id: octos_core::SessionKey,
     update: PermissionProfileUpdate,
 ) -> MenuAction {
-    MenuAction::SendAppUi(AppUiCommand::SetPermissionProfile(
+    MenuAction::send_appui(AppUiCommand::SetPermissionProfile(
         PermissionProfileSetParams {
             session_id,
             update,
@@ -4095,7 +4113,7 @@ fn approval_scopes_refresh_item(
     let item = MenuItem::new(
         "permissions.scopes.refresh",
         t!("menu.permissions.item.scopes_refresh.label"),
-        MenuAction::SendAppUi(AppUiCommand::ListApprovalScopes(ApprovalScopesListParams {
+        MenuAction::send_appui(AppUiCommand::ListApprovalScopes(ApprovalScopesListParams {
             session_id,
         })),
     )
@@ -5316,6 +5334,13 @@ mod tests {
     use octos_core::SessionKey;
     use octos_core::ui_protocol::{TurnId, UiCursor};
 
+    fn appui_command(action: &MenuAction) -> &AppUiCommand {
+        let MenuAction::SendAppUi(command) = action else {
+            panic!("expected AppUI action");
+        };
+        command.as_ref()
+    }
+
     fn runtime_status(session_id: &SessionKey) -> SessionRuntimeStatus {
         SessionRuntimeStatus {
             session_id: session_id.clone(),
@@ -6403,7 +6428,7 @@ mod tests {
             .iter()
             .find(|item| item.id == "status.refresh")
             .expect("refresh item");
-        let MenuAction::SendAppUi(AppUiCommand::ReadSessionStatus(params)) = &refresh.action else {
+        let AppUiCommand::ReadSessionStatus(params) = appui_command(&refresh.action) else {
             panic!("expected session/status/read action");
         };
         assert_eq!(params.session_id, session_id);
@@ -6439,7 +6464,7 @@ mod tests {
                 .find(|item| item.id == "cost.refresh")
                 .expect("refresh item")
                 .action,
-            MenuAction::SendAppUi(AppUiCommand::ReadSessionStatus(_))
+            MenuAction::SendAppUi(command) if matches!(command.as_ref(), AppUiCommand::ReadSessionStatus(_))
         ));
         let cost = spec
             .items
@@ -6533,14 +6558,14 @@ mod tests {
             .expect("refresh item");
         assert!(matches!(
             &refresh.action,
-            MenuAction::SendAppUi(AppUiCommand::ProfileLlmList(_))
+            MenuAction::SendAppUi(command) if matches!(command.as_ref(), AppUiCommand::ProfileLlmList(_))
         ));
         let select = spec
             .items
             .iter()
             .find(|item| item.label == "DeepSeek V4 Pro")
             .expect("model selection");
-        let MenuAction::SendAppUi(AppUiCommand::ProfileLlmSelect(params)) = &select.action else {
+        let AppUiCommand::ProfileLlmSelect(params) = appui_command(&select.action) else {
             panic!("expected profile/llm/select action");
         };
         assert_eq!(params.model_id, "deepseek-v4-pro");
@@ -6576,7 +6601,7 @@ mod tests {
             .iter()
             .find(|item| item.id == "model.refresh")
             .expect("refresh item");
-        let MenuAction::SendAppUi(AppUiCommand::ProfileLlmList(params)) = &refresh.action else {
+        let AppUiCommand::ProfileLlmList(params) = appui_command(&refresh.action) else {
             panic!("expected profile/llm/list action");
         };
         assert_eq!(params.profile_id.as_deref(), Some("coding"));
@@ -6632,7 +6657,7 @@ mod tests {
             .iter()
             .find(|item| item.label.contains("kimi-k2.6"))
             .expect("primary model row");
-        let MenuAction::SendAppUi(AppUiCommand::ProfileLlmSelect(params)) = &select.action else {
+        let AppUiCommand::ProfileLlmSelect(params) = appui_command(&select.action) else {
             panic!("expected profile/llm/select");
         };
         assert_eq!(params.profile_id.as_deref(), Some("dspfac"));
@@ -6878,7 +6903,7 @@ mod tests {
                 .find(|item| item.id == "mcp.refresh")
                 .expect("refresh item")
                 .action,
-            MenuAction::SendAppUi(AppUiCommand::ListMcpStatus(_))
+            MenuAction::SendAppUi(command) if matches!(command.as_ref(), AppUiCommand::ListMcpStatus(_))
         ));
         let failed = spec
             .items
@@ -6935,8 +6960,7 @@ mod tests {
             .iter()
             .find(|item| item.id == "mcp.server.github.toggle")
             .expect("toggle item");
-        let MenuAction::SendAppUi(AppUiCommand::SetMcpConfigEnabled(params)) = &toggle.action
-        else {
+        let AppUiCommand::SetMcpConfigEnabled(params) = appui_command(&toggle.action) else {
             panic!("toggle should call Octos UI set_enabled");
         };
         assert_eq!(params.server, "github");
@@ -7000,8 +7024,7 @@ mod tests {
             .iter()
             .find(|item| item.id == "tools.tool.web_fetch.toggle")
             .expect("tool toggle");
-        let MenuAction::SendAppUi(AppUiCommand::SetToolConfigEnabled(params)) = &toggle.action
-        else {
+        let AppUiCommand::SetToolConfigEnabled(params) = appui_command(&toggle.action) else {
             panic!("toggle should call Octos UI set_enabled");
         };
         assert_eq!(params.tool, "web_fetch");
@@ -7180,7 +7203,7 @@ mod tests {
             .expect("remove item");
         assert!(matches!(
             &remove.action,
-            MenuAction::SendAppUi(AppUiCommand::ProfileSkillsRemove(_))
+            MenuAction::SendAppUi(command) if matches!(command.as_ref(), AppUiCommand::ProfileSkillsRemove(_))
         ));
         assert!(remove.state.destructive);
 
@@ -7189,8 +7212,7 @@ mod tests {
             .iter()
             .find(|item| item.id == "skills.registry.news")
             .expect("registry install item");
-        let MenuAction::SendAppUi(AppUiCommand::ProfileSkillsInstall(params)) = &install.action
-        else {
+        let AppUiCommand::ProfileSkillsInstall(params) = appui_command(&install.action) else {
             panic!("expected profile skills install action");
         };
         assert_eq!(params.profile_id.as_deref(), Some("coding"));
@@ -7229,7 +7251,7 @@ mod tests {
         assert!(item.is_enabled());
         assert!(matches!(
             &item.action,
-            MenuAction::SendAppUi(AppUiCommand::ListApprovalScopes(_))
+            MenuAction::SendAppUi(command) if matches!(command.as_ref(), AppUiCommand::ListApprovalScopes(_))
         ));
     }
 
@@ -7343,7 +7365,7 @@ mod tests {
         assert!(full_access.is_enabled());
         assert!(matches!(
             &full_access.action,
-            MenuAction::SendAppUi(AppUiCommand::SetPermissionProfile(_))
+            MenuAction::SendAppUi(command) if matches!(command.as_ref(), AppUiCommand::SetPermissionProfile(_))
         ));
 
         let refresh = spec
@@ -7354,7 +7376,7 @@ mod tests {
         assert!(refresh.is_enabled());
         assert!(matches!(
             &refresh.action,
-            MenuAction::SendAppUi(AppUiCommand::ListPermissionProfiles(_))
+            MenuAction::SendAppUi(command) if matches!(command.as_ref(), AppUiCommand::ListPermissionProfiles(_))
         ));
     }
 
@@ -7444,8 +7466,7 @@ mod tests {
             .find(|item| item.id == "permissions.default")
             .expect("default row");
         assert!(!default.state.current);
-        let MenuAction::SendAppUi(AppUiCommand::SetPermissionProfile(params)) = &default.action
-        else {
+        let AppUiCommand::SetPermissionProfile(params) = appui_command(&default.action) else {
             panic!("expected permission profile update");
         };
         assert_eq!(params.update.approval_policy.as_deref(), Some("on-request"));

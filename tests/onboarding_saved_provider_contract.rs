@@ -99,7 +99,10 @@ fn onboard_open_with_profile_hydrates_saved_provider() {
     // fetch that profile's saved LLM state.
     let action = run_command(&mut store, "/onboard profile alex");
 
-    let KeyAction::Send(AppUiCommand::ProfileLlmList(params)) = action else {
+    let KeyAction::Send(command) = action else {
+        panic!("resolving a profile must hydrate profile/llm/list");
+    };
+    let AppUiCommand::ProfileLlmList(params) = *command else {
         panic!("resolving a profile must hydrate profile/llm/list");
     };
     assert_eq!(params.profile_id.as_deref(), Some("alex"));
@@ -107,7 +110,10 @@ fn onboard_open_with_profile_hydrates_saved_provider() {
     // Re-opening the wizard while the state is still missing re-requests it.
     let action = run_command(&mut store, "/onboard");
     assert!(
-        matches!(action, KeyAction::Send(AppUiCommand::ProfileLlmList(_))),
+        matches!(
+            action,
+            KeyAction::Send(command) if matches!(*command, AppUiCommand::ProfileLlmList(_))
+        ),
         "/onboard with a resolved profile but no llm state must hydrate"
     );
 }
@@ -121,7 +127,10 @@ fn hydrate_is_idempotent_for_current_profile() {
     let action = run_command(&mut store, "/onboard");
 
     assert!(
-        !matches!(action, KeyAction::Send(AppUiCommand::ProfileLlmList(_))),
+        !matches!(
+            action,
+            KeyAction::Send(command) if matches!(*command, AppUiCommand::ProfileLlmList(_))
+        ),
         "llm state for the current profile is already hydrated; no re-request"
     );
 }

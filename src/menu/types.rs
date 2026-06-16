@@ -103,7 +103,7 @@ pub struct CommandSpec {
 
 impl CommandSpec {
     pub fn matches_name(&self, candidate: &str) -> bool {
-        self.name == candidate || self.aliases.iter().any(|alias| *alias == candidate)
+        self.name == candidate || self.aliases.contains(&candidate)
     }
 
     pub fn slash_name(&self) -> String {
@@ -240,6 +240,7 @@ impl AppUiActionKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocalAction {
     ShowProcessStatus,
+    ActivityNavigator,
     StopActiveTurn,
     Exit,
     ShowHelp,
@@ -476,9 +477,15 @@ pub enum MenuAction {
     Close,
     CloseAll,
     Local(LocalAction),
-    SendAppUi(AppUiCommand),
+    SendAppUi(Box<AppUiCommand>),
     SubmitPrompt(String),
     Noop,
+}
+
+impl MenuAction {
+    pub fn send_appui(command: AppUiCommand) -> Self {
+        Self::SendAppUi(Box::new(command))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -488,7 +495,7 @@ pub enum ClientEffect {
     CloseMenu,
     CloseAllMenus,
     Local(LocalAction),
-    SendAppUi(AppUiCommand),
+    SendAppUi(Box<AppUiCommand>),
     SubmitPrompt(String),
     Status(String),
 }

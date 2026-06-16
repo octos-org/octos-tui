@@ -289,12 +289,10 @@ impl Store {
             .filter_map(|visible| {
                 let command = visible.command;
                 let names = std::iter::once(command.name).chain(command.aliases.iter().copied());
-                let rank = if query.is_empty() {
-                    Some(0)
-                } else if names
+                let exact_match = names
                     .clone()
-                    .any(|name| name.eq_ignore_ascii_case(query.as_str()))
-                {
+                    .any(|name| name.eq_ignore_ascii_case(query.as_str()));
+                let rank = if query.is_empty() || exact_match {
                     Some(0)
                 } else if names
                     .clone()
@@ -925,6 +923,12 @@ impl Store {
         match action {
             LocalAction::ShowProcessStatus => {
                 self.show_local_process_status();
+                None
+            }
+            LocalAction::ActivityNavigator => {
+                self.close_all_menus();
+                self.state.activity_navigator.open();
+                self.state.status = t!("status.activity_navigator_opened").into_owned();
                 None
             }
             LocalAction::StopActiveTurn => {
@@ -1639,7 +1643,7 @@ impl Store {
                 if self.block_onboarding_provider_edit_if_pending() {
                     return None;
                 }
-                self.state.onboarding.apply_selection(selection);
+                self.state.onboarding.apply_selection(*selection);
                 self.state.status = t!("status.provider_route_selected").into_owned();
                 if self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_ROUTE) {
                     self.close_all_menus();
@@ -2078,7 +2082,10 @@ impl Store {
             },
             ..LlmSelectionConfig::default()
         };
-        self.dispatch_onboarding_action(OnboardingAction::SetProviderSelection(selection), None)
+        self.dispatch_onboarding_action(
+            OnboardingAction::SetProviderSelection(Box::new(selection)),
+            None,
+        )
     }
 
     fn mark_onboarding_provider_dirty(
@@ -3062,14 +3069,11 @@ impl Store {
             .active()
             .map(|frame| frame.selected_index)
             .unwrap_or(0);
-        let Some(action) = self
+        let action = self
             .state
             .active_menu
             .as_ref()
-            .and_then(|menu| active_menu_selected_action(menu, selected_index))
-        else {
-            return None;
-        };
+            .and_then(|menu| active_menu_selected_action(menu, selected_index))?;
         self.dispatch_menu_action(action)
     }
 
@@ -3097,7 +3101,7 @@ impl Store {
                 None
             }
             MenuAction::Local(action) => self.dispatch_local_action(action, None),
-            MenuAction::SendAppUi(command) => Some(command),
+            MenuAction::SendAppUi(command) => Some(*command),
             MenuAction::SubmitPrompt(prompt) => {
                 self.start_prompt_turn(prompt, t!("status.queued_menu_prompt").into_owned())
             }
@@ -6647,9 +6651,7 @@ impl Store {
         let partial_fallback_summary =
             self.turn_partial_completion_fallback_message(&event.turn_id);
         let (status, reset_scroll, completed_current_turn) = {
-            let Some(session) = self.find_session_mut(&event.session_id) else {
-                return None;
-            };
+            let session = self.find_session_mut(&event.session_id)?;
             let title = session.title.clone();
             match session.live_reply.take() {
                 Some(live_reply) if live_reply.turn_id == event.turn_id => {
@@ -6733,9 +6735,7 @@ impl Store {
         let follow_tail = self.state.transcript_scroll == 0;
         let fallback_summary =
             self.turn_error_fallback_message(&event.turn_id, &event.code, &event.message);
-        let Some(session) = self.find_session_mut(&event.session_id) else {
-            return None;
-        };
+        let session = self.find_session_mut(&event.session_id)?;
         let title = session.title.clone();
         // `failed_current_turn`: this error terminates the LIVE turn — it owns
         // the retry-clear and the live-turn run-state transition.
@@ -7020,7 +7020,7 @@ impl Store {
                         let detail = activity
                             .detail
                             .as_deref()
-                            .or_else(|| Some(activity.status.as_str()))
+                            .or(Some(activity.status.as_str()))
                             .unwrap_or_default();
                         push_unique_summary(
                             &mut summary.files_changed,
@@ -8311,7 +8311,7 @@ mod tests {
         use octos_core::ui_protocol::ReasoningEffortLevel as L;
         let mut store = store_with_empty_session();
         let key = store.active_session().expect("active session").id.clone();
-        assert!(store.state.session_reasoning_effort.get(&key).is_none());
+        assert!(!store.state.session_reasoning_effort.contains_key(&key));
 
         store.dispatch_set_thinking("high");
         assert_eq!(
@@ -8326,7 +8326,7 @@ mod tests {
 
         // `default` clears the override (server default applies).
         store.dispatch_set_thinking("default");
-        assert!(store.state.session_reasoning_effort.get(&key).is_none());
+        assert!(!store.state.session_reasoning_effort.contains_key(&key));
 
         // Unknown arg is echoed and does not change the current level.
         store.dispatch_set_thinking("high");
@@ -8350,7 +8350,7 @@ mod tests {
 
         // Per-session: the level is keyed by SessionKey, not global.
         let other = SessionKey("local:other".into());
-        assert!(store.state.session_reasoning_effort.get(&other).is_none());
+        assert!(!store.state.session_reasoning_effort.contains_key(&other));
     }
 
     #[test]
@@ -8369,7 +8369,7 @@ mod tests {
 
         // The "Default" menu item clears the override.
         store.dispatch_set_thinking_level(None);
-        assert!(store.state.session_reasoning_effort.get(&key).is_none());
+        assert!(!store.state.session_reasoning_effort.contains_key(&key));
     }
 
     #[test]
@@ -10437,8 +10437,10 @@ mod tests {
     /// regression test pins the redaction contract.
     #[test]
     fn provider_api_key_is_redacted_in_debug_output() {
-        let mut state = crate::model::OnboardingWizardState::default();
-        state.api_key = Some(crate::model::SecretString::new("sk-very-secret-value-xyz"));
+        let state = crate::model::OnboardingWizardState {
+            api_key: Some(crate::model::SecretString::new("sk-very-secret-value-xyz")),
+            ..crate::model::OnboardingWizardState::default()
+        };
         let formatted = format!("{state:?}");
         assert!(
             !formatted.contains("sk-very-secret-value-xyz"),
@@ -10938,7 +10940,7 @@ mod tests {
         }))
         .expect("session/opened payload");
         store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened2)));
-        assert!(store.state.session_reasoning_effort.get(&sid).is_none());
+        assert!(!store.state.session_reasoning_effort.contains_key(&sid));
     }
 
     /// M22-D: when `permission/profile/set` is NOT advertised, the
