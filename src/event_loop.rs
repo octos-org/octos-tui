@@ -95,6 +95,9 @@ pub fn run(cli: Cli) -> Result<()> {
     // pinned); the default `native` keeps the wheel on the terminal so native
     // selection/copy survive. Seeded once at launch, read-only afterwards.
     store.state.pinned_scroll = cli.scroll_mode == crate::cli::ScrollMode::Pinned;
+    // Retain the launch config path so `/saveconfig` can persist runtime UI
+    // settings (theme/lang/scroll-mode) back into it.
+    store.state.config_path = cli.config.clone();
     // Seed the onboarding workspace candidate so the first-launch workspace
     // probe validates a real directory. The explicit `--cwd` wins; when it is
     // absent the store falls back to the process working directory (for

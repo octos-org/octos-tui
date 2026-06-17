@@ -69,6 +69,17 @@ pub enum ScrollMode {
     Pinned,
 }
 
+impl ScrollMode {
+    /// Kebab id symmetric with the `scroll-mode` config key / `--scroll-mode`
+    /// flag, so a saved value round-trips back through the loader.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScrollMode::Native => "native",
+            ScrollMode::Pinned => "pinned",
+        }
+    }
+}
+
 /// UI display language (i18n). English is the source/fallback locale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -240,7 +251,9 @@ pub struct CliFileConfig {
 impl Cli {
     pub fn parse() -> Result<Self> {
         let args = CliArgs::parse();
-        Self::from_args(args)
+        // Production launch reads the default config when no `--config` is
+        // given, so `/saveconfig` settings round-trip on the next plain launch.
+        Self::from_args(args, true)
     }
 
     #[cfg(test)]
@@ -250,12 +263,20 @@ impl Cli {
         T: Into<std::ffi::OsString> + Clone,
     {
         let args = CliArgs::try_parse_from(itr)?;
-        Self::from_args(args)
+        // Tests stay deterministic: don't read the ambient `$HOME` default
+        // config (the default-read path is covered by `load_config_file_if_present`
+        // tests, which inject a path instead of mutating `$HOME`).
+        Self::from_args(args, false)
     }
 
-    fn from_args(args: CliArgs) -> Result<Self> {
+    fn from_args(args: CliArgs, use_default_config: bool) -> Result<Self> {
         let file_config = match args.config.as_ref() {
             Some(path) => Some(load_config_file(path)?),
+            // No explicit `--config`: fall back to the default location so UI
+            // settings saved via `/saveconfig` (which writes there) round-trip
+            // on the next plain launch. Skipped in tests (`use_default_config`
+            // = false) so the suite never depends on the ambient `$HOME`.
+            None if use_default_config => load_default_config_file(),
             None => None,
         };
         let file_config = file_config.unwrap_or_default();
@@ -323,6 +344,103 @@ pub fn load_config_file(path: &Path) -> Result<CliFileConfig> {
         .wrap_err_with(|| format!("failed to read TUI config {}", path.display()))?;
     serde_json::from_str(&contents)
         .wrap_err_with(|| format!("failed to parse TUI config {}", path.display()))
+}
+
+/// Load the default config file (the path `/saveconfig` writes to when the
+/// session was launched without `--config`) so saved UI settings round-trip on
+/// the next plain launch. `None` when no default path resolves or the file is
+/// absent/unreadable (see [`load_config_file_if_present`]).
+fn load_default_config_file() -> Option<CliFileConfig> {
+    load_config_file_if_present(&default_config_path()?)
+}
+
+/// Leniently load an *auto-discovered* config file: a missing file is the
+/// normal first-run case and yields `None`; a present-but-unreadable/corrupt
+/// file must NOT block startup — unlike an explicit `--config`, the user didn't
+/// ask for this file — so we warn and fall back to built-in defaults rather
+/// than propagating the error. (Kept path-injectable so it's testable without
+/// mutating the process-global `$HOME`.)
+fn load_config_file_if_present(path: &Path) -> Option<CliFileConfig> {
+    if !path.exists() {
+        return None;
+    }
+    match load_config_file(path) {
+        Ok(config) => Some(config),
+        Err(error) => {
+            eprintln!(
+                "warning: ignoring unreadable default TUI config {}: {error}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Default config path used by `/saveconfig` when the session was launched
+/// without an explicit `--config`. Follows the XDG/CLI convention the backend
+/// adopted (`~/.config/octos-tui/config.json`).
+pub fn default_config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+    Some(
+        PathBuf::from(home)
+            .join(".config")
+            .join("octos-tui")
+            .join("config.json"),
+    )
+}
+
+/// Persist the runtime UI settings (theme / lang / scroll-mode) back into the
+/// config file, MERGING into whatever is already there: the existing JSON is
+/// read as a generic object and only these three keys are patched, so transport
+/// keys (stdio-command, profile-id, session, endpoint, …) and any unknown keys
+/// survive untouched. A missing or empty file starts from an empty object.
+/// Returns the path actually written.
+pub fn save_ui_settings(
+    path: &Path,
+    theme: ThemeName,
+    lang: Lang,
+    scroll_mode: ScrollMode,
+) -> Result<()> {
+    let mut root = match fs::read_to_string(path) {
+        Ok(contents) if contents.trim().is_empty() => {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+        Ok(contents) => serde_json::from_str::<serde_json::Value>(&contents)
+            .wrap_err_with(|| format!("failed to parse TUI config {}", path.display()))?,
+        // A not-yet-created file is the normal first-save case → start empty.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+        // Any OTHER read error (permissions, invalid UTF-8, …) must NOT be
+        // treated as empty: that would overwrite an existing config with only
+        // the UI keys, dropping the transport/unknown keys it otherwise
+        // preserves. Surface it so the save aborts instead of clobbering.
+        Err(error) => {
+            return Err(error)
+                .wrap_err_with(|| format!("failed to read TUI config {}", path.display()));
+        }
+    };
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| eyre!("TUI config {} is not a JSON object", path.display()))?;
+    object.insert("theme".into(), theme.as_str().into());
+    object.insert("lang".into(), lang.code().into());
+    object.insert("scroll-mode".into(), scroll_mode.as_str().into());
+    // Drop any legacy snake_case alias so the canonical key is authoritative.
+    object.remove("scroll_mode");
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("failed to create config dir {}", parent.display()))?;
+    }
+    let mut serialized =
+        serde_json::to_string_pretty(&root).wrap_err("failed to serialize TUI config")?;
+    serialized.push('\n');
+    fs::write(path, serialized)
+        .wrap_err_with(|| format!("failed to write TUI config {}", path.display()))
 }
 
 pub fn parse_websocket_url(value: &str) -> std::result::Result<String, String> {
@@ -393,6 +511,35 @@ mod tests {
         let cli = Cli::try_parse_from(["octos-tui"]).expect("parse default");
         // No flag/config/env override in this minimal invocation → English.
         assert!(matches!(cli.lang, super::Lang::En | super::Lang::Zh));
+    }
+
+    // The default-config read (used at launch when there's no `--config`) is
+    // lenient and path-injectable: a present file loads, an absent file yields
+    // None (the caller falls back to built-in defaults), and a corrupt/
+    // unreadable file is skipped rather than blocking startup. Exercised via an
+    // explicit path so it never mutates the process-global `$HOME`.
+    #[test]
+    fn default_config_load_is_lenient_and_path_injectable() {
+        let path = write_config("default-config", r#"{ "theme": "claude" }"#);
+
+        // Present + valid → loaded (this is what makes /saveconfig round-trip).
+        let cfg = super::load_config_file_if_present(&path).expect("present default config loads");
+        assert_eq!(cfg.theme, Some(ThemeName::Claude));
+
+        // Absent → None.
+        fs::remove_file(&path).expect("remove config");
+        assert!(
+            super::load_config_file_if_present(&path).is_none(),
+            "absent default config yields None"
+        );
+
+        // Present but corrupt → None (skipped, not a fatal startup error).
+        fs::write(&path, "{ not valid json").expect("write corrupt config");
+        assert!(
+            super::load_config_file_if_present(&path).is_none(),
+            "corrupt default config is skipped, not fatal"
+        );
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

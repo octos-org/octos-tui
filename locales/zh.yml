@@ -404,6 +404,8 @@ command:
     desc: 读取后端任务产物
   theme:
     desc: 选择本地 TUI 主题
+  saveconfig:
+    desc: "把当前主题/语言/滚动模式保存到配置文件。"
   scrollmode:
     desc: "切换滚轮滚动模式：/scrollmode [native|pinned]（不带参数为切换）。"
   thinking:
@@ -1193,6 +1195,10 @@ status:
   summary_none_observed: "未观察到"
   summary_not_reported: "未报告"
   summary_none_recorded: "未记录"
+saveconfig:
+  saved: "设置已保存到 %{path}。"
+  failed: "保存配置失败：%{error}"
+  no_path: "没有可用的配置路径可保存。"
 scrollmode:
   current: "（当前：%{mode}）"
   set_pinned: "滚动模式：pinned —— 滚轮滚动会话内容，输入框钉在底部（选择文本用 Shift+拖选）。"

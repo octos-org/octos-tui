@@ -386,6 +386,10 @@ lang:
   switched: "Language switched to English."
   usage: "Current language: %{current}. Usage: /lang <en|zh>."
   unknown: "Unknown language '%{value}'. Available: en, zh."
+saveconfig:
+  saved: "Settings saved to %{path}."
+  failed: "Could not save config: %{error}"
+  no_path: "No config path available to save to."
 scrollmode:
   current: "(current: %{mode})"
   set_pinned: "Scroll mode: pinned — the wheel scrolls the transcript, composer stays at the bottom (Shift+drag to select)."
@@ -791,6 +795,8 @@ command:
     desc: Read backend task artifacts.
   theme:
     desc: Choose the local TUI theme.
+  saveconfig:
+    desc: "Save the active appearance, language and scroll-mode to the config file."
   scrollmode:
     desc: 'Switch wheel-scroll behavior: /scrollmode [native|pinned] (bare toggles).'
   thinking:

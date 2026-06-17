@@ -3127,6 +3127,10 @@ pub struct AppState {
     /// pager bottom drops back to the inline tail. False = `native` (default):
     /// the wheel belongs to the terminal and native selection/copy stay intact.
     pub pinned_scroll: bool,
+    /// Path of the `--config` file this session launched from, retained so
+    /// `/saveconfig` can persist runtime UI settings back. `None` when launched
+    /// without `--config` (saving then falls back to the default path).
+    pub config_path: Option<std::path::PathBuf>,
     pub focus: FocusPane,
     pub artifacts: ArtifactPaneState,
     pub workspace: WorkspacePaneState,
@@ -4699,6 +4703,7 @@ impl AppState {
             transcript_scroll: 0,
             transcript_pager_active: false,
             pinned_scroll: false,
+            config_path: None,
             focus: FocusPane::Composer,
             artifacts: panes.artifacts,
             workspace: panes.workspace,

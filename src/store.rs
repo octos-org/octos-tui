@@ -1009,6 +1009,11 @@ impl Store {
                 self.close_all_menus();
                 None
             }
+            LocalAction::SaveConfig => {
+                self.dispatch_save_config();
+                self.close_all_menus();
+                None
+            }
             LocalAction::SetThinkingLevel(level) => self.dispatch_set_thinking_level(level),
             LocalAction::CopyLastReply => {
                 self.copy_last_reply();
@@ -1062,6 +1067,37 @@ impl Store {
     /// reasoning style; the server decides whether the effort is honored.
     /// `/thinking` with no arg opens the selection menu; with an arg
     /// (`low|medium|high|max|default`) it sets the level inline as a shortcut.
+    /// `/saveconfig` — persist the runtime UI settings (theme/lang/scroll-mode)
+    /// back to the launch config file (or the default path when launched without
+    /// `--config`), merging so transport/unknown keys survive. Status-row only.
+    fn dispatch_save_config(&mut self) {
+        let path = self
+            .state
+            .config_path
+            .clone()
+            .or_else(crate::cli::default_config_path);
+        let Some(path) = path else {
+            self.state.status = t!("saveconfig.no_path").into_owned();
+            return;
+        };
+        let scroll_mode = if self.state.pinned_scroll {
+            crate::cli::ScrollMode::Pinned
+        } else {
+            crate::cli::ScrollMode::Native
+        };
+        let lang =
+            crate::cli::Lang::from_env_value(&rust_i18n::locale()).unwrap_or(crate::cli::Lang::En);
+        match crate::cli::save_ui_settings(&path, self.state.theme, lang, scroll_mode) {
+            Ok(()) => {
+                self.state.status =
+                    t!("saveconfig.saved", path = path.display().to_string()).into_owned();
+            }
+            Err(err) => {
+                self.state.status = t!("saveconfig.failed", error = err.to_string()).into_owned();
+            }
+        }
+    }
+
     /// `/scrollmode` — runtime switch of the wheel-scroll model. Bare command
     /// toggles; `native`/`pinned` set explicitly. Mouse capture follows on the
     /// next frame (the draw loop re-syncs capture from `wants_mouse_capture`).
@@ -4572,6 +4608,14 @@ impl Store {
                 // server never echoes, so preserve it across snapshot replays
                 // (otherwise a launch --theme or a runtime /theme reverts to Codex).
                 let theme = self.state.theme;
+                // Local-only client settings the server never echoes, dropped by
+                // `from_snapshot`'s defaults: the launch config path (otherwise
+                // `/saveconfig` reverts to the default path after a reconnect
+                // instead of updating the launch `--config`) and the wheel
+                // scroll mode (otherwise a launch `--scroll-mode`/`/scrollmode`
+                // reverts to native).
+                let config_path = self.state.config_path.clone();
+                let pinned_scroll = self.state.pinned_scroll;
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
@@ -4599,6 +4643,8 @@ impl Store {
                 state.tool_config_catalog = tool_config_catalog;
                 state.session_reasoning_effort = session_reasoning_effort;
                 state.theme = theme;
+                state.config_path = config_path;
+                state.pinned_scroll = pinned_scroll;
                 state.restore_optimistic_user_messages();
                 self.state = state;
                 None
@@ -8231,7 +8277,11 @@ mod tests {
         assert!(!current_of("codex"), "non-active theme not current");
 
         // The active theme survives a snapshot replay (reconnect/refresh): the
-        // server never echoes it, so the client must preserve it locally.
+        // server never echoes it, so the client must preserve it locally. The
+        // launch config path and the wheel scroll mode are the same class of
+        // local-only setting and must survive the replay too.
+        store.state.config_path = Some(std::path::PathBuf::from("/tmp/launch-config.json"));
+        store.state.pinned_scroll = true;
         let sessions = store.state.sessions.clone();
         store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
             sessions,
@@ -8244,6 +8294,15 @@ mod tests {
             store.state.theme,
             ThemeName::Claude,
             "theme must survive snapshot replay"
+        );
+        assert_eq!(
+            store.state.config_path.as_deref(),
+            Some(std::path::Path::new("/tmp/launch-config.json")),
+            "launch config path must survive snapshot replay so /saveconfig keeps targeting it"
+        );
+        assert!(
+            store.state.pinned_scroll,
+            "wheel scroll mode must survive snapshot replay"
         );
     }
 
@@ -11358,7 +11417,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(labels, vec!["/keymap"]);
 
+        // Uniform completion: accepting the filtered item completes it into the
+        // composer (it does NOT open the menu yet) — consistent across all
+        // commands, argful or not.
         assert!(store.accept_active_menu_item().is_none());
+        assert_eq!(store.state.composer, "/keymap");
+        // The follow-up Enter resolves the now-complete command and opens it.
+        assert!(store.compose_command().is_none());
         assert_eq!(
             store
                 .state

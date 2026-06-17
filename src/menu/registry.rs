@@ -612,6 +612,15 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             entry: CommandEntry::LocalAction(LocalAction::SetScrollMode),
         },
         CommandSpec {
+            name: "saveconfig",
+            aliases: &["save-config"],
+            description: "command.saveconfig.desc",
+            category: CommandCategory::Settings,
+            availability: CommandAvailability::always(),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::LocalAction(LocalAction::SaveConfig),
+        },
+        CommandSpec {
             name: "statusline",
             aliases: &["status-line"],
             description: "command.statusline.desc",
