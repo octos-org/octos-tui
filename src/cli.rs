@@ -267,7 +267,10 @@ impl Cli {
     fn from_args(args: CliArgs) -> Result<Self> {
         let file_config = match args.config.as_ref() {
             Some(path) => Some(load_config_file(path)?),
-            None => None,
+            // No explicit `--config`: fall back to the default location so UI
+            // settings saved via `/saveconfig` (which writes there) round-trip
+            // on the next plain launch.
+            None => load_default_config_file(),
         };
         let file_config = file_config.unwrap_or_default();
 
@@ -334,6 +337,29 @@ pub fn load_config_file(path: &Path) -> Result<CliFileConfig> {
         .wrap_err_with(|| format!("failed to read TUI config {}", path.display()))?;
     serde_json::from_str(&contents)
         .wrap_err_with(|| format!("failed to parse TUI config {}", path.display()))
+}
+
+/// Load the default config file (the path `/saveconfig` writes to when the
+/// session was launched without `--config`) so saved UI settings round-trip on
+/// the next plain launch. A missing file is the normal first-run case and
+/// yields `None`. A present-but-unreadable/corrupt file must NOT block startup
+/// — unlike an explicit `--config`, the user didn't ask for this file — so we
+/// warn and fall back to built-in defaults rather than propagating the error.
+fn load_default_config_file() -> Option<CliFileConfig> {
+    let path = default_config_path()?;
+    if !path.exists() {
+        return None;
+    }
+    match load_config_file(&path) {
+        Ok(config) => Some(config),
+        Err(error) => {
+            eprintln!(
+                "warning: ignoring unreadable default TUI config {}: {error}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 /// Default config path used by `/saveconfig` when the session was launched
@@ -459,6 +485,65 @@ mod tests {
         let cli = Cli::try_parse_from(["octos-tui"]).expect("parse default");
         // No flag/config/env override in this minimal invocation → English.
         assert!(matches!(cli.lang, super::Lang::En | super::Lang::Zh));
+    }
+
+    // Without `--config`, startup now reads the default config path that
+    // `/saveconfig` writes to, so saved UI settings round-trip on a plain
+    // launch. A missing default file falls back to built-in defaults.
+    #[test]
+    fn loads_default_config_when_no_explicit_config_flag() {
+        use std::sync::Mutex;
+        // HOME is process-global; serialize HOME-mutating access.
+        static HOME_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is valid")
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("octos-tui-home-{nonce}"));
+        let cfg_dir = home.join(".config").join("octos-tui");
+        fs::create_dir_all(&cfg_dir).expect("config dir");
+        let cfg_path = cfg_dir.join("config.json");
+
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: the workspace denies unsafe and `std::env::set_var` is unsafe
+        // under edition 2024. Guarded by HOME_LOCK (no concurrent reader) and
+        // restored below before the guard drops.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        // A saved default config (theme=claude) is read on a plain launch.
+        fs::write(&cfg_path, r#"{ "theme": "claude" }"#).expect("write default config");
+        let cli = Cli::try_parse_from(["octos-tui"]).expect("parse with default config");
+        assert_eq!(
+            cli.theme,
+            ThemeName::Claude,
+            "default config saved by /saveconfig must be loaded on a plain launch"
+        );
+
+        // No default file present → built-in default theme.
+        fs::remove_file(&cfg_path).ok();
+        let cli = Cli::try_parse_from(["octos-tui"]).expect("parse without default config");
+        assert_eq!(
+            cli.theme,
+            ThemeName::Codex,
+            "absent default config → built-in default theme"
+        );
+
+        // Restore HOME so other tests see the original environment.
+        #[allow(unsafe_code)]
+        unsafe {
+            match prev_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
