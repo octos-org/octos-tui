@@ -264,22 +264,9 @@ impl Cli {
     {
         let args = CliArgs::try_parse_from(itr)?;
         // Tests stay deterministic: don't read the ambient `$HOME` default
-        // config. Use `try_parse_from_with_default` to exercise that path.
+        // config (the default-read path is covered by `load_config_file_if_present`
+        // tests, which inject a path instead of mutating `$HOME`).
         Self::from_args(args, false)
-    }
-
-    /// Test-only parse that controls whether the default-config fallback runs,
-    /// so the default-path behavior can be exercised under a temp `$HOME`
-    /// without making every other `try_parse_from` test depend on the ambient
-    /// environment.
-    #[cfg(test)]
-    pub fn try_parse_from_with_default<I, T>(itr: I, use_default_config: bool) -> Result<Self>
-    where
-        I: IntoIterator<Item = T>,
-        T: Into<std::ffi::OsString> + Clone,
-    {
-        let args = CliArgs::try_parse_from(itr)?;
-        Self::from_args(args, use_default_config)
     }
 
     fn from_args(args: CliArgs, use_default_config: bool) -> Result<Self> {
@@ -361,16 +348,23 @@ pub fn load_config_file(path: &Path) -> Result<CliFileConfig> {
 
 /// Load the default config file (the path `/saveconfig` writes to when the
 /// session was launched without `--config`) so saved UI settings round-trip on
-/// the next plain launch. A missing file is the normal first-run case and
-/// yields `None`. A present-but-unreadable/corrupt file must NOT block startup
-/// — unlike an explicit `--config`, the user didn't ask for this file — so we
-/// warn and fall back to built-in defaults rather than propagating the error.
+/// the next plain launch. `None` when no default path resolves or the file is
+/// absent/unreadable (see [`load_config_file_if_present`]).
 fn load_default_config_file() -> Option<CliFileConfig> {
-    let path = default_config_path()?;
+    load_config_file_if_present(&default_config_path()?)
+}
+
+/// Leniently load an *auto-discovered* config file: a missing file is the
+/// normal first-run case and yields `None`; a present-but-unreadable/corrupt
+/// file must NOT block startup — unlike an explicit `--config`, the user didn't
+/// ask for this file — so we warn and fall back to built-in defaults rather
+/// than propagating the error. (Kept path-injectable so it's testable without
+/// mutating the process-global `$HOME`.)
+fn load_config_file_if_present(path: &Path) -> Option<CliFileConfig> {
     if !path.exists() {
         return None;
     }
-    match load_config_file(&path) {
+    match load_config_file(path) {
         Ok(config) => Some(config),
         Err(error) => {
             eprintln!(
@@ -519,65 +513,33 @@ mod tests {
         assert!(matches!(cli.lang, super::Lang::En | super::Lang::Zh));
     }
 
-    // Without `--config`, startup now reads the default config path that
-    // `/saveconfig` writes to, so saved UI settings round-trip on a plain
-    // launch. A missing default file falls back to built-in defaults.
+    // The default-config read (used at launch when there's no `--config`) is
+    // lenient and path-injectable: a present file loads, an absent file yields
+    // None (the caller falls back to built-in defaults), and a corrupt/
+    // unreadable file is skipped rather than blocking startup. Exercised via an
+    // explicit path so it never mutates the process-global `$HOME`.
     #[test]
-    fn loads_default_config_when_no_explicit_config_flag() {
-        use std::sync::Mutex;
-        // HOME is process-global; serialize HOME-mutating access.
-        static HOME_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = HOME_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+    fn default_config_load_is_lenient_and_path_injectable() {
+        let path = write_config("default-config", r#"{ "theme": "claude" }"#);
 
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock is valid")
-            .as_nanos();
-        let home = std::env::temp_dir().join(format!("octos-tui-home-{nonce}"));
-        let cfg_dir = home.join(".config").join("octos-tui");
-        fs::create_dir_all(&cfg_dir).expect("config dir");
-        let cfg_path = cfg_dir.join("config.json");
+        // Present + valid → loaded (this is what makes /saveconfig round-trip).
+        let cfg = super::load_config_file_if_present(&path).expect("present default config loads");
+        assert_eq!(cfg.theme, Some(ThemeName::Claude));
 
-        let prev_home = std::env::var_os("HOME");
-        // SAFETY: the workspace denies unsafe and `std::env::set_var` is unsafe
-        // under edition 2024. Guarded by HOME_LOCK (no concurrent reader) and
-        // restored below before the guard drops.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-
-        // A saved default config (theme=claude) is read on a plain launch.
-        fs::write(&cfg_path, r#"{ "theme": "claude" }"#).expect("write default config");
-        let cli = Cli::try_parse_from_with_default(["octos-tui"], true)
-            .expect("parse with default config");
-        assert_eq!(
-            cli.theme,
-            ThemeName::Claude,
-            "default config saved by /saveconfig must be loaded on a plain launch"
+        // Absent → None.
+        fs::remove_file(&path).expect("remove config");
+        assert!(
+            super::load_config_file_if_present(&path).is_none(),
+            "absent default config yields None"
         );
 
-        // No default file present → built-in default theme.
-        fs::remove_file(&cfg_path).ok();
-        let cli = Cli::try_parse_from_with_default(["octos-tui"], true)
-            .expect("parse without default config");
-        assert_eq!(
-            cli.theme,
-            ThemeName::Codex,
-            "absent default config → built-in default theme"
+        // Present but corrupt → None (skipped, not a fatal startup error).
+        fs::write(&path, "{ not valid json").expect("write corrupt config");
+        assert!(
+            super::load_config_file_if_present(&path).is_none(),
+            "corrupt default config is skipped, not fatal"
         );
-
-        // Restore HOME so other tests see the original environment.
-        #[allow(unsafe_code)]
-        unsafe {
-            match prev_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
