@@ -251,7 +251,9 @@ pub struct CliFileConfig {
 impl Cli {
     pub fn parse() -> Result<Self> {
         let args = CliArgs::parse();
-        Self::from_args(args)
+        // Production launch reads the default config when no `--config` is
+        // given, so `/saveconfig` settings round-trip on the next plain launch.
+        Self::from_args(args, true)
     }
 
     #[cfg(test)]
@@ -261,16 +263,34 @@ impl Cli {
         T: Into<std::ffi::OsString> + Clone,
     {
         let args = CliArgs::try_parse_from(itr)?;
-        Self::from_args(args)
+        // Tests stay deterministic: don't read the ambient `$HOME` default
+        // config. Use `try_parse_from_with_default` to exercise that path.
+        Self::from_args(args, false)
     }
 
-    fn from_args(args: CliArgs) -> Result<Self> {
+    /// Test-only parse that controls whether the default-config fallback runs,
+    /// so the default-path behavior can be exercised under a temp `$HOME`
+    /// without making every other `try_parse_from` test depend on the ambient
+    /// environment.
+    #[cfg(test)]
+    pub fn try_parse_from_with_default<I, T>(itr: I, use_default_config: bool) -> Result<Self>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let args = CliArgs::try_parse_from(itr)?;
+        Self::from_args(args, use_default_config)
+    }
+
+    fn from_args(args: CliArgs, use_default_config: bool) -> Result<Self> {
         let file_config = match args.config.as_ref() {
             Some(path) => Some(load_config_file(path)?),
             // No explicit `--config`: fall back to the default location so UI
             // settings saved via `/saveconfig` (which writes there) round-trip
-            // on the next plain launch.
-            None => load_default_config_file(),
+            // on the next plain launch. Skipped in tests (`use_default_config`
+            // = false) so the suite never depends on the ambient `$HOME`.
+            None if use_default_config => load_default_config_file(),
+            None => None,
         };
         let file_config = file_config.unwrap_or_default();
 
@@ -388,11 +408,23 @@ pub fn save_ui_settings(
     scroll_mode: ScrollMode,
 ) -> Result<()> {
     let mut root = match fs::read_to_string(path) {
-        Ok(contents) if !contents.trim().is_empty() => {
-            serde_json::from_str::<serde_json::Value>(&contents)
-                .wrap_err_with(|| format!("failed to parse TUI config {}", path.display()))?
+        Ok(contents) if contents.trim().is_empty() => {
+            serde_json::Value::Object(serde_json::Map::new())
         }
-        _ => serde_json::Value::Object(serde_json::Map::new()),
+        Ok(contents) => serde_json::from_str::<serde_json::Value>(&contents)
+            .wrap_err_with(|| format!("failed to parse TUI config {}", path.display()))?,
+        // A not-yet-created file is the normal first-save case → start empty.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+        // Any OTHER read error (permissions, invalid UTF-8, …) must NOT be
+        // treated as empty: that would overwrite an existing config with only
+        // the UI keys, dropping the transport/unknown keys it otherwise
+        // preserves. Surface it so the save aborts instead of clobbering.
+        Err(error) => {
+            return Err(error)
+                .wrap_err_with(|| format!("failed to read TUI config {}", path.display()));
+        }
     };
     let object = root
         .as_object_mut()
@@ -519,7 +551,8 @@ mod tests {
 
         // A saved default config (theme=claude) is read on a plain launch.
         fs::write(&cfg_path, r#"{ "theme": "claude" }"#).expect("write default config");
-        let cli = Cli::try_parse_from(["octos-tui"]).expect("parse with default config");
+        let cli = Cli::try_parse_from_with_default(["octos-tui"], true)
+            .expect("parse with default config");
         assert_eq!(
             cli.theme,
             ThemeName::Claude,
@@ -528,7 +561,8 @@ mod tests {
 
         // No default file present → built-in default theme.
         fs::remove_file(&cfg_path).ok();
-        let cli = Cli::try_parse_from(["octos-tui"]).expect("parse without default config");
+        let cli = Cli::try_parse_from_with_default(["octos-tui"], true)
+            .expect("parse without default config");
         assert_eq!(
             cli.theme,
             ThemeName::Codex,

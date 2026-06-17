@@ -7,7 +7,7 @@
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use octos_core::{Message, SessionKey};
-use octos_tui::cli::{ScrollMode, ThemeName, load_config_file};
+use octos_tui::cli::{Lang, ScrollMode, ThemeName, load_config_file, save_ui_settings};
 use octos_tui::event_loop::handle_terminal_event;
 use octos_tui::model::{AppState, SessionView};
 use octos_tui::store::Store;
@@ -85,6 +85,28 @@ fn saveconfig_preserves_transport_keys() {
     let config = load_config_file(&path).expect("reparse");
     assert_eq!(config.stdio_command.as_deref(), Some("octos serve --stdio"));
     assert_eq!(config.profile_id.as_deref(), Some("alex"));
+}
+
+#[test]
+fn saveconfig_does_not_clobber_an_unreadable_config() {
+    // An existing-but-unreadable config (here: invalid UTF-8) must surface a
+    // read error rather than being treated as empty and overwritten with only
+    // the UI keys — that would silently drop the transport keys it holds.
+    let path = unique_dir("unreadable").join("config.json");
+    let original: &[u8] = &[0x66, 0x6f, 0x6f, 0xff, 0xfe]; // "foo" + invalid UTF-8
+    std::fs::write(&path, original).unwrap();
+
+    let result = save_ui_settings(&path, ThemeName::Claude, Lang::En, ScrollMode::Pinned);
+
+    assert!(
+        result.is_err(),
+        "an unreadable existing config must not be silently overwritten"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        original,
+        "the existing config file must be left intact when it can't be read"
+    );
 }
 
 #[test]

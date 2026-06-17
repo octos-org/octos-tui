@@ -4610,6 +4610,14 @@ impl Store {
                 // server never echoes, so preserve it across snapshot replays
                 // (otherwise a launch --theme or a runtime /theme reverts to Codex).
                 let theme = self.state.theme;
+                // Local-only client settings the server never echoes, dropped by
+                // `from_snapshot`'s defaults: the launch config path (otherwise
+                // `/saveconfig` reverts to the default path after a reconnect
+                // instead of updating the launch `--config`) and the wheel
+                // scroll mode (otherwise a launch `--scroll-mode`/`/scrollmode`
+                // reverts to native).
+                let config_path = self.state.config_path.clone();
+                let pinned_scroll = self.state.pinned_scroll;
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
@@ -4637,6 +4645,8 @@ impl Store {
                 state.tool_config_catalog = tool_config_catalog;
                 state.session_reasoning_effort = session_reasoning_effort;
                 state.theme = theme;
+                state.config_path = config_path;
+                state.pinned_scroll = pinned_scroll;
                 state.restore_optimistic_user_messages();
                 self.state = state;
                 None
@@ -8269,7 +8279,11 @@ mod tests {
         assert!(!current_of("codex"), "non-active theme not current");
 
         // The active theme survives a snapshot replay (reconnect/refresh): the
-        // server never echoes it, so the client must preserve it locally.
+        // server never echoes it, so the client must preserve it locally. The
+        // launch config path and the wheel scroll mode are the same class of
+        // local-only setting and must survive the replay too.
+        store.state.config_path = Some(std::path::PathBuf::from("/tmp/launch-config.json"));
+        store.state.pinned_scroll = true;
         let sessions = store.state.sessions.clone();
         store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
             sessions,
@@ -8282,6 +8296,15 @@ mod tests {
             store.state.theme,
             ThemeName::Claude,
             "theme must survive snapshot replay"
+        );
+        assert_eq!(
+            store.state.config_path.as_deref(),
+            Some(std::path::Path::new("/tmp/launch-config.json")),
+            "launch config path must survive snapshot replay so /saveconfig keeps targeting it"
+        );
+        assert!(
+            store.state.pinned_scroll,
+            "wheel scroll mode must survive snapshot replay"
         );
     }
 
