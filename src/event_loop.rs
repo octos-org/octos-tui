@@ -276,6 +276,7 @@ where
                 &store.state,
                 palette,
                 height,
+                size.height,
                 update.lines_to_insert,
                 live_tail_finalization,
             )
@@ -286,6 +287,7 @@ where
             &store.state,
             palette,
             height,
+            size.height,
             update.lines_to_insert,
             live_tail_finalization,
         )
@@ -297,6 +299,7 @@ fn draw_inline_frame<B>(
     state: &crate::model::AppState,
     palette: Palette,
     height: u16,
+    terminal_height: u16,
     lines_to_insert: Vec<ratatui::text::Line<'static>>,
     live_tail_finalization: Option<app::LiveTurnFinalization>,
 ) -> Result<()>
@@ -313,6 +316,7 @@ where
             frame,
             state,
             palette,
+            terminal_height,
             live_tail_finalization.as_ref(),
         );
     })?;

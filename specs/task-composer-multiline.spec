@@ -28,6 +28,11 @@ Vim 模式是独立的后续任务，不在本期。
   单行/空）→沿用现有 `scroll_transcript_up`。Down 对称。如此既得多行光标移动，又不丢
   "方向键滚动 transcript" 的既有手感。
 - **换行键位提示**：在 composer 底部提示串里加入换行键说明（en/zh 双语齐备）。
+- **输入框随换行长高（关键体验）**：composer 高度上限按**完整终端高度**计算，渲染
+  路径（`render_viewport`）必须与预留路径（`live_ui_height`）用同一基准——此前渲染
+  误用 inline 视口区域高度算上限、被钳到 3 行，导致多行输入丢前面的行。并且 inline
+  live-tail 用 `Min(1)` 布局，预留高度须把这 1 行算进去，否则空 tail 会少预留一行、
+  从 composer 偷走一行。
 
 ## 边界
 
@@ -99,3 +104,10 @@ Vim 模式是独立的后续任务，不在本期。
   假设 composer 含 "abc\nde"、光标在最后一行末尾
   当 用户按下 Down
   那么 不发生 panic、光标停在合法位置（回退为滚动 transcript）
+
+场景: 多行输入在 inline 视口里不被截断
+  测试: multiline_composer_not_capped_in_inline_viewport
+  假设 composer 含 6 个逻辑行、终端高 40
+  当 渲染 inline 视口
+  那么 首行与末行都可见（高度上限按完整终端高度、非视口区域高度）
+  并且 不出现"earlier lines hidden"截断

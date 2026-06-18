@@ -165,7 +165,11 @@ pub fn live_ui_height_with_finalization(
     let chrome = menu_height + autonomy_height + harness_height + composer_height + 1; // +1 status
 
     let tail_height = live_tail_height_with_finalization(app, width, height, live_finalization);
-    let total = chrome.saturating_add(tail_height);
+    // The live-tail pane is laid out with `Constraint::Min(1)`, so it always
+    // occupies at least one row even when there is no in-flight content. Reserve
+    // that floor here too, otherwise an empty tail under-reserves by a row and
+    // the layout steals it from the composer (clipping the last input line).
+    let total = chrome.saturating_add(tail_height.max(1));
 
     // Never let the live UI eat the whole screen: leave at least a few rows of
     // scrollback visible above it (so the user always sees prior output and can
@@ -212,17 +216,25 @@ fn live_tail_height_with_finalization(
 /// Mirrors `render_chat_layout` but the top pane shows only the live transcript
 /// tail (finalized history is in scrollback, not here).
 pub fn render_viewport(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
-    render_viewport_with_finalization(frame, app, palette, None);
+    let terminal_height = frame.area().height;
+    render_viewport_with_finalization(frame, app, palette, terminal_height, None);
 }
 
 pub fn render_viewport_with_finalization(
     frame: &mut impl FrameLike,
     app: &AppState,
     palette: Palette,
+    terminal_height: u16,
     live_finalization: Option<&LiveTurnFinalization>,
 ) {
     let area = frame.area();
-    let composer_height = composer_height_for_size(app, area.width, area.height);
+    // The composer cap must be derived from the FULL terminal height — the same
+    // basis `live_ui_height` used to RESERVE the composer rows. `area.height`
+    // here is only the inline viewport region (it already excludes scrollback),
+    // so deriving the cap from it would shrink the composer below what was
+    // reserved (cap floors at 3), clipping multi-line input. Everything else
+    // legitimately lays out within `area`.
+    let composer_height = composer_height_for_size(app, area.width, terminal_height);
     let active_menu = active_menu_surface(app);
     let menu_height = menu_height_for_viewport(
         active_menu.as_ref(),
@@ -12069,7 +12081,7 @@ mod tests {
         let area = Rect::new(0, 0, width, live_height);
         let mut buffer = Buffer::empty(area);
         let mut frame = crate::tui_terminal::Frame::for_test(area, &mut buffer);
-        render_viewport_with_finalization(&mut frame, app, palette, live_finalization);
+        render_viewport_with_finalization(&mut frame, app, palette, height, live_finalization);
         rendered_rows(&buffer)
     }
 
@@ -12744,5 +12756,38 @@ mod tests {
             multi > single,
             "composer height must grow with newlines: {multi} vs {single}"
         );
+    }
+
+    #[test]
+    fn multiline_composer_not_capped_in_inline_viewport() {
+        // Regression: the inline render derived the composer row cap from the
+        // small viewport-region height (flooring at 3 rows), so a 6-line draft
+        // dropped its earliest lines. The cap must come from the FULL terminal
+        // height — the same basis `live_ui_height` reserved against — so every
+        // line stays visible.
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:composer".into()),
+                title: "composer".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("hi")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.focus = crate::model::FocusPane::Composer;
+        app.composer = "L1\nL2\nL3\nL4\nL5\nL6".into();
+        let rows = viewport_rows(&app, 80, 40);
+        let joined = rows.join("\n");
+        for marker in ["L1", "L6"] {
+            assert!(
+                joined.contains(marker),
+                "composer line {marker} must stay visible (not capped); rows: {rows:#?}"
+            );
+        }
     }
 }
