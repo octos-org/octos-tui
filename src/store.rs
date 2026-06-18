@@ -1018,6 +1018,11 @@ impl Store {
                 self.close_all_menus();
                 None
             }
+            LocalAction::ToggleVimMode => {
+                self.dispatch_toggle_vim_mode();
+                self.close_all_menus();
+                None
+            }
             LocalAction::SetThinkingLevel(level) => self.dispatch_set_thinking_level(level),
             LocalAction::CopyLastReply => {
                 self.copy_last_reply();
@@ -1091,7 +1096,13 @@ impl Store {
         };
         let lang =
             crate::cli::Lang::from_env_value(&rust_i18n::locale()).unwrap_or(crate::cli::Lang::En);
-        match crate::cli::save_ui_settings(&path, self.state.theme, lang, scroll_mode) {
+        match crate::cli::save_ui_settings(
+            &path,
+            self.state.theme,
+            lang,
+            scroll_mode,
+            self.state.vim_mode,
+        ) {
             Ok(()) => {
                 self.state.status =
                     t!("saveconfig.saved", path = path.display().to_string()).into_owned();
@@ -1100,6 +1111,20 @@ impl Store {
                 self.state.status = t!("saveconfig.failed", error = err.to_string()).into_owned();
             }
         }
+    }
+
+    /// `/vimmode` — toggle Vim modal editing at runtime. Resets the composer to
+    /// Insert so typing works immediately after enabling; clears any pending
+    /// operator. Status-row only (persist with `/saveconfig`).
+    fn dispatch_toggle_vim_mode(&mut self) {
+        self.state.vim_mode = !self.state.vim_mode;
+        self.state.composer_mode = crate::model::ComposerMode::Insert;
+        self.state.composer_vim_pending = None;
+        self.state.status = if self.state.vim_mode {
+            t!("vimmode.enabled").into_owned()
+        } else {
+            t!("vimmode.disabled").into_owned()
+        };
     }
 
     /// `/scrollmode` — runtime switch of the wheel-scroll model. Bare command
@@ -4620,6 +4645,11 @@ impl Store {
                 // reverts to native).
                 let config_path = self.state.config_path.clone();
                 let pinned_scroll = self.state.pinned_scroll;
+                // Local-only Vim editing settings the server never echoes: the
+                // launch/runtime vim toggle and the current Normal/Insert mode
+                // (otherwise a reconnect drops you out of Vim mid-edit).
+                let vim_mode = self.state.vim_mode;
+                let composer_mode = self.state.composer_mode;
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
@@ -4649,6 +4679,8 @@ impl Store {
                 state.theme = theme;
                 state.config_path = config_path;
                 state.pinned_scroll = pinned_scroll;
+                state.vim_mode = vim_mode;
+                state.composer_mode = composer_mode;
                 state.restore_optimistic_user_messages();
                 self.state = state;
                 None

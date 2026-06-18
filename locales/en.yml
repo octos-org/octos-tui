@@ -199,6 +199,8 @@ app:
     more_queued: "+%{count} more queued"
   composer:
     preview_label: "preview"
+    vim_normal: "NORMAL"
+    vim_insert: "INSERT"
   artifact:
     from: "from %{source}"
   field:
@@ -400,6 +402,9 @@ scrollmode:
   set_pinned: "Scroll mode: pinned — the wheel scrolls the transcript, composer stays at the bottom (Shift+drag to select)."
   set_native: "Scroll mode: native — the wheel belongs to the terminal again (Ctrl+T opens the pager)."
   unknown: "Unknown scroll mode '%{value}'. Available: native, pinned."
+vimmode:
+  enabled: "Vim mode: on — Esc for Normal, i to insert (Insert mode now)."
+  disabled: "Vim mode: off — the composer is a plain text field again."
 thinking:
   usage: "Reasoning effort: %{current}. Usage: /thinking <low|medium|high|max|default>."
   set: "Reasoning effort set to %{level}."
@@ -808,6 +813,8 @@ command:
     desc: "Save the active appearance, language and scroll-mode to the config file."
   scrollmode:
     desc: 'Switch wheel-scroll behavior: /scrollmode [native|pinned] (bare toggles).'
+  vimmode:
+    desc: "Toggle Vim modal editing in the composer (Normal/Insert)."
   thinking:
     desc: 'Set reasoning effort for thinking models: /thinking low|medium|high|max|default.'
   threads:

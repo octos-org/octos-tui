@@ -2991,6 +2991,15 @@ pub enum FocusPane {
     Composer,
 }
 
+/// Composer editing mode under Vim (see `AppState.vim_mode`). `Insert` behaves
+/// like a plain text field; `Normal` interprets keys as Vim motions/operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ComposerMode {
+    #[default]
+    Insert,
+    Normal,
+}
+
 impl FocusPane {
     pub fn next(self) -> Self {
         match self {
@@ -3197,6 +3206,17 @@ pub struct AppState {
     /// pager bottom drops back to the inline tail. False = `native` (default):
     /// the wheel belongs to the terminal and native selection/copy stay intact.
     pub pinned_scroll: bool,
+    /// Vim modal editing for the composer (opt-in via `--vim-mode`/config
+    /// `vim-mode`/`/vimmode`). When false the composer behaves exactly as a
+    /// plain text field (equivalent to always-Insert); `composer_mode` is only
+    /// consulted when this is true.
+    pub vim_mode: bool,
+    /// Current composer editing mode under Vim. Defaults to `Insert` so typing
+    /// works immediately when Vim is enabled; `Esc` switches to `Normal`.
+    pub composer_mode: ComposerMode,
+    /// Pending Vim multi-key prefix in Normal mode (`g`/`d`/`c`), resolved or
+    /// cleared by the next key. `None` when no sequence is in progress.
+    pub composer_vim_pending: Option<char>,
     /// Path of the `--config` file this session launched from, retained so
     /// `/saveconfig` can persist runtime UI settings back. `None` when launched
     /// without `--config` (saving then falls back to the default path).
@@ -4800,6 +4820,9 @@ impl AppState {
             transcript_scroll: 0,
             transcript_pager_active: false,
             pinned_scroll: false,
+            vim_mode: false,
+            composer_mode: ComposerMode::Insert,
+            composer_vim_pending: None,
             config_path: None,
             activity_navigator: ActivityNavigatorState::default(),
             focus: FocusPane::Composer,
@@ -5977,6 +6000,90 @@ impl AppState {
         self.composer_cursor = Some(prev_word_boundary(&self.composer, cursor));
     }
 
+    /// Vim `e`: move to the last character of the next word.
+    pub fn move_composer_cursor_word_end(&mut self) {
+        let cursor = self.composer_cursor_index();
+        self.composer_cursor = Some(word_end_boundary(&self.composer, cursor));
+    }
+
+    /// Vim `w`: move to the start of the next word (skipping trailing
+    /// whitespace), unlike the emacs-style `next_word` which stops at word end.
+    pub fn move_composer_cursor_word_forward(&mut self) {
+        let cursor = self.composer_cursor_index();
+        self.composer_cursor = Some(vim_word_forward_boundary(&self.composer, cursor));
+    }
+
+    /// Vim `dw`: delete from the cursor to the start of the next word.
+    pub fn delete_composer_word_forward(&mut self) {
+        let cursor = self.composer_cursor_index();
+        let end = vim_word_forward_boundary(&self.composer, cursor);
+        self.composer.drain(cursor..end);
+        self.composer_cursor = Some(cursor);
+    }
+
+    /// Vim `gg`: jump to the very start of the buffer.
+    pub fn move_composer_cursor_buffer_start(&mut self) {
+        self.composer_cursor = Some(0);
+    }
+
+    /// Vim `G`: jump to the very end of the buffer.
+    pub fn move_composer_cursor_buffer_end(&mut self) {
+        self.composer_cursor = Some(self.composer.len());
+    }
+
+    /// Vim `dd`: delete the current logical line. Removes its trailing newline
+    /// (or, on the last line, the preceding one) so lines don't pile up empty.
+    pub fn delete_composer_line(&mut self) {
+        let cursor = self.composer_cursor_index();
+        let line_start = self.composer[..cursor]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let line_end = self.composer[cursor..]
+            .find('\n')
+            .map(|offset| cursor + offset)
+            .unwrap_or(self.composer.len());
+        let (drain_start, drain_end, new_cursor) = if line_end < self.composer.len() {
+            (line_start, line_end + 1, line_start)
+        } else if line_start > 0 {
+            (line_start - 1, line_end, line_start - 1)
+        } else {
+            (line_start, line_end, 0)
+        };
+        self.composer.drain(drain_start..drain_end);
+        self.composer_cursor = Some(self.clamp_composer_cursor(new_cursor));
+    }
+
+    /// Vim `cc` body: clear the current logical line's content, cursor at line
+    /// start (the caller switches to Insert).
+    pub fn clear_composer_line(&mut self) {
+        let cursor = self.composer_cursor_index();
+        let line_start = self.composer[..cursor]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let line_end = self.composer[cursor..]
+            .find('\n')
+            .map(|offset| cursor + offset)
+            .unwrap_or(self.composer.len());
+        self.composer.drain(line_start..line_end);
+        self.composer_cursor = Some(line_start);
+    }
+
+    /// Vim `o`: open a new line below the current one, cursor on it.
+    pub fn open_composer_line_below(&mut self) {
+        self.move_composer_cursor_line_end();
+        self.insert_composer_text("\n");
+    }
+
+    /// Vim `O`: open a new line above the current one, cursor on it.
+    pub fn open_composer_line_above(&mut self) {
+        self.move_composer_cursor_line_start();
+        let at = self.composer_cursor_index();
+        self.composer.insert(at, '\n');
+        self.composer_cursor = Some(at);
+    }
+
     pub fn move_composer_cursor_next_word(&mut self) {
         let cursor = self.composer_cursor_index();
         self.composer_cursor = Some(next_word_boundary(&self.composer, cursor));
@@ -6060,6 +6167,58 @@ fn next_char_boundary(text: &str, cursor: usize) -> Option<usize> {
         .nth(1)
         .map(|(idx, _)| cursor + idx)
         .or_else(|| (cursor < text.len()).then_some(text.len()))
+}
+
+/// Vim `w`: byte offset of the start of the next word at/after `cursor`. From a
+/// word, skips the rest of it then any whitespace; from whitespace, skips the
+/// whitespace. Returns `text.len()` when none remains.
+fn vim_word_forward_boundary(text: &str, cursor: usize) -> usize {
+    let cis: Vec<(usize, char)> = text.char_indices().collect();
+    let mut i = cis
+        .iter()
+        .position(|(b, _)| *b >= cursor)
+        .unwrap_or(cis.len());
+    if i >= cis.len() {
+        return text.len();
+    }
+    if cis[i].1.is_whitespace() {
+        while i < cis.len() && cis[i].1.is_whitespace() {
+            i += 1;
+        }
+    } else {
+        while i < cis.len() && !cis[i].1.is_whitespace() {
+            i += 1;
+        }
+        while i < cis.len() && cis[i].1.is_whitespace() {
+            i += 1;
+        }
+    }
+    if i >= cis.len() { text.len() } else { cis[i].0 }
+}
+
+/// Vim `e`: byte offset of the last character of the next word at/after
+/// `cursor`. Steps one char forward, skips whitespace, then lands on the final
+/// non-whitespace char of that word. Returns `text.len()` when none remains.
+fn word_end_boundary(text: &str, cursor: usize) -> usize {
+    let cis: Vec<(usize, char)> = text.char_indices().collect();
+    if cis.is_empty() {
+        return 0;
+    }
+    let mut i = cis
+        .iter()
+        .position(|(b, _)| *b >= cursor)
+        .unwrap_or(cis.len());
+    i += 1; // always move at least one char
+    while i < cis.len() && cis[i].1.is_whitespace() {
+        i += 1;
+    }
+    if i >= cis.len() {
+        return text.len();
+    }
+    while i + 1 < cis.len() && !cis[i + 1].1.is_whitespace() {
+        i += 1;
+    }
+    cis[i].0
 }
 
 fn prev_word_boundary(text: &str, cursor: usize) -> usize {

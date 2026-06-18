@@ -269,9 +269,12 @@ pub enum LocalAction {
     /// Set the per-session reasoning effort to a specific level from the
     /// `/thinking` selection menu. `None` clears the override (server default).
     SetThinkingLevel(Option<octos_core::ui_protocol::ReasoningEffortLevel>),
-    /// Persist the runtime UI settings (theme/lang/scroll-mode) back to the
-    /// launch config file (`/saveconfig`).
+    /// Persist the runtime UI settings (theme/lang/scroll-mode/vim-mode) back to
+    /// the launch config file (`/saveconfig`).
     SaveConfig,
+    /// Toggle Vim modal editing in the composer at runtime (`/vimmode`). Flips
+    /// the runtime `AppState.vim_mode`; the composer resets to Insert.
+    ToggleVimMode,
     /// Switch the wheel-scroll behavior at runtime (`/scrollmode` toggles,
     /// `/scrollmode <native|pinned>` sets). Only flips the runtime
     /// `AppState.pinned_scroll`; the launch config stays the default source.

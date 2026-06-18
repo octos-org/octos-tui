@@ -217,6 +217,7 @@ given.
 --theme <name>           codex | claude | slate | solarized | terminal
 --lang en|zh             UI language; falls back to OCTOS_LANG / LANG. Default: en
 --scroll-mode <mode>     native (terminal scrollback, default) | pinned (composer pinned)
+--vim-mode               enable Vim modal editing in the composer (default off)
 ```
 
 `--endpoint` and `--stdio-command` are mutually exclusive — pick one transport.
@@ -237,13 +238,15 @@ settings loaded by `octos serve`, and the TUI config rejects them.
   "readonly": false,
   "theme": "codex",
   "lang": "en",
-  "scroll-mode": "native"
+  "scroll-mode": "native",
+  "vim-mode": false
 }
 ```
 
-`/saveconfig` writes the active `theme` / `lang` / `scroll-mode` back into this
-file (merging — it never clobbers transport keys like `stdio_command`); without
-`--config` it falls back to `~/.config/octos-tui/config.json`.
+`/saveconfig` writes the active `theme` / `lang` / `scroll-mode` / `vim-mode`
+back into this file (merging — it never clobbers transport keys like
+`stdio_command`); without `--config` it falls back to
+`~/.config/octos-tui/config.json`.
 
 ### Themes
 
@@ -274,7 +277,8 @@ c       stage the selected hunk as next-turn context
 /lang       switch the UI language (menu, or /lang zh) — English / 中文
 /thinking   set reasoning effort for thinking models, per session (menu, or /thinking high)
 /scrollmode switch wheel-scroll behavior (toggle, or /scrollmode native|pinned)
-/saveconfig persist the active theme / language / scroll-mode to the config file
+/vimmode    toggle Vim modal editing in the composer (Normal/Insert)
+/saveconfig persist the active theme / language / scroll-mode / vim-mode to the config file
 /onboard    set onboarding fields inline (name, username, email, key, ...)
 ```
 
@@ -290,6 +294,27 @@ every command.
 
 Unknown slash commands are handled locally with a warning and are not sent to
 the model.
+
+### Composer editing
+
+The composer is multi-line: **Enter** sends, **Shift+Enter** (or **Ctrl+J** as a
+portable fallback) inserts a newline, and the box grows as you add lines. Arrow
+**Up/Down** move the cursor between lines (and fall back to scrolling the
+transcript at the first/last line). Emacs-style keys also work (Ctrl+A/E,
+Alt+B/F, Ctrl+W, Ctrl+K, …).
+
+**Vim mode** is opt-in — `--vim-mode`, config `"vim-mode": true`, or `/vimmode`
+at runtime; the composer title then shows `NORMAL` / `INSERT`. It implements a
+pragmatic subset:
+
+```text
+motions   h l j k   0 $   w b e   gg G
+edits     x   dd   dw   cc
+insert    i a A I o O      (Esc returns to Normal)
+```
+
+Enter still sends in both modes. Visual mode, registers/yank-paste, and numeric
+counts (`3dd`) are out of scope.
 
 ### Scrolling and the transcript pager
 

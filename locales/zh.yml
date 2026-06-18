@@ -188,6 +188,8 @@ app:
     more_queued: "+%{count} 条更多已排队"
   composer:
     preview_label: "预览"
+    vim_normal: "NORMAL"
+    vim_insert: "INSERT"
   artifact:
     from: "来自 %{source}"
   field:
@@ -415,6 +417,8 @@ command:
     desc: "把当前主题/语言/滚动模式保存到配置文件。"
   scrollmode:
     desc: "切换滚轮滚动模式：/scrollmode [native|pinned]（不带参数为切换）。"
+  vimmode:
+    desc: "切换输入框的 Vim 模态编辑（Normal/Insert）。"
   thinking:
     desc: 设置思考模型的思考强度：/thinking low|medium|high|max|default
   threads:
@@ -1213,6 +1217,9 @@ scrollmode:
   set_pinned: "滚动模式：pinned —— 滚轮滚动会话内容，输入框钉在底部（选择文本用 Shift+拖选）。"
   set_native: "滚动模式：native —— 滚轮归还终端（Ctrl+T 进入回看）。"
   unknown: "未知滚动模式 '%{value}'。可用：native、pinned。"
+vimmode:
+  enabled: "Vim 模式：开 —— Esc 进 Normal，i 进 Insert（当前 Insert）。"
+  disabled: "Vim 模式：关 —— 输入框恢复为普通文本框。"
 thinking:
   cleared: 已清除推理强度，使用服务器默认值。
   no_session: 没有活动会话——请先打开或选择一个会话。

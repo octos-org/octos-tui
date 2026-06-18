@@ -6007,6 +6007,7 @@ mod tests {
             theme: crate::cli::ThemeName::Codex,
             lang: crate::cli::Lang::En,
             scroll_mode: crate::cli::ScrollMode::Native,
+            vim_mode: false,
         };
 
         let launch = launch_from_cli(&cli);
@@ -7123,6 +7124,7 @@ mod tests {
             theme: crate::cli::ThemeName::Codex,
             lang: crate::cli::Lang::En,
             scroll_mode: crate::cli::ScrollMode::Native,
+            vim_mode: false,
         };
 
         let launch = launch_from_cli(&cli);

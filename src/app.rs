@@ -6126,8 +6126,20 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
         }
     }
 
+    // When Vim mode is on, surface the current Normal/Insert mode in the title
+    // so the user always knows which mode their keys act in.
+    let title = if app.vim_mode {
+        let mode = if app.composer_mode == crate::model::ComposerMode::Normal {
+            t!("app.composer.vim_normal")
+        } else {
+            t!("app.composer.vim_insert")
+        };
+        format!("{} · {}", t!("app.pane.composer"), mode)
+    } else {
+        t!("app.pane.composer").to_string()
+    };
     let block = titled_block(
-        t!("app.pane.composer").to_string(),
+        title,
         palette,
         app.focus == FocusPane::Composer,
         Some(t!("app.hint.composer_send").into_owned()),

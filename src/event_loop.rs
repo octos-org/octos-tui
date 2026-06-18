@@ -96,8 +96,11 @@ pub fn run(cli: Cli) -> Result<()> {
     // selection/copy survive. Seeded once at launch, read-only afterwards.
     store.state.pinned_scroll = cli.scroll_mode == crate::cli::ScrollMode::Pinned;
     // Retain the launch config path so `/saveconfig` can persist runtime UI
-    // settings (theme/lang/scroll-mode) back into it.
+    // settings (theme/lang/scroll-mode/vim-mode) back into it.
     store.state.config_path = cli.config.clone();
+    // Seed Vim modal editing from the launch flag/config (default off). Runtime
+    // `/vimmode` toggles it afterwards; the composer starts in Insert.
+    store.state.vim_mode = cli.vim_mode;
     // Seed the onboarding workspace candidate so the first-launch workspace
     // probe validates a real directory. The explicit `--cwd` wins; when it is
     // absent the store falls back to the process working directory (for
@@ -689,6 +692,13 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return handle_menu_key(store, key);
     }
 
+    // Vim modal editing: only after every overlay/menu has had its say, so Vim
+    // never hijacks their keys. No-op (returns None) unless Vim is enabled and
+    // the composer is focused.
+    if let Some(action) = handle_composer_vim_key(store, &key) {
+        return action;
+    }
+
     match key.code {
         KeyCode::Tab => {
             store.state.focus = store.state.focus.next();
@@ -970,6 +980,108 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
     }
 
     false
+}
+
+/// Vim modal editing for the composer (pragmatic subset). Returns `Some` when
+/// the key was consumed, `None` to fall through to the normal composer/global
+/// handling. No-op unless `vim_mode` is on and the composer is focused — so
+/// non-Vim users (and every overlay, which is checked earlier) are unaffected.
+fn handle_composer_vim_key(store: &mut Store, key: &KeyEvent) -> Option<KeyAction> {
+    use crate::model::ComposerMode;
+
+    if !store.state.vim_mode || store.state.focus != FocusPane::Composer {
+        return None;
+    }
+
+    // Insert mode behaves like a plain field; only Esc is special (→ Normal).
+    if store.state.composer_mode == ComposerMode::Insert {
+        if key.code == KeyCode::Esc {
+            store.state.composer_mode = ComposerMode::Normal;
+            store.state.composer_vim_pending = None;
+            return Some(KeyAction::Continue);
+        }
+        return None;
+    }
+
+    // ----- Normal mode -----
+    // Enter still submits: fall through to the Enter→submit arm.
+    if key.code == KeyCode::Enter {
+        store.state.composer_vim_pending = None;
+        return None;
+    }
+    // Esc clears any pending operator and stays in Normal (a no-op otherwise).
+    if key.code == KeyCode::Esc {
+        store.state.composer_vim_pending = None;
+        return Some(KeyAction::Continue);
+    }
+    // Non-character keys (arrows, etc.) fall through so they keep moving the
+    // cursor via the normal composer arms.
+    let KeyCode::Char(c) = key.code else {
+        return None;
+    };
+
+    // Resolve a pending two-key sequence (gg / dd / dw / cc).
+    if let Some(pending) = store.state.composer_vim_pending.take() {
+        match (pending, c) {
+            ('g', 'g') => store.state.move_composer_cursor_buffer_start(),
+            ('d', 'd') => store.state.delete_composer_line(),
+            ('d', 'w') => store.state.delete_composer_word_forward(),
+            ('c', 'c') => {
+                store.state.clear_composer_line();
+                store.state.composer_mode = ComposerMode::Insert;
+            }
+            // Unknown sequence — pending already cleared, swallow the key.
+            _ => {}
+        }
+        return Some(KeyAction::Continue);
+    }
+
+    match c {
+        // Motions.
+        'h' => store.state.move_composer_cursor_left(),
+        'l' => store.state.move_composer_cursor_right(),
+        'j' => {
+            store.state.move_composer_cursor_down();
+        }
+        'k' => {
+            store.state.move_composer_cursor_up();
+        }
+        '0' => store.state.move_composer_cursor_line_start(),
+        '$' => store.state.move_composer_cursor_line_end(),
+        'w' => store.state.move_composer_cursor_word_forward(),
+        'b' => store.state.move_composer_cursor_prev_word(),
+        'e' => store.state.move_composer_cursor_word_end(),
+        'G' => store.state.move_composer_cursor_buffer_end(),
+        // Edits.
+        'x' => store.state.delete_composer_next_char(),
+        // Operator/jump prefixes — wait for the second key.
+        'g' | 'd' | 'c' => store.state.composer_vim_pending = Some(c),
+        // Enter Insert mode (positioning variants).
+        'i' => store.state.composer_mode = ComposerMode::Insert,
+        'a' => {
+            store.state.move_composer_cursor_right();
+            store.state.composer_mode = ComposerMode::Insert;
+        }
+        'A' => {
+            store.state.move_composer_cursor_line_end();
+            store.state.composer_mode = ComposerMode::Insert;
+        }
+        'I' => {
+            store.state.move_composer_cursor_line_start();
+            store.state.composer_mode = ComposerMode::Insert;
+        }
+        'o' => {
+            store.state.open_composer_line_below();
+            store.state.composer_mode = ComposerMode::Insert;
+        }
+        'O' => {
+            store.state.open_composer_line_above();
+            store.state.composer_mode = ComposerMode::Insert;
+        }
+        // Any other key in Normal mode is swallowed (never inserts text).
+        _ => {}
+    }
+    Some(KeyAction::Continue)
 }
 
 fn handle_composer_enter(store: &mut Store) -> KeyAction {

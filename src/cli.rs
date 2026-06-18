@@ -138,6 +138,8 @@ pub struct Cli {
     pub lang: Lang,
     /// Wheel-scroll behavior for the chat flow.
     pub scroll_mode: ScrollMode,
+    /// Vim modal editing for the composer (opt-in; default off).
+    pub vim_mode: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -212,6 +214,11 @@ struct CliArgs {
     /// (native selection then needs Shift+drag).
     #[arg(long = "scroll-mode", value_enum)]
     pub scroll_mode: Option<ScrollMode>,
+
+    /// Enable Vim modal editing in the composer (Normal/Insert). Off by default;
+    /// also toggled at runtime with `/vimmode`.
+    #[arg(long = "vim-mode")]
+    pub vim_mode: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -246,6 +253,9 @@ pub struct CliFileConfig {
 
     #[serde(alias = "scroll_mode")]
     pub scroll_mode: Option<ScrollMode>,
+
+    #[serde(alias = "vim_mode")]
+    pub vim_mode: Option<bool>,
 }
 
 impl Cli {
@@ -335,6 +345,10 @@ impl Cli {
                 .scroll_mode
                 .or(file_config.scroll_mode)
                 .unwrap_or_default(),
+            // The flag is a bare bool (no way to distinguish "unset" from
+            // "false"), so the CLI flag only force-enables; the config provides
+            // the default when the flag is absent.
+            vim_mode: args.vim_mode || file_config.vim_mode.unwrap_or(false),
         })
     }
 }
@@ -404,17 +418,18 @@ fn config_path_from_home(
     )
 }
 
-/// Persist the runtime UI settings (theme / lang / scroll-mode) back into the
-/// config file, MERGING into whatever is already there: the existing JSON is
-/// read as a generic object and only these three keys are patched, so transport
-/// keys (stdio-command, profile-id, session, endpoint, …) and any unknown keys
-/// survive untouched. A missing or empty file starts from an empty object.
-/// Returns the path actually written.
+/// Persist the runtime UI settings (theme / lang / scroll-mode / vim-mode) back
+/// into the config file, MERGING into whatever is already there: the existing
+/// JSON is read as a generic object and only these keys are patched, so
+/// transport keys (stdio-command, profile-id, session, endpoint, …) and any
+/// unknown keys survive untouched. A missing or empty file starts from an empty
+/// object. Returns the path actually written.
 pub fn save_ui_settings(
     path: &Path,
     theme: ThemeName,
     lang: Lang,
     scroll_mode: ScrollMode,
+    vim_mode: bool,
 ) -> Result<()> {
     let mut root = match fs::read_to_string(path) {
         Ok(contents) if contents.trim().is_empty() => {
@@ -441,8 +456,10 @@ pub fn save_ui_settings(
     object.insert("theme".into(), theme.as_str().into());
     object.insert("lang".into(), lang.code().into());
     object.insert("scroll-mode".into(), scroll_mode.as_str().into());
-    // Drop any legacy snake_case alias so the canonical key is authoritative.
+    object.insert("vim-mode".into(), vim_mode.into());
+    // Drop any legacy snake_case aliases so the canonical keys are authoritative.
     object.remove("scroll_mode");
+    object.remove("vim_mode");
 
     if let Some(parent) = path
         .parent()

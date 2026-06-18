@@ -96,7 +96,13 @@ fn saveconfig_does_not_clobber_an_unreadable_config() {
     let original: &[u8] = &[0x66, 0x6f, 0x6f, 0xff, 0xfe]; // "foo" + invalid UTF-8
     std::fs::write(&path, original).unwrap();
 
-    let result = save_ui_settings(&path, ThemeName::Claude, Lang::En, ScrollMode::Pinned);
+    let result = save_ui_settings(
+        &path,
+        ThemeName::Claude,
+        Lang::En,
+        ScrollMode::Pinned,
+        false,
+    );
 
     assert!(
         result.is_err(),
