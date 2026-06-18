@@ -378,11 +378,26 @@ fn load_config_file_if_present(path: &Path) -> Option<CliFileConfig> {
 
 /// Default config path used by `/saveconfig` when the session was launched
 /// without an explicit `--config`. Follows the XDG/CLI convention the backend
-/// adopted (`~/.config/octos-tui/config.json`).
+/// adopted (`~/.config/octos-tui/config.json`). Falls back to `USERPROFILE` on
+/// Windows, where `HOME` is usually unset, so `/saveconfig` still has a default
+/// home to write to there.
 pub fn default_config_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+    config_path_from_home(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+/// Pure resolver behind [`default_config_path`]: prefer `HOME`, fall back to
+/// `USERPROFILE` (Windows, where `HOME` is usually unset). Empty values are
+/// ignored. Split out so the fallback is testable without mutating process env
+/// (`std::env::set_var` is `unsafe` under edition 2024 + `unsafe_code = deny`).
+fn config_path_from_home(
+    home: Option<std::ffi::OsString>,
+    userprofile: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let base = home
+        .filter(|value| !value.is_empty())
+        .or_else(|| userprofile.filter(|value| !value.is_empty()))?;
     Some(
-        PathBuf::from(home)
+        PathBuf::from(base)
             .join(".config")
             .join("octos-tui")
             .join("config.json"),
@@ -502,6 +517,35 @@ mod tests {
         assert_eq!(Lang::from_env_value(""), None);
         assert_eq!(Lang::Zh.code(), "zh");
         assert_eq!(Lang::En.code(), "en");
+    }
+
+    #[test]
+    fn config_path_prefers_home_then_userprofile() {
+        use super::config_path_from_home;
+        use std::ffi::OsString;
+
+        let suffix: PathBuf = [".config", "octos-tui", "config.json"].iter().collect();
+
+        // HOME wins when set.
+        let from_home = config_path_from_home(Some(OsString::from("/home/u")), None)
+            .expect("HOME resolves a path");
+        assert!(from_home.starts_with("/home/u") && from_home.ends_with(&suffix));
+
+        // Windows: HOME unset/empty → fall back to USERPROFILE.
+        let from_profile = config_path_from_home(
+            Some(OsString::new()),
+            Some(OsString::from("C:\\Users\\Alex")),
+        )
+        .expect("USERPROFILE resolves a path when HOME is empty");
+        assert!(from_profile.ends_with(&suffix));
+        assert!(
+            config_path_from_home(None, Some(OsString::from("C:\\Users\\Alex"))).is_some(),
+            "missing HOME still resolves via USERPROFILE"
+        );
+
+        // Neither set (or both empty) → no default path.
+        assert!(config_path_from_home(None, None).is_none());
+        assert!(config_path_from_home(Some(OsString::new()), Some(OsString::new())).is_none());
     }
 
     #[test]
