@@ -3673,6 +3673,40 @@ fn markdown_table_separator(line: &str) -> bool {
     })
 }
 
+/// Parse a markdown link `[text](url)` at the start of `s`, requiring
+/// non-empty text AND url. Returns `(link_text, url, consumed_bytes)`, or `None`
+/// to fall through to the plain-text path. Shared by the span renderer and the
+/// width-measurement path (`plain_inline_markdown`) so the two cannot drift —
+/// a link in a table cell measures exactly what it renders.
+fn parse_markdown_link(s: &str) -> Option<(&str, &str, usize)> {
+    let after_lb = s.strip_prefix('[')?;
+    let mid = after_lb.find("](")?;
+    let rel_close = after_lb[mid + 2..].find(')')?;
+    let link_text = &after_lb[..mid];
+    let url = &after_lb[mid + 2..mid + 2 + rel_close];
+    if link_text.is_empty() || url.is_empty() {
+        return None;
+    }
+    // '[' + link_text + "](" + url + ')'
+    Some((link_text, url, 1 + mid + 2 + rel_close + 1))
+}
+
+/// Parse `~~text~~` at the start of `s`, requiring NON-WHITESPACE content
+/// between the markers. Returns `(struck_text, consumed_bytes)`, or `None` for
+/// degenerate forms (`~~~~`, `~~ ~~`) so they fall through to the plain-text
+/// path and the literal tildes survive instead of being silently eaten. Shared
+/// by the span renderer and `plain_inline_markdown` so width matches render.
+fn parse_markdown_strikethrough(s: &str) -> Option<(&str, usize)> {
+    let after_open = s.strip_prefix("~~")?;
+    let close = after_open.find("~~")?;
+    let struck = &after_open[..close];
+    if struck.trim().is_empty() {
+        return None;
+    }
+    // "~~" + struck + "~~"
+    Some((struck, 2 + close + 2))
+}
+
 fn inline_markdown_spans(
     text: &str,
     normal_style: Style,
@@ -3690,38 +3724,26 @@ fn inline_markdown_spans(
         // terminal's native URL detector can linkify it for cmd/ctrl+click in
         // the native-scrollback flow. (When the link text already IS the url,
         // we show it once instead of duplicating.)
-        if let Some(after_lb) = rest.strip_prefix('[')
-            && let Some(mid) = after_lb.find("](")
-            && let Some(rel_close) = after_lb[mid + 2..].find(')')
-        {
-            let link_text = &after_lb[..mid];
-            let url = &after_lb[mid + 2..mid + 2 + rel_close];
-            if !link_text.is_empty() && !url.is_empty() {
-                if link_text == url {
-                    spans.push(Span::styled(url.to_string(), code_style));
-                } else {
-                    spans.push(Span::styled(link_text.to_string(), code_style));
-                    spans.push(Span::styled(
-                        format!(" ({url})"),
-                        normal_style.add_modifier(Modifier::DIM),
-                    ));
-                }
-                rest = &after_lb[mid + 2 + rel_close + 1..];
-                continue;
-            }
-        }
-
-        if let Some(after_open) = rest.strip_prefix("~~")
-            && let Some(close) = after_open.find("~~")
-        {
-            let struck = &after_open[..close];
-            if !struck.is_empty() {
+        if let Some((link_text, url, consumed)) = parse_markdown_link(rest) {
+            if link_text == url {
+                spans.push(Span::styled(url.to_string(), code_style));
+            } else {
+                spans.push(Span::styled(link_text.to_string(), code_style));
                 spans.push(Span::styled(
-                    struck.to_string(),
-                    normal_style.add_modifier(Modifier::CROSSED_OUT),
+                    format!(" ({url})"),
+                    normal_style.add_modifier(Modifier::DIM),
                 ));
             }
-            rest = &after_open[close + 2..];
+            rest = &rest[consumed..];
+            continue;
+        }
+
+        if let Some((struck, consumed)) = parse_markdown_strikethrough(rest) {
+            spans.push(Span::styled(
+                struck.to_string(),
+                normal_style.add_modifier(Modifier::CROSSED_OUT),
+            ));
+            rest = &rest[consumed..];
             continue;
         }
 
@@ -5275,6 +5297,25 @@ fn plain_inline_markdown(text: &str) -> String {
     let mut output = String::new();
     let mut rest = text;
     while !rest.is_empty() {
+        // Mirror the link/strikethrough rendering exactly so the measured width
+        // equals what `inline_markdown_spans` draws — otherwise a link in a
+        // table cell sizes the column by the raw `[text](url)` markup and can
+        // shrink/ellipsize unrelated columns (issue #207).
+        if let Some((link_text, url, consumed)) = parse_markdown_link(rest) {
+            if link_text == url {
+                output.push_str(url);
+            } else {
+                output.push_str(link_text);
+                output.push_str(&format!(" ({url})"));
+            }
+            rest = &rest[consumed..];
+            continue;
+        }
+        if let Some((struck, consumed)) = parse_markdown_strikethrough(rest) {
+            output.push_str(struck);
+            rest = &rest[consumed..];
+            continue;
+        }
         if let Some(after_open) = rest.strip_prefix("**")
             && let Some(close) = after_open.find("**")
         {
@@ -12607,5 +12648,84 @@ mod tests {
                 .any(|row| row.contains("COMMITTED_HISTORY_MARKER")),
             "committed history must stay in scrollback, not the inline viewport: {rows:#?}"
         );
+    }
+
+    // ===== markdown link/strikethrough edge cases (issue #207) =====
+
+    #[test]
+    fn markdown_link_and_strike_parsers_validate_content() {
+        // Well-formed link: returns (text, url, bytes consumed incl. delimiters).
+        assert_eq!(parse_markdown_link("[a](b)rest"), Some(("a", "b", 6)));
+        // Empty text or url → not a link (fall through to plain text).
+        assert_eq!(parse_markdown_link("[](b)"), None);
+        assert_eq!(parse_markdown_link("[a]()"), None);
+        assert_eq!(parse_markdown_link("plain"), None);
+        // Strikethrough requires non-whitespace content.
+        assert_eq!(parse_markdown_strikethrough("~~x~~y"), Some(("x", 5)));
+        assert_eq!(parse_markdown_strikethrough("~~~~"), None);
+        assert_eq!(parse_markdown_strikethrough("~~  ~~"), None);
+    }
+
+    #[test]
+    fn degenerate_strikethrough_keeps_literal_tildes() {
+        let style = Style::default();
+        // `~~~~` and `~~ ~~` have no real content: the markers must NOT be eaten
+        // — the literal tildes survive and nothing is struck through.
+        for input in ["~~~~", "~~ ~~"] {
+            let spans = inline_markdown_spans(input, style, style, style);
+            let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(text, input, "degenerate `{input}` must render literally");
+            assert!(
+                spans
+                    .iter()
+                    .all(|s| !s.style.add_modifier.contains(Modifier::CROSSED_OUT)),
+                "degenerate `{input}` must produce no struck span"
+            );
+        }
+        // A real strikethrough still renders struck.
+        let spans = inline_markdown_spans("~~gone~~", style, style, style);
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::CROSSED_OUT)
+                    && s.content.as_ref() == "gone"),
+            "a non-empty strikethrough must still be struck"
+        );
+    }
+
+    #[test]
+    fn table_cell_width_matches_rendered_link() {
+        // The width path (`plain_inline_markdown`) must measure the RENDERED
+        // link form, not the raw `[text](url)` markup, or a link in a table
+        // cell mis-sizes its column (issue #207).
+        assert_eq!(
+            plain_inline_markdown("[Octos](https://octos.dev)"),
+            "Octos (https://octos.dev)"
+        );
+        // When the text already IS the url it collapses to a single url — the
+        // measured width must collapse the same way (was measuring `[url](url)`).
+        assert_eq!(
+            plain_inline_markdown("[https://octos.dev](https://octos.dev)"),
+            "https://octos.dev"
+        );
+
+        // Measured text equals the concatenated rendered span text — same parser
+        // drives both, so they cannot drift.
+        let style = Style::default();
+        for input in [
+            "see [Octos](https://octos.dev) here",
+            "[https://octos.dev](https://octos.dev)",
+            "a ~~struck~~ b",
+        ] {
+            let rendered: String = inline_markdown_spans(input, style, style, style)
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert_eq!(
+                plain_inline_markdown(input),
+                rendered,
+                "width measurement must equal rendered text for `{input}`"
+            );
+        }
     }
 }

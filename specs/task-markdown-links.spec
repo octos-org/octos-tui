@@ -18,7 +18,12 @@ estimate: 0.5d
   会被计入宽度破坏布局。url **完整渲染、不截断**，使终端的裸 URL 自动识别能在
   native-scrollback 流里 linkify（cmd/ctrl+click）；当 link text 本身即 url 时
   只渲染一次，不重复。
-- 删除线 `~~text~~`：行内加 CROSSED_OUT modifier。
+- 删除线 `~~text~~`：行内加 CROSSED_OUT modifier。仅当标记间为**非空白**内容时
+  才消费标记；退化形式（`~~~~`、`~~ ~~`）回落普通文本路径，保留字面波浪号不吞掉
+  （#207）。
+- 宽度测量与渲染共用同一解析器：表格列宽走 `plain_inline_markdown`，必须按**渲染后**
+  的链接形态计宽（`text (url)`，或 text==url 时仅 `url`），不能按原始 `[text](url)`
+  标记计宽，否则单元格内链接会错误压缩相邻列（#207）。
 - 水平分割线：整行 `---` / `***` / `___`（≥3 个、去空白后纯重复符号）在块级
   渲染为一条 muted 横线（仿 `markdown_heading` 加 `markdown_hr` 判定）。
 - 嵌套列表 / 嵌套引用本期不做（成本高、价值低）。
@@ -78,3 +83,15 @@ estimate: 0.5d
   假设 正文含 [just brackets] 但其后无 (url)
   当 渲染行内 span
   那么 按普通文本渲染、不产生链接样式
+
+场景: 退化删除线保留字面波浪号
+  测试: degenerate_strikethrough_keeps_literal_tildes
+  假设 正文含 ~~~~ 或 ~~ ~~（标记间无实际内容）
+  当 渲染行内 span
+  那么 字面波浪号原样保留、无任何 CROSSED_OUT span
+
+场景: 表格单元格链接按渲染形态计宽
+  测试: table_cell_width_matches_rendered_link
+  假设 单元格正文含 markdown 链接
+  当 用 plain_inline_markdown 测量列宽
+  那么 测得文本等于渲染后的链接文字、与 span 渲染结果一致（不含 [ ] ( ) 标记）
