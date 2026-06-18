@@ -15,10 +15,12 @@ Vim 模式是独立的后续任务，不在本期。
 
 ## 已定决策
 
-- **换行键**：`Alt+Enter` 与 `Ctrl+J` 在 composer 聚焦时于光标处插入 `\n`，不发送。
-  二者并存：`Ctrl+J` 在所有终端都可靠（本就是 LF），`Alt(Option)+Enter` 多数终端可用。
-  不依赖 `Shift+Enter`（macOS Terminal.app 在无 Kitty/modifyOtherKeys 时收不到独立的
-  Shift+Enter）。插入逻辑复用既有 `insert_composer_text`。
+- **换行键**：`Shift+Enter`（首选、最直觉）、`Ctrl+J`（可移植兜底，本就是 LF）、
+  `Alt+Enter`（部分终端可用）在 composer 聚焦时于光标处插入 `\n`，不发送。
+  `Shift+Enter` 仅在终端上报该修饰键时到达应用（Kitty 键盘协议，或 Warp 这类直接映射
+  的终端）；否则普通 Enter 无法区分会发送，故 `Ctrl+J` 作可移植兜底。`Alt(Option)+Enter`
+  在以 `Enter+ALT` 上报的终端（如 iTerm2）有效；Warp 把 Option+Enter 发成 `ESC+CR`、接不住。
+  插入逻辑复用既有 `insert_composer_text`。
 - **Enter 语义不变**：普通 `Enter` 仍发送（`handle_composer_enter`），保留现有习惯；
   "粘贴多行"启发式 `should_insert_unbracketed_paste_newline` 不回归。
 - **上下行光标移动**：新增 `move_composer_cursor_up` / `move_composer_cursor_down`
@@ -59,7 +61,14 @@ Vim 模式是独立的后续任务，不在本期。
 
 ## 完成条件
 
-场景: Alt+Enter 在光标处插入换行而不发送
+场景: Shift+Enter 在光标处插入换行而不发送（首选键）
+  测试: shift_enter_inserts_newline_without_submitting
+  假设 composer 聚焦且含文本 "ab"、光标在末尾
+  当 用户按下 Shift+Enter
+  那么 composer 文本变为 "ab\n"
+  并且 不产生发送动作（不调用 turn/start）
+
+场景: Alt+Enter 在以 Enter+ALT 上报的终端插入换行
   测试: alt_enter_inserts_newline_without_submitting
   假设 composer 聚焦且含文本 "ab"、光标在末尾
   当 用户按下 Alt+Enter

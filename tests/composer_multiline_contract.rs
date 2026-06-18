@@ -57,6 +57,22 @@ fn alt_enter_inserts_newline_without_submitting() {
 }
 
 #[test]
+fn shift_enter_inserts_newline_without_submitting() {
+    // The primary newline key, for terminals that report the Shift modifier.
+    let mut store = composer_store("ab", Some(2));
+    let action = handle_terminal_event(&mut store, key(KeyCode::Enter, KeyModifiers::SHIFT));
+
+    assert_eq!(
+        store.state.composer, "ab\n",
+        "Shift+Enter must insert a newline"
+    );
+    assert!(
+        matches!(action, KeyAction::Continue),
+        "Shift+Enter must not submit the turn"
+    );
+}
+
+#[test]
 fn ctrl_j_inserts_newline() {
     let mut store = composer_store("ab", Some(2));
     let action = handle_terminal_event(&mut store, key(KeyCode::Char('j'), KeyModifiers::CONTROL));

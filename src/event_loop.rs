@@ -883,10 +883,22 @@ fn handle_activity_navigator_key(store: &mut Store, key: KeyEvent) -> KeyAction 
 }
 
 fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
+    // Shift+Enter is the primary, most intuitive newline key. It only reaches
+    // the app when the terminal reports the modifier (the Kitty keyboard
+    // protocol, or terminals like Warp that map it directly); otherwise plain
+    // Enter is indistinguishable and submits, which is why Ctrl+J is the
+    // portable fallback. Handled here, before the Enter→submit arm.
+    if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
+        store.state.insert_composer_text("\n");
+        return true;
+    }
+
     if key.modifiers.contains(KeyModifiers::ALT) {
         match key.code {
-            // Alt+Enter inserts a newline instead of submitting (plain Enter
-            // still submits). Without this the Enter arm below would send.
+            // Alt+Enter also inserts a newline where the terminal reports it as
+            // Enter+ALT (e.g. iTerm2). Some terminals (Warp) send Option+Enter
+            // as ESC+CR instead, where it can't be caught — use Shift+Enter or
+            // Ctrl+J there.
             KeyCode::Enter => {
                 store.state.insert_composer_text("\n");
                 return true;
