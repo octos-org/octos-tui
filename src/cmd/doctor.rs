@@ -13,27 +13,34 @@
 //!   shadowing installs.
 //! - **Terminal**: TERM/terminfo, UTF-8 locale, CJK width, color support.
 //! - **Config & data**: config dir + data dir writability.
-//! - **Backend**: stdio-command resolves (+ `octos --version`), and a
-//!   structural **protocol-skew** comparison of the TUI's compiled-in
-//!   `octos-core` schema/feature set against the protocol's known feature
-//!   registry. The live WS `config/capabilities/list` probe is a documented
-//!   TODO (see [`backend_checks`]).
+//! - **Backend**: stdio-command resolves (+ `octos --version`); configured WS
+//!   endpoints are probed with `config/capabilities/list`, falling back to a
+//!   structural protocol-skew check against the compiled-in `octos-core`.
 //! - **Network**: GitHub reachability.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use eyre::Result;
+use futures::{SinkExt, StreamExt};
 use octos_core::ui_protocol::{
-    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
-    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
-    UI_PROTOCOL_KNOWN_FEATURES, UI_PROTOCOL_SCHEMA_VERSION, UI_PROTOCOL_V1, UiProtocolCapabilities,
+    JSON_RPC_VERSION, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_KNOWN_FEATURES, UI_PROTOCOL_SCHEMA_VERSION,
+    UI_PROTOCOL_V1, UiProtocolCapabilities,
+};
+use tokio::runtime::Builder as TokioRuntimeBuilder;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message as WsMessage, client::IntoClientRequest},
 };
 
 use super::github::{self, Reachability};
 use super::install_method::{self, InstallMethod};
+use crate::model::{APPUI_METHOD_CONFIG_CAPABILITIES_LIST, ConfigCapabilitiesListResult};
 
 /// Features the TUI *requires* of any server it connects to (the set it sends
 /// in `X-Octos-Ui-Features`). The skew check fails when the server's schema is
@@ -779,20 +786,33 @@ fn backend_checks(args: &DoctorArgs) -> Vec<Check> {
     let mut checks = Vec::new();
 
     // Transport resolution.
+    let mut checked_live_protocol = false;
     if let Some(cmd) = &args.stdio_command {
         checks.push(stdio_command_check(cmd));
     } else if let Some(endpoint) = &args.endpoint {
-        // Live WS probe is a documented TODO; we record the configured endpoint
-        // and run the structural skew check below regardless.
-        checks.push(
-            Check::warn(
-                CAT_BACKEND,
-                "WS endpoint probe",
-                format!("endpoint configured ({endpoint}); live config/capabilities/list probe not yet wired"),
-                "run `octos-tui --endpoint … ` to exercise the live connection (TODO: doctor live WS probe)",
-            )
-            .with_value(endpoint.clone()),
-        );
+        match probe_ws_capabilities(endpoint) {
+            Ok(capabilities) => {
+                checks.push(
+                    Check::pass(
+                        CAT_BACKEND,
+                        "WS endpoint probe",
+                        "config/capabilities/list responded",
+                    )
+                    .with_value(endpoint.clone()),
+                );
+                checks.push(compare_against_server(&capabilities));
+                checked_live_protocol = true;
+            }
+            Err(message) => checks.push(
+                Check::warn(
+                    CAT_BACKEND,
+                    "WS endpoint probe",
+                    message,
+                    "ensure the octos server is running, the endpoint is correct, and auth requirements are satisfied",
+                )
+                .with_value(endpoint.clone()),
+            ),
+        }
     } else {
         checks.push(Check::pass(
             CAT_BACKEND,
@@ -801,10 +821,12 @@ fn backend_checks(args: &DoctorArgs) -> Vec<Check> {
         ));
     }
 
-    // Structural protocol-skew check (always runs; does not need a live
-    // server). Compares the TUI's required feature set + compiled-in schema
-    // version against the octos-core feature registry the TUI is built with.
-    checks.push(protocol_skew_check());
+    // Structural fallback when no live capabilities were available. Compares
+    // the TUI's required feature set + compiled-in schema version against the
+    // octos-core feature registry the TUI is built with.
+    if !checked_live_protocol {
+        checks.push(protocol_skew_check());
+    }
 
     checks
 }
@@ -938,14 +960,116 @@ fn stdio_command_check(command: &str) -> Check {
     }
 }
 
+const WS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const WS_PROBE_ID: &str = "octos-tui-doctor-capabilities";
+
+fn probe_ws_capabilities(endpoint: &str) -> std::result::Result<UiProtocolCapabilities, String> {
+    let runtime = TokioRuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("failed to create WS probe runtime: {err}"))?;
+
+    runtime.block_on(async move {
+        let mut request = endpoint
+            .into_client_request()
+            .map_err(|err| format!("failed to build WebSocket request: {err}"))?;
+        request.headers_mut().insert(
+            "X-Octos-Ui-Features",
+            TUI_REQUIRED_FEATURES
+                .join(",")
+                .parse()
+                .map_err(|err| format!("failed to build feature header: {err}"))?,
+        );
+
+        let (mut ws, _) = tokio::time::timeout(WS_PROBE_TIMEOUT, connect_async(request))
+            .await
+            .map_err(|_| format!("timed out connecting to {endpoint}"))?
+            .map_err(|err| format!("failed to connect to {endpoint}: {err}"))?;
+
+        let request = serde_json::json!({
+            "jsonrpc": JSON_RPC_VERSION,
+            "id": WS_PROBE_ID,
+            "method": APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
+            "params": {}
+        });
+        tokio::time::timeout(
+            WS_PROBE_TIMEOUT,
+            ws.send(WsMessage::Text(request.to_string().into())),
+        )
+        .await
+        .map_err(|_| "timed out sending config/capabilities/list".to_string())?
+        .map_err(|err| format!("failed to send config/capabilities/list: {err}"))?;
+
+        loop {
+            let Some(message) = tokio::time::timeout(WS_PROBE_TIMEOUT, ws.next())
+                .await
+                .map_err(|_| {
+                    "timed out waiting for config/capabilities/list response".to_string()
+                })?
+            else {
+                return Err("server closed before config/capabilities/list response".to_string());
+            };
+            let message =
+                message.map_err(|err| format!("failed to read capabilities response: {err}"))?;
+            match message {
+                WsMessage::Text(text) => {
+                    if let Some(capabilities) = decode_matching_capabilities_response(&text)? {
+                        return Ok(capabilities);
+                    }
+                }
+                WsMessage::Binary(bytes) => {
+                    let text = String::from_utf8(bytes.to_vec())
+                        .map_err(|err| format!("capabilities response is not UTF-8: {err}"))?;
+                    if let Some(capabilities) = decode_matching_capabilities_response(&text)? {
+                        return Ok(capabilities);
+                    }
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) => {}
+                WsMessage::Close(_) => {
+                    return Err(
+                        "server closed before config/capabilities/list response".to_string()
+                    );
+                }
+                WsMessage::Frame(_) => {}
+            }
+        }
+    })
+}
+
+fn decode_matching_capabilities_response(
+    text: &str,
+) -> std::result::Result<Option<UiProtocolCapabilities>, String> {
+    let frame: serde_json::Value = serde_json::from_str(text)
+        .map_err(|err| format!("capabilities response is not valid JSON: {err}"))?;
+    if frame.get("id") != Some(&serde_json::Value::String(WS_PROBE_ID.to_string())) {
+        return Ok(None);
+    }
+    if let Some(error) = frame.get("error") {
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown JSON-RPC error");
+        return Err(format!(
+            "config/capabilities/list returned JSON-RPC error: {message}"
+        ));
+    }
+    let result = frame
+        .get("result")
+        .cloned()
+        .ok_or_else(|| "capabilities response is missing result".to_string())?;
+    serde_json::from_value::<ConfigCapabilitiesListResult>(result)
+        .map(|result| result.capabilities)
+        .map(Some)
+        .map_err(|err| format!("failed to decode config/capabilities/list result: {err}"))
+}
+
 /// Structural protocol-skew check (design §B, P3 fallback).
 ///
 /// Compares what the TUI requires against the `octos-core` it was compiled
 /// with: confirms every [`TUI_REQUIRED_FEATURES`] entry is a known feature in
 /// this protocol build (so the TUI isn't asking for a feature the protocol
 /// crate no longer defines), and reports the compiled-in protocol/schema
-/// version. A live server `config/capabilities/list` comparison reuses
-/// [`compare_against_server`]; wiring the live WS handshake is a TODO.
+/// version.
 fn protocol_skew_check() -> Check {
     let unknown: Vec<&str> = TUI_REQUIRED_FEATURES
         .iter()
@@ -1107,6 +1231,127 @@ mod tests {
 
     fn server_caps() -> UiProtocolCapabilities {
         UiProtocolCapabilities::full_protocol()
+    }
+
+    #[test]
+    fn decode_capabilities_response_accepts_result() {
+        let caps = server_caps();
+        let text = serde_json::json!({
+            "jsonrpc": JSON_RPC_VERSION,
+            "id": WS_PROBE_ID,
+            "result": {
+                "capabilities": caps
+            }
+        })
+        .to_string();
+
+        let decoded = decode_matching_capabilities_response(&text)
+            .expect("capabilities decode")
+            .expect("matching response");
+        assert_eq!(decoded.version.protocol, UI_PROTOCOL_V1);
+    }
+
+    #[test]
+    fn decode_capabilities_response_reports_jsonrpc_error() {
+        let text = serde_json::json!({
+            "jsonrpc": JSON_RPC_VERSION,
+            "id": WS_PROBE_ID,
+            "error": {
+                "code": -32601,
+                "message": "method not found"
+            }
+        })
+        .to_string();
+
+        let err =
+            decode_matching_capabilities_response(&text).expect_err("error response rejected");
+        assert!(err.contains("method not found"));
+    }
+
+    #[test]
+    fn decode_matching_capabilities_response_ignores_unrelated_frame() {
+        let text = serde_json::json!({
+            "jsonrpc": JSON_RPC_VERSION,
+            "method": "server/heartbeat",
+            "params": {}
+        })
+        .to_string();
+
+        let decoded =
+            decode_matching_capabilities_response(&text).expect("unrelated frame is valid JSON");
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn ws_probe_ignores_unrelated_frames_and_fetches_live_capabilities() {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind test websocket server: {err}"),
+        };
+        listener
+            .set_nonblocking(true)
+            .expect("test websocket listener nonblocking");
+        let addr = listener.local_addr().expect("test websocket addr");
+
+        let thread = std::thread::spawn(move || {
+            let runtime = TokioRuntimeBuilder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test websocket runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("wrap test websocket listener");
+                let (stream, _) = listener.accept().await.expect("accept doctor probe");
+                let mut ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("accept doctor websocket");
+                let request = ws
+                    .next()
+                    .await
+                    .expect("doctor request arrives")
+                    .expect("doctor request reads");
+                let text = match request {
+                    WsMessage::Text(text) => text.to_string(),
+                    WsMessage::Binary(bytes) => {
+                        String::from_utf8(bytes.to_vec()).expect("binary request is UTF-8")
+                    }
+                    other => panic!("unexpected doctor websocket message: {other:?}"),
+                };
+                let frame: serde_json::Value =
+                    serde_json::from_str(&text).expect("doctor request is JSON");
+                assert_eq!(frame["method"], APPUI_METHOD_CONFIG_CAPABILITIES_LIST);
+                ws.send(WsMessage::Text(
+                    serde_json::json!({
+                        "jsonrpc": JSON_RPC_VERSION,
+                        "method": "server/heartbeat",
+                        "params": {}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("send unrelated notification");
+                ws.send(WsMessage::Text(
+                    serde_json::json!({
+                        "jsonrpc": JSON_RPC_VERSION,
+                        "id": frame["id"].clone(),
+                        "result": {
+                            "capabilities": server_caps()
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("send doctor capabilities response");
+            });
+        });
+
+        let caps = probe_ws_capabilities(&format!("ws://{addr}/ui-protocol"))
+            .expect("doctor probe returns capabilities");
+        thread.join().expect("test websocket exits");
+        assert_eq!(caps.version.protocol, UI_PROTOCOL_V1);
     }
 
     #[test]
