@@ -5924,6 +5924,54 @@ impl AppState {
         self.composer_cursor = Some(line_end);
     }
 
+    /// Move the cursor up one logical line (`\n`-separated), preserving the
+    /// column (char offset within the line). Returns `false` when already on the
+    /// first line so the caller can fall back to scrolling the transcript.
+    pub fn move_composer_cursor_up(&mut self) -> bool {
+        let cursor = self.composer_cursor_index();
+        let line_start = self.composer[..cursor]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        if line_start == 0 {
+            return false;
+        }
+        let column = self.composer[line_start..cursor].chars().count();
+        let prev_line_start = self.composer[..line_start - 1]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let prev_line = &self.composer[prev_line_start..line_start - 1];
+        self.composer_cursor = Some(prev_line_start + byte_offset_for_column(prev_line, column));
+        true
+    }
+
+    /// Move the cursor down one logical line, preserving the column. Returns
+    /// `false` when already on the last line so the caller can fall back to
+    /// scrolling the transcript.
+    pub fn move_composer_cursor_down(&mut self) -> bool {
+        let cursor = self.composer_cursor_index();
+        let Some(newline) = self.composer[cursor..]
+            .find('\n')
+            .map(|offset| cursor + offset)
+        else {
+            return false;
+        };
+        let line_start = self.composer[..cursor]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let column = self.composer[line_start..cursor].chars().count();
+        let next_line_start = newline + 1;
+        let next_line_end = self.composer[next_line_start..]
+            .find('\n')
+            .map(|offset| next_line_start + offset)
+            .unwrap_or(self.composer.len());
+        let next_line = &self.composer[next_line_start..next_line_end];
+        self.composer_cursor = Some(next_line_start + byte_offset_for_column(next_line, column));
+        true
+    }
+
     pub fn move_composer_cursor_prev_word(&mut self) {
         let cursor = self.composer_cursor_index();
         self.composer_cursor = Some(prev_word_boundary(&self.composer, cursor));
@@ -5982,6 +6030,16 @@ fn is_protocol_target(target: &str) -> bool {
         || target
             .get(..6)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("stdio:"))
+}
+
+/// Byte offset within `line` at the given column (char count), clamped to the
+/// end of the line when it is shorter than `column`. `line` must not contain a
+/// `\n` (callers pass a single logical line).
+fn byte_offset_for_column(line: &str, column: usize) -> usize {
+    line.char_indices()
+        .nth(column)
+        .map(|(idx, _)| idx)
+        .unwrap_or(line.len())
 }
 
 fn prev_char_boundary(text: &str, cursor: usize) -> Option<usize> {

@@ -720,6 +720,19 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::Up if store.state.transcript_pager_active => {
             store.state.scroll_transcript_up(1);
         }
+        // In the composer, Up/Down move the cursor between logical lines; at the
+        // first/last line they fall back to the existing transcript scroll so
+        // that affordance isn't lost.
+        KeyCode::Down if store.state.focus == FocusPane::Composer => {
+            if !store.state.move_composer_cursor_down() {
+                store.state.scroll_transcript_down(1);
+            }
+        }
+        KeyCode::Up if store.state.focus == FocusPane::Composer => {
+            if !store.state.move_composer_cursor_up() {
+                store.state.scroll_transcript_up(1);
+            }
+        }
         KeyCode::Down => {
             move_down(&mut store.state);
         }
@@ -868,6 +881,12 @@ fn handle_activity_navigator_key(store: &mut Store, key: KeyEvent) -> KeyAction 
 fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::ALT) {
         match key.code {
+            // Alt+Enter inserts a newline instead of submitting (plain Enter
+            // still submits). Without this the Enter arm below would send.
+            KeyCode::Enter => {
+                store.state.insert_composer_text("\n");
+                return true;
+            }
             KeyCode::Char('b') | KeyCode::Left => {
                 store.state.move_composer_cursor_prev_word();
                 return true;
@@ -890,6 +909,14 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
 
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
+            // Ctrl+J is a literal line feed and works in every terminal (no
+            // Kitty/modifyOtherKeys needed), so it is the portable newline key
+            // alongside Alt+Enter. (Terminals that fold Ctrl+J into Enter will
+            // submit instead — Alt+Enter is the fallback there.)
+            KeyCode::Char('j') => {
+                store.state.insert_composer_text("\n");
+                return true;
+            }
             KeyCode::Char('a') | KeyCode::Home => {
                 store.state.move_composer_cursor_line_start();
                 return true;

@@ -128,7 +128,7 @@ app:
   hint:
     # Pane/modal footer hints (keyboard keys kept literal).
     list_nav: "j/k or Up/Down"
-    composer_send: "Enter send | Tab inspector"
+    composer_send: "Enter send | Alt+Enter / Ctrl+J newline | Tab inspector"
     statusbar_keys: "Tab inspector | Ctrl+O expand"
     menu: "Menu | j/k move | Enter accept | Esc close"
     onboarding: "Onboarding | Enter continue | type to edit fields"

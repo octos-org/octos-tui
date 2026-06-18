@@ -12728,4 +12728,21 @@ mod tests {
             );
         }
     }
+
+    // ===== composer multi-line (specs/task-composer-multiline.spec) =====
+
+    #[test]
+    fn composer_height_grows_with_newlines() {
+        // The composer box must reserve more rows as newlines are added, so a
+        // multi-line draft is fully visible instead of being clipped.
+        let mut app = AppState::new(vec![], 0, "ready".into(), None, false);
+        app.composer = "one".into();
+        let single = composer_height_for_size(&app, 80, 40);
+        app.composer = "one\ntwo\nthree".into();
+        let multi = composer_height_for_size(&app, 80, 40);
+        assert!(
+            multi > single,
+            "composer height must grow with newlines: {multi} vs {single}"
+        );
+    }
 }

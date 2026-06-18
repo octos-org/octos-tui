@@ -118,7 +118,7 @@ app:
     multiline_tail_line: "多行输入 | 显示超长行末尾 | Enter 发送全文 | Ctrl+U 清空"
   hint:
     list_nav: "j/k 或 Up/Down"
-    composer_send: "Enter 发送 | Tab 检查器"
+    composer_send: "Enter 发送 | Alt+Enter / Ctrl+J 换行 | Tab 检查器"
     statusbar_keys: "Tab 检查器 | Ctrl+O 展开"
     menu: "菜单 | j/k 移动 | Enter 确认 | Esc 关闭"
     onboarding: "引导 | Enter 继续 | 输入可编辑字段"
