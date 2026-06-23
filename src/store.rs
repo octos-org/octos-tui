@@ -2441,6 +2441,7 @@ impl Store {
             topic: None,
             profile_id: Some(profile_id),
             cwd: onboarding_workspace_cwd(&self.state.workspace.root),
+            sandbox: None,
             after: None,
         }))
     }
@@ -3466,6 +3467,7 @@ impl Store {
             topic: None,
             rewrite_for: None,
             reasoning_effort,
+            live_video: false,
         }))
     }
 
@@ -5540,6 +5542,12 @@ impl Store {
             if token_cost.session_cost.is_some() {
                 entry.2 = token_cost.session_cost;
             }
+            // Real per-model context window for an honest ctx-fill gauge.
+            if let Some(window) = token_cost.context_window {
+                self.state
+                    .session_context_window
+                    .insert(event.session_id.clone(), window);
+            }
         }
         // Gap 2 fix #3: surface the `UiRetryBackoff` carried on
         // `metadata.retry` (previously ignored) so the harness status row can
@@ -5619,6 +5627,12 @@ impl Store {
 
     fn apply_notification(&mut self, notification: UiNotification) -> Option<AppUiCommand> {
         match notification {
+            // #1477 voice rich-output visual lifecycle. octos-tui does not yet
+            // render generated visuals (a separate feature); ignore gracefully
+            // so newer servers that emit these don't wedge the client.
+            UiNotification::VisualGenerating(_)
+            | UiNotification::VisualSucceeded(_)
+            | UiNotification::VisualFailed(_) => None,
             UiNotification::SessionOpened(event) => {
                 let session_id = event.session_id.clone();
                 // Restore the server-persisted per-session reasoning effort so

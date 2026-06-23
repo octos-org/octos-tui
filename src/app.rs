@@ -5789,9 +5789,9 @@ fn render_autonomy_indicator(app: &AppState, palette: Palette) -> Paragraph<'sta
     Paragraph::new(Text::from(lines)).style(Style::default().fg(palette.text).bg(palette.surface))
 }
 
-/// Default context-window denominator used to render `ctx N%`. The wire does
-/// not (yet) carry a per-model context-window max, so we estimate the percent
-/// against a common modern default. Surfaces the inspector-only
+/// Fallback context-window denominator for `ctx N%`, used only until a cost
+/// update carries the real per-model window (`token_cost.context_window`, stored
+/// in `AppState::session_context_window`). Surfaces the inspector-only
 /// `token_estimate` as a glanceable budget bar in the harness status row.
 const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 128_000;
 
@@ -5831,10 +5831,20 @@ fn harness_context_ratio(app: &AppState) -> Option<f64> {
         .state
         .as_ref()?
         .token_estimate;
-    if DEFAULT_CONTEXT_WINDOW_TOKENS == 0 {
+    // Prefer the real per-model context window carried on the wire
+    // (`metadata.token_cost.context_window`); fall back to the fixed default
+    // only until the first cost update arrives for this session.
+    let window = app
+        .session_context_window
+        .get(&session.id)
+        .copied()
+        .filter(|w| *w > 0)
+        .map(|w| w as usize)
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
+    if window == 0 {
         return None;
     }
-    Some((token_estimate as f64 / DEFAULT_CONTEXT_WINDOW_TOKENS as f64).clamp(0.0, 1.0))
+    Some((token_estimate as f64 / window as f64).clamp(0.0, 1.0))
 }
 
 /// Integer context-window percent (0..=100) for the `ctx N%` label.
@@ -5946,10 +5956,10 @@ fn harness_status_lines(
     // terminals where the gauge column is dropped.
     if include_ctx_text {
         if let Some(percent) = harness_context_percent(app) {
-            // `~` marks this as an estimate: the wire carries no per-model
-            // context window, so the percent is against a fixed default
-            // denominator (`DEFAULT_CONTEXT_WINDOW_TOKENS`) and is approximate
-            // when the real model window differs.
+            // `~` marks this as an estimate: the numerator is the harness
+            // `token_estimate`. The denominator is the real per-model context
+            // window once a cost update carries it (`token_cost.context_window`),
+            // falling back to `DEFAULT_CONTEXT_WINDOW_TOKENS` until then.
             spans.push(Span::styled(
                 format!(" · ctx ~{percent}%"),
                 palette.muted().bg(palette.surface),
@@ -11610,6 +11620,36 @@ mod tests {
         assert!(text.contains("Loops: 2 running"));
         assert!(text.contains("5m deploy-check"));
         assert!(text.contains("self-paced PR-watch"));
+    }
+
+    #[test]
+    fn harness_context_ratio_uses_real_window_when_known() {
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+        app.context_lifecycle_mut(&session_id).state = Some(crate::model::ContextLifecycleState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: String::new(),
+            item_count: 10,
+            token_estimate: 64_000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        });
+
+        // No known window yet → fall back to the fixed default (64000/128000).
+        assert_eq!(harness_context_ratio(&app), Some(0.5));
+
+        // Once the real per-model window arrives on the wire (here 256k), the
+        // SAME token estimate is honestly a quarter full — not a misleading 50%.
+        app.session_context_window
+            .insert(session_id.clone(), 256_000);
+        assert_eq!(harness_context_ratio(&app), Some(0.25));
+
+        // A tiny window clamps to a full gauge rather than overflowing.
+        app.session_context_window.insert(session_id.clone(), 1_000);
+        assert_eq!(harness_context_ratio(&app), Some(1.0));
     }
 
     #[test]
