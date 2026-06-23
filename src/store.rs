@@ -5540,6 +5540,12 @@ impl Store {
             if token_cost.session_cost.is_some() {
                 entry.2 = token_cost.session_cost;
             }
+            // Real per-model context window for an honest ctx-fill gauge.
+            if let Some(window) = token_cost.context_window {
+                self.state
+                    .session_context_window
+                    .insert(event.session_id.clone(), window);
+            }
         }
         // Gap 2 fix #3: surface the `UiRetryBackoff` carried on
         // `metadata.retry` (previously ignored) so the harness status row can

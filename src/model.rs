@@ -3164,6 +3164,11 @@ pub struct AppState {
     /// cumulative; in/out reflect the most recent update. Rendered on the job
     /// indicator.
     pub session_usage: std::collections::HashMap<SessionKey, SessionUsage>,
+    /// Real per-model context window (tokens) per session, carried on the wire
+    /// via `metadata.token_cost.context_window`. Used as the denominator for an
+    /// honest context-fill gauge; falls back to a fixed default until the first
+    /// cost update arrives.
+    pub session_context_window: std::collections::HashMap<SessionKey, u64>,
     /// Latest retry/backoff status per session — the `UiRetryBackoff` carried
     /// on `metadata.retry` progress updates that the TUI previously ignored.
     /// Drives the "retrying (attempt N)" surface in the harness status row.
@@ -4812,6 +4817,7 @@ impl AppState {
             sessions,
             orchestration: std::collections::HashMap::new(),
             session_usage: std::collections::HashMap::new(),
+            session_context_window: std::collections::HashMap::new(),
             session_retry: std::collections::HashMap::new(),
             session_reasoning_effort: std::collections::HashMap::new(),
             finalized_by_switch: std::collections::HashMap::new(),
