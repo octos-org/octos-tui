@@ -1058,6 +1058,7 @@ impl ProtocolAppUiBackend {
                 topic: None,
                 profile_id: self.launch.profile_id.clone(),
                 cwd: self.launch.cwd.clone(),
+                sandbox: None,
                 after: None,
             })
         })
@@ -1358,6 +1359,7 @@ impl AppUiBackend for ProtocolAppUiBackend {
                     topic: None,
                     profile_id: self.launch.profile_id.clone(),
                     cwd: self.launch.cwd.clone(),
+                    sandbox: None,
                     after: None,
                 },
             ))?;
@@ -4834,6 +4836,7 @@ mod tests {
                 topic: None,
                 rewrite_for: None,
                 reasoning_effort: None,
+                live_video: false,
             }),
         )
         .expect("request encodes");
@@ -4866,6 +4869,7 @@ mod tests {
                 topic: None,
                 rewrite_for: None,
                 reasoning_effort: None,
+                live_video: false,
             }),
         )
         .expect("request encodes");
@@ -5712,6 +5716,7 @@ mod tests {
             AppUiCommand::OpenSession(SessionOpenParams {
                 session_id: session_id.clone(),
                 topic: None,
+                sandbox: None,
                 profile_id: Some("coding".into()),
                 cwd: Some("/repo".into()),
                 after: None,
@@ -5786,6 +5791,7 @@ mod tests {
                 topic: None,
                 rewrite_for: None,
                 reasoning_effort: None,
+                live_video: false,
             }),
             AppUiCommand::InterruptTurn(TurnInterruptParams {
                 session_id: session_id.clone(),
@@ -6227,6 +6233,7 @@ mod tests {
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
                 session_id: session_id.clone(),
                 topic: None,
+                sandbox: None,
                 profile_id: Some("coding".into()),
                 cwd: None,
                 after: None,
@@ -6415,6 +6422,7 @@ mod tests {
                 topic: None,
                 rewrite_for: None,
                 reasoning_effort: None,
+                live_video: false,
             }))
             .expect("request builds");
 
@@ -6510,6 +6518,7 @@ mod tests {
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
                 session_id: session_id.clone(),
                 topic: None,
+                sandbox: None,
                 profile_id: Some("coding".into()),
                 cwd: Some("/repo".into()),
                 after: None,
@@ -7077,6 +7086,7 @@ mod tests {
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
                 session_id: SessionKey("local:test".into()),
                 topic: None,
+                sandbox: None,
                 profile_id: Some("coding".into()),
                 cwd: None,
                 after: None,
@@ -7154,6 +7164,7 @@ mod tests {
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
                 session_id: SessionKey("local:test".into()),
                 topic: None,
+                sandbox: None,
                 profile_id: Some("coding".into()),
                 cwd: Some("/tmp/project".into()),
                 after: None,
@@ -7230,6 +7241,7 @@ mod tests {
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
                 session_id: session_id.clone(),
                 topic: None,
+                sandbox: None,
                 profile_id: Some("coding".into()),
                 cwd: None,
                 after: None,
@@ -7458,6 +7470,7 @@ mod tests {
                 topic: None,
                 rewrite_for: None,
                 reasoning_effort: None,
+                live_video: false,
             }))
             .expect("readonly send is local");
         backend
@@ -7519,6 +7532,7 @@ mod tests {
                 topic: None,
                 rewrite_for: None,
                 reasoning_effort: None,
+                live_video: false,
             }))
             .expect("send");
 
@@ -7551,6 +7565,7 @@ mod tests {
                 topic: None,
                 rewrite_for: None,
                 reasoning_effort: None,
+                live_video: false,
             }))
             .expect("submit prompt");
 
@@ -7702,6 +7717,7 @@ mod tests {
                 topic: None,
                 rewrite_for: None,
                 reasoning_effort: None,
+                live_video: false,
             }))
             .expect("send");
 
