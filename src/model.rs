@@ -3169,6 +3169,13 @@ pub struct AppState {
     /// honest context-fill gauge; falls back to a fixed default until the first
     /// cost update arrives.
     pub session_context_window: std::collections::HashMap<SessionKey, u64>,
+    /// Turn ids that reached a terminal state (completed/errored), per session.
+    /// A late `MessageDelta` for one of these — e.g. background spawn_only tokens
+    /// re-streamed under the dead foreground turn id — must be dropped, not
+    /// lazy-bound into `live_reply`: binding a completed turn latches
+    /// `active_turn()` forever (no second terminal arrives to clear it), wedging
+    /// the composer into queuing all input.
+    pub completed_turns: std::collections::HashMap<SessionKey, std::collections::HashSet<TurnId>>,
     /// Latest retry/backoff status per session — the `UiRetryBackoff` carried
     /// on `metadata.retry` progress updates that the TUI previously ignored.
     /// Drives the "retrying (attempt N)" surface in the harness status row.
@@ -4818,6 +4825,7 @@ impl AppState {
             orchestration: std::collections::HashMap::new(),
             session_usage: std::collections::HashMap::new(),
             session_context_window: std::collections::HashMap::new(),
+            completed_turns: std::collections::HashMap::new(),
             session_retry: std::collections::HashMap::new(),
             session_reasoning_effort: std::collections::HashMap::new(),
             finalized_by_switch: std::collections::HashMap::new(),
@@ -5363,6 +5371,23 @@ impl AppState {
         let session = self.active_session()?;
         let live_reply = session.live_reply.as_ref()?;
         Some((&session.id, &live_reply.turn_id))
+    }
+
+    /// Record that a turn reached a terminal state, so a late delta for it is
+    /// dropped instead of resurrecting it into `live_reply` (see
+    /// [`AppState::completed_turns`]).
+    pub fn mark_turn_completed(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        self.completed_turns
+            .entry(session_id.clone())
+            .or_default()
+            .insert(turn_id.clone());
+    }
+
+    /// True when `turn_id` already reached a terminal state in this session.
+    pub fn is_turn_completed(&self, session_id: &SessionKey, turn_id: &TurnId) -> bool {
+        self.completed_turns
+            .get(session_id)
+            .is_some_and(|turns| turns.contains(turn_id))
     }
 
     pub fn record_submitted_user_prompt(

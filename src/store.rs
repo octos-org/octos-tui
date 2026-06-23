@@ -5761,6 +5761,15 @@ impl Store {
                 text,
                 ..
             }) => {
+                // A late delta for an already-terminal turn (e.g. background
+                // spawn_only tokens re-streamed under the dead foreground turn
+                // id) must NOT lazy-bind into `live_reply`: that latches
+                // `active_turn()` forever (the completed turn never gets a second
+                // TurnCompleted to clear it), wedging the composer into queuing
+                // all input. Drop it.
+                if self.state.is_turn_completed(&session_id, &turn_id) {
+                    return None;
+                }
                 let follow_tail = self.state.transcript_scroll == 0;
                 // Lazy-bind: a delta whose turn_id has no current live_reply
                 // binding (None, or a binding for an OLDER turn) must still be
@@ -6684,6 +6693,11 @@ impl Store {
         // terminal for an already-finalized turn still dismisses the picker
         // instead of leaving it wedged (nit).
         self.clear_question_for_turn(&event.session_id, &event.turn_id);
+        // Mark this turn terminal so a late delta for it is dropped rather than
+        // resurrecting it into `live_reply` (the wedge fix). Done before the
+        // finalized-by-switch early return so it always records.
+        self.state
+            .mark_turn_completed(&event.session_id, &event.turn_id);
         if self
             .state
             .take_turn_finalized_by_switch(&event.session_id, &event.turn_id)
@@ -6778,6 +6792,10 @@ impl Store {
         // A turn error cancels any pending AskUserQuestion picker for this turn
         // (design §4.2: the turn-interrupt/error path is Phase-1's cancellation).
         self.clear_question_for_turn(&event.session_id, &event.turn_id);
+        // Mark this turn terminal so a late delta for it is dropped rather than
+        // resurrecting it into `live_reply` (the wedge fix).
+        self.state
+            .mark_turn_completed(&event.session_id, &event.turn_id);
         let follow_tail = self.state.transcript_scroll == 0;
         let fallback_summary =
             self.turn_error_fallback_message(&event.turn_id, &event.code, &event.message);
@@ -12988,6 +13006,86 @@ mod tests {
         assert_eq!(
             after, before,
             "late terminal for a dropped-empty prior turn must be a no-op"
+        );
+    }
+
+    #[test]
+    fn late_delta_for_completed_turn_does_not_wedge_active_turn() {
+        // Regression — the compaction/spawn_only hang root cause: a late
+        // `MessageDelta` for an already-completed turn (background spawn_only
+        // tokens re-streamed under the dead foreground turn id) must be DROPPED,
+        // not lazy-bound into `live_reply`. Pre-fix, the stale delta rebound
+        // `live_reply` to completed turn A (marking the live turn B
+        // finalized-by-switch), so `TurnCompleted{B}` early-returned without
+        // clearing `live_reply` → `active_turn()` stayed `Some` forever → the
+        // composer queued every message ("queued N messages after active turn").
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Turn A streams then completes → live_reply cleared, A marked terminal.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                text: "answer A".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            store.state.active_turn().is_none(),
+            "turn A completed → idle"
+        );
+
+        // Turn B goes live.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                text: "answer B".into(),
+            },
+        )));
+        assert!(store.state.active_turn().is_some(), "turn B is live");
+
+        // LATE delta for the already-completed turn A — the wedge trigger.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                text: " stray tail".into(),
+            },
+        )));
+
+        // B completes normally; with the fix nothing latched → back to idle.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_b.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        assert!(
+            store.state.active_turn().is_none(),
+            "a late delta for a completed turn must not latch active_turn (the hang)"
         );
     }
 
