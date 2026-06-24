@@ -4616,6 +4616,8 @@ impl Store {
                 let pending_messages = self.state.pending_messages.clone();
                 let optimistic_user_messages = self.state.optimistic_user_messages.clone();
                 let turn_prompt_anchors = self.state.turn_prompt_anchors.clone();
+                let live_reply_segment_boundaries =
+                    self.state.live_reply_segment_boundaries.clone();
                 let approval_auto_open = self.state.approval_auto_open;
                 let user_question_auto_open = self.state.user_question_auto_open;
                 let expanded_tool_outputs = self.state.expanded_tool_outputs;
@@ -4663,6 +4665,7 @@ impl Store {
                 state.pending_messages = pending_messages;
                 state.optimistic_user_messages = optimistic_user_messages;
                 state.turn_prompt_anchors = turn_prompt_anchors;
+                state.live_reply_segment_boundaries = live_reply_segment_boundaries;
                 state.approval_auto_open = approval_auto_open;
                 state.user_question_auto_open = user_question_auto_open;
                 state.expanded_tool_outputs = expanded_tool_outputs;
@@ -5825,6 +5828,15 @@ impl Store {
             UiNotification::ToolStarted(event) => {
                 self.state
                     .record_turn_prompt_anchor_from_latest_user(&event.session_id, &event.turn_id);
+                // A tool call starting means the current assistant CONTENT segment
+                // just ended (the next content streams after the tool result). Record
+                // the live-reply length NOW as a segment boundary, with the correct
+                // per-segment offset, so the live-delta renderer starts a fresh
+                // markdown block for the next segment instead of gluing
+                // "...skeleton." onto the next "### Step N". (MessagePersisted is the
+                // wrong signal: it fires at turn end with the full text length.)
+                self.state
+                    .record_live_reply_segment_boundary(&event.session_id, &event.turn_id);
                 let mut item =
                     ActivityItem::new(ActivityKind::Tool, event.tool_name.clone(), "running")
                         .with_turn(event.turn_id)
@@ -6493,6 +6505,24 @@ impl Store {
     }
 
     fn apply_message_persisted(&mut self, event: MessagePersistedEvent) -> Option<AppUiCommand> {
+        let persisted_live_assistant_turn = (event.role.as_str() == "assistant")
+            .then(|| {
+                self.find_session(&event.session_id)
+                    .and_then(|session| session.live_reply.as_ref())
+                    .filter(|live_reply| {
+                        event
+                            .turn_id
+                            .as_ref()
+                            .is_none_or(|turn_id| turn_id == &live_reply.turn_id)
+                    })
+                    .map(|live_reply| live_reply.turn_id.clone())
+            })
+            .flatten();
+        if let Some(turn_id) = persisted_live_assistant_turn {
+            self.state
+                .record_live_reply_segment_boundary(&event.session_id, &turn_id);
+        }
+
         let attachment_count = event.media.len();
         let attachment_hint = match attachment_count {
             0 => String::new(),
@@ -6723,6 +6753,8 @@ impl Store {
         // finalized-by-switch early return so it always records.
         self.state
             .mark_turn_completed(&event.session_id, &event.turn_id);
+        self.state
+            .clear_live_reply_segment_boundaries(&event.session_id, &event.turn_id);
         if self
             .state
             .take_turn_finalized_by_switch(&event.session_id, &event.turn_id)
@@ -6821,6 +6853,8 @@ impl Store {
         // resurrecting it into `live_reply` (the wedge fix).
         self.state
             .mark_turn_completed(&event.session_id, &event.turn_id);
+        self.state
+            .clear_live_reply_segment_boundaries(&event.session_id, &event.turn_id);
         let follow_tail = self.state.transcript_scroll == 0;
         let fallback_summary =
             self.turn_error_fallback_message(&event.turn_id, &event.code, &event.message);
@@ -6914,12 +6948,16 @@ impl Store {
             return None;
         }
 
-        let prompt = self.state.pending_messages[0].clone();
-        let command =
-            self.start_prompt_turn(prompt, t!("status.submitted_staged_message").into_owned());
-        if command.is_some() {
-            self.state.pending_messages.remove(0);
+        let prompt = self.state.pending_messages.remove(0);
+        let mut remaining_pending = std::mem::take(&mut self.state.pending_messages);
+        let command = self.start_prompt_turn(
+            prompt.clone(),
+            t!("status.submitted_staged_message").into_owned(),
+        );
+        if command.is_none() {
+            remaining_pending.insert(0, prompt);
         }
+        self.state.pending_messages = remaining_pending;
         command
     }
 
@@ -6986,6 +7024,8 @@ impl Store {
         // fallback card or mishandling the dropped-empty case.
         self.state
             .mark_turn_finalized_by_switch(session_id, &prior_turn);
+        self.state
+            .clear_live_reply_segment_boundaries(session_id, &prior_turn);
         let complete_live_plan = self.turn_had_completion_activity(&prior_turn);
         let fallback_summary = self.turn_completion_fallback_message(&prior_turn);
         let partial_fallback_summary = self.turn_partial_completion_fallback_message(&prior_turn);
@@ -12298,6 +12338,81 @@ mod tests {
     }
 
     #[test]
+    fn assistant_message_persisted_records_live_reply_segment_boundary() {
+        let turn_id = TurnId::new();
+        let text = "### Step 1\n\nBody one.";
+        let mut store = store_with_live_reply(turn_id.clone(), text);
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessagePersisted(
+            MessagePersistedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: Some(turn_id.clone()),
+                thread_id: None,
+                seq: 1,
+                role: "assistant".into(),
+                message_id: "msg-1".into(),
+                client_message_id: None,
+                source: octos_core::ui_protocol::MessagePersistedSource::Assistant,
+                cursor: UiCursor {
+                    stream: "local:test".into(),
+                    seq: 1,
+                },
+                persisted_at: chrono::Utc::now(),
+                media: vec![],
+                content: Some(text.into()),
+            },
+        )));
+
+        assert_eq!(
+            store
+                .state
+                .live_reply_segment_boundaries
+                .get(&(session_id, turn_id))
+                .cloned(),
+            Some(vec![text.len()]),
+            "assistant persistence while the turn is live should mark the current live buffer length"
+        );
+    }
+
+    #[test]
+    fn tool_started_records_live_reply_segment_boundary_at_segment_offset() {
+        // The REAL per-segment boundary signal. A tool call starting means the
+        // current assistant CONTENT segment just ended, so the live-reply length
+        // at that moment is exactly where the live-delta renderer must start the
+        // next segment as a fresh markdown block. Without this, an agentic turn's
+        // later "### Step N" glued onto the previous segment's body on the real
+        // terminal (MessagePersisted fires at turn END with the full length — the
+        // wrong offset — so it never split mid-turn).
+        let turn_id = TurnId::new();
+        let text = "### Step 1\n\nBody one.";
+        let mut store = store_with_live_reply(turn_id.clone(), text);
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
+            ToolStartedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                tool_call_id: "call-1".into(),
+                tool_name: "write_file".into(),
+                arguments: None,
+            },
+        )));
+
+        assert_eq!(
+            store
+                .state
+                .live_reply_segment_boundaries
+                .get(&(session_id, turn_id))
+                .cloned(),
+            Some(vec![text.len()]),
+            "a tool call starting mid-turn must record the current live-reply length as a segment boundary"
+        );
+    }
+
+    #[test]
     fn server_initiated_continuation_turn_with_turn_started_renders_its_answer() {
         // Live-rendering bug (mini5): a single user prompt expanded into
         // server-INITIATED master-continuation turns (reason=child_completed /
@@ -14400,6 +14515,48 @@ mod tests {
         assert_eq!(store.state.sessions[0].messages.len(), 2);
         assert_eq!(store.state.sessions[0].messages[1].content, "continue now");
         assert_eq!(store.state.run_state.label(), "running");
+    }
+
+    #[test]
+    fn completed_turn_submits_one_duplicate_staged_message_and_keeps_next_pending() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "done");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.pending_messages = vec!["repeat".into(), "repeat".into()];
+
+        let command = store
+            .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+                TurnCompletedEvent {
+                    session_id,
+                    topic: None,
+                    turn_id,
+                    cursor: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    session_result: None,
+                },
+            )))
+            .expect("first staged prompt submits after turn completion");
+
+        let AppUiCommand::SubmitPrompt(params) = command else {
+            panic!("expected staged prompt submission");
+        };
+        assert_eq!(
+            params.input,
+            vec![InputItem::Text {
+                text: "repeat".into()
+            }]
+        );
+        assert_eq!(store.state.pending_messages, vec!["repeat"]);
+        assert_eq!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .filter(|message| message.role.as_str() == "user" && message.content == "repeat")
+                .count(),
+            1,
+            "the submitted duplicate gets one optimistic echo while the next duplicate stays pending"
+        );
     }
 
     #[test]

@@ -3244,6 +3244,11 @@ pub struct AppState {
     pub pending_messages: Vec<String>,
     pub optimistic_user_messages: Vec<OptimisticUserMessage>,
     pub turn_prompt_anchors: Vec<TurnPromptAnchor>,
+    /// Byte offsets in `live_reply.text` where one persisted assistant content
+    /// segment ended and the next streamed segment should render as fresh
+    /// markdown. Kept out-of-band so coverage/dedup can keep comparing the
+    /// unmodified live text against committed content.
+    pub live_reply_segment_boundaries: std::collections::HashMap<(SessionKey, TurnId), Vec<usize>>,
     pub status: String,
     pub target: Option<String>,
     pub readonly: bool,
@@ -4748,6 +4753,7 @@ impl AppState {
     /// FIFO.
     pub const FINALIZED_BY_SWITCH_CAP: usize = 128;
     const MAX_TURN_PROMPT_ANCHORS: usize = 128;
+    const MAX_LIVE_REPLY_SEGMENT_BOUNDARIES: usize = 256;
 
     /// Record that `turn_id` in `session_id` was finalized (committed OR
     /// dropped) by a turn-switch, so the turn's OWN late terminal can be
@@ -4788,6 +4794,47 @@ impl AppState {
         } else {
             false
         }
+    }
+
+    pub fn record_live_reply_segment_boundary(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> bool {
+        let Some(len) = self
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .and_then(|session| session.live_reply.as_ref())
+            .filter(|live_reply| &live_reply.turn_id == turn_id)
+            .map(|live_reply| live_reply.text.len())
+            .filter(|len| *len > 0)
+        else {
+            return false;
+        };
+
+        let boundaries = self
+            .live_reply_segment_boundaries
+            .entry((session_id.clone(), turn_id.clone()))
+            .or_default();
+        if boundaries.last().copied() == Some(len) {
+            return false;
+        }
+        boundaries.push(len);
+        if boundaries.len() > Self::MAX_LIVE_REPLY_SEGMENT_BOUNDARIES {
+            let excess = boundaries.len() - Self::MAX_LIVE_REPLY_SEGMENT_BOUNDARIES;
+            boundaries.drain(0..excess);
+        }
+        true
+    }
+
+    pub fn clear_live_reply_segment_boundaries(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) {
+        self.live_reply_segment_boundaries
+            .remove(&(session_id.clone(), turn_id.clone()));
     }
 
     pub fn from_snapshot(snapshot: AppUiSnapshot) -> Self {
@@ -4860,6 +4907,7 @@ impl AppState {
             pending_messages: Vec::new(),
             optimistic_user_messages: Vec::new(),
             turn_prompt_anchors: Vec::new(),
+            live_reply_segment_boundaries: std::collections::HashMap::new(),
             status,
             target,
             readonly,
@@ -5408,6 +5456,17 @@ impl AppState {
         turn_id: TurnId,
         content: String,
     ) {
+        if self
+            .pending_messages
+            .iter()
+            .any(|pending| pending == &content)
+        {
+            self.optimistic_user_messages.retain(|optimistic| {
+                optimistic.session_id != session_id || optimistic.content != content
+            });
+            return;
+        }
+
         let Some(session) = self
             .sessions
             .iter()
@@ -7491,6 +7550,43 @@ mod tests {
                     && message.content == "confirmed prompt")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn pending_prompt_is_not_restored_as_optimistic_history() {
+        let session_id = SessionKey("local:test".into());
+        let mut state = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("active prompt"),
+                    Message::assistant("partial answer"),
+                ],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        state.pending_messages.push("queued next".into());
+
+        state.record_submitted_user_prompt(session_id, TurnId::new(), "queued next".into());
+
+        assert!(
+            state.sessions[0]
+                .messages
+                .iter()
+                .all(|message| message.content != "queued next"),
+            "a prompt still in pending_messages must not be inserted into session history"
+        );
+        assert!(
+            state.optimistic_user_messages.is_empty(),
+            "the skipped pending prompt must not leave a stale optimistic entry"
         );
     }
 
