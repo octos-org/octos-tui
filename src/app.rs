@@ -2736,7 +2736,7 @@ fn push_turn_flow(
     push_activity_section_with_finalization(lines, palette, app, live_finalization);
 
     if live_turn_diff_preview_visible(app) {
-        push_inline_diff_preview(lines, palette, &app.diff_preview);
+        push_inline_diff_preview(lines, palette, &app.diff_preview, app.expanded_tool_outputs);
     }
 }
 
@@ -4506,7 +4506,7 @@ fn push_turn_activity_log_section(
         ]));
     }
     if app.diff_preview.active && app.diff_preview.turn_id.as_ref() == Some(&log.turn_id) {
-        push_inline_diff_preview(lines, palette, &app.diff_preview);
+        push_inline_diff_preview(lines, palette, &app.diff_preview, app.expanded_tool_outputs);
     }
 }
 
@@ -4930,6 +4930,7 @@ fn push_inline_diff_preview(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
     diff: &DiffPreviewPaneState,
+    expanded: bool,
 ) {
     // C6: when there is no usable line diff ("line diff unavailable for this
     // mutation"), hide the box entirely instead of rendering an empty preview
@@ -4999,6 +5000,7 @@ fn push_inline_diff_preview(
                     diff.selected_file,
                     diff.selected_hunk,
                     file,
+                    expanded,
                 );
             }
         }
@@ -5033,6 +5035,31 @@ fn push_inline_diff_preview(
     }
 }
 
+fn push_diff_content_line(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    line: &crate::model::DiffPreviewLine,
+) {
+    let sign = diff_line_sign(&line.kind);
+    let old_line = line
+        .old_line
+        .map(|line| line.to_string())
+        .unwrap_or_else(|| "-".into());
+    let new_line = line
+        .new_line
+        .map(|line| line.to_string())
+        .unwrap_or_else(|| "-".into());
+    let marker_style = diff_line_marker_style(&line.kind, palette);
+    let gutter_style = diff_line_gutter_style(&line.kind, palette);
+    let body_style = diff_line_style(&line.kind, palette);
+    lines.push(Line::from(vec![
+        Span::styled("    ", gutter_style),
+        Span::styled(format!("{sign} "), marker_style),
+        Span::styled(format!("{old_line:>4} {new_line:>4} "), gutter_style),
+        Span::styled(line.content.clone(), body_style),
+    ]));
+}
+
 fn push_diff_file_lines(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -5040,6 +5067,7 @@ fn push_diff_file_lines(
     selected_file: usize,
     selected_hunk: usize,
     file: &crate::model::DiffPreviewFile,
+    expanded: bool,
 ) {
     let path = match &file.old_path {
         Some(old_path) if old_path != &file.path => format!("{old_path} -> {}", file.path),
@@ -5076,6 +5104,30 @@ fn push_diff_file_lines(
     }
 
     let hunk_idx = selected_hunk.min(file.hunks.len().saturating_sub(1));
+
+    if expanded {
+        // Ctrl+O review mode for staging: show EVERY hunk header so the diff
+        // structure stays navigable, and the SELECTED hunk's COMPLETE body so
+        // the user can see exactly what they are about to stage (the collapsed
+        // view caps each hunk at 4 lines, which is the "can't see the diff"
+        // complaint). Non-selected hunks stay header-only to keep the inline
+        // view bounded; navigate with the hunk keys to expand another.
+        for (idx, hunk) in file.hunks.iter().enumerate() {
+            let selected = file_idx == selected_file && idx == selected_hunk;
+            let marker = if selected { "  › " } else { "  ├ " };
+            lines.push(Line::from(vec![
+                Span::styled(marker, palette.selected()),
+                Span::styled(hunk.header.clone(), diff_hunk_style(palette)),
+            ]));
+            if selected {
+                for line in &hunk.lines {
+                    push_diff_content_line(lines, palette, line);
+                }
+            }
+        }
+        return;
+    }
+
     if hunk_idx > 0 {
         lines.push(Line::from(vec![
             Span::styled("    ", palette.muted()),
@@ -5094,24 +5146,7 @@ fn push_diff_file_lines(
             Span::styled(hunk.header.clone(), diff_hunk_style(palette)),
         ]));
         for line in hunk.lines.iter().take(4) {
-            let sign = diff_line_sign(&line.kind);
-            let old_line = line
-                .old_line
-                .map(|line| line.to_string())
-                .unwrap_or_else(|| "-".into());
-            let new_line = line
-                .new_line
-                .map(|line| line.to_string())
-                .unwrap_or_else(|| "-".into());
-            let marker_style = diff_line_marker_style(&line.kind, palette);
-            let gutter_style = diff_line_gutter_style(&line.kind, palette);
-            let body_style = diff_line_style(&line.kind, palette);
-            lines.push(Line::from(vec![
-                Span::styled("    ", gutter_style),
-                Span::styled(format!("{sign} "), marker_style),
-                Span::styled(format!("{old_line:>4} {new_line:>4} "), gutter_style),
-                Span::styled(line.content.clone(), body_style),
-            ]));
+            push_diff_content_line(lines, palette, line);
         }
         if hunk.lines.len() > 4 {
             lines.push(Line::from(vec![
@@ -11128,6 +11163,64 @@ mod tests {
         assert!(text.contains("@@ -1 +1 @@"));
         assert!(text.contains("todo!()"));
         assert!(text.contains("Ok(42)"));
+    }
+
+    #[test]
+    fn ctrl_o_expands_diff_preview_to_full_selected_hunk() {
+        // The collapsed inline diff caps each hunk at 4 lines — the "Tab doesn't
+        // expand the diff" complaint. Ctrl+O (expanded_tool_outputs) must reveal
+        // the SELECTED hunk's complete body, and the hidden-lines hint must
+        // point at that working key (was a misleading "(Tab inspector)").
+        let make = || DiffPreviewGetResult {
+            status: "ready".into(),
+            source: "pending_store".into(),
+            preview: DiffPreview {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+                title: Some("Big patch".into()),
+                files: vec![DiffPreviewFile {
+                    path: "src/big.rs".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    hunks: vec![DiffPreviewHunk {
+                        header: "@@ -1,6 +1,6 @@".into(),
+                        lines: (1u32..=6)
+                            .map(|n| DiffPreviewLine {
+                                kind: "added".into(),
+                                content: format!("line {n} content"),
+                                old_line: None,
+                                new_line: Some(n),
+                            })
+                            .collect(),
+                    }],
+                }],
+            },
+        };
+
+        // Collapsed (default): capped at 4 lines, hint points to Ctrl+O.
+        let collapsed = rendered_text(&app_with_diff(make()));
+        assert!(collapsed.contains("line 4 content"));
+        assert!(
+            !collapsed.contains("line 5 content"),
+            "5th line hidden when collapsed: {collapsed:?}"
+        );
+        assert!(
+            collapsed.contains("Ctrl+O expand"),
+            "hidden-lines hint must point at the working key: {collapsed:?}"
+        );
+
+        // Expanded (Ctrl+O): full selected hunk, no truncation hint.
+        let mut app = app_with_diff(make());
+        app.expanded_tool_outputs = true;
+        let expanded = rendered_text(&app);
+        assert!(
+            expanded.contains("line 5 content") && expanded.contains("line 6 content"),
+            "all lines of the selected hunk shown when expanded: {expanded:?}"
+        );
+        assert!(
+            !expanded.contains("more diff line(s) hidden"),
+            "no truncation hint when expanded: {expanded:?}"
+        );
     }
 
     #[test]

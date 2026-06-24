@@ -2786,7 +2786,7 @@ mod tests {
         ));
         assert!(store.state.expanded_tool_outputs);
         assert_eq!(store.state.focus, FocusPane::Composer);
-        assert_eq!(store.state.status, "Expanded tool output cards");
+        assert_eq!(store.state.status, "Expanded tool output + diff");
 
         assert!(matches!(
             handle_key(
@@ -2796,7 +2796,7 @@ mod tests {
             KeyAction::Continue
         ));
         assert!(!store.state.expanded_tool_outputs);
-        assert_eq!(store.state.status, "Collapsed tool output cards");
+        assert_eq!(store.state.status, "Collapsed tool output + diff");
     }
 
     #[test]
