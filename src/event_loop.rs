@@ -636,13 +636,15 @@ fn handle_paste(store: &mut Store, text: &str) -> KeyAction {
         return KeyAction::Continue;
     }
 
-    let opens_slash_popup = store.state.composer.is_empty() && text.starts_with('/');
+    // A paste is literal text and must NEVER trigger a slash command — a pasted
+    // file path ("/Users/...") or multi-line snippet beginning with '/' is not a
+    // command. Unlike a typed leading '/', we do not open the slash-command menu
+    // here. (Regression: pasting a path opened/ran the slash menu.)
     store.state.insert_composer_text(text);
     store.state.focus = FocusPane::Composer;
 
-    if opens_slash_popup {
-        store.open_menu(crate::menu::MenuId::from(crate::menu::registry::MENU_HELP));
-    }
+    // Only keep an ALREADY-open slash search in sync (e.g. the user typed '/' to
+    // open the menu, then pasted an argument); never open it from a paste.
     if store.state.menu_stack.is_active() && slash_help_menu_active(store) {
         sync_slash_help_search_query(store);
     }
@@ -2392,7 +2394,9 @@ mod tests {
     }
 
     #[test]
-    fn terminal_paste_opens_slash_menu_when_composer_starts_with_slash() {
+    fn terminal_paste_starting_with_slash_does_not_open_slash_menu() {
+        // A paste is literal text: pasting "/permissions" inserts it verbatim and
+        // must NOT open the slash-command menu (only a TYPED leading '/' does).
         let mut store = store_with_sessions(1);
 
         assert!(matches!(
@@ -2401,16 +2405,24 @@ mod tests {
         ));
 
         assert_eq!(store.state.composer, "/permissions");
-        assert!(store.state.menu_stack.is_active());
-        assert_eq!(
-            store
-                .state
-                .menu_stack
-                .active()
-                .expect("slash menu")
-                .search_query,
-            "permissions"
-        );
+        assert!(!store.state.menu_stack.is_active());
+    }
+
+    #[test]
+    fn terminal_paste_multiline_path_is_literal_not_slash_command() {
+        // Regression: pasting a file path / multi-line snippet beginning with '/'
+        // (e.g. shell output) must be inserted verbatim and must NOT open or run a
+        // slash command.
+        let mut store = store_with_sessions(1);
+        let pasted = "/Users/cloud/enable_screenshare.sh\nPassword: secret";
+
+        assert!(matches!(
+            handle_terminal_event(&mut store, Event::Paste(pasted.into())),
+            KeyAction::Continue
+        ));
+
+        assert_eq!(store.state.composer, pasted);
+        assert!(!store.state.menu_stack.is_active());
     }
 
     #[test]
