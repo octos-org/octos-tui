@@ -371,6 +371,12 @@ fn live_tail_lines_with_finalization(
         push_pending_messages_block(&mut lines, palette, &app.pending_messages, wrap_width);
     }
 
+    // Collapse interior multi-blank runs (recent-context → turn-flow →
+    // pending-messages each guard only their own separator, so their seams can
+    // stack) before trimming the trailing spacer rows below. Both run on the
+    // shared builder, so the height calc and the render stay in lock-step.
+    collapse_blank_runs(&mut lines);
+
     // Trailing spacer rows inflate the inline viewport height; once the turn
     // settles and the tail shrinks they become permanent blank rows in the
     // append-only scrollback (the "scar"). Trimming here shrinks the viewport
@@ -386,6 +392,44 @@ fn live_tail_lines_with_finalization(
 fn trim_trailing_blank_lines(lines: &mut Vec<Line<'static>>) {
     while lines.last().is_some_and(|line| line_is_blank(Some(line))) {
         lines.pop();
+    }
+}
+
+/// Collapse any run of two-or-more consecutive blank lines down to a single
+/// blank, keeping the first of each run. The block builders
+/// (`push_message_block`, `push_live_reply_block`, `push_formatted_body_marked`,
+/// the activity-log/tool-call sections) each guard their *own* leading/trailing
+/// separator, but a single flush concatenates several of them into one buffer
+/// (committed history + live-turn deltas in `viewport.rs`), so a block that ends
+/// in a blank followed by one that opens with a blank sums to a multi-line gap.
+/// Applied once at the assembly endpoints, this guarantees at most one blank
+/// between blocks regardless of how the pieces were produced. It never tightens
+/// a single blank or fuses two non-blank blocks (a run of one stays one), so it
+/// can only remove excess vertical space, never introduce it.
+pub fn collapse_blank_runs(lines: &mut Vec<Line<'static>>) {
+    collapse_blank_runs_seeded(lines, false);
+}
+
+/// [`collapse_blank_runs`] that also closes the seam against content already
+/// emitted before this batch. `prev_ends_blank` is whether the line immediately
+/// preceding these — e.g. the last line already in scrollback from an earlier
+/// flush — was blank; when it was, a leading blank here is dropped. Reply text
+/// streams to scrollback across many small flushes, so without this a chunk
+/// ending on a blank and the next chunk opening on a blank stack into a 2-line
+/// gap that per-batch collapse can't see. Returns whether the batch now ends on
+/// a blank (feed back as the next call's `prev_ends_blank`).
+pub fn collapse_blank_runs_seeded(lines: &mut Vec<Line<'static>>, prev_ends_blank: bool) -> bool {
+    let mut prev_blank = prev_ends_blank;
+    lines.retain(|line| {
+        let blank = line_is_blank(Some(line));
+        let keep = !(blank && prev_blank);
+        prev_blank = blank;
+        keep
+    });
+    match lines.last() {
+        Some(line) => line_is_blank(Some(line)),
+        // Batch contributed nothing (all dropped) → seam state is unchanged.
+        None => prev_ends_blank,
     }
 }
 
@@ -476,12 +520,19 @@ pub fn finalized_history_lines_range_dedup_live(
         });
         if let Some(coverage) = reply_coverage {
             let suffix = &message.content[coverage.reply_flushed_text.len()..];
-            if !suffix.trim().is_empty() {
-                // Continuation of a reply whose prefix is already in
-                // scrollback (coverage is only matched when non-empty) —
-                // never re-issue the bullet.
-                push_live_reply_block(&mut lines, palette, suffix, wrap_width, false);
-            }
+            // Continuation of a reply whose prefix is already in scrollback
+            // (coverage is only matched when non-empty) — never re-issue the
+            // bullet, but do seed blank handling from the streamed prefix so a
+            // separator split across commit still renders like one document.
+            push_live_reply_block_seeded(
+                &mut lines,
+                palette,
+                suffix,
+                wrap_width,
+                false,
+                true,
+                live_reply_prefix_ends_blank(palette, &coverage.reply_flushed_text, wrap_width),
+            );
         } else {
             push_message_block(
                 &mut lines,
@@ -585,10 +636,16 @@ pub fn finalized_live_turn_lines_between(
         .starts_with(previous.reply_flushed_text.as_str())
     {
         let new_reply = &next.reply_flushed_text[previous.reply_flushed_text.len()..];
-        if !new_reply.trim().is_empty() {
-            let first = previous.reply_flushed_text.is_empty();
-            push_live_reply_block(&mut lines, palette, new_reply, wrap_width, first);
-        }
+        let first = previous.reply_flushed_text.is_empty();
+        push_live_reply_block_seeded(
+            &mut lines,
+            palette,
+            new_reply,
+            wrap_width,
+            first,
+            !previous.reply_flushed_text.trim().is_empty(),
+            live_reply_prefix_ends_blank(palette, &previous.reply_flushed_text, wrap_width),
+        );
     }
 
     let previous_activity = previous
@@ -2857,6 +2914,62 @@ fn push_live_reply_block(
     push_formatted_body_marked(lines, palette, content, "", marker, Some(bg), width);
 }
 
+fn push_live_reply_block_seeded(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    content: &str,
+    width: usize,
+    first: bool,
+    previous_reply_has_output: bool,
+    previous_reply_ends_blank: bool,
+) {
+    if !seeded_live_reply_content_can_emit(
+        content,
+        previous_reply_has_output,
+        previous_reply_ends_blank,
+    ) {
+        return;
+    }
+    if !lines.is_empty() && !line_is_blank(lines.last()) {
+        lines.push(Line::from(""));
+    }
+
+    let bg = chat_message_bg(palette, "assistant");
+    let marker = first.then_some("• ");
+    push_formatted_body_marked_seeded(
+        lines,
+        palette,
+        content,
+        "",
+        marker,
+        Some(bg),
+        width,
+        previous_reply_has_output,
+        previous_reply_ends_blank,
+    );
+}
+
+fn seeded_live_reply_content_can_emit(
+    content: &str,
+    previous_reply_has_output: bool,
+    previous_reply_ends_blank: bool,
+) -> bool {
+    !content.trim().is_empty()
+        || (previous_reply_has_output
+            && !previous_reply_ends_blank
+            && content.contains('\n')
+            && content.lines().any(|line| line.trim().is_empty()))
+}
+
+fn live_reply_prefix_ends_blank(palette: Palette, content: &str, width: usize) -> bool {
+    if content.trim().is_empty() {
+        return false;
+    }
+    let mut lines = Vec::new();
+    push_live_reply_block(&mut lines, palette, content, width, true);
+    lines.last().is_some_and(|line| line_is_blank(Some(line)))
+}
+
 fn push_pending_messages_block(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -3106,12 +3219,36 @@ fn push_formatted_body_marked(
     bg: Option<Color>,
     width: usize,
 ) {
+    push_formatted_body_marked_seeded(
+        lines,
+        palette,
+        content,
+        indent,
+        prose_marker,
+        bg,
+        width,
+        false,
+        false,
+    );
+}
+
+fn push_formatted_body_marked_seeded(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    content: &str,
+    indent: &'static str,
+    prose_marker: Option<&'static str>,
+    bg: Option<Color>,
+    width: usize,
+    previous_reply_has_output: bool,
+    previous_reply_ends_blank: bool,
+) {
     // `Some((language, collected body))` while inside a fenced block: the body
     // is rendered as ONE unit when the fence closes (or at end of input for a
     // still-streaming block) so highlighting can be memoized per block — the
     // pager re-renders all history every scroll frame.
     let mut in_code: Option<(String, Vec<String>)> = None;
-    let mut last_blank = false;
+    let mut last_blank = previous_reply_ends_blank;
     let mut prose = Vec::new();
     let mut table = Vec::new();
     let mut checkbox_index = 1usize;
@@ -3166,7 +3303,7 @@ fn push_formatted_body_marked(
             flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             checkbox_index = 1;
-            if !last_blank && !lines.is_empty() {
+            if !last_blank && (previous_reply_has_output || !lines.is_empty()) {
                 lines.push(chat_line(
                     vec![Span::styled(indent, style_bg(palette.border(), bg))],
                     bg,
@@ -12392,6 +12529,75 @@ mod tests {
     }
 
     #[test]
+    fn streamed_code_fence_separator_survives_chunk_boundary() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let flushed_fence = "```rust\nfn main() {}\n```\n";
+        let full = format!("{flushed_fence}\nAfter the block.\n\n");
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("show code")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: full,
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+
+        let previous = LiveTurnFinalization::new(&session_id, &turn_id);
+        let mut fence = LiveTurnFinalization::new(&session_id, &turn_id);
+        fence.reply_flushed_text = flushed_fence.to_string();
+        let next = next_live_turn_finalization(&app, Some(&fence)).expect("watermark");
+
+        let mut streamed = finalized_live_turn_lines_between(
+            &app,
+            Palette::for_theme(ThemeName::Slate),
+            80,
+            &previous,
+            &fence,
+        );
+        streamed.extend(finalized_live_turn_lines_between(
+            &app,
+            Palette::for_theme(ThemeName::Slate),
+            80,
+            &fence,
+            &next,
+        ));
+
+        let rendered = streamed
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let close = rendered
+            .iter()
+            .position(|line| line.contains("└─"))
+            .expect("code fence close");
+        let after = rendered
+            .iter()
+            .position(|line| line.contains("After the block."))
+            .expect("paragraph after fence");
+        assert_eq!(
+            &rendered[close + 1..after],
+            [""],
+            "streaming should keep exactly one blank between code and prose: {rendered:#?}"
+        );
+    }
+
+    #[test]
     fn committed_turn_does_not_duplicate_live_flushed_reply_or_activity() {
         let turn_id = TurnId::new();
         let session_id = SessionKey("local:test".into());
@@ -12699,6 +12905,97 @@ mod tests {
             !line_is_blank(tail.last()),
             "live tail must not end on a spacer row (scar source)"
         );
+    }
+
+    #[test]
+    fn collapse_blank_runs_reduces_multi_blank_gaps_to_one() {
+        // The reported bug: concatenated block builders stack into 5-6 blank
+        // gaps. A run of any length collapses to a single blank; single blanks,
+        // content, and order are untouched. Mixed plain + styled (whitespace
+        // span) blanks count the same.
+        let mut lines = vec![
+            Line::from("user"),
+            Line::from(""),
+            Line::from("   "), // styled-ish blank (whitespace)
+            Line::from(""),
+            Line::from(""),
+            Line::from(""), // 5-blank run (the "6-blank user→reply" shape)
+            Line::from("• reply"),
+            Line::from(""), // a lone interior blank — must survive
+            Line::from("more"),
+        ];
+        collapse_blank_runs(&mut lines);
+
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                if line_is_blank(Some(l)) {
+                    "<blank>".to_string()
+                } else {
+                    l.spans.iter().map(|s| s.content.as_ref()).collect()
+                }
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec!["user", "<blank>", "• reply", "<blank>", "more"],
+            "every blank run collapses to exactly one; content + order preserved"
+        );
+    }
+
+    #[test]
+    fn collapse_blank_runs_seeded_closes_cross_flush_seam() {
+        // Reply text streams to scrollback across many small flushes. Flush 1
+        // ends on its trailing blank separator; flush 2 opens on a blank. Per
+        // flush each is fine, but at the seam they stack to a 2-line gap — the
+        // exact mini5-observed bug. Seeding flush 2 with "prev ended blank"
+        // drops its leading blank.
+        let mut flush1 = vec![Line::from("paragraph one"), Line::from("")];
+        let ends_blank = collapse_blank_runs_seeded(&mut flush1, false);
+        assert!(ends_blank, "flush 1 ends on a blank separator");
+
+        let mut flush2 = vec![Line::from(""), Line::from("paragraph two")];
+        let ends_blank2 = collapse_blank_runs_seeded(&mut flush2, ends_blank);
+        let rendered: Vec<String> = flush2
+            .iter()
+            .map(|l| {
+                if line_is_blank(Some(l)) {
+                    "<blank>".to_string()
+                } else {
+                    l.spans.iter().map(|s| s.content.as_ref()).collect()
+                }
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec!["paragraph two"],
+            "seam blank dropped: scrollback shows one blank between the chunks, not two"
+        );
+        assert!(!ends_blank2, "flush 2 ends on content");
+
+        // An all-blank batch after a blank collapses to nothing and leaves the
+        // seam state blank (the separator already in scrollback stands).
+        let mut flush3 = vec![Line::from(""), Line::from("  ")];
+        assert!(collapse_blank_runs_seeded(&mut flush3, true));
+        assert!(flush3.is_empty(), "redundant blanks after a blank all drop");
+    }
+
+    #[test]
+    fn collapse_blank_runs_is_idempotent_and_preserves_edges() {
+        // Already-collapsed input is unchanged (idempotent), and a single
+        // leading/trailing blank is kept (collapse only removes *excess*).
+        let mut lines = vec![
+            Line::from(""),
+            Line::from("a"),
+            Line::from(""),
+            Line::from("b"),
+            Line::from(""),
+        ];
+        let before = lines.len();
+        collapse_blank_runs(&mut lines);
+        assert_eq!(lines.len(), before, "no runs to collapse → unchanged");
+        collapse_blank_runs(&mut lines);
+        assert_eq!(lines.len(), before, "idempotent on a second pass");
     }
 
     #[test]

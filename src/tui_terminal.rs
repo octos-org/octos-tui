@@ -140,6 +140,14 @@ where
     pub last_known_screen_size: Size,
     /// Last cursor position we placed, so history insertion can restore it.
     pub last_known_cursor_pos: Position,
+    /// Count of visible history rows currently occupying the area above the
+    /// inline viewport. Rows above the viewport that have never held inserted
+    /// history are spare capacity, not blank transcript separators.
+    visible_history_rows: u16,
+    /// One-past-the-last row occupied by visible history above the viewport.
+    /// This lets history remain bottom-adjacent normally while still tracking
+    /// a blank gap if the live viewport later moves down.
+    visible_history_bottom: u16,
 }
 
 impl<B> Drop for Terminal<B>
@@ -172,6 +180,8 @@ where
             viewport_area: Rect::new(0, cursor_pos.y, 0, 0),
             last_known_screen_size: screen_size,
             last_known_cursor_pos: cursor_pos,
+            visible_history_rows: 0,
+            visible_history_bottom: 0,
         })
     }
 
@@ -201,6 +211,23 @@ where
         self.current_buffer_mut().resize(area);
         self.previous_buffer_mut().resize(area);
         self.viewport_area = area;
+        self.visible_history_rows = self.visible_history_rows.min(area.top());
+        self.visible_history_bottom = self.visible_history_bottom.min(area.top());
+        self.visible_history_rows = self.visible_history_rows.min(self.visible_history_bottom);
+    }
+
+    pub(crate) fn visible_history_rows(&self) -> u16 {
+        self.visible_history_rows
+    }
+
+    pub(crate) fn visible_history_bottom(&self) -> u16 {
+        self.visible_history_bottom
+    }
+
+    pub(crate) fn set_visible_history_extent(&mut self, rows: u16, bottom: u16) {
+        self.visible_history_bottom = bottom.min(self.viewport_area.top());
+        self.visible_history_rows = rows.min(self.viewport_area.top());
+        self.visible_history_rows = self.visible_history_rows.min(self.visible_history_bottom);
     }
 
     pub fn size(&self) -> io::Result<Size> {
@@ -384,6 +411,11 @@ where
     pub(crate) fn clear_after_position(&mut self, position: Position) -> io::Result<()> {
         self.backend.set_cursor_position(position)?;
         self.backend.clear_region(ClearType::AfterCursor)?;
+        if position.y <= self.viewport_area.top() {
+            self.visible_history_rows = self.visible_history_rows.min(position.y);
+            self.visible_history_bottom = self.visible_history_bottom.min(position.y);
+            self.visible_history_rows = self.visible_history_rows.min(self.visible_history_bottom);
+        }
         self.previous_buffer_mut().reset();
         Ok(())
     }
@@ -394,6 +426,8 @@ where
         self.backend.set_cursor_position(home)?;
         self.backend.clear_region(ClearType::All)?;
         self.backend.set_cursor_position(home)?;
+        self.visible_history_rows = 0;
+        self.visible_history_bottom = 0;
         self.previous_buffer_mut().reset();
         Ok(())
     }

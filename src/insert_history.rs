@@ -69,6 +69,8 @@ where
     let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
     let mut area = terminal.viewport_area;
     let last_cursor_pos = terminal.last_known_cursor_pos;
+    let visible_history_rows = terminal.visible_history_rows();
+    let visible_history_bottom = terminal.visible_history_bottom();
     let wrap_width = area.width.max(1) as usize;
 
     // Pre-wrap to the viewport width so each physical row is one grid row.
@@ -88,7 +90,7 @@ where
     // the area between the screen top and the viewport bottom; the viewport then
     // shifts down. Otherwise the region above is already full-height and the
     // reverse-index scroll pushes the oldest rows into scrollback.
-    let cursor_top = if area.bottom() < screen_size.height {
+    if area.bottom() < screen_size.height {
         let scroll_amount = wrapped_rows.min(screen_size.height - area.bottom());
         let top_1based = area.top() + 1;
         set_scroll_region(writer, top_1based, screen_size.height)?;
@@ -97,20 +99,56 @@ where
             queue!(writer, Print("\x1bM"))?; // Reverse Index (ESC M): scroll region down.
         }
         reset_scroll_region(writer)?;
-        let cursor_top = area.top().saturating_sub(1);
         area.y += scroll_amount;
         should_update_area = true;
-        cursor_top
-    } else {
-        area.top().saturating_sub(1)
-    };
+    }
 
-    // Limit scrolling to the rows above the viewport, then print the new lines
-    // starting just below the previous top of that region.
+    // Limit scrolling to the rows above the viewport. The terminal may have
+    // spare blank capacity between the already-inserted history and the live
+    // viewport (for example after the live tail shrinks). Append into that gap
+    // first; only scroll rows that are known to be visible history. Using a
+    // leading CRLF to create space preserves the gap once per call, which makes
+    // streamed chunks render with extra blank rows compared with one combined
+    // insert.
     set_scroll_region(writer, 1, area.top())?;
+    let history_bottom = if visible_history_rows == 0 {
+        area.top()
+    } else {
+        visible_history_bottom.min(area.top())
+    };
+    let history_rows = visible_history_rows.min(history_bottom);
+    let history_top = history_bottom.saturating_sub(history_rows);
+    let overflowing_rows = history_bottom
+        .saturating_add(wrapped_rows)
+        .saturating_sub(area.top());
+    let history_rows_to_scroll = overflowing_rows.min(history_rows);
+    let index_count = if history_rows_to_scroll > 0 {
+        history_top.saturating_add(history_rows_to_scroll)
+    } else {
+        0
+    };
+    if index_count > 0 {
+        queue!(writer, MoveTo(0, area.top().saturating_sub(1)))?;
+        for _ in 0..index_count {
+            queue!(writer, Print("\x1bD"))?; // Index (ESC D): scroll region up.
+        }
+    }
+    let remaining_history_rows = history_rows.saturating_sub(history_rows_to_scroll);
+    let base_bottom = if index_count > 0 {
+        remaining_history_rows
+    } else {
+        history_bottom
+    };
+    let new_bottom = base_bottom.saturating_add(wrapped_rows).min(area.top());
+    let new_visible_history_rows = remaining_history_rows
+        .saturating_add(wrapped_rows)
+        .min(area.top());
+    let cursor_top = new_bottom.saturating_sub(wrapped_rows.min(new_bottom));
     queue!(writer, MoveTo(0, cursor_top))?;
-    for line in &wrapped {
-        queue!(writer, Print("\r\n"))?;
+    for (idx, line) in wrapped.iter().enumerate() {
+        if idx > 0 {
+            queue!(writer, Print("\r\n"))?;
+        }
         write_history_line(writer, line)?;
     }
     reset_scroll_region(writer)?;
@@ -121,6 +159,7 @@ where
     if should_update_area {
         terminal.set_viewport_area(area);
     }
+    terminal.set_visible_history_extent(new_visible_history_rows, new_bottom);
     // Flush these out-of-band scrollback writes now. The draw() that follows
     // only flushes the backend when the live viewport diff or the cursor
     // changed, so without this the inserted history could sit buffered and not
@@ -342,6 +381,7 @@ fn queue_modifier_diff<W: Write>(w: &mut W, from: Modifier, to: Modifier) -> io:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui_terminal::FrameLike;
     use ratatui::backend::{Backend, ClearType as RtClearType, WindowSize};
     use ratatui::layout::{Position, Rect};
     use ratatui::style::Style;
@@ -424,6 +464,330 @@ mod tests {
         t
     }
 
+    #[derive(Debug)]
+    struct ScreenBackend {
+        buf: Vec<u8>,
+        size: Size,
+        cursor: Position,
+        margin_top: u16,
+        margin_bottom: u16,
+        rows: Vec<Vec<char>>,
+        scrollback: Vec<String>,
+        pending: Vec<u8>,
+    }
+
+    impl ScreenBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                buf: Vec::new(),
+                size: Size::new(width, height),
+                cursor: Position { x: 0, y: 0 },
+                margin_top: 0,
+                margin_bottom: height.saturating_sub(1),
+                rows: vec![vec![' '; usize::from(width)]; usize::from(height)],
+                scrollback: Vec::new(),
+                pending: Vec::new(),
+            }
+        }
+
+        fn screen_rows_above(&self, viewport_top: u16) -> Vec<String> {
+            let mut rows = self.scrollback.clone();
+            rows.extend(
+                self.rows
+                    .iter()
+                    .take(usize::from(viewport_top))
+                    .map(|row| row.iter().collect::<String>().trim_end().to_string()),
+            );
+            trim_transcript_rows(rows)
+        }
+
+        fn write_byte(&mut self, byte: u8) {
+            match byte {
+                b'\r' => self.cursor.x = 0,
+                b'\n' => self.linefeed(),
+                0x20..=0x7e => self.write_printable(char::from(byte)),
+                _ => {}
+            }
+        }
+
+        fn write_printable(&mut self, ch: char) {
+            if self.cursor.y >= self.size.height {
+                return;
+            }
+            if self.cursor.x >= self.size.width {
+                self.cursor.x = 0;
+                self.linefeed();
+            }
+            if let Some(row) = self.rows.get_mut(usize::from(self.cursor.y))
+                && let Some(cell) = row.get_mut(usize::from(self.cursor.x))
+            {
+                *cell = ch;
+            }
+            self.cursor.x = self.cursor.x.saturating_add(1);
+        }
+
+        fn linefeed(&mut self) {
+            if self.cursor.y == self.margin_bottom {
+                self.scroll_region_up();
+            } else {
+                self.cursor.y = (self.cursor.y + 1).min(self.size.height.saturating_sub(1));
+            }
+        }
+
+        fn reverse_index(&mut self) {
+            if self.cursor.y == self.margin_top {
+                self.scroll_region_down();
+            } else {
+                self.cursor.y = self.cursor.y.saturating_sub(1);
+            }
+        }
+
+        fn scroll_region_up(&mut self) {
+            let top = usize::from(self.margin_top);
+            let bottom = usize::from(self.margin_bottom);
+            if top >= self.rows.len() || bottom >= self.rows.len() || top > bottom {
+                return;
+            }
+            if self.margin_top == 0 {
+                self.scrollback.push(
+                    self.rows[top]
+                        .iter()
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string(),
+                );
+            }
+            for row in top..bottom {
+                self.rows[row] = self.rows[row + 1].clone();
+            }
+            self.rows[bottom] = vec![' '; usize::from(self.size.width)];
+        }
+
+        fn scroll_region_down(&mut self) {
+            let top = usize::from(self.margin_top);
+            let bottom = usize::from(self.margin_bottom);
+            if top >= self.rows.len() || bottom >= self.rows.len() || top > bottom {
+                return;
+            }
+            for row in (top + 1..=bottom).rev() {
+                self.rows[row] = self.rows[row - 1].clone();
+            }
+            self.rows[top] = vec![' '; usize::from(self.size.width)];
+        }
+
+        fn clear_to_eol(&mut self) {
+            if let Some(row) = self.rows.get_mut(usize::from(self.cursor.y)) {
+                for cell in row.iter_mut().skip(usize::from(self.cursor.x)) {
+                    *cell = ' ';
+                }
+            }
+        }
+
+        fn handle_csi(&mut self, params: &str, command: u8) {
+            match command {
+                b'H' | b'f' => {
+                    let parsed = parse_csi_numbers(params);
+                    let row = parsed.first().copied().unwrap_or(1).saturating_sub(1);
+                    let col = parsed.get(1).copied().unwrap_or(1).saturating_sub(1);
+                    self.cursor = Position {
+                        x: col.min(self.size.width.saturating_sub(1)),
+                        y: row.min(self.size.height.saturating_sub(1)),
+                    };
+                }
+                b'K' => self.clear_to_eol(),
+                b'r' => {
+                    let parsed = parse_csi_numbers(params);
+                    if parsed.len() >= 2 {
+                        let top = parsed[0].max(1).saturating_sub(1);
+                        let bottom = parsed[1].max(1).min(self.size.height).saturating_sub(1);
+                        if top <= bottom {
+                            self.margin_top = top;
+                            self.margin_bottom = bottom;
+                        }
+                    } else {
+                        self.margin_top = 0;
+                        self.margin_bottom = self.size.height.saturating_sub(1);
+                    }
+                }
+                b'm' => {}
+                _ => {}
+            }
+        }
+
+        fn process_pending(&mut self) {
+            let mut consumed = 0;
+            while consumed < self.pending.len() {
+                if self.pending[consumed] == 0x1b {
+                    match self.pending.get(consumed + 1).copied() {
+                        None => break,
+                        Some(b'[') => {
+                            let start = consumed + 2;
+                            let mut end = start;
+                            while end < self.pending.len()
+                                && !(0x40..=0x7e).contains(&self.pending[end])
+                            {
+                                end += 1;
+                            }
+                            if end >= self.pending.len() {
+                                break;
+                            }
+                            let params =
+                                String::from_utf8_lossy(&self.pending[start..end]).into_owned();
+                            let command = self.pending[end];
+                            self.handle_csi(&params, command);
+                            consumed = end + 1;
+                            continue;
+                        }
+                        Some(b'M') => {
+                            self.reverse_index();
+                            consumed += 2;
+                            continue;
+                        }
+                        Some(b'D') => {
+                            self.linefeed();
+                            consumed += 2;
+                            continue;
+                        }
+                        Some(_) => {}
+                    }
+                }
+                self.write_byte(self.pending[consumed]);
+                consumed += 1;
+            }
+            if consumed > 0 {
+                self.pending.drain(..consumed);
+            }
+        }
+    }
+
+    fn parse_csi_numbers(params: &str) -> Vec<u16> {
+        params
+            .trim_start_matches('?')
+            .split(';')
+            .filter(|part| !part.is_empty())
+            .filter_map(|part| part.parse::<u16>().ok())
+            .collect()
+    }
+
+    fn trim_transcript_rows(mut rows: Vec<String>) -> Vec<String> {
+        let first_content = rows.iter().position(|row| !row.is_empty()).unwrap_or(0);
+        rows.drain(..first_content);
+        if let Some(last_content) = rows.iter().rposition(|row| !row.is_empty()) {
+            rows.truncate((last_content + 2).min(rows.len()));
+        }
+        rows
+    }
+
+    impl Write for ScreenBackend {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.buf.extend_from_slice(data);
+            self.pending.extend_from_slice(data);
+            self.process_pending();
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Backend for ScreenBackend {
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            for (x, y, cell) in content {
+                if y >= self.size.height || x >= self.size.width {
+                    continue;
+                }
+                let symbol = cell.symbol();
+                let row = &mut self.rows[usize::from(y)];
+                let mut col = usize::from(x);
+                if symbol.is_empty() {
+                    if let Some(target) = row.get_mut(col) {
+                        *target = ' ';
+                    }
+                    continue;
+                }
+                for ch in symbol.chars() {
+                    if col >= row.len() {
+                        break;
+                    }
+                    row[col] = ch;
+                    col += 1;
+                }
+            }
+            Ok(())
+        }
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            Ok(self.cursor)
+        }
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.cursor = position.into();
+            Ok(())
+        }
+        fn clear(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn clear_region(&mut self, _clear_type: RtClearType) -> io::Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> io::Result<Size> {
+            Ok(self.size)
+        }
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            Ok(WindowSize {
+                columns_rows: self.size,
+                pixels: Size::new(0, 0),
+            })
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn screen_term(width: u16, height: u16, viewport: Rect) -> Terminal<ScreenBackend> {
+        let mut t = Terminal::new(ScreenBackend::new(width, height)).expect("terminal");
+        t.set_viewport_area(viewport);
+        t
+    }
+
+    fn text_line(text: &str) -> Line<'static> {
+        Line::from(text.to_string())
+    }
+
+    fn blank_line() -> Line<'static> {
+        Line::from("")
+    }
+
+    fn seed_history_then_move_viewport(
+        width: u16,
+        height: u16,
+        final_viewport: Rect,
+    ) -> Terminal<ScreenBackend> {
+        let seed_top = final_viewport.y.saturating_sub(1).max(1);
+        let seed_viewport = Rect::new(0, seed_top, width, height - seed_top);
+        let mut term = screen_term(width, height, seed_viewport);
+        insert_history_lines(&mut term, vec![text_line("old")]).expect("seed old history");
+        term.set_viewport_area(final_viewport);
+        term
+    }
+
+    fn draw_live_tail(term: &mut Terminal<ScreenBackend>, label: &str) {
+        term.invalidate_viewport();
+        term.draw(|frame| {
+            use ratatui::widgets::Paragraph;
+
+            frame.render_widget(Paragraph::new(format!("\n{label}")), frame.area());
+        })
+        .expect("draw live tail");
+    }
+
     /// Explicit default-background reset (`CSI 49 m`). Any background SGR that
     /// is NOT this is a non-default (theme) background.
     fn default_bg_seq() -> &'static str {
@@ -487,6 +851,70 @@ mod tests {
         assert!(
             out.contains("\x1b[39m"),
             "expected a foreground reset (CSI 39 m) in the scrollback stream: {out:?}"
+        );
+    }
+
+    #[test]
+    fn consecutive_blank_terminated_inserts_match_one_combined_insert() {
+        for height in 3..=8 {
+            for viewport_top in 1..height {
+                let width = 24;
+                let viewport = Rect::new(0, viewport_top, width, height - viewport_top);
+
+                let mut split = seed_history_then_move_viewport(width, height, viewport);
+                insert_history_lines(&mut split, vec![text_line("first"), blank_line()])
+                    .expect("first insert history");
+                insert_history_lines(&mut split, vec![text_line("second"), blank_line()])
+                    .expect("second insert history");
+                let split_rows = split.backend().screen_rows_above(split.viewport_area.top());
+
+                let mut combined = seed_history_then_move_viewport(width, height, viewport);
+                insert_history_lines(
+                    &mut combined,
+                    vec![
+                        text_line("first"),
+                        blank_line(),
+                        text_line("second"),
+                        blank_line(),
+                    ],
+                )
+                .expect("combined insert history");
+                let combined_rows = combined
+                    .backend()
+                    .screen_rows_above(combined.viewport_area.top());
+
+                assert_eq!(
+                    split_rows,
+                    vec!["old", "first", "", "second", ""],
+                    "split inserts should keep exactly one blank separator: height={height} viewport_top={viewport_top}"
+                );
+                assert_eq!(
+                    split_rows, combined_rows,
+                    "chunked history insertion must be row-equivalent to one combined insertion: height={height} viewport_top={viewport_top}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_tail_redraw_between_blank_terminated_inserts_does_not_leave_blank_row() {
+        let width = 24;
+        let height = 8;
+        let viewport = Rect::new(0, 3, width, 2);
+        let mut split = screen_term(width, height, viewport);
+
+        draw_live_tail(&mut split, "live one");
+        insert_history_lines(&mut split, vec![text_line("first"), blank_line()])
+            .expect("first insert history");
+        draw_live_tail(&mut split, "live two");
+        insert_history_lines(&mut split, vec![text_line("second"), blank_line()])
+            .expect("second insert history");
+
+        let split_rows = split.backend().screen_rows_above(split.viewport_area.top());
+        assert_eq!(
+            split_rows,
+            vec!["first", "", "second", ""],
+            "redrawing a leading-blank live tail between inserts must not add a second blank"
         );
     }
 

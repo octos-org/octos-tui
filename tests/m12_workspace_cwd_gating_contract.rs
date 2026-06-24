@@ -46,6 +46,7 @@ fn scrub_session_open_cwd_when_feature_absent() {
         topic: None,
         profile_id: Some("ada-server".into()),
         cwd: Some("/tmp/solo-project".into()),
+        sandbox: None,
         after: None,
     };
     let supported: Vec<String> = Vec::new();
@@ -67,6 +68,7 @@ fn scrub_session_open_cwd_passthrough_when_feature_present() {
         topic: None,
         profile_id: Some("ada-server".into()),
         cwd: Some("/tmp/solo-project".into()),
+        sandbox: None,
         after: None,
     };
     let supported = vec!["session.workspace_cwd.v1".to_string()];

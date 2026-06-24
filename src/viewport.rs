@@ -33,6 +33,12 @@ pub struct ScrollbackTracker {
     /// Recently completed live-turn watermarks kept long enough to dedupe the
     /// eventual committed assistant message / archived activity log.
     completed_live: Vec<LiveTurnFinalization>,
+    /// Whether the last line pushed to scrollback was blank. Reply chunks stream
+    /// in across many flushes; without carrying this, a chunk that ends on a
+    /// blank followed by one that opens on a blank stacks into a 2-line gap at
+    /// the seam (per-flush collapse can't see across flushes). Seeds the next
+    /// flush's blank-run collapse so cross-flush seams close to one blank.
+    last_flushed_ends_blank: bool,
 }
 
 /// What the event loop should do with scrollback before drawing the viewport.
@@ -138,6 +144,17 @@ impl ScrollbackTracker {
             ));
         }
         self.active_live = next_live.filter(LiveTurnFinalization::has_flushed_content);
+
+        // A single flush concatenates committed history + live-turn deltas, each
+        // of which guards only its own separators; their seam can stack into a
+        // multi-line gap. Collapse runs on the combined buffer — seeded with
+        // whether the previously flushed scrollback line was blank, so blanks
+        // stacked across the many small reply-streaming flushes also close to a
+        // single blank. On a reset the prior scrollback is stale, so don't carry
+        // the seam across it.
+        let seam_seed = !reset && self.last_flushed_ends_blank;
+        self.last_flushed_ends_blank =
+            app::collapse_blank_runs_seeded(&mut lines_to_insert, seam_seed);
 
         ScrollbackUpdate {
             lines_to_insert,

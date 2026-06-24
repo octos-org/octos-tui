@@ -9,8 +9,8 @@
 use octos_core::ui_protocol::TurnId;
 use octos_core::{Message, SessionKey};
 use octos_tui::app::{
-    finalized_history_lines_range_dedup_live, finalized_live_turn_lines_between,
-    next_live_turn_finalization,
+    LiveTurnFinalization, finalized_history_lines_range_dedup_live,
+    finalized_live_turn_lines_between, next_live_turn_finalization,
 };
 use octos_tui::cli::ThemeName;
 use octos_tui::model::{AppState, LiveReply, SessionView};
@@ -64,6 +64,16 @@ fn lines_text(lines: &[ratatui::text::Line<'_>]) -> Vec<String> {
                 .collect::<String>()
         })
         .collect()
+}
+
+fn live_coverage_for(store: &Store, reply_flushed_text: &str) -> LiveTurnFinalization {
+    let (session_id, turn_id) = store.state.active_turn().expect("active turn");
+    LiveTurnFinalization {
+        session_id: session_id.0.clone(),
+        turn_id: turn_id.0.to_string(),
+        reply_flushed_text: reply_flushed_text.to_string(),
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -192,6 +202,70 @@ fn commit_suffix_joins_flushed_prefix_without_marker() {
     assert!(
         !lines.iter().any(|l| l.contains("• ")),
         "the commit suffix is a continuation — no second bullet"
+    );
+}
+
+#[test]
+fn code_fence_separator_survives_stream_and_commit_boundaries() {
+    let flushed_fence = "```rust\nfn main() {}\n```\n";
+    let full = format!("{flushed_fence}\nAfter the block.\n\n");
+    let store = streaming_store(&full);
+    let fence_coverage = live_coverage_for(&store, flushed_fence);
+    let next = next_live_turn_finalization(&store.state, None).expect("watermark");
+
+    let mut streamed = lines_text(&finalized_live_turn_lines_between(
+        &store.state,
+        palette(),
+        80,
+        &LiveTurnFinalization::default(),
+        &fence_coverage,
+    ));
+    streamed.extend(lines_text(&finalized_live_turn_lines_between(
+        &store.state,
+        palette(),
+        80,
+        &fence_coverage,
+        &next,
+    )));
+    let close = streamed
+        .iter()
+        .position(|line| line.contains("└─"))
+        .expect("code fence close");
+    let after = streamed
+        .iter()
+        .position(|line| line.contains("After the block."))
+        .expect("paragraph after fence");
+    assert_eq!(
+        &streamed[close + 1..after],
+        [""],
+        "streaming should keep exactly one blank between code and prose: {streamed:#?}"
+    );
+
+    let mut committed_store = streaming_store("ignored");
+    committed_store.state.sessions[0].live_reply = None;
+    committed_store.state.sessions[0]
+        .messages
+        .push(Message::assistant(full));
+    let committed = lines_text(&finalized_history_lines_range_dedup_live(
+        &committed_store.state,
+        palette(),
+        80,
+        1,
+        &[LiveTurnFinalization {
+            reply_flushed_text: flushed_fence.to_string(),
+            ..Default::default()
+        }],
+    ));
+    assert_eq!(
+        committed.first().map(String::as_str),
+        Some(""),
+        "commit suffix should preserve the separator after a streamed fence: {committed:#?}"
+    );
+    assert!(
+        committed
+            .iter()
+            .any(|line| line.contains("After the block.")),
+        "commit suffix should include the unflushed paragraph: {committed:#?}"
     );
 }
 
