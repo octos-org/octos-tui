@@ -4705,6 +4705,70 @@ fn spinner_frame() -> &'static str {
     SPINNER_FRAMES[(elapsed / 120) as usize % SPINNER_FRAMES.len()]
 }
 
+/// Seconds since process start — the same process clock `spinner_frame` rides,
+/// so a wave keyed off it advances on every ~25ms animation redraw without
+/// threading a phase counter through `AppState`.
+fn anim_time_secs() -> f32 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f32()
+}
+
+/// Extract an RGB triple from a ratatui `Color`. Truecolor themes store
+/// `Color::Rgb`; named/`Reset` colors (the Terminal theme) fall back to neutral
+/// grey so the wave degrades to a subtle ripple rather than panicking.
+fn rgb_of(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (170, 170, 170),
+    }
+}
+
+/// Linear RGB lerp across gradient `stops`; `t` clamped to 0..=1.
+fn gradient_sample(stops: &[(u8, u8, u8)], t: f32) -> (u8, u8, u8) {
+    match stops {
+        [] => (255, 255, 255),
+        [only] => *only,
+        _ => {
+            let f = t.clamp(0.0, 1.0) * (stops.len() - 1) as f32;
+            let lo = f.floor() as usize;
+            let hi = (lo + 1).min(stops.len() - 1);
+            let frac = f - lo as f32;
+            let (a, b) = (stops[lo], stops[hi]);
+            let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * frac).round() as u8;
+            (mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
+        }
+    }
+}
+
+/// One `Span` per grapheme, each colored from a sine-driven sample point that
+/// slides with `phase`, so a bright crest travels along `text` like a ripple.
+/// Advances by DISPLAY columns (CJK/emoji are double-width) so the wave stays
+/// even across multi-width glyphs; `bg` preserves the row's surface background.
+fn wave_gradient_spans(
+    text: &str,
+    phase: f32,
+    stops: &[(u8, u8, u8)],
+    bg: Color,
+) -> Vec<Span<'static>> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    const K: f32 = 0.45; // radians per display column — ripple tightness
+    let mut spans = Vec::new();
+    let mut col = 0.0f32;
+    for g in text.graphemes(true) {
+        let wave = 0.5 + 0.5 * (col * K - phase).sin();
+        let (r, gg, b) = gradient_sample(stops, wave);
+        spans.push(Span::styled(
+            g.to_string(),
+            Style::default().fg(Color::Rgb(r, gg, b)).bg(bg),
+        ));
+        col += g.width().max(1) as f32;
+    }
+    spans
+}
+
 /// Title for an agent-task group chip. Pure so it can be unit-tested
 /// directly (Gap 2 fix #2). The order of precedence is deliberate:
 ///
@@ -6043,16 +6107,22 @@ fn harness_status_lines(
     };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled(
-        format!("{} ", spinner_frame()),
-        Style::default()
-            .fg(palette.accent)
-            .add_modifier(Modifier::BOLD)
-            .bg(palette.surface),
-    ));
-    spans.push(Span::styled(
-        phase.to_string(),
-        palette.title().bg(palette.surface),
+    // Water-wave gradient on "spinner + phase" (e.g. "⣻ Working"): a bright crest
+    // ripples across the label, advanced by the ~25ms animation redraw via the
+    // shared process clock. Uses Color::Rgb like the rest of octos-tui's themes
+    // (truecolor-assuming, so it works over SSH where COLORTERM isn't forwarded);
+    // the non-RGB Terminal theme degrades to a neutral-grey ripple via rgb_of.
+    let label = format!("{} {}", spinner_frame(), phase);
+    let stops = [
+        rgb_of(palette.muted),
+        rgb_of(palette.accent),
+        rgb_of(palette.highlight),
+    ];
+    spans.extend(wave_gradient_spans(
+        &label,
+        anim_time_secs() * 3.0,
+        &stops,
+        palette.surface,
     ));
 
     if let Some(status) = status {
@@ -7410,6 +7480,37 @@ mod tests {
         );
         app.diff_preview.apply_result(result);
         app
+    }
+
+    #[test]
+    fn gradient_sample_lerps_endpoints_and_midpoint() {
+        let stops = [(0u8, 0u8, 0u8), (100u8, 200u8, 40u8)];
+        assert_eq!(gradient_sample(&stops, 0.0), (0, 0, 0));
+        assert_eq!(gradient_sample(&stops, 1.0), (100, 200, 40));
+        assert_eq!(gradient_sample(&stops, 0.5), (50, 100, 20));
+        // Out-of-range clamps; degenerate stop lists don't panic.
+        assert_eq!(gradient_sample(&stops, 2.0), (100, 200, 40));
+        assert_eq!(gradient_sample(&[(7, 7, 7)], 0.5), (7, 7, 7));
+    }
+
+    #[test]
+    fn wave_gradient_spans_colors_each_grapheme_and_animates() {
+        let stops = [(0u8, 0u8, 0u8), (255u8, 255u8, 255u8)];
+        let a = wave_gradient_spans("abc", 0.0, &stops, Color::Reset);
+        assert_eq!(a.len(), 3, "one span per grapheme");
+        assert!(
+            a.iter()
+                .all(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _)))),
+            "every glyph gets a truecolor fg"
+        );
+        // Advancing the phase moves the crest → the first glyph recolors.
+        let b = wave_gradient_spans("abc", 1.5, &stops, Color::Reset);
+        assert_ne!(a[0].style.fg, b[0].style.fg, "the wave advances with phase");
+        // CJK double-width graphemes still produce one span each.
+        assert_eq!(
+            wave_gradient_spans("水波", 0.0, &stops, Color::Reset).len(),
+            2
+        );
     }
 
     #[test]
