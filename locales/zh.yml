@@ -75,8 +75,8 @@ app:
     select_stage_hint: "[/] 选择代码块 | c 暂存所选差异上下文"
     more_files_hidden: "还有 %{count} 个文件已隐藏（Tab 检查器）"
     line_unavailable: "此更改无可用的行级差异"
-    more_lines_hidden: "还有 %{count} 行差异已隐藏（Tab 检查器）"
-    more_hunks_hidden: "还有 %{count} 个代码块已隐藏（Tab 检查器）"
+    more_lines_hidden: "还有 %{count} 行差异已隐藏（Ctrl+O 展开）"
+    more_hunks_hidden: "还有 %{count} 个代码块已隐藏（Ctrl+O 展开）"
   autonomy:
     goal_prefix: "目标："
     loops_running: "循环：%{count} 个运行中"

@@ -5856,9 +5856,9 @@ impl AppState {
     pub fn toggle_tool_output_expansion(&mut self) {
         self.expanded_tool_outputs = !self.expanded_tool_outputs;
         self.status = if self.expanded_tool_outputs {
-            "Expanded tool output cards".into()
+            "Expanded tool output + diff".into()
         } else {
-            "Collapsed tool output cards".into()
+            "Collapsed tool output + diff".into()
         };
     }
 

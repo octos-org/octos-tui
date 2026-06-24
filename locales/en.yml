@@ -84,8 +84,8 @@ app:
     select_stage_hint: "[/] select hunk | c stage selected diff context"
     more_files_hidden: "+%{count} more file(s) hidden (Tab inspector)"
     line_unavailable: "line diff unavailable for this mutation"
-    more_lines_hidden: "%{count} more diff line(s) hidden (Tab inspector)"
-    more_hunks_hidden: "+%{count} more hunk(s) hidden (Tab inspector)"
+    more_lines_hidden: "%{count} more diff line(s) hidden (Ctrl+O expand)"
+    more_hunks_hidden: "+%{count} more hunk(s) hidden (Ctrl+O expand)"
   autonomy:
     goal_prefix: "Goal: "
     loops_running: "Loops: %{count} running"
