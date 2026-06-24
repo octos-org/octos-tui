@@ -76,6 +76,7 @@ pub fn run(cli: Cli) -> Result<()> {
     let mut guard = TerminalGuard {
         mode: RenderMode::Inline,
         saved_inline_viewport: None,
+        saved_visible_history_extent: None,
         mouse_captured: false,
     };
 
@@ -1638,6 +1639,7 @@ fn is_alt_char(key: &KeyEvent, expected: char) -> bool {
 struct TerminalGuard {
     mode: RenderMode,
     saved_inline_viewport: Option<ratatui::layout::Rect>,
+    saved_visible_history_extent: Option<(u16, u16)>,
     /// Mouse capture is on ONLY while the transcript pager is up (so the wheel
     /// scrolls the pager). It must never be on in the inline chat flow, where
     /// it would defeat native terminal selection/copy.
@@ -1674,6 +1676,10 @@ impl TerminalGuard {
             return Ok(());
         }
         self.saved_inline_viewport = Some(terminal.viewport_area);
+        self.saved_visible_history_extent = Some((
+            terminal.visible_history_rows(),
+            terminal.visible_history_bottom(),
+        ));
         execute!(terminal.backend_mut(), EnterAlternateScreen)?;
         let size = terminal.size()?;
         terminal.set_viewport_area(ratatui::layout::Rect::new(0, 0, size.width, size.height));
@@ -1698,7 +1704,11 @@ impl TerminalGuard {
             let size = terminal.size()?;
             ratatui::layout::Rect::new(0, size.height.saturating_sub(1), size.width, 1)
         };
+        let saved_visible_history_extent = self.saved_visible_history_extent.take();
         terminal.set_viewport_area(self.saved_inline_viewport.take().unwrap_or(fallback));
+        if let Some((rows, bottom)) = saved_visible_history_extent {
+            terminal.set_visible_history_extent(rows, bottom);
+        }
         terminal.invalidate_viewport();
         self.mode = RenderMode::Inline;
         Ok(())
@@ -2105,6 +2115,7 @@ mod tests {
         let mut guard = TerminalGuard {
             mode: RenderMode::Inline,
             saved_inline_viewport: None,
+            saved_visible_history_extent: None,
             mouse_captured: false,
         };
         let mut scrollback = ScrollbackTracker::new();
@@ -2160,6 +2171,7 @@ mod tests {
         let mut guard = TerminalGuard {
             mode: RenderMode::Inline,
             saved_inline_viewport: None,
+            saved_visible_history_extent: None,
             mouse_captured: false,
         };
         let mut scrollback = ScrollbackTracker::new();
@@ -2184,10 +2196,12 @@ mod tests {
         let mut terminal =
             InlineTerminal::new(RecordingBackend::new(80, 24)).expect("recording terminal");
         terminal.set_viewport_area(Rect::new(0, 20, 80, 4));
+        terminal.set_visible_history_extent(3, 20);
         terminal.last_known_screen_size = Size::new(80, 24);
         let mut guard = TerminalGuard {
             mode: RenderMode::Inline,
             saved_inline_viewport: None,
+            saved_visible_history_extent: None,
             mouse_captured: false,
         };
 
@@ -2204,6 +2218,8 @@ mod tests {
             .expect("leave alt screen");
         assert_eq!(guard.mode, RenderMode::Inline);
         assert_eq!(terminal.viewport_area, Rect::new(0, 20, 80, 4));
+        assert_eq!(terminal.visible_history_rows(), 3);
+        assert_eq!(terminal.visible_history_bottom(), 20);
 
         terminal
             .resize_viewport_to(4)

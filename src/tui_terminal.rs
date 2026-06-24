@@ -271,6 +271,11 @@ where
                     old_area.top(),
                     old_bottom_with_new_height,
                 )?;
+                self.visible_history_bottom = self
+                    .visible_history_bottom
+                    .saturating_sub(old_bottom_with_new_height);
+                self.visible_history_rows =
+                    self.visible_history_rows.min(self.visible_history_bottom);
             }
 
             // A terminal shrink can leave `old_area.y` outside the new visible
@@ -805,5 +810,19 @@ mod tests {
         assert_eq!(terminal.viewport_area, Rect::new(0, 45, 130, 5));
         assert_eq!(terminal.backend().cursor, Position { x: 0, y: 45 });
         assert_eq!(terminal.backend().clears, vec![ClearType::AfterCursor]);
+    }
+
+    #[test]
+    fn viewport_growth_scrolls_visible_history_extent_up() {
+        let mut terminal = Terminal::new(RecordingBackend::new(10, 10)).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 8, 10, 2));
+        terminal.set_visible_history_extent(5, 6);
+        terminal.last_known_screen_size = Size::new(10, 10);
+
+        terminal.resize_viewport_to(4).expect("resize viewport");
+
+        assert_eq!(terminal.viewport_area, Rect::new(0, 6, 10, 4));
+        assert_eq!(terminal.visible_history_bottom(), 4);
+        assert_eq!(terminal.visible_history_rows(), 4);
     }
 }
