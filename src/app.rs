@@ -2706,12 +2706,6 @@ fn anchored_turn_activity_logs<'a>(
                             message.role.as_str() == "user" && message.content == *request
                         })
                     })
-                })
-                .or_else(|| {
-                    session
-                        .messages
-                        .iter()
-                        .rposition(|message| message.role.as_str() == "user")
                 })?;
             Some((activity_log_render_index(session, anchor_index), log))
         })
@@ -12750,6 +12744,93 @@ mod tests {
         assert!(
             text.contains("$ cargo build"),
             "missing tool detail: {text:?}"
+        );
+    }
+
+    #[test]
+    fn finalized_history_lines_place_each_activity_log_after_own_reply() {
+        let session_id = SessionKey("local:test".into());
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let mut app = chat_app(vec![
+            Message::user("first prompt"),
+            Message::assistant("First answer."),
+            Message::user("second prompt"),
+            Message::assistant("Second answer."),
+        ]);
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id: session_id.clone(),
+            turn_id: turn_a.clone(),
+            request: Some("first prompt".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_a)
+                    .with_detail("cargo test --first")
+                    .with_success(true),
+            ],
+        });
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_b.clone(),
+            request: Some("second prompt".into()),
+            anchor_index: Some(2),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_b)
+                    .with_detail("cargo test --second")
+                    .with_success(true),
+            ],
+        });
+
+        let lines = finalized_history_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let first_reply = rendered
+            .iter()
+            .position(|line| line.contains("First answer."))
+            .expect("first reply");
+        let second_prompt = rendered
+            .iter()
+            .position(|line| line.contains("second prompt"))
+            .expect("second prompt");
+        let second_reply = rendered
+            .iter()
+            .position(|line| line.contains("Second answer."))
+            .expect("second reply");
+        let cards = rendered
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| line.contains("Agent task completed").then_some(idx))
+            .collect::<Vec<_>>();
+        assert_eq!(cards.len(), 2, "expected two activity cards: {rendered:#?}");
+        let first_card = cards[0];
+        let second_card = cards[1];
+
+        assert_eq!(
+            first_card,
+            first_reply + 2,
+            "first card should follow first reply with one blank: {rendered:#?}"
+        );
+        assert!(line_is_blank(lines.get(first_reply + 1)));
+        assert_eq!(
+            second_card,
+            second_reply + 2,
+            "second card should follow second reply with one blank: {rendered:#?}"
+        );
+        assert!(line_is_blank(lines.get(second_reply + 1)));
+        assert!(
+            first_card < second_prompt
+                && second_prompt < second_reply
+                && second_reply < second_card,
+            "activity cards must stay in turn order: {rendered:#?}"
         );
     }
 

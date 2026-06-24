@@ -3243,6 +3243,7 @@ pub struct AppState {
     pub composer_drafts: Vec<ComposerDraft>,
     pub pending_messages: Vec<String>,
     pub optimistic_user_messages: Vec<OptimisticUserMessage>,
+    pub turn_prompt_anchors: Vec<TurnPromptAnchor>,
     pub status: String,
     pub target: Option<String>,
     pub readonly: bool,
@@ -3356,6 +3357,15 @@ pub struct ComposerDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptimisticUserMessage {
+    pub session_id: SessionKey,
+    pub turn_id: TurnId,
+    pub content: String,
+    pub anchor_index: usize,
+    pub prior_matching_user_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnPromptAnchor {
     pub session_id: SessionKey,
     pub turn_id: TurnId,
     pub content: String,
@@ -4737,6 +4747,7 @@ impl AppState {
     /// realistically be followed by a late terminal, so older ids are evicted
     /// FIFO.
     pub const FINALIZED_BY_SWITCH_CAP: usize = 128;
+    const MAX_TURN_PROMPT_ANCHORS: usize = 128;
 
     /// Record that `turn_id` in `session_id` was finalized (committed OR
     /// dropped) by a turn-switch, so the turn's OWN late terminal can be
@@ -4848,6 +4859,7 @@ impl AppState {
             composer_drafts: Vec::new(),
             pending_messages: Vec::new(),
             optimistic_user_messages: Vec::new(),
+            turn_prompt_anchors: Vec::new(),
             status,
             target,
             readonly,
@@ -5403,13 +5415,22 @@ impl AppState {
         else {
             return;
         };
+        let prior_matching_user_count = matching_user_message_count(session, &content);
+        let anchor_index = session.messages.len();
         let optimistic = OptimisticUserMessage {
-            prior_matching_user_count: matching_user_message_count(session, &content),
-            anchor_index: session.messages.len(),
+            prior_matching_user_count,
+            anchor_index,
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            content: content.clone(),
+        };
+        self.remember_turn_prompt_anchor(TurnPromptAnchor {
             session_id,
             turn_id,
             content,
-        };
+            anchor_index,
+            prior_matching_user_count,
+        });
         self.optimistic_user_messages.push(optimistic);
         const MAX_OPTIMISTIC_USER_MESSAGES: usize = 64;
         if self.optimistic_user_messages.len() > MAX_OPTIMISTIC_USER_MESSAGES {
@@ -5443,6 +5464,57 @@ impl AppState {
             retained.push(optimistic);
         }
         self.optimistic_user_messages = retained;
+    }
+
+    pub fn record_turn_prompt_anchor_from_latest_user(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> bool {
+        if self
+            .turn_prompt_anchors
+            .iter()
+            .any(|anchor| &anchor.session_id == session_id && &anchor.turn_id == turn_id)
+        {
+            return true;
+        }
+
+        let Some(anchor) = self
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .and_then(|session| {
+                latest_user_anchor(session).map(
+                    |(anchor_index, content, prior_matching_user_count)| TurnPromptAnchor {
+                        session_id: session_id.clone(),
+                        turn_id: turn_id.clone(),
+                        content,
+                        anchor_index,
+                        prior_matching_user_count,
+                    },
+                )
+            })
+        else {
+            return false;
+        };
+
+        self.remember_turn_prompt_anchor(anchor);
+        true
+    }
+
+    fn remember_turn_prompt_anchor(&mut self, anchor: TurnPromptAnchor) {
+        if let Some(existing) = self.turn_prompt_anchors.iter_mut().find(|existing| {
+            existing.session_id == anchor.session_id && existing.turn_id == anchor.turn_id
+        }) {
+            *existing = anchor;
+        } else {
+            self.turn_prompt_anchors.push(anchor);
+        }
+
+        if self.turn_prompt_anchors.len() > Self::MAX_TURN_PROMPT_ANCHORS {
+            let excess = self.turn_prompt_anchors.len() - Self::MAX_TURN_PROMPT_ANCHORS;
+            self.turn_prompt_anchors.drain(0..excess);
+        }
     }
 
     /// Orphan activity-chip self-heal: a turn just became terminal, so any of
@@ -5507,10 +5579,17 @@ impl AppState {
             .iter()
             .rev()
             .find(|message| &message.session_id == session_id && &message.turn_id == turn_id);
+        let prompt_anchor = self
+            .turn_prompt_anchors
+            .iter()
+            .rev()
+            .find(|anchor| &anchor.session_id == session_id && &anchor.turn_id == turn_id);
         let request = optimistic
             .map(|message| message.content.clone())
-            .or_else(|| latest_user_content_for_session(&self.sessions, session_id));
-        let anchor_index = optimistic.map(|message| message.anchor_index);
+            .or_else(|| prompt_anchor.map(|anchor| anchor.content.clone()));
+        let anchor_index = optimistic.map(|message| message.anchor_index).or_else(|| {
+            prompt_anchor.and_then(|anchor| resolve_turn_prompt_anchor(&self.sessions, anchor))
+        });
         let log = TurnActivityLog {
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
@@ -6614,21 +6693,46 @@ fn matching_user_message_count(session: &SessionView, content: &str) -> usize {
         .count()
 }
 
-fn latest_user_content_for_session(
-    sessions: &[SessionView],
-    session_id: &SessionKey,
-) -> Option<String> {
-    sessions
+fn latest_user_anchor(session: &SessionView) -> Option<(usize, String, usize)> {
+    let (anchor_index, message) = session
+        .messages
         .iter()
-        .find(|session| &session.id == session_id)
-        .and_then(|session| {
-            session
-                .messages
-                .iter()
-                .rev()
-                .find(|message| message.role.as_str() == "user")
-                .map(|message| message.content.clone())
-        })
+        .enumerate()
+        .rev()
+        .find(|(_, message)| message.role.as_str() == "user")?;
+    let prior_matching_user_count = session.messages[..anchor_index]
+        .iter()
+        .filter(|prior| prior.role.as_str() == "user" && prior.content == message.content)
+        .count();
+    Some((
+        anchor_index,
+        message.content.clone(),
+        prior_matching_user_count,
+    ))
+}
+
+fn resolve_turn_prompt_anchor(
+    sessions: &[SessionView],
+    anchor: &TurnPromptAnchor,
+) -> Option<usize> {
+    let session = sessions
+        .iter()
+        .find(|session| session.id == anchor.session_id)?;
+    if session
+        .messages
+        .get(anchor.anchor_index)
+        .is_some_and(|message| message.role.as_str() == "user" && message.content == anchor.content)
+    {
+        return Some(anchor.anchor_index);
+    }
+
+    session
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role.as_str() == "user" && message.content == anchor.content)
+        .nth(anchor.prior_matching_user_count)
+        .map(|(idx, _)| idx)
 }
 
 fn estimated_activity_rows(item: &ActivityItem) -> usize {

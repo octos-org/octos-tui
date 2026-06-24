@@ -4615,6 +4615,7 @@ impl Store {
                 let composer_drafts = self.state.composer_drafts.clone();
                 let pending_messages = self.state.pending_messages.clone();
                 let optimistic_user_messages = self.state.optimistic_user_messages.clone();
+                let turn_prompt_anchors = self.state.turn_prompt_anchors.clone();
                 let approval_auto_open = self.state.approval_auto_open;
                 let user_question_auto_open = self.state.user_question_auto_open;
                 let expanded_tool_outputs = self.state.expanded_tool_outputs;
@@ -4661,6 +4662,7 @@ impl Store {
                 state.composer_drafts = composer_drafts;
                 state.pending_messages = pending_messages;
                 state.optimistic_user_messages = optimistic_user_messages;
+                state.turn_prompt_anchors = turn_prompt_anchors;
                 state.approval_auto_open = approval_auto_open;
                 state.user_question_auto_open = user_question_auto_open;
                 state.expanded_tool_outputs = expanded_tool_outputs;
@@ -5732,6 +5734,8 @@ impl Store {
                 // (No-op when the bound buffer is for the SAME turn — that case
                 // is the lazy-bind/replay race handled just below.)
                 self.commit_pending_live_reply_for_turn_switch(&event.session_id, &event.turn_id);
+                self.state
+                    .record_turn_prompt_anchor_from_latest_user(&event.session_id, &event.turn_id);
                 if let Some(session) = self.find_session_mut(&event.session_id) {
                     // Out-of-order lifecycle (nit 1): a MessageDelta may have
                     // already lazy-bound THIS turn before its TurnStarted was
@@ -5785,6 +5789,8 @@ impl Store {
                     .unwrap_or(true);
                 if needs_bind {
                     self.commit_pending_live_reply_for_turn_switch(&session_id, &turn_id);
+                    self.state
+                        .record_turn_prompt_anchor_from_latest_user(&session_id, &turn_id);
                 }
                 let mut reset_scroll = false;
                 if let Some(session) = self.find_session_mut(&session_id) {
@@ -5812,6 +5818,8 @@ impl Store {
                 None
             }
             UiNotification::ToolStarted(event) => {
+                self.state
+                    .record_turn_prompt_anchor_from_latest_user(&event.session_id, &event.turn_id);
                 let mut item =
                     ActivityItem::new(ActivityKind::Tool, event.tool_name.clone(), "running")
                         .with_turn(event.turn_id)
@@ -5852,6 +5860,8 @@ impl Store {
                 None
             }
             UiNotification::ToolCompleted(event) => {
+                self.state
+                    .record_turn_prompt_anchor_from_latest_user(&event.session_id, &event.turn_id);
                 let status = match event.success {
                     Some(false) => "failed",
                     _ => "complete",
@@ -5890,6 +5900,8 @@ impl Store {
             UiNotification::ApprovalRequested(event) => {
                 let title = event.title.clone();
                 let session_id = event.session_id.clone();
+                self.state
+                    .record_turn_prompt_anchor_from_latest_user(&session_id, &event.turn_id);
                 self.state.push_activity(
                     ActivityItem::new(
                         ActivityKind::Approval,
@@ -6550,6 +6562,8 @@ impl Store {
         event: UserQuestionRequestedEvent,
     ) -> Option<AppUiCommand> {
         let title = event.title.clone();
+        self.state
+            .record_turn_prompt_anchor_from_latest_user(&event.session_id, &event.turn_id);
         let detail = if event.questions.is_empty() {
             "free text".to_string()
         } else {
@@ -12550,6 +12564,87 @@ mod tests {
             .expect("turn activity log");
         assert_eq!(log.request.as_deref(), Some("build the site"));
         assert_eq!(log.items.len(), 1);
+    }
+
+    #[test]
+    fn turn_activity_logs_keep_prompt_anchor_after_optimistic_prompt_confirms() {
+        let turn_a = TurnId::new();
+        let mut store = store_with_live_reply(turn_a.clone(), "first answer");
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_a.clone(),
+            "first prompt".into(),
+        );
+        store.state.restore_optimistic_user_messages();
+        assert!(
+            store.state.optimistic_user_messages.is_empty(),
+            "server-confirmed prompt should no longer depend on the optimistic entry"
+        );
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_turn(turn_a.clone())
+                .with_detail("cargo test --first")
+                .with_success(true),
+        );
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let turn_b = TurnId::new();
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: turn_b.clone(),
+            text: "second answer".into(),
+        });
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_b.clone(),
+            "second prompt".into(),
+        );
+        store.state.restore_optimistic_user_messages();
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_turn(turn_b.clone())
+                .with_detail("cargo test --second")
+                .with_success(true),
+        );
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_b.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let log_a = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_a)
+            .expect("first turn activity log");
+        let log_b = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_b)
+            .expect("second turn activity log");
+        assert_eq!(log_a.request.as_deref(), Some("first prompt"));
+        assert_eq!(log_a.anchor_index, Some(0));
+        assert_eq!(log_b.request.as_deref(), Some("second prompt"));
+        assert_eq!(log_b.anchor_index, Some(2));
     }
 
     #[test]
