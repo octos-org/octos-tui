@@ -6753,8 +6753,13 @@ impl Store {
         // finalized-by-switch early return so it always records.
         self.state
             .mark_turn_completed(&event.session_id, &event.turn_id);
-        self.state
-            .clear_live_reply_segment_boundaries(&event.session_id, &event.turn_id);
+        // Do NOT clear live_reply_segment_boundaries on completion: after the turn
+        // settles the committed-path render (finalized_history_lines_range_dedup_live)
+        // still needs them to split a concatenated live-reply commit into discrete
+        // segments. Clearing here left the committed message glued ("…html.Step 2:")
+        // because the render ran with no boundaries. They are per-turn capped and the
+        // prior-turn clear on the next turn-switch reaps them once the message is
+        // safely in native scrollback.
         if self
             .state
             .take_turn_finalized_by_switch(&event.session_id, &event.turn_id)

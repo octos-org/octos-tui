@@ -594,6 +594,26 @@ pub fn finalized_history_lines_range_dedup_live(
                 true,
                 live_reply_prefix_ends_blank(palette, &coverage.reply_flushed_text, wrap_width),
             );
+        } else if message.role.as_str() == "assistant" {
+            let boundaries =
+                committed_reply_segment_boundaries_for_message(app, session, idx, &message.content);
+            if boundaries.is_empty() {
+                push_message_block(
+                    &mut lines,
+                    palette,
+                    message.role.as_str(),
+                    &message.content,
+                    wrap_width,
+                );
+            } else {
+                push_committed_assistant_reply_segments(
+                    &mut lines,
+                    palette,
+                    &message.content,
+                    wrap_width,
+                    &boundaries,
+                );
+            }
         } else {
             push_message_block(
                 &mut lines,
@@ -629,6 +649,93 @@ pub fn finalized_history_lines_range_dedup_live(
     }
     strip_lines_background(&mut lines);
     lines
+}
+
+fn committed_reply_segment_boundaries_for_message(
+    app: &AppState,
+    session: &SessionView,
+    message_idx: usize,
+    content: &str,
+) -> Vec<usize> {
+    let mut boundaries = app
+        .live_reply_segment_boundaries
+        .iter()
+        .filter(|((session_id, _), _)| session_id == &session.id)
+        .filter(|((session_id, turn_id), _)| {
+            let coverage = LiveTurnFinalization {
+                session_id: session_id.0.clone(),
+                turn_id: turn_id.0.to_string(),
+                ..Default::default()
+            };
+            committed_reply_index_for_live_finalization(app, session, &coverage)
+                == Some(message_idx)
+        })
+        .flat_map(|(_, boundaries)| boundaries.iter().copied())
+        .filter(|boundary| {
+            *boundary > 0 && *boundary < content.len() && content.is_char_boundary(*boundary)
+        })
+        .collect::<Vec<_>>();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    boundaries
+}
+
+fn push_committed_assistant_reply_segments(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    content: &str,
+    wrap_width: usize,
+    boundaries: &[usize],
+) {
+    let mut cursor = 0;
+    let mut first = true;
+    let mut previous_reply_has_output = false;
+    let mut previous_reply_ends_blank = false;
+
+    for boundary in boundaries {
+        if *boundary > cursor {
+            let chunk = &content[cursor..*boundary];
+            push_live_reply_block_seeded(
+                lines,
+                palette,
+                chunk,
+                wrap_width,
+                first,
+                previous_reply_has_output,
+                previous_reply_ends_blank,
+            );
+            if !chunk.trim().is_empty() {
+                first = false;
+            }
+            cursor = *boundary;
+            previous_reply_has_output = !content[..cursor].trim().is_empty();
+            previous_reply_ends_blank =
+                live_reply_prefix_ends_blank(palette, &content[..cursor], wrap_width);
+        }
+
+        if *boundary < content.len() {
+            push_live_reply_segment_separator(
+                lines,
+                previous_reply_has_output,
+                previous_reply_ends_blank,
+            );
+            previous_reply_has_output = false;
+            previous_reply_ends_blank = true;
+            first = false;
+        }
+    }
+
+    if cursor < content.len() {
+        push_live_reply_block_seeded(
+            lines,
+            palette,
+            &content[cursor..],
+            wrap_width,
+            first,
+            previous_reply_has_output,
+            previous_reply_ends_blank,
+        );
+    }
 }
 
 /// Return the next active-turn watermark by extending the previous one with any
@@ -12946,6 +13053,72 @@ mod tests {
         assert!(
             !rendered.iter().any(|line| line.contains("Body one.###")),
             "segment boundary must prevent body/header gluing: {rendered:#?}"
+        );
+    }
+
+    #[test]
+    fn committed_assistant_segment_boundary_starts_fresh_markdown_block() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let first_segment = "**Step 1:** a.";
+        let second_segment = "**Step 2:** b.";
+        let content = format!("{first_segment}{second_segment}");
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("build a demo"),
+                    Message::assistant(content.as_str()),
+                ],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_prompt_anchors.push(TurnPromptAnchor {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            content: "build a demo".into(),
+            anchor_index: 0,
+            prior_matching_user_count: 0,
+        });
+        app.live_reply_segment_boundaries
+            .insert((session_id, turn_id), vec![first_segment.len()]);
+
+        let rendered = line_texts(&finalized_history_lines_range_dedup_live(
+            &app,
+            Palette::for_theme(ThemeName::Slate),
+            100,
+            1,
+            &[],
+        ));
+        let first = rendered
+            .iter()
+            .position(|line| line == "• Step 1: a.")
+            .expect("first segment should render as assistant prose");
+        let second = rendered
+            .iter()
+            .position(|line| line == "Step 2: b." || line == "• Step 2: b.")
+            .expect("second segment should render as a discrete markdown block");
+
+        assert_eq!(
+            rendered.get(first + 1).map(String::as_str),
+            Some(""),
+            "segment boundary should force a blank paragraph break: {rendered:#?}"
+        );
+        assert_eq!(
+            second,
+            first + 2,
+            "Step 2 should not be glued onto Step 1: {rendered:#?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains("a.Step 2")),
+            "committed assistant segment boundary must prevent gluing: {rendered:#?}"
         );
     }
 
