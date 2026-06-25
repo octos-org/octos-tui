@@ -713,13 +713,48 @@ fn sanitize_pasted_text(text: &str) -> String {
                 }
             }
             '\t' => out.push(' '),
-            // Zero-width / format chars (ZWSP, ZWNJ, ZWJ, word-joiner, BOM).
-            '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}' => {}
+            // Unicode line / paragraph separators -> newline (composer is multi-line).
+            '\u{2028}' | '\u{2029}' => out.push('\n'),
+            // Invisible / non-rendering format codepoints (zero-width, bidi controls,
+            // variation selectors, BOM, ...). Inserted raw they have zero/odd display
+            // width but still occupy buffer bytes, so the byte-cursor desyncs from the
+            // width-based render: text fails to render and backspace leaves residue.
+            c if is_invisible_format_char(c) => {}
             c if c.is_control() => {}
             c => out.push(c),
         }
     }
     out
+}
+
+/// Invisible / non-rendering format codepoints that rich (HTML) clipboard copies
+/// carry: zero-width spaces & joiners, bidi (Trojan-Source) controls, variation
+/// selectors, BOM, interlinear-annotation marks, and tag chars. The plain-text
+/// composer can't render these — raw, they desync the byte-cursor from the
+/// width-based render. Mirrors codex's curated strip set
+/// (codex-rs/tui/src/terminal_title.rs::is_disallowed_terminal_title_char), widened
+/// to the full tags / variation-selectors-supplement plane.
+fn is_invisible_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'                    // soft hyphen
+            | '\u{034f}'              // combining grapheme joiner
+            | '\u{061c}'              // arabic letter mark
+            | '\u{115f}'..='\u{1160}' // hangul choseong/jungseong fillers
+            | '\u{17b4}'..='\u{17b5}' // khmer inherent vowels (invisible)
+            | '\u{180b}'..='\u{180e}' // mongolian free variation selectors + vowel sep
+            | '\u{200b}'..='\u{200f}' // ZWSP, ZWNJ, ZWJ, LRM, RLM
+            | '\u{202a}'..='\u{202e}' // bidi embedding / override
+            | '\u{2060}'..='\u{206f}' // word joiner, invisibles, deprecated format
+            | '\u{3164}'              // hangul filler
+            | '\u{fe00}'..='\u{fe0f}' // variation selectors
+            | '\u{feff}'              // BOM / zero-width no-break space
+            | '\u{ffa0}'              // halfwidth hangul filler
+            | '\u{fff9}'..='\u{fffb}' // interlinear annotation
+            | '\u{1bca0}'..='\u{1bca3}' // shorthand format controls
+            | '\u{1d173}'..='\u{1d17a}' // musical symbol formatting
+            | '\u{e0000}'..='\u{e0fff}' // tags + variation selectors supplement
+    )
 }
 
 fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
@@ -2504,6 +2539,30 @@ mod tests {
         let styled = "AAA\u{1b}[31mRED\u{1b}[0m\u{200b}XYZ\r\n\tEND";
         handle_terminal_event(&mut store, Event::Paste(styled.into()));
         assert_eq!(store.state.composer, "AAAREDXYZ\n END");
+    }
+
+    #[test]
+    fn terminal_paste_strips_html_invisible_format_chars_keeping_cjk() {
+        // Real-world repro: copying CJK from a styled web page interleaves the
+        // visible text with invisible format codepoints (LRM, ZWSP, soft hyphen,
+        // variation selector, bidi embedding, word-joiner, BOM, isolate-pop). The
+        // old 5-char strip-set missed most of these, so they stayed in the buffer
+        // and desynced the byte-cursor from the width render — the text rendered
+        // mostly blank with only the tail surviving. All must reduce to plain CJK.
+        let mut store = store_with_sessions(1);
+        let styled =
+            "\u{200e}五\u{200b}大\u{00ad}拉\u{fe0f}格\u{202a}朗\u{2060}日\u{feff}点\u{2069}";
+        handle_terminal_event(&mut store, Event::Paste(styled.into()));
+        assert_eq!(store.state.composer, "五大拉格朗日点");
+    }
+
+    #[test]
+    fn terminal_paste_maps_unicode_line_and_paragraph_separators_to_newline() {
+        // U+2028 / U+2029 are not ASCII control chars; left raw they render oddly
+        // in the plain-text composer. They mean "line break" — map them to '\n'.
+        let mut store = store_with_sessions(1);
+        handle_terminal_event(&mut store, Event::Paste("a\u{2028}b\u{2029}c".into()));
+        assert_eq!(store.state.composer, "a\nb\nc");
     }
 
     #[test]
