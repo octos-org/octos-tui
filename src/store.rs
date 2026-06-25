@@ -1199,6 +1199,11 @@ impl Store {
                 self.state.status = t!("thinking.cleared").to_string();
             }
         }
+        // Rebuild the open /thinking menu so its `*` active-marker jumps to the
+        // just-selected level immediately. The marker is computed from
+        // session_reasoning_effort at menu-build time (menu_app_snapshot), so
+        // without a refresh it stays on the previous level until the next rebuild.
+        self.refresh_active_menu();
         None
     }
 
