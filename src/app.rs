@@ -651,6 +651,23 @@ pub fn finalized_history_lines_range_dedup_live(
     lines
 }
 
+/// A recorded segment boundary is "word-safe" when it does NOT fall inside a
+/// word/token — i.e. not (the char before AND the char at the offset are both
+/// word chars). `message/persisted` can sample the live buffer mid-word
+/// ("anim|ate"); splitting or flushing there breaks words in immutable
+/// scrollback. Boundaries adjacent to a delimiter (whitespace, punctuation, line
+/// end, or buffer edge) pass — `ToolStarted` boundaries normally sit after
+/// sentence punctuation and pass anyway.
+fn boundary_is_word_safe(text: &str, boundary: usize) -> bool {
+    if boundary > text.len() || !text.is_char_boundary(boundary) {
+        return false;
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let before = text[..boundary].chars().next_back().is_some_and(is_word);
+    let after = text[boundary..].chars().next().is_some_and(is_word);
+    !(before && after)
+}
+
 fn committed_reply_segment_boundaries_for_message(
     app: &AppState,
     session: &SessionView,
@@ -672,7 +689,10 @@ fn committed_reply_segment_boundaries_for_message(
         })
         .flat_map(|(_, boundaries)| boundaries.iter().copied())
         .filter(|boundary| {
-            *boundary > 0 && *boundary < content.len() && content.is_char_boundary(*boundary)
+            *boundary > 0
+                && *boundary < content.len()
+                && content.is_char_boundary(*boundary)
+                && boundary_is_word_safe(content, *boundary)
         })
         .collect::<Vec<_>>();
     boundaries.sort_unstable();
@@ -773,7 +793,11 @@ pub fn next_live_turn_finalization(
             .into_iter()
             .flatten()
             .copied()
-            .filter(|b| *b <= live_reply.text.len() && live_reply.text.is_char_boundary(*b))
+            .filter(|b| {
+                *b <= live_reply.text.len()
+                    && live_reply.text.is_char_boundary(*b)
+                    && boundary_is_word_safe(&live_reply.text, *b)
+            })
             .max()
             .unwrap_or(0);
         // A completed segment is flushable UNLESS it ends inside an unclosed code
@@ -960,7 +984,9 @@ fn live_reply_segment_boundaries_in_delta(
         .flatten()
         .copied()
         .filter(|boundary| {
-            (previous_len..next_len).contains(boundary) && flushed_text.is_char_boundary(*boundary)
+            (previous_len..next_len).contains(boundary)
+                && flushed_text.is_char_boundary(*boundary)
+                && boundary_is_word_safe(flushed_text, *boundary)
         })
         .collect::<Vec<_>>();
     boundaries.sort_unstable();
@@ -13024,6 +13050,21 @@ mod tests {
             live.contains("segment two still live"),
             "the in-progress segment stays in the live tail:\n{live}"
         );
+    }
+
+    #[test]
+    fn word_safe_boundary_rejects_mid_word_splits() {
+        // Mid-word (both neighbors are word chars) -> rejected, so a message/persisted
+        // event sampling the live buffer at "anim|ate" never splits/flushes mid-word.
+        assert!(!boundary_is_word_safe("animate", 4));
+        assert!(!boundary_is_word_safe("haloPhase", 7));
+        // Adjacent to a delimiter -> accepted (real segment ends still pass).
+        assert!(boundary_is_word_safe("loop: next", 5));
+        assert!(boundary_is_word_safe("done. Now", 5));
+        assert!(boundary_is_word_safe("a\nb", 2));
+        assert!(boundary_is_word_safe("end", 3));
+        // Non-char-boundary -> rejected (safe).
+        assert!(!boundary_is_word_safe("五大", 1));
     }
 
     #[test]
