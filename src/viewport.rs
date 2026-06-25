@@ -39,6 +39,10 @@ pub struct ScrollbackTracker {
     /// the seam (per-flush collapse can't see across flushes). Seeds the next
     /// flush's blank-run collapse so cross-flush seams close to one blank.
     last_flushed_ends_blank: bool,
+    /// Whether the previous live tail had guarded sections (activity or pending
+    /// messages) whose separator rows can become orphaned when that tail settles
+    /// and shrinks away.
+    live_tail_had_guarded_sections: bool,
 }
 
 /// What the event loop should do with scrollback before drawing the viewport.
@@ -69,6 +73,7 @@ impl ScrollbackTracker {
         wrap_width: usize,
     ) -> ScrollbackUpdate {
         let fingerprint = app::committed_messages_fingerprint(app);
+        let previous_live_tail_had_guarded_sections = self.live_tail_had_guarded_sections;
         let (previous_live, next_live) = self.reconcile_active_live(app);
         let mut lines_to_insert = Vec::new();
         let mut reset = false;
@@ -144,6 +149,8 @@ impl ScrollbackTracker {
             ));
         }
         self.active_live = next_live.filter(LiveTurnFinalization::has_flushed_content);
+        self.live_tail_had_guarded_sections =
+            app::live_tail_has_guarded_sections(app, self.active_live.as_ref());
 
         // A single flush concatenates committed history + live-turn deltas, each
         // of which guards only its own separators; their seam can stack into a
@@ -153,8 +160,14 @@ impl ScrollbackTracker {
         // single blank. On a reset the prior scrollback is stale, so don't carry
         // the seam across it.
         let seam_seed = !reset && self.last_flushed_ends_blank;
-        self.last_flushed_ends_blank =
-            app::collapse_blank_runs_seeded(&mut lines_to_insert, seam_seed);
+        let drop_orphaned_leading_blank_run = !reset
+            && previous_live_tail_had_guarded_sections
+            && !self.live_tail_had_guarded_sections;
+        self.last_flushed_ends_blank = app::collapse_blank_runs_seeded_orphan_guard(
+            &mut lines_to_insert,
+            seam_seed,
+            drop_orphaned_leading_blank_run,
+        );
 
         ScrollbackUpdate {
             lines_to_insert,

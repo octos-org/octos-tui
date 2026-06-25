@@ -636,18 +636,150 @@ fn handle_paste(store: &mut Store, text: &str) -> KeyAction {
         return KeyAction::Continue;
     }
 
-    let opens_slash_popup = store.state.composer.is_empty() && text.starts_with('/');
-    store.state.insert_composer_text(text);
+    // The composer is a PLAIN-TEXT field. Strip styling/control noise from a paste
+    // (web copies carry ANSI/CSI/OSC escapes, zero-width + format chars, CR, tabs).
+    // Inserted raw, those have zero/odd display width but still occupy buffer bytes,
+    // so the byte-cursor and the width-based render desync: the text fails to render
+    // and backspace leaves residue (it deletes the invisible bytes, not the glyphs).
+    let text = sanitize_pasted_text(text);
+    if text.is_empty() {
+        return KeyAction::Continue;
+    }
+
+    // A paste is literal text and must NEVER trigger a slash command — a pasted
+    // file path ("/Users/...") or multi-line snippet beginning with '/' is not a
+    // command. Unlike a typed leading '/', we do not open the slash-command menu
+    // here. (Regression: pasting a path opened/ran the slash menu.)
+    store.state.insert_composer_text(&text);
     store.state.focus = FocusPane::Composer;
 
-    if opens_slash_popup {
-        store.open_menu(crate::menu::MenuId::from(crate::menu::registry::MENU_HELP));
-    }
+    // Only keep an ALREADY-open slash search in sync (e.g. the user typed '/' to
+    // open the menu, then pasted an argument); never open it from a paste.
     if store.state.menu_stack.is_active() && slash_help_menu_active(store) {
         sync_slash_help_search_query(store);
     }
 
     KeyAction::Continue
+}
+
+/// Reduce pasted text to the plain text the composer can render. Strips ANSI/CSI/OSC
+/// escape sequences and control + zero-width/format chars (which web copies carry and
+/// which desync the byte-cursor from the width-based render), normalizes CR/CRLF to
+/// LF, and turns tabs into a space. Newlines are kept (the composer is multi-line).
+fn sanitize_pasted_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.peek() {
+                // CSI: ESC [ ... <final byte 0x40..=0x7e>
+                Some('[') => {
+                    chars.next();
+                    while let Some(&n) = chars.peek() {
+                        chars.next();
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] ... terminated by BEL or ESC \
+                Some(']') => {
+                    chars.next();
+                    while let Some(&n) = chars.peek() {
+                        chars.next();
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Other two-char ESC sequence (e.g. ESC + a letter): drop both.
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            // 8-bit C1 CSI (U+009B) / OSC (U+009D): the single-char forms of ESC[
+            // and ESC]. Drop the whole sequence, not just the introducer (else the
+            // params/text like "31m…" leak into the composer).
+            '\u{9b}' => {
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if ('\u{40}'..='\u{7e}').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            '\u{9d}' => {
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n == '\u{7}' || n == '\u{9c}' {
+                        break;
+                    }
+                    if n == '\u{1b}' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            '\n' => out.push('\n'),
+            // CR / CRLF -> single LF (web copies often use \r\n).
+            '\r' => {
+                out.push('\n');
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            '\t' => out.push(' '),
+            // Unicode line / paragraph separators -> newline (composer is multi-line).
+            '\u{2028}' | '\u{2029}' => out.push('\n'),
+            // Invisible / non-rendering format codepoints (zero-width, bidi controls,
+            // variation selectors, BOM, ...). Inserted raw they have zero/odd display
+            // width but still occupy buffer bytes, so the byte-cursor desyncs from the
+            // width-based render: text fails to render and backspace leaves residue.
+            c if is_invisible_format_char(c) => {}
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Invisible / non-rendering format codepoints that rich (HTML) clipboard copies
+/// carry: zero-width spaces & joiners, bidi (Trojan-Source) controls, variation
+/// selectors, BOM, interlinear-annotation marks, and tag chars. The plain-text
+/// composer can't render these — raw, they desync the byte-cursor from the
+/// width-based render. Mirrors codex's curated strip set
+/// (codex-rs/tui/src/terminal_title.rs::is_disallowed_terminal_title_char), widened
+/// to the full tags / variation-selectors-supplement plane.
+fn is_invisible_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'                    // soft hyphen
+            | '\u{034f}'              // combining grapheme joiner
+            | '\u{061c}'              // arabic letter mark
+            | '\u{115f}'..='\u{1160}' // hangul choseong/jungseong fillers
+            | '\u{17b4}'..='\u{17b5}' // khmer inherent vowels (invisible)
+            | '\u{180b}'..='\u{180e}' // mongolian free variation selectors + vowel sep
+            | '\u{200b}'..='\u{200f}' // ZWSP, ZWNJ, ZWJ, LRM, RLM
+            | '\u{202a}'..='\u{202e}' // bidi embedding / override
+            | '\u{2060}'..='\u{206f}' // word joiner, invisibles, deprecated format
+            | '\u{3164}'              // hangul filler
+            | '\u{fe00}'..='\u{fe0f}' // variation selectors
+            | '\u{feff}'              // BOM / zero-width no-break space
+            | '\u{ffa0}'              // halfwidth hangul filler
+            | '\u{fff9}'..='\u{fffb}' // interlinear annotation
+            | '\u{1bca0}'..='\u{1bca3}' // shorthand format controls
+            | '\u{1d173}'..='\u{1d17a}' // musical symbol formatting
+            | '\u{e0000}'..='\u{e0fff}' // tags + variation selectors supplement
+    )
 }
 
 fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
@@ -2392,7 +2524,9 @@ mod tests {
     }
 
     #[test]
-    fn terminal_paste_opens_slash_menu_when_composer_starts_with_slash() {
+    fn terminal_paste_starting_with_slash_does_not_open_slash_menu() {
+        // A paste is literal text: pasting "/permissions" inserts it verbatim and
+        // must NOT open the slash-command menu (only a TYPED leading '/' does).
         let mut store = store_with_sessions(1);
 
         assert!(matches!(
@@ -2401,16 +2535,69 @@ mod tests {
         ));
 
         assert_eq!(store.state.composer, "/permissions");
-        assert!(store.state.menu_stack.is_active());
-        assert_eq!(
-            store
-                .state
-                .menu_stack
-                .active()
-                .expect("slash menu")
-                .search_query,
-            "permissions"
-        );
+        assert!(!store.state.menu_stack.is_active());
+    }
+
+    #[test]
+    fn terminal_paste_multiline_path_is_literal_not_slash_command() {
+        // Regression: pasting a file path / multi-line snippet beginning with '/'
+        // (e.g. shell output) must be inserted verbatim and must NOT open or run a
+        // slash command.
+        let mut store = store_with_sessions(1);
+        let pasted = "/Users/cloud/enable_screenshare.sh\nPassword: secret";
+
+        assert!(matches!(
+            handle_terminal_event(&mut store, Event::Paste(pasted.into())),
+            KeyAction::Continue
+        ));
+
+        assert_eq!(store.state.composer, pasted);
+        assert!(!store.state.menu_stack.is_active());
+    }
+
+    #[test]
+    fn terminal_paste_sanitizes_styled_web_text_to_plain() {
+        // Web copies carry ANSI escapes, zero-width/format chars, CR, tabs. The
+        // composer is plain-text: a paste must be reduced to renderable plain text
+        // so the byte-cursor stays aligned with the render (no residue on delete).
+        let mut store = store_with_sessions(1);
+        let styled = "AAA\u{1b}[31mRED\u{1b}[0m\u{200b}XYZ\r\n\tEND";
+        handle_terminal_event(&mut store, Event::Paste(styled.into()));
+        assert_eq!(store.state.composer, "AAAREDXYZ\n END");
+    }
+
+    #[test]
+    fn terminal_paste_strips_html_invisible_format_chars_keeping_cjk() {
+        // Real-world repro: copying CJK from a styled web page interleaves the
+        // visible text with invisible format codepoints (LRM, ZWSP, soft hyphen,
+        // variation selector, bidi embedding, word-joiner, BOM, isolate-pop). The
+        // old 5-char strip-set missed most of these, so they stayed in the buffer
+        // and desynced the byte-cursor from the width render — the text rendered
+        // mostly blank with only the tail surviving. All must reduce to plain CJK.
+        let mut store = store_with_sessions(1);
+        let styled =
+            "\u{200e}五\u{200b}大\u{00ad}拉\u{fe0f}格\u{202a}朗\u{2060}日\u{feff}点\u{2069}";
+        handle_terminal_event(&mut store, Event::Paste(styled.into()));
+        assert_eq!(store.state.composer, "五大拉格朗日点");
+    }
+
+    #[test]
+    fn terminal_paste_maps_unicode_line_and_paragraph_separators_to_newline() {
+        // U+2028 / U+2029 are not ASCII control chars; left raw they render oddly
+        // in the plain-text composer. They mean "line break" — map them to '\n'.
+        let mut store = store_with_sessions(1);
+        handle_terminal_event(&mut store, Event::Paste("a\u{2028}b\u{2029}c".into()));
+        assert_eq!(store.state.composer, "a\nb\nc");
+    }
+
+    #[test]
+    fn terminal_paste_strips_8bit_c1_csi_and_osc_sequences() {
+        // Some sources emit the 8-bit C1 forms of CSI (U+009B) / OSC (U+009D)
+        // instead of ESC[ / ESC]. The whole sequence must drop, not just the
+        // introducer (else the params/text like "31m…" leak into the composer).
+        let mut store = store_with_sessions(1);
+        handle_terminal_event(&mut store, Event::Paste("\u{9b}31mred\u{9d}0;t\u{7}END".into()));
+        assert_eq!(store.state.composer, "redEND");
     }
 
     #[test]

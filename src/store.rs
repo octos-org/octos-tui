@@ -1199,6 +1199,11 @@ impl Store {
                 self.state.status = t!("thinking.cleared").to_string();
             }
         }
+        // Rebuild the open /thinking menu so its `*` active-marker jumps to the
+        // just-selected level immediately. The marker is computed from
+        // session_reasoning_effort at menu-build time (menu_app_snapshot), so
+        // without a refresh it stays on the previous level until the next rebuild.
+        self.refresh_active_menu();
         None
     }
 
@@ -4615,6 +4620,9 @@ impl Store {
                 let composer_drafts = self.state.composer_drafts.clone();
                 let pending_messages = self.state.pending_messages.clone();
                 let optimistic_user_messages = self.state.optimistic_user_messages.clone();
+                let turn_prompt_anchors = self.state.turn_prompt_anchors.clone();
+                let live_reply_segment_boundaries =
+                    self.state.live_reply_segment_boundaries.clone();
                 let approval_auto_open = self.state.approval_auto_open;
                 let user_question_auto_open = self.state.user_question_auto_open;
                 let expanded_tool_outputs = self.state.expanded_tool_outputs;
@@ -4661,6 +4669,8 @@ impl Store {
                 state.composer_drafts = composer_drafts;
                 state.pending_messages = pending_messages;
                 state.optimistic_user_messages = optimistic_user_messages;
+                state.turn_prompt_anchors = turn_prompt_anchors;
+                state.live_reply_segment_boundaries = live_reply_segment_boundaries;
                 state.approval_auto_open = approval_auto_open;
                 state.user_question_auto_open = user_question_auto_open;
                 state.expanded_tool_outputs = expanded_tool_outputs;
@@ -5732,6 +5742,8 @@ impl Store {
                 // (No-op when the bound buffer is for the SAME turn — that case
                 // is the lazy-bind/replay race handled just below.)
                 self.commit_pending_live_reply_for_turn_switch(&event.session_id, &event.turn_id);
+                self.state
+                    .record_turn_prompt_anchor_from_latest_user(&event.session_id, &event.turn_id);
                 if let Some(session) = self.find_session_mut(&event.session_id) {
                     // Out-of-order lifecycle (nit 1): a MessageDelta may have
                     // already lazy-bound THIS turn before its TurnStarted was
@@ -5785,6 +5797,8 @@ impl Store {
                     .unwrap_or(true);
                 if needs_bind {
                     self.commit_pending_live_reply_for_turn_switch(&session_id, &turn_id);
+                    self.state
+                        .record_turn_prompt_anchor_from_latest_user(&session_id, &turn_id);
                 }
                 let mut reset_scroll = false;
                 if let Some(session) = self.find_session_mut(&session_id) {
@@ -5812,6 +5826,17 @@ impl Store {
                 None
             }
             UiNotification::ToolStarted(event) => {
+                self.state
+                    .record_turn_prompt_anchor_from_latest_user(&event.session_id, &event.turn_id);
+                // A tool call starting means the current assistant CONTENT segment
+                // just ended (the next content streams after the tool result). Record
+                // the live-reply length NOW as a segment boundary, with the correct
+                // per-segment offset, so the live-delta renderer starts a fresh
+                // markdown block for the next segment instead of gluing
+                // "...skeleton." onto the next "### Step N". (MessagePersisted is the
+                // wrong signal: it fires at turn end with the full text length.)
+                self.state
+                    .record_live_reply_segment_boundary(&event.session_id, &event.turn_id);
                 let mut item =
                     ActivityItem::new(ActivityKind::Tool, event.tool_name.clone(), "running")
                         .with_turn(event.turn_id)
@@ -5852,6 +5877,8 @@ impl Store {
                 None
             }
             UiNotification::ToolCompleted(event) => {
+                self.state
+                    .record_turn_prompt_anchor_from_latest_user(&event.session_id, &event.turn_id);
                 let status = match event.success {
                     Some(false) => "failed",
                     _ => "complete",
@@ -5890,6 +5917,8 @@ impl Store {
             UiNotification::ApprovalRequested(event) => {
                 let title = event.title.clone();
                 let session_id = event.session_id.clone();
+                self.state
+                    .record_turn_prompt_anchor_from_latest_user(&session_id, &event.turn_id);
                 self.state.push_activity(
                     ActivityItem::new(
                         ActivityKind::Approval,
@@ -5951,6 +5980,18 @@ impl Store {
                     .with_detail("protocol warning"),
                 );
                 self.state.status = format!("Warning [{}]: {}", event.code, event.message);
+                None
+            }
+            UiNotification::ReasoningDelta(event) => {
+                // Accumulate streamed reasoning fragments for this turn. The
+                // committed message picks them up in commit_live_reply as
+                // reasoning_content, rendered as a "· reasoning" block above the
+                // answer. Keyed per-turn exactly like MessageDelta's live_reply.
+                self.state
+                    .live_reasoning
+                    .entry((event.session_id, event.turn_id))
+                    .or_default()
+                    .push_str(&event.text);
                 None
             }
             UiNotification::TurnCompleted(event) => self.commit_live_reply(event),
@@ -6313,6 +6354,13 @@ impl Store {
                 // Same as AssistantDelta: internal projection, not status-bar news.
                 None
             }
+            Payload::ReasoningDelta { text } => {
+                // Envelope reasoning stream → the assistant message's
+                // reasoning_content (rendered as a "· reasoning" block). Internal
+                // projection, not status-bar news.
+                self.upsert_envelope_assistant_reasoning(&session_id, &thread_id, text);
+                None
+            }
             Payload::ToolStart { tool_call_id, name } => {
                 self.state.push_activity(
                     ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
@@ -6427,6 +6475,35 @@ impl Store {
         }
     }
 
+    /// Append a streamed reasoning fragment to the envelope assistant message's
+    /// `reasoning_content` (rendered as a `· reasoning` block), creating the
+    /// message if reasoning arrives before any answer text. Mirrors
+    /// [`Self::upsert_envelope_assistant_message`] but targets `reasoning_content`.
+    fn upsert_envelope_assistant_reasoning(
+        &mut self,
+        session_id: &SessionKey,
+        thread_id: &str,
+        text: String,
+    ) {
+        let Some(session) = self.find_session_mut(session_id) else {
+            return;
+        };
+        if let Some(message) = session.messages.iter_mut().rev().find(|message| {
+            message.role == MessageRole::Assistant
+                && message.thread_id.as_deref() == Some(thread_id)
+        }) {
+            message
+                .reasoning_content
+                .get_or_insert_with(String::new)
+                .push_str(&text);
+        } else {
+            let mut message =
+                Message::assistant_with_thread(String::new(), ThreadId::new(thread_id.to_owned()));
+            message.reasoning_content = Some(text);
+            session.messages.push(message);
+        }
+    }
+
     fn apply_turn_spawn_complete(
         &mut self,
         event: octos_core::ui_protocol::TurnSpawnCompleteEvent,
@@ -6470,6 +6547,24 @@ impl Store {
     }
 
     fn apply_message_persisted(&mut self, event: MessagePersistedEvent) -> Option<AppUiCommand> {
+        let persisted_live_assistant_turn = (event.role.as_str() == "assistant")
+            .then(|| {
+                self.find_session(&event.session_id)
+                    .and_then(|session| session.live_reply.as_ref())
+                    .filter(|live_reply| {
+                        event
+                            .turn_id
+                            .as_ref()
+                            .is_none_or(|turn_id| turn_id == &live_reply.turn_id)
+                    })
+                    .map(|live_reply| live_reply.turn_id.clone())
+            })
+            .flatten();
+        if let Some(turn_id) = persisted_live_assistant_turn {
+            self.state
+                .record_live_reply_segment_boundary(&event.session_id, &turn_id);
+        }
+
         let attachment_count = event.media.len();
         let attachment_hint = match attachment_count {
             0 => String::new(),
@@ -6550,6 +6645,8 @@ impl Store {
         event: UserQuestionRequestedEvent,
     ) -> Option<AppUiCommand> {
         let title = event.title.clone();
+        self.state
+            .record_turn_prompt_anchor_from_latest_user(&event.session_id, &event.turn_id);
         let detail = if event.questions.is_empty() {
             "free text".to_string()
         } else {
@@ -6698,19 +6795,34 @@ impl Store {
         // finalized-by-switch early return so it always records.
         self.state
             .mark_turn_completed(&event.session_id, &event.turn_id);
+        // Do NOT clear live_reply_segment_boundaries on completion: after the turn
+        // settles the committed-path render (finalized_history_lines_range_dedup_live)
+        // still needs them to split a concatenated live-reply commit into discrete
+        // segments. Clearing here left the committed message glued ("…html.Step 2:")
+        // because the render ran with no boundaries. They are per-turn capped and the
+        // prior-turn clear on the next turn-switch reaps them once the message is
+        // safely in native scrollback.
         if self
             .state
             .take_turn_finalized_by_switch(&event.session_id, &event.turn_id)
         {
             return None;
         }
+        // Streamed reasoning for this turn (legacy ReasoningDelta accumulator)
+        // becomes the committed message's reasoning_content — the transcript
+        // renders it as a separate "· reasoning" block above the answer.
+        let reasoning = self
+            .state
+            .live_reasoning
+            .remove(&(event.session_id.clone(), event.turn_id.clone()))
+            .filter(|reasoning| !reasoning.trim().is_empty());
         let seq = event.cursor.map(|cursor| cursor.seq).unwrap_or(0);
         let follow_tail = self.state.transcript_scroll == 0;
         let complete_live_plan = self.turn_had_completion_activity(&event.turn_id);
         let fallback_summary = self.turn_completion_fallback_message(&event.turn_id);
         let partial_fallback_summary =
             self.turn_partial_completion_fallback_message(&event.turn_id);
-        let (status, reset_scroll, completed_current_turn) = {
+        let (status, reset_scroll, completed_current_turn, restore_reasoning) = {
             let session = self.find_session_mut(&event.session_id)?;
             let title = session.title.clone();
             match session.live_reply.take() {
@@ -6721,31 +6833,48 @@ impl Store {
                         &fallback_summary,
                         &partial_fallback_summary,
                     );
-                    session.messages.push(Message::assistant(text));
+                    let mut message = Message::assistant(text);
+                    message.reasoning_content = reasoning;
+                    session.messages.push(message);
                     (
                         t!("status.turn_completed", title = title, seq = seq).into_owned(),
                         true,
                         true,
+                        None,
                     )
                 }
                 Some(live_reply) => {
+                    // Stale terminal (a different turn's reply is live): this turn
+                    // did not commit here, so preserve its reasoning for the real
+                    // terminal rather than dropping it.
                     session.live_reply = Some(live_reply);
                     (
                         t!("status.turn_completed_stale", title = title).into_owned(),
                         false,
                         false,
+                        reasoning,
                     )
                 }
-                None => (
-                    {
-                        session.messages.push(Message::assistant(fallback_summary));
-                        t!("status.turn_completed", title = title, seq = seq).into_owned()
-                    },
-                    true,
-                    true,
-                ),
+                None => {
+                    // No live reply (empty / already-persisted answer): still
+                    // surface any streamed reasoning on the fallback message.
+                    let mut message = Message::assistant(fallback_summary);
+                    message.reasoning_content = reasoning;
+                    session.messages.push(message);
+                    (
+                        t!("status.turn_completed", title = title, seq = seq).into_owned(),
+                        true,
+                        true,
+                        None,
+                    )
+                }
             }
         };
+        if let Some(reasoning) = restore_reasoning {
+            self.state
+                .live_reasoning
+                .insert((event.session_id.clone(), event.turn_id.clone()), reasoning);
+        }
         if reset_scroll {
             if follow_tail {
                 self.state.scroll_transcript_to_latest();
@@ -6796,6 +6925,8 @@ impl Store {
         // resurrecting it into `live_reply` (the wedge fix).
         self.state
             .mark_turn_completed(&event.session_id, &event.turn_id);
+        self.state
+            .clear_live_reply_segment_boundaries(&event.session_id, &event.turn_id);
         let follow_tail = self.state.transcript_scroll == 0;
         let fallback_summary =
             self.turn_error_fallback_message(&event.turn_id, &event.code, &event.message);
@@ -6889,12 +7020,16 @@ impl Store {
             return None;
         }
 
-        let prompt = self.state.pending_messages[0].clone();
-        let command =
-            self.start_prompt_turn(prompt, t!("status.submitted_staged_message").into_owned());
-        if command.is_some() {
-            self.state.pending_messages.remove(0);
+        let prompt = self.state.pending_messages.remove(0);
+        let mut remaining_pending = std::mem::take(&mut self.state.pending_messages);
+        let command = self.start_prompt_turn(
+            prompt.clone(),
+            t!("status.submitted_staged_message").into_owned(),
+        );
+        if command.is_none() {
+            remaining_pending.insert(0, prompt);
         }
+        self.state.pending_messages = remaining_pending;
         command
     }
 
@@ -6961,6 +7096,17 @@ impl Store {
         // fallback card or mishandling the dropped-empty case.
         self.state
             .mark_turn_finalized_by_switch(session_id, &prior_turn);
+        self.state
+            .clear_live_reply_segment_boundaries(session_id, &prior_turn);
+        // The prior turn's streamed reasoning commits with its message below (or is
+        // dropped with an empty turn); either way it must leave the accumulator,
+        // since this switch finalizes the turn and its own late TurnCompleted
+        // early-returns without draining it (otherwise reasoning is lost + stale).
+        let prior_reasoning = self
+            .state
+            .live_reasoning
+            .remove(&(session_id.clone(), prior_turn.clone()))
+            .filter(|reasoning| !reasoning.trim().is_empty());
         let complete_live_plan = self.turn_had_completion_activity(&prior_turn);
         let fallback_summary = self.turn_completion_fallback_message(&prior_turn);
         let partial_fallback_summary = self.turn_partial_completion_fallback_message(&prior_turn);
@@ -6981,7 +7127,9 @@ impl Store {
                     &fallback_summary,
                     &partial_fallback_summary,
                 );
-                session.messages.push(Message::assistant(text));
+                let mut message = Message::assistant(text);
+                message.reasoning_content = prior_reasoning;
+                session.messages.push(message);
                 committed = true;
             }
         }
@@ -12273,6 +12421,81 @@ mod tests {
     }
 
     #[test]
+    fn assistant_message_persisted_records_live_reply_segment_boundary() {
+        let turn_id = TurnId::new();
+        let text = "### Step 1\n\nBody one.";
+        let mut store = store_with_live_reply(turn_id.clone(), text);
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessagePersisted(
+            MessagePersistedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: Some(turn_id.clone()),
+                thread_id: None,
+                seq: 1,
+                role: "assistant".into(),
+                message_id: "msg-1".into(),
+                client_message_id: None,
+                source: octos_core::ui_protocol::MessagePersistedSource::Assistant,
+                cursor: UiCursor {
+                    stream: "local:test".into(),
+                    seq: 1,
+                },
+                persisted_at: chrono::Utc::now(),
+                media: vec![],
+                content: Some(text.into()),
+            },
+        )));
+
+        assert_eq!(
+            store
+                .state
+                .live_reply_segment_boundaries
+                .get(&(session_id, turn_id))
+                .cloned(),
+            Some(vec![text.len()]),
+            "assistant persistence while the turn is live should mark the current live buffer length"
+        );
+    }
+
+    #[test]
+    fn tool_started_records_live_reply_segment_boundary_at_segment_offset() {
+        // The REAL per-segment boundary signal. A tool call starting means the
+        // current assistant CONTENT segment just ended, so the live-reply length
+        // at that moment is exactly where the live-delta renderer must start the
+        // next segment as a fresh markdown block. Without this, an agentic turn's
+        // later "### Step N" glued onto the previous segment's body on the real
+        // terminal (MessagePersisted fires at turn END with the full length — the
+        // wrong offset — so it never split mid-turn).
+        let turn_id = TurnId::new();
+        let text = "### Step 1\n\nBody one.";
+        let mut store = store_with_live_reply(turn_id.clone(), text);
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
+            ToolStartedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                tool_call_id: "call-1".into(),
+                tool_name: "write_file".into(),
+                arguments: None,
+            },
+        )));
+
+        assert_eq!(
+            store
+                .state
+                .live_reply_segment_boundaries
+                .get(&(session_id, turn_id))
+                .cloned(),
+            Some(vec![text.len()]),
+            "a tool call starting mid-turn must record the current live-reply length as a segment boundary"
+        );
+    }
+
+    #[test]
     fn server_initiated_continuation_turn_with_turn_started_renders_its_answer() {
         // Live-rendering bug (mini5): a single user prompt expanded into
         // server-INITIATED master-continuation turns (reason=child_completed /
@@ -12343,6 +12566,101 @@ mod tests {
                 .iter()
                 .any(|c| c.contains("did not receive a final assistant answer")),
             "continuation turn with deltas must NOT show the fallback card: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_delta_populates_committed_message_reasoning_content() {
+        use octos_core::ui_protocol::{
+            MessageDeltaEvent, ReasoningDeltaEvent, TurnCompletedEvent, TurnStartedEvent,
+        };
+        let mut store = protocol_store_with_autonomy();
+        let session_id = store.state.sessions[0].id.clone();
+        let turn_id = TurnId::new();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        // Streamed reasoning arrives interleaved with the answer text.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ReasoningDelta(
+            ReasoningDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                text: "weighing the options".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                text: "the answer".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        // The committed message carries the streamed reasoning as reasoning_content,
+        // which the transcript renders as a "· reasoning" block.
+        let reasoning = store.state.sessions[0]
+            .messages
+            .iter()
+            .find_map(|message| message.reasoning_content.as_deref());
+        assert_eq!(
+            reasoning,
+            Some("weighing the options"),
+            "ReasoningDelta must populate the committed message's reasoning_content"
+        );
+    }
+
+    #[test]
+    fn reasoning_without_answer_attaches_to_fallback_message() {
+        use octos_core::ui_protocol::{ReasoningDeltaEvent, TurnCompletedEvent};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = store.state.sessions[0].id.clone();
+        let turn_id = TurnId::new();
+        // Reasoning streams but no answer text arrives — the terminal hits the
+        // None arm of commit_live_reply (codex review: reasoning must not be lost).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ReasoningDelta(
+            ReasoningDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                text: "no answer came".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        let reasoning = store.state.sessions[0]
+            .messages
+            .iter()
+            .find_map(|message| message.reasoning_content.as_deref());
+        assert_eq!(
+            reasoning,
+            Some("no answer came"),
+            "reasoning must attach to the fallback message even with no answer"
         );
     }
 
@@ -12550,6 +12868,87 @@ mod tests {
             .expect("turn activity log");
         assert_eq!(log.request.as_deref(), Some("build the site"));
         assert_eq!(log.items.len(), 1);
+    }
+
+    #[test]
+    fn turn_activity_logs_keep_prompt_anchor_after_optimistic_prompt_confirms() {
+        let turn_a = TurnId::new();
+        let mut store = store_with_live_reply(turn_a.clone(), "first answer");
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_a.clone(),
+            "first prompt".into(),
+        );
+        store.state.restore_optimistic_user_messages();
+        assert!(
+            store.state.optimistic_user_messages.is_empty(),
+            "server-confirmed prompt should no longer depend on the optimistic entry"
+        );
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_turn(turn_a.clone())
+                .with_detail("cargo test --first")
+                .with_success(true),
+        );
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let turn_b = TurnId::new();
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: turn_b.clone(),
+            text: "second answer".into(),
+        });
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_b.clone(),
+            "second prompt".into(),
+        );
+        store.state.restore_optimistic_user_messages();
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_turn(turn_b.clone())
+                .with_detail("cargo test --second")
+                .with_success(true),
+        );
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_b.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let log_a = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_a)
+            .expect("first turn activity log");
+        let log_b = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_b)
+            .expect("second turn activity log");
+        assert_eq!(log_a.request.as_deref(), Some("first prompt"));
+        assert_eq!(log_a.anchor_index, Some(0));
+        assert_eq!(log_b.request.as_deref(), Some("second prompt"));
+        assert_eq!(log_b.anchor_index, Some(2));
     }
 
     #[test]
@@ -14294,6 +14693,48 @@ mod tests {
         assert_eq!(store.state.sessions[0].messages.len(), 2);
         assert_eq!(store.state.sessions[0].messages[1].content, "continue now");
         assert_eq!(store.state.run_state.label(), "running");
+    }
+
+    #[test]
+    fn completed_turn_submits_one_duplicate_staged_message_and_keeps_next_pending() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "done");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.pending_messages = vec!["repeat".into(), "repeat".into()];
+
+        let command = store
+            .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+                TurnCompletedEvent {
+                    session_id,
+                    topic: None,
+                    turn_id,
+                    cursor: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    session_result: None,
+                },
+            )))
+            .expect("first staged prompt submits after turn completion");
+
+        let AppUiCommand::SubmitPrompt(params) = command else {
+            panic!("expected staged prompt submission");
+        };
+        assert_eq!(
+            params.input,
+            vec![InputItem::Text {
+                text: "repeat".into()
+            }]
+        );
+        assert_eq!(store.state.pending_messages, vec!["repeat"]);
+        assert_eq!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .filter(|message| message.role.as_str() == "user" && message.content == "repeat")
+                .count(),
+            1,
+            "the submitted duplicate gets one optimistic echo while the next duplicate stays pending"
+        );
     }
 
     #[test]

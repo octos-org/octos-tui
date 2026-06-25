@@ -17,7 +17,7 @@ use crate::{
         ActivityItem, ActivityKind, ActivityNavigatorFilter, AppState, ApprovalModalState,
         ArtifactDetailState, ComposerPresentation, DiffPreviewPaneState, FocusPane,
         PlanStep as RenderedPlanStep, SessionAutonomyState, SessionRunState, SessionView,
-        TaskOutputDetailState, TaskView, ThreadGraphDetailState, TurnActivityLog,
+        TaskOutputDetailState, TaskView, ThreadGraphDetailState, TurnActivityLog, TurnPromptAnchor,
         TurnStateDetailState, UserQuestionEntry, UserQuestionPickerState, extract_plan_steps,
         task_state_label,
     },
@@ -212,6 +212,33 @@ fn live_tail_height_with_finalization(
     rows.clamp(0, max_tail)
 }
 
+pub(crate) fn live_tail_has_guarded_sections(
+    app: &AppState,
+    live_finalization: Option<&LiveTurnFinalization>,
+) -> bool {
+    !app.pending_messages.is_empty() || live_tail_has_activity_section(app, live_finalization)
+}
+
+fn live_tail_has_activity_section(
+    app: &AppState,
+    live_finalization: Option<&LiveTurnFinalization>,
+) -> bool {
+    let mut flow_activity = flow_activity_items(app);
+    if let Some(finalization) = active_live_finalization(app, live_finalization) {
+        flow_activity = flow_activity
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, item)| {
+                !finalization
+                    .activity_flushed_keys
+                    .contains(&activity_finalization_key(item, *idx))
+            })
+            .map(|(_, item)| item)
+            .collect();
+    }
+    !flow_activity.is_empty()
+}
+
 /// Render the live UI into the inline viewport (`frame.area()` is the viewport).
 /// Mirrors `render_chat_layout` but the top pane shows only the live transcript
 /// tail (finalized history is in scrollback, not here).
@@ -352,9 +379,19 @@ fn live_tail_lines_with_finalization(
                 .user_question
                 .as_ref()
                 .is_some_and(|picker| picker.visible);
-        let show_recent_context = interactive_context_visible
-            || !active_finalization.is_some_and(LiveTurnFinalization::has_flushed_content);
-        if show_recent_context && let Some(prompt) = latest_user_message(session) {
+        // The recent-user-context pin is only needed while an interactive overlay
+        // (approval / question) is visible — there it shows which prompt you're
+        // acting on. Otherwise the committed prompt is already in native scrollback
+        // just above the live tail, so pinning it again duplicates it (bug 2A: most
+        // visibly for a mid-turn-submitted prompt whose turn hasn't replied yet —
+        // the pin and the scrollback copy both sit on screen). The old
+        // `!has_flushed_content` clause showed the pin for every just-started turn,
+        // which is exactly the redundant case.
+        let show_recent_context = interactive_context_visible;
+        if show_recent_context
+            && let Some(prompt) = latest_user_message(session)
+                .filter(|prompt| !pending_messages_contains(&app.pending_messages, prompt))
+        {
             push_recent_user_context(&mut lines, palette, prompt, wrap_width);
         }
         push_turn_flow(
@@ -431,6 +468,23 @@ pub fn collapse_blank_runs_seeded(lines: &mut Vec<Line<'static>>, prev_ends_blan
         // Batch contributed nothing (all dropped) → seam state is unchanged.
         None => prev_ends_blank,
     }
+}
+
+pub fn collapse_blank_runs_seeded_orphan_guard(
+    lines: &mut Vec<Line<'static>>,
+    prev_ends_blank: bool,
+    drop_orphaned_leading_blank_run: bool,
+) -> bool {
+    if drop_orphaned_leading_blank_run {
+        let leading_blank_run = lines
+            .iter()
+            .take_while(|line| line_is_blank(Some(line)))
+            .count();
+        if leading_blank_run > 1 {
+            lines.drain(0..leading_blank_run);
+        }
+    }
+    collapse_blank_runs_seeded(lines, prev_ends_blank)
 }
 
 /// The finalized transcript lines to push into scrollback: committed
@@ -510,15 +564,22 @@ pub fn finalized_history_lines_range_dedup_live(
         return lines;
     };
     let anchored_activity_logs = anchored_turn_activity_logs(app, session);
+    let mut used_reply_coverages = vec![false; live_coverages.len()];
     for (idx, message) in session.messages.iter().enumerate().skip(start) {
-        let reply_coverage = live_coverages.iter().find(|coverage| {
-            !coverage.reply_flushed_text.is_empty()
-                && message.role.as_str() == "assistant"
-                && message
-                    .content
-                    .starts_with(coverage.reply_flushed_text.as_str())
-        });
-        if let Some(coverage) = reply_coverage {
+        let reply_coverage_idx =
+            live_coverages
+                .iter()
+                .enumerate()
+                .find_map(|(coverage_idx, coverage)| {
+                    (!used_reply_coverages[coverage_idx]
+                        && live_reply_coverage_matches_message(
+                            app, session, idx, message, coverage,
+                        ))
+                    .then_some(coverage_idx)
+                });
+        if let Some(coverage_idx) = reply_coverage_idx {
+            used_reply_coverages[coverage_idx] = true;
+            let coverage = &live_coverages[coverage_idx];
             let suffix = &message.content[coverage.reply_flushed_text.len()..];
             // Continuation of a reply whose prefix is already in scrollback
             // (coverage is only matched when non-empty) — never re-issue the
@@ -533,6 +594,26 @@ pub fn finalized_history_lines_range_dedup_live(
                 true,
                 live_reply_prefix_ends_blank(palette, &coverage.reply_flushed_text, wrap_width),
             );
+        } else if message.role.as_str() == "assistant" {
+            let boundaries =
+                committed_reply_segment_boundaries_for_message(app, session, idx, &message.content);
+            if boundaries.is_empty() {
+                push_message_block(
+                    &mut lines,
+                    palette,
+                    message.role.as_str(),
+                    &message.content,
+                    wrap_width,
+                );
+            } else {
+                push_committed_assistant_reply_segments(
+                    &mut lines,
+                    palette,
+                    &message.content,
+                    wrap_width,
+                    &boundaries,
+                );
+            }
         } else {
             push_message_block(
                 &mut lines,
@@ -570,6 +651,113 @@ pub fn finalized_history_lines_range_dedup_live(
     lines
 }
 
+/// A recorded segment boundary is "word-safe" when it does NOT fall inside a
+/// word/token — i.e. not (the char before AND the char at the offset are both
+/// word chars). `message/persisted` can sample the live buffer mid-word
+/// ("anim|ate"); splitting or flushing there breaks words in immutable
+/// scrollback. Boundaries adjacent to a delimiter (whitespace, punctuation, line
+/// end, or buffer edge) pass — `ToolStarted` boundaries normally sit after
+/// sentence punctuation and pass anyway.
+fn boundary_is_word_safe(text: &str, boundary: usize) -> bool {
+    if boundary > text.len() || !text.is_char_boundary(boundary) {
+        return false;
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let before = text[..boundary].chars().next_back().is_some_and(is_word);
+    let after = text[boundary..].chars().next().is_some_and(is_word);
+    !(before && after)
+}
+
+fn committed_reply_segment_boundaries_for_message(
+    app: &AppState,
+    session: &SessionView,
+    message_idx: usize,
+    content: &str,
+) -> Vec<usize> {
+    let mut boundaries = app
+        .live_reply_segment_boundaries
+        .iter()
+        .filter(|((session_id, _), _)| session_id == &session.id)
+        .filter(|((session_id, turn_id), _)| {
+            let coverage = LiveTurnFinalization {
+                session_id: session_id.0.clone(),
+                turn_id: turn_id.0.to_string(),
+                ..Default::default()
+            };
+            committed_reply_index_for_live_finalization(app, session, &coverage)
+                == Some(message_idx)
+        })
+        .flat_map(|(_, boundaries)| boundaries.iter().copied())
+        .filter(|boundary| {
+            *boundary > 0
+                && *boundary < content.len()
+                && content.is_char_boundary(*boundary)
+                && boundary_is_word_safe(content, *boundary)
+        })
+        .collect::<Vec<_>>();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    boundaries
+}
+
+fn push_committed_assistant_reply_segments(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    content: &str,
+    wrap_width: usize,
+    boundaries: &[usize],
+) {
+    let mut cursor = 0;
+    let mut first = true;
+    let mut previous_reply_has_output = false;
+    let mut previous_reply_ends_blank = false;
+
+    for boundary in boundaries {
+        if *boundary > cursor {
+            let chunk = &content[cursor..*boundary];
+            push_live_reply_block_seeded(
+                lines,
+                palette,
+                chunk,
+                wrap_width,
+                first,
+                previous_reply_has_output,
+                previous_reply_ends_blank,
+            );
+            if !chunk.trim().is_empty() {
+                first = false;
+            }
+            cursor = *boundary;
+            previous_reply_has_output = !content[..cursor].trim().is_empty();
+            previous_reply_ends_blank =
+                live_reply_prefix_ends_blank(palette, &content[..cursor], wrap_width);
+        }
+
+        if *boundary < content.len() {
+            push_live_reply_segment_separator(
+                lines,
+                previous_reply_has_output,
+                previous_reply_ends_blank,
+            );
+            previous_reply_has_output = false;
+            previous_reply_ends_blank = true;
+            first = false;
+        }
+    }
+
+    if cursor < content.len() {
+        push_live_reply_block_seeded(
+            lines,
+            palette,
+            &content[cursor..],
+            wrap_width,
+            first,
+            previous_reply_has_output,
+            previous_reply_ends_blank,
+        );
+    }
+}
+
 /// Return the next active-turn watermark by extending the previous one with any
 /// newly settled live reply lines and any non-running activity rows.
 pub fn next_live_turn_finalization(
@@ -591,7 +779,45 @@ pub fn next_live_turn_finalization(
             .text
             .starts_with(next.reply_flushed_text.as_str())
     {
-        let stable_end = stable_live_reply_prefix_len(&live_reply.text);
+        // A completed content segment (the text before a tool call) is stable and
+        // flushable even without a trailing blank line. Without this, an agentic
+        // turn whose narration segments are glued ("…step 1.step 2:") never
+        // advances the blank-line watermark, so the whole growing reply stays in
+        // the height-limited live tail and clips to its bottom — the user sees a
+        // mid-reply fragment ("intermediate truncated") while the committed render
+        // is correct. Flush through the last completed segment boundary so the
+        // live tail holds only the in-progress segment.
+        let last_completed_segment = app
+            .live_reply_segment_boundaries
+            .get(&(session_id.clone(), turn_id.clone()))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|b| {
+                *b <= live_reply.text.len()
+                    && live_reply.text.is_char_boundary(*b)
+                    && boundary_is_word_safe(&live_reply.text, *b)
+            })
+            .max()
+            .unwrap_or(0);
+        // A completed segment is flushable UNLESS it ends inside an unclosed code
+        // fence (a tool call mid-```block```), which stable_live_reply_prefix_len
+        // deliberately pins behind — never flush an unbalanced fence into immutable
+        // scrollback. Plain-text narration segments (the glued case this targets)
+        // carry no fence and stay flushable.
+        let segment_end = if last_completed_segment > 0
+            && live_reply.text[..last_completed_segment]
+                .lines()
+                .filter(|line| line.trim_start().starts_with("```"))
+                .count()
+                % 2
+                == 0
+        {
+            last_completed_segment
+        } else {
+            0
+        };
+        let stable_end = stable_live_reply_prefix_len(&live_reply.text).max(segment_end);
         if stable_end > next.reply_flushed_text.len() {
             next.reply_flushed_text = live_reply.text[..stable_end].to_string();
         }
@@ -635,16 +861,8 @@ pub fn finalized_live_turn_lines_between(
         .reply_flushed_text
         .starts_with(previous.reply_flushed_text.as_str())
     {
-        let new_reply = &next.reply_flushed_text[previous.reply_flushed_text.len()..];
-        let first = previous.reply_flushed_text.is_empty();
-        push_live_reply_block_seeded(
-            &mut lines,
-            palette,
-            new_reply,
-            wrap_width,
-            first,
-            !previous.reply_flushed_text.trim().is_empty(),
-            live_reply_prefix_ends_blank(palette, &previous.reply_flushed_text, wrap_width),
+        push_live_reply_delta_seeded(
+            &mut lines, app, session_id, turn_id, palette, wrap_width, previous, next,
         );
     }
 
@@ -674,6 +892,119 @@ pub fn finalized_live_turn_lines_between(
 
     strip_lines_background(&mut lines);
     lines
+}
+
+fn push_live_reply_delta_seeded(
+    lines: &mut Vec<Line<'static>>,
+    app: &AppState,
+    session_id: &SessionKey,
+    turn_id: &octos_core::ui_protocol::TurnId,
+    palette: Palette,
+    wrap_width: usize,
+    previous: &LiveTurnFinalization,
+    next: &LiveTurnFinalization,
+) {
+    let previous_len = previous.reply_flushed_text.len();
+    let next_len = next.reply_flushed_text.len();
+    let boundaries = live_reply_segment_boundaries_in_delta(
+        app,
+        session_id,
+        turn_id,
+        previous_len,
+        next_len,
+        &next.reply_flushed_text,
+    );
+    let mut cursor = previous_len;
+    let mut first = previous.reply_flushed_text.is_empty();
+    let mut previous_reply_has_output = !previous.reply_flushed_text.trim().is_empty();
+    let mut previous_reply_ends_blank =
+        live_reply_prefix_ends_blank(palette, &previous.reply_flushed_text, wrap_width);
+
+    for boundary in boundaries {
+        if boundary > cursor {
+            let chunk = &next.reply_flushed_text[cursor..boundary];
+            push_live_reply_block_seeded(
+                lines,
+                palette,
+                chunk,
+                wrap_width,
+                first,
+                previous_reply_has_output,
+                previous_reply_ends_blank,
+            );
+            if !chunk.trim().is_empty() {
+                first = false;
+            }
+            cursor = boundary;
+            previous_reply_has_output = !next.reply_flushed_text[..cursor].trim().is_empty();
+            previous_reply_ends_blank = live_reply_prefix_ends_blank(
+                palette,
+                &next.reply_flushed_text[..cursor],
+                wrap_width,
+            );
+        }
+
+        if boundary < next_len {
+            push_live_reply_segment_separator(
+                lines,
+                previous_reply_has_output,
+                previous_reply_ends_blank,
+            );
+            previous_reply_has_output = false;
+            previous_reply_ends_blank = true;
+            first = false;
+        }
+    }
+
+    if cursor < next_len {
+        push_live_reply_block_seeded(
+            lines,
+            palette,
+            &next.reply_flushed_text[cursor..next_len],
+            wrap_width,
+            first,
+            previous_reply_has_output,
+            previous_reply_ends_blank,
+        );
+    }
+}
+
+fn live_reply_segment_boundaries_in_delta(
+    app: &AppState,
+    session_id: &SessionKey,
+    turn_id: &octos_core::ui_protocol::TurnId,
+    previous_len: usize,
+    next_len: usize,
+    flushed_text: &str,
+) -> Vec<usize> {
+    let mut boundaries = app
+        .live_reply_segment_boundaries
+        .get(&(session_id.clone(), turn_id.clone()))
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|boundary| {
+            (previous_len..next_len).contains(boundary)
+                && flushed_text.is_char_boundary(*boundary)
+                && boundary_is_word_safe(flushed_text, *boundary)
+        })
+        .collect::<Vec<_>>();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    boundaries
+}
+
+fn push_live_reply_segment_separator(
+    lines: &mut Vec<Line<'static>>,
+    previous_reply_has_output: bool,
+    previous_reply_ends_blank: bool,
+) {
+    if lines.last().is_some_and(|line| line_is_blank(Some(line))) {
+        return;
+    }
+    if !lines.is_empty() || (previous_reply_has_output && !previous_reply_ends_blank) {
+        lines.push(Line::from(""));
+    }
 }
 
 /// Render late archived activity for turns whose live activity rows were
@@ -746,12 +1077,14 @@ pub fn committed_reply_matches_live_finalization(
 ) -> bool {
     !coverage.reply_flushed_text.is_empty()
         && app.active_session().is_some_and(|session| {
-            session.messages.iter().skip(start).any(|message| {
-                message.role.as_str() == "assistant"
-                    && message
-                        .content
-                        .starts_with(coverage.reply_flushed_text.as_str())
-            })
+            session
+                .messages
+                .iter()
+                .enumerate()
+                .skip(start)
+                .any(|(idx, message)| {
+                    live_reply_coverage_matches_message(app, session, idx, message, coverage)
+                })
         })
 }
 
@@ -2689,6 +3022,10 @@ fn latest_user_message(session: &SessionView) -> Option<&str> {
         .filter(|content| !content.trim().is_empty())
 }
 
+fn pending_messages_contains(pending: &[String], content: &str) -> bool {
+    pending.iter().any(|pending| pending == content)
+}
+
 fn anchored_turn_activity_logs<'a>(
     app: &'a AppState,
     session: &'a SessionView,
@@ -2706,12 +3043,6 @@ fn anchored_turn_activity_logs<'a>(
                             message.role.as_str() == "user" && message.content == *request
                         })
                     })
-                })
-                .or_else(|| {
-                    session
-                        .messages
-                        .iter()
-                        .rposition(|message| message.role.as_str() == "user")
                 })?;
             Some((activity_log_render_index(session, anchor_index), log))
         })
@@ -2737,12 +3068,88 @@ fn user_message_at(session: &SessionView, idx: usize) -> bool {
         .is_some_and(|message| message.role.as_str() == "user")
 }
 
+fn live_reply_coverage_matches_message(
+    app: &AppState,
+    session: &SessionView,
+    message_idx: usize,
+    message: &Message,
+    coverage: &LiveTurnFinalization,
+) -> bool {
+    if coverage.reply_flushed_text.is_empty()
+        || message.role.as_str() != "assistant"
+        || !message
+            .content
+            .starts_with(coverage.reply_flushed_text.as_str())
+    {
+        return false;
+    }
+
+    committed_reply_index_for_live_finalization(app, session, coverage)
+        .is_none_or(|reply_idx| reply_idx == message_idx)
+}
+
+fn committed_reply_index_for_live_finalization(
+    app: &AppState,
+    session: &SessionView,
+    coverage: &LiveTurnFinalization,
+) -> Option<usize> {
+    let prompt_idx = app
+        .turn_prompt_anchors
+        .iter()
+        .rev()
+        .find(|anchor| {
+            anchor.session_id == session.id
+                && anchor.turn_id.0.to_string() == coverage.turn_id
+                && anchor.session_id.0 == coverage.session_id
+        })
+        .and_then(|anchor| resolve_turn_prompt_anchor_for_render(session, anchor))
+        .or_else(|| {
+            app.turn_activity_logs
+                .iter()
+                .rev()
+                .find(|log| {
+                    log.session_id == session.id
+                        && log.turn_id.0.to_string() == coverage.turn_id
+                        && log.session_id.0 == coverage.session_id
+                })
+                .and_then(|log| log.anchor_index)
+                .filter(|idx| user_message_at(session, *idx))
+        })?;
+
+    let reply_idx = activity_log_render_index(session, prompt_idx);
+    session
+        .messages
+        .get(reply_idx)
+        .is_some_and(|message| message.role.as_str() == "assistant")
+        .then_some(reply_idx)
+}
+
+fn resolve_turn_prompt_anchor_for_render(
+    session: &SessionView,
+    anchor: &TurnPromptAnchor,
+) -> Option<usize> {
+    if session
+        .messages
+        .get(anchor.anchor_index)
+        .is_some_and(|message| message.role.as_str() == "user" && message.content == anchor.content)
+    {
+        return Some(anchor.anchor_index);
+    }
+
+    session
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role.as_str() == "user" && message.content == anchor.content)
+        .nth(anchor.prior_matching_user_count)
+        .map(|(idx, _)| idx)
+}
+
 fn should_pin_recent_user_context(app: &AppState, session: &SessionView) -> bool {
     session.live_reply.is_some()
         || live_turn_diff_preview_visible(app)
         || app.active_turn().is_some()
         || app.run_state.is_active()
-        || has_flow_activity(app)
 }
 
 fn should_show_turn_flow(app: &AppState, session: &SessionView) -> bool {
@@ -4510,10 +4917,6 @@ fn push_activity_section_with_finalization(
     }
 }
 
-fn has_flow_activity(app: &AppState) -> bool {
-    !flow_activity_items(app).is_empty()
-}
-
 /// Pending master re-entries the server has queued for the active session
 /// (from the `session/orchestration` mirror). Drives the "re-entering" chip
 /// title so a settled-but-continuing turn doesn't read as completed.
@@ -4709,6 +5112,70 @@ fn spinner_frame() -> &'static str {
     static START: OnceLock<Instant> = OnceLock::new();
     let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
     SPINNER_FRAMES[(elapsed / 120) as usize % SPINNER_FRAMES.len()]
+}
+
+/// Seconds since process start — the same process clock `spinner_frame` rides,
+/// so a wave keyed off it advances on every ~25ms animation redraw without
+/// threading a phase counter through `AppState`.
+fn anim_time_secs() -> f32 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f32()
+}
+
+/// Extract an RGB triple from a ratatui `Color`. Truecolor themes store
+/// `Color::Rgb`; named/`Reset` colors (the Terminal theme) fall back to neutral
+/// grey so the wave degrades to a subtle ripple rather than panicking.
+fn rgb_of(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (170, 170, 170),
+    }
+}
+
+/// Linear RGB lerp across gradient `stops`; `t` clamped to 0..=1.
+fn gradient_sample(stops: &[(u8, u8, u8)], t: f32) -> (u8, u8, u8) {
+    match stops {
+        [] => (255, 255, 255),
+        [only] => *only,
+        _ => {
+            let f = t.clamp(0.0, 1.0) * (stops.len() - 1) as f32;
+            let lo = f.floor() as usize;
+            let hi = (lo + 1).min(stops.len() - 1);
+            let frac = f - lo as f32;
+            let (a, b) = (stops[lo], stops[hi]);
+            let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * frac).round() as u8;
+            (mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
+        }
+    }
+}
+
+/// One `Span` per grapheme, each colored from a sine-driven sample point that
+/// slides with `phase`, so a bright crest travels along `text` like a ripple.
+/// Advances by DISPLAY columns (CJK/emoji are double-width) so the wave stays
+/// even across multi-width glyphs; `bg` preserves the row's surface background.
+fn wave_gradient_spans(
+    text: &str,
+    phase: f32,
+    stops: &[(u8, u8, u8)],
+    bg: Color,
+) -> Vec<Span<'static>> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    const K: f32 = 0.45; // radians per display column — ripple tightness
+    let mut spans = Vec::new();
+    let mut col = 0.0f32;
+    for g in text.graphemes(true) {
+        let wave = 0.5 + 0.5 * (col * K - phase).sin();
+        let (r, gg, b) = gradient_sample(stops, wave);
+        spans.push(Span::styled(
+            g.to_string(),
+            Style::default().fg(Color::Rgb(r, gg, b)).bg(bg),
+        ));
+        col += g.width().max(1) as f32;
+    }
+    spans
 }
 
 /// Title for an agent-task group chip. Pure so it can be unit-tested
@@ -6049,16 +6516,22 @@ fn harness_status_lines(
     };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled(
-        format!("{} ", spinner_frame()),
-        Style::default()
-            .fg(palette.accent)
-            .add_modifier(Modifier::BOLD)
-            .bg(palette.surface),
-    ));
-    spans.push(Span::styled(
-        phase.to_string(),
-        palette.title().bg(palette.surface),
+    // Water-wave gradient on "spinner + phase" (e.g. "⣻ Working"): a bright crest
+    // ripples across the label, advanced by the ~25ms animation redraw via the
+    // shared process clock. Uses Color::Rgb like the rest of octos-tui's themes
+    // (truecolor-assuming, so it works over SSH where COLORTERM isn't forwarded);
+    // the non-RGB Terminal theme degrades to a neutral-grey ripple via rgb_of.
+    let label = format!("{} {}", spinner_frame(), phase);
+    let stops = [
+        rgb_of(palette.muted),
+        rgb_of(palette.accent),
+        rgb_of(palette.highlight),
+    ];
+    spans.extend(wave_gradient_spans(
+        &label,
+        anim_time_secs() * 3.0,
+        &stops,
+        palette.surface,
     ));
 
     if let Some(status) = status {
@@ -7282,7 +7755,7 @@ mod tests {
         cli::ThemeName,
         model::{
             ApprovalModalState, DiffPreview, DiffPreviewFile, DiffPreviewGetResult,
-            DiffPreviewHunk, DiffPreviewLine, SessionView,
+            DiffPreviewHunk, DiffPreviewLine, SessionView, TurnPromptAnchor,
         },
         store::Store,
         viewport::ScrollbackTracker,
@@ -7416,6 +7889,37 @@ mod tests {
         );
         app.diff_preview.apply_result(result);
         app
+    }
+
+    #[test]
+    fn gradient_sample_lerps_endpoints_and_midpoint() {
+        let stops = [(0u8, 0u8, 0u8), (100u8, 200u8, 40u8)];
+        assert_eq!(gradient_sample(&stops, 0.0), (0, 0, 0));
+        assert_eq!(gradient_sample(&stops, 1.0), (100, 200, 40));
+        assert_eq!(gradient_sample(&stops, 0.5), (50, 100, 20));
+        // Out-of-range clamps; degenerate stop lists don't panic.
+        assert_eq!(gradient_sample(&stops, 2.0), (100, 200, 40));
+        assert_eq!(gradient_sample(&[(7, 7, 7)], 0.5), (7, 7, 7));
+    }
+
+    #[test]
+    fn wave_gradient_spans_colors_each_grapheme_and_animates() {
+        let stops = [(0u8, 0u8, 0u8), (255u8, 255u8, 255u8)];
+        let a = wave_gradient_spans("abc", 0.0, &stops, Color::Reset);
+        assert_eq!(a.len(), 3, "one span per grapheme");
+        assert!(
+            a.iter()
+                .all(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _)))),
+            "every glyph gets a truecolor fg"
+        );
+        // Advancing the phase moves the crest → the first glyph recolors.
+        let b = wave_gradient_spans("abc", 1.5, &stops, Color::Reset);
+        assert_ne!(a[0].style.fg, b[0].style.fg, "the wave advances with phase");
+        // CJK double-width graphemes still produce one span each.
+        assert_eq!(
+            wave_gradient_spans("水波", 0.0, &stops, Color::Reset).len(),
+            2
+        );
     }
 
     #[test]
@@ -12380,6 +12884,18 @@ mod tests {
             .join("\n")
     }
 
+    fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
     #[test]
     fn viewport_renders_live_ui_not_committed_history() {
         // Committed messages live in scrollback (finalized_history_lines), NOT
@@ -12482,6 +12998,76 @@ mod tests {
     }
 
     #[test]
+    fn glued_completed_segment_flushes_via_boundary_so_live_tail_holds_only_current_segment() {
+        // Agentic narration segments are glued in live_reply (no blank line
+        // between "…step one.step two:"), so the blank-line flush watermark never
+        // advances and the whole growing reply piles up in the height-limited live
+        // tail, clipping to its bottom ("intermediate truncated"). A completed
+        // segment boundary (recorded when its tool call started) must flush the
+        // finished segment so the live tail holds only the in-progress one.
+        let turn_id = TurnId::new();
+        let session = SessionKey("local:test".into());
+        let head = "segment one glued.";
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("go")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: format!("{head}segment two still live"),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+        // Boundary recorded at the tool call between segment one and two. There is
+        // no blank line, so only this boundary can advance the watermark.
+        app.live_reply_segment_boundaries
+            .insert((session, turn_id), vec![head.len()]);
+
+        let mut tracker = ScrollbackTracker::new();
+        let update = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
+        let inserted = lines_text(&update.lines_to_insert);
+        assert!(
+            inserted.contains("segment one glued."),
+            "completed boundary-terminated segment must flush to scrollback even \
+             without a blank line: {inserted:?}"
+        );
+        let rows =
+            viewport_rows_with_finalization(&app, 100, 40, update.live_tail_finalization.as_ref());
+        let live = rows.join("\n");
+        assert!(
+            !live.contains("segment one glued."),
+            "flushed segment must not remain in the live tail:\n{live}"
+        );
+        assert!(
+            live.contains("segment two still live"),
+            "the in-progress segment stays in the live tail:\n{live}"
+        );
+    }
+
+    #[test]
+    fn word_safe_boundary_rejects_mid_word_splits() {
+        // Mid-word (both neighbors are word chars) -> rejected, so a message/persisted
+        // event sampling the live buffer at "anim|ate" never splits/flushes mid-word.
+        assert!(!boundary_is_word_safe("animate", 4));
+        assert!(!boundary_is_word_safe("haloPhase", 7));
+        // Adjacent to a delimiter -> accepted (real segment ends still pass).
+        assert!(boundary_is_word_safe("loop: next", 5));
+        assert!(boundary_is_word_safe("done. Now", 5));
+        assert!(boundary_is_word_safe("a\nb", 2));
+        assert!(boundary_is_word_safe("end", 3));
+        // Non-char-boundary -> rejected (safe).
+        assert!(!boundary_is_word_safe("五大", 1));
+    }
+
+    #[test]
     fn active_turn_completed_reply_lines_flush_to_scrollback_and_leave_only_suffix_live() {
         let turn_id = TurnId::new();
         let mut app = AppState::new(
@@ -12525,6 +13111,144 @@ mod tests {
         assert!(
             live.contains("streaming suffix still live"),
             "only the active reply suffix should remain live:\n{live}"
+        );
+    }
+
+    #[test]
+    fn live_delta_segment_boundary_starts_fresh_markdown_block() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let first_segment = "### Step 1\n\nBody one.";
+        let second_segment = "### Step 2\n\nBody two.";
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("build a demo")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: first_segment.into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+
+        let previous = next_live_turn_finalization(&app, None).expect("first watermark");
+        assert_eq!(previous.reply_flushed_text, "### Step 1\n\n");
+
+        app.live_reply_segment_boundaries.insert(
+            (session_id.clone(), turn_id.clone()),
+            vec![first_segment.len()],
+        );
+        app.sessions[0].live_reply.as_mut().unwrap().text =
+            format!("{first_segment}{second_segment}");
+        let next = next_live_turn_finalization(&app, Some(&previous)).expect("next watermark");
+
+        let rendered = line_texts(&finalized_live_turn_lines_between(
+            &app,
+            Palette::for_theme(ThemeName::Slate),
+            100,
+            &previous,
+            &next,
+        ));
+        let body = rendered
+            .iter()
+            .position(|line| line == "Body one.")
+            .expect("first segment body should render before the boundary");
+        let heading = rendered
+            .iter()
+            .position(|line| line == "Step 2")
+            .expect("second segment heading should render as markdown");
+
+        assert_eq!(
+            rendered.get(body + 1).map(String::as_str),
+            Some(""),
+            "segment boundary should force a blank paragraph break: {rendered:#?}"
+        );
+        assert_eq!(
+            heading,
+            body + 2,
+            "Step 2 should be a discrete heading immediately after the boundary break: {rendered:#?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains("###")),
+            "markdown heading markers must not leak in live scrollback: {rendered:#?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains("Body one.###")),
+            "segment boundary must prevent body/header gluing: {rendered:#?}"
+        );
+    }
+
+    #[test]
+    fn committed_assistant_segment_boundary_starts_fresh_markdown_block() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let first_segment = "**Step 1:** a.";
+        let second_segment = "**Step 2:** b.";
+        let content = format!("{first_segment}{second_segment}");
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("build a demo"),
+                    Message::assistant(content.as_str()),
+                ],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_prompt_anchors.push(TurnPromptAnchor {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            content: "build a demo".into(),
+            anchor_index: 0,
+            prior_matching_user_count: 0,
+        });
+        app.live_reply_segment_boundaries
+            .insert((session_id, turn_id), vec![first_segment.len()]);
+
+        let rendered = line_texts(&finalized_history_lines_range_dedup_live(
+            &app,
+            Palette::for_theme(ThemeName::Slate),
+            100,
+            1,
+            &[],
+        ));
+        let first = rendered
+            .iter()
+            .position(|line| line == "• Step 1: a.")
+            .expect("first segment should render as assistant prose");
+        let second = rendered
+            .iter()
+            .position(|line| line == "Step 2: b." || line == "• Step 2: b.")
+            .expect("second segment should render as a discrete markdown block");
+
+        assert_eq!(
+            rendered.get(first + 1).map(String::as_str),
+            Some(""),
+            "segment boundary should force a blank paragraph break: {rendered:#?}"
+        );
+        assert_eq!(
+            second,
+            first + 2,
+            "Step 2 should not be glued onto Step 1: {rendered:#?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains("a.Step 2")),
+            "committed assistant segment boundary must prevent gluing: {rendered:#?}"
         );
     }
 
@@ -12686,6 +13410,119 @@ mod tests {
     }
 
     #[test]
+    fn committed_agentic_turn_keeps_later_assistant_messages_discrete() {
+        let session_id = SessionKey("local:test".into());
+        let turn_id = TurnId::new();
+        let first = "### Step 1\n\nI'll create demo.html with an HTML5 skeleton.";
+        let second = "### Step 2\n\nNow I'll add a style block.";
+        let third = "### Step 3\n\nFinally, I'll add an <h1>.";
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("build a demo page"),
+                    Message::assistant(first),
+                    Message::assistant(second),
+                    Message::assistant(third),
+                ],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_prompt_anchors.push(TurnPromptAnchor {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            content: "build a demo page".into(),
+            anchor_index: 0,
+            prior_matching_user_count: 0,
+        });
+
+        let coverage = LiveTurnFinalization {
+            session_id: session_id.0,
+            turn_id: turn_id.0.to_string(),
+            reply_flushed_text: "### Step ".into(),
+            ..Default::default()
+        };
+        let rendered = line_texts(&finalized_history_lines_range_dedup_live(
+            &app,
+            Palette::for_theme(ThemeName::Slate),
+            100,
+            1,
+            &[coverage],
+        ));
+
+        assert_eq!(
+            rendered,
+            vec![
+                "1",
+                "",
+                "I'll create demo.html with an HTML5 skeleton.",
+                "",
+                "Step 2",
+                "",
+                "• Now I'll add a style block.",
+                "",
+                "Step 3",
+                "",
+                "• Finally, I'll add an <h1>.",
+            ],
+            "later assistant messages must render as fresh markdown blocks, not live-reply continuations"
+        );
+    }
+
+    #[test]
+    fn pending_prompt_present_in_session_history_renders_once() {
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("active prompt"),
+                    Message::assistant("partial answer"),
+                    Message::user("queued next"),
+                ],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id,
+                    text: "still working".into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.pending_messages.push("queued next".into());
+        app.set_run_state_in_progress();
+
+        let rendered = line_texts(&live_tail_lines_with_finalization(
+            &app,
+            Palette::for_theme(ThemeName::Slate),
+            100,
+            None,
+        ));
+
+        assert_eq!(
+            rendered,
+            vec![
+                "• still working",
+                "",
+                "queued 1 messages after active turn",
+                "› queued next",
+            ],
+            "a prompt that is still pending must not also render as recent user context"
+        );
+    }
+
+    #[test]
     fn finalized_history_lines_range_skips_already_flushed() {
         let app = chat_app(vec![
             Message::user("q1"),
@@ -12750,6 +13587,93 @@ mod tests {
         assert!(
             text.contains("$ cargo build"),
             "missing tool detail: {text:?}"
+        );
+    }
+
+    #[test]
+    fn finalized_history_lines_place_each_activity_log_after_own_reply() {
+        let session_id = SessionKey("local:test".into());
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let mut app = chat_app(vec![
+            Message::user("first prompt"),
+            Message::assistant("First answer."),
+            Message::user("second prompt"),
+            Message::assistant("Second answer."),
+        ]);
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id: session_id.clone(),
+            turn_id: turn_a.clone(),
+            request: Some("first prompt".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_a)
+                    .with_detail("cargo test --first")
+                    .with_success(true),
+            ],
+        });
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_b.clone(),
+            request: Some("second prompt".into()),
+            anchor_index: Some(2),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_b)
+                    .with_detail("cargo test --second")
+                    .with_success(true),
+            ],
+        });
+
+        let lines = finalized_history_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let first_reply = rendered
+            .iter()
+            .position(|line| line.contains("First answer."))
+            .expect("first reply");
+        let second_prompt = rendered
+            .iter()
+            .position(|line| line.contains("second prompt"))
+            .expect("second prompt");
+        let second_reply = rendered
+            .iter()
+            .position(|line| line.contains("Second answer."))
+            .expect("second reply");
+        let cards = rendered
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| line.contains("Agent task completed").then_some(idx))
+            .collect::<Vec<_>>();
+        assert_eq!(cards.len(), 2, "expected two activity cards: {rendered:#?}");
+        let first_card = cards[0];
+        let second_card = cards[1];
+
+        assert_eq!(
+            first_card,
+            first_reply + 2,
+            "first card should follow first reply with one blank: {rendered:#?}"
+        );
+        assert!(line_is_blank(lines.get(first_reply + 1)));
+        assert_eq!(
+            second_card,
+            second_reply + 2,
+            "second card should follow second reply with one blank: {rendered:#?}"
+        );
+        assert!(line_is_blank(lines.get(second_reply + 1)));
+        assert!(
+            first_card < second_prompt
+                && second_prompt < second_reply
+                && second_reply < second_card,
+            "activity cards must stay in turn order: {rendered:#?}"
         );
     }
 
@@ -12978,6 +13902,33 @@ mod tests {
         let mut flush3 = vec![Line::from(""), Line::from("  ")];
         assert!(collapse_blank_runs_seeded(&mut flush3, true));
         assert!(flush3.is_empty(), "redundant blanks after a blank all drop");
+    }
+
+    #[test]
+    fn orphan_guard_drops_only_multi_line_leading_blank_runs() {
+        let mut orphaned = vec![
+            Line::from(""),
+            Line::from(" "),
+            Line::from(""),
+            Line::from("▌ next prompt"),
+        ];
+        let ends_blank = collapse_blank_runs_seeded_orphan_guard(&mut orphaned, false, true);
+        let rendered = line_texts(&orphaned);
+
+        assert_eq!(
+            rendered,
+            vec!["▌ next prompt"],
+            "a live-tail shrink must not carry an orphaned guardian blank run into scrollback"
+        );
+        assert!(!ends_blank);
+
+        let mut legitimate_separator = vec![Line::from(""), Line::from("▌ next prompt")];
+        collapse_blank_runs_seeded_orphan_guard(&mut legitimate_separator, false, true);
+        assert_eq!(
+            line_texts(&legitimate_separator),
+            vec!["", "▌ next prompt"],
+            "a single separator between distinct turns must survive"
+        );
     }
 
     #[test]
