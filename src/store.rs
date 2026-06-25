@@ -5643,11 +5643,6 @@ impl Store {
             UiNotification::VisualGenerating(_)
             | UiNotification::VisualSucceeded(_)
             | UiNotification::VisualFailed(_) => None,
-            // Reasoning streaming (octos #1502): the backend now emits live
-            // reasoning deltas. The reasoning render was reverted pending a
-            // proper rework, so consume + ignore these — without this arm the
-            // latest serve would spam "unknown notification" on this client.
-            UiNotification::ReasoningDelta(_) => None,
             UiNotification::SessionOpened(event) => {
                 let session_id = event.session_id.clone();
                 // Restore the server-persisted per-session reasoning effort so
@@ -6424,12 +6419,6 @@ impl Store {
                 self.state.status = format!("Turn completed for {thread_id}");
                 self.state.set_run_state_success();
                 self.submit_next_pending_if_idle()
-            }
-            Payload::ReasoningDelta { .. } => {
-                // Reasoning streaming (#1502): consume the projection-envelope
-                // reasoning delta. Render reverted pending rework (mirrors the
-                // UiNotification::ReasoningDelta no-op above).
-                None
             }
         }
     }
