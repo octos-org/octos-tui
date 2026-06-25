@@ -759,7 +759,25 @@ pub fn next_live_turn_finalization(
             .text
             .starts_with(next.reply_flushed_text.as_str())
     {
-        let stable_end = stable_live_reply_prefix_len(&live_reply.text);
+        // A completed content segment (the text before a tool call) is stable and
+        // flushable even without a trailing blank line. Without this, an agentic
+        // turn whose narration segments are glued ("…step 1.step 2:") never
+        // advances the blank-line watermark, so the whole growing reply stays in
+        // the height-limited live tail and clips to its bottom — the user sees a
+        // mid-reply fragment ("intermediate truncated") while the committed render
+        // is correct. Flush through the last completed segment boundary so the
+        // live tail holds only the in-progress segment.
+        let last_completed_segment = app
+            .live_reply_segment_boundaries
+            .get(&(session_id.clone(), turn_id.clone()))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|b| *b <= live_reply.text.len() && live_reply.text.is_char_boundary(*b))
+            .max()
+            .unwrap_or(0);
+        let stable_end =
+            stable_live_reply_prefix_len(&live_reply.text).max(last_completed_segment);
         if stable_end > next.reply_flushed_text.len() {
             next.reply_flushed_text = live_reply.text[..stable_end].to_string();
         }
@@ -12934,6 +12952,61 @@ mod tests {
         assert!(
             live.contains("cargo clippy --all-targets") && live.contains("Orchestrating"),
             "running activity should remain as the small live tail:\n{live}"
+        );
+    }
+
+    #[test]
+    fn glued_completed_segment_flushes_via_boundary_so_live_tail_holds_only_current_segment() {
+        // Agentic narration segments are glued in live_reply (no blank line
+        // between "…step one.step two:"), so the blank-line flush watermark never
+        // advances and the whole growing reply piles up in the height-limited live
+        // tail, clipping to its bottom ("intermediate truncated"). A completed
+        // segment boundary (recorded when its tool call started) must flush the
+        // finished segment so the live tail holds only the in-progress one.
+        let turn_id = TurnId::new();
+        let session = SessionKey("local:test".into());
+        let head = "segment one glued.";
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("go")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: format!("{head}segment two still live"),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+        // Boundary recorded at the tool call between segment one and two. There is
+        // no blank line, so only this boundary can advance the watermark.
+        app.live_reply_segment_boundaries
+            .insert((session, turn_id), vec![head.len()]);
+
+        let mut tracker = ScrollbackTracker::new();
+        let update = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
+        let inserted = lines_text(&update.lines_to_insert);
+        assert!(
+            inserted.contains("segment one glued."),
+            "completed boundary-terminated segment must flush to scrollback even \
+             without a blank line: {inserted:?}"
+        );
+        let rows =
+            viewport_rows_with_finalization(&app, 100, 40, update.live_tail_finalization.as_ref());
+        let live = rows.join("\n");
+        assert!(
+            !live.contains("segment one glued."),
+            "flushed segment must not remain in the live tail:\n{live}"
+        );
+        assert!(
+            live.contains("segment two still live"),
+            "the in-progress segment stays in the live tail:\n{live}"
         );
     }
 
