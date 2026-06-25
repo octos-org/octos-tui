@@ -6822,7 +6822,7 @@ impl Store {
         let fallback_summary = self.turn_completion_fallback_message(&event.turn_id);
         let partial_fallback_summary =
             self.turn_partial_completion_fallback_message(&event.turn_id);
-        let (status, reset_scroll, completed_current_turn) = {
+        let (status, reset_scroll, completed_current_turn, restore_reasoning) = {
             let session = self.find_session_mut(&event.session_id)?;
             let title = session.title.clone();
             match session.live_reply.take() {
@@ -6840,26 +6840,41 @@ impl Store {
                         t!("status.turn_completed", title = title, seq = seq).into_owned(),
                         true,
                         true,
+                        None,
                     )
                 }
                 Some(live_reply) => {
+                    // Stale terminal (a different turn's reply is live): this turn
+                    // did not commit here, so preserve its reasoning for the real
+                    // terminal rather than dropping it.
                     session.live_reply = Some(live_reply);
                     (
                         t!("status.turn_completed_stale", title = title).into_owned(),
                         false,
                         false,
+                        reasoning,
                     )
                 }
-                None => (
-                    {
-                        session.messages.push(Message::assistant(fallback_summary));
-                        t!("status.turn_completed", title = title, seq = seq).into_owned()
-                    },
-                    true,
-                    true,
-                ),
+                None => {
+                    // No live reply (empty / already-persisted answer): still
+                    // surface any streamed reasoning on the fallback message.
+                    let mut message = Message::assistant(fallback_summary);
+                    message.reasoning_content = reasoning;
+                    session.messages.push(message);
+                    (
+                        t!("status.turn_completed", title = title, seq = seq).into_owned(),
+                        true,
+                        true,
+                        None,
+                    )
+                }
             }
         };
+        if let Some(reasoning) = restore_reasoning {
+            self.state
+                .live_reasoning
+                .insert((event.session_id.clone(), event.turn_id.clone()), reasoning);
+        }
         if reset_scroll {
             if follow_tail {
                 self.state.scroll_transcript_to_latest();
@@ -7083,6 +7098,15 @@ impl Store {
             .mark_turn_finalized_by_switch(session_id, &prior_turn);
         self.state
             .clear_live_reply_segment_boundaries(session_id, &prior_turn);
+        // The prior turn's streamed reasoning commits with its message below (or is
+        // dropped with an empty turn); either way it must leave the accumulator,
+        // since this switch finalizes the turn and its own late TurnCompleted
+        // early-returns without draining it (otherwise reasoning is lost + stale).
+        let prior_reasoning = self
+            .state
+            .live_reasoning
+            .remove(&(session_id.clone(), prior_turn.clone()))
+            .filter(|reasoning| !reasoning.trim().is_empty());
         let complete_live_plan = self.turn_had_completion_activity(&prior_turn);
         let fallback_summary = self.turn_completion_fallback_message(&prior_turn);
         let partial_fallback_summary = self.turn_partial_completion_fallback_message(&prior_turn);
@@ -7103,7 +7127,9 @@ impl Store {
                     &fallback_summary,
                     &partial_fallback_summary,
                 );
-                session.messages.push(Message::assistant(text));
+                let mut message = Message::assistant(text);
+                message.reasoning_content = prior_reasoning;
+                session.messages.push(message);
                 committed = true;
             }
         }
@@ -12597,6 +12623,44 @@ mod tests {
             reasoning,
             Some("weighing the options"),
             "ReasoningDelta must populate the committed message's reasoning_content"
+        );
+    }
+
+    #[test]
+    fn reasoning_without_answer_attaches_to_fallback_message() {
+        use octos_core::ui_protocol::{ReasoningDeltaEvent, TurnCompletedEvent};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = store.state.sessions[0].id.clone();
+        let turn_id = TurnId::new();
+        // Reasoning streams but no answer text arrives — the terminal hits the
+        // None arm of commit_live_reply (codex review: reasoning must not be lost).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ReasoningDelta(
+            ReasoningDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                text: "no answer came".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        let reasoning = store.state.sessions[0]
+            .messages
+            .iter()
+            .find_map(|message| message.reasoning_content.as_deref());
+        assert_eq!(
+            reasoning,
+            Some("no answer came"),
+            "reasoning must attach to the fallback message even with no answer"
         );
     }
 

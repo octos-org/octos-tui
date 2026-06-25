@@ -776,8 +776,24 @@ pub fn next_live_turn_finalization(
             .filter(|b| *b <= live_reply.text.len() && live_reply.text.is_char_boundary(*b))
             .max()
             .unwrap_or(0);
-        let stable_end =
-            stable_live_reply_prefix_len(&live_reply.text).max(last_completed_segment);
+        // A completed segment is flushable UNLESS it ends inside an unclosed code
+        // fence (a tool call mid-```block```), which stable_live_reply_prefix_len
+        // deliberately pins behind — never flush an unbalanced fence into immutable
+        // scrollback. Plain-text narration segments (the glued case this targets)
+        // carry no fence and stay flushable.
+        let segment_end = if last_completed_segment > 0
+            && live_reply.text[..last_completed_segment]
+                .lines()
+                .filter(|line| line.trim_start().starts_with("```"))
+                .count()
+                % 2
+                == 0
+        {
+            last_completed_segment
+        } else {
+            0
+        };
+        let stable_end = stable_live_reply_prefix_len(&live_reply.text).max(segment_end);
         if stable_end > next.reply_flushed_text.len() {
             next.reply_flushed_text = live_reply.text[..stable_end].to_string();
         }

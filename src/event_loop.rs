@@ -704,6 +704,31 @@ fn sanitize_pasted_text(text: &str) -> String {
                 }
                 None => {}
             },
+            // 8-bit C1 CSI (U+009B) / OSC (U+009D): the single-char forms of ESC[
+            // and ESC]. Drop the whole sequence, not just the introducer (else the
+            // params/text like "31m…" leak into the composer).
+            '\u{9b}' => {
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if ('\u{40}'..='\u{7e}').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            '\u{9d}' => {
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n == '\u{7}' || n == '\u{9c}' {
+                        break;
+                    }
+                    if n == '\u{1b}' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
             '\n' => out.push('\n'),
             // CR / CRLF -> single LF (web copies often use \r\n).
             '\r' => {
@@ -2563,6 +2588,16 @@ mod tests {
         let mut store = store_with_sessions(1);
         handle_terminal_event(&mut store, Event::Paste("a\u{2028}b\u{2029}c".into()));
         assert_eq!(store.state.composer, "a\nb\nc");
+    }
+
+    #[test]
+    fn terminal_paste_strips_8bit_c1_csi_and_osc_sequences() {
+        // Some sources emit the 8-bit C1 forms of CSI (U+009B) / OSC (U+009D)
+        // instead of ESC[ / ESC]. The whole sequence must drop, not just the
+        // introducer (else the params/text like "31m…" leak into the composer).
+        let mut store = store_with_sessions(1);
+        handle_terminal_event(&mut store, Event::Paste("\u{9b}31mred\u{9d}0;t\u{7}END".into()));
+        assert_eq!(store.state.composer, "redEND");
     }
 
     #[test]
