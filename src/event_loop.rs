@@ -636,11 +636,21 @@ fn handle_paste(store: &mut Store, text: &str) -> KeyAction {
         return KeyAction::Continue;
     }
 
+    // The composer is a PLAIN-TEXT field. Strip styling/control noise from a paste
+    // (web copies carry ANSI/CSI/OSC escapes, zero-width + format chars, CR, tabs).
+    // Inserted raw, those have zero/odd display width but still occupy buffer bytes,
+    // so the byte-cursor and the width-based render desync: the text fails to render
+    // and backspace leaves residue (it deletes the invisible bytes, not the glyphs).
+    let text = sanitize_pasted_text(text);
+    if text.is_empty() {
+        return KeyAction::Continue;
+    }
+
     // A paste is literal text and must NEVER trigger a slash command — a pasted
     // file path ("/Users/...") or multi-line snippet beginning with '/' is not a
     // command. Unlike a typed leading '/', we do not open the slash-command menu
     // here. (Regression: pasting a path opened/ran the slash menu.)
-    store.state.insert_composer_text(text);
+    store.state.insert_composer_text(&text);
     store.state.focus = FocusPane::Composer;
 
     // Only keep an ALREADY-open slash search in sync (e.g. the user typed '/' to
@@ -650,6 +660,66 @@ fn handle_paste(store: &mut Store, text: &str) -> KeyAction {
     }
 
     KeyAction::Continue
+}
+
+/// Reduce pasted text to the plain text the composer can render. Strips ANSI/CSI/OSC
+/// escape sequences and control + zero-width/format chars (which web copies carry and
+/// which desync the byte-cursor from the width-based render), normalizes CR/CRLF to
+/// LF, and turns tabs into a space. Newlines are kept (the composer is multi-line).
+fn sanitize_pasted_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.peek() {
+                // CSI: ESC [ ... <final byte 0x40..=0x7e>
+                Some('[') => {
+                    chars.next();
+                    while let Some(&n) = chars.peek() {
+                        chars.next();
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] ... terminated by BEL or ESC \
+                Some(']') => {
+                    chars.next();
+                    while let Some(&n) = chars.peek() {
+                        chars.next();
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Other two-char ESC sequence (e.g. ESC + a letter): drop both.
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            '\n' => out.push('\n'),
+            // CR / CRLF -> single LF (web copies often use \r\n).
+            '\r' => {
+                out.push('\n');
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            '\t' => out.push(' '),
+            // Zero-width / format chars (ZWSP, ZWNJ, ZWJ, word-joiner, BOM).
+            '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}' => {}
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
@@ -2423,6 +2493,17 @@ mod tests {
 
         assert_eq!(store.state.composer, pasted);
         assert!(!store.state.menu_stack.is_active());
+    }
+
+    #[test]
+    fn terminal_paste_sanitizes_styled_web_text_to_plain() {
+        // Web copies carry ANSI escapes, zero-width/format chars, CR, tabs. The
+        // composer is plain-text: a paste must be reduced to renderable plain text
+        // so the byte-cursor stays aligned with the render (no residue on delete).
+        let mut store = store_with_sessions(1);
+        let styled = "AAA\u{1b}[31mRED\u{1b}[0m\u{200b}XYZ\r\n\tEND";
+        handle_terminal_event(&mut store, Event::Paste(styled.into()));
+        assert_eq!(store.state.composer, "AAAREDXYZ\n END");
     }
 
     #[test]
