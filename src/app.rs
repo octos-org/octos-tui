@@ -2983,7 +2983,6 @@ fn should_pin_recent_user_context(app: &AppState, session: &SessionView) -> bool
         || live_turn_diff_preview_visible(app)
         || app.active_turn().is_some()
         || app.run_state.is_active()
-        || has_flow_activity(app)
 }
 
 fn should_show_turn_flow(app: &AppState, session: &SessionView) -> bool {
@@ -4749,10 +4748,6 @@ fn push_activity_section_with_finalization(
             ),
         ]));
     }
-}
-
-fn has_flow_activity(app: &AppState) -> bool {
-    !flow_activity_items(app).is_empty()
 }
 
 /// Pending master re-entries the server has queued for the active session
