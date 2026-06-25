@@ -5982,6 +5982,18 @@ impl Store {
                 self.state.status = format!("Warning [{}]: {}", event.code, event.message);
                 None
             }
+            UiNotification::ReasoningDelta(event) => {
+                // Accumulate streamed reasoning fragments for this turn. The
+                // committed message picks them up in commit_live_reply as
+                // reasoning_content, rendered as a "· reasoning" block above the
+                // answer. Keyed per-turn exactly like MessageDelta's live_reply.
+                self.state
+                    .live_reasoning
+                    .entry((event.session_id, event.turn_id))
+                    .or_default()
+                    .push_str(&event.text);
+                None
+            }
             UiNotification::TurnCompleted(event) => self.commit_live_reply(event),
             UiNotification::TurnError(event) => self.fail_live_reply(event),
             UiNotification::ApprovalAutoResolved(event) => self.apply_approval_auto_resolved(event),
@@ -6342,6 +6354,13 @@ impl Store {
                 // Same as AssistantDelta: internal projection, not status-bar news.
                 None
             }
+            Payload::ReasoningDelta { text } => {
+                // Envelope reasoning stream → the assistant message's
+                // reasoning_content (rendered as a "· reasoning" block). Internal
+                // projection, not status-bar news.
+                self.upsert_envelope_assistant_reasoning(&session_id, &thread_id, text);
+                None
+            }
             Payload::ToolStart { tool_call_id, name } => {
                 self.state.push_activity(
                     ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
@@ -6453,6 +6472,35 @@ impl Store {
             self.state.scroll_transcript_to_latest();
         } else {
             self.state.preserve_transcript_position_after_append(1);
+        }
+    }
+
+    /// Append a streamed reasoning fragment to the envelope assistant message's
+    /// `reasoning_content` (rendered as a `· reasoning` block), creating the
+    /// message if reasoning arrives before any answer text. Mirrors
+    /// [`Self::upsert_envelope_assistant_message`] but targets `reasoning_content`.
+    fn upsert_envelope_assistant_reasoning(
+        &mut self,
+        session_id: &SessionKey,
+        thread_id: &str,
+        text: String,
+    ) {
+        let Some(session) = self.find_session_mut(session_id) else {
+            return;
+        };
+        if let Some(message) = session.messages.iter_mut().rev().find(|message| {
+            message.role == MessageRole::Assistant
+                && message.thread_id.as_deref() == Some(thread_id)
+        }) {
+            message
+                .reasoning_content
+                .get_or_insert_with(String::new)
+                .push_str(&text);
+        } else {
+            let mut message =
+                Message::assistant_with_thread(String::new(), ThreadId::new(thread_id.to_owned()));
+            message.reasoning_content = Some(text);
+            session.messages.push(message);
         }
     }
 
@@ -6760,6 +6808,14 @@ impl Store {
         {
             return None;
         }
+        // Streamed reasoning for this turn (legacy ReasoningDelta accumulator)
+        // becomes the committed message's reasoning_content — the transcript
+        // renders it as a separate "· reasoning" block above the answer.
+        let reasoning = self
+            .state
+            .live_reasoning
+            .remove(&(event.session_id.clone(), event.turn_id.clone()))
+            .filter(|reasoning| !reasoning.trim().is_empty());
         let seq = event.cursor.map(|cursor| cursor.seq).unwrap_or(0);
         let follow_tail = self.state.transcript_scroll == 0;
         let complete_live_plan = self.turn_had_completion_activity(&event.turn_id);
@@ -6777,7 +6833,9 @@ impl Store {
                         &fallback_summary,
                         &partial_fallback_summary,
                     );
-                    session.messages.push(Message::assistant(text));
+                    let mut message = Message::assistant(text);
+                    message.reasoning_content = reasoning;
+                    session.messages.push(message);
                     (
                         t!("status.turn_completed", title = title, seq = seq).into_owned(),
                         true,
@@ -12482,6 +12540,63 @@ mod tests {
                 .iter()
                 .any(|c| c.contains("did not receive a final assistant answer")),
             "continuation turn with deltas must NOT show the fallback card: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_delta_populates_committed_message_reasoning_content() {
+        use octos_core::ui_protocol::{
+            MessageDeltaEvent, ReasoningDeltaEvent, TurnCompletedEvent, TurnStartedEvent,
+        };
+        let mut store = protocol_store_with_autonomy();
+        let session_id = store.state.sessions[0].id.clone();
+        let turn_id = TurnId::new();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        // Streamed reasoning arrives interleaved with the answer text.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ReasoningDelta(
+            ReasoningDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                text: "weighing the options".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                text: "the answer".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        // The committed message carries the streamed reasoning as reasoning_content,
+        // which the transcript renders as a "· reasoning" block.
+        let reasoning = store.state.sessions[0]
+            .messages
+            .iter()
+            .find_map(|message| message.reasoning_content.as_deref());
+        assert_eq!(
+            reasoning,
+            Some("weighing the options"),
+            "ReasoningDelta must populate the committed message's reasoning_content"
         );
     }
 

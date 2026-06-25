@@ -3249,6 +3249,11 @@ pub struct AppState {
     /// markdown. Kept out-of-band so coverage/dedup can keep comparing the
     /// unmodified live text against committed content.
     pub live_reply_segment_boundaries: std::collections::HashMap<(SessionKey, TurnId), Vec<usize>>,
+    /// Accumulated streamed reasoning fragments per active turn (legacy
+    /// `ReasoningDelta` path). `commit_live_reply` moves them onto the committed
+    /// message's `reasoning_content`, which the transcript renders as a separate
+    /// `· reasoning` block above the answer.
+    pub live_reasoning: std::collections::HashMap<(SessionKey, TurnId), String>,
     pub status: String,
     pub target: Option<String>,
     pub readonly: bool,
@@ -4908,6 +4913,7 @@ impl AppState {
             optimistic_user_messages: Vec::new(),
             turn_prompt_anchors: Vec::new(),
             live_reply_segment_boundaries: std::collections::HashMap::new(),
+            live_reasoning: std::collections::HashMap::new(),
             status,
             target,
             readonly,

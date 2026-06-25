@@ -2027,12 +2027,7 @@ fn rpc_value_to_app_event(
         };
 
         let params = frame.get("params").cloned().unwrap_or(Value::Null);
-        // Notifications this client deliberately drops. Heartbeats are pure
-        // keepalive. `message/reasoning_delta` is streamed by newer servers, but
-        // the pinned protocol has no variant for it and reasoning rendering is
-        // reverted pending rework — ignore it quietly instead of surfacing an
-        // "unknown UI protocol notification" error on every reasoning token.
-        if matches!(method, "server/heartbeat" | "message/reasoning_delta") {
+        if method == "server/heartbeat" {
             return Ok(None);
         }
         return Ok(Some(notification_to_app_event(method, params).into()));
@@ -5922,23 +5917,6 @@ mod tests {
             "params": {
                 "timestamp": "2026-05-13T17:17:00Z"
             }
-        })
-        .to_string();
-
-        let event = rpc_text_to_app_event(&frame).expect("frame decodes");
-        assert!(event.is_none());
-    }
-
-    #[test]
-    fn reasoning_delta_notification_is_ignored() {
-        // A newer server streams message/reasoning_delta, but the pinned protocol
-        // has no variant for it and reasoning rendering is reverted pending rework.
-        // It must be dropped quietly (like a heartbeat), not surfaced as an
-        // "unknown UI protocol notification" error on every reasoning token.
-        let frame = json!({
-            "jsonrpc": "2.0",
-            "method": "message/reasoning_delta",
-            "params": { "thread_id": "t1", "delta": "thinking..." }
         })
         .to_string();
 
