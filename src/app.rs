@@ -522,9 +522,9 @@ pub fn finalized_history_lines_range(
             &message.content,
             wrap_width,
         );
-        if let Some(reasoning) = message.reasoning_content.as_deref() {
-            push_message_block(&mut lines, palette, "reasoning", reasoning, wrap_width);
-        }
+        // Codex-style: the verbose committed `reasoning_content` is intentionally
+        // NOT rendered into scrollback. The data is kept on the message for a
+        // future /thinking reveal; we just don't push it as a block here.
         if let Some(tool_call_id) = message.tool_call_id.as_deref() {
             lines.push(Line::from(vec![
                 Span::styled("         tool_call ", palette.muted()),
@@ -623,9 +623,9 @@ pub fn finalized_history_lines_range_dedup_live(
                 wrap_width,
             );
         }
-        if let Some(reasoning) = message.reasoning_content.as_deref() {
-            push_message_block(&mut lines, palette, "reasoning", reasoning, wrap_width);
-        }
+        // Codex-style: the verbose committed `reasoning_content` is intentionally
+        // NOT rendered into scrollback. The data is kept on the message for a
+        // future /thinking reveal; we just don't push it as a block here.
         if let Some(tool_call_id) = message.tool_call_id.as_deref() {
             lines.push(Line::from(vec![
                 Span::styled("         tool_call ", palette.muted()),
@@ -2843,9 +2843,9 @@ fn transcript_render_model(app: &AppState, palette: Palette, area: Rect) -> Tran
                 &message.content,
                 wrap_width,
             );
-            if let Some(reasoning) = message.reasoning_content.as_deref() {
-                push_message_block(&mut lines, palette, "reasoning", reasoning, wrap_width);
-            }
+            // Codex-style: the verbose committed `reasoning_content` is
+            // intentionally NOT rendered into scrollback. The data is kept on the
+            // message for a future /thinking reveal; we just don't push it here.
             if let Some(tool_call_id) = message.tool_call_id.as_deref() {
                 lines.push(Line::from(vec![
                     Span::styled("         tool_call ", palette.muted()),
@@ -3179,19 +3179,24 @@ fn push_turn_flow(
         push_inline_user_question_card(lines, palette, picker, width);
     }
 
-    // Live reasoning for the active turn: render the model's "thinking" DURING
-    // the stream, above the answer — not only after the turn commits. Deltas
-    // already accumulate in `live_reasoning` (keyed per-turn like `live_reply`);
-    // commit_live_reply later moves them onto the message's reasoning_content,
-    // so this live block hands off to the committed "· reasoning" block with no
-    // double-render (the live entry is removed as the message is pushed).
+    // Live reasoning for the active turn: codex-style, we DON'T render the
+    // verbose "thinking" text. The deltas still accumulate in `live_reasoning`
+    // (so a future /thinking toggle can reveal them and commit_live_reply can
+    // hand them to the message's reasoning_content); we only surface a single
+    // dimmed `· thinking…` indicator, and ONLY while the model is still
+    // reasoning — once the answer has started streaming (`live_reply.text` has
+    // non-empty content for the active turn) we drop the indicator too.
     if let Some((session_id, turn_id)) = app.active_turn()
-        && let Some(reasoning) = app
+        && app
             .live_reasoning
             .get(&(session_id.clone(), turn_id.clone()))
-            .filter(|reasoning| !reasoning.trim().is_empty())
+            .is_some_and(|reasoning| !reasoning.trim().is_empty())
+        && session
+            .live_reply
+            .as_ref()
+            .is_none_or(|live_reply| live_reply.text.trim().is_empty())
     {
-        push_message_block(lines, palette, "reasoning", reasoning, width);
+        push_thinking_indicator(lines, palette);
     }
 
     if let Some(live_reply) = &session.live_reply {
@@ -3264,6 +3269,30 @@ fn push_user_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, con
             Span::styled(raw_line.trim_end().to_string(), body),
         ]));
     }
+}
+
+/// The terse codex-style "thinking" indicator shown in place of the verbose
+/// live reasoning text. Reuses the `reasoning` role styling (`· ` prefix +
+/// surface background) so it reads as a dimmed continuation of that lane.
+const THINKING_INDICATOR_TEXT: &str = "thinking…";
+
+/// Push a single dimmed `· thinking…` line. Mirrors the `reasoning` role's
+/// prefix/background from [`push_message_block`] / [`chat_message_bg`] but
+/// renders one fixed line instead of the model's full reasoning prose.
+fn push_thinking_indicator(lines: &mut Vec<Line<'static>>, palette: Palette) {
+    if !lines.is_empty() && !line_is_blank(lines.last()) {
+        lines.push(Line::from(""));
+    }
+
+    let bg = chat_message_bg(palette, "reasoning");
+    let style = palette.muted().add_modifier(Modifier::DIM).bg(bg);
+    lines.push(chat_line(
+        vec![Span::styled(
+            format!("· {THINKING_INDICATOR_TEXT}"),
+            style,
+        )],
+        Some(bg),
+    ));
 }
 
 fn push_message_block(
@@ -13816,6 +13845,116 @@ mod tests {
         );
         app.set_run_state_in_progress();
         app
+    }
+
+    #[test]
+    fn live_reasoning_before_answer_renders_terse_thinking_not_verbose_text() {
+        // Codex-style live render: with non-empty live_reasoning and NO answer
+        // streamed yet, push_turn_flow surfaces a single dimmed `· thinking…`
+        // indicator and NEVER the verbose reasoning prose.
+        const VERBOSE: &str =
+            "Let me carefully reason step by step about the user's request in great detail";
+        // Empty live_reply.text => the answer has not started streaming yet.
+        let app = active_turn_app("");
+        let (session_id, turn_id) = app
+            .active_turn()
+            .map(|(sid, tid)| (sid.clone(), tid.clone()))
+            .expect("active turn present (live_reply is Some)");
+        let mut app = app;
+        app.live_reasoning
+            .insert((session_id, turn_id), VERBOSE.to_string());
+
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let session = app.active_session().expect("active session").clone();
+        let mut lines = Vec::new();
+        push_turn_flow(&mut lines, palette, &app, &session, 80, None);
+        let rendered = lines_text(&lines);
+
+        assert!(
+            rendered.contains(THINKING_INDICATOR_TEXT),
+            "live render should show the terse `thinking` indicator; got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("· "),
+            "terse indicator should reuse the reasoning `· ` prefix; got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(VERBOSE),
+            "verbose live reasoning text must NOT be rendered; got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn live_reasoning_after_answer_started_renders_neither() {
+        // Once the answer has begun streaming (live_reply.text non-empty), the
+        // codex-style live render drops the thinking indicator too (and never
+        // shows the verbose reasoning).
+        const VERBOSE: &str = "internal chain of thought that should stay hidden";
+        let app = active_turn_app("the answer has begun");
+        let (session_id, turn_id) = app
+            .active_turn()
+            .map(|(sid, tid)| (sid.clone(), tid.clone()))
+            .expect("active turn present");
+        let mut app = app;
+        app.live_reasoning
+            .insert((session_id, turn_id), VERBOSE.to_string());
+
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let session = app.active_session().expect("active session").clone();
+        let mut lines = Vec::new();
+        push_turn_flow(&mut lines, palette, &app, &session, 80, None);
+        let rendered = lines_text(&lines);
+
+        assert!(
+            !rendered.contains(THINKING_INDICATOR_TEXT),
+            "thinking indicator must drop once the answer streams; got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(VERBOSE),
+            "verbose live reasoning text must NOT be rendered; got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("the answer has begun"),
+            "the streamed answer should still render; got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn committed_assistant_reasoning_content_is_not_rendered_in_scrollback() {
+        // Codex-style committed render: a finalized assistant message carrying
+        // reasoning_content must NOT spill the verbose reasoning into scrollback.
+        const VERBOSE: &str =
+            "Here is my long winded committed reasoning that should never show";
+        let mut assistant = Message::assistant("The final answer.");
+        assistant.reasoning_content = Some(VERBOSE.to_string());
+
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:scar".into()),
+                title: "scar".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("go"), assistant],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "Idle".into(),
+            None,
+            false,
+        );
+
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let lines = finalized_history_lines_range(&app, palette, 80, 0);
+        let rendered = lines_text(&lines);
+
+        assert!(
+            rendered.contains("The final answer."),
+            "the committed answer should still render; got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(VERBOSE),
+            "verbose committed reasoning must NOT appear in scrollback; got: {rendered:?}"
+        );
     }
 
     #[test]
