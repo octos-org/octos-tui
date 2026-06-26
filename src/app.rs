@@ -3179,6 +3179,21 @@ fn push_turn_flow(
         push_inline_user_question_card(lines, palette, picker, width);
     }
 
+    // Live reasoning for the active turn: render the model's "thinking" DURING
+    // the stream, above the answer — not only after the turn commits. Deltas
+    // already accumulate in `live_reasoning` (keyed per-turn like `live_reply`);
+    // commit_live_reply later moves them onto the message's reasoning_content,
+    // so this live block hands off to the committed "· reasoning" block with no
+    // double-render (the live entry is removed as the message is pushed).
+    if let Some((session_id, turn_id)) = app.active_turn()
+        && let Some(reasoning) = app
+            .live_reasoning
+            .get(&(session_id.clone(), turn_id.clone()))
+            .filter(|reasoning| !reasoning.trim().is_empty())
+    {
+        push_message_block(lines, palette, "reasoning", reasoning, width);
+    }
+
     if let Some(live_reply) = &session.live_reply {
         let reply_text = if let Some(finalization) = live_finalization {
             live_reply
