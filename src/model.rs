@@ -3317,6 +3317,10 @@ pub struct AppState {
     /// operator's *local* clipboard — and the store has no terminal handle, so
     /// the work is split across this field.
     pub pending_clipboard: Option<String>,
+    /// Timestamp of when the launch banner first became visible in the
+    /// current session. `None` until the banner activates; cleared when it
+    /// deactivates so the next empty session re-animates.
+    pub banner_reveal_start: Option<std::time::Instant>,
 }
 
 /// M16-G2 per-session lifecycle ledger entry. The TUI keeps these in
@@ -4893,6 +4897,7 @@ impl AppState {
             pending_goal_transition: None,
             exit_requested: false,
             pending_clipboard: None,
+            banner_reveal_start: None,
         }
     }
 
