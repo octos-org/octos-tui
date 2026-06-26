@@ -1196,7 +1196,10 @@ fn committed_content_hash(
     for message in &session.messages {
         message.role.as_str().hash(&mut hasher);
         message.content.hash(&mut hasher);
-        message.reasoning_content.hash(&mut hasher);
+        // reasoning_content is intentionally NOT hashed: codex-style display no
+        // longer renders it in committed scrollback, so a change to it (e.g. a
+        // late commit_live_reply attaching it) must not flip this hash and force
+        // a full re-flush of unchanged visible history (would duplicate scrollback).
         message.tool_call_id.hash(&mut hasher);
     }
     for (render_index, log) in anchored_activity_logs {
