@@ -3824,22 +3824,53 @@ impl Store {
     /// Only Pending/Running tasks are cancellable; the resulting terminal state
     /// arrives via the `task/updated` notification.
     pub fn cancel_task_command(&mut self) -> Option<AppUiCommand> {
+        // `x` in the Tasks pane: cancel the SELECTED task.
         let Some(task) = self.state.active_task() else {
             self.state.status = t!("status.no_task_to_cancel").into_owned();
             return None;
         };
-        let cancellable = matches!(
-            task.state,
-            TaskRuntimeState::Pending | TaskRuntimeState::Running
-        );
-        let task_id = task.id.clone();
-        let title = task.title.clone();
-        let state_label = task_state_label(task.state);
-        if !cancellable {
+        let (task_id, title, state) = (task.id.clone(), task.title.clone(), task.state);
+        self.cancel_task_command_inner(task_id, title, state)
+    }
+
+    /// Esc with no live turn: cancel the first cancellable (Pending/Running)
+    /// background task in the active session, regardless of the Tasks-pane
+    /// selection — which may point at an older completed task after newer tasks
+    /// were appended (`apply_task_update` pushes without moving the selection),
+    /// so keying off the selected row alone would miss the running task. Returns
+    /// `None` silently when nothing is cancellable, so plain Esc still just
+    /// refocuses the composer.
+    pub fn cancel_running_background_task_command(&mut self) -> Option<AppUiCommand> {
+        let (task_id, title, state) = self.state.active_session().and_then(|session| {
+            session
+                .tasks
+                .iter()
+                .find(|task| {
+                    matches!(
+                        task.state,
+                        TaskRuntimeState::Pending | TaskRuntimeState::Running
+                    )
+                })
+                .map(|task| (task.id.clone(), task.title.clone(), task.state))
+        })?;
+        self.cancel_task_command_inner(task_id, title, state)
+    }
+
+    /// Shared body for `cancel_task_command` (`x`, selected task) and
+    /// `cancel_running_background_task_command` (Esc, first running task): gate
+    /// on cancellable state + the negotiated `harness.task_control.v1`
+    /// capability, then emit `task/cancel`.
+    fn cancel_task_command_inner(
+        &mut self,
+        task_id: TaskId,
+        title: String,
+        state: TaskRuntimeState,
+    ) -> Option<AppUiCommand> {
+        if !matches!(state, TaskRuntimeState::Pending | TaskRuntimeState::Running) {
             self.state.status = t!(
                 "status.task_already_terminal",
                 title = title,
-                state = state_label
+                state = task_state_label(state)
             )
             .into_owned();
             return None;

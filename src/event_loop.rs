@@ -849,6 +849,18 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
                 if let Some(command) = command {
                     return KeyAction::send(command);
                 }
+            } else if let Some(command) = store.cancel_running_background_task_command() {
+                // No live foreground turn, but a spawn_only background task
+                // (deep_research / run_pipeline / sub-agent orchestration) is
+                // still running: the foreground turn already finished and
+                // handed off, so `active_turn()` is None and the interrupt path
+                // above is a no-op. Esc should still stop the work, so cancel
+                // the first running background task — independent of the
+                // Tasks-pane selection, which may sit on an older completed
+                // task. The command builder returns None (falling through to
+                // refocus) when nothing is cancellable or the server doesn't
+                // advertise task control.
+                return KeyAction::send(command);
             }
             store.state.focus = FocusPane::Composer;
         }
@@ -3293,15 +3305,66 @@ mod tests {
     }
 
     #[test]
-    fn esc_without_active_turn_only_refocuses_composer() {
+    fn esc_without_active_turn_or_cancellable_task_refocuses_composer() {
         let mut store = store_with_sessions(1);
         store.state.focus = FocusPane::Tasks;
         assert!(store.state.active_turn().is_none());
+        // No tasks at all → nothing cancellable → Esc just refocuses.
 
         let action = handle_key(&mut store, key(KeyCode::Esc));
 
         assert!(matches!(action, KeyAction::Continue));
         assert_eq!(store.state.focus, FocusPane::Composer);
+    }
+
+    #[test]
+    fn esc_cancels_running_background_task_even_when_selection_is_stale() {
+        // Stale-selection regression (codex P2): the Tasks-pane selection sits
+        // on an older COMPLETED task — `selected_task` defaults to 0 and is not
+        // moved when newer tasks are appended (`apply_task_update` pushes) — but
+        // a later spawn_only task is still running. Esc with no live turn must
+        // cancel the RUNNING task, not no-op on the selected completed row
+        // (which is the reported bug: Esc looked dead while orchestration ran).
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.set_capabilities(UiProtocolCapabilities::new(
+            &[octos_core::ui_protocol::methods::TASK_CANCEL],
+            &[],
+        ));
+        // Index 0 (the selected row): already completed.
+        store.state.sessions[0].tasks.push(TaskView {
+            id: TaskId::new(),
+            title: "done".into(),
+            state: TaskRuntimeState::Completed,
+            runtime_detail: None,
+            output_tail: String::new(),
+            turn_id: None,
+        });
+        // Index 1: the live background task the user wants to stop.
+        let running_id = TaskId::new();
+        store.state.sessions[0].tasks.push(TaskView {
+            id: running_id.clone(),
+            title: "deep_research".into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: None,
+            output_tail: String::new(),
+            turn_id: None,
+        });
+        assert_eq!(
+            store.state.selected_task, 0,
+            "selection sits on the completed task"
+        );
+        assert!(store.state.active_turn().is_none());
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+
+        let AppUiCommand::CancelTask(params) = sent_command(action) else {
+            panic!("expected CancelTask command for the running task");
+        };
+        assert_eq!(
+            params.task_id, running_id,
+            "must cancel the running task, not the selected completed one"
+        );
     }
 
     #[test]
