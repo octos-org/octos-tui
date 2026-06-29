@@ -2379,7 +2379,7 @@ fn render_artifacts(app: &AppState, palette: Palette) -> Paragraph<'static> {
 
 /// True for a fresh session that has no messages yet — where we show the launch
 /// banner at the top of the transcript area (it scrolls away on the first turn).
-fn launch_banner_active(app: &AppState) -> bool {
+pub(crate) fn launch_banner_active(app: &AppState) -> bool {
     app.pending_messages.is_empty()
         && app
             .active_session()
@@ -2432,11 +2432,16 @@ fn render_launch_banner(frame: &mut impl FrameLike, app: &AppState, palette: Pal
             .map(|l| l.chars().count())
             .max()
             .unwrap_or(0);
-        for art in ONBOARDING_LOGO_ART.lines() {
-            lines.push(centered(
-                vec![Span::styled(format!("{art:<fig_w$}"), accent)],
-                fig_w,
-            ));
+        let visible = banner_visible_rows(app.banner_reveal_start);
+        for (i, art) in ONBOARDING_LOGO_ART.lines().enumerate() {
+            if i < visible {
+                lines.push(centered(
+                    vec![Span::styled(format!("{art:<fig_w$}"), accent)],
+                    fig_w,
+                ));
+            } else {
+                lines.push(centered(vec![], 0));
+            }
         }
         lines.push(centered(vec![], 0));
     }
@@ -8207,7 +8212,7 @@ mod tests {
 
     #[test]
     fn render_launch_banner_shows_box_logo_and_greeting_on_empty_session() {
-        let app = AppState::new(
+        let mut app = AppState::new(
             vec![SessionView {
                 id: SessionKey("local:test".into()),
                 title: "test".into(),
@@ -8221,6 +8226,7 @@ mod tests {
             None,
             false,
         );
+        app.banner_reveal_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
         assert!(
             launch_banner_active(&app),
             "empty session must show the launch banner"
@@ -8246,6 +8252,56 @@ mod tests {
         assert!(
             text.contains("Welcome back — dspfac"),
             "banner greeting names the profile"
+        );
+    }
+
+    #[test]
+    fn render_launch_banner_reveals_rows_progressively() {
+        use std::time::{Duration, Instant};
+
+        let make_app = |reveal_start: Option<Instant>| {
+            let mut app = AppState::new(
+                vec![SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "test".into(),
+                    profile_id: None,
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                }],
+                0,
+                "ready".into(),
+                None,
+                false,
+            );
+            app.banner_reveal_start = reveal_start;
+            app
+        };
+
+        // Not yet started — no figlet rows visible
+        let app_none = make_app(None);
+        let text_none =
+            rendered_buffer_with_size(&app_none, Palette::for_theme(ThemeName::Slate), 100, 30)
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+        assert!(
+            !text_none.contains("██████╗"),
+            "no figlet rows should appear before animation starts"
+        );
+
+        // Pre-completed — all rows visible
+        let app_done = make_app(Some(Instant::now() - Duration::from_secs(10)));
+        let text_done =
+            rendered_buffer_with_size(&app_done, Palette::for_theme(ThemeName::Slate), 100, 30)
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+        assert!(
+            text_done.contains("██████╗"),
+            "all figlet rows should appear once animation is complete"
         );
     }
 
