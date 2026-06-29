@@ -109,6 +109,45 @@ impl CommandSpec {
     pub fn slash_name(&self) -> String {
         format!("/{}", self.name)
     }
+
+    /// Whether a successful invocation may be persisted to the plaintext
+    /// command-history file (and recalled with Up). FAIL-CLOSED: only the
+    /// commands listed here are recorded; everything else — auth/credential
+    /// families (`onboard`/`login`/`provider`), config-upsert that can carry
+    /// tokens (`mcp`/`tools` upsert, `skills install <repo-url>`), and any newly
+    /// added command — defaults to NOT recorded, so it can never leak secrets/PII
+    /// to history before review. Checked on the canonical `name`, so aliases
+    /// (`/auth`=`/login`, `/setup`=`/onboard`) are covered too.
+    pub fn history_safe(&self) -> bool {
+        matches!(
+            self.name,
+            "ps" | "stop"
+                | "help"
+                | "activity"
+                | "copy"
+                | "exit"
+                | "model"
+                | "status"
+                | "cost"
+                | "theme"
+                | "lang"
+                | "thinking"
+                | "scrollmode"
+                | "saveconfig"
+                | "vimmode"
+                | "statusline"
+                | "title"
+                | "keymap"
+                | "permissions"
+                | "task"
+                | "threads"
+                | "turn"
+                | "review"
+                | "agents"
+                | "goal"
+                | "loop"
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

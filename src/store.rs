@@ -185,6 +185,42 @@ pub struct Store {
     pub state: AppState,
 }
 
+/// Whether `prompt` may be persisted to the plaintext command-history file (and
+/// recalled with Up).
+///
+/// - Plain chat prompts are recorded (the primary recall target).
+/// - `!`-bang local-shell commands are skipped for v1: their text is
+///   unstructured and may carry tokens / `KEY=value` env assignments.
+/// - Slash commands are resolved through [`CommandRegistry`] and recorded only
+///   when the resolved command is [`CommandSpec::history_safe`].
+///
+/// FAIL-CLOSED: an unknown / newly added slash command, and the auth/credential
+/// families (`onboard`/`login`/`provider` and their aliases), are never
+/// recorded — so a sensitive command cannot leak a secret/OTP/PII to history
+/// until it is explicitly classified safe. Resolution is alias-aware, which is
+/// exactly what the earlier raw-token denylist missed (`/auth`=`/login`,
+/// `/setup`=`/onboard`).
+fn should_record_in_history(prompt: &str) -> bool {
+    if prompt.is_empty() || prompt.starts_with('!') {
+        return false;
+    }
+    match CommandRegistry::with_core_commands().resolve(prompt) {
+        CommandResolution::NotCommand => true,
+        // A slash command is recorded only if it is history-safe AND the user
+        // typed NO trailing args. The spec's arg-mode isn't enough: a no-arg
+        // command with stray text (e.g. `/theme sk-...`, `/copy token`) still
+        // resolves to Found and the dispatcher ignores the extra text, but
+        // recording the raw prompt would persist a secret. Gating on the actual
+        // invocation args also keeps arg-bearing commands out (their args could
+        // be rejected); recording those needs a safe-args classifier (follow-up).
+        CommandResolution::Found {
+            command,
+            invocation,
+        } => command.history_safe() && invocation.args.trim().is_empty(),
+        CommandResolution::Unknown { .. } | CommandResolution::EmptyCommand => false,
+    }
+}
+
 impl Store {
     pub fn from_snapshot(snapshot: AppUiSnapshot) -> Self {
         Self {
@@ -238,9 +274,27 @@ impl Store {
         self.state.active_session()
     }
 
+    /// Whether a `/`-prefixed `prompt` resolves to an AVAILABLE command, so a
+    /// history-safe command that wouldn't actually execute is not persisted.
+    fn slash_command_available(&self, prompt: &str) -> bool {
+        let registry = CommandRegistry::with_core_commands();
+        match registry.resolve(prompt) {
+            CommandResolution::Found { command, .. } => registry
+                .evaluate(command, &self.state.availability_context())
+                .is_available(),
+            _ => false,
+        }
+    }
+
     pub fn compose_command(&mut self) -> Option<AppUiCommand> {
         let prompt = self.state.composer.trim().to_string();
         if prompt.starts_with('/') {
+            // Record a history-safe AND available slash command before dispatch
+            // (slash runs regardless of readonly/session). Fail-closed; the
+            // availability gate avoids persisting a command that won't execute.
+            if should_record_in_history(&prompt) && self.slash_command_available(&prompt) {
+                self.state.composer_history.record(&prompt);
+            }
             return self.dispatch_slash_command(&prompt);
         }
 
@@ -268,6 +322,12 @@ impl Store {
         }
 
         self.state.clear_current_composer_draft();
+        // Accepted plain prompt — record before staging/sending. Slash/bang
+        // returned above; readonly/empty/no-session were rejected above, so only
+        // genuinely-submitted prompts reach here (rejected ones never persist).
+        if should_record_in_history(&prompt) {
+            self.state.composer_history.record(&prompt);
+        }
         if self.state.active_turn().is_some() {
             self.state.pending_messages.push(prompt);
             self.state.status = t!("status.message_staged").into_owned();
@@ -4649,6 +4709,10 @@ impl Store {
             AppUiEvent::Snapshot(snapshot) => {
                 let composer = self.state.composer.clone();
                 let composer_drafts = self.state.composer_drafts.clone();
+                // Local-only: command history is a client-side ring the server
+                // never echoes; `from_snapshot` would drop it. Preserve the
+                // entries across replays (reconnect/refresh) and reset browsing.
+                let composer_history = self.state.composer_history.clone();
                 let pending_messages = self.state.pending_messages.clone();
                 let optimistic_user_messages = self.state.optimistic_user_messages.clone();
                 let turn_prompt_anchors = self.state.turn_prompt_anchors.clone();
@@ -4698,6 +4762,8 @@ impl Store {
                 }
                 state.set_composer_text(composer);
                 state.composer_drafts = composer_drafts;
+                state.composer_history = composer_history;
+                state.composer_history.reset_navigation();
                 state.pending_messages = pending_messages;
                 state.optimistic_user_messages = optimistic_user_messages;
                 state.turn_prompt_anchors = turn_prompt_anchors;
@@ -8313,6 +8379,53 @@ mod tests {
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
         }
+    }
+
+    #[test]
+    fn history_capture_is_fail_closed_for_commands() {
+        // Recorded: plain chat prompts + NO-ARG history-safe slash commands
+        // (resolved through the registry).
+        assert!(should_record_in_history(
+            "write a function that returns a key"
+        ));
+        assert!(should_record_in_history("/model"));
+        assert!(should_record_in_history("/theme"));
+        assert!(should_record_in_history("/status"));
+        // Arg-bearing safe commands stay out for now (their args could be
+        // rejected downstream; safe-args recording is a follow-up).
+        assert!(!should_record_in_history("/thinking high"));
+        assert!(!should_record_in_history("/task investigate the flake"));
+        assert!(!should_record_in_history("/lang zh"));
+        // Skipped: the auth/credential families — including aliases, which
+        // resolve to the canonical name (this is what the raw-token denylist
+        // missed) — keys, OTP codes, and account PII alike.
+        assert!(!should_record_in_history("/onboard key sk-abc123"));
+        assert!(!should_record_in_history("/provider api-key sk-xyz"));
+        assert!(!should_record_in_history("/onboard otp 123456"));
+        assert!(!should_record_in_history("/login send ada@example.com"));
+        assert!(!should_record_in_history("/auth verify 123456")); // /auth -> login
+        assert!(!should_record_in_history("/setup key sk-zzz")); // /setup -> onboard
+        // Config-upsert commands carry tokens in their args (mcp/tools upsert,
+        // skills install <repo-url>) — kept out of the allowlist.
+        assert!(!should_record_in_history(
+            "/mcp upsert srv {\"token\":\"x\"}"
+        ));
+        assert!(!should_record_in_history("/tools upsert {\"key\":\"sk\"}"));
+        assert!(!should_record_in_history(
+            "/skills install https://tok@h/repo"
+        ));
+        // No-arg commands with stray trailing args: the dispatcher ignores the
+        // args, but recording the raw text would persist a secret after them.
+        assert!(!should_record_in_history("/theme sk-secret-token"));
+        assert!(!should_record_in_history("/copy some-token"));
+        // Fail-closed: unknown/new slash commands and bang shells are never
+        // recorded, even with no obvious secret.
+        assert!(!should_record_in_history("/frobnicate widgets"));
+        assert!(!should_record_in_history("!export TOKEN=sk-secret"));
+        assert!(!should_record_in_history("!ls -la"));
+        // Degenerate inputs.
+        assert!(!should_record_in_history(""));
+        assert!(!should_record_in_history("/"));
     }
 
     #[test]
