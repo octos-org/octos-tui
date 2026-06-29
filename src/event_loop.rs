@@ -44,6 +44,8 @@ const INITIAL_CAPABILITIES_HANDSHAKE_POLL: Duration = Duration::from_millis(10);
 /// Redraw cadence while a turn is active, so the spinner/status animates without
 /// a fixed-rate repaint when nothing is happening.
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(120);
+/// Total duration for the launch-banner row-by-row reveal (6 rows × 120 ms).
+const BANNER_REVEAL_DURATION: Duration = Duration::from_millis(720);
 const MAX_BACKEND_EVENTS_PER_TICK: usize = 512;
 /// Cap on queued terminal input events handled per frame. High enough that a
 /// momentum-scroll burst coalesces into one repaint, low enough that a
@@ -135,7 +137,16 @@ pub fn run(cli: Cli) -> Result<()> {
         // redraw on the animation cadence so the spinner/status moves; otherwise
         // an idle UI emits no terminal writes and never wipes a live selection.
         let turn_active = store.state.run_state.is_active();
-        if turn_active && last_animation.elapsed() >= ANIMATION_INTERVAL {
+        let banner_active = crate::app::launch_banner_active(&store.state);
+        if banner_active && store.state.banner_reveal_start.is_none() {
+            store.state.banner_reveal_start = Some(Instant::now());
+            dirty = true;
+        } else if !banner_active {
+            store.state.banner_reveal_start = None;
+        }
+        let banner_animating = store.state.banner_reveal_start
+            .is_some_and(|t| t.elapsed() < BANNER_REVEAL_DURATION);
+        if (turn_active || banner_animating) && last_animation.elapsed() >= ANIMATION_INTERVAL {
             dirty = true;
             last_animation = Instant::now();
         }
@@ -144,7 +155,7 @@ pub fn run(cli: Cli) -> Result<()> {
             dirty = false;
         }
 
-        let poll = if turn_active {
+        let poll = if turn_active || banner_animating {
             ANIMATION_INTERVAL.min(UI_EVENT_POLL_INTERVAL)
         } else {
             UI_EVENT_POLL_INTERVAL
@@ -563,6 +574,8 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
+    store.state.status_error = None;
+
     if is_control_char(&key, 'q') {
         return KeyAction::Quit;
     }
@@ -570,7 +583,7 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     if is_control_char(&key, 'c') {
         return store
             .interrupt_command()
-            .map_or(KeyAction::Continue, KeyAction::send);
+            .map_or(KeyAction::Quit, KeyAction::send);
     }
 
     if is_control_char(&key, 'u') {

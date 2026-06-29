@@ -97,7 +97,7 @@ empty** data directory and pass **no** `--profile-id`. The TUI launches the
 server as a child process over stdio, so you only run one command:
 
 ```bash
-./target/release/octos-tui \
+./target/debug/octos-tui \
   --mode protocol \
   --stdio-command "octos serve --stdio --solo --data-dir ./octos-data"
 ```

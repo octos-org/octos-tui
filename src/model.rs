@@ -3244,6 +3244,10 @@ pub struct AppState {
     pub pending_messages: Vec<String>,
     pub optimistic_user_messages: Vec<OptimisticUserMessage>,
     pub status: String,
+    /// Transient error shown in the status bar with `danger` styling instead of
+    /// the normal muted `status` text. Cleared on the next key press so it
+    /// behaves like a dismissable inline toast.
+    pub status_error: Option<String>,
     pub target: Option<String>,
     pub readonly: bool,
     pub protocol_version: &'static str,
@@ -3313,6 +3317,10 @@ pub struct AppState {
     /// operator's *local* clipboard — and the store has no terminal handle, so
     /// the work is split across this field.
     pub pending_clipboard: Option<String>,
+    /// Timestamp of when the launch banner first became visible in the
+    /// current session. `None` until the banner activates; cleared when it
+    /// deactivates so the next empty session re-animates.
+    pub banner_reveal_start: Option<std::time::Instant>,
 }
 
 /// M16-G2 per-session lifecycle ledger entry. The TUI keeps these in
@@ -4849,6 +4857,7 @@ impl AppState {
             pending_messages: Vec::new(),
             optimistic_user_messages: Vec::new(),
             status,
+            status_error: None,
             target,
             readonly,
             protocol_version: APP_UI_API_V1,
@@ -4888,6 +4897,7 @@ impl AppState {
             pending_goal_transition: None,
             exit_requested: false,
             pending_clipboard: None,
+            banner_reveal_start: None,
         }
     }
 

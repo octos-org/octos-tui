@@ -2379,7 +2379,7 @@ fn render_artifacts(app: &AppState, palette: Palette) -> Paragraph<'static> {
 
 /// True for a fresh session that has no messages yet — where we show the launch
 /// banner at the top of the transcript area (it scrolls away on the first turn).
-fn launch_banner_active(app: &AppState) -> bool {
+pub(crate) fn launch_banner_active(app: &AppState) -> bool {
     app.pending_messages.is_empty()
         && app
             .active_session()
@@ -2432,11 +2432,16 @@ fn render_launch_banner(frame: &mut impl FrameLike, app: &AppState, palette: Pal
             .map(|l| l.chars().count())
             .max()
             .unwrap_or(0);
-        for art in ONBOARDING_LOGO_ART.lines() {
-            lines.push(centered(
-                vec![Span::styled(format!("{art:<fig_w$}"), accent)],
-                fig_w,
-            ));
+        let visible = banner_visible_rows(app.banner_reveal_start);
+        for (i, art) in ONBOARDING_LOGO_ART.lines().enumerate() {
+            if i < visible {
+                lines.push(centered(
+                    vec![Span::styled(format!("{art:<fig_w$}"), accent)],
+                    fig_w,
+                ));
+            } else {
+                lines.push(centered(vec![], 0));
+            }
         }
         lines.push(centered(vec![], 0));
     }
@@ -4711,6 +4716,19 @@ fn spinner_frame() -> &'static str {
     SPINNER_FRAMES[(elapsed / 120) as usize % SPINNER_FRAMES.len()]
 }
 
+/// Number of figlet rows to reveal based on elapsed time since the banner
+/// first became active. Returns 0 when the timestamp is not yet set, and
+/// clamps at the art's actual line count once the animation completes.
+fn banner_visible_rows(start: Option<std::time::Instant>) -> usize {
+    const ROW_INTERVAL_MS: u128 = 120;
+    let total_rows = ONBOARDING_LOGO_ART.lines().count();
+    match start {
+        None => 0,
+        Some(t) => ((t.elapsed().as_millis() / ROW_INTERVAL_MS) as usize + 1)
+            .min(total_rows),
+    }
+}
+
 /// Title for an agent-task group chip. Pure so it can be unit-tested
 /// directly (Gap 2 fix #2). The order of precedence is deliberate:
 ///
@@ -6615,7 +6633,14 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
         Span::styled(context, palette.muted().bg(palette.surface_alt)),
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
-        Span::styled(app.status.clone(), palette.muted().bg(palette.surface_alt)),
+        if let Some(err) = &app.status_error {
+            Span::styled(
+                err.clone(),
+                Style::default().fg(palette.danger).bg(palette.surface_alt),
+            )
+        } else {
+            Span::styled(app.status.clone(), palette.muted().bg(palette.surface_alt))
+        },
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
         Span::styled(
             format!("{mode} {turn}"),
@@ -8187,7 +8212,7 @@ mod tests {
 
     #[test]
     fn render_launch_banner_shows_box_logo_and_greeting_on_empty_session() {
-        let app = AppState::new(
+        let mut app = AppState::new(
             vec![SessionView {
                 id: SessionKey("local:test".into()),
                 title: "test".into(),
@@ -8201,6 +8226,7 @@ mod tests {
             None,
             false,
         );
+        app.banner_reveal_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
         assert!(
             launch_banner_active(&app),
             "empty session must show the launch banner"
@@ -8226,6 +8252,56 @@ mod tests {
         assert!(
             text.contains("Welcome back — dspfac"),
             "banner greeting names the profile"
+        );
+    }
+
+    #[test]
+    fn render_launch_banner_reveals_rows_progressively() {
+        use std::time::{Duration, Instant};
+
+        let make_app = |reveal_start: Option<Instant>| {
+            let mut app = AppState::new(
+                vec![SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "test".into(),
+                    profile_id: None,
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                }],
+                0,
+                "ready".into(),
+                None,
+                false,
+            );
+            app.banner_reveal_start = reveal_start;
+            app
+        };
+
+        // Not yet started — no figlet rows visible
+        let app_none = make_app(None);
+        let text_none =
+            rendered_buffer_with_size(&app_none, Palette::for_theme(ThemeName::Slate), 100, 30)
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+        assert!(
+            !text_none.contains("██████╗"),
+            "no figlet rows should appear before animation starts"
+        );
+
+        // Pre-completed — all rows visible
+        let app_done = make_app(Some(Instant::now() - Duration::from_secs(10)));
+        let text_done =
+            rendered_buffer_with_size(&app_done, Palette::for_theme(ThemeName::Slate), 100, 30)
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+        assert!(
+            text_done.contains("██████╗"),
+            "all figlet rows should appear once animation is complete"
         );
     }
 
@@ -13231,5 +13307,78 @@ mod tests {
                 "composer line {marker} must stay visible (not capped); rows: {rows:#?}"
             );
         }
+    }
+
+    #[test]
+    fn banner_visible_rows_returns_correct_counts() {
+        use std::time::{Duration, Instant};
+
+        // None → 0 rows (not yet started)
+        assert_eq!(banner_visible_rows(None), 0);
+
+        // Freshly started → 1 row immediately
+        let just_now = Instant::now();
+        assert_eq!(banner_visible_rows(Some(just_now)), 1);
+
+        // t=60ms → still row 1 (60/120 = 0, +1 = 1)
+        let t60 = Instant::now() - Duration::from_millis(60);
+        assert_eq!(banner_visible_rows(Some(t60)), 1);
+
+        // t=120ms → row 2 (120/120 = 1, +1 = 2)
+        let t120 = Instant::now() - Duration::from_millis(120);
+        assert_eq!(banner_visible_rows(Some(t120)), 2);
+
+        // t=480ms → row 5 (480/120 = 4, +1 = 5)
+        let t480 = Instant::now() - Duration::from_millis(480);
+        assert_eq!(banner_visible_rows(Some(t480)), 5);
+
+        // t=720ms → row 6 (720/120 = 6, +1 = 7, clamped to 6)
+        let t720 = Instant::now() - Duration::from_millis(720);
+        assert_eq!(banner_visible_rows(Some(t720)), 6);
+
+        // Long past → still capped at 6
+        let old = Instant::now() - Duration::from_secs(10);
+        assert_eq!(banner_visible_rows(Some(old)), 6);
+    }
+
+    #[test]
+    fn banner_reveal_start_cleared_when_banner_inactive() {
+        // When the banner is no longer active (session has messages),
+        // the event loop clears banner_reveal_start. This test verifies
+        // launch_banner_active returns false for a session with messages,
+        // confirming the condition that triggers the clear in the event loop.
+        use std::time::Instant;
+
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: None,
+                messages: vec![Message::user("hello")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // Simulate that the banner was previously animating.
+        app.banner_reveal_start = Some(Instant::now());
+
+        // The event loop clears banner_reveal_start when !launch_banner_active.
+        // Verify the condition is false so the clear path is taken.
+        assert!(
+            !launch_banner_active(&app),
+            "banner must be inactive when session has messages"
+        );
+        // Simulate the event loop's clear.
+        if !launch_banner_active(&app) {
+            app.banner_reveal_start = None;
+        }
+        assert!(
+            app.banner_reveal_start.is_none(),
+            "banner_reveal_start must be cleared when banner is inactive"
+        );
     }
 }

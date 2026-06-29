@@ -1058,7 +1058,6 @@ impl ProtocolAppUiBackend {
                 topic: None,
                 profile_id: self.launch.profile_id.clone(),
                 cwd: self.launch.cwd.clone(),
-                sandbox: None,
                 after: None,
             })
         })
@@ -1359,7 +1358,6 @@ impl AppUiBackend for ProtocolAppUiBackend {
                     topic: None,
                     profile_id: self.launch.profile_id.clone(),
                     cwd: self.launch.cwd.clone(),
-                    sandbox: None,
                     after: None,
                 },
             ))?;
