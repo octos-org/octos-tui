@@ -318,7 +318,13 @@ impl Cli {
 
         Ok(Self {
             config: args.config,
-            mode: args.mode.or(file_config.mode).unwrap_or(Mode::Mock),
+            mode: args.mode.or(file_config.mode).unwrap_or_else(|| {
+                if base_url.is_some() || stdio_command.is_some() {
+                    Mode::Protocol
+                } else {
+                    Mode::Mock
+                }
+            }),
             base_url,
             stdio_command,
             session: args.session.or(file_config.session),
@@ -647,6 +653,44 @@ mod tests {
         assert!(cli.base_url.is_none());
         assert!(cli.stdio_command.is_none());
         assert_eq!(cli.theme, ThemeName::Codex);
+    }
+
+    #[test]
+    fn auto_selects_protocol_mode_when_endpoint_is_given() {
+        let cli = Cli::try_parse_from([
+            "octos-tui",
+            "--endpoint",
+            "ws://localhost:8080/ui-protocol",
+        ])
+        .expect("cli parses");
+
+        assert_eq!(cli.mode, Mode::Protocol);
+    }
+
+    #[test]
+    fn auto_selects_protocol_mode_when_stdio_command_is_given() {
+        let cli = Cli::try_parse_from([
+            "octos-tui",
+            "--stdio-command",
+            "octos serve --stdio",
+        ])
+        .expect("cli parses");
+
+        assert_eq!(cli.mode, Mode::Protocol);
+    }
+
+    #[test]
+    fn explicit_mock_mode_overrides_endpoint() {
+        let cli = Cli::try_parse_from([
+            "octos-tui",
+            "--mode",
+            "mock",
+            "--endpoint",
+            "ws://localhost:8080/ui-protocol",
+        ])
+        .expect("cli parses");
+
+        assert_eq!(cli.mode, Mode::Mock);
     }
 
     #[test]
