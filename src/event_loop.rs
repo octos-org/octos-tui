@@ -88,6 +88,10 @@ pub fn run(cli: Cli) -> Result<()> {
     let mut backend = build_backend(&cli);
     let snapshot = backend.bootstrap()?;
     let mut store = Store::from_snapshot(snapshot);
+    // Seed cross-session command history from disk (best-effort) so Up/Down
+    // recall works from the first keystroke; preserved across snapshot replays
+    // by `Store::apply_event`.
+    store.state.composer_history = crate::history::ComposerHistory::load_from_default_path();
     // Seed the runtime palette from the launch theme (`--theme`/config). The
     // `/theme` menu mutates this field, so the palette below is recomputed each
     // frame from `store.state.theme` rather than captured once at startup.
@@ -883,13 +887,43 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         // first/last line they fall back to the existing transcript scroll so
         // that affordance isn't lost.
         KeyCode::Down if store.state.focus == FocusPane::Composer => {
-            if !store.state.move_composer_cursor_down() {
-                store.state.scroll_transcript_down(1);
+            // Mirror of Up: while browsing, step to a newer entry first (past the
+            // newest, recall_next returns an empty draft); recall_next returns
+            // None once the entry is edited, then ordinary cursor movement
+            // resumes. Otherwise move the cursor down a line and, only at the
+            // last line, try newer history then transcript scroll.
+            let current = store.state.composer.clone();
+            if store.state.composer_history.is_navigating() {
+                if let Some(text) = store.state.composer_history.recall_next(&current) {
+                    store.state.set_composer_text(text);
+                } else if !store.state.move_composer_cursor_down() {
+                    store.state.scroll_transcript_down(1);
+                }
+            } else if !store.state.move_composer_cursor_down() {
+                match store.state.composer_history.recall_next(&current) {
+                    Some(text) => store.state.set_composer_text(text),
+                    None => store.state.scroll_transcript_down(1),
+                }
             }
         }
         KeyCode::Up if store.state.focus == FocusPane::Composer => {
-            if !store.state.move_composer_cursor_up() {
-                store.state.scroll_transcript_up(1);
+            // While browsing history, Up steps to an older entry FIRST, so a
+            // recalled multiline entry doesn't trap the cursor inside it;
+            // recall_prev returns None once the entry is edited, and ordinary
+            // cursor movement resumes. Otherwise move the cursor up a line and,
+            // only at the first line, try history (empty composer) then scroll.
+            let current = store.state.composer.clone();
+            if store.state.composer_history.is_navigating() {
+                if let Some(text) = store.state.composer_history.recall_prev(&current) {
+                    store.state.set_composer_text(text);
+                } else if !store.state.move_composer_cursor_up() {
+                    store.state.scroll_transcript_up(1);
+                }
+            } else if !store.state.move_composer_cursor_up() {
+                match store.state.composer_history.recall_prev(&current) {
+                    Some(text) => store.state.set_composer_text(text),
+                    None => store.state.scroll_transcript_up(1),
+                }
             }
         }
         KeyCode::Down => {
@@ -2051,6 +2085,123 @@ mod tests {
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
         }
+    }
+
+    // --- command-history Up/Down recall wiring (crate::history) ---
+
+    fn composer_store_with_history(entries: &[&str]) -> Store {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.composer_history = crate::history::ComposerHistory::from_entries(
+            entries.iter().map(|s| s.to_string()).collect(),
+        );
+        store
+    }
+
+    #[test]
+    fn up_from_empty_composer_recalls_newest_then_older() {
+        let mut store = composer_store_with_history(&["older", "newest"]);
+        handle_key(&mut store, key(KeyCode::Up));
+        assert_eq!(store.state.composer, "newest");
+        handle_key(&mut store, key(KeyCode::Up));
+        assert_eq!(store.state.composer, "older");
+    }
+
+    #[test]
+    fn up_from_nonempty_composer_does_not_recall() {
+        let mut store = composer_store_with_history(&["entry"]);
+        store.state.set_composer_text("typed draft");
+        handle_key(&mut store, key(KeyCode::Up));
+        // Gate: recall only starts from an empty composer; the draft is intact.
+        assert_eq!(store.state.composer, "typed draft");
+    }
+
+    #[test]
+    fn down_past_newest_history_returns_to_empty_draft() {
+        let mut store = composer_store_with_history(&["a", "b"]);
+        handle_key(&mut store, key(KeyCode::Up)); // → "b" (newest)
+        assert_eq!(store.state.composer, "b");
+        handle_key(&mut store, key(KeyCode::Down)); // past newest → empty draft
+        assert_eq!(store.state.composer, "");
+    }
+
+    #[test]
+    fn up_steps_history_through_multiline_recalled_entries() {
+        let mut store = composer_store_with_history(&["older", "line1\nline2"]);
+        handle_key(&mut store, key(KeyCode::Up)); // recall newest (multiline)
+        assert_eq!(store.state.composer, "line1\nline2");
+        // Up again steps to the OLDER entry rather than moving the cursor up a
+        // line inside the recalled multiline draft.
+        handle_key(&mut store, key(KeyCode::Up));
+        assert_eq!(store.state.composer, "older");
+    }
+
+    #[test]
+    fn clearing_composer_resets_history_navigation() {
+        let mut store = composer_store_with_history(&["older", "newest"]);
+        handle_key(&mut store, key(KeyCode::Up)); // recall "newest"
+        assert_eq!(store.state.composer, "newest");
+        assert!(store.state.composer_history.is_navigating());
+        store.state.clear_current_composer_draft(); // Ctrl+U path
+        assert!(!store.state.composer_history.is_navigating());
+        // Up after clear recalls the newest again — not a stale 2-press no-op.
+        handle_key(&mut store, key(KeyCode::Up));
+        assert_eq!(store.state.composer, "newest");
+    }
+
+    #[test]
+    fn accepted_plain_prompt_is_recorded() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.set_composer_text("hello there");
+        let _ = store.compose_command();
+        assert_eq!(store.state.composer_history.entries(), &["hello there"]);
+    }
+
+    #[test]
+    fn readonly_rejected_prompt_is_not_recorded() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.readonly = true;
+        store.state.set_composer_text("never sent");
+        let _ = store.compose_command();
+        // A prompt rejected by the readonly guard must not reach history.
+        assert!(store.state.composer_history.entries().is_empty());
+    }
+
+    #[test]
+    fn accepted_no_arg_slash_is_recorded() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        // `/theme` is `always()`-available and history-safe; it opens the theme
+        // menu (a pure-client `Accepted(None)`), so it must be recorded even
+        // though it emits no backend command.
+        store.state.set_composer_text("/theme");
+        let command = store.compose_command();
+        assert!(
+            command.is_none(),
+            "/theme opens a menu and sends no backend command"
+        );
+        assert_eq!(store.state.composer_history.entries(), &["/theme"]);
+    }
+
+    #[test]
+    fn bare_loop_in_readonly_is_not_recorded() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.readonly = true;
+        // Bare `/loop` is history-safe and registry-available (it is
+        // READ-gated, so readonly does not hide it), but the dispatcher rejects
+        // it before it runs (here: unavailable in this mock/disconnected store;
+        // in a live readonly session it is the `require_mutating_appui_method`
+        // block — see `store::tests::bare_loop_in_readonly_mutating_is_not_recorded`).
+        // Either way a rejected command must NOT persist (the regression fix).
+        store.state.set_composer_text("/loop");
+        let _ = store.compose_command();
+        assert!(
+            store.state.composer_history.entries().is_empty(),
+            "a rejected bare /loop must not reach history"
+        );
     }
 
     fn onboarding_capabilities_event() -> ClientEvent {

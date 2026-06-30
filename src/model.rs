@@ -3241,6 +3241,10 @@ pub struct AppState {
     pub composer: String,
     pub composer_cursor: Option<usize>,
     pub composer_drafts: Vec<ComposerDraft>,
+    /// Cross-session command history for Up/Down recall (codex/claude-code
+    /// style); persisted to `~/.config/octos-tui/history.jsonl`. See
+    /// [`crate::history::ComposerHistory`].
+    pub composer_history: crate::history::ComposerHistory,
     pub pending_messages: Vec<String>,
     pub optimistic_user_messages: Vec<OptimisticUserMessage>,
     pub turn_prompt_anchors: Vec<TurnPromptAnchor>,
@@ -4909,6 +4913,7 @@ impl AppState {
             composer: String::new(),
             composer_cursor: None,
             composer_drafts: Vec::new(),
+            composer_history: crate::history::ComposerHistory::default(),
             pending_messages: Vec::new(),
             optimistic_user_messages: Vec::new(),
             turn_prompt_anchors: Vec::new(),
@@ -5770,6 +5775,7 @@ impl AppState {
             return;
         }
         self.persist_composer_draft_for_selected_session();
+        self.composer_history.reset_navigation(); // end history browse on switch
         self.selected_session = (self.selected_session + 1) % self.sessions.len();
         self.selected_task = 0;
         self.transcript_scroll = 0;
@@ -5782,6 +5788,7 @@ impl AppState {
             return;
         }
         self.persist_composer_draft_for_selected_session();
+        self.composer_history.reset_navigation(); // end history browse on switch
         if self.selected_session == 0 {
             self.selected_session = self.sessions.len() - 1;
         } else {
@@ -6043,6 +6050,11 @@ impl AppState {
         let session_id = self.active_session().map(|session| session.id.clone());
         self.composer.clear();
         self.composer_cursor = None;
+        // Clearing the composer (e.g. Ctrl+U) ends any history browse, so the
+        // next Up recalls the newest entry instead of comparing the now-empty
+        // composer against a stale recalled entry (which would scroll and need a
+        // second press).
+        self.composer_history.reset_navigation();
         if let Some(session_id) = session_id {
             self.composer_drafts
                 .retain(|draft| draft.session_id != session_id);

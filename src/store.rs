@@ -185,6 +185,88 @@ pub struct Store {
     pub state: AppState,
 }
 
+/// Outcome of dispatching a `/`-prefixed slash command.
+///
+/// Threaded through the single-caller slash-dispatch chain
+/// ([`Store::dispatch_slash_command`] → [`Store::dispatch_command_entry`] /
+/// [`Store::dispatch_autonomy_slash`] → [`Store::dispatch_local_action`]) so
+/// that [`Store::compose_command`] can record command history ONLY after the
+/// dispatcher actually accepts (ran) the command. A command can resolve to a
+/// known, history-safe verb yet still be rejected at dispatch time — readonly
+/// mode blocking a mutating method (e.g. bare `/loop`), an unwired AppUI
+/// action, no active turn for `/turn`/`/stop`, or an autonomy parse error.
+/// Those rejected commands must NOT persist to history (fail-closed: when
+/// unsure, [`Rejected`](SlashDispatchOutcome::Rejected)).
+///
+/// `Accepted` carries the optional [`AppUiCommand`] the dispatcher produced (it
+/// is `None` for accepted pure-client commands like `/theme`, `/ps`, `/copy`,
+/// `OpenMenu`), so acceptance is decoupled from "produced a backend command".
+/// The command is boxed (as elsewhere in this crate, e.g.
+/// [`crate::menu::types::MenuAction::SendAppUi`]) to keep the enum small —
+/// `AppUiCommand` is a large variant and `Rejected` carries no data.
+#[derive(Debug)]
+pub(crate) enum SlashDispatchOutcome {
+    /// The dispatcher ran the command. The inner `Option` is the backend
+    /// command to emit (`None` for client-only commands).
+    Accepted(Option<Box<AppUiCommand>>),
+    /// The dispatcher rejected the command (unavailable, readonly-blocked,
+    /// unwired, no active turn, parse error, …). Never recorded.
+    Rejected,
+}
+
+impl SlashDispatchOutcome {
+    /// Build an `Accepted` from the `Option<AppUiCommand>` a dispatcher
+    /// produced, boxing the command if present.
+    fn accepted(command: Option<AppUiCommand>) -> Self {
+        SlashDispatchOutcome::Accepted(command.map(Box::new))
+    }
+
+    /// Collapse to the backend command to emit: the inner (unboxed) command when
+    /// `Accepted`, `None` when `Rejected`.
+    fn into_command(self) -> Option<AppUiCommand> {
+        match self {
+            SlashDispatchOutcome::Accepted(command) => command.map(|boxed| *boxed),
+            SlashDispatchOutcome::Rejected => None,
+        }
+    }
+}
+
+/// Whether `prompt` may be persisted to the plaintext command-history file (and
+/// recalled with Up).
+///
+/// - Plain chat prompts are recorded (the primary recall target).
+/// - `!`-bang local-shell commands are skipped for v1: their text is
+///   unstructured and may carry tokens / `KEY=value` env assignments.
+/// - Slash commands are resolved through [`CommandRegistry`] and recorded only
+///   when the resolved command is [`CommandSpec::history_safe`].
+///
+/// FAIL-CLOSED: an unknown / newly added slash command, and the auth/credential
+/// families (`onboard`/`login`/`provider` and their aliases), are never
+/// recorded — so a sensitive command cannot leak a secret/OTP/PII to history
+/// until it is explicitly classified safe. Resolution is alias-aware, which is
+/// exactly what the earlier raw-token denylist missed (`/auth`=`/login`,
+/// `/setup`=`/onboard`).
+fn should_record_in_history(prompt: &str) -> bool {
+    if prompt.is_empty() || prompt.starts_with('!') {
+        return false;
+    }
+    match CommandRegistry::with_core_commands().resolve(prompt) {
+        CommandResolution::NotCommand => true,
+        // A slash command is recorded only if it is history-safe AND the user
+        // typed NO trailing args. The spec's arg-mode isn't enough: a no-arg
+        // command with stray text (e.g. `/theme sk-...`, `/copy token`) still
+        // resolves to Found and the dispatcher ignores the extra text, but
+        // recording the raw prompt would persist a secret. Gating on the actual
+        // invocation args also keeps arg-bearing commands out (their args could
+        // be rejected); recording those needs a safe-args classifier (follow-up).
+        CommandResolution::Found {
+            command,
+            invocation,
+        } => command.history_safe() && invocation.args.trim().is_empty(),
+        CommandResolution::Unknown { .. } | CommandResolution::EmptyCommand => false,
+    }
+}
+
 impl Store {
     pub fn from_snapshot(snapshot: AppUiSnapshot) -> Self {
         Self {
@@ -241,7 +323,20 @@ impl Store {
     pub fn compose_command(&mut self) -> Option<AppUiCommand> {
         let prompt = self.state.composer.trim().to_string();
         if prompt.starts_with('/') {
-            return self.dispatch_slash_command(&prompt);
+            // Record a history-safe, no-arg slash command ONLY after the
+            // dispatcher ACCEPTS (ran) it. Acceptance is the Outcome — a known
+            // history-safe verb can still be rejected at dispatch time
+            // (readonly-mutating, unwired AppUI, no active turn, parse error),
+            // and those must NOT persist. Fail-closed (Rejected ⇒ never
+            // recorded). `should_record_in_history` still gates history_safe +
+            // empty args so an arg-bearing/secret-carrying form is excluded.
+            let outcome = self.dispatch_slash_command(&prompt);
+            if matches!(outcome, SlashDispatchOutcome::Accepted(_))
+                && should_record_in_history(&prompt)
+            {
+                self.state.composer_history.record(&prompt);
+            }
+            return outcome.into_command();
         }
 
         // `!`-bang client-local shell (Claude Code's `!` model). Intercepted
@@ -268,6 +363,12 @@ impl Store {
         }
 
         self.state.clear_current_composer_draft();
+        // Accepted plain prompt — record before staging/sending. Slash/bang
+        // returned above; readonly/empty/no-session were rejected above, so only
+        // genuinely-submitted prompts reach here (rejected ones never persist).
+        if should_record_in_history(&prompt) {
+            self.state.composer_history.record(&prompt);
+        }
         if self.state.active_turn().is_some() {
             self.state.pending_messages.push(prompt);
             self.state.status = t!("status.message_staged").into_owned();
@@ -324,7 +425,7 @@ impl Store {
         matches.into_iter().map(|(_, command)| command).collect()
     }
 
-    fn dispatch_slash_command(&mut self, draft: &str) -> Option<AppUiCommand> {
+    fn dispatch_slash_command(&mut self, draft: &str) -> SlashDispatchOutcome {
         let registry = CommandRegistry::with_core_commands();
         let resolution = registry.resolve(draft);
         self.state.clear_current_composer_draft();
@@ -342,7 +443,7 @@ impl Store {
                         &command_name,
                         availability.reason.as_deref().unwrap_or(&fallback_reason),
                     );
-                    return None;
+                    return SlashDispatchOutcome::Rejected;
                 }
                 // M15-E autonomy commands need richer-than-verb parsing
                 // (intervals, multi-word objectives). The registry's
@@ -360,13 +461,13 @@ impl Store {
             }
             CommandResolution::EmptyCommand => {
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
-                None
+                SlashDispatchOutcome::Rejected
             }
             CommandResolution::Unknown { invocation } => {
                 self.show_unknown_slash_command(&format!("/{}", invocation.name), draft);
-                None
+                SlashDispatchOutcome::Rejected
             }
-            CommandResolution::NotCommand => None,
+            CommandResolution::NotCommand => SlashDispatchOutcome::Rejected,
         }
     }
 
@@ -376,8 +477,14 @@ impl Store {
     /// at the dispatch site (and via the registry's
     /// `coding.autonomy.v1` gate), so old servers see the slash
     /// command rendered as `Unsupported` rather than getting probed.
-    pub(crate) fn dispatch_autonomy_slash(&mut self, draft: &str) -> Option<AppUiCommand> {
-        match crate::autonomy::parse_autonomy_slash(draft) {
+    pub(crate) fn dispatch_autonomy_slash(&mut self, draft: &str) -> SlashDispatchOutcome {
+        // Each `dispatch_*_command` produces a single `Option<AppUiCommand>`:
+        // `Some` when it accepts (every accepted autonomy intent emits a
+        // command), `None` when it rejects (missing session, capability gate,
+        // readonly-mutating block, bad id, no active turn). Map that Option by
+        // `is_some` to Accepted/Rejected. Parse errors and `Ok(None)` (no
+        // intent, e.g. bare `/turn`) are rejected — fail-closed, never recorded.
+        let produced = match crate::autonomy::parse_autonomy_slash(draft) {
             Ok(Some(crate::autonomy::AutonomyCommand::Agents(cmd))) => {
                 self.dispatch_agents_command(cmd)
             }
@@ -396,11 +503,15 @@ impl Store {
             Ok(Some(crate::autonomy::AutonomyCommand::Loop(cmd))) => {
                 self.dispatch_loop_command(cmd)
             }
-            Ok(None) => None,
+            Ok(None) => return SlashDispatchOutcome::Rejected,
             Err(err) => {
                 self.state.status = err.to_string();
-                None
+                return SlashDispatchOutcome::Rejected;
             }
+        };
+        match produced {
+            Some(command) => SlashDispatchOutcome::accepted(Some(command)),
+            None => SlashDispatchOutcome::Rejected,
         }
     }
 
@@ -891,27 +1002,41 @@ impl Store {
         &mut self,
         entry: &CommandEntry,
         inline_args: Option<&str>,
-    ) -> Option<AppUiCommand> {
+    ) -> SlashDispatchOutcome {
         match entry {
             CommandEntry::OpenMenu(id) => {
+                // Pure-client: always runs. Returns no backend command.
                 self.open_menu(id.clone());
-                None
+                SlashDispatchOutcome::accepted(None)
             }
             CommandEntry::LocalAction(action) => {
                 self.dispatch_local_action(action.clone(), inline_args)
             }
             CommandEntry::AppUiAction(crate::menu::types::AppUiActionKind::ReviewStart) => {
-                self.review_start_command(inline_args.unwrap_or_default())
+                // ReviewStart rejects (returns None) when there is an active
+                // turn or the mutating method is gated/readonly-blocked.
+                match self.review_start_command(inline_args.unwrap_or_default()) {
+                    Some(command) => SlashDispatchOutcome::accepted(Some(command)),
+                    None => SlashDispatchOutcome::Rejected,
+                }
             }
             CommandEntry::AppUiAction(action) => {
+                // Unwired AppUI action: status-only, nothing ran. Reject.
                 self.state.status =
                     t!("status.appui_not_wired", method = action.method()).into_owned();
-                None
+                SlashDispatchOutcome::Rejected
             }
-            CommandEntry::PromptTemplate(template) => self.start_prompt_turn(
-                (*template).to_string(),
-                t!("status.queued_prompt_template").into_owned(),
-            ),
+            CommandEntry::PromptTemplate(template) => {
+                // Submits a turn; only `None` when there is no active session
+                // (nothing was submitted) — treat that as rejected (fail-closed).
+                match self.start_prompt_turn(
+                    (*template).to_string(),
+                    t!("status.queued_prompt_template").into_owned(),
+                ) {
+                    Some(command) => SlashDispatchOutcome::accepted(Some(command)),
+                    None => SlashDispatchOutcome::Rejected,
+                }
+            }
         }
     }
 
@@ -919,8 +1044,31 @@ impl Store {
         &mut self,
         action: LocalAction,
         inline_args: Option<&str>,
-    ) -> Option<AppUiCommand> {
-        match action {
+    ) -> SlashDispatchOutcome {
+        // `/stop` is the one local action that can REJECT: with no active turn
+        // `interrupt_command()` returns `None` and nothing is sent to the
+        // backend, so it must not be recorded (fail-closed). Handle it first so
+        // every other arm below is unconditionally Accepted (the dispatcher ran
+        // it — a no-op success like `/copy` with nothing to copy or
+        // `/saveconfig` with no change still counts as accepted).
+        if let LocalAction::StopActiveTurn = action {
+            let had_active_turn = self.state.active_turn().is_some();
+            let command = self.interrupt_command();
+            if !had_active_turn {
+                self.push_local_activity(
+                    ActivityKind::Warning,
+                    t!("status.local_stop").into_owned(),
+                    t!("status.no_active_turn").into_owned(),
+                    Some(t!("status.nothing_sent_to_backend").into_owned()),
+                );
+            }
+            return match command {
+                Some(command) => SlashDispatchOutcome::accepted(Some(command)),
+                None => SlashDispatchOutcome::Rejected,
+            };
+        }
+
+        let command = match action {
             LocalAction::ShowProcessStatus => {
                 self.show_local_process_status();
                 None
@@ -932,17 +1080,8 @@ impl Store {
                 None
             }
             LocalAction::StopActiveTurn => {
-                let had_active_turn = self.state.active_turn().is_some();
-                let command = self.interrupt_command();
-                if !had_active_turn {
-                    self.push_local_activity(
-                        ActivityKind::Warning,
-                        t!("status.local_stop").into_owned(),
-                        t!("status.no_active_turn").into_owned(),
-                        Some(t!("status.nothing_sent_to_backend").into_owned()),
-                    );
-                }
-                command
+                // Handled above with an early return; unreachable here.
+                None
             }
             LocalAction::Exit => {
                 self.state.exit_requested = true;
@@ -1032,7 +1171,10 @@ impl Store {
                 self.state.status = t!("status.local_action_not_wired", name = name).into_owned();
                 None
             }
-        }
+        };
+        // Every non-`/stop` local action ran (the dispatcher accepted it),
+        // regardless of whether it produced a backend command.
+        SlashDispatchOutcome::accepted(command)
     }
 
     /// `/lang <code>` — switch the UI display language at runtime. Empty arg
@@ -3131,7 +3273,12 @@ impl Store {
                 self.close_all_menus();
                 None
             }
-            MenuAction::Local(action) => self.dispatch_local_action(action, None),
+            MenuAction::Local(action) => {
+                // Menu-driven local action: history recording is only for the
+                // typed-slash path in `compose_command`, so collapse the
+                // dispatch outcome to its backend command here.
+                self.dispatch_local_action(action, None).into_command()
+            }
             MenuAction::SendAppUi(command) => Some(*command),
             MenuAction::SubmitPrompt(prompt) => {
                 self.start_prompt_turn(prompt, t!("status.queued_menu_prompt").into_owned())
@@ -4649,6 +4796,10 @@ impl Store {
             AppUiEvent::Snapshot(snapshot) => {
                 let composer = self.state.composer.clone();
                 let composer_drafts = self.state.composer_drafts.clone();
+                // Local-only: command history is a client-side ring the server
+                // never echoes; `from_snapshot` would drop it. Preserve the
+                // entries across replays (reconnect/refresh) and reset browsing.
+                let composer_history = self.state.composer_history.clone();
                 let pending_messages = self.state.pending_messages.clone();
                 let optimistic_user_messages = self.state.optimistic_user_messages.clone();
                 let turn_prompt_anchors = self.state.turn_prompt_anchors.clone();
@@ -4698,6 +4849,8 @@ impl Store {
                 }
                 state.set_composer_text(composer);
                 state.composer_drafts = composer_drafts;
+                state.composer_history = composer_history;
+                state.composer_history.reset_navigation();
                 state.pending_messages = pending_messages;
                 state.optimistic_user_messages = optimistic_user_messages;
                 state.turn_prompt_anchors = turn_prompt_anchors;
@@ -8316,6 +8469,53 @@ mod tests {
     }
 
     #[test]
+    fn history_capture_is_fail_closed_for_commands() {
+        // Recorded: plain chat prompts + NO-ARG history-safe slash commands
+        // (resolved through the registry).
+        assert!(should_record_in_history(
+            "write a function that returns a key"
+        ));
+        assert!(should_record_in_history("/model"));
+        assert!(should_record_in_history("/theme"));
+        assert!(should_record_in_history("/status"));
+        // Arg-bearing safe commands stay out for now (their args could be
+        // rejected downstream; safe-args recording is a follow-up).
+        assert!(!should_record_in_history("/thinking high"));
+        assert!(!should_record_in_history("/task investigate the flake"));
+        assert!(!should_record_in_history("/lang zh"));
+        // Skipped: the auth/credential families — including aliases, which
+        // resolve to the canonical name (this is what the raw-token denylist
+        // missed) — keys, OTP codes, and account PII alike.
+        assert!(!should_record_in_history("/onboard key sk-abc123"));
+        assert!(!should_record_in_history("/provider api-key sk-xyz"));
+        assert!(!should_record_in_history("/onboard otp 123456"));
+        assert!(!should_record_in_history("/login send ada@example.com"));
+        assert!(!should_record_in_history("/auth verify 123456")); // /auth -> login
+        assert!(!should_record_in_history("/setup key sk-zzz")); // /setup -> onboard
+        // Config-upsert commands carry tokens in their args (mcp/tools upsert,
+        // skills install <repo-url>) — kept out of the allowlist.
+        assert!(!should_record_in_history(
+            "/mcp upsert srv {\"token\":\"x\"}"
+        ));
+        assert!(!should_record_in_history("/tools upsert {\"key\":\"sk\"}"));
+        assert!(!should_record_in_history(
+            "/skills install https://tok@h/repo"
+        ));
+        // No-arg commands with stray trailing args: the dispatcher ignores the
+        // args, but recording the raw text would persist a secret after them.
+        assert!(!should_record_in_history("/theme sk-secret-token"));
+        assert!(!should_record_in_history("/copy some-token"));
+        // Fail-closed: unknown/new slash commands and bang shells are never
+        // recorded, even with no obvious secret.
+        assert!(!should_record_in_history("/frobnicate widgets"));
+        assert!(!should_record_in_history("!export TOKEN=sk-secret"));
+        assert!(!should_record_in_history("!ls -la"));
+        // Degenerate inputs.
+        assert!(!should_record_in_history(""));
+        assert!(!should_record_in_history("/"));
+    }
+
+    #[test]
     fn copy_last_reply_stages_assistant_text_for_clipboard() {
         let mut store = store_with_assistant_message("the deep-research report");
         assert!(store.state.pending_clipboard.is_none());
@@ -8357,8 +8557,9 @@ mod tests {
     fn copy_command_dispatch_stages_clipboard() {
         let mut store = store_with_assistant_message("final answer");
 
-        let command =
-            store.dispatch_local_action(crate::menu::types::LocalAction::CopyLastReply, None);
+        let command = store
+            .dispatch_local_action(crate::menu::types::LocalAction::CopyLastReply, None)
+            .into_command();
 
         assert!(command.is_none(), "/copy is local-only, sends no command");
         assert_eq!(
@@ -16792,6 +16993,50 @@ mod tests {
             ],
         ));
         store
+    }
+
+    #[test]
+    fn bare_loop_in_readonly_mutating_is_not_recorded() {
+        // Bare `/loop` resolves to a maintenance `LoopCommand::Create`, which is
+        // a MUTATING dispatch. The registry marks `/loop` as app-ui-READ
+        // available (so it is NOT hidden in readonly), but `dispatch_loop_command`
+        // calls `require_mutating_appui_method(LOOP_CREATE)`, which rejects in
+        // readonly mode. The pre-dispatch recording bug recorded `/loop` anyway
+        // (registry-available + history-safe); recording AFTER the Accepted
+        // outcome must not persist this readonly-rejected command.
+        let mut store = protocol_store_with_autonomy();
+        store.state.readonly = true;
+        store.state.set_composer_text("/loop");
+
+        let command = store.compose_command();
+
+        assert!(
+            command.is_none(),
+            "readonly blocks the mutating loop-create, so no backend command"
+        );
+        assert!(
+            store.state.composer_history.entries().is_empty(),
+            "a readonly-rejected bare /loop must not reach history"
+        );
+    }
+
+    #[test]
+    fn bare_loop_when_accepted_is_recorded() {
+        // Complement to the readonly case: when the mutating loop-create is
+        // accepted (writable session), the same history-safe bare `/loop` IS
+        // recorded. This proves the readonly test is not vacuous — `/loop` is
+        // genuinely recordable, gated only by dispatch acceptance.
+        let mut store = protocol_store_with_autonomy();
+        store.state.readonly = false;
+        store.state.set_composer_text("/loop");
+
+        let command = store.compose_command();
+
+        assert!(
+            matches!(command, Some(AppUiCommand::CreateLoop(_))),
+            "an accepted bare /loop emits CreateLoop, got: {command:?}"
+        );
+        assert_eq!(store.state.composer_history.entries(), &["/loop"]);
     }
 
     #[test]
