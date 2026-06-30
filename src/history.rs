@@ -230,6 +230,10 @@ fn rewrite_history_file(path: &Path, entries: &[String]) -> std::io::Result<()> 
     // `mode(0o600)` above is ignored if a stale temp already existed; force
     // owner-only before the rename publishes it as the history file.
     tighten_permissions(&tmp);
+    // `rename` atomically replaces on Unix; on Windows it fails when the
+    // destination exists, so remove it first there (compaction is best-effort).
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(path);
     std::fs::rename(&tmp, path)
 }
 
