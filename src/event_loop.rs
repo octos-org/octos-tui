@@ -2169,6 +2169,41 @@ mod tests {
         assert!(store.state.composer_history.entries().is_empty());
     }
 
+    #[test]
+    fn accepted_no_arg_slash_is_recorded() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        // `/theme` is `always()`-available and history-safe; it opens the theme
+        // menu (a pure-client `Accepted(None)`), so it must be recorded even
+        // though it emits no backend command.
+        store.state.set_composer_text("/theme");
+        let command = store.compose_command();
+        assert!(
+            command.is_none(),
+            "/theme opens a menu and sends no backend command"
+        );
+        assert_eq!(store.state.composer_history.entries(), &["/theme"]);
+    }
+
+    #[test]
+    fn bare_loop_in_readonly_is_not_recorded() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.readonly = true;
+        // Bare `/loop` is history-safe and registry-available (it is
+        // READ-gated, so readonly does not hide it), but the dispatcher rejects
+        // it before it runs (here: unavailable in this mock/disconnected store;
+        // in a live readonly session it is the `require_mutating_appui_method`
+        // block — see `store::tests::bare_loop_in_readonly_mutating_is_not_recorded`).
+        // Either way a rejected command must NOT persist (the regression fix).
+        store.state.set_composer_text("/loop");
+        let _ = store.compose_command();
+        assert!(
+            store.state.composer_history.entries().is_empty(),
+            "a rejected bare /loop must not reach history"
+        );
+    }
+
     fn onboarding_capabilities_event() -> ClientEvent {
         ClientEvent::Capabilities(crate::client_event::CapabilitiesClientEvent {
             result: crate::model::ConfigCapabilitiesListResult {
