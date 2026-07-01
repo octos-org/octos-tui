@@ -11,12 +11,12 @@ use octos_core::ui_protocol::{
     ApprovalRequestedEvent, ApprovalSandboxDetails, ApprovalSandboxEscalationDetails,
     ApprovalSandboxEscalationEndpoint, ApprovalScopesListResult, ApprovalTypedDetails,
     MessageDeltaEvent, OutputCursor, PermissionProfileListResult, PermissionProfileSelection,
-    PermissionProfileSetResult, PreviewId, SessionHydrateResult, SessionOpenParams,
-    SessionOpenResult, SessionOpened, TaskArtifactReadResult, TaskOutputDeltaEvent,
-    TaskOutputReadResult, TaskRuntimeState, TaskUpdatedEvent, ThreadGraphGetResult,
-    ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnId,
-    TurnStartedEvent, TurnStateGetResult, UiCursor, UiNotification, UiPaneSnapshot,
-    UiProtocolCapabilities, WarningEvent, approval_kinds, methods, rpc_error_codes,
+    PermissionProfileSetResult, PreviewId, SessionHydrateResult, SessionListResult,
+    SessionOpenParams, SessionOpenResult, SessionOpened, TaskArtifactReadResult,
+    TaskOutputDeltaEvent, TaskOutputReadResult, TaskRuntimeState, TaskUpdatedEvent,
+    ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent,
+    TurnCompletedEvent, TurnId, TurnStartedEvent, TurnStateGetResult, UiCursor, UiNotification,
+    UiPaneSnapshot, UiProtocolCapabilities, WarningEvent, approval_kinds, methods, rpc_error_codes,
 };
 use octos_core::ui_protocol::{
     JSON_RPC_VERSION, MAX_TEXT_FRAME_BYTES, RpcRequest, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
@@ -1117,6 +1117,7 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ReadTaskOutput(_)
                 | AppUiCommand::ReadTaskArtifact(_)
                 | AppUiCommand::HydrateSession(_)
+                | AppUiCommand::ListSessions(_)
                 | AppUiCommand::GetThreadGraph(_)
                 | AppUiCommand::GetTurnState(_)
                 | AppUiCommand::AuthStatus(_)
@@ -1894,6 +1895,7 @@ fn rpc_request_from_command(
         AppUiCommand::ReadTaskOutput(params) => serde_json::to_value(params),
         AppUiCommand::ReadTaskArtifact(params) => serde_json::to_value(params),
         AppUiCommand::HydrateSession(params) => serde_json::to_value(params),
+        AppUiCommand::ListSessions(params) => serde_json::to_value(params),
         AppUiCommand::GetThreadGraph(params) => serde_json::to_value(params),
         AppUiCommand::GetTurnState(params) => serde_json::to_value(params),
         AppUiCommand::StartReview(params) => serde_json::to_value(params),
@@ -2400,6 +2402,10 @@ fn success_response_to_app_event(
         methods::SESSION_HYDRATE => match serde_json::from_value::<SessionHydrateResult>(result) {
             Ok(result) => Ok(Some(ClientEvent::SessionHydrate(result))),
             Err(err) => Ok(Some(autonomy_decode_error(methods::SESSION_HYDRATE, err))),
+        },
+        methods::SESSION_LIST => match serde_json::from_value::<SessionListResult>(result) {
+            Ok(result) => Ok(Some(ClientEvent::SessionList(result))),
+            Err(err) => Ok(Some(autonomy_decode_error(methods::SESSION_LIST, err))),
         },
         methods::THREAD_GRAPH_GET => match serde_json::from_value::<ThreadGraphGetResult>(result) {
             Ok(result) => Ok(Some(autonomy_event(AutonomyResult::ThreadGraph(result)))),
@@ -3953,6 +3959,34 @@ impl AppUiBackend for MockAppUiBackend {
             AppUiCommand::HydrateSession(_) => Err(eyre!(
                 "mock app-ui backend does not implement session hydrate yet"
             )),
+            // Stub a small `session/list` so `--mock` and tests can exercise the
+            // `/resume` picker end-to-end. Mirrors the server's `SessionInfo`
+            // shape (`{id, message_count, title?}`); `updated_at` is included on
+            // one row to exercise the ordering path.
+            AppUiCommand::ListSessions(_) => {
+                self.queue
+                    .push_back(ClientEvent::SessionList(SessionListResult {
+                        sessions: serde_json::json!([
+                            {
+                                "id": "local:mock#alpha",
+                                "message_count": 12,
+                                "title": "Mock session alpha",
+                                "updated_at": "2026-06-30T10:00:00Z"
+                            },
+                            {
+                                "id": "local:mock#bravo",
+                                "message_count": 3,
+                                "title": "Mock session bravo",
+                                "updated_at": "2026-07-01T09:30:00Z"
+                            },
+                            {
+                                "id": "local:mock#charlie",
+                                "message_count": 47
+                            }
+                        ]),
+                    }));
+                Ok(())
+            }
             AppUiCommand::GetThreadGraph(_) => Err(eyre!(
                 "mock app-ui backend does not implement thread graph reads yet"
             )),
@@ -5750,6 +5784,7 @@ mod tests {
                 after: None,
                 include: Vec::new(),
             }),
+            AppUiCommand::ListSessions(octos_core::ui_protocol::SessionListParams {}),
             AppUiCommand::GetThreadGraph(ThreadGraphGetParams {
                 session_id: session_id.clone(),
                 at: None,

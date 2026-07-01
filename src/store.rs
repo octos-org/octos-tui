@@ -5,12 +5,12 @@ use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
     ApprovalRespondParams, DiffPreviewGetParams, EnvelopeNotification, EnvelopeToolEndStatus,
     HydratedMessage, InputItem, MessageDeltaEvent, MessagePersistedEvent, Payload,
-    ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult, SessionOpenParams,
-    TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState,
-    TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent, TurnId,
-    TurnInterruptParams, TurnLifecycleState, TurnSpawnCompleteEvent, TurnStartParams,
-    TurnStateGetParams, UiContextState, UiNotification, UiProgressEvent,
-    UserQuestionRequestedEvent,
+    ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult, SessionListParams,
+    SessionListResult, SessionOpenParams, TaskArtifactReadParams, TaskOutputDeltaEvent,
+    TaskOutputReadParams, TaskRuntimeState, TaskUpdatedEvent, ThreadGraphGetParams,
+    TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams, TurnLifecycleState,
+    TurnSpawnCompleteEvent, TurnStartParams, TurnStateGetParams, UiContextState, UiNotification,
+    UiProgressEvent, UserQuestionRequestedEvent,
 };
 use octos_core::{Message, MessageRole, SessionKey, TaskId, ThreadId};
 use serde_json::Value;
@@ -38,11 +38,11 @@ use crate::{
         OnboardingProviderSaveTarget, ProfileLlmCatalogParams, ProfileLlmListParams,
         ProfileLlmListResult, ProfileLocalCreateParams, ProfileSkillsInstallParams,
         ProfileSkillsListParams, ProfileSkillsRegistrySearchParams, ProfileSkillsRemoveParams,
-        ReviewStartParams, ReviewStartResult, SecretString, SessionMcpCatalog, SessionModelCatalog,
-        SessionRuntimeStatus, SessionToolCatalog, SessionView, TaskView, ToolConfigDeleteParams,
-        ToolConfigListParams, ToolConfigSetEnabledParams, ToolConfigTestParams,
-        ToolConfigUpsertParams, UserQuestionPickerState, complete_plan_steps_in_text,
-        task_state_label, terminal_task_state_from_agent_status,
+        ResumeSessionRow, ReviewStartParams, ReviewStartResult, SecretString, SessionMcpCatalog,
+        SessionModelCatalog, SessionRuntimeStatus, SessionToolCatalog, SessionView, TaskView,
+        ToolConfigDeleteParams, ToolConfigListParams, ToolConfigSetEnabledParams,
+        ToolConfigTestParams, ToolConfigUpsertParams, UserQuestionPickerState,
+        complete_plan_steps_in_text, task_state_label, terminal_task_state_from_agent_status,
     },
 };
 
@@ -1167,6 +1167,30 @@ impl Store {
                 self.copy_last_reply();
                 None
             }
+            LocalAction::OpenResumePicker => {
+                let arg = inline_args.unwrap_or_default().trim();
+                if arg.is_empty() {
+                    // Open the picker (it renders `Loading` until data lands)
+                    // and fetch the session list; the `SessionList` result
+                    // refreshes the open menu into `Ready` rows.
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_RESUME));
+                    Some(AppUiCommand::ListSessions(SessionListParams {}))
+                } else {
+                    // `/resume <query>` shortcut: resolve to a session id by
+                    // case-insensitive substring match and switch directly,
+                    // reusing the same guard + hydrate path as a picker pick.
+                    match self.resolve_resume_session(arg) {
+                        Some(id) => self.resume_session_command(id),
+                        None => {
+                            self.state.status = format!(
+                                "No prior session matches \"{arg}\"; run /resume with no argument to browse."
+                            );
+                            None
+                        }
+                    }
+                }
+            }
+            LocalAction::ResumeSession(id) => self.resume_session_command(id),
             LocalAction::Custom(name) => {
                 self.state.status = t!("status.local_action_not_wired", name = name).into_owned();
                 None
@@ -1175,6 +1199,74 @@ impl Store {
         // Every non-`/stop` local action ran (the dispatcher accepted it),
         // regardless of whether it produced a backend command.
         SlashDispatchOutcome::accepted(command)
+    }
+
+    /// Case-insensitive substring resolve of a `/resume <query>` argument to a
+    /// known session id. Scans `resume_sessions` in its current (newest-first)
+    /// order, matching the id and the optional title, and returns the first
+    /// hit. `None` when nothing matches (or the list has not been fetched yet).
+    fn resolve_resume_session(&self, query: &str) -> Option<String> {
+        let needle = query.to_lowercase();
+        self.state
+            .resume_sessions
+            .iter()
+            .find(|row| {
+                row.id.to_lowercase().contains(&needle)
+                    || row
+                        .title
+                        .as_deref()
+                        .is_some_and(|title| title.to_lowercase().contains(&needle))
+            })
+            .map(|row| row.id.clone())
+    }
+
+    /// Switch the active session to `session_id` and hydrate its transcript via
+    /// the existing `session/hydrate` render path. Reuses the active-turn guard
+    /// (`/stop`'s check): resuming mid-turn would swap the transcript out from
+    /// under a streaming reply, so while a turn is live this refuses — status
+    /// only, no command. Shared by the `/resume` picker selection and the
+    /// `/resume <query>` inline shortcut.
+    fn resume_session_command(&mut self, session_id: String) -> Option<AppUiCommand> {
+        if self.state.active_turn().is_some() {
+            self.state.status =
+                "Finish or stop the active turn before resuming another session.".into();
+            return None;
+        }
+        let session_id = SessionKey(session_id);
+        // Select the existing SessionView, or create a placeholder so the
+        // switch is immediate; `apply_session_hydrate_result` also
+        // find-or-creates when the hydrate result lands and fills in the real
+        // transcript.
+        if let Some(index) = self
+            .state
+            .sessions
+            .iter()
+            .position(|session| session.id == session_id)
+        {
+            self.state.selected_session = index;
+        } else {
+            let profile_id = self.active_session_profile_id();
+            self.state.sessions.push(SessionView {
+                id: session_id.clone(),
+                title: session_id.0.clone(),
+                profile_id,
+                messages: Vec::new(),
+                tasks: Vec::new(),
+                live_reply: None,
+            });
+            self.state.selected_session = self.state.sessions.len().saturating_sub(1);
+        }
+        self.state.status = format!("Resuming {}…", session_id.0);
+        Some(AppUiCommand::HydrateSession(SessionHydrateParams {
+            session_id,
+            after: None,
+            include: vec![
+                "messages".into(),
+                "turns".into(),
+                "pending_approvals".into(),
+                "pending_questions".into(),
+            ],
+        }))
     }
 
     /// `/lang <code>` — switch the UI display language at runtime. Empty arg
@@ -3418,6 +3510,7 @@ impl Store {
                 })
                 .count(),
             pinned_scroll: self.state.pinned_scroll,
+            resume_sessions: &self.state.resume_sessions,
         }
     }
 
@@ -4253,6 +4346,11 @@ impl Store {
                 self.refresh_active_menu_if_open();
                 None
             }
+            ClientEvent::SessionList(result) => {
+                self.apply_session_list_result(result);
+                self.refresh_active_menu_if_open();
+                None
+            }
             ClientEvent::ReviewStart(result) => {
                 self.apply_review_start_result(result);
                 self.refresh_active_menu_if_open();
@@ -4842,6 +4940,11 @@ impl Store {
                 // (otherwise a reconnect drops you out of Vim mid-edit).
                 let vim_mode = self.state.vim_mode;
                 let composer_mode = self.state.composer_mode;
+                // Local-only: the `/resume` picker list is client-fetched via
+                // `session/list`; the server never echoes it in a snapshot, so
+                // `from_snapshot` would drop it. Preserve it across replays
+                // (reconnect/refresh) so an open picker doesn't blank out.
+                let resume_sessions = self.state.resume_sessions.clone();
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
@@ -4877,6 +4980,7 @@ impl Store {
                 state.pinned_scroll = pinned_scroll;
                 state.vim_mode = vim_mode;
                 state.composer_mode = composer_mode;
+                state.resume_sessions = resume_sessions;
                 state.restore_optimistic_user_messages();
                 self.state = state;
                 None
@@ -5223,6 +5327,30 @@ impl Store {
             event.message.clone(),
         ));
         self.state.status = event.message;
+    }
+
+    /// Fold a `session/list` result into `resume_sessions` (newest-first) for
+    /// the `/resume` picker, then let any open menu repaint. Tolerant of missing
+    /// fields: each entry parses as a [`ResumeSessionRow`] whose non-`id` fields
+    /// default, so a short/legacy `SessionInfo` still lands. A payload that is
+    /// not an array of objects leaves the previous list untouched and records a
+    /// status line rather than clearing the picker.
+    fn apply_session_list_result(&mut self, result: SessionListResult) {
+        match serde_json::from_value::<Vec<ResumeSessionRow>>(result.sessions) {
+            Ok(mut rows) => {
+                // Stable sort by `updated_at` DESC. `Option<String>` orders
+                // `None` below `Some`, so `b.cmp(a)` puts the most-recent first
+                // and pushes timestamp-less rows to the end while preserving
+                // their server order (the documented fallback).
+                rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                let count = rows.len();
+                self.state.resume_sessions = rows;
+                self.state.status = format!("Loaded {count} prior session(s) for /resume.");
+            }
+            Err(err) => {
+                self.state.status = format!("Could not parse the session list: {err}");
+            }
+        }
     }
 
     fn apply_session_hydrate_result(&mut self, result: SessionHydrateResult) {
@@ -8566,6 +8694,135 @@ mod tests {
             store.state.pending_clipboard.as_deref(),
             Some("final answer")
         );
+    }
+
+    #[test]
+    fn resume_picker_dispatch_opens_menu_and_lists_sessions() {
+        let mut store = store_with_empty_session();
+
+        let command = store
+            .dispatch_local_action(LocalAction::OpenResumePicker, None)
+            .into_command();
+
+        assert!(
+            matches!(command, Some(AppUiCommand::ListSessions(_))),
+            "/resume must fetch session/list, got: {command:?}"
+        );
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_RESUME),
+            "/resume opens the resume picker menu (rendered Loading until data lands)"
+        );
+    }
+
+    #[test]
+    fn session_list_result_populates_and_sorts_resume_sessions() {
+        let mut store = store_with_empty_session();
+
+        store.apply_client_event(ClientEvent::SessionList(SessionListResult {
+            sessions: serde_json::json!([
+                { "id": "s:old", "message_count": 1, "updated_at": "2026-06-01T00:00:00Z" },
+                { "id": "s:new", "message_count": 9, "title": "Newest", "updated_at": "2026-07-01T00:00:00Z" },
+                { "id": "s:legacy", "message_count": 3 }
+            ]),
+        }));
+
+        let ids: Vec<&str> = store
+            .state
+            .resume_sessions
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        // Newest-first by `updated_at` DESC; the timestamp-less row sorts last
+        // (fallback: server order preserved via a stable sort).
+        assert_eq!(ids, vec!["s:new", "s:old", "s:legacy"]);
+        assert_eq!(
+            store.state.resume_sessions[0].title.as_deref(),
+            Some("Newest")
+        );
+        // A short/legacy entry still parses (missing title/updated_at default).
+        assert_eq!(store.state.resume_sessions[2].message_count, 3);
+    }
+
+    #[test]
+    fn resume_session_switches_and_returns_hydrate_command() {
+        let mut store = store_with_empty_session();
+
+        let command = store
+            .dispatch_local_action(LocalAction::ResumeSession("coding:api:prior".into()), None)
+            .into_command();
+
+        match command {
+            Some(AppUiCommand::HydrateSession(params)) => {
+                assert_eq!(params.session_id, SessionKey("coding:api:prior".into()));
+                assert!(
+                    params.include.iter().any(|section| section == "messages"),
+                    "hydrate must request the messages section"
+                );
+            }
+            other => panic!("expected HydrateSession, got {other:?}"),
+        }
+        // The SessionView was created + selected so the switch is immediate; the
+        // hydrate result then fills in the real transcript.
+        assert_eq!(
+            store
+                .state
+                .active_session()
+                .map(|session| session.id.0.as_str()),
+            Some("coding:api:prior")
+        );
+    }
+
+    #[test]
+    fn resume_session_is_refused_while_a_turn_is_active() {
+        let mut store = store_with_live_reply(TurnId::new(), "streaming");
+        let before = store.state.sessions.len();
+
+        let command = store
+            .dispatch_local_action(LocalAction::ResumeSession("coding:api:other".into()), None)
+            .into_command();
+
+        assert!(command.is_none(), "resume must not hydrate mid-turn");
+        assert_eq!(
+            store.state.sessions.len(),
+            before,
+            "no placeholder session is created while a turn is live"
+        );
+    }
+
+    #[test]
+    fn resume_inline_query_resolves_to_a_session_and_hydrates() {
+        let mut store = store_with_empty_session();
+        store.state.resume_sessions = vec![
+            ResumeSessionRow {
+                id: "coding:api:alpha".into(),
+                title: Some("Alpha deck".into()),
+                message_count: 4,
+                updated_at: None,
+            },
+            ResumeSessionRow {
+                id: "coding:api:bravo".into(),
+                title: None,
+                message_count: 1,
+                updated_at: None,
+            },
+        ];
+
+        // `/resume <query>`: case-insensitive substring over the title here.
+        let command = store
+            .dispatch_local_action(LocalAction::OpenResumePicker, Some("ALPHA"))
+            .into_command();
+
+        match command {
+            Some(AppUiCommand::HydrateSession(params)) => {
+                assert_eq!(params.session_id, SessionKey("coding:api:alpha".into()));
+            }
+            other => panic!("expected inline /resume to hydrate the match, got {other:?}"),
+        }
     }
 
     /// `/lang` with no/unknown code must NOT mutate the process-global locale

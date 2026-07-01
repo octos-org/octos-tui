@@ -5,12 +5,12 @@ use octos_core::ui_protocol::{
     ApprovalDecision, ApprovalId, ApprovalRenderHints, ApprovalRequestedEvent,
     ApprovalScopesListParams, ApprovalTypedDetails, DiffPreviewGetParams, OutputCursor,
     PermissionProfileListParams, PermissionProfileSelection, PermissionProfileSetParams, PreviewId,
-    QuestionId, SessionHydrateParams, SessionOrchestrationEvent, TaskArtifactReadParams,
-    TaskCancelParams, TaskListParams, TaskOutputReadParams, TaskRestartFromNodeParams,
-    TaskRuntimeState, ThreadGraphGetParams, ThreadGraphGetResult, TurnId, TurnInterruptParams,
-    TurnStartParams, TurnStateGetParams, TurnStateGetResult, UiPaneSnapshot,
-    UiProtocolCapabilities, UiRetryBackoff, UserQuestion, UserQuestionAnswer, UserQuestionOption,
-    UserQuestionRequestedEvent, UserQuestionRespondParams, approval_scopes,
+    QuestionId, SessionHydrateParams, SessionListParams, SessionOrchestrationEvent,
+    TaskArtifactReadParams, TaskCancelParams, TaskListParams, TaskOutputReadParams,
+    TaskRestartFromNodeParams, TaskRuntimeState, ThreadGraphGetParams, ThreadGraphGetResult,
+    TurnId, TurnInterruptParams, TurnStartParams, TurnStateGetParams, TurnStateGetResult,
+    UiPaneSnapshot, UiProtocolCapabilities, UiRetryBackoff, UserQuestion, UserQuestionAnswer,
+    UserQuestionOption, UserQuestionRequestedEvent, UserQuestionRespondParams, approval_scopes,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -609,6 +609,10 @@ pub enum AppUiCommand {
     ReadTaskOutput(TaskOutputReadParams),
     ReadTaskArtifact(TaskArtifactReadParams),
     HydrateSession(SessionHydrateParams),
+    /// `session/list` — fetch the user's prior sessions to populate the
+    /// `/resume` picker. A READ (non-mutating) method (see
+    /// [`ProtocolAppUiBackend::readonly_allows_command`]).
+    ListSessions(SessionListParams),
     GetThreadGraph(ThreadGraphGetParams),
     GetTurnState(TurnStateGetParams),
     StartReview(ReviewStartParams),
@@ -695,6 +699,7 @@ impl AppUiCommand {
             Self::ReadTaskOutput(_) => octos_core::ui_protocol::methods::TASK_OUTPUT_READ,
             Self::ReadTaskArtifact(_) => APPUI_METHOD_TASK_ARTIFACT_READ,
             Self::HydrateSession(_) => APPUI_METHOD_SESSION_HYDRATE,
+            Self::ListSessions(_) => octos_core::ui_protocol::methods::SESSION_LIST,
             Self::GetThreadGraph(_) => APPUI_METHOD_THREAD_GRAPH_GET,
             Self::GetTurnState(_) => APPUI_METHOD_TURN_STATE_GET,
             Self::StartReview(_) => APPUI_METHOD_REVIEW_START,
@@ -757,6 +762,23 @@ impl AppUiCommand {
             Self::LocalShellExec { .. } => APPUI_METHOD_LOCAL_SHELL_EXEC,
         }
     }
+}
+
+/// One row in the `/resume` session picker, projected from a `session/list`
+/// entry (the `SessionInfo` shape the server emits: `{id, message_count,
+/// title?}`). `updated_at` is accepted for forward-compat ordering but is
+/// absent from today's `SessionInfo`, so it is `None` in practice. All
+/// non-`id` fields default so a malformed/short entry still parses (the
+/// picker tolerates missing fields rather than dropping the whole list).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResumeSessionRow {
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub message_count: usize,
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3328,6 +3350,12 @@ pub struct AppState {
     /// operator's *local* clipboard — and the store has no terminal handle, so
     /// the work is split across this field.
     pub pending_clipboard: Option<String>,
+    /// Prior sessions fetched via `session/list` to populate the `/resume`
+    /// picker. Local-only client state the server never echoes in a snapshot —
+    /// preserved across snapshot replays (see `apply_event(Snapshot)`), and
+    /// mirrored into `MenuAppSnapshot` so the resume menu can render it. Empty
+    /// until `/resume` triggers the first fetch.
+    pub resume_sessions: Vec<ResumeSessionRow>,
 }
 
 /// M16-G2 per-session lifecycle ledger entry. The TUI keeps these in
@@ -4959,6 +4987,7 @@ impl AppState {
             pending_goal_transition: None,
             exit_requested: false,
             pending_clipboard: None,
+            resume_sessions: Vec::new(),
         }
     }
 

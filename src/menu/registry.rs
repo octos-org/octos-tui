@@ -25,6 +25,8 @@ pub const MENU_LOGIN: &str = "login";
 pub const MENU_PROVIDER: &str = "provider";
 pub const MENU_MODEL: &str = "model";
 pub const MENU_COST: &str = "cost";
+/// `/resume` session picker menu.
+pub const MENU_RESUME: &str = "resume";
 pub const MENU_STATUS: &str = "status";
 pub const MENU_THEME: &str = "theme";
 /// Reasoning/thinking effort selection menu (opened by `/thinking` with no arg).
@@ -153,6 +155,9 @@ pub const APPUI_SKILLS_MENU_METHODS_ANY: &[&str] = &[
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
     APPUI_METHOD_PROFILE_SKILLS_REMOVE,
 ];
+/// `/resume` is gated on the server advertising `session/list`; without it the
+/// picker has no way to fetch prior sessions, so the command hides.
+pub const APPUI_RESUME_MENU_METHODS_ANY: &[&str] = &[methods::SESSION_LIST];
 
 /// M15-E (UPCR-2026-021) required capability feature for the
 /// combined `/agents` `/goal` `/loop` surface. Clients MUST gate
@@ -585,6 +590,16 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_COST)),
         },
         CommandSpec {
+            name: "resume",
+            aliases: &["sessions"],
+            description: "Switch to a prior session and reload its transcript.",
+            category: CommandCategory::Session,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_required_methods_any(APPUI_RESUME_MENU_METHODS_ANY),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::OpenResumePicker),
+        },
+        CommandSpec {
             name: "theme",
             aliases: &[],
             description: "command.theme.desc",
@@ -843,6 +858,55 @@ mod tests {
         };
         assert_eq!(command.name, "help");
         assert_eq!(invocation.args, "theme");
+    }
+
+    #[test]
+    fn resume_command_is_history_safe_and_gated_on_session_list() {
+        let registry = CommandRegistry::with_core_commands();
+
+        // Name + alias resolve, and the verb is history-safe (recorded for
+        // Up-recall, checked on the canonical name so `/sessions` is covered).
+        let resume = registry.find("resume").expect("/resume is registered");
+        assert_eq!(resume.name, "resume");
+        assert!(resume.history_safe(), "/resume must be history-safe");
+        assert_eq!(
+            registry.find("/sessions").map(|command| command.name),
+            Some("resume"),
+            "/sessions must alias /resume"
+        );
+
+        // Hidden until the server advertises `session/list`; visible once it does.
+        let base_caps = CapabilitySet::from_methods([methods::TURN_INTERRUPT]);
+        let list_caps = CapabilitySet::from_methods([methods::SESSION_LIST]);
+        let without = AvailabilityContext {
+            task: TaskActivity::Idle,
+            approval_modal_visible: false,
+            readonly: false,
+            runtime: RuntimeMode::Protocol,
+            connection: ConnectionState::Connected,
+            capabilities: Some(&base_caps),
+            feature_flags: &[],
+            session_open: true,
+        };
+        assert!(
+            !registry
+                .available_commands(&without)
+                .into_iter()
+                .any(|command| command.name == "resume"),
+            "/resume hides without session/list"
+        );
+
+        let with = AvailabilityContext {
+            capabilities: Some(&list_caps),
+            ..without
+        };
+        assert!(
+            registry
+                .available_commands(&with)
+                .into_iter()
+                .any(|command| command.name == "resume"),
+            "/resume appears once session/list is advertised"
+        );
     }
 
     #[test]

@@ -129,6 +129,7 @@ impl CommandSpec {
                 | "model"
                 | "status"
                 | "cost"
+                | "resume"
                 | "theme"
                 | "lang"
                 | "thinking"
@@ -323,6 +324,14 @@ pub enum LocalAction {
     /// `AppState::pending_clipboard`; the event loop emits the OSC 52 escape
     /// sequence so the copy works over SSH against the fleet minis.
     CopyLastReply,
+    /// Open the `/resume` session picker. Fetches `session/list` and opens the
+    /// resume selection menu, which renders `Loading` until the `SessionList`
+    /// result lands and refreshes it (same async pattern as `/cost`).
+    OpenResumePicker,
+    /// Resume a specific session chosen from the `/resume` picker: switch the
+    /// active session to `session_id` and hydrate its prior transcript through
+    /// the existing `session/hydrate` render path.
+    ResumeSession(String),
     Custom(&'static str),
 }
 
@@ -626,6 +635,11 @@ pub struct MenuAppSnapshot<'a> {
     /// Current wheel-scroll mode, so the `/scrollmode` help entry can show
     /// which mode is active before the user toggles blindly.
     pub pinned_scroll: bool,
+    /// Prior sessions fetched via `session/list`, mirrored from
+    /// `AppState::resume_sessions` so the `/resume` picker (`resume_menu`) can
+    /// render one row per session. Empty until the first fetch lands (the menu
+    /// renders `Loading` in that window).
+    pub resume_sessions: &'a [crate::model::ResumeSessionRow],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

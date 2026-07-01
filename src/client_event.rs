@@ -2,8 +2,8 @@ use octos_core::{
     SessionKey,
     app_ui::AppUiEvent,
     ui_protocol::{
-        PermissionProfileSelection, SessionHydrateResult, TaskArtifactReadResult,
-        ThreadGraphGetResult, TurnStateGetResult,
+        PermissionProfileSelection, SessionHydrateResult, SessionListResult,
+        TaskArtifactReadResult, ThreadGraphGetResult, TurnStateGetResult,
     },
 };
 
@@ -32,6 +32,9 @@ pub enum ClientEvent {
     McpConfigMutation(McpConfigMutationClientEvent),
     PermissionProfile(PermissionProfileClientEvent),
     SessionHydrate(SessionHydrateResult),
+    /// Result of a `session/list` request, used to populate the `/resume`
+    /// session picker.
+    SessionList(SessionListResult),
     ReviewStart(ReviewStartResult),
     AuthStatus(AuthStatusClientEvent),
     AuthSendCode(AuthSendCodeClientEvent),
