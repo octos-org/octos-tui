@@ -27,6 +27,8 @@ pub const MENU_MODEL: &str = "model";
 pub const MENU_COST: &str = "cost";
 /// `/resume` session picker menu.
 pub const MENU_RESUME: &str = "resume";
+/// `/rewind` turn picker menu.
+pub const MENU_REWIND: &str = "rewind";
 pub const MENU_STATUS: &str = "status";
 pub const MENU_THEME: &str = "theme";
 /// Reasoning/thinking effort selection menu (opened by `/thinking` with no arg).
@@ -158,6 +160,10 @@ pub const APPUI_SKILLS_MENU_METHODS_ANY: &[&str] = &[
 /// `/resume` is gated on the server advertising `session/list`; without it the
 /// picker has no way to fetch prior sessions, so the command hides.
 pub const APPUI_RESUME_MENU_METHODS_ANY: &[&str] = &[methods::SESSION_LIST];
+/// `/rewind` is gated on the server advertising `session/rollback`; without it
+/// there is no way to drop the later turns, so the command hides.
+pub const APPUI_REWIND_MENU_METHODS_ANY: &[&str] =
+    &[octos_core::ui_protocol::methods::SESSION_ROLLBACK];
 
 /// M15-E (UPCR-2026-021) required capability feature for the
 /// combined `/agents` `/goal` `/loop` surface. Clients MUST gate
@@ -600,6 +606,20 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             entry: CommandEntry::LocalAction(LocalAction::OpenResumePicker),
         },
         CommandSpec {
+            name: "rewind",
+            aliases: &["backtrack"],
+            description: "Go back to an earlier message in this session to edit and resend it.",
+            category: CommandCategory::Session,
+            // `session/rollback` is a MUTATING method, so this uses
+            // `app_ui_mutating` (like `/review`) — it hides in read-only mode —
+            // rather than `/resume`'s `app_ui_read`. Gated on the server
+            // advertising `session/rollback`.
+            availability: CommandAvailability::app_ui_mutating(&[])
+                .with_required_methods_any(APPUI_REWIND_MENU_METHODS_ANY),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::LocalAction(LocalAction::OpenRewindPicker),
+        },
+        CommandSpec {
             name: "theme",
             aliases: &[],
             description: "command.theme.desc",
@@ -906,6 +926,71 @@ mod tests {
                 .into_iter()
                 .any(|command| command.name == "resume"),
             "/resume appears once session/list is advertised"
+        );
+    }
+
+    #[test]
+    fn rewind_command_is_history_safe_and_gated_on_session_rollback() {
+        let registry = CommandRegistry::with_core_commands();
+
+        // Name + alias resolve, and the verb is history-safe (checked on the
+        // canonical name so `/backtrack` is covered too).
+        let rewind = registry.find("rewind").expect("/rewind is registered");
+        assert_eq!(rewind.name, "rewind");
+        assert!(rewind.history_safe(), "/rewind must be history-safe");
+        assert_eq!(
+            registry.find("/backtrack").map(|command| command.name),
+            Some("rewind"),
+            "/backtrack must alias /rewind"
+        );
+
+        // Hidden until the server advertises `session/rollback`; visible once it
+        // does.
+        let base_caps = CapabilitySet::from_methods([methods::TURN_INTERRUPT]);
+        let rollback_caps = CapabilitySet::from_methods([methods::SESSION_ROLLBACK]);
+        let without = AvailabilityContext {
+            task: TaskActivity::Idle,
+            approval_modal_visible: false,
+            readonly: false,
+            runtime: RuntimeMode::Protocol,
+            connection: ConnectionState::Connected,
+            capabilities: Some(&base_caps),
+            feature_flags: &[],
+            session_open: true,
+        };
+        assert!(
+            !registry
+                .available_commands(&without)
+                .into_iter()
+                .any(|command| command.name == "rewind"),
+            "/rewind hides without session/rollback"
+        );
+
+        let with = AvailabilityContext {
+            capabilities: Some(&rollback_caps),
+            ..without
+        };
+        assert!(
+            registry
+                .available_commands(&with)
+                .into_iter()
+                .any(|command| command.name == "rewind"),
+            "/rewind appears once session/rollback is advertised"
+        );
+
+        // `session/rollback` is mutating: unlike `/resume`, `/rewind` uses
+        // `app_ui_mutating`, so it must hide in read-only mode even when the
+        // method is advertised.
+        let readonly = AvailabilityContext {
+            readonly: true,
+            ..with
+        };
+        assert!(
+            !registry
+                .available_commands(&readonly)
+                .into_iter()
+                .any(|command| command.name == "rewind"),
+            "/rewind hides in read-only mode (mutating command)"
         );
     }
 

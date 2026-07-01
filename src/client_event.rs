@@ -2,7 +2,7 @@ use octos_core::{
     SessionKey,
     app_ui::AppUiEvent,
     ui_protocol::{
-        PermissionProfileSelection, SessionHydrateResult, SessionListResult,
+        PermissionProfileSelection, SessionHydrateResult, SessionListResult, SessionRollbackResult,
         TaskArtifactReadResult, ThreadGraphGetResult, TurnStateGetResult,
     },
 };
@@ -35,6 +35,10 @@ pub enum ClientEvent {
     /// Result of a `session/list` request, used to populate the `/resume`
     /// session picker.
     SessionList(SessionListResult),
+    /// Result of a `session/rollback` request (`/rewind`): the later user turns
+    /// were dropped from the session and `thread` carries the trimmed
+    /// transcript to re-render (same shape as `session/hydrate`).
+    SessionRollback(SessionRollbackResult),
     ReviewStart(ReviewStartResult),
     AuthStatus(AuthStatusClientEvent),
     AuthSendCode(AuthSendCodeClientEvent),

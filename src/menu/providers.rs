@@ -35,8 +35,8 @@ use crate::menu::{
         APPUI_PERMISSION_MENU_METHODS_ANY, APPUI_PROVIDER_MENU_METHODS_ANY,
         APPUI_TOOL_SETTINGS_MENU_METHODS_ANY, MENU_COST, MENU_HELP, MENU_KEYMAP, MENU_LOGIN,
         MENU_MCP, MENU_MODEL, MENU_ONBOARD, MENU_ONBOARD_LANGUAGE, MENU_PERMISSIONS, MENU_PROVIDER,
-        MENU_RESUME, MENU_SKILLS, MENU_STATUS, MENU_STATUS_LINE, MENU_THEME, MENU_TITLE,
-        MENU_TOOL_SETTINGS,
+        MENU_RESUME, MENU_REWIND, MENU_SKILLS, MENU_STATUS, MENU_STATUS_LINE, MENU_THEME,
+        MENU_TITLE, MENU_TOOL_SETTINGS,
     },
 };
 use crate::model::{
@@ -71,6 +71,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::Status,
         Provider::Cost,
         Provider::Resume,
+        Provider::Rewind,
         Provider::Model,
         Provider::Llm,
         Provider::Permissions,
@@ -104,6 +105,7 @@ enum Provider {
     Status,
     Cost,
     Resume,
+    Rewind,
     Model,
     Llm,
     Permissions,
@@ -132,6 +134,7 @@ impl MenuProvider for Provider {
             Self::Status => MENU_STATUS,
             Self::Cost => MENU_COST,
             Self::Resume => MENU_RESUME,
+            Self::Rewind => MENU_REWIND,
             Self::Model => MENU_MODEL,
             Self::Llm => MENU_PROVIDER,
             Self::Permissions => MENU_PERMISSIONS,
@@ -160,6 +163,7 @@ impl MenuProvider for Provider {
             Self::Status => MenuBuildResult::Ready(status_menu(ctx)),
             Self::Cost => cost_menu(ctx),
             Self::Resume => resume_menu(ctx),
+            Self::Rewind => rewind_menu(ctx),
             Self::Model => model_menu(ctx),
             Self::Llm => provider_menu(ctx),
             Self::Permissions => permissions_menu(ctx),
@@ -845,6 +849,54 @@ fn resume_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         searchable: true,
         search_placeholder: Some("Search sessions…".into()),
         footer_hint: Some("Enter to resume · Esc to close".into()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// `/rewind` turn picker. Unlike `/resume` this needs no async fetch — the
+/// active session's user turns are already in the local transcript, snapshotted
+/// into `rewind_turns` when the picker opens. Empty → `Unavailable` (nothing to
+/// rewind to); otherwise one selectable row per user turn (newest-first), and
+/// picking a row drops the later turns via `session/rollback` and puts that
+/// message back in the composer to edit and resend. Strings are plain English
+/// (no new i18n keys), mirroring `/resume`.
+fn rewind_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    if ctx.app.rewind_turns.is_empty() {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(MENU_REWIND),
+            title: "Rewind the conversation".into(),
+            message: "Nothing to rewind to in this session".into(),
+            footer_hint: Some("Esc to close".into()),
+        });
+    }
+
+    let items = ctx
+        .app
+        .rewind_turns
+        .iter()
+        .map(|row| {
+            MenuItem::new(
+                format!("rewind:{}", row.num_turns),
+                row.preview.clone(),
+                MenuAction::Local(LocalAction::RewindToTurn {
+                    num_turns: row.num_turns,
+                    prefill: row.prefill.clone(),
+                }),
+            )
+            .with_description(format!("drops {} turn(s)", row.num_turns))
+        })
+        .collect();
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(MENU_REWIND),
+        title: "Rewind the conversation".into(),
+        subtitle: Some("Go back to an earlier message to edit and resend it.".into()),
+        items,
+        tabs: Vec::new(),
+        searchable: true,
+        search_placeholder: Some("Search messages…".into()),
+        footer_hint: Some("Enter to rewind · Esc to close".into()),
         preview: None,
         mode: MenuMode::SingleSelect,
     })
@@ -6606,6 +6658,87 @@ mod tests {
         let bravo = &spec.items[1];
         assert_eq!(bravo.label, "local:bravo");
         assert_eq!(bravo.description.as_deref(), Some("2 messages"));
+    }
+
+    #[test]
+    fn rewind_menu_is_unavailable_without_user_messages() {
+        let capabilities = CapabilitySet::from_methods([methods::SESSION_ROLLBACK]);
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot::default(),
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let result = core_menu_registry().build(&MenuId::from(MENU_REWIND), &ctx);
+        assert!(
+            matches!(
+                result,
+                MenuBuildResult::Unavailable(status) if status.message.contains("Nothing to rewind")
+            ),
+            "an empty rewind_turns must render an Unavailable placeholder"
+        );
+    }
+
+    #[test]
+    fn rewind_menu_renders_a_row_per_user_turn_newest_first() {
+        // Rows are already newest-first (row 0 = newest user message → the
+        // store builds them that way); num_turns is index + 1.
+        let rows = vec![
+            crate::model::RewindTurnRow {
+                preview: "third question".into(),
+                num_turns: 1,
+                prefill: "third question in full".into(),
+            },
+            crate::model::RewindTurnRow {
+                preview: "second question".into(),
+                num_turns: 2,
+                prefill: "second question in full".into(),
+            },
+            crate::model::RewindTurnRow {
+                preview: "first question".into(),
+                num_turns: 3,
+                prefill: "first question in full".into(),
+            },
+        ];
+        let capabilities = CapabilitySet::from_methods([methods::SESSION_ROLLBACK]);
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                rewind_turns: &rows,
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) =
+            core_menu_registry().build(&MenuId::from(MENU_REWIND), &ctx)
+        else {
+            panic!("expected a ready rewind menu");
+        };
+        assert!(spec.searchable, "the picker is searchable");
+        assert_eq!(spec.mode, MenuMode::SingleSelect);
+        assert_eq!(spec.items.len(), 3);
+
+        // Row 0 is the newest user message → num_turns 1 (drop the last
+        // exchange), label is the preview, description reports the drop count,
+        // and the action carries num_turns + the full prefill.
+        let newest = &spec.items[0];
+        assert_eq!(newest.label, "third question");
+        assert_eq!(newest.description.as_deref(), Some("drops 1 turn(s)"));
+        assert!(matches!(
+            &newest.action,
+            MenuAction::Local(LocalAction::RewindToTurn { num_turns, prefill })
+                if *num_turns == 1 && prefill == "third question in full"
+        ));
+
+        // The oldest user message is last → num_turns 3.
+        let oldest = &spec.items[2];
+        assert!(matches!(
+            &oldest.action,
+            MenuAction::Local(LocalAction::RewindToTurn { num_turns, .. }) if *num_turns == 3
+        ));
     }
 
     #[test]
