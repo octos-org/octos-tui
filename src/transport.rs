@@ -251,6 +251,7 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 ///  - delivering a data frame ([`Self::record_frame`]), or
 ///  - surviving at least [`RECONNECT_SHORT_LIVED_WINDOW`] before dying
 ///    (checked in [`Self::record_disconnect`]).
+///
 /// Until proven, a connection that dies young counts as one more consecutive
 /// failure, so a spawn/exit crash-loop keeps backing off exponentially.
 #[derive(Debug, Default)]
@@ -592,10 +593,7 @@ impl WebSocketTransportDriver {
                 tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(request))
                     .await
                     .map_err(|_| {
-                        eyre!(
-                            "connect timed out after {}s",
-                            WS_CONNECT_TIMEOUT.as_secs()
-                        )
+                        eyre!("connect timed out after {}s", WS_CONNECT_TIMEOUT.as_secs())
                     })?
                     .map_err(eyre::Report::from)
             })
@@ -826,10 +824,8 @@ impl StdioTransportDriver {
         // a whole line in memory before any size check can run, so a single
         // giant (or endless, never-newline) stdout line would balloon the
         // process before the MAX_TEXT_FRAME_BYTES check ever saw it.
-        let mut stdout_lines =
-            CappedLineReader::new(BufReader::new(stdout), MAX_TEXT_FRAME_BYTES);
-        let mut stderr_lines =
-            CappedLineReader::new(BufReader::new(stderr), STDIO_STDERR_LINE_CAP);
+        let mut stdout_lines = CappedLineReader::new(BufReader::new(stdout), MAX_TEXT_FRAME_BYTES);
+        let mut stderr_lines = CappedLineReader::new(BufReader::new(stderr), STDIO_STDERR_LINE_CAP);
         let mut stderr_open = true;
         let mut stderr_ring = StderrRing::default();
         let (command_tx, mut command_rx) = mpsc::channel(PROTOCOL_TRANSPORT_QUEUE_CAPACITY);
@@ -1558,6 +1554,7 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ReadTaskArtifact(_)
                 | AppUiCommand::HydrateSession(_)
                 | AppUiCommand::ListSessions(_)
+                | AppUiCommand::ListTasks(_)
                 | AppUiCommand::GetThreadGraph(_)
                 | AppUiCommand::GetTurnState(_)
                 | AppUiCommand::AuthStatus(_)
@@ -1757,7 +1754,25 @@ impl ProtocolAppUiBackend {
             | AppUiCommand::SetToolConfigEnabled(_)
             | AppUiCommand::UpsertToolConfig(_)
             | AppUiCommand::DeleteToolConfig(_)
-            | AppUiCommand::TestToolConfig(_) => {
+            | AppUiCommand::TestToolConfig(_)
+            // M15-era + session/review/model mutations: expected readonly
+            // blocks, labeled like the set above. Without these arms they
+            // fell into the `_` fallback, which mislabels the block as an
+            // "unexpectedly blocked read-style" readonly_policy bug.
+            | AppUiCommand::SessionRollback(_)
+            | AppUiCommand::StartReview(_)
+            | AppUiCommand::SelectModel(_)
+            | AppUiCommand::CancelTask(_)
+            | AppUiCommand::RestartTaskFromNode(_)
+            | AppUiCommand::InterruptAgent(_)
+            | AppUiCommand::CloseAgent(_)
+            | AppUiCommand::SetSessionGoal(_)
+            | AppUiCommand::ClearSessionGoal(_)
+            | AppUiCommand::CreateLoop(_)
+            | AppUiCommand::DeleteLoop(_)
+            | AppUiCommand::PauseLoop(_)
+            | AppUiCommand::ResumeLoop(_)
+            | AppUiCommand::FireLoopNow(_) => {
                 self.queue.push_back(
                     AppUiEvent::Error(AppUiError {
                         code: "readonly".into(),
@@ -3164,8 +3179,33 @@ fn success_response_to_app_event(
                 ))),
             }
         }
+        crate::model::APPUI_METHOD_PROFILE_LLM_FETCH_MODELS => {
+            Ok(Some(profile_llm_fetch_models_event(&result)))
+        }
         _ => Ok(None),
     }
+}
+
+/// `profile/llm/fetch_models` result → status event.
+///
+/// The server result (`{profile_id, family_id, models: [String], reason?}` —
+/// see `raw_profile_llm_fetch_models` in octos-cli's `ui_protocol.rs`)
+/// carries a plain model-id list, not the provider configuration
+/// `ProfileLlmListResult` describes, and this client cannot add new
+/// `ClientEvent` variants, so the outcome surfaces as a status line the way
+/// `approval/respond` acks do. Without this arm the response was silently
+/// dropped and onboarding's "Fetch models" button looked dead on a real
+/// backend.
+fn profile_llm_fetch_models_event(result: &Value) -> ClientEvent {
+    let count = result
+        .get("models")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let message = match result.get("reason").and_then(Value::as_str) {
+        Some(reason) => format!("Fetched {count} models ({reason})"),
+        None => format!("Fetched {count} models"),
+    };
+    AppUiEvent::Status(AppUiStatus { message }).into()
 }
 
 fn autonomy_event(result: AutonomyResult) -> ClientEvent {
@@ -4159,12 +4199,14 @@ impl AppUiBackend for MockAppUiBackend {
                 Ok(())
             }
             AppUiCommand::ProfileLlmFetchModels(_) => {
-                self.queue.push_back(
-                    AppUiEvent::Status(AppUiStatus {
-                        message: "Mock fetch_models returned no additional models".into(),
-                    })
-                    .into(),
-                );
+                // Same event shape as the real decode arm
+                // (profile_llm_fetch_models_event) so the mock cannot mask a
+                // missing real-backend mapping.
+                self.queue
+                    .push_back(profile_llm_fetch_models_event(&serde_json::json!({
+                        "models": [],
+                        "reason": "mock backend",
+                    })));
                 Ok(())
             }
             AppUiCommand::ProfileSkillsList(_) => {
@@ -6389,6 +6431,142 @@ mod tests {
         }
     }
 
+    /// `task/list` is a pure read (M15-E inspection); `--readonly` viewers
+    /// must keep it, like the other task/agent/goal/loop reads.
+    #[test]
+    fn readonly_allows_task_list() {
+        assert!(ProtocolAppUiBackend::readonly_allows_command(
+            &AppUiCommand::ListTasks(TaskListParams {
+                session_id: SessionKey("local:test".into()),
+                topic: None,
+            })
+        ));
+    }
+
+    /// M15-era mutating commands blocked in readonly mode must be labeled as
+    /// ordinary readonly blocks (code "readonly"), not fall into the
+    /// "unexpectedly blocked read-style" readonly_policy arm that claims a
+    /// policy bug.
+    #[test]
+    fn readonly_blocks_m15_mutations_with_proper_label() {
+        let session_id = SessionKey("local:test".into());
+        let mutations = [
+            AppUiCommand::SessionRollback(octos_core::ui_protocol::SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            }),
+            AppUiCommand::StartReview(ReviewStartParams {
+                session_id: session_id.clone(),
+                profile_id: None,
+                turn_id: None,
+                target: None,
+                prompt: None,
+                instructions: None,
+                delivery: None,
+            }),
+            AppUiCommand::SelectModel(ModelSelectParams {
+                session_id: session_id.clone(),
+                model: "deepseek-v4-pro".into(),
+                provider: None,
+                route: None,
+            }),
+            AppUiCommand::CancelTask(TaskCancelParams {
+                task_id: TaskId::new(),
+                session_id: Some(session_id.clone()),
+                profile_id: None,
+            }),
+            AppUiCommand::RestartTaskFromNode(TaskRestartFromNodeParams {
+                session_id: Some(session_id.clone()),
+                task_id: TaskId::new(),
+                node_id: Some("node-1".into()),
+                profile_id: None,
+            }),
+            AppUiCommand::InterruptAgent(crate::model::AgentInterruptParams {
+                session_id: session_id.clone(),
+                agent_id: "ag-1".into(),
+            }),
+            AppUiCommand::CloseAgent(crate::model::AgentCloseParams {
+                session_id: session_id.clone(),
+                agent_id: "ag-1".into(),
+            }),
+            AppUiCommand::SetSessionGoal(crate::model::SessionGoalSetParams {
+                session_id: session_id.clone(),
+                profile_id: None,
+                objective: "goal".into(),
+                status: None,
+                token_budget: None,
+                transition_actor: None,
+                action: Default::default(),
+            }),
+            AppUiCommand::ClearSessionGoal(crate::model::SessionGoalClearParams {
+                session_id: session_id.clone(),
+                profile_id: None,
+            }),
+            AppUiCommand::CreateLoop(crate::model::LoopCreateParams {
+                session_id: session_id.clone(),
+                profile_id: None,
+                prompt: "poll".into(),
+                mode: crate::model::LoopMode::FixedInterval,
+                interval_seconds: Some(60),
+            }),
+            AppUiCommand::DeleteLoop(crate::model::LoopIdParams {
+                session_id: session_id.clone(),
+                loop_id: "loop-1".into(),
+            }),
+            AppUiCommand::PauseLoop(crate::model::LoopIdParams {
+                session_id: session_id.clone(),
+                loop_id: "loop-1".into(),
+            }),
+            AppUiCommand::ResumeLoop(crate::model::LoopIdParams {
+                session_id: session_id.clone(),
+                loop_id: "loop-1".into(),
+            }),
+            AppUiCommand::FireLoopNow(crate::model::LoopIdParams {
+                session_id: session_id.clone(),
+                loop_id: "loop-1".into(),
+            }),
+        ];
+
+        for command in mutations {
+            let method = command.method().to_string();
+            assert!(
+                !ProtocolAppUiBackend::readonly_allows_command(&command),
+                "{method} must be blocked in read-only mode"
+            );
+
+            let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+                endpoint: Some(AppUiEndpoint::websocket(
+                    "wss://example.test/ui-protocol",
+                    None,
+                )),
+                readonly: true,
+                ..AppUiLaunch::default()
+            });
+            backend
+                .send(command)
+                .expect("readonly block is reported as an app event");
+            let event = backend.next_event().expect("poll").expect("queued event");
+            let AppUiEvent::Error(error) = unwrap_app_event(event) else {
+                panic!("expected readonly error event for {method}");
+            };
+            assert_eq!(
+                error.code, "readonly",
+                "{method} must use the ordinary readonly label, got {}: {}",
+                error.code, error.message
+            );
+            assert!(
+                error.message.contains(&method),
+                "message names the blocked method: {}",
+                error.message
+            );
+            assert!(
+                !error.message.contains("unexpectedly"),
+                "{method} is an expected block, not a policy bug: {}",
+                error.message
+            );
+        }
+    }
+
     #[test]
     fn protocol_notification_maps_to_app_event() {
         let turn_id = TurnId::new();
@@ -6757,8 +6935,7 @@ mod tests {
         // accumulate unboundedly. A small BufReader capacity exercises the
         // incremental chunked path a real pipe produces.
         let input = vec![b'b'; 256 * 1024];
-        let mut reader =
-            CappedLineReader::new(BufReader::with_capacity(64, &input[..]), 1024);
+        let mut reader = CappedLineReader::new(BufReader::with_capacity(64, &input[..]), 1024);
 
         match reader.next_line().await.expect("read") {
             CappedLine::TooLong { discarded } => {
@@ -6916,7 +7093,10 @@ mod tests {
             Some("diagnostic".into()),
         );
         assert!(message.contains("wait failed"));
-        assert!(message.contains("diagnostic"), "wait errors count as failure");
+        assert!(
+            message.contains("diagnostic"),
+            "wait errors count as failure"
+        );
     }
 
     // --- stdio driver end-to-end: exit race + stderr tail + oversized skip ---
@@ -6982,7 +7162,10 @@ mod tests {
             drive_stdio_until_disconnect("echo done; echo routine-noise >&2; exit 0");
 
         assert_eq!(frames, vec!["done".to_string()]);
-        assert!(message.contains("exited with"), "status reported: {message}");
+        assert!(
+            message.contains("exited with"),
+            "status reported: {message}"
+        );
         assert!(
             !message.contains("routine-noise"),
             "clean exits stay terse: {message}"
@@ -7055,6 +7238,100 @@ mod tests {
                 .as_ref()
                 .map(|endpoint| endpoint.label().to_string()),
             Some("octos serve --stdio".into())
+        );
+    }
+
+    /// `profile/llm/fetch_models` responses must produce an event: this arm
+    /// was missing, so the result was silently dropped and onboarding's
+    /// "Fetch models" button appeared dead against a real backend (the mock
+    /// faked a status, masking it).
+    #[test]
+    fn protocol_decodes_profile_llm_fetch_models_result_as_status() {
+        let mut exchange = ProtocolExchange::default();
+        let request = exchange
+            .build_tracked_request(AppUiCommand::ProfileLlmFetchModels(
+                crate::model::ProfileLlmFetchModelsParams {
+                    profile_id: Some("ada".into()),
+                    selection: Default::default(),
+                    api_key: None,
+                },
+            ))
+            .expect("request builds");
+
+        // Server result shape (see raw_profile_llm_fetch_models in
+        // octos-cli's ui_protocol.rs): profile_id/family_id/models[String]
+        // plus an optional reason. It does NOT carry provider config, so it
+        // must not be decoded as ProfileLlmListResult.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": {
+                "profile_id": "ada",
+                "family_id": "openai",
+                "models": ["gpt-a", "gpt-b", "gpt-c"],
+            }
+        })
+        .to_string();
+
+        let event = exchange
+            .decode_rpc_text(&response)
+            .expect("response decodes")
+            .expect("fetch_models result must yield an event, not be dropped");
+        let AppUiEvent::Status(status) = unwrap_app_event(event) else {
+            panic!("expected a status event for fetch_models");
+        };
+        assert!(
+            status.message.contains("Fetched 3 models"),
+            "count surfaces: {}",
+            status.message
+        );
+        assert!(exchange.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn protocol_fetch_models_status_reports_server_reason() {
+        let event = profile_llm_fetch_models_event(&json!({
+            "profile_id": "ada",
+            "family_id": "openai",
+            "models": [],
+            "reason": "no_api_key",
+        }));
+        let AppUiEvent::Status(status) = unwrap_app_event(event) else {
+            panic!("expected a status event");
+        };
+        assert!(
+            status.message.contains("Fetched 0 models") && status.message.contains("no_api_key"),
+            "reason surfaces: {}",
+            status.message
+        );
+    }
+
+    /// The mock backend must produce the same event shape as the real decode
+    /// arm so it cannot mask a missing real-backend mapping again.
+    #[test]
+    fn mock_fetch_models_matches_real_decode_arm_shape() {
+        let mut backend = MockAppUiBackend::new(AppUiLaunch::default());
+        backend
+            .send(AppUiCommand::ProfileLlmFetchModels(
+                crate::model::ProfileLlmFetchModelsParams {
+                    profile_id: Some("ada".into()),
+                    selection: Default::default(),
+                    api_key: None,
+                },
+            ))
+            .expect("mock accepts fetch_models");
+
+        let event = backend
+            .next_event()
+            .expect("poll mock")
+            .expect("mock emits an event");
+        let AppUiEvent::Status(status) = unwrap_app_event(event) else {
+            panic!("expected a status event from the mock");
+        };
+        assert!(
+            status.message.starts_with("Fetched 0 models"),
+            "mock aligns with the real arm: {}",
+            status.message
         );
     }
 
