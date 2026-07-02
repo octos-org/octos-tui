@@ -3413,12 +3413,15 @@ pub struct AppState {
     /// `rewind_menu` can render one row per turn. Local-only client state the
     /// server never echoes — preserved across snapshot replays.
     pub rewind_turns: Vec<RewindTurnRow>,
-    /// The full text of the user message chosen in the `/rewind` picker,
-    /// stashed while `session/rollback` is in flight. When the `SessionRollback`
-    /// result lands it is placed back into the composer (so the user can edit
-    /// and resend that turn) and cleared. Local-only, preserved across snapshot
-    /// replays.
-    pub pending_rewind_prefill: Option<String>,
+    /// The full text of the user message chosen in the `/rewind` picker, keyed
+    /// by the session the rewind was issued in, stashed while
+    /// `session/rollback` is in flight. When the `SessionRollback` result for
+    /// THAT session lands it is placed back into the composer (so the user can
+    /// edit and resend that turn) — unless the user switched sessions
+    /// meanwhile, in which case it becomes that session's composer draft
+    /// instead of clobbering the live composer. Local-only, preserved across
+    /// snapshot replays.
+    pub pending_rewind_prefill: Option<(SessionKey, String)>,
 }
 
 /// M16-G2 per-session lifecycle ledger entry. The TUI keeps these in

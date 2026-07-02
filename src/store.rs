@@ -1211,9 +1211,11 @@ impl Store {
                     None
                 }
             }
-            LocalAction::RewindToTurn { num_turns, prefill } => {
-                self.rewind_to_turn_command(num_turns, prefill)
-            }
+            LocalAction::RewindToTurn {
+                session_id,
+                num_turns,
+                prefill,
+            } => self.rewind_to_turn_command(session_id, num_turns, prefill),
             LocalAction::Custom(name) => {
                 self.state.status = t!("status.local_action_not_wired", name = name).into_owned();
                 None
@@ -1329,11 +1331,25 @@ impl Store {
     }
 
     /// Handle a `/rewind` pick: drop the last `num_turns` user turns from the
-    /// active session via `session/rollback`, stashing `prefill` so the chosen
-    /// message can be restored to the composer once the rollback result lands
-    /// (rewind-and-edit). Guards against rewinding mid-turn (same guard as
-    /// `/resume`): a live turn means refuse with a status line and no command.
-    fn rewind_to_turn_command(&mut self, num_turns: u32, prefill: String) -> Option<AppUiCommand> {
+    /// active session via `session/rollback`, stashing `prefill` (keyed by the
+    /// session) so the chosen message can be restored to the composer once the
+    /// rollback result lands (rewind-and-edit). Guards, in order:
+    /// - a live turn means refuse with a status line and no command (same
+    ///   guard as `/resume`);
+    /// - `picked_session_id` (the session the picker rows were built from)
+    ///   must still be the active session — the user may have switched
+    ///   sessions while the picker was open, and a stale pick must never roll
+    ///   back the wrong session;
+    /// - the pick must still match the CURRENT transcript: the picker rows are
+    ///   a snapshot, so if the transcript changed underneath (hydrate, another
+    ///   rollback, new turns) the carried `num_turns`/`prefill` pair may now
+    ///   point at a different turn. Recompute and require an exact match.
+    fn rewind_to_turn_command(
+        &mut self,
+        picked_session_id: String,
+        num_turns: u32,
+        prefill: String,
+    ) -> Option<AppUiCommand> {
         if self.state.active_turn().is_some() {
             self.state.status =
                 "Finish or stop the active turn before rewinding the conversation.".into();
@@ -1347,7 +1363,20 @@ impl Store {
             self.state.status = "No active session to rewind.".into();
             return None;
         };
-        self.state.pending_rewind_prefill = Some(prefill);
+        if session_id.0 != picked_session_id {
+            self.state.status =
+                "Rewind pick belongs to another session — reopen /rewind.".into();
+            return None;
+        }
+        let fresh_rows = self.collect_rewind_turns();
+        let pick_is_current = fresh_rows
+            .get((num_turns as usize).saturating_sub(1))
+            .is_some_and(|row| row.prefill == prefill);
+        if !pick_is_current {
+            self.state.status = "Transcript changed — reopen /rewind.".into();
+            return None;
+        }
+        self.state.pending_rewind_prefill = Some((session_id.clone(), prefill));
         self.state.status = format!("Rewinding {num_turns} turn(s)…");
         Some(AppUiCommand::SessionRollback(SessionRollbackParams {
             session_id,
@@ -3470,6 +3499,14 @@ impl Store {
             self.state.active_menu = None;
             return;
         };
+        // The `/rewind` rows are a transcript snapshot taken at picker open;
+        // any refresh while the picker is up (session switch, hydrate landing,
+        // rollback result) must recompute them from the CURRENT active
+        // transcript so the menu never offers rows for turns that no longer
+        // exist (dispatch re-validates too, but stale rows should not render).
+        if frame.id.as_str() == crate::menu::registry::MENU_REWIND {
+            self.state.rewind_turns = self.collect_rewind_turns();
+        }
         let path = self.state.menu_stack.path();
         let app = self.menu_app_snapshot();
         let availability = self.state.availability_context();
@@ -5484,11 +5521,12 @@ impl Store {
 
     /// Apply a `session/rollback` result (`/rewind`): re-render the trimmed
     /// transcript through the exact same path `session/hydrate` uses, then
-    /// restore the chosen user message to the composer (the stashed
+    /// restore the chosen user message (the stashed, session-keyed
     /// `pending_rewind_prefill`) so the user can edit and resend it. The stash
     /// is cleared and the status reports how many turns were dropped.
     fn apply_session_rollback_result(&mut self, result: SessionRollbackResult) {
         let dropped = result.dropped_turns;
+        let rolled_session = result.thread.session_id.clone();
         // The server returns the trimmed session as a `SessionHydrateResult`, so
         // reuse the hydrate render path verbatim to repaint the transcript.
         self.apply_session_hydrate_result(result.thread);
@@ -5498,12 +5536,45 @@ impl Store {
         // `refresh_active_menu_if_open`) it would otherwise offer already-dropped
         // turns. Recomputing keeps `rewind_turns` consistent with the transcript.
         self.state.rewind_turns = self.collect_rewind_turns();
-        // Put the chosen message back in the composer to edit and resend
-        // (rewind-and-edit), using the same composer-set mechanism as
-        // `LocalAction::EditComposer`.
-        if let Some(prefill) = self.state.pending_rewind_prefill.take() {
-            self.state.set_composer_text(prefill);
-            self.state.focus = FocusPane::Composer;
+        // Rewind-and-edit: only the rollback we actually stashed for may consume
+        // the stash (a result for a DIFFERENT session leaves it in place for the
+        // matching result). The prefill lands in the LIVE composer only when the
+        // rewound session is still the active one — if the user switched
+        // sessions while the rollback was in flight it becomes that session's
+        // composer draft (restored on switch-back) instead of clobbering the
+        // composer of whatever session is active now.
+        if self
+            .state
+            .pending_rewind_prefill
+            .as_ref()
+            .is_some_and(|(key, _)| key == &rolled_session)
+        {
+            let (key, prefill) = self
+                .state
+                .pending_rewind_prefill
+                .take()
+                .expect("checked above");
+            let key_is_active = self
+                .state
+                .active_session()
+                .is_some_and(|session| session.id == key);
+            if key_is_active {
+                // Same composer-set mechanism as `LocalAction::EditComposer`.
+                self.state.set_composer_text(prefill);
+                self.state.focus = FocusPane::Composer;
+            } else if let Some(draft) = self
+                .state
+                .composer_drafts
+                .iter_mut()
+                .find(|draft| draft.session_id == key)
+            {
+                draft.text = prefill;
+            } else if !prefill.is_empty() {
+                self.state.composer_drafts.push(crate::model::ComposerDraft {
+                    session_id: key,
+                    text: prefill,
+                });
+            }
         }
         self.state.status = format!("Rewound {dropped} turn(s) — edit and resend");
     }
@@ -9365,13 +9436,15 @@ mod tests {
 
     #[test]
     fn rewind_to_turn_returns_rollback_command_and_stashes_prefill() {
-        let mut store = store_with_empty_session();
+        let mut store = store_with_user_turns(&["first question", "second question"]);
 
+        // Rows are newest-first: num_turns 2 targets "first question".
         let command = store
             .dispatch_local_action(
                 LocalAction::RewindToTurn {
+                    session_id: "local:test".into(),
                     num_turns: 2,
-                    prefill: "edit me and resend".into(),
+                    prefill: "first question".into(),
                 },
                 None,
             )
@@ -9385,9 +9458,9 @@ mod tests {
             other => panic!("expected SessionRollback, got {other:?}"),
         }
         assert_eq!(
-            store.state.pending_rewind_prefill.as_deref(),
-            Some("edit me and resend"),
-            "the chosen message is stashed for restore after the rollback lands"
+            store.state.pending_rewind_prefill,
+            Some((SessionKey("local:test".into()), "first question".into())),
+            "the chosen message is stashed (keyed by session) for restore after the rollback lands"
         );
     }
 
@@ -9398,6 +9471,7 @@ mod tests {
         let command = store
             .dispatch_local_action(
                 LocalAction::RewindToTurn {
+                    session_id: "local:test".into(),
                     num_turns: 1,
                     prefill: "nope".into(),
                 },
@@ -9412,6 +9486,167 @@ mod tests {
         );
     }
 
+    /// A pick carried from a picker built for ANOTHER session (the user
+    /// switched sessions while the picker was open) must be refused: rolling
+    /// back `num_turns` of whatever session is active now would drop the
+    /// wrong turns.
+    #[test]
+    fn rewind_pick_bound_to_another_session_is_refused() {
+        let mut store = store_with_user_turns(&["first question", "second question"]);
+
+        let command = store
+            .dispatch_local_action(
+                LocalAction::RewindToTurn {
+                    session_id: "local:other".into(),
+                    num_turns: 1,
+                    prefill: "second question".into(),
+                },
+                None,
+            )
+            .into_command();
+
+        assert!(
+            command.is_none(),
+            "a pick bound to another session must not roll back the active one"
+        );
+        assert!(store.state.pending_rewind_prefill.is_none());
+        assert!(
+            store.state.status.contains("another session"),
+            "the refusal is surfaced: {}",
+            store.state.status
+        );
+    }
+
+    /// The picker rows are a snapshot; if the transcript changed while the
+    /// picker was open (hydrate landing, another rollback), the carried
+    /// `num_turns`/`prefill` pair may point at a DIFFERENT turn now. Dispatch
+    /// re-validates against the current transcript and refuses on mismatch.
+    #[test]
+    fn rewind_pick_is_refused_when_transcript_changed_under_the_picker() {
+        let mut store = store_with_user_turns(&["first question", "second question"]);
+
+        // The pick says "drop 1 turn to re-edit 'second question'", but a new
+        // exchange landed since the rows were built — num_turns 1 now targets
+        // "third question".
+        store.state.sessions[0]
+            .messages
+            .push(Message::user("third question"));
+        store.state.sessions[0]
+            .messages
+            .push(Message::assistant("ok"));
+
+        let command = store
+            .dispatch_local_action(
+                LocalAction::RewindToTurn {
+                    session_id: "local:test".into(),
+                    num_turns: 1,
+                    prefill: "second question".into(),
+                },
+                None,
+            )
+            .into_command();
+
+        assert!(
+            command.is_none(),
+            "a stale pick must not roll back a different turn than the user chose"
+        );
+        assert!(store.state.pending_rewind_prefill.is_none());
+        assert!(
+            store.state.status.contains("Transcript changed"),
+            "the refusal is surfaced: {}",
+            store.state.status
+        );
+    }
+
+    /// While the `/rewind` picker is open, any menu refresh recomputes the
+    /// rows from the CURRENT transcript so the picker never renders rows for
+    /// turns that no longer exist.
+    #[test]
+    fn rewind_rows_recompute_on_menu_refresh() {
+        let mut store =
+            store_with_user_turns(&["first question", "second question", "third question"]);
+        store.dispatch_local_action(LocalAction::OpenRewindPicker, None);
+        assert_eq!(store.state.rewind_turns.len(), 3);
+
+        // The transcript shrinks underneath the open picker (e.g. a hydrate
+        // replaced it).
+        store.state.sessions[0].messages = vec![Message::user("first question")];
+        store.refresh_active_menu();
+
+        assert_eq!(
+            store.state.rewind_turns.len(),
+            1,
+            "the open picker's rows must track the current transcript"
+        );
+        assert_eq!(store.state.rewind_turns[0].prefill, "first question");
+    }
+
+    /// A rollback result landing AFTER the user switched sessions must not
+    /// clobber the now-active session's composer: the prefill becomes the
+    /// rewound session's composer draft instead (restored on switch-back).
+    #[test]
+    fn rollback_result_after_session_switch_lands_prefill_as_draft() {
+        use crate::client_event::ClientEvent;
+
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.sessions[0].messages = vec![
+            Message::user("first question"),
+            Message::assistant("ok"),
+        ];
+        // The rewind was issued in A…
+        store.state.pending_rewind_prefill =
+            Some((SessionKey("local:a".into()), "second question".into()));
+        // …but the user switched to B before the result landed.
+        store.state.switch_selected_session(1);
+        store.state.set_composer_text("typing in B");
+
+        store.apply_client_event(ClientEvent::SessionRollback(SessionRollbackResult {
+            dropped_turns: 1,
+            thread: SessionHydrateResult {
+                session_id: SessionKey("local:a".into()),
+                cursor: octos_core::ui_protocol::UiCursor {
+                    stream: "local:a".into(),
+                    seq: 1,
+                },
+                context: None,
+                context_state: None,
+                messages: Some(vec![HydratedMessage {
+                    seq: 1,
+                    role: "user".into(),
+                    content: "first question".into(),
+                    turn_id: None,
+                    thread_id: None,
+                    client_message_id: None,
+                    persisted_at: chrono::Utc::now(),
+                    message_id: None,
+                    source: None,
+                    media: Vec::new(),
+                }]),
+                threads: None,
+                turns: None,
+                pending_approvals: None,
+                pending_questions: None,
+                replayed_envelopes: None,
+            },
+        }));
+
+        assert_eq!(
+            store.state.composer, "typing in B",
+            "the active session's composer must not be clobbered by A's prefill"
+        );
+        assert_eq!(
+            store
+                .state
+                .composer_drafts
+                .iter()
+                .find(|draft| draft.session_id == SessionKey("local:a".into()))
+                .map(|draft| draft.text.as_str()),
+            Some("second question"),
+            "the prefill lands as A's composer draft instead"
+        );
+        assert!(store.state.pending_rewind_prefill.is_none());
+    }
+
     #[test]
     fn session_rollback_result_applies_trimmed_thread_and_prefills_composer() {
         use crate::client_event::ClientEvent;
@@ -9419,7 +9654,8 @@ mod tests {
         let mut store = store_with_user_turns(&["first question", "second question"]);
         let session_id = store.state.sessions[0].id.clone();
         // Simulate the pending pick: RewindToTurn stashed the chosen message.
-        store.state.pending_rewind_prefill = Some("second question".into());
+        store.state.pending_rewind_prefill =
+            Some((SessionKey("local:test".into()), "second question".into()));
 
         // Server drops 1 user turn and returns the trimmed transcript (the first
         // exchange only), shaped exactly like a session/hydrate result.
@@ -9485,7 +9721,8 @@ mod tests {
             "the open picker snapshots one row per user turn"
         );
         // Simulate the pending pick of turn 3 (drop the last two exchanges).
-        store.state.pending_rewind_prefill = Some("second question".into());
+        store.state.pending_rewind_prefill =
+            Some((SessionKey("local:test".into()), "second question".into()));
 
         // Server drops 2 user turns and returns the trimmed transcript (the first
         // exchange only), shaped like a session/hydrate result.
