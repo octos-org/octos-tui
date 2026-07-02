@@ -343,8 +343,12 @@ pub enum LocalAction {
     /// `/rewind` picker. `num_turns` trailing user turns are dropped server-side
     /// via `session/rollback`; `prefill` (that turn's full text) is stashed and,
     /// once the rollback result lands, put back in the composer to edit and
-    /// resend (rewind-and-edit).
+    /// resend (rewind-and-edit). `session_id` is the session the picker rows
+    /// were built from: dispatch refuses when it no longer matches the active
+    /// session (the user switched sessions while the picker was open), so a
+    /// stale pick can never roll back the wrong session's turns.
     RewindToTurn {
+        session_id: String,
         num_turns: u32,
         prefill: String,
     },
