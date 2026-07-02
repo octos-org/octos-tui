@@ -2013,7 +2013,21 @@ impl Store {
                 self.state.onboarding.last_message =
                     Some(t!("status.profile_updated").into_owned());
                 self.state.status = t!("status.onboarding_profile_updated").into_owned();
-                self.refresh_active_menu_and_advance();
+                // Setting the profile id can swap the wizard from the
+                // local-profile step to the provider (LLM config) step IN
+                // PLACE on the same menu frame — the same transition the
+                // ProfileLocalCreate result path handles. A blind advance
+                // would leave the stale row index pointing at an arbitrary
+                // provider row (e.g. API key), so anchor the cursor on the
+                // provider start row like that path does; when the rebuilt
+                // menu has no provider rows (no step swap happened), keep the
+                // wizard's usual advance-to-next-row behavior.
+                if self.state.menu_stack.is_active() {
+                    self.refresh_active_menu();
+                    if !self.focus_provider_start_row() {
+                        self.advance_active_menu_selection();
+                    }
+                }
                 // The wizard just advanced to provider setup for this profile;
                 // hydrate its saved provider so the rows reflect server truth.
                 self.onboarding_hydrate_saved_provider_command()
@@ -11009,6 +11023,69 @@ mod tests {
         assert_eq!(
             spec.items[selected].id, "onboard.provider.family",
             "fresh provider step must land on Model family, not the stale row carried over from the local-profile Continue button"
+        );
+    }
+
+    /// The same in-place local-profile→provider step swap happens when the
+    /// profile id is set directly (`/onboard profile <id>` → SetProfileId),
+    /// not just via the ProfileLocalCreate result — the cursor must be
+    /// re-anchored on the provider start row on this path too, not blindly
+    /// advanced from the stale local-step index.
+    #[test]
+    fn provider_step_opens_on_model_family_after_set_profile_id() {
+        let mut store = protocol_store_without_sessions();
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[
+                        crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+                        crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+                    ],
+                    &[],
+                ),
+            },
+            message: "Octos UI capabilities refreshed".into(),
+        }));
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected local-profile onboarding menu");
+        };
+        let create_index = spec
+            .items
+            .iter()
+            .position(|item| item.id == "onboard.local.create")
+            .expect("local create row");
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("active menu")
+            .selected_index = create_index;
+
+        // `/onboard profile ada-server`: the wizard swaps to the provider step
+        // in place on the same frame.
+        store.dispatch_onboarding_action(
+            OnboardingAction::SetProfileId("ada-server".into()),
+            None,
+        );
+
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected provider setup menu after profile id set");
+        };
+        assert!(
+            spec.items
+                .iter()
+                .any(|item| item.id == "onboard.provider.family"),
+            "expected provider step with the Model family row"
+        );
+        let selected = store
+            .state
+            .menu_stack
+            .active()
+            .expect("active menu")
+            .selected_index;
+        assert_eq!(
+            spec.items[selected].id, "onboard.provider.family",
+            "the provider step must land on Model family, not a stale/advanced index"
         );
     }
 
