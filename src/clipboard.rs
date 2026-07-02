@@ -85,6 +85,16 @@ pub fn osc52_copy_sequence_capped(text: &str, tmux: bool) -> (String, bool) {
     (sequence, truncated)
 }
 
+/// How many CHARACTERS of `text` will actually reach the clipboard once the
+/// OSC 52 input cap is applied, or `None` when the whole text fits. Lets the
+/// `/copy` status line report a truncated copy honestly instead of claiming
+/// the full length (the emit-time cap in [`osc52_copy_sequence_capped`] is
+/// otherwise invisible to the caller that stages the status).
+pub fn osc52_truncated_chars(text: &str) -> Option<usize> {
+    let (kept, truncated) = truncate_at_char_boundary(text, OSC52_MAX_INPUT_BYTES);
+    truncated.then(|| kept.chars().count())
+}
+
 /// Truncate `text` to at most `max_bytes`, backing off to a UTF-8 char
 /// boundary so the kept head is always valid UTF-8. Returns the (possibly
 /// shortened) slice and whether anything was dropped.

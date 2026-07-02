@@ -1658,6 +1658,21 @@ impl ProtocolAppUiBackend {
                     self.mark_disconnected(
                         "UI protocol disconnected; reconnect will retry on next send/read.",
                     );
+                } else if code == "frame_too_large" {
+                    // A skipped over-cap stdio line may have BEEN the response
+                    // to an in-flight request — its id is unknowable (the
+                    // frame was discarded before decode), so the matching
+                    // `pending_requests` entry would otherwise leak forever
+                    // and repeated large responses would wedge sends at
+                    // MAX_PENDING_REQUESTS. Cancel pending requests like the
+                    // disconnect path does, but keep the connection up.
+                    let cancelled = self.protocol.cancel_pending_requests(
+                        "response may have been discarded (frame too large)",
+                    );
+                    self.queue
+                        .extend(cancelled.into_iter().filter_map(|cancelled| {
+                            (!cancelled.is_capabilities_probe()).then_some(cancelled.event.into())
+                        }));
                 }
                 self.queue
                     .push_back(AppUiEvent::Error(AppUiError { code, message }).into());
@@ -7585,6 +7600,55 @@ mod tests {
         assert!(error.message.contains(methods::DIFF_PREVIEW_GET));
         assert!(error.message.contains(&request.id));
         assert!(error.message.contains("transport closed for test"));
+    }
+
+    #[test]
+    fn skipped_oversized_frame_cancels_pending_requests_without_disconnect() {
+        // codex P2 (deep-review wave): a skipped over-cap stdio line may have
+        // BEEN the response to an in-flight request — its id is unknowable, so
+        // the pending entry leaked forever and repeated large responses wedged
+        // sends at MAX_PENDING_REQUESTS. The skip now cancels pending requests
+        // like the disconnect path does, while keeping the connection up.
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        let request = backend
+            .build_tracked_request(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+            }))
+            .expect("request builds");
+        backend.mark_connected("wss://example.test/ui-protocol");
+
+        let first = backend
+            .handle_transport_event(stdio_frame_too_large_skipped_event(2_000_000))
+            .expect("event handled")
+            .expect("event surfaced");
+
+        assert!(backend.protocol.pending_requests.is_empty());
+        let AppUiEvent::Error(error) = unwrap_app_event(first) else {
+            panic!("expected cancellation error first");
+        };
+        assert_eq!(error.code, "request_cancelled");
+        assert!(error.message.contains(&request.id));
+
+        let next = backend.queue.pop_front().expect("frame_too_large error");
+        let AppUiEvent::Error(error) = unwrap_app_event(next) else {
+            panic!("expected frame_too_large error");
+        };
+        assert_eq!(error.code, "frame_too_large");
+        assert!(
+            matches!(backend.connection_state, ProtocolConnectionState::Connected),
+            "the child stays alive; a skipped frame must not disconnect"
+        );
+        assert!(
+            backend.queue.is_empty(),
+            "no disconnect status may be queued"
+        );
     }
 
     #[test]

@@ -176,6 +176,13 @@ impl ComposerHistory {
     /// bind `path` as the persistence target for subsequent [`Self::record`].
     pub fn load(path: &Path) -> Self {
         let mut entries = Vec::new();
+        // Oversized entries are skipped in memory; remember that we did and
+        // compact the file below even when the count stays under the cap —
+        // otherwise a pre-existing bloated line is re-read (and re-skipped)
+        // on every startup forever. Unparseable/torn lines deliberately do
+        // NOT trigger a rewrite: they can be a concurrent writer's partial
+        // append, and rewriting would discard it.
+        let mut dropped_oversized = false;
         if let Ok(contents) = std::fs::read_to_string(path) {
             for line in contents.lines() {
                 let line = line.trim();
@@ -183,9 +190,14 @@ impl ComposerHistory {
                     continue;
                 }
                 if let Ok(entry) = serde_json::from_str::<String>(line) {
-                    if !entry.trim().is_empty() && entry.len() <= MAX_ENTRY_BYTES {
-                        entries.push(entry);
+                    if entry.trim().is_empty() {
+                        continue;
                     }
+                    if entry.len() > MAX_ENTRY_BYTES {
+                        dropped_oversized = true;
+                        continue;
+                    }
+                    entries.push(entry);
                 }
             }
         }
@@ -200,7 +212,7 @@ impl ComposerHistory {
         // this feature, or by another tool); tighten it on load so stored
         // prompts are owner-only immediately, not only after the next append.
         tighten_permissions(path);
-        if oversized {
+        if oversized || dropped_oversized {
             let _ = rewrite_history_file(path, &entries);
         }
         Self {
@@ -427,6 +439,32 @@ mod tests {
         std::fs::write(&path, body).unwrap();
         let hist = ComposerHistory::load(&path);
         assert_eq!(hist.entries(), &["ok1", "ok2"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_compacts_the_file_after_dropping_an_oversized_entry() {
+        // codex P3 (deep-review wave): the oversized line was skipped in
+        // memory but left on disk — re-read and re-skipped on EVERY startup,
+        // so the byte cap never fixed pre-existing bloat. Load now rewrites
+        // the compacted file even when the count is under MAX_ENTRIES.
+        let path = temp_path("oversized-load-compacts");
+        let huge = "y".repeat(MAX_ENTRY_BYTES + 1);
+        let body = format!(
+            "\"ok1\"\n{}\n\"ok2\"\n",
+            serde_json::to_string(&huge).unwrap()
+        );
+        std::fs::write(&path, body).unwrap();
+
+        let hist = ComposerHistory::load(&path);
+        assert_eq!(hist.entries(), &["ok1", "ok2"]);
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !on_disk.contains(&huge),
+            "the oversized line must be compacted off disk on load"
+        );
+        assert!(on_disk.contains("ok1") && on_disk.contains("ok2"));
         let _ = std::fs::remove_file(&path);
     }
 

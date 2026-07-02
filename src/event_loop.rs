@@ -1132,7 +1132,12 @@ fn handle_activity_navigator_key(store: &mut Store, key: KeyEvent) -> KeyAction 
                     .iter()
                     .position(|session| session.id == session_id)
             {
-                store.state.selected_session = idx;
+                // Full switch bundle (drafts, staged-message stash, task/scroll
+                // resets) — a bare `selected_session` assignment here left the
+                // OLD session's staged prompts on the active queue, so a later
+                // terminal event would submit them into the newly selected
+                // session (codex P1 on the per-session staged-queue fix).
+                store.state.switch_selected_session(idx);
                 store.state.status = t!(
                     "status.activity_navigator_selected_session",
                     title = store.state.sessions[idx].title.clone()
@@ -3881,6 +3886,44 @@ mod tests {
             store.state.active_turn().is_some(),
             "Esc with a pending operator only clears it; the turn keeps running"
         );
+    }
+
+    #[test]
+    fn activity_navigator_enter_runs_the_full_session_switch_bundle() {
+        // codex P1 (deep-review wave): the navigator Enter path assigned
+        // `selected_session` directly, bypassing `switch_selected_session` —
+        // the outgoing session's draft was never persisted (and with
+        // per-session staged queues, the old session's staged prompts stayed
+        // on the active queue, misdelivering into the picked session).
+        let mut store = store_with_sessions(2);
+        store.state.set_composer_text("draft for zero");
+        // A task row is unambiguously linked to its owning session (activity
+        // items without a turn also match the ACTIVE session via the
+        // belongs-to fallback, which would make row 0 a self-switch).
+        store.state.sessions[1].tasks.push(TaskView {
+            id: TaskId::new(),
+            title: "background probe".into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: None,
+            output_tail: String::new(),
+            turn_id: None,
+        });
+        store.state.activity_navigator.active = true;
+        store.state.activity_navigator.selected = 0;
+
+        handle_activity_navigator_key(&mut store, key(KeyCode::Enter));
+
+        assert_eq!(
+            store.state.selected_session, 1,
+            "navigator pick lands on the target session"
+        );
+        assert!(
+            store.state.composer.is_empty(),
+            "outgoing draft must not bleed into the picked session"
+        );
+        // Switching back restores the stashed draft — proof the full bundle ran.
+        store.state.switch_selected_session(0);
+        assert_eq!(store.state.composer, "draft for zero");
     }
 
     #[test]

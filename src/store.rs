@@ -4014,8 +4014,17 @@ impl Store {
         match crate::clipboard::copyable_assistant_text(&self.state) {
             Some(text) => {
                 let chars = text.chars().count();
+                // OSC 52 payloads are capped at emit time (terminal limits);
+                // don't claim a full copy when only the head will reach the
+                // clipboard (codex P2 on the OSC 52 cap).
+                let status = match crate::clipboard::osc52_truncated_chars(&text) {
+                    Some(kept) => {
+                        format!("Copied first {kept} of {chars} chars (terminal clipboard cap)")
+                    }
+                    None => t!("status.copied_last_reply", chars = chars).into_owned(),
+                };
                 self.state.pending_clipboard = Some(text);
-                self.state.status = t!("status.copied_last_reply", chars = chars).into_owned();
+                self.state.status = status;
             }
             None => {
                 self.state.status = t!("status.nothing_to_copy").into_owned();
@@ -9027,6 +9036,34 @@ mod tests {
                 .contains(t!("status.copied_last_reply", chars = 24).as_ref()),
             "status should confirm the copy, got: {}",
             store.state.status
+        );
+    }
+
+    #[test]
+    fn copy_last_reply_reports_truncated_copy_for_oversized_replies() {
+        // codex P2 (deep-review wave): OSC 52 caps the payload at emit time
+        // (terminal clipboard limits), but the status claimed the full char
+        // count — the user pasted only the head with no indication. The
+        // status must report a partial copy for over-cap replies.
+        let huge = "x".repeat(60 * 1024); // > the 54KB OSC 52 input cap
+        let mut store = store_with_assistant_message(&huge);
+
+        store.copy_last_reply();
+
+        assert!(
+            store.state.status.contains("Copied first"),
+            "status must surface truncation, got: {}",
+            store.state.status
+        );
+        assert!(
+            store.state.status.contains("terminal clipboard cap"),
+            "status must explain why, got: {}",
+            store.state.status
+        );
+        // The staged text is still the full reply; the cap applies at emit.
+        assert_eq!(
+            store.state.pending_clipboard.as_deref(),
+            Some(huge.as_str())
         );
     }
 
