@@ -250,7 +250,10 @@ mod tests {
         let payload = payload_of(&seq);
         assert!(payload.len() <= OSC52_MAX_ENCODED_BYTES);
         // Head is kept: payload is exactly base64 of the input's prefix.
-        assert_eq!(payload, base64_encode(&text.as_bytes()[..OSC52_MAX_INPUT_BYTES]));
+        assert_eq!(
+            payload,
+            base64_encode(&text.as_bytes()[..OSC52_MAX_INPUT_BYTES])
+        );
         // Valid base64: length is a multiple of 4 (whole input, no padding split).
         assert_eq!(payload.len() % 4, 0);
     }
