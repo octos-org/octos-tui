@@ -32,7 +32,7 @@ use serde_json::Value;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncWriteExt, BufReader},
     process::Command,
     runtime::Runtime,
     sync::mpsc,
@@ -822,9 +822,16 @@ impl StdioTransportDriver {
             .take()
             .ok_or_else(|| eyre!("UI protocol stdio child stderr was not piped"))?;
         let mut stdin = stdin;
-        let mut lines = BufReader::new(stdout).lines();
-        let mut stderr_lines = BufReader::new(stderr).lines();
+        // Capped line readers instead of `lines()`: `next_line()` accumulates
+        // a whole line in memory before any size check can run, so a single
+        // giant (or endless, never-newline) stdout line would balloon the
+        // process before the MAX_TEXT_FRAME_BYTES check ever saw it.
+        let mut stdout_lines =
+            CappedLineReader::new(BufReader::new(stdout), MAX_TEXT_FRAME_BYTES);
+        let mut stderr_lines =
+            CappedLineReader::new(BufReader::new(stderr), STDIO_STDERR_LINE_CAP);
         let mut stderr_open = true;
+        let mut stderr_ring = StderrRing::default();
         let (command_tx, mut command_rx) = mpsc::channel(PROTOCOL_TRANSPORT_QUEUE_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(PROTOCOL_TRANSPORT_QUEUE_CAPACITY);
 
@@ -857,17 +864,45 @@ impl StdioTransportDriver {
                             break;
                         }
                     }
-                    line = lines.next_line() => {
+                    line = stdout_lines.next_line() => {
                         match line {
-                            Ok(Some(text)) => {
+                            Ok(CappedLine::Line(text)) => {
                                 if event_tx.send(stdio_text_frame_event(text)).await.is_err() {
                                     break;
                                 }
                             }
-                            Ok(None) => {
-                                let _ = event_tx.send(TransportEvent::Disconnected(
-                                    "UI protocol stdio stdout closed; reconnect will relaunch on next send/read.".into(),
-                                )).await;
+                            Ok(CappedLine::TooLong { discarded }) => {
+                                // One oversized frame is dropped, not fatal: a
+                                // stdio disconnect respawns a FRESH server and
+                                // loses all session state, which is strictly
+                                // worse than skipping a single frame.
+                                if event_tx
+                                    .send(stdio_frame_too_large_skipped_event(discarded))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(CappedLine::Eof) => {
+                                // stdout closed: the child is usually exiting.
+                                // Reap it (bounded) so the disconnect message
+                                // carries exit status + stderr tail instead of
+                                // a bare "closed".
+                                let status =
+                                    tokio::time::timeout(STDIO_EXIT_DRAIN_BUDGET, child.wait())
+                                        .await;
+                                if stderr_open {
+                                    drain_stderr_to_eof(&mut stderr_lines, &mut stderr_ring).await;
+                                }
+                                let message = match status {
+                                    Ok(status) => stdio_exit_disconnect_message(
+                                        &status,
+                                        stderr_ring.tail(),
+                                    ),
+                                    Err(_) => "UI protocol stdio stdout closed; reconnect will relaunch on next send/read.".to_string(),
+                                };
+                                let _ = event_tx.send(TransportEvent::Disconnected(message)).await;
                                 break;
                             }
                             Err(err) => {
@@ -882,8 +917,13 @@ impl StdioTransportDriver {
                     }
                     line = stderr_lines.next_line(), if stderr_open => {
                         match line {
-                            Ok(Some(_)) => {}
-                            Ok(None) => {
+                            Ok(CappedLine::Line(text)) => {
+                                stderr_ring.push(text);
+                            }
+                            Ok(CappedLine::TooLong { discarded }) => {
+                                stderr_ring.push(format!("[stderr line dropped: {discarded} bytes]"));
+                            }
+                            Ok(CappedLine::Eof) => {
                                 stderr_open = false;
                             }
                             Err(err) => {
@@ -897,15 +937,17 @@ impl StdioTransportDriver {
                         }
                     }
                     status = child.wait() => {
-                        let message = match status {
-                            Ok(status) => format!(
-                                "UI protocol stdio child exited with {status}; reconnect will relaunch on next send/read."
-                            ),
-                            Err(err) => format!(
-                                "failed to wait for UI protocol stdio child: {err}; reconnect will relaunch on next send/read."
-                            ),
-                        };
-                        let _ = event_tx.send(TransportEvent::Disconnected(message)).await;
+                        // Pipe contents survive child death: drain buffered
+                        // stdout to EOF first (bounded) so final responses are
+                        // delivered before the disconnect, then collect the
+                        // stderr tail for the exit report.
+                        drain_stdout_to_eof(&mut stdout_lines, &event_tx).await;
+                        if stderr_open {
+                            drain_stderr_to_eof(&mut stderr_lines, &mut stderr_ring).await;
+                        }
+                        let _ = event_tx.send(TransportEvent::Disconnected(
+                            stdio_exit_disconnect_message(&status, stderr_ring.tail()),
+                        )).await;
                         break;
                     }
                 }
@@ -984,6 +1026,262 @@ fn stdio_text_frame_event(text: String) -> TransportEvent {
         };
     }
     TransportEvent::Frame(TransportFrame::Text(text))
+}
+
+/// Per-line cap for child stderr: diagnostics only, so a small bound is fine.
+const STDIO_STDERR_LINE_CAP: usize = 8 * 1024;
+/// Ring bounds for retained child stderr (most recent wins).
+const STDIO_STDERR_RING_MAX_LINES: usize = 20;
+const STDIO_STDERR_RING_MAX_BYTES: usize = 8 * 1024;
+/// Wall-clock budget for post-exit pipe drains and the bounded `child.wait()`
+/// reap. Pipe data survives child death, but a grandchild inheriting the
+/// write end could keep the pipe open forever — the budget guarantees the
+/// Disconnected event is still emitted promptly.
+const STDIO_EXIT_DRAIN_BUDGET: Duration = Duration::from_secs(2);
+
+/// Outcome of reading one line through [`CappedLineReader`].
+#[derive(Debug, PartialEq, Eq)]
+enum CappedLine {
+    /// A complete line (newline / trailing `\r` stripped, lossy UTF-8).
+    Line(String),
+    /// The line exceeded the cap and was discarded up to (and including) its
+    /// terminating newline; `discarded` counts the dropped bytes.
+    TooLong { discarded: u64 },
+    /// End of stream.
+    Eof,
+}
+
+/// Line reader that never buffers more than `cap` bytes for a single line,
+/// unlike `AsyncBufReadExt::lines()`, which accumulates the entire line in
+/// memory before any size check can run. Once a line crosses the cap the
+/// remainder is discarded (streamed, not buffered) until the next newline
+/// and reported as [`CappedLine::TooLong`], so the reader recovers on the
+/// following line.
+///
+/// Cancel-safe by construction: partial-line state lives in the struct, not
+/// the future, so dropping a `next_line` future at a `select!` never loses
+/// consumed bytes — the same guarantee `tokio::io::Lines` documents.
+///
+/// Non-UTF-8 bytes are decoded lossily (U+FFFD) instead of erroring the
+/// transport down: one bad byte in a frame surfaces as a JSON decode error
+/// for that frame rather than killing the child session.
+struct CappedLineReader<R> {
+    reader: R,
+    cap: usize,
+    buf: Vec<u8>,
+    /// `Some(bytes_discarded_so_far)` while skipping an over-cap line to its
+    /// terminating newline.
+    discarding: Option<u64>,
+}
+
+impl<R: tokio::io::AsyncBufRead + Unpin> CappedLineReader<R> {
+    fn new(reader: R, cap: usize) -> Self {
+        Self {
+            reader,
+            cap,
+            buf: Vec::new(),
+            discarding: None,
+        }
+    }
+
+    async fn next_line(&mut self) -> std::io::Result<CappedLine> {
+        use tokio::io::AsyncBufReadExt;
+
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                // EOF: flush discard state, then any final unterminated line.
+                if let Some(discarded) = self.discarding.take() {
+                    return Ok(CappedLine::TooLong { discarded });
+                }
+                if self.buf.is_empty() {
+                    return Ok(CappedLine::Eof);
+                }
+                return Ok(CappedLine::Line(take_line_string(&mut self.buf)));
+            }
+
+            let newline = available.iter().position(|&byte| byte == b'\n');
+            match (self.discarding.is_some(), newline) {
+                (true, Some(pos)) => {
+                    let discarded = self.discarding.take().unwrap_or(0) + (pos as u64) + 1;
+                    self.reader.consume(pos + 1);
+                    return Ok(CappedLine::TooLong { discarded });
+                }
+                (true, None) => {
+                    let chunk = available.len();
+                    if let Some(discarded) = self.discarding.as_mut() {
+                        *discarded += chunk as u64;
+                    }
+                    self.reader.consume(chunk);
+                }
+                (false, Some(pos)) => {
+                    if self.buf.len() + pos > self.cap {
+                        // Complete line, but over cap: drop it without ever
+                        // materializing the full copy.
+                        let discarded = (self.buf.len() + pos + 1) as u64;
+                        self.buf = Vec::new();
+                        self.reader.consume(pos + 1);
+                        return Ok(CappedLine::TooLong { discarded });
+                    }
+                    self.buf.extend_from_slice(&available[..pos]);
+                    self.reader.consume(pos + 1);
+                    return Ok(CappedLine::Line(take_line_string(&mut self.buf)));
+                }
+                (false, None) => {
+                    let chunk = available.len();
+                    if self.buf.len() + chunk > self.cap {
+                        // Crossed the cap mid-line: release the partial buffer
+                        // and stream-discard until the newline.
+                        self.discarding = Some((self.buf.len() + chunk) as u64);
+                        self.buf = Vec::new();
+                    } else {
+                        self.buf.extend_from_slice(available);
+                    }
+                    self.reader.consume(chunk);
+                }
+            }
+        }
+    }
+}
+
+/// Take the accumulated line bytes as a `String`: strips one trailing `\r`
+/// (CRLF input) and decodes lossily on invalid UTF-8.
+fn take_line_string(buf: &mut Vec<u8>) -> String {
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    let bytes = std::mem::take(buf);
+    match String::from_utf8(bytes) {
+        Ok(line) => line,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    }
+}
+
+/// Error event for a skipped over-cap stdio line. `disconnect: false` on
+/// purpose: the child stays alive and the reader has already resynced to the
+/// next line.
+fn stdio_frame_too_large_skipped_event(discarded: u64) -> TransportEvent {
+    TransportEvent::Error {
+        code: "frame_too_large".into(),
+        message: format!(
+            "UI protocol stdio frame exceeded {MAX_TEXT_FRAME_BYTES} bytes ({discarded} bytes discarded); skipped to next line"
+        ),
+        disconnect: false,
+    }
+}
+
+/// Bounded ring of the most recent child stderr lines, kept so a nonzero
+/// exit can report *why* the child died (previously stderr was read and
+/// dropped).
+#[derive(Debug, Default)]
+struct StderrRing {
+    lines: VecDeque<String>,
+    bytes: usize,
+}
+
+impl StderrRing {
+    fn push(&mut self, line: String) {
+        self.bytes += line.len();
+        self.lines.push_back(line);
+        // Always keep at least the newest line, even if it alone exceeds the
+        // byte budget.
+        while self.lines.len() > 1
+            && (self.lines.len() > STDIO_STDERR_RING_MAX_LINES
+                || self.bytes > STDIO_STDERR_RING_MAX_BYTES)
+        {
+            if let Some(evicted) = self.lines.pop_front() {
+                self.bytes -= evicted.len();
+            }
+        }
+    }
+
+    fn tail(&self) -> Option<String> {
+        (!self.lines.is_empty()).then(|| {
+            self.lines
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    }
+}
+
+/// Disconnect message for a reaped stdio child: exit status plus, on failure,
+/// the retained stderr tail (the actionable part of "my server won't start").
+fn stdio_exit_disconnect_message(
+    status: &std::io::Result<std::process::ExitStatus>,
+    stderr_tail: Option<String>,
+) -> String {
+    let (base, failed) = match status {
+        Ok(status) => (
+            format!(
+                "UI protocol stdio child exited with {status}; reconnect will relaunch on next send/read."
+            ),
+            !status.success(),
+        ),
+        Err(err) => (
+            format!(
+                "failed to wait for UI protocol stdio child: {err}; reconnect will relaunch on next send/read."
+            ),
+            true,
+        ),
+    };
+    match stderr_tail {
+        Some(tail) if failed => format!("{base}\nstderr tail:\n{tail}"),
+        _ => base,
+    }
+}
+
+/// Drain remaining stdout lines to EOF after child exit, forwarding them as
+/// frames so responses already written to the pipe are not dropped. Bounded
+/// by [`STDIO_EXIT_DRAIN_BUDGET`].
+async fn drain_stdout_to_eof<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut CappedLineReader<R>,
+    event_tx: &mpsc::Sender<TransportEvent>,
+) {
+    let _ = tokio::time::timeout(STDIO_EXIT_DRAIN_BUDGET, async {
+        loop {
+            match reader.next_line().await {
+                Ok(CappedLine::Line(text)) => {
+                    if event_tx.send(stdio_text_frame_event(text)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(CappedLine::TooLong { discarded }) => {
+                    if event_tx
+                        .send(stdio_frame_too_large_skipped_event(discarded))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(CappedLine::Eof) | Err(_) => break,
+            }
+        }
+    })
+    .await;
+}
+
+/// Drain remaining stderr lines to EOF into the ring after child exit so the
+/// final error output (written just before death) reaches the disconnect
+/// message. Bounded by [`STDIO_EXIT_DRAIN_BUDGET`].
+async fn drain_stderr_to_eof<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut CappedLineReader<R>,
+    ring: &mut StderrRing,
+) {
+    let _ = tokio::time::timeout(STDIO_EXIT_DRAIN_BUDGET, async {
+        loop {
+            match reader.next_line().await {
+                Ok(CappedLine::Line(text)) => ring.push(text),
+                Ok(CappedLine::TooLong { discarded }) => {
+                    ring.push(format!("[stderr line dropped: {discarded} bytes]"));
+                }
+                Ok(CappedLine::Eof) | Err(_) => break,
+            }
+        }
+    })
+    .await;
 }
 
 fn bounded_send_error(
@@ -6424,6 +6722,294 @@ mod tests {
 
         assert_eq!(driver.label(), "octos serve --stdio");
         assert!(!driver.is_connected());
+    }
+
+    // --- CappedLineReader: bounded stdio line buffering ---
+
+    #[tokio::test]
+    async fn capped_line_reader_discards_giant_line_and_recovers() {
+        // A 3 MB line (newline-terminated) followed by a normal line: the
+        // giant line must be discarded without ever buffering it whole, and
+        // the reader must resync on the next line.
+        let giant = 3 * 1024 * 1024;
+        let mut input = vec![b'a'; giant];
+        input.push(b'\n');
+        input.extend_from_slice(b"next line\n");
+
+        let mut reader = CappedLineReader::new(BufReader::new(&input[..]), 1024);
+        match reader.next_line().await.expect("read giant line") {
+            CappedLine::TooLong { discarded } => {
+                assert_eq!(discarded, (giant + 1) as u64, "content + newline discarded");
+            }
+            other => panic!("expected TooLong for the giant line, got {other:?}"),
+        }
+        assert_eq!(
+            reader.next_line().await.expect("read next line"),
+            CappedLine::Line("next line".into())
+        );
+        assert_eq!(reader.next_line().await.expect("read eof"), CappedLine::Eof);
+    }
+
+    #[tokio::test]
+    async fn capped_line_reader_discards_giant_line_without_trailing_newline() {
+        // Giant input with NO newline at all (the pathological
+        // never-newline stream): must terminate with TooLong at EOF, not
+        // accumulate unboundedly. A small BufReader capacity exercises the
+        // incremental chunked path a real pipe produces.
+        let input = vec![b'b'; 256 * 1024];
+        let mut reader =
+            CappedLineReader::new(BufReader::with_capacity(64, &input[..]), 1024);
+
+        match reader.next_line().await.expect("read") {
+            CappedLine::TooLong { discarded } => {
+                assert_eq!(discarded, input.len() as u64);
+            }
+            other => panic!("expected TooLong, got {other:?}"),
+        }
+        assert_eq!(reader.next_line().await.expect("read eof"), CappedLine::Eof);
+    }
+
+    #[tokio::test]
+    async fn capped_line_reader_keeps_lines_at_the_cap_boundary() {
+        // len == cap passes; len == cap+1 is dropped.
+        let mut input = vec![b'x'; 8];
+        input.push(b'\n');
+        input.extend_from_slice(&[b'y'; 9]);
+        input.push(b'\n');
+        let mut reader = CappedLineReader::new(BufReader::new(&input[..]), 8);
+
+        assert_eq!(
+            reader.next_line().await.expect("read"),
+            CappedLine::Line("xxxxxxxx".into())
+        );
+        assert!(matches!(
+            reader.next_line().await.expect("read"),
+            CappedLine::TooLong { discarded: 10 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn capped_line_reader_handles_crlf_final_partial_and_non_utf8() {
+        let input: &[u8] = b"first\r\ncaf\xE9 latte\nlast-no-newline";
+        let mut reader = CappedLineReader::new(BufReader::new(input), 1024);
+
+        assert_eq!(
+            reader.next_line().await.expect("read"),
+            CappedLine::Line("first".into()),
+            "trailing CR is stripped"
+        );
+        assert_eq!(
+            reader.next_line().await.expect("read"),
+            CappedLine::Line("caf\u{FFFD} latte".into()),
+            "invalid UTF-8 decodes lossily instead of erroring the transport"
+        );
+        assert_eq!(
+            reader.next_line().await.expect("read"),
+            CappedLine::Line("last-no-newline".into()),
+            "final unterminated line is still delivered"
+        );
+        assert_eq!(reader.next_line().await.expect("read"), CappedLine::Eof);
+    }
+
+    /// Shell snippet emitting one giant `x…x` line (`over` bytes, newline
+    /// terminated) followed by `after-too-long`. head/tr instead of awk: BSD
+    /// awk's gsub is quadratic on a 1 MB string (~9 s), which starves test
+    /// deadlines.
+    #[cfg(unix)]
+    fn giant_line_script(over: usize) -> String {
+        format!("head -c {over} /dev/zero | tr '\\000' 'x'; echo; echo after-too-long")
+    }
+
+    /// Same discard-and-recover contract, but over a real child pipe (chunked
+    /// delivery + backpressure) rather than an in-memory slice.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capped_line_reader_discards_giant_line_on_a_real_pipe() {
+        let over = MAX_TEXT_FRAME_BYTES + 512;
+        let script = giant_line_script(over);
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn awk child");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let mut reader = CappedLineReader::new(BufReader::new(stdout), MAX_TEXT_FRAME_BYTES);
+
+        match tokio::time::timeout(Duration::from_secs(5), reader.next_line())
+            .await
+            .expect("giant line read within budget")
+            .expect("read")
+        {
+            CappedLine::TooLong { discarded } => assert_eq!(discarded, (over + 1) as u64),
+            other => panic!("expected TooLong, got {other:?}"),
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), reader.next_line())
+                .await
+                .expect("next line within budget")
+                .expect("read"),
+            CappedLine::Line("after-too-long".into())
+        );
+        let _ = child.wait().await;
+    }
+
+    #[test]
+    fn stdio_skipped_frame_error_does_not_disconnect() {
+        let TransportEvent::Error {
+            code,
+            message,
+            disconnect,
+        } = stdio_frame_too_large_skipped_event(2048)
+        else {
+            panic!("expected error event");
+        };
+        assert_eq!(code, "frame_too_large");
+        assert!(message.contains("2048 bytes discarded"));
+        assert!(!disconnect, "a skipped frame must keep the child session");
+    }
+
+    // --- StderrRing + exit disconnect message ---
+
+    #[test]
+    fn stderr_ring_keeps_only_the_most_recent_lines() {
+        let mut ring = StderrRing::default();
+        for index in 0..40 {
+            ring.push(format!("line-{index}"));
+        }
+        let tail = ring.tail().expect("tail present");
+        assert!(!tail.contains("line-19"), "old lines evicted: {tail}");
+        assert!(tail.contains("line-20") && tail.contains("line-39"));
+        assert_eq!(tail.lines().count(), STDIO_STDERR_RING_MAX_LINES);
+    }
+
+    #[test]
+    fn stderr_ring_bounds_bytes_but_keeps_newest_line() {
+        let mut ring = StderrRing::default();
+        ring.push("first".into());
+        ring.push("z".repeat(STDIO_STDERR_RING_MAX_BYTES + 100));
+        let tail = ring.tail().expect("tail present");
+        assert!(!tail.contains("first"), "byte budget evicts older lines");
+        assert!(tail.starts_with("zzz"), "newest line survives even if huge");
+    }
+
+    #[test]
+    fn stdio_exit_message_attaches_stderr_tail_only_on_failure() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            let failing = std::process::ExitStatus::from_raw(3 << 8);
+            let message =
+                stdio_exit_disconnect_message(&Ok(failing), Some("boom: bad config".into()));
+            assert!(message.contains("exited with"));
+            assert!(message.contains("stderr tail:"));
+            assert!(message.contains("boom: bad config"));
+
+            let clean = std::process::ExitStatus::from_raw(0);
+            let message = stdio_exit_disconnect_message(&Ok(clean), Some("noise".into()));
+            assert!(!message.contains("stderr tail:"), "clean exit stays terse");
+            assert!(!message.contains("noise"));
+        }
+
+        let message = stdio_exit_disconnect_message(
+            &Err(std::io::Error::other("wait failed")),
+            Some("diagnostic".into()),
+        );
+        assert!(message.contains("wait failed"));
+        assert!(message.contains("diagnostic"), "wait errors count as failure");
+    }
+
+    // --- stdio driver end-to-end: exit race + stderr tail + oversized skip ---
+
+    fn drive_stdio_until_disconnect(
+        command: &str,
+    ) -> (Vec<String>, Vec<(String, String, bool)>, String) {
+        let runtime = Runtime::new().expect("test runtime");
+        let mut driver = StdioTransportDriver::new(command.into()).expect("driver builds");
+        driver.connect(&runtime).expect("stdio child spawns");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut frames = Vec::new();
+        let mut errors = Vec::new();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for stdio disconnect; frames={frames:?} errors={errors:?}"
+            );
+            match driver.poll_event().expect("poll stdio driver") {
+                Some(TransportEvent::Frame(TransportFrame::Text(text))) => frames.push(text),
+                Some(TransportEvent::Frame(_)) => {}
+                Some(TransportEvent::Error {
+                    code,
+                    message,
+                    disconnect,
+                }) => errors.push((code, message, disconnect)),
+                Some(TransportEvent::Disconnected(message)) => return (frames, errors, message),
+                None => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
+
+    /// Child-exit race: the final stdout line written right before death must
+    /// be delivered before Disconnected, and a nonzero exit must carry the
+    /// stderr tail instead of discarding it.
+    #[cfg(unix)]
+    #[test]
+    fn stdio_child_exit_delivers_final_stdout_and_stderr_tail() {
+        let (frames, _errors, message) = drive_stdio_until_disconnect(
+            "echo final-response; echo 'boom: config invalid' >&2; exit 3",
+        );
+
+        assert_eq!(
+            frames,
+            vec!["final-response".to_string()],
+            "final stdout line survives the child-exit race"
+        );
+        assert!(
+            message.contains("exited with") && message.contains("3"),
+            "exit status reported: {message}"
+        );
+        assert!(
+            message.contains("boom: config invalid"),
+            "stderr tail attached on nonzero exit: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_clean_exit_reports_no_stderr_tail() {
+        let (frames, _errors, message) =
+            drive_stdio_until_disconnect("echo done; echo routine-noise >&2; exit 0");
+
+        assert_eq!(frames, vec!["done".to_string()]);
+        assert!(message.contains("exited with"), "status reported: {message}");
+        assert!(
+            !message.contains("routine-noise"),
+            "clean exits stay terse: {message}"
+        );
+    }
+
+    /// An oversized stdout line must surface as a non-fatal frame_too_large
+    /// error and the stream must keep delivering subsequent lines.
+    #[cfg(unix)]
+    #[test]
+    fn stdio_oversized_line_is_skipped_without_killing_the_session() {
+        let over = MAX_TEXT_FRAME_BYTES + 512;
+        let command = giant_line_script(over);
+        let (frames, errors, _message) = drive_stdio_until_disconnect(&command);
+
+        let (code, message, disconnect) = errors
+            .iter()
+            .find(|(code, _, _)| code == "frame_too_large")
+            .expect("oversized line reported");
+        assert_eq!(code, "frame_too_large");
+        assert!(message.contains("discarded"));
+        assert!(!disconnect, "skip must not tear down the session");
+        assert_eq!(
+            frames,
+            vec!["after-too-long".to_string()],
+            "stream recovers on the next line"
+        );
     }
 
     #[test]
