@@ -525,15 +525,19 @@ fn parse_interval(raw: &str) -> Result<Duration, AutonomyParseError> {
     let value: u64 = digits
         .parse()
         .map_err(|_| AutonomyParseError::InvalidInterval(s.to_string()))?;
+    // Unit scaling uses checked multiplication: a huge value (e.g. 19
+    // digits of days) would overflow u64 — a debug panic or a silent
+    // release wrap-around cadence. Overflow is just another invalid
+    // interval.
     let dur = match unit {
-        "ms" => Duration::from_millis(value),
-        "s" | "sec" | "secs" => Duration::from_secs(value),
-        "m" | "min" | "mins" => Duration::from_secs(value * 60),
-        "h" | "hr" | "hrs" => Duration::from_secs(value * 60 * 60),
-        "d" | "day" | "days" => Duration::from_secs(value * 60 * 60 * 24),
+        "ms" => Some(Duration::from_millis(value)),
+        "s" | "sec" | "secs" => Some(Duration::from_secs(value)),
+        "m" | "min" | "mins" => value.checked_mul(60).map(Duration::from_secs),
+        "h" | "hr" | "hrs" => value.checked_mul(60 * 60).map(Duration::from_secs),
+        "d" | "day" | "days" => value.checked_mul(60 * 60 * 24).map(Duration::from_secs),
         _ => return Err(AutonomyParseError::InvalidInterval(s.to_string())),
     };
-    Ok(dur)
+    dur.ok_or_else(|| AutonomyParseError::InvalidInterval(s.to_string()))
 }
 
 #[cfg(test)]
@@ -883,6 +887,27 @@ mod tests {
             parse_autonomy_slash("/loop every 5xz hello").unwrap_err(),
             AutonomyParseError::InvalidInterval(_)
         ));
+    }
+
+    #[test]
+    fn should_reject_interval_when_unit_multiplication_overflows() {
+        // 10^19 parses as u64, but *60*60*24 overflows u64. This must
+        // surface as the invalid-interval error, not a debug panic /
+        // release wrap-around cadence.
+        assert!(matches!(
+            parse_autonomy_slash("/loop every 9999999999999999999d hello").unwrap_err(),
+            AutonomyParseError::InvalidInterval(_)
+        ));
+        assert!(matches!(
+            parse_autonomy_slash("/loop every 9999999999999999999h hello").unwrap_err(),
+            AutonomyParseError::InvalidInterval(_)
+        ));
+        assert!(matches!(
+            parse_autonomy_slash("/loop every 9999999999999999999m hello").unwrap_err(),
+            AutonomyParseError::InvalidInterval(_)
+        ));
+        // A huge but non-overflowing value still parses.
+        assert!(parse_autonomy_slash("/loop every 9999999999s hello").is_ok());
     }
 
     #[test]
