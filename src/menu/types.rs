@@ -656,6 +656,12 @@ pub struct MenuAppSnapshot<'a> {
     /// render one row per session. Empty until the first fetch lands (the menu
     /// renders `Loading` in that window).
     pub resume_sessions: &'a [crate::model::ResumeSessionRow],
+    /// Whether a `session/list` result has landed, mirrored from
+    /// `AppState::resume_list_loaded`. Lets `resume_menu` tell a genuinely
+    /// in-flight fetch (render `Loading`) apart from a completed fetch that
+    /// returned zero sessions (render a "No sessions" placeholder), instead of
+    /// showing `Loading` forever whenever `resume_sessions` is empty.
+    pub resume_list_loaded: bool,
     /// Active-session user turns for the `/rewind` picker, mirrored from
     /// `AppState::rewind_turns` so `rewind_menu` can render one row per turn.
     /// Empty when the active session has no user messages (the menu renders

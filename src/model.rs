@@ -3379,6 +3379,13 @@ pub struct AppState {
     /// mirrored into `MenuAppSnapshot` so the resume menu can render it. Empty
     /// until `/resume` triggers the first fetch.
     pub resume_sessions: Vec<ResumeSessionRow>,
+    /// Whether a `session/list` result has landed yet, distinguishing "the fetch
+    /// is still in flight" from "the fetch returned zero prior sessions". Without
+    /// it an empty [`Self::resume_sessions`] is ambiguous and the `/resume`
+    /// picker would render `Loading` forever when the server has no sessions.
+    /// Set true when the first (and every subsequent) `session/list` result is
+    /// applied. Local-only client state — preserved across snapshot replays.
+    pub resume_list_loaded: bool,
     /// Active-session user turns for the `/rewind` picker, newest-first.
     /// Populated locally (from the active session's transcript) when
     /// `OpenRewindPicker` is dispatched, and mirrored into `MenuAppSnapshot` so
@@ -5023,6 +5030,7 @@ impl AppState {
             exit_requested: false,
             pending_clipboard: None,
             resume_sessions: Vec::new(),
+            resume_list_loaded: false,
             rewind_turns: Vec::new(),
             pending_rewind_prefill: None,
         }

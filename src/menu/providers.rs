@@ -807,6 +807,19 @@ fn cost_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 /// pattern; strings are plain English (no new i18n keys), mirroring `/copy`.
 fn resume_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     if ctx.app.resume_sessions.is_empty() {
+        // Distinguish "the fetch already returned zero sessions" from "the fetch
+        // is still in flight". Only the latter renders `Loading`; a completed
+        // fetch with no sessions renders a terminal placeholder instead of
+        // spinning forever (`resume_list_loaded` flips true when a `session/list`
+        // result is applied — see `Store::apply_session_list_result`).
+        if ctx.app.resume_list_loaded {
+            return MenuBuildResult::Unavailable(MenuStatusSpec {
+                id: MenuId::from(MENU_RESUME),
+                title: "Resume a session".into(),
+                message: "No prior sessions to resume".into(),
+                footer_hint: Some("Esc to close".into()),
+            });
+        }
         return MenuBuildResult::Loading(MenuStatusSpec {
             id: MenuId::from(MENU_RESUME),
             title: "Resume a session".into(),
@@ -6602,6 +6615,33 @@ mod tests {
                 MenuBuildResult::Loading(status) if status.message.contains("Loading")
             ),
             "empty resume_sessions must render a Loading placeholder"
+        );
+    }
+
+    #[test]
+    fn resume_menu_shows_no_sessions_when_loaded_but_empty() {
+        // A `session/list` result landed but returned zero prior sessions
+        // (`resume_list_loaded == true`, `resume_sessions` empty). The picker
+        // must render a terminal "No sessions" placeholder, NOT `Loading`
+        // forever (which is indistinguishable from a fetch still in flight).
+        let capabilities = CapabilitySet::from_methods([methods::SESSION_LIST]);
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                resume_list_loaded: true,
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let result = core_menu_registry().build(&MenuId::from(MENU_RESUME), &ctx);
+        assert!(
+            matches!(
+                &result,
+                MenuBuildResult::Unavailable(status) if status.message.contains("No prior sessions")
+            ),
+            "a loaded-but-empty session list must render a No-sessions placeholder, got: {result:?}"
         );
     }
 
