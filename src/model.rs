@@ -3300,7 +3300,18 @@ pub struct AppState {
     /// style); persisted to `~/.config/octos-tui/history.jsonl`. See
     /// [`crate::history::ComposerHistory`].
     pub composer_history: crate::history::ComposerHistory,
+    /// Prompts staged while the ACTIVE session's turn was running, submitted
+    /// FIFO when it next goes idle. This holds the ACTIVE session's queue
+    /// only: `switch_selected_session` stashes it into
+    /// [`Self::pending_messages_by_session`] on the way out and loads the
+    /// incoming session's queue on the way in (exactly like
+    /// `composer_drafts`), so a terminal firing in one session can never
+    /// drain another session's staged prompts into it.
     pub pending_messages: Vec<String>,
+    /// Staged-prompt queues for NON-active sessions, keyed by session.
+    /// Stashed/loaded by [`Self::switch_selected_session`]. Local-only client
+    /// state the server never echoes — preserved across snapshot replays.
+    pub pending_messages_by_session: std::collections::HashMap<SessionKey, Vec<String>>,
     pub optimistic_user_messages: Vec<OptimisticUserMessage>,
     pub turn_prompt_anchors: Vec<TurnPromptAnchor>,
     /// Byte offsets in `live_reply.text` where one persisted assistant content
@@ -5007,6 +5018,7 @@ impl AppState {
             composer_drafts: Vec::new(),
             composer_history: crate::history::ComposerHistory::default(),
             pending_messages: Vec::new(),
+            pending_messages_by_session: std::collections::HashMap::new(),
             optimistic_user_messages: Vec::new(),
             turn_prompt_anchors: Vec::new(),
             live_reply_segment_boundaries: std::collections::HashMap::new(),
@@ -5881,34 +5893,75 @@ impl AppState {
             .or_else(|| preview_id_from_text(&task.output_tail))
     }
 
+    /// Switch the selected session to `index`, running the FULL housekeeping
+    /// bundle every switch path must share (Up/Down in the sessions pane,
+    /// `/resume`, `session/opened`): persist the outgoing session's composer
+    /// draft and staged-message queue, end any history browse, reset the
+    /// per-session task/scroll selection, load the incoming session's draft
+    /// and staged queue, and refresh the run state from the new selection.
+    /// Assigning `selected_session` directly skips these invariants — a saved
+    /// draft is silently deleted (never restored, then persisted-empty and
+    /// retained out) or attributed to the wrong session, and staged messages
+    /// drain into the wrong session. Out-of-range `index` is a no-op.
+    pub fn switch_selected_session(&mut self, index: usize) {
+        if index >= self.sessions.len() {
+            return;
+        }
+        self.persist_composer_draft_for_selected_session();
+        self.stash_pending_messages_for_selected_session();
+        self.composer_history.reset_navigation(); // end history browse on switch
+        self.selected_session = index;
+        self.selected_task = 0;
+        self.transcript_scroll = 0;
+        self.load_composer_draft_for_selected_session();
+        self.load_pending_messages_for_selected_session();
+        self.refresh_run_state_from_selection();
+    }
+
+    /// Stash the ACTIVE session's staged-prompt queue under its key on the way
+    /// out of a session switch (mirror of `persist_composer_draft_for_selected_session`).
+    fn stash_pending_messages_for_selected_session(&mut self) {
+        let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
+            return;
+        };
+        let staged = std::mem::take(&mut self.pending_messages);
+        if staged.is_empty() {
+            self.pending_messages_by_session.remove(&session_id);
+        } else {
+            self.pending_messages_by_session.insert(session_id, staged);
+        }
+    }
+
+    /// Load the incoming ACTIVE session's staged-prompt queue on the way into
+    /// a session switch (mirror of `load_composer_draft_for_selected_session`).
+    fn load_pending_messages_for_selected_session(&mut self) {
+        let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
+            self.pending_messages.clear();
+            return;
+        };
+        self.pending_messages = self
+            .pending_messages_by_session
+            .remove(&session_id)
+            .unwrap_or_default();
+    }
+
     pub fn select_next_session(&mut self) {
         if self.sessions.is_empty() {
             return;
         }
-        self.persist_composer_draft_for_selected_session();
-        self.composer_history.reset_navigation(); // end history browse on switch
-        self.selected_session = (self.selected_session + 1) % self.sessions.len();
-        self.selected_task = 0;
-        self.transcript_scroll = 0;
-        self.load_composer_draft_for_selected_session();
-        self.refresh_run_state_from_selection();
+        self.switch_selected_session((self.selected_session + 1) % self.sessions.len());
     }
 
     pub fn select_prev_session(&mut self) {
         if self.sessions.is_empty() {
             return;
         }
-        self.persist_composer_draft_for_selected_session();
-        self.composer_history.reset_navigation(); // end history browse on switch
-        if self.selected_session == 0 {
-            self.selected_session = self.sessions.len() - 1;
+        let index = if self.selected_session == 0 {
+            self.sessions.len() - 1
         } else {
-            self.selected_session -= 1;
-        }
-        self.selected_task = 0;
-        self.transcript_scroll = 0;
-        self.load_composer_draft_for_selected_session();
-        self.refresh_run_state_from_selection();
+            self.selected_session - 1
+        };
+        self.switch_selected_session(index);
     }
 
     pub fn select_next_task(&mut self) {

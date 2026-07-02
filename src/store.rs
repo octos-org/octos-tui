@@ -1259,14 +1259,17 @@ impl Store {
         // Select the existing SessionView, or create a placeholder so the
         // switch is immediate; `apply_session_hydrate_result` also
         // find-or-creates when the hydrate result lands and fills in the real
-        // transcript.
+        // transcript. Both branches run the full switch bundle
+        // (`switch_selected_session`) — assigning `selected_session` directly
+        // would silently delete the outgoing session's composer draft and
+        // strand/misdeliver its staged messages.
         if let Some(index) = self
             .state
             .sessions
             .iter()
             .position(|session| session.id == session_id)
         {
-            self.state.selected_session = index;
+            self.state.switch_selected_session(index);
         } else {
             let profile_id = self.active_session_profile_id();
             self.state.sessions.push(SessionView {
@@ -1277,8 +1280,13 @@ impl Store {
                 tasks: Vec::new(),
                 live_reply: None,
             });
-            self.state.selected_session = self.state.sessions.len().saturating_sub(1);
+            self.state
+                .switch_selected_session(self.state.sessions.len().saturating_sub(1));
         }
+        // The incoming session may be idle with staged messages waiting (they
+        // were left queued when a terminal fired while another session was
+        // active) — drain them now that it is active again.
+        self.enqueue_staged_drain_after_switch();
         self.state.status = format!("Resuming {}…", session_id.0);
         Some(AppUiCommand::HydrateSession(SessionHydrateParams {
             session_id,
@@ -4984,6 +4992,8 @@ impl Store {
                 // entries across replays (reconnect/refresh) and reset browsing.
                 let composer_history = self.state.composer_history.clone();
                 let pending_messages = self.state.pending_messages.clone();
+                let pending_messages_by_session =
+                    self.state.pending_messages_by_session.clone();
                 let optimistic_user_messages = self.state.optimistic_user_messages.clone();
                 let turn_prompt_anchors = self.state.turn_prompt_anchors.clone();
                 let live_reply_segment_boundaries =
@@ -5059,6 +5069,7 @@ impl Store {
                 state.composer_history = composer_history;
                 state.composer_history.reset_navigation();
                 state.pending_messages = pending_messages;
+                state.pending_messages_by_session = pending_messages_by_session;
                 state.optimistic_user_messages = optimistic_user_messages;
                 state.turn_prompt_anchors = turn_prompt_anchors;
                 state.live_reply_segment_boundaries = live_reply_segment_boundaries;
@@ -5524,7 +5535,10 @@ impl Store {
                     tasks: Vec::new(),
                     live_reply: None,
                 });
-                self.state.selected_session = self.state.sessions.len().saturating_sub(1);
+                // Full switch bundle (draft + staged-queue housekeeping), not a
+                // bare `selected_session` assignment — see `switch_selected_session`.
+                self.state
+                    .switch_selected_session(self.state.sessions.len().saturating_sub(1));
             }
             self.state
                 .optimistic_user_messages
@@ -6120,13 +6134,18 @@ impl Store {
                 if let Some(workspace_root) = event.workspace_root {
                     self.state.workspace.root = workspace_root;
                 }
+                // Both branches run the full switch bundle
+                // (`switch_selected_session`) so the outgoing session's
+                // composer draft is persisted (not silently deleted or
+                // attributed to the incoming session) and staged messages
+                // stay bound to the session they were staged in.
                 if let Some(index) = self
                     .state
                     .sessions
                     .iter()
                     .position(|session| session.id == session_id)
                 {
-                    self.state.selected_session = index;
+                    self.state.switch_selected_session(index);
                     self.state.sessions[index].profile_id = event.active_profile_id.clone();
                 } else {
                     self.state.sessions.push(SessionView {
@@ -6137,11 +6156,17 @@ impl Store {
                         tasks: Vec::new(),
                         live_reply: None,
                     });
-                    self.state.selected_session = self.state.sessions.len().saturating_sub(1);
+                    self.state
+                        .switch_selected_session(self.state.sessions.len().saturating_sub(1));
                 }
                 if self.state.active_turn().is_none() {
                     self.state.set_run_state_idle();
                 }
+                // Idle incoming session with staged messages → drain them now
+                // that it is active again (queued on the follow-up queue; this
+                // arm has its own return value). After the idle reset above so
+                // a drained submit's in-progress run state is not clobbered.
+                self.enqueue_staged_drain_after_switch();
                 // Issue #4: finishing the setup wizard must drop the user into a
                 // clean, ready coding surface — not leave the onboarding menu
                 // stacked over the chat. When a session opens while an
@@ -7535,6 +7560,22 @@ impl Store {
         self.submit_next_pending_if_idle()
     }
 
+    /// After an explicit session switch the incoming session may be idle with
+    /// staged messages waiting (they were left queued when its terminal fired
+    /// while another session was active). The switch sites return their own
+    /// command, so a drained submit is enqueued on the follow-up queue the
+    /// event loop drains next tick.
+    fn enqueue_staged_drain_after_switch(&mut self) {
+        if let Some(command) = self.submit_next_pending_if_idle() {
+            self.state.enqueue_autonomy_hydration(command);
+        }
+    }
+
+    /// Submit the ACTIVE session's next staged prompt when it is idle.
+    /// `pending_messages` holds the active session's queue only (other
+    /// sessions' queues are stashed per-session and reloaded on switch), so a
+    /// terminal firing here can never submit another session's staged prompt
+    /// into this one.
     fn submit_next_pending_if_idle(&mut self) -> Option<AppUiCommand> {
         if self.state.active_turn().is_some() || self.state.pending_messages.is_empty() {
             return None;
@@ -9031,6 +9072,222 @@ mod tests {
             }
             other => panic!("expected inline /resume to hydrate the match, got {other:?}"),
         }
+    }
+
+    /// A composer draft typed in session A must survive `/resume`-ing away and
+    /// back: `resume_session_command` runs the full switch bundle, so the
+    /// outgoing draft is persisted under A (not deleted or attributed to the
+    /// incoming session) and restored on return.
+    #[test]
+    fn resume_persists_outgoing_draft_and_restores_it_on_return() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.set_composer_text("draft for A");
+
+        // /resume into B: A's draft is persisted, B starts with an empty composer.
+        store
+            .dispatch_local_action(LocalAction::ResumeSession("local:b".into()), None)
+            .into_command()
+            .expect("hydrate command for B");
+        assert_eq!(
+            store.state.active_session().map(|s| s.id.0.as_str()),
+            Some("local:b")
+        );
+        assert!(
+            store.state.composer.is_empty(),
+            "B has no draft; A's draft must not bleed into B"
+        );
+
+        // /resume back into A: the draft is restored.
+        store
+            .dispatch_local_action(LocalAction::ResumeSession("local:a".into()), None)
+            .into_command()
+            .expect("hydrate command for A");
+        assert_eq!(
+            store.state.composer, "draft for A",
+            "the draft persisted on the way out must be restored on return"
+        );
+    }
+
+    /// A server-initiated `session/opened` switch must persist the outgoing
+    /// session's composer draft under the OLD session, exactly like a manual
+    /// switch does.
+    #[test]
+    fn session_opened_switch_persists_outgoing_draft_under_old_session() {
+        use octos_core::ui_protocol::SessionOpened;
+
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.set_composer_text("draft for A");
+
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": SessionKey("local:b".into()),
+            "active_profile_id": "coding",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        assert_eq!(
+            store.state.active_session().map(|s| s.id.0.as_str()),
+            Some("local:b")
+        );
+        assert!(
+            store.state.composer.is_empty(),
+            "the incoming session must not inherit A's draft"
+        );
+        assert_eq!(
+            store
+                .state
+                .composer_drafts
+                .iter()
+                .find(|draft| draft.session_id == SessionKey("local:a".into()))
+                .map(|draft| draft.text.as_str()),
+            Some("draft for A"),
+            "the outgoing draft must be persisted under the OLD session"
+        );
+    }
+
+    /// Cross-session staged-message delivery: a prompt staged in session A
+    /// while A's turn ran must NOT submit into session B when A's terminal
+    /// fires while B is active — it stays queued for A and drains only once A
+    /// is active (and idle) again.
+    #[test]
+    fn staged_messages_stay_with_their_session_across_switches() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: turn_id.clone(),
+            text: "streaming in A".into(),
+        });
+        // Stage while A's turn is live (the compose path's staging branch).
+        store.state.set_composer_text("staged for A");
+        assert!(
+            store.compose_command().is_none(),
+            "a mid-turn submit stages instead of starting a turn"
+        );
+        assert_eq!(store.state.pending_messages, vec!["staged for A"]);
+
+        // Tab-switch to B while A's turn is still running.
+        store.state.switch_selected_session(1);
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "B's queue starts empty; A's staged prompt is stashed under A"
+        );
+
+        // A's terminal fires while B is active: nothing may submit into B.
+        let command = store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: SessionKey("local:a".into()),
+                topic: None,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            command.is_none(),
+            "A's terminal must not drain A's staged prompt into active session B"
+        );
+        assert!(
+            store.state.sessions[1]
+                .messages
+                .iter()
+                .all(|message| message.content != "staged for A"),
+            "the staged prompt must not appear in B's transcript"
+        );
+
+        // Switching back to (now idle) A restores its queue; the drain then
+        // submits it into A.
+        store.state.switch_selected_session(0);
+        assert_eq!(store.state.pending_messages, vec!["staged for A"]);
+        let command = store
+            .submit_next_pending_if_idle()
+            .expect("idle A drains its own staged prompt");
+        let AppUiCommand::SubmitPrompt(params) = command else {
+            panic!("expected staged prompt submission");
+        };
+        assert_eq!(params.session_id, SessionKey("local:a".into()));
+        assert!(store.state.pending_messages.is_empty());
+    }
+
+    /// `/resume`-ing into an idle session with staged messages submits them:
+    /// the switch site drains the reloaded queue onto the follow-up queue
+    /// (the resume itself returns the hydrate command).
+    #[test]
+    fn resuming_idle_session_with_staged_messages_enqueues_the_submit() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        // A stashed queue for B (staged earlier while B's turn ran, then the
+        // user switched away before it drained).
+        store
+            .state
+            .pending_messages_by_session
+            .insert(SessionKey("local:b".into()), vec!["queued for B".into()]);
+
+        let command = store
+            .dispatch_local_action(LocalAction::ResumeSession("local:b".into()), None)
+            .into_command();
+        assert!(
+            matches!(command, Some(AppUiCommand::HydrateSession(_))),
+            "resume still returns the hydrate command"
+        );
+
+        let queued = store
+            .state
+            .pending_autonomy_hydration
+            .iter()
+            .find_map(|command| match command {
+                AppUiCommand::SubmitPrompt(params) => Some(params.clone()),
+                _ => None,
+            })
+            .expect("the staged prompt submit is enqueued as a follow-up");
+        assert_eq!(queued.session_id, SessionKey("local:b".into()));
+        assert_eq!(
+            queued.input,
+            vec![InputItem::Text {
+                text: "queued for B".into()
+            }]
+        );
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "the drained prompt left B's queue"
+        );
+    }
+
+    /// The per-session staged-queue stash is local-only (like
+    /// `pending_messages` itself) and must survive a snapshot replay.
+    #[test]
+    fn stashed_staged_queues_survive_snapshot_replay() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .pending_messages_by_session
+            .insert(SessionKey("local:other".into()), vec!["stashed".into()]);
+
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![SessionView {
+                id: session_id,
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            selected_session: 0,
+            status: "replayed".into(),
+            target: None,
+            readonly: false,
+        }));
+
+        assert_eq!(
+            store
+                .state
+                .pending_messages_by_session
+                .get(&SessionKey("local:other".into()))
+                .map(Vec::as_slice),
+            Some(&["stashed".to_string()][..]),
+            "stashed per-session staged queues must survive a snapshot replay"
+        );
     }
 
     /// Build a store whose single active session has one user+assistant
