@@ -29,6 +29,13 @@ use std::path::{Path, PathBuf};
 /// Maximum entries kept in memory and trimmed-to on load (oldest dropped).
 const MAX_ENTRIES: usize = 1000;
 
+/// Maximum byte length of a single history entry. `MAX_ENTRIES` caps the
+/// COUNT, not the bytes: without a per-entry cap a single pasted megabyte log
+/// bloats the on-disk file and every startup load. Oversized prompts are
+/// skipped on `record` and on `load` (recalling a megabyte blob back into the
+/// composer is not useful anyway).
+const MAX_ENTRY_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ComposerHistory {
     /// Submitted prompts, oldest → newest. Global across sessions.
@@ -71,14 +78,15 @@ impl ComposerHistory {
         self.nav_index = None;
     }
 
-    /// Record a just-submitted prompt: trims, skips empties, dedups against the
-    /// most recent entry, caps to `MAX_ENTRIES`, ends any browsing, and (when a
-    /// `persist_path` is set) appends the new line to disk. Returns `true` when
-    /// a new entry was appended.
+    /// Record a just-submitted prompt: trims, skips empties and entries over
+    /// [`MAX_ENTRY_BYTES`], dedups against the most recent entry, caps to
+    /// `MAX_ENTRIES`, ends any browsing, and (when a `persist_path` is set)
+    /// appends the new line to disk. Returns `true` when a new entry was
+    /// appended.
     pub fn record(&mut self, prompt: &str) -> bool {
         self.nav_index = None;
         let trimmed = prompt.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || trimmed.len() > MAX_ENTRY_BYTES {
             return false;
         }
         if self.entries.last().map(String::as_str) == Some(trimmed) {
@@ -175,7 +183,7 @@ impl ComposerHistory {
                     continue;
                 }
                 if let Ok(entry) = serde_json::from_str::<String>(line) {
-                    if !entry.trim().is_empty() {
+                    if !entry.trim().is_empty() && entry.len() <= MAX_ENTRY_BYTES {
                         entries.push(entry);
                     }
                 }
@@ -205,7 +213,8 @@ impl ComposerHistory {
 
 /// Overwrite `path` with exactly `entries` (one JSON line each), owner-only,
 /// via a temp sibling + atomic rename so a crash mid-write can't corrupt the
-/// existing history. Best-effort: a failure leaves the current file intact.
+/// existing history. Best-effort: a failure leaves the current file intact
+/// (and removes the temp, which also carries history data).
 fn rewrite_history_file(path: &Path, entries: &[String]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -215,7 +224,23 @@ fn rewrite_history_file(path: &Path, entries: &[String]) -> std::io::Result<()> 
         body.push_str(&serde_json::to_string(entry).unwrap_or_default());
         body.push('\n');
     }
-    let tmp = path.with_extension("jsonl.compact");
+    let tmp = compaction_temp_path(path);
+    let result = write_temp_then_publish(&tmp, path, body.as_bytes());
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Per-process compaction temp beside `path`. The name embeds the pid: the old
+/// FIXED `history.jsonl.compact` name was shared across processes, so two
+/// `octos-tui` instances compacting the same file interleaved their writes and
+/// could publish a torn file via rename.
+fn compaction_temp_path(path: &Path) -> PathBuf {
+    path.with_extension(format!("jsonl.compact.{}", std::process::id()))
+}
+
+fn write_temp_then_publish(tmp: &Path, path: &Path, body: &[u8]) -> std::io::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).write(true).truncate(true);
     #[cfg(unix)]
@@ -224,17 +249,18 @@ fn rewrite_history_file(path: &Path, entries: &[String]) -> std::io::Result<()> 
         opts.mode(0o600);
     }
     {
-        let mut file = opts.open(&tmp)?;
-        file.write_all(body.as_bytes())?;
+        let mut file = opts.open(tmp)?;
+        file.write_all(body)?;
     }
-    // `mode(0o600)` above is ignored if a stale temp already existed; force
-    // owner-only before the rename publishes it as the history file.
-    tighten_permissions(&tmp);
+    // `mode(0o600)` above is ignored if a stale temp already existed (this
+    // pid failing here earlier); force owner-only before the rename publishes
+    // it as the history file.
+    tighten_permissions(tmp);
     // `rename` atomically replaces on Unix; on Windows it fails when the
     // destination exists, so remove it first there (compaction is best-effort).
     #[cfg(windows)]
     let _ = std::fs::remove_file(path);
-    std::fs::rename(&tmp, path)
+    std::fs::rename(tmp, path)
 }
 
 /// Pure resolver: prefer `HOME`, fall back to `USERPROFILE` (Windows). Empty
@@ -364,6 +390,82 @@ mod tests {
             hist.entries().last().map(String::as_str),
             Some(format!("cmd{}", MAX_ENTRIES + 49).as_str())
         );
+    }
+
+    #[test]
+    fn record_skips_oversized_entry_and_nav_stays_coherent() {
+        // Fix #9 (a): MAX_ENTRIES caps the COUNT, not the bytes — a pasted
+        // megabyte log would bloat the file and every startup load. Oversized
+        // entries are skipped entirely.
+        let mut hist = h(&["a", "b"]);
+        let huge = "x".repeat(MAX_ENTRY_BYTES + 1);
+        assert!(!hist.record(&huge));
+        assert_eq!(hist.entries(), &["a", "b"]);
+        // Navigation still starts cleanly at the newest real entry.
+        assert_eq!(hist.recall_prev(""), Some("b".to_string()));
+        assert_eq!(hist.recall_prev("b"), Some("a".to_string()));
+    }
+
+    #[test]
+    fn record_accepts_entry_exactly_at_the_byte_cap() {
+        let mut hist = ComposerHistory::default();
+        let max = "x".repeat(MAX_ENTRY_BYTES);
+        assert!(hist.record(&max));
+        assert_eq!(hist.entries().len(), 1);
+    }
+
+    #[test]
+    fn load_skips_oversized_entries() {
+        // Symmetric with `record`: an externally bloated file must not carry
+        // a megabyte entry into memory (and back out through compaction).
+        let path = temp_path("oversized-load");
+        let huge = "y".repeat(MAX_ENTRY_BYTES + 1);
+        let body = format!(
+            "\"ok1\"\n{}\n\"ok2\"\n",
+            serde_json::to_string(&huge).unwrap()
+        );
+        std::fs::write(&path, body).unwrap();
+        let hist = ComposerHistory::load(&path);
+        assert_eq!(hist.entries(), &["ok1", "ok2"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn compaction_temp_path_is_unique_per_process() {
+        // Fix #9 (b): the old fixed `history.jsonl.compact` name was shared
+        // across processes — two octos-tui instances compacting the same file
+        // interleave writes / publish a torn file via rename.
+        let path = PathBuf::from("/tmp/octos-tui-hist/history.jsonl");
+        let tmp = compaction_temp_path(&path);
+        let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.contains(&std::process::id().to_string()),
+            "temp name must embed the pid: {name}"
+        );
+        assert_ne!(
+            tmp,
+            path.with_extension("jsonl.compact"),
+            "fixed shared temp name is a cross-process collision"
+        );
+        assert_eq!(
+            tmp.parent(),
+            path.parent(),
+            "temp must stay a sibling of the history file for atomic rename"
+        );
+    }
+
+    #[test]
+    fn failed_compaction_cleans_up_its_temp() {
+        // Make the DESTINATION a directory so the final rename fails; the
+        // temp (which contains history data) must not be left behind.
+        let path = temp_path("compact-fail");
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(rewrite_history_file(&path, &["a".to_string()]).is_err());
+        assert!(
+            !compaction_temp_path(&path).exists(),
+            "failed compaction must remove its temp"
+        );
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]
@@ -536,7 +638,9 @@ mod tests {
     fn compaction_is_owner_only_even_with_stale_loose_temp() {
         use std::os::unix::fs::PermissionsExt;
         let path = temp_path("compact-perms");
-        let tmp = path.with_extension("jsonl.compact");
+        // The temp this process would reuse (same pid, e.g. an earlier failed
+        // compaction in this run).
+        let tmp = compaction_temp_path(&path);
         let _ = std::fs::remove_file(&path);
         let mut body = String::new();
         for i in 0..(MAX_ENTRIES + 5) {
