@@ -316,9 +316,23 @@ impl Cli {
             file_config.readonly.unwrap_or(false)
         };
 
+        // Mode resolution: explicit (CLI flag, then config) always wins.
+        // When neither sets a mode but a transport IS configured
+        // (stdio-command or endpoint), infer Protocol — otherwise
+        // `octos-tui --stdio-command '…'` would silently launch the MOCK
+        // backend and ignore the transport. Mock stays the default only
+        // for a transport-less launch.
+        let mode = args.mode.or(file_config.mode).unwrap_or_else(|| {
+            if stdio_command.is_some() || base_url.is_some() {
+                Mode::Protocol
+            } else {
+                Mode::Mock
+            }
+        });
+
         Ok(Self {
             config: args.config,
-            mode: args.mode.or(file_config.mode).unwrap_or(Mode::Mock),
+            mode,
             base_url,
             stdio_command,
             session: args.session.or(file_config.session),
@@ -647,6 +661,64 @@ mod tests {
         assert!(cli.base_url.is_none());
         assert!(cli.stdio_command.is_none());
         assert_eq!(cli.theme, ThemeName::Codex);
+    }
+
+    // A configured transport with no explicit mode must NOT silently
+    // launch the mock backend (the transport flag would be ignored and
+    // the user would chat with fake data). Absent mode + a transport
+    // infers Protocol.
+    #[test]
+    fn should_infer_protocol_mode_when_stdio_command_set_without_mode() {
+        let cli = Cli::try_parse_from(["octos-tui", "--stdio-command", "octos serve --stdio"])
+            .expect("cli parses");
+
+        assert_eq!(cli.mode, Mode::Protocol);
+        assert_eq!(cli.stdio_command.as_deref(), Some("octos serve --stdio"));
+    }
+
+    #[test]
+    fn should_infer_protocol_mode_when_endpoint_set_without_mode() {
+        let cli = Cli::try_parse_from(["octos-tui", "--endpoint", "ws://127.0.0.1:1/ui"])
+            .expect("cli parses");
+
+        assert_eq!(cli.mode, Mode::Protocol);
+        assert_eq!(cli.base_url.as_deref(), Some("ws://127.0.0.1:1/ui"));
+    }
+
+    #[test]
+    fn should_infer_protocol_mode_from_config_transport_without_mode() {
+        let path = write_config(
+            "infer-mode",
+            r#"{ "stdio_command": "octos serve --stdio" }"#,
+        );
+
+        let cli = Cli::try_parse_from(["octos-tui", "--config", path.to_str().unwrap()])
+            .expect("cli parses");
+
+        assert_eq!(cli.mode, Mode::Protocol);
+    }
+
+    #[test]
+    fn explicit_mock_mode_wins_over_transport_inference() {
+        let cli = Cli::try_parse_from([
+            "octos-tui",
+            "--mode",
+            "mock",
+            "--stdio-command",
+            "octos serve --stdio",
+        ])
+        .expect("cli parses");
+
+        assert_eq!(cli.mode, Mode::Mock);
+
+        // Config-level explicit mode also wins over inference.
+        let path = write_config(
+            "explicit-mock",
+            r#"{ "mode": "mock", "stdio_command": "octos serve --stdio" }"#,
+        );
+        let cli = Cli::try_parse_from(["octos-tui", "--config", path.to_str().unwrap()])
+            .expect("cli parses");
+        assert_eq!(cli.mode, Mode::Mock);
     }
 
     #[test]
