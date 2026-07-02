@@ -3589,6 +3589,7 @@ impl Store {
                 .count(),
             pinned_scroll: self.state.pinned_scroll,
             resume_sessions: &self.state.resume_sessions,
+            resume_list_loaded: self.state.resume_list_loaded,
             rewind_turns: &self.state.rewind_turns,
         }
     }
@@ -5029,6 +5030,7 @@ impl Store {
                 // `from_snapshot` would drop it. Preserve it across replays
                 // (reconnect/refresh) so an open picker doesn't blank out.
                 let resume_sessions = self.state.resume_sessions.clone();
+                let resume_list_loaded = self.state.resume_list_loaded;
                 // Local-only: the `/rewind` picker rows are derived from the
                 // transcript and the pending prefill is in-flight; neither is
                 // echoed in a snapshot, so preserve both across replays.
@@ -5070,6 +5072,7 @@ impl Store {
                 state.vim_mode = vim_mode;
                 state.composer_mode = composer_mode;
                 state.resume_sessions = resume_sessions;
+                state.resume_list_loaded = resume_list_loaded;
                 state.rewind_turns = rewind_turns;
                 state.pending_rewind_prefill = pending_rewind_prefill;
                 state.restore_optimistic_user_messages();
@@ -5427,6 +5430,12 @@ impl Store {
     /// not an array of objects leaves the previous list untouched and records a
     /// status line rather than clearing the picker.
     fn apply_session_list_result(&mut self, result: SessionListResult) {
+        // A `session/list` result has now landed, so the `/resume` picker must
+        // stop showing `Loading`: mark the list loaded whether it parses or not
+        // (a malformed payload still ends the in-flight fetch — the picker then
+        // renders "No sessions" with the parse-error status, not `Loading`
+        // forever).
+        self.state.resume_list_loaded = true;
         match serde_json::from_value::<Vec<ResumeSessionRow>>(result.sessions) {
             Ok(mut rows) => {
                 // Stable sort by `updated_at` DESC. `Option<String>` orders
@@ -5454,6 +5463,12 @@ impl Store {
         // The server returns the trimmed session as a `SessionHydrateResult`, so
         // reuse the hydrate render path verbatim to repaint the transcript.
         self.apply_session_hydrate_result(result.thread);
+        // Rebuild the `/rewind` picker rows from the now-trimmed transcript. The
+        // snapshot taken when the picker opened still lists the just-dropped
+        // turns; if the picker is still open (the caller then calls
+        // `refresh_active_menu_if_open`) it would otherwise offer already-dropped
+        // turns. Recomputing keeps `rewind_turns` consistent with the transcript.
+        self.state.rewind_turns = self.collect_rewind_turns();
         // Put the chosen message back in the composer to edit and resend
         // (rewind-and-edit), using the same composer-set mechanism as
         // `LocalAction::EditComposer`.
@@ -9119,6 +9134,105 @@ mod tests {
             "status reports how many turns were dropped: {}",
             store.state.status
         );
+    }
+
+    #[test]
+    fn session_rollback_result_refreshes_rewind_turns_from_trimmed_transcript() {
+        use crate::client_event::ClientEvent;
+
+        // Open the picker on a 3-turn session, so `rewind_turns` snapshots three
+        // rows (drop 1 / 2 / 3) while the menu stays open.
+        let mut store =
+            store_with_user_turns(&["first question", "second question", "third question"]);
+        let session_id = store.state.sessions[0].id.clone();
+        store.dispatch_local_action(LocalAction::OpenRewindPicker, None);
+        assert_eq!(
+            store.state.rewind_turns.len(),
+            3,
+            "the open picker snapshots one row per user turn"
+        );
+        // Simulate the pending pick of turn 3 (drop the last two exchanges).
+        store.state.pending_rewind_prefill = Some("second question".into());
+
+        // Server drops 2 user turns and returns the trimmed transcript (the first
+        // exchange only), shaped like a session/hydrate result.
+        store.apply_client_event(ClientEvent::SessionRollback(SessionRollbackResult {
+            dropped_turns: 2,
+            thread: SessionHydrateResult {
+                session_id: session_id.clone(),
+                cursor: octos_core::ui_protocol::UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 1,
+                },
+                context: None,
+                context_state: None,
+                messages: Some(vec![HydratedMessage {
+                    seq: 1,
+                    role: "user".into(),
+                    content: "first question".into(),
+                    turn_id: None,
+                    thread_id: None,
+                    client_message_id: None,
+                    persisted_at: chrono::Utc::now(),
+                    message_id: None,
+                    source: None,
+                    media: Vec::new(),
+                }]),
+                threads: None,
+                turns: None,
+                pending_approvals: None,
+                pending_questions: None,
+                replayed_envelopes: None,
+            },
+        }));
+
+        // The stale 3-row snapshot MUST be refreshed from the trimmed transcript:
+        // only the surviving user turn remains, so a still-open picker can no
+        // longer offer the already-dropped turns 2 and 3.
+        assert_eq!(
+            store.state.rewind_turns.len(),
+            1,
+            "rewind_turns is rebuilt from the trimmed transcript (one surviving turn)"
+        );
+        assert_eq!(store.state.rewind_turns[0].num_turns, 1);
+        assert_eq!(store.state.rewind_turns[0].preview, "first question");
+        assert!(
+            !store.state.rewind_turns.iter().any(|row| row.num_turns > 1),
+            "no dropped turn may still be offered after the rollback"
+        );
+    }
+
+    #[test]
+    fn empty_session_list_result_renders_no_sessions_not_loading() {
+        use crate::client_event::ClientEvent;
+
+        let mut store = store_with_empty_session();
+        // Open the picker: while the fetch is in flight it renders `Loading`.
+        store.dispatch_local_action(LocalAction::OpenResumePicker, None);
+        assert!(
+            matches!(store.state.active_menu, Some(MenuBuildResult::Loading(_))),
+            "the picker renders Loading until the session/list result lands"
+        );
+
+        // Server returns zero prior sessions.
+        store.apply_client_event(ClientEvent::SessionList(SessionListResult {
+            sessions: serde_json::json!([]),
+        }));
+
+        assert!(
+            store.state.resume_list_loaded,
+            "an applied session/list result marks the list loaded"
+        );
+        assert!(store.state.resume_sessions.is_empty());
+        // The open picker now shows a terminal No-sessions state, not `Loading`.
+        match &store.state.active_menu {
+            Some(MenuBuildResult::Unavailable(status)) => assert!(
+                status.message.contains("No prior sessions"),
+                "expected a No-sessions message, got: {}",
+                status.message
+            ),
+            other => panic!("expected an Unavailable No-sessions menu, got {other:?}"),
+        }
     }
 
     /// `/lang` with no/unknown code must NOT mutate the process-global locale

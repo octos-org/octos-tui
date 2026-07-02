@@ -157,9 +157,13 @@ pub const APPUI_SKILLS_MENU_METHODS_ANY: &[&str] = &[
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
     APPUI_METHOD_PROFILE_SKILLS_REMOVE,
 ];
-/// `/resume` is gated on the server advertising `session/list`; without it the
-/// picker has no way to fetch prior sessions, so the command hides.
-pub const APPUI_RESUME_MENU_METHODS_ANY: &[&str] = &[methods::SESSION_LIST];
+/// `/resume` is gated on the server advertising BOTH `session/list` AND
+/// `session/hydrate` (ALL, not any-of): the picker fetches prior sessions via
+/// `session/list`, and picking a row loads that session via `session/hydrate`.
+/// A server that advertised list-but-not-hydrate would let a selection emit an
+/// unsupported `session/hydrate` RPC, so the command hides unless both land.
+pub const APPUI_RESUME_MENU_METHODS_ALL: &[&str] =
+    &[methods::SESSION_LIST, methods::SESSION_HYDRATE];
 /// `/rewind` is gated on the server advertising `session/rollback`; without it
 /// there is no way to drop the later turns, so the command hides.
 pub const APPUI_REWIND_MENU_METHODS_ANY: &[&str] =
@@ -600,8 +604,11 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             aliases: &["sessions"],
             description: "Switch to a prior session and reload its transcript.",
             category: CommandCategory::Session,
-            availability: CommandAvailability::app_ui_read(&[])
-                .with_required_methods_any(APPUI_RESUME_MENU_METHODS_ANY),
+            // Gated on ALL of `APPUI_RESUME_MENU_METHODS_ALL` (`session/list` +
+            // `session/hydrate`): `app_ui_read` requires every listed method, so
+            // a list-but-not-hydrate server hides `/resume` rather than letting a
+            // pick emit an unsupported `session/hydrate`.
+            availability: CommandAvailability::app_ui_read(APPUI_RESUME_MENU_METHODS_ALL),
             inline_args: InlineArgMode::Optional,
             entry: CommandEntry::LocalAction(LocalAction::OpenResumePicker),
         },
@@ -881,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_command_is_history_safe_and_gated_on_session_list() {
+    fn resume_command_is_history_safe_and_gated_on_session_list_and_hydrate() {
         let registry = CommandRegistry::with_core_commands();
 
         // Name + alias resolve, and the verb is history-safe (recorded for
@@ -895,9 +902,14 @@ mod tests {
             "/sessions must alias /resume"
         );
 
-        // Hidden until the server advertises `session/list`; visible once it does.
+        // `/resume` fetches the list via `session/list` AND loads the chosen
+        // session via `session/hydrate` on selection, so it must be gated on
+        // BOTH — advertising list-but-not-hydrate would make a picked row emit
+        // an unsupported `session/hydrate` RPC.
         let base_caps = CapabilitySet::from_methods([methods::TURN_INTERRUPT]);
-        let list_caps = CapabilitySet::from_methods([methods::SESSION_LIST]);
+        let list_only_caps = CapabilitySet::from_methods([methods::SESSION_LIST]);
+        let both_caps =
+            CapabilitySet::from_methods([methods::SESSION_LIST, methods::SESSION_HYDRATE]);
         let without = AvailabilityContext {
             task: TaskActivity::Idle,
             approval_modal_visible: false,
@@ -908,24 +920,37 @@ mod tests {
             feature_flags: &[],
             session_open: true,
         };
-        assert!(
-            !registry
-                .available_commands(&without)
+        let is_available = |ctx: &AvailabilityContext<'_>| {
+            registry
+                .available_commands(ctx)
                 .into_iter()
-                .any(|command| command.name == "resume"),
+                .any(|command| command.name == "resume")
+        };
+
+        assert!(
+            !is_available(&without),
             "/resume hides without session/list"
         );
 
-        let with = AvailabilityContext {
-            capabilities: Some(&list_caps),
+        // Advertising `session/list` alone is not enough: selection would emit
+        // an unsupported `session/hydrate`, so `/resume` must still hide.
+        let list_only = AvailabilityContext {
+            capabilities: Some(&list_only_caps),
             ..without
         };
         assert!(
-            registry
-                .available_commands(&with)
-                .into_iter()
-                .any(|command| command.name == "resume"),
-            "/resume appears once session/list is advertised"
+            !is_available(&list_only),
+            "/resume must hide when session/hydrate is not advertised (list-only server)"
+        );
+
+        // Visible once BOTH `session/list` and `session/hydrate` are advertised.
+        let with_both = AvailabilityContext {
+            capabilities: Some(&both_caps),
+            ..without
+        };
+        assert!(
+            is_available(&with_both),
+            "/resume appears once both session/list and session/hydrate are advertised"
         );
     }
 
