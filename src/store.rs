@@ -1177,6 +1177,19 @@ impl Store {
                     // refreshes the open menu into `Ready` rows.
                     self.open_menu(MenuId::from(crate::menu::registry::MENU_RESUME));
                     Some(AppUiCommand::ListSessions(SessionListParams {}))
+                } else if !self.state.resume_list_loaded {
+                    // `/resume <query>` before the list ever loaded: the local
+                    // resolve below would ALWAYS fail (`resume_sessions` is only
+                    // populated by a fetch). Fetch-then-filter instead: open the
+                    // picker with the query pre-seeded as its search filter and
+                    // request the list — when the `SessionList` result lands it
+                    // refreshes the open menu already narrowed to the query.
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_RESUME));
+                    if let Some(frame) = self.state.menu_stack.active_mut() {
+                        frame.search_query = arg.to_owned();
+                    }
+                    self.refresh_active_menu();
+                    Some(AppUiCommand::ListSessions(SessionListParams {}))
                 } else {
                     // `/resume <query>` shortcut: resolve to a session id by
                     // case-insensitive substring match and switch directly,
@@ -9151,9 +9164,35 @@ mod tests {
         );
     }
 
+    /// `/resume <query>` typed before the session list ever loaded must not
+    /// dead-end on "No prior session matches" (the list is only populated by
+    /// the no-arg picker). It opens the picker with the query pre-seeded and
+    /// fetches the list — fetch-then-filter.
+    #[test]
+    fn resume_query_before_list_load_opens_seeded_picker_and_fetches() {
+        let mut store = store_with_empty_session();
+        assert!(!store.state.resume_list_loaded, "fresh store: nothing fetched");
+
+        let command = store
+            .dispatch_local_action(LocalAction::OpenResumePicker, Some("alpha"))
+            .into_command();
+
+        assert!(
+            matches!(command, Some(AppUiCommand::ListSessions(_))),
+            "the unfetched-list path must fetch instead of resolving locally"
+        );
+        let frame = store.state.menu_stack.active().expect("picker open");
+        assert_eq!(frame.id.as_str(), crate::menu::registry::MENU_RESUME);
+        assert_eq!(
+            frame.search_query, "alpha",
+            "the query is pre-seeded so the fetched list arrives filtered"
+        );
+    }
+
     #[test]
     fn resume_inline_query_resolves_to_a_session_and_hydrates() {
         let mut store = store_with_empty_session();
+        store.state.resume_list_loaded = true;
         store.state.resume_sessions = vec![
             ResumeSessionRow {
                 id: "coding:api:alpha".into(),
