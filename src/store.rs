@@ -7697,6 +7697,16 @@ impl Store {
         }
     }
 
+    /// Event-loop hook for DIRECT session switches that bypass the store
+    /// dispatch paths (Sessions-pane Up/Down, the activity navigator):
+    /// `AppState::switch_selected_session` restores the incoming session's
+    /// staged queue, but only a store-level drain can turn it into a
+    /// `turn/start` — without this, a prompt staged in an idle session sat
+    /// stuck until some unrelated turn event (codex round-2 P2).
+    pub fn drain_staged_after_direct_switch(&mut self) {
+        self.enqueue_staged_drain_after_switch();
+    }
+
     /// Submit the ACTIVE session's next staged prompt when it is idle.
     /// `pending_messages` holds the active session's queue only (other
     /// sessions' queues are stashed per-session and reloaded on switch), so a

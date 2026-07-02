@@ -662,12 +662,12 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     }
 
     if is_alt_char(&key, 'j') {
-        move_down(&mut store.state);
+        move_down(store);
         return KeyAction::Continue;
     }
 
     if is_alt_char(&key, 'k') {
-        move_up(&mut store.state);
+        move_up(store);
         return KeyAction::Continue;
     }
 
@@ -953,10 +953,10 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             return KeyAction::Quit;
         }
         KeyCode::Char('j') if store.state.focus != FocusPane::Composer => {
-            move_down(&mut store.state);
+            move_down(store);
         }
         KeyCode::Char('k') if store.state.focus != FocusPane::Composer => {
-            move_up(&mut store.state);
+            move_up(store);
         }
         KeyCode::Down if store.state.transcript_pager_active => {
             store.state.scroll_transcript_down(1);
@@ -1008,10 +1008,10 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             }
         }
         KeyCode::Down => {
-            move_down(&mut store.state);
+            move_down(store);
         }
         KeyCode::Up => {
-            move_up(&mut store.state);
+            move_up(store);
         }
         KeyCode::PageDown => match store.state.focus {
             FocusPane::Workspace => store.state.workspace.scroll_down(8),
@@ -1138,6 +1138,10 @@ fn handle_activity_navigator_key(store: &mut Store, key: KeyEvent) -> KeyAction 
                 // terminal event would submit them into the newly selected
                 // session (codex P1 on the per-session staged-queue fix).
                 store.state.switch_selected_session(idx);
+                // ...and drain the incoming session's restored staged queue
+                // (codex round-2 P2: without this a staged prompt sits stuck
+                // until an unrelated turn event).
+                store.drain_staged_after_direct_switch();
                 store.state.status = t!(
                     "status.activity_navigator_selected_session",
                     title = store.state.sessions[idx].title.clone()
@@ -1819,25 +1823,34 @@ fn handle_turn_state_detail_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     KeyAction::Continue
 }
 
-fn move_down(state: &mut crate::model::AppState) {
-    match state.focus {
-        FocusPane::Sessions => state.select_next_session(),
-        FocusPane::Tasks => state.select_next_task(),
-        FocusPane::Artifacts => state.select_next_artifact(),
-        FocusPane::Workspace => state.select_next_workspace_entry(),
-        FocusPane::Git => state.select_next_git_entry(),
-        FocusPane::Transcript | FocusPane::Composer => state.scroll_transcript_down(1),
+fn move_down(store: &mut Store) {
+    match store.state.focus {
+        FocusPane::Sessions => {
+            store.state.select_next_session();
+            // A direct switch restores the incoming session's staged queue;
+            // drain it (as a follow-up command) or a staged prompt sits stuck
+            // until an unrelated turn event (codex round-2 P2).
+            store.drain_staged_after_direct_switch();
+        }
+        FocusPane::Tasks => store.state.select_next_task(),
+        FocusPane::Artifacts => store.state.select_next_artifact(),
+        FocusPane::Workspace => store.state.select_next_workspace_entry(),
+        FocusPane::Git => store.state.select_next_git_entry(),
+        FocusPane::Transcript | FocusPane::Composer => store.state.scroll_transcript_down(1),
     }
 }
 
-fn move_up(state: &mut crate::model::AppState) {
-    match state.focus {
-        FocusPane::Sessions => state.select_prev_session(),
-        FocusPane::Tasks => state.select_prev_task(),
-        FocusPane::Artifacts => state.select_prev_artifact(),
-        FocusPane::Workspace => state.select_prev_workspace_entry(),
-        FocusPane::Git => state.select_prev_git_entry(),
-        FocusPane::Transcript | FocusPane::Composer => state.scroll_transcript_up(1),
+fn move_up(store: &mut Store) {
+    match store.state.focus {
+        FocusPane::Sessions => {
+            store.state.select_prev_session();
+            store.drain_staged_after_direct_switch();
+        }
+        FocusPane::Tasks => store.state.select_prev_task(),
+        FocusPane::Artifacts => store.state.select_prev_artifact(),
+        FocusPane::Workspace => store.state.select_prev_workspace_entry(),
+        FocusPane::Git => store.state.select_prev_git_entry(),
+        FocusPane::Transcript | FocusPane::Composer => store.state.scroll_transcript_up(1),
     }
 }
 
@@ -3924,6 +3937,52 @@ mod tests {
         // Switching back restores the stashed draft — proof the full bundle ran.
         store.state.switch_selected_session(0);
         assert_eq!(store.state.composer, "draft for zero");
+    }
+
+    #[test]
+    fn sessions_pane_switch_back_drains_the_staged_queue() {
+        // codex round-2 P2: switch_selected_session restores the incoming
+        // session's staged queue, but the Sessions-pane Up/Down path never
+        // drained it — the staged prompt sat stuck until an unrelated turn
+        // event. The direct-switch paths now enqueue the drained submit on
+        // the follow-up queue.
+        let mut store = store_with_sessions(2);
+        // Switch away FIRST (the outgoing bundle stashes session 0's — empty —
+        // active queue), THEN seed session 0's stash: a staged prompt left
+        // behind when its terminal fired while session 1 was active.
+        store.state.switch_selected_session(1);
+        store.state.pending_messages_by_session.insert(
+            store.state.sessions[0].id.clone(),
+            vec!["staged for zero".into()],
+        );
+        store.state.focus = FocusPane::Sessions;
+
+        // Down wraps 1 -> 0 (two sessions): the direct switch back must drain.
+        handle_key(&mut store, key(KeyCode::Down));
+
+        assert_eq!(store.state.selected_session, 0);
+        let follow_up = store
+            .state
+            .pending_autonomy_hydration
+            .iter()
+            .find_map(|command| match command {
+                AppUiCommand::SubmitPrompt(params) => {
+                    params.input.iter().find_map(|item| match item {
+                        octos_core::ui_protocol::InputItem::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            });
+        assert_eq!(
+            follow_up.as_deref(),
+            Some("staged for zero"),
+            "the restored staged prompt must be submitted as a follow-up"
+        );
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "the staged queue drained"
+        );
     }
 
     #[test]

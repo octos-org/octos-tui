@@ -880,6 +880,20 @@ impl StdioTransportDriver {
                                     break;
                                 }
                             }
+                            Ok(CappedLine::NotUtf8 { lossy }) => {
+                                // A mangled frame's request id is unknowable;
+                                // forwarding the lossy text would just decode
+                                // as malformed_json and silently leak its
+                                // pending-request entry. Skip it like TooLong
+                                // (the backend cancels pending requests).
+                                if event_tx
+                                    .send(stdio_frame_not_utf8_skipped_event(lossy.len()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
                             Ok(CappedLine::Eof) => {
                                 // stdout closed: the child is usually exiting.
                                 // Reap it (bounded) so the disconnect message
@@ -918,6 +932,10 @@ impl StdioTransportDriver {
                             }
                             Ok(CappedLine::TooLong { discarded }) => {
                                 stderr_ring.push(format!("[stderr line dropped: {discarded} bytes]"));
+                            }
+                            Ok(CappedLine::NotUtf8 { lossy }) => {
+                                // Diagnostics keep best-effort text.
+                                stderr_ring.push(lossy);
                             }
                             Ok(CappedLine::Eof) => {
                                 stderr_open = false;
@@ -1038,11 +1056,17 @@ const STDIO_EXIT_DRAIN_BUDGET: Duration = Duration::from_secs(2);
 /// Outcome of reading one line through [`CappedLineReader`].
 #[derive(Debug, PartialEq, Eq)]
 enum CappedLine {
-    /// A complete line (newline / trailing `\r` stripped, lossy UTF-8).
+    /// A complete line (newline / trailing `\r` stripped, strict UTF-8).
     Line(String),
     /// The line exceeded the cap and was discarded up to (and including) its
     /// terminating newline; `discarded` counts the dropped bytes.
     TooLong { discarded: u64 },
+    /// A complete line whose bytes were not valid UTF-8. Carries the lossy
+    /// decoding for DIAGNOSTIC consumers (the stderr ring); the stdout frame
+    /// path must NOT forward it as a frame — a mangled response's id is
+    /// untrustworthy, so it is skipped with pending requests cancelled
+    /// (same treatment as `TooLong`, codex round-2 P2).
+    NotUtf8 { lossy: String },
     /// End of stream.
     Eof,
 }
@@ -1093,7 +1117,7 @@ impl<R: tokio::io::AsyncBufRead + Unpin> CappedLineReader<R> {
                 if self.buf.is_empty() {
                     return Ok(CappedLine::Eof);
                 }
-                return Ok(CappedLine::Line(take_line_string(&mut self.buf)));
+                return Ok(take_line(&mut self.buf));
             }
 
             let newline = available.iter().position(|&byte| byte == b'\n');
@@ -1121,7 +1145,7 @@ impl<R: tokio::io::AsyncBufRead + Unpin> CappedLineReader<R> {
                     }
                     self.buf.extend_from_slice(&available[..pos]);
                     self.reader.consume(pos + 1);
-                    return Ok(CappedLine::Line(take_line_string(&mut self.buf)));
+                    return Ok(take_line(&mut self.buf));
                 }
                 (false, None) => {
                     let chunk = available.len();
@@ -1140,16 +1164,21 @@ impl<R: tokio::io::AsyncBufRead + Unpin> CappedLineReader<R> {
     }
 }
 
-/// Take the accumulated line bytes as a `String`: strips one trailing `\r`
-/// (CRLF input) and decodes lossily on invalid UTF-8.
-fn take_line_string(buf: &mut Vec<u8>) -> String {
+/// Take the accumulated line bytes: strips one trailing `\r` (CRLF input).
+/// Strict UTF-8 yields [`CappedLine::Line`]; invalid bytes yield
+/// [`CappedLine::NotUtf8`] with a lossy decoding for diagnostic consumers —
+/// forwarding a lossily-mangled frame would decode as `malformed_json` with
+/// an unknowable request id, silently leaking its pending-request entry.
+fn take_line(buf: &mut Vec<u8>) -> CappedLine {
     if buf.last() == Some(&b'\r') {
         buf.pop();
     }
     let bytes = std::mem::take(buf);
     match String::from_utf8(bytes) {
-        Ok(line) => line,
-        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+        Ok(line) => CappedLine::Line(line),
+        Err(err) => CappedLine::NotUtf8 {
+            lossy: String::from_utf8_lossy(err.as_bytes()).into_owned(),
+        },
     }
 }
 
@@ -1161,6 +1190,20 @@ fn stdio_frame_too_large_skipped_event(discarded: u64) -> TransportEvent {
         code: "frame_too_large".into(),
         message: format!(
             "UI protocol stdio frame exceeded {MAX_TEXT_FRAME_BYTES} bytes ({discarded} bytes discarded); skipped to next line"
+        ),
+        disconnect: false,
+    }
+}
+
+/// Error event for a skipped invalid-UTF-8 stdio line. Same non-fatal
+/// semantics as [`stdio_frame_too_large_skipped_event`], and the same
+/// pending-request cancellation in the backend: the frame may have been a
+/// response whose id is now unknowable.
+fn stdio_frame_not_utf8_skipped_event(lossy_len: usize) -> TransportEvent {
+    TransportEvent::Error {
+        code: "frame_not_utf8".into(),
+        message: format!(
+            "UI protocol stdio frame was not valid UTF-8 (~{lossy_len} bytes); skipped to next line"
         ),
         disconnect: false,
     }
@@ -1252,6 +1295,15 @@ async fn drain_stdout_to_eof<R: tokio::io::AsyncBufRead + Unpin>(
                         break;
                     }
                 }
+                Ok(CappedLine::NotUtf8 { lossy }) => {
+                    if event_tx
+                        .send(stdio_frame_not_utf8_skipped_event(lossy.len()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 Ok(CappedLine::Eof) | Err(_) => break,
             }
         }
@@ -1273,6 +1325,7 @@ async fn drain_stderr_to_eof<R: tokio::io::AsyncBufRead + Unpin>(
                 Ok(CappedLine::TooLong { discarded }) => {
                     ring.push(format!("[stderr line dropped: {discarded} bytes]"));
                 }
+                Ok(CappedLine::NotUtf8 { lossy }) => ring.push(lossy),
                 Ok(CappedLine::Eof) | Err(_) => break,
             }
         }
@@ -1658,14 +1711,15 @@ impl ProtocolAppUiBackend {
                     self.mark_disconnected(
                         "UI protocol disconnected; reconnect will retry on next send/read.",
                     );
-                } else if code == "frame_too_large" {
-                    // A skipped over-cap stdio line may have BEEN the response
-                    // to an in-flight request — its id is unknowable (the
-                    // frame was discarded before decode), so the matching
-                    // `pending_requests` entry would otherwise leak forever
-                    // and repeated large responses would wedge sends at
-                    // MAX_PENDING_REQUESTS. Cancel pending requests like the
-                    // disconnect path does, but keep the connection up.
+                } else if code == "frame_too_large" || code == "frame_not_utf8" {
+                    // A skipped stdio line (over-cap, or invalid UTF-8) may
+                    // have BEEN the response to an in-flight request — its id
+                    // is unknowable (the frame was discarded before decode),
+                    // so the matching `pending_requests` entry would otherwise
+                    // leak forever and repeated bad responses would wedge
+                    // sends at MAX_PENDING_REQUESTS. Cancel pending requests
+                    // like the disconnect path does, but keep the connection
+                    // up.
                     let cancelled = self.protocol.cancel_pending_requests(
                         "response may have been discarded (frame too large)",
                     );
@@ -6992,8 +7046,12 @@ mod tests {
         );
         assert_eq!(
             reader.next_line().await.expect("read"),
-            CappedLine::Line("caf\u{FFFD} latte".into()),
-            "invalid UTF-8 decodes lossily instead of erroring the transport"
+            CappedLine::NotUtf8 {
+                lossy: "caf\u{FFFD} latte".into()
+            },
+            "invalid UTF-8 is surfaced as NotUtf8 (skipped on the frame path, \
+             lossy for stderr diagnostics) — delivering it lossily decoded as \
+             malformed_json and leaked the pending request (codex round-2 P2)"
         );
         assert_eq!(
             reader.next_line().await.expect("read"),
@@ -7649,6 +7707,61 @@ mod tests {
             backend.queue.is_empty(),
             "no disconnect status may be queued"
         );
+    }
+
+    #[test]
+    fn skipped_not_utf8_frame_cancels_pending_requests_without_disconnect() {
+        // codex round-2 P2: an invalid-UTF-8 stdio line used to be delivered
+        // LOSSILY — decoding as malformed_json with an unknowable id and
+        // silently leaking its pending-request entry. It is now skipped like
+        // an over-cap frame, with pending requests cancelled.
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        let request = backend
+            .build_tracked_request(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+            }))
+            .expect("request builds");
+        backend.mark_connected("wss://example.test/ui-protocol");
+
+        let first = backend
+            .handle_transport_event(stdio_frame_not_utf8_skipped_event(42))
+            .expect("event handled")
+            .expect("event surfaced");
+
+        assert!(backend.protocol.pending_requests.is_empty());
+        let AppUiEvent::Error(error) = unwrap_app_event(first) else {
+            panic!("expected cancellation error first");
+        };
+        assert_eq!(error.code, "request_cancelled");
+        assert!(error.message.contains(&request.id));
+        let next = backend.queue.pop_front().expect("frame_not_utf8 error");
+        let AppUiEvent::Error(error) = unwrap_app_event(next) else {
+            panic!("expected frame_not_utf8 error");
+        };
+        assert_eq!(error.code, "frame_not_utf8");
+        assert!(matches!(
+            backend.connection_state,
+            ProtocolConnectionState::Connected
+        ));
+    }
+
+    #[test]
+    fn take_line_yields_not_utf8_for_invalid_bytes() {
+        let mut buf = vec![0xf0, 0x9f, b'x', 0xff, b'\r'];
+        let CappedLine::NotUtf8 { lossy } = take_line(&mut buf) else {
+            panic!("expected NotUtf8 for invalid bytes");
+        };
+        assert!(lossy.contains('x'), "lossy text keeps readable bytes");
+        // Strict UTF-8 still yields Line.
+        let mut ok = b"hello\r".to_vec();
+        assert_eq!(take_line(&mut ok), CappedLine::Line("hello".into()));
     }
 
     #[test]
