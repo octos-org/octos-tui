@@ -532,7 +532,12 @@ fn component_menu(
         tabs: Vec::new(),
         searchable: true,
         search_placeholder: Some(t!("menu.component.search").into_owned()),
-        footer_hint: Some(t!("menu.component.footer").into_owned()),
+        // Honest footer: the checkboxes are a read-only preview of the
+        // build-time layout — no Space toggle / reorder handling is wired and
+        // Enter reports "not wired" — so promise only navigation (plain
+        // English, no i18n key; the localized `menu.component.footer` still
+        // advertises the unwired Space toggle).
+        footer_hint: Some("Up/Down move | Esc close — read-only preview, save not wired yet".into()),
         preview: Some(MenuPreview::Text {
             title: Some(t!("menu.component.preview_title").into_owned()),
             body: selected.join(" | "),

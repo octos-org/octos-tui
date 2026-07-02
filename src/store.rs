@@ -1109,20 +1109,16 @@ impl Store {
                 }
                 None
             }
-            LocalAction::SaveStatusLine(items) => {
-                self.state.status = t!(
-                    "status.statusline_layout_selected",
-                    items = items.join(", ")
-                )
-                .into_owned();
+            // Honesty over a false success: nothing applies these layouts —
+            // the menu checkboxes are build-time constants and no Space/
+            // reorder handling exists — so mirror SaveKeymap's explicit
+            // not-wired wording instead of claiming "layout selected".
+            LocalAction::SaveStatusLine(_) => {
+                self.state.status = "Status line layout save is not wired yet".into();
                 None
             }
-            LocalAction::SaveTerminalTitle(items) => {
-                self.state.status = t!(
-                    "status.terminal_title_layout_selected",
-                    items = items.join(", ")
-                )
-                .into_owned();
+            LocalAction::SaveTerminalTitle(_) => {
+                self.state.status = "Terminal title layout save is not wired yet".into();
                 None
             }
             LocalAction::SaveKeymap => {
@@ -9161,6 +9157,56 @@ mod tests {
             store.state.sessions.len(),
             before,
             "no placeholder session is created while a turn is live"
+        );
+    }
+
+    /// `/statusline` and `/title` picks apply NOTHING (the checkboxes are
+    /// build-time constants; no Space/reorder handling exists), so their
+    /// statuses must say so explicitly — mirroring SaveKeymap — instead of
+    /// reporting a false "layout selected" success.
+    #[test]
+    fn statusline_and_title_saves_report_not_wired() {
+        let mut store = store_with_empty_session();
+
+        let command = store
+            .dispatch_local_action(LocalAction::SaveStatusLine(vec!["state".into()]), None)
+            .into_command();
+        assert!(command.is_none());
+        assert!(
+            store.state.status.contains("not wired"),
+            "SaveStatusLine must not claim success: {}",
+            store.state.status
+        );
+
+        let command = store
+            .dispatch_local_action(LocalAction::SaveTerminalTitle(vec!["model".into()]), None)
+            .into_command();
+        assert!(command.is_none());
+        assert!(
+            store.state.status.contains("not wired"),
+            "SaveTerminalTitle must not claim success: {}",
+            store.state.status
+        );
+    }
+
+    /// The `/statusline` picker's footer must not promise the unwired Space
+    /// toggle / reorder interactions (read-only checkboxes are kept).
+    #[test]
+    fn statusline_menu_footer_does_not_promise_unwired_interactions() {
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_STATUS_LINE));
+
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected the statusline menu to build");
+        };
+        let footer = spec.footer_hint.as_deref().unwrap_or_default();
+        assert!(
+            !footer.contains("Space toggle") && !footer.contains("reorder"),
+            "footer must not advertise unwired interactions: {footer}"
+        );
+        assert!(
+            footer.contains("not wired"),
+            "footer should surface the read-only state: {footer}"
         );
     }
 
