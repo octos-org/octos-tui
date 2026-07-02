@@ -1373,8 +1373,7 @@ impl Store {
             return None;
         };
         if session_id.0 != picked_session_id {
-            self.state.status =
-                "Rewind pick belongs to another session — reopen /rewind.".into();
+            self.state.status = "Rewind pick belongs to another session — reopen /rewind.".into();
             return None;
         }
         let fresh_rows = self.collect_rewind_turns();
@@ -5075,8 +5074,7 @@ impl Store {
                 // entries across replays (reconnect/refresh) and reset browsing.
                 let composer_history = self.state.composer_history.clone();
                 let pending_messages = self.state.pending_messages.clone();
-                let pending_messages_by_session =
-                    self.state.pending_messages_by_session.clone();
+                let pending_messages_by_session = self.state.pending_messages_by_session.clone();
                 let optimistic_user_messages = self.state.optimistic_user_messages.clone();
                 let turn_prompt_anchors = self.state.turn_prompt_anchors.clone();
                 let live_reply_segment_boundaries =
@@ -5616,10 +5614,12 @@ impl Store {
             {
                 draft.text = prefill;
             } else if !prefill.is_empty() {
-                self.state.composer_drafts.push(crate::model::ComposerDraft {
-                    session_id: key,
-                    text: prefill,
-                });
+                self.state
+                    .composer_drafts
+                    .push(crate::model::ComposerDraft {
+                        session_id: key,
+                        text: prefill,
+                    });
             }
         }
         self.state.status = format!("Rewound {dropped} turn(s) — edit and resend");
@@ -9217,7 +9217,10 @@ mod tests {
     #[test]
     fn resume_query_before_list_load_opens_seeded_picker_and_fetches() {
         let mut store = store_with_empty_session();
-        assert!(!store.state.resume_list_loaded, "fresh store: nothing fetched");
+        assert!(
+            !store.state.resume_list_loaded,
+            "fresh store: nothing fetched"
+        );
 
         let command = store
             .dispatch_local_action(LocalAction::OpenResumePicker, Some("alpha"))
@@ -9769,10 +9772,8 @@ mod tests {
         use crate::client_event::ClientEvent;
 
         let mut store = store_with_two_sessions("local:a", "local:b");
-        store.state.sessions[0].messages = vec![
-            Message::user("first question"),
-            Message::assistant("ok"),
-        ];
+        store.state.sessions[0].messages =
+            vec![Message::user("first question"), Message::assistant("ok")];
         // The rewind was issued in A…
         store.state.pending_rewind_prefill =
             Some((SessionKey("local:a".into()), "second question".into()));
@@ -11148,10 +11149,7 @@ mod tests {
 
         // `/onboard profile ada-server`: the wizard swaps to the provider step
         // in place on the same frame.
-        store.dispatch_onboarding_action(
-            OnboardingAction::SetProfileId("ada-server".into()),
-            None,
-        );
+        store.dispatch_onboarding_action(OnboardingAction::SetProfileId("ada-server".into()), None);
 
         let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
             panic!("expected provider setup menu after profile id set");
@@ -14538,10 +14536,10 @@ mod tests {
         let errored_turn = TurnId::new();
         let mut store = store_with_live_reply(live_turn.clone(), "still streaming");
         let session_id = store.state.sessions[0].id.clone();
-        store.state.live_reasoning.insert(
-            (session_id.clone(), errored_turn.clone()),
-            "keep me".into(),
-        );
+        store
+            .state
+            .live_reasoning
+            .insert((session_id.clone(), errored_turn.clone()), "keep me".into());
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
             TurnErrorEvent {

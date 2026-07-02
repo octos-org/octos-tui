@@ -537,7 +537,9 @@ fn component_menu(
         // Enter reports "not wired" — so promise only navigation (plain
         // English, no i18n key; the localized `menu.component.footer` still
         // advertises the unwired Space toggle).
-        footer_hint: Some("Up/Down move | Esc close — read-only preview, save not wired yet".into()),
+        footer_hint: Some(
+            "Up/Down move | Esc close — read-only preview, save not wired yet".into(),
+        ),
         preview: Some(MenuPreview::Text {
             title: Some(t!("menu.component.preview_title").into_owned()),
             body: selected.join(" | "),

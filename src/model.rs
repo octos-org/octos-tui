@@ -5566,10 +5566,7 @@ impl AppState {
     /// dropped instead of resurrecting it into `live_reply` (see
     /// [`AppState::completed_turns`]). Bounded FIFO per session.
     pub fn mark_turn_completed(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
-        let (set, queue) = self
-            .completed_turns
-            .entry(session_id.clone())
-            .or_default();
+        let (set, queue) = self.completed_turns.entry(session_id.clone()).or_default();
         if set.insert(turn_id.clone()) {
             queue.push_back(turn_id.clone());
             while queue.len() > Self::COMPLETED_TURNS_CAP {
