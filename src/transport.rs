@@ -1720,9 +1720,12 @@ impl ProtocolAppUiBackend {
                     // sends at MAX_PENDING_REQUESTS. Cancel pending requests
                     // like the disconnect path does, but keep the connection
                     // up.
-                    let cancelled = self.protocol.cancel_pending_requests(
-                        "response may have been discarded (frame too large)",
-                    );
+                    let reason = if code == "frame_not_utf8" {
+                        "response may have been discarded (frame was not valid UTF-8)"
+                    } else {
+                        "response may have been discarded (frame too large)"
+                    };
+                    let cancelled = self.protocol.cancel_pending_requests(reason);
                     self.queue
                         .extend(cancelled.into_iter().filter_map(|cancelled| {
                             (!cancelled.is_capabilities_probe()).then_some(cancelled.event.into())

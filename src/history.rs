@@ -183,21 +183,28 @@ impl ComposerHistory {
         // NOT trigger a rewrite: they can be a concurrent writer's partial
         // append, and rewriting would discard it.
         let mut dropped_oversized = false;
+        // A torn/unparseable line can be a CONCURRENT writer's partial append;
+        // any load that saw one must not rewrite the file, or the in-flight
+        // entry is deleted (compaction defers to a later, clean load).
+        let mut saw_unparseable = false;
         if let Ok(contents) = std::fs::read_to_string(path) {
             for line in contents.lines() {
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
                 }
-                if let Ok(entry) = serde_json::from_str::<String>(line) {
-                    if entry.trim().is_empty() {
-                        continue;
+                match serde_json::from_str::<String>(line) {
+                    Ok(entry) => {
+                        if entry.trim().is_empty() {
+                            continue;
+                        }
+                        if entry.len() > MAX_ENTRY_BYTES {
+                            dropped_oversized = true;
+                            continue;
+                        }
+                        entries.push(entry);
                     }
-                    if entry.len() > MAX_ENTRY_BYTES {
-                        dropped_oversized = true;
-                        continue;
-                    }
-                    entries.push(entry);
+                    Err(_) => saw_unparseable = true,
                 }
             }
         }
@@ -212,7 +219,7 @@ impl ComposerHistory {
         // this feature, or by another tool); tighten it on load so stored
         // prompts are owner-only immediately, not only after the next append.
         tighten_permissions(path);
-        if oversized || dropped_oversized {
+        if (oversized || dropped_oversized) && !saw_unparseable {
             let _ = rewrite_history_file(path, &entries);
         }
         Self {
@@ -465,6 +472,31 @@ mod tests {
             "the oversized line must be compacted off disk on load"
         );
         assert!(on_disk.contains("ok1") && on_disk.contains("ok2"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_defers_compaction_when_a_torn_line_is_present() {
+        // codex round-3 P3: a torn/unparseable line can be a CONCURRENT
+        // writer's partial append — a load that saw one must not rewrite the
+        // file (which would delete the in-flight entry), even when an
+        // oversized entry would otherwise trigger compaction.
+        let path = temp_path("torn-defers-compaction");
+        let huge = "y".repeat(MAX_ENTRY_BYTES + 1);
+        let body = format!(
+            "\"ok1\"\n{}\n\"torn-partial-append\n",
+            serde_json::to_string(&huge).unwrap()
+        );
+        std::fs::write(&path, &body).unwrap();
+
+        let hist = ComposerHistory::load(&path);
+        assert_eq!(hist.entries(), &["ok1"], "torn + oversized lines skipped");
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            on_disk, body,
+            "no rewrite may happen while a torn line is present"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
