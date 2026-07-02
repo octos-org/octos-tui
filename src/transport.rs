@@ -30,6 +30,7 @@ use octos_core::ui_protocol::{
 use octos_core::{Message, SessionKey, TaskId};
 use serde_json::Value;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
@@ -202,6 +203,7 @@ pub struct ProtocolAppUiBackend {
     runtime_error: Option<String>,
     driver: Option<ProtocolTransportDriver>,
     connection_state: ProtocolConnectionState,
+    reconnect: ReconnectBackoff,
     disconnected_status_reported: bool,
     refresh_capabilities_on_reconnect: bool,
     queue: VecDeque<ClientEvent>,
@@ -218,6 +220,112 @@ pub struct ProtocolAppUiBackend {
 enum ProtocolConnectionState {
     Disconnected,
     Connected,
+}
+
+/// Delay before the first reconnect retry; doubles per consecutive failure.
+const RECONNECT_BACKOFF_BASE: Duration = Duration::from_millis(500);
+/// Ceiling for the exponential reconnect delay.
+const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(5);
+/// A connection that dies within this window of connecting counts as a
+/// failed attempt even though `connect()` itself succeeded — an instantly
+/// exiting stdio child (typo'd `--stdio-command`, crash-looping server)
+/// "connects" successfully every time, so a reset-on-connect policy would
+/// never let the backoff grow.
+const RECONNECT_SHORT_LIVED_WINDOW: Duration = Duration::from_secs(1);
+/// Wall-clock budget for the WebSocket connect + handshake. Without it, a
+/// blackholed endpoint blocks the UI thread for the OS TCP timeout on every
+/// reconnect attempt.
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Reconnect backoff state machine for the protocol transport.
+///
+/// `ensure_connected` runs on every event-loop tick (~25 ms) *and* on every
+/// send, so without gating, a dead endpoint is re-dialed tens of times per
+/// second forever. This struct schedules attempts at
+/// `RECONNECT_BACKOFF_BASE * 2^(failures-1)` (capped at
+/// `RECONNECT_BACKOFF_CAP`) after each consecutive failure.
+///
+/// Failure-reset choice (documented per review): failures are **not** reset
+/// merely because `connect()` succeeded — a spawn that exits instantly still
+/// "connects". Instead a connection proves itself by either
+///  - delivering a data frame ([`Self::record_frame`]), or
+///  - surviving at least [`RECONNECT_SHORT_LIVED_WINDOW`] before dying
+///    (checked in [`Self::record_disconnect`]).
+/// Until proven, a connection that dies young counts as one more consecutive
+/// failure, so a spawn/exit crash-loop keeps backing off exponentially.
+#[derive(Debug, Default)]
+struct ReconnectBackoff {
+    last_attempt: Option<Instant>,
+    consecutive_failures: u32,
+    connected_at: Option<Instant>,
+}
+
+impl ReconnectBackoff {
+    /// Whether a reconnect may be attempted at `now`. Never blocks the first
+    /// attempt; afterwards gates on the failure-scaled delay since the last
+    /// attempt.
+    fn should_attempt(&self, now: Instant) -> bool {
+        match self.last_attempt {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= self.current_delay(),
+        }
+    }
+
+    /// Delay implied by the current consecutive-failure count.
+    fn current_delay(&self) -> Duration {
+        if self.consecutive_failures == 0 {
+            return Duration::ZERO;
+        }
+        // Exponent is clamped so the shift cannot overflow; the cap keeps
+        // the effective delay at RECONNECT_BACKOFF_CAP anyway.
+        let exponent = self.consecutive_failures.saturating_sub(1).min(8);
+        RECONNECT_BACKOFF_BASE
+            .saturating_mul(1u32 << exponent)
+            .min(RECONNECT_BACKOFF_CAP)
+    }
+
+    /// A connect attempt failed outright (spawn error, TCP/WS failure).
+    fn record_failure(&mut self, now: Instant) {
+        self.last_attempt = Some(now);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.connected_at = None;
+    }
+
+    /// A connect attempt succeeded. Does NOT reset the failure count — see
+    /// the type docs; the connection still has to prove itself.
+    fn record_success(&mut self, now: Instant) {
+        self.last_attempt = Some(now);
+        self.connected_at = Some(now);
+    }
+
+    /// The connection delivered a data frame: it is proven good, so the
+    /// failure streak resets and a later death is treated as fresh.
+    fn record_frame(&mut self) {
+        self.consecutive_failures = 0;
+        self.connected_at = None;
+    }
+
+    /// An established connection dropped. Deaths within
+    /// [`RECONNECT_SHORT_LIVED_WINDOW`] of the connect count as one more
+    /// consecutive failure (crash-loop); longer-lived connections reset the
+    /// streak so a healthy server restart reconnects immediately. Calls
+    /// while already disconnected are no-ops, so the quiet backing-off
+    /// `ensure_connected` error path cannot push the schedule forward.
+    fn record_disconnect(&mut self, now: Instant) {
+        let Some(connected_at) = self.connected_at.take() else {
+            return;
+        };
+        if now.saturating_duration_since(connected_at) < RECONNECT_SHORT_LIVED_WINDOW {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            self.last_attempt = Some(now);
+        } else {
+            self.consecutive_failures = 0;
+        }
+    }
+
+    fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,8 +584,21 @@ impl WebSocketTransportDriver {
             self.auth_token.as_deref(),
             self.profile_id.as_deref(),
         )?;
+        // `connect` runs on the UI thread (block_on), so the TCP connect +
+        // WS handshake must be time-bounded: a blackholed endpoint would
+        // otherwise freeze the interface for the OS TCP timeout.
         let (stream, _) = runtime
-            .block_on(async { connect_async(request).await })
+            .block_on(async {
+                tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(request))
+                    .await
+                    .map_err(|_| {
+                        eyre!(
+                            "connect timed out after {}s",
+                            WS_CONNECT_TIMEOUT.as_secs()
+                        )
+                    })?
+                    .map_err(eyre::Report::from)
+            })
             .wrap_err_with(|| {
                 format!("failed to connect UI protocol endpoint {}", self.endpoint)
             })?;
@@ -908,6 +1029,7 @@ impl ProtocolAppUiBackend {
             runtime_error,
             driver: None,
             connection_state: ProtocolConnectionState::Disconnected,
+            reconnect: ReconnectBackoff::default(),
             disconnected_status_reported: false,
             refresh_capabilities_on_reconnect: false,
             queue: VecDeque::new(),
@@ -985,6 +1107,17 @@ impl ProtocolAppUiBackend {
             return Ok(());
         }
 
+        // Backoff gate: `ensure_connected` runs on every event-loop tick and
+        // every send, so a dead endpoint must not be re-dialed each time —
+        // return a quiet error without attempting until the schedule allows.
+        let now = Instant::now();
+        if !self.reconnect.should_attempt(now) {
+            return Err(eyre!(
+                "reconnect is backing off after {} consecutive failure(s)",
+                self.reconnect.consecutive_failures()
+            ));
+        }
+
         self.ensure_driver()?;
         let runtime = self
             .runtime
@@ -997,7 +1130,11 @@ impl ProtocolAppUiBackend {
 
         let should_reopen_session =
             self.disconnected_status_reported && self.launch.session_id.is_some();
-        driver.connect(runtime)?;
+        if let Err(err) = driver.connect(runtime) {
+            self.reconnect.record_failure(now);
+            return Err(err);
+        }
+        self.reconnect.record_success(now);
         let endpoint = driver.label().to_string();
         self.mark_connected(&endpoint);
         self.refresh_capabilities_after_reconnect()?;
@@ -1034,6 +1171,10 @@ impl ProtocolAppUiBackend {
         if let Some(driver) = self.driver.as_mut() {
             driver.disconnect();
         }
+        // No-op when there was no live connection, so the repeated
+        // mark_disconnected calls made while backing off cannot push the
+        // reconnect schedule forward.
+        self.reconnect.record_disconnect(Instant::now());
         self.refresh_capabilities_on_reconnect = true;
         let cancelled_requests = self.protocol.cancel_pending_requests(&message);
 
@@ -1175,7 +1316,21 @@ impl ProtocolAppUiBackend {
             .poll_event();
 
         match read_result {
-            Ok(event) => Ok(event),
+            Ok(event) => {
+                // A delivered data frame proves the connection is real, so
+                // the reconnect failure streak resets (control frames such as
+                // WS Close don't count — a connect/close loop must still back
+                // off).
+                if matches!(
+                    event,
+                    Some(TransportEvent::Frame(
+                        TransportFrame::Text(_) | TransportFrame::Binary(_)
+                    ))
+                ) {
+                    self.reconnect.record_frame();
+                }
+                Ok(event)
+            }
             Err(err) => {
                 self.mark_disconnected(
                     "UI protocol disconnected while reading; reconnect will retry on next send/read.",
@@ -6042,6 +6197,211 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("coding")
         );
+    }
+
+    // --- ReconnectBackoff state machine (no networks involved) ---
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn reconnect_backoff_allows_first_attempt_immediately() {
+        let backoff = ReconnectBackoff::default();
+        assert!(backoff.should_attempt(Instant::now()));
+    }
+
+    #[test]
+    fn reconnect_backoff_schedule_doubles_and_caps_at_five_seconds() {
+        let t0 = Instant::now();
+        let mut backoff = ReconnectBackoff::default();
+
+        // Failure 1 → wait 500ms.
+        backoff.record_failure(t0);
+        assert!(!backoff.should_attempt(t0 + ms(499)));
+        assert!(backoff.should_attempt(t0 + ms(500)));
+
+        // Failure 2 → wait 1s.
+        let t1 = t0 + ms(500);
+        backoff.record_failure(t1);
+        assert!(!backoff.should_attempt(t1 + ms(999)));
+        assert!(backoff.should_attempt(t1 + ms(1000)));
+
+        // Failures 3/4 → 2s/4s.
+        let t2 = t1 + ms(1000);
+        backoff.record_failure(t2);
+        assert!(!backoff.should_attempt(t2 + ms(1999)));
+        assert!(backoff.should_attempt(t2 + ms(2000)));
+        let t3 = t2 + ms(2000);
+        backoff.record_failure(t3);
+        assert!(!backoff.should_attempt(t3 + ms(3999)));
+        assert!(backoff.should_attempt(t3 + ms(4000)));
+
+        // Failure 5+ → capped at 5s (8s uncapped).
+        let t4 = t3 + ms(4000);
+        backoff.record_failure(t4);
+        assert!(!backoff.should_attempt(t4 + ms(4999)));
+        assert!(backoff.should_attempt(t4 + ms(5000)));
+        let t5 = t4 + ms(5000);
+        backoff.record_failure(t5);
+        assert!(!backoff.should_attempt(t5 + ms(4999)));
+        assert!(backoff.should_attempt(t5 + ms(5000)));
+    }
+
+    #[test]
+    fn reconnect_backoff_treats_instant_exit_loop_as_failures() {
+        // The storm scenario: spawn always "succeeds", the child dies
+        // instantly. Successful connects must NOT reset the streak; the
+        // short-lived disconnect keeps growing it.
+        let t0 = Instant::now();
+        let mut backoff = ReconnectBackoff::default();
+
+        assert!(backoff.should_attempt(t0));
+        backoff.record_success(t0);
+        backoff.record_disconnect(t0 + ms(10)); // died 10ms after connect
+        assert_eq!(backoff.consecutive_failures(), 1);
+        let t1 = t0 + ms(10);
+        assert!(!backoff.should_attempt(t1 + ms(489)));
+        assert!(backoff.should_attempt(t1 + ms(500)));
+
+        backoff.record_success(t1 + ms(500));
+        backoff.record_disconnect(t1 + ms(510));
+        assert_eq!(backoff.consecutive_failures(), 2);
+        let t2 = t1 + ms(510);
+        assert!(!backoff.should_attempt(t2 + ms(999)));
+        assert!(backoff.should_attempt(t2 + ms(1000)));
+    }
+
+    #[test]
+    fn reconnect_backoff_long_lived_connection_resets_failures() {
+        let t0 = Instant::now();
+        let mut backoff = ReconnectBackoff::default();
+        backoff.record_failure(t0);
+        backoff.record_failure(t0 + ms(500));
+        assert_eq!(backoff.consecutive_failures(), 2);
+
+        // Connection survives past the short-lived window before dying.
+        let connect = t0 + ms(1500);
+        backoff.record_success(connect);
+        backoff.record_disconnect(connect + ms(1500));
+        assert_eq!(backoff.consecutive_failures(), 0);
+        assert!(backoff.should_attempt(connect + ms(1500)));
+    }
+
+    #[test]
+    fn reconnect_backoff_frame_delivery_resets_failures() {
+        let t0 = Instant::now();
+        let mut backoff = ReconnectBackoff::default();
+        backoff.record_failure(t0);
+        backoff.record_failure(t0 + ms(500));
+
+        // Connect, receive a data frame, die 100ms in: the frame proved the
+        // connection, so the quick death does not count as a failure.
+        let connect = t0 + ms(1500);
+        backoff.record_success(connect);
+        backoff.record_frame();
+        backoff.record_disconnect(connect + ms(100));
+        assert_eq!(backoff.consecutive_failures(), 0);
+        assert!(backoff.should_attempt(connect + ms(100)));
+    }
+
+    #[test]
+    fn reconnect_backoff_ignores_disconnects_while_already_disconnected() {
+        // The quiet ensure_connected error path calls mark_disconnected on
+        // every tick; that must not slide the schedule forward.
+        let t0 = Instant::now();
+        let mut backoff = ReconnectBackoff::default();
+        backoff.record_success(t0);
+        backoff.record_disconnect(t0 + ms(10));
+        assert_eq!(backoff.consecutive_failures(), 1);
+
+        for tick in 1..100u64 {
+            backoff.record_disconnect(t0 + ms(10 + tick * 25));
+        }
+        assert_eq!(backoff.consecutive_failures(), 1);
+        assert!(backoff.should_attempt(t0 + ms(10) + ms(500)));
+    }
+
+    /// End-to-end storm guard: an instantly-exiting stdio child must be
+    /// respawned on the backoff schedule, not once per event-loop poll.
+    #[cfg(unix)]
+    #[test]
+    fn stdio_reconnect_backs_off_for_instantly_exiting_child() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is valid")
+            .as_nanos();
+        let marker = std::env::temp_dir().join(format!("octos-tui-backoff-{nonce}.log"));
+        let command = format!("echo spawned >> {}; exit 7", marker.display());
+
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::stdio(command)),
+            ..AppUiLaunch::default()
+        });
+
+        // Bootstrap performs the first connect; then poll aggressively for
+        // ~1.2s the way the event loop would.
+        let _ = backend.bootstrap();
+        let deadline = Instant::now() + Duration::from_millis(1200);
+        while Instant::now() < deadline {
+            let _ = backend.next_event();
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let spawns = std::fs::read_to_string(&marker)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            (1..=4).contains(&spawns),
+            "instantly-exiting stdio child should respawn on the backoff \
+             schedule (expected 1..=4 spawns in 1.2s, got {spawns})"
+        );
+    }
+
+    /// The WS connect path must give up after WS_CONNECT_TIMEOUT instead of
+    /// blocking the UI thread until the OS TCP timeout: a listener that
+    /// accepts but never answers the handshake simulates a blackholed
+    /// endpoint.
+    #[test]
+    fn websocket_connect_times_out_against_unresponsive_endpoint() {
+        let listener = match StdTcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind test listener: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener addr");
+        let hold = thread::spawn(move || {
+            // Accept the TCP connection and then never answer the WS
+            // handshake until the client hangs up.
+            if let Ok((stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut buf = [0u8; 1024];
+                use std::io::Read;
+                let mut stream = stream;
+                while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+            }
+        });
+
+        let runtime = Runtime::new().expect("test runtime");
+        let mut driver = WebSocketTransportDriver::new(format!("ws://{addr}/ui"), None, None);
+        let started = Instant::now();
+        let err = driver
+            .connect(&runtime)
+            .expect_err("handshake-less endpoint must not connect");
+        let elapsed = started.elapsed();
+
+        assert!(
+            format!("{err:#}").contains("timed out"),
+            "expected connect timeout error, got: {err:#}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "connect must be bounded by WS_CONNECT_TIMEOUT, took {elapsed:?}"
+        );
+        drop(driver);
+        hold.join().expect("hold thread exits");
     }
 
     #[test]
