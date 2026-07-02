@@ -3219,8 +3219,18 @@ pub struct AppState {
     /// re-streamed under the dead foreground turn id — must be dropped, not
     /// lazy-bound into `live_reply`: binding a completed turn latches
     /// `active_turn()` forever (no second terminal arrives to clear it), wedging
-    /// the composer into queuing all input.
-    pub completed_turns: std::collections::HashMap<SessionKey, std::collections::HashSet<TurnId>>,
+    /// the composer into queuing all input. Bounded per session via the paired
+    /// FIFO queue (capped at [`Self::COMPLETED_TURNS_CAP`], the same pattern as
+    /// [`AppState::finalized_by_switch`]) so a long-running session cannot grow
+    /// it without bound — only recent turns can realistically receive a late
+    /// delta or a replayed terminal.
+    pub completed_turns: std::collections::HashMap<
+        SessionKey,
+        (
+            std::collections::HashSet<TurnId>,
+            std::collections::VecDeque<TurnId>,
+        ),
+    >,
     /// Latest retry/backoff status per session — the `UiRetryBackoff` carried
     /// on `metadata.retry` progress updates that the TUI previously ignored.
     /// Drives the "retrying (attempt N)" surface in the harness status row.
@@ -3961,12 +3971,16 @@ impl TaskOutputDetailState {
         self.scroll = 0;
     }
 
+    // `scroll` counts lines FROM THE BOTTOM (the renderer computes
+    // `scroll_top = max_scroll - scroll`, same as the transcript), so
+    // scrolling up must INCREASE it and scrolling down must DECREASE it —
+    // mirroring `AppState::scroll_transcript_up/down`.
     pub fn scroll_up(&mut self, lines: usize) {
-        self.scroll = self.scroll.saturating_sub(lines);
+        self.scroll = self.scroll.saturating_add(lines);
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
-        self.scroll = self.scroll.saturating_add(lines);
+        self.scroll = self.scroll.saturating_sub(lines);
     }
 }
 
@@ -4014,12 +4028,13 @@ impl ArtifactDetailState {
         *self = Self::default();
     }
 
+    // From-bottom scroll semantics — see `TaskOutputDetailState::scroll_up`.
     pub fn scroll_up(&mut self, lines: usize) {
-        self.scroll = self.scroll.saturating_sub(lines);
+        self.scroll = self.scroll.saturating_add(lines);
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
-        self.scroll = self.scroll.saturating_add(lines);
+        self.scroll = self.scroll.saturating_sub(lines);
     }
 }
 
@@ -4057,12 +4072,13 @@ impl ThreadGraphDetailState {
         *self = Self::default();
     }
 
+    // From-bottom scroll semantics — see `TaskOutputDetailState::scroll_up`.
     pub fn scroll_up(&mut self, lines: usize) {
-        self.scroll = self.scroll.saturating_sub(lines);
+        self.scroll = self.scroll.saturating_add(lines);
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
-        self.scroll = self.scroll.saturating_add(lines);
+        self.scroll = self.scroll.saturating_sub(lines);
     }
 }
 
@@ -4130,12 +4146,13 @@ impl TurnStateDetailState {
         *self = Self::default();
     }
 
+    // From-bottom scroll semantics — see `TaskOutputDetailState::scroll_up`.
     pub fn scroll_up(&mut self, lines: usize) {
-        self.scroll = self.scroll.saturating_sub(lines);
+        self.scroll = self.scroll.saturating_add(lines);
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
-        self.scroll = self.scroll.saturating_add(lines);
+        self.scroll = self.scroll.saturating_sub(lines);
     }
 }
 
@@ -4385,6 +4402,11 @@ impl DiffPreviewPaneState {
         *self = Self::default();
     }
 
+    // NOTE: currently dead code — nothing calls these and the diff renderer
+    // does not read `scroll` (hunk selection drives the viewport instead).
+    // They already use the from-bottom convention (up = add, down = sub)
+    // shared by the transcript and the detail modals, so a future caller
+    // inherits the right direction.
     pub fn scroll_up(&mut self, lines: usize) {
         self.scroll = self.scroll.saturating_add(lines);
     }
@@ -5518,21 +5540,36 @@ impl AppState {
         Some((&session.id, &live_reply.turn_id))
     }
 
+    /// Per-session cap on the [`AppState::completed_turns`] terminal-turn set —
+    /// the same bounded-FIFO pattern (and cap value) as
+    /// [`Self::FINALIZED_BY_SWITCH_CAP`]: only the most recent terminals can
+    /// realistically be followed by a late delta or a replayed terminal, so
+    /// older ids are evicted FIFO.
+    pub const COMPLETED_TURNS_CAP: usize = 128;
+
     /// Record that a turn reached a terminal state, so a late delta for it is
     /// dropped instead of resurrecting it into `live_reply` (see
-    /// [`AppState::completed_turns`]).
+    /// [`AppState::completed_turns`]). Bounded FIFO per session.
     pub fn mark_turn_completed(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
-        self.completed_turns
+        let (set, queue) = self
+            .completed_turns
             .entry(session_id.clone())
-            .or_default()
-            .insert(turn_id.clone());
+            .or_default();
+        if set.insert(turn_id.clone()) {
+            queue.push_back(turn_id.clone());
+            while queue.len() > Self::COMPLETED_TURNS_CAP {
+                if let Some(evicted) = queue.pop_front() {
+                    set.remove(&evicted);
+                }
+            }
+        }
     }
 
     /// True when `turn_id` already reached a terminal state in this session.
     pub fn is_turn_completed(&self, session_id: &SessionKey, turn_id: &TurnId) -> bool {
         self.completed_turns
             .get(session_id)
-            .is_some_and(|turns| turns.contains(turn_id))
+            .is_some_and(|(turns, _)| turns.contains(turn_id))
     }
 
     pub fn record_submitted_user_prompt(
@@ -7266,6 +7303,89 @@ mod tests {
 
         git.scroll_up(99);
         assert_eq!(git.scroll, 0);
+    }
+
+    /// `completed_turns` grows on EVERY terminal for the life of the session;
+    /// without a cap a long-running session retains every turn id ever seen.
+    /// Mirror `finalized_by_switch`'s bounded FIFO: oldest ids evict first and
+    /// only the newest `COMPLETED_TURNS_CAP` remain queryable.
+    #[test]
+    fn mark_turn_completed_is_bounded_per_session_and_keeps_newest() {
+        let session_id = SessionKey("local:test".into());
+        let mut state = AppState::new(Vec::new(), 0, "ready".into(), None, false);
+
+        let turn_ids: Vec<TurnId> = (0..AppState::COMPLETED_TURNS_CAP + 10)
+            .map(|_| TurnId::new())
+            .collect();
+        for turn_id in &turn_ids {
+            state.mark_turn_completed(&session_id, turn_id);
+        }
+
+        let (set, queue) = state
+            .completed_turns
+            .get(&session_id)
+            .expect("session entry exists");
+        assert_eq!(set.len(), AppState::COMPLETED_TURNS_CAP, "set is bounded");
+        assert_eq!(
+            queue.len(),
+            AppState::COMPLETED_TURNS_CAP,
+            "FIFO queue is bounded"
+        );
+        // The 10 oldest ids were evicted; the newest CAP ids are retained.
+        for evicted in &turn_ids[..10] {
+            assert!(
+                !state.is_turn_completed(&session_id, evicted),
+                "oldest ids evict FIFO"
+            );
+        }
+        for retained in &turn_ids[10..] {
+            assert!(
+                state.is_turn_completed(&session_id, retained),
+                "newest ids are retained"
+            );
+        }
+        // Re-marking an already-present id must not grow the queue (no dupes).
+        state.mark_turn_completed(&session_id, turn_ids.last().expect("non-empty"));
+        let (_, queue) = state
+            .completed_turns
+            .get(&session_id)
+            .expect("session entry exists");
+        assert_eq!(queue.len(), AppState::COMPLETED_TURNS_CAP);
+    }
+
+    /// The four detail modals render `scroll` FROM THE BOTTOM
+    /// (`scroll_top = max_scroll - scroll` in app.rs), exactly like the
+    /// transcript: they open pinned to the tail (`scroll == 0`), Up must
+    /// INCREASE `scroll` (reveal earlier lines) and Down must DECREASE it.
+    /// The old top-origin bodies left Up dead at the bottom and made Down
+    /// scroll the wrong way.
+    #[test]
+    fn detail_modal_scroll_up_from_bottom_increases_offset() {
+        let mut task_output = TaskOutputDetailState::default();
+        task_output.scroll_up(3);
+        assert_eq!(task_output.scroll, 3, "Up from the tail reveals history");
+        task_output.scroll_down(1);
+        assert_eq!(task_output.scroll, 2);
+        task_output.scroll_down(99);
+        assert_eq!(task_output.scroll, 0, "Down saturates at the live tail");
+
+        let mut artifact = ArtifactDetailState::default();
+        artifact.scroll_up(2);
+        assert_eq!(artifact.scroll, 2);
+        artifact.scroll_down(2);
+        assert_eq!(artifact.scroll, 0);
+
+        let mut graph = ThreadGraphDetailState::default();
+        graph.scroll_up(5);
+        assert_eq!(graph.scroll, 5);
+        graph.scroll_down(4);
+        assert_eq!(graph.scroll, 1);
+
+        let mut turn = TurnStateDetailState::default();
+        turn.scroll_up(1);
+        assert_eq!(turn.scroll, 1);
+        turn.scroll_down(9);
+        assert_eq!(turn.scroll, 0);
     }
 
     #[test]
