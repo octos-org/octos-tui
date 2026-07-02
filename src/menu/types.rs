@@ -129,6 +129,8 @@ impl CommandSpec {
                 | "model"
                 | "status"
                 | "cost"
+                | "resume"
+                | "rewind"
                 | "theme"
                 | "lang"
                 | "thinking"
@@ -323,6 +325,29 @@ pub enum LocalAction {
     /// `AppState::pending_clipboard`; the event loop emits the OSC 52 escape
     /// sequence so the copy works over SSH against the fleet minis.
     CopyLastReply,
+    /// Open the `/resume` session picker. Fetches `session/list` and opens the
+    /// resume selection menu, which renders `Loading` until the `SessionList`
+    /// result lands and refreshes it (same async pattern as `/cost`).
+    OpenResumePicker,
+    /// Resume a specific session chosen from the `/resume` picker: switch the
+    /// active session to `session_id` and hydrate its prior transcript through
+    /// the existing `session/hydrate` render path.
+    ResumeSession(String),
+    /// Open the `/rewind` turn picker. Snapshots the ACTIVE session's user
+    /// messages (newest-first) into `AppState::rewind_turns` and opens the
+    /// rewind selection menu. Unlike `/resume` this needs no fetch — the turns
+    /// are already in the local transcript — so the menu renders `Ready`
+    /// immediately (or `Unavailable` when there are no user turns to rewind to).
+    OpenRewindPicker,
+    /// Rewind the active session to an earlier user turn chosen from the
+    /// `/rewind` picker. `num_turns` trailing user turns are dropped server-side
+    /// via `session/rollback`; `prefill` (that turn's full text) is stashed and,
+    /// once the rollback result lands, put back in the composer to edit and
+    /// resend (rewind-and-edit).
+    RewindToTurn {
+        num_turns: u32,
+        prefill: String,
+    },
     Custom(&'static str),
 }
 
@@ -626,6 +651,16 @@ pub struct MenuAppSnapshot<'a> {
     /// Current wheel-scroll mode, so the `/scrollmode` help entry can show
     /// which mode is active before the user toggles blindly.
     pub pinned_scroll: bool,
+    /// Prior sessions fetched via `session/list`, mirrored from
+    /// `AppState::resume_sessions` so the `/resume` picker (`resume_menu`) can
+    /// render one row per session. Empty until the first fetch lands (the menu
+    /// renders `Loading` in that window).
+    pub resume_sessions: &'a [crate::model::ResumeSessionRow],
+    /// Active-session user turns for the `/rewind` picker, mirrored from
+    /// `AppState::rewind_turns` so `rewind_menu` can render one row per turn.
+    /// Empty when the active session has no user messages (the menu renders
+    /// `Unavailable` in that case).
+    pub rewind_turns: &'a [crate::model::RewindTurnRow],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

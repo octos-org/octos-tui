@@ -10,13 +10,14 @@ use octos_core::ui_protocol::{
     ApprovalCommandDetails, ApprovalDiffDetails, ApprovalFilesystemDetails, ApprovalNetworkDetails,
     ApprovalRequestedEvent, ApprovalSandboxDetails, ApprovalSandboxEscalationDetails,
     ApprovalSandboxEscalationEndpoint, ApprovalScopesListResult, ApprovalTypedDetails,
-    MessageDeltaEvent, OutputCursor, PermissionProfileListResult, PermissionProfileSelection,
-    PermissionProfileSetResult, PreviewId, SessionHydrateResult, SessionOpenParams,
-    SessionOpenResult, SessionOpened, TaskArtifactReadResult, TaskOutputDeltaEvent,
-    TaskOutputReadResult, TaskRuntimeState, TaskUpdatedEvent, ThreadGraphGetResult,
-    ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnId,
-    TurnStartedEvent, TurnStateGetResult, UiCursor, UiNotification, UiPaneSnapshot,
-    UiProtocolCapabilities, WarningEvent, approval_kinds, methods, rpc_error_codes,
+    HydratedMessage, MessageDeltaEvent, OutputCursor, PermissionProfileListResult,
+    PermissionProfileSelection, PermissionProfileSetResult, PreviewId, SessionHydrateResult,
+    SessionListResult, SessionOpenParams, SessionOpenResult, SessionOpened, SessionRollbackResult,
+    TaskArtifactReadResult, TaskOutputDeltaEvent, TaskOutputReadResult, TaskRuntimeState,
+    TaskUpdatedEvent, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
+    ToolStartedEvent, TurnCompletedEvent, TurnId, TurnStartedEvent, TurnStateGetResult, UiCursor,
+    UiNotification, UiPaneSnapshot, UiProtocolCapabilities, WarningEvent, approval_kinds, methods,
+    rpc_error_codes,
 };
 use octos_core::ui_protocol::{
     JSON_RPC_VERSION, MAX_TEXT_FRAME_BYTES, RpcRequest, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
@@ -1117,6 +1118,7 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ReadTaskOutput(_)
                 | AppUiCommand::ReadTaskArtifact(_)
                 | AppUiCommand::HydrateSession(_)
+                | AppUiCommand::ListSessions(_)
                 | AppUiCommand::GetThreadGraph(_)
                 | AppUiCommand::GetTurnState(_)
                 | AppUiCommand::AuthStatus(_)
@@ -1894,6 +1896,8 @@ fn rpc_request_from_command(
         AppUiCommand::ReadTaskOutput(params) => serde_json::to_value(params),
         AppUiCommand::ReadTaskArtifact(params) => serde_json::to_value(params),
         AppUiCommand::HydrateSession(params) => serde_json::to_value(params),
+        AppUiCommand::ListSessions(params) => serde_json::to_value(params),
+        AppUiCommand::SessionRollback(params) => serde_json::to_value(params),
         AppUiCommand::GetThreadGraph(params) => serde_json::to_value(params),
         AppUiCommand::GetTurnState(params) => serde_json::to_value(params),
         AppUiCommand::StartReview(params) => serde_json::to_value(params),
@@ -2401,6 +2405,16 @@ fn success_response_to_app_event(
             Ok(result) => Ok(Some(ClientEvent::SessionHydrate(result))),
             Err(err) => Ok(Some(autonomy_decode_error(methods::SESSION_HYDRATE, err))),
         },
+        methods::SESSION_LIST => match serde_json::from_value::<SessionListResult>(result) {
+            Ok(result) => Ok(Some(ClientEvent::SessionList(result))),
+            Err(err) => Ok(Some(autonomy_decode_error(methods::SESSION_LIST, err))),
+        },
+        methods::SESSION_ROLLBACK => {
+            match serde_json::from_value::<SessionRollbackResult>(result) {
+                Ok(result) => Ok(Some(ClientEvent::SessionRollback(result))),
+                Err(err) => Ok(Some(autonomy_decode_error(methods::SESSION_ROLLBACK, err))),
+            }
+        }
         methods::THREAD_GRAPH_GET => match serde_json::from_value::<ThreadGraphGetResult>(result) {
             Ok(result) => Ok(Some(autonomy_event(AutonomyResult::ThreadGraph(result)))),
             Err(err) => Ok(Some(autonomy_decode_error(methods::THREAD_GRAPH_GET, err))),
@@ -3953,6 +3967,72 @@ impl AppUiBackend for MockAppUiBackend {
             AppUiCommand::HydrateSession(_) => Err(eyre!(
                 "mock app-ui backend does not implement session hydrate yet"
             )),
+            // Stub a small `session/list` so `--mock` and tests can exercise the
+            // `/resume` picker end-to-end. Mirrors the server's `SessionInfo`
+            // shape (`{id, message_count, title?}`); `updated_at` is included on
+            // one row to exercise the ordering path.
+            AppUiCommand::ListSessions(_) => {
+                self.queue
+                    .push_back(ClientEvent::SessionList(SessionListResult {
+                        sessions: serde_json::json!([
+                            {
+                                "id": "local:mock#alpha",
+                                "message_count": 12,
+                                "title": "Mock session alpha",
+                                "updated_at": "2026-06-30T10:00:00Z"
+                            },
+                            {
+                                "id": "local:mock#bravo",
+                                "message_count": 3,
+                                "title": "Mock session bravo",
+                                "updated_at": "2026-07-01T09:30:00Z"
+                            },
+                            {
+                                "id": "local:mock#charlie",
+                                "message_count": 47
+                            }
+                        ]),
+                    }));
+                Ok(())
+            }
+            // Stub a `session/rollback` so `--mock` and tests can exercise the
+            // `/rewind` picker end-to-end: drop one user turn and return a
+            // trimmed `thread` (same shape as `session/hydrate`) with a single
+            // surviving user message, echoing the request's session id.
+            AppUiCommand::SessionRollback(params) => {
+                let session_id = params.session_id.clone();
+                self.queue
+                    .push_back(ClientEvent::SessionRollback(SessionRollbackResult {
+                        dropped_turns: 1,
+                        thread: SessionHydrateResult {
+                            session_id: session_id.clone(),
+                            cursor: UiCursor {
+                                stream: session_id.0.clone(),
+                                seq: 1,
+                            },
+                            context: None,
+                            context_state: None,
+                            messages: Some(vec![HydratedMessage {
+                                seq: 1,
+                                role: "user".into(),
+                                content: "first mock prompt".into(),
+                                turn_id: None,
+                                thread_id: None,
+                                client_message_id: None,
+                                persisted_at: Utc::now(),
+                                message_id: None,
+                                source: None,
+                                media: Vec::new(),
+                            }]),
+                            threads: None,
+                            turns: None,
+                            pending_approvals: None,
+                            pending_questions: None,
+                            replayed_envelopes: None,
+                        },
+                    }));
+                Ok(())
+            }
             AppUiCommand::GetThreadGraph(_) => Err(eyre!(
                 "mock app-ui backend does not implement thread graph reads yet"
             )),
@@ -5750,6 +5830,7 @@ mod tests {
                 after: None,
                 include: Vec::new(),
             }),
+            AppUiCommand::ListSessions(octos_core::ui_protocol::SessionListParams {}),
             AppUiCommand::GetThreadGraph(ThreadGraphGetParams {
                 session_id: session_id.clone(),
                 at: None,
@@ -5796,6 +5877,10 @@ mod tests {
             AppUiCommand::InterruptTurn(TurnInterruptParams {
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
+            }),
+            AppUiCommand::SessionRollback(octos_core::ui_protocol::SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
             }),
             AppUiCommand::StartReview(ReviewStartParams {
                 session_id: session_id.clone(),

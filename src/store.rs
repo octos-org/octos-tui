@@ -5,7 +5,8 @@ use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
     ApprovalRespondParams, DiffPreviewGetParams, EnvelopeNotification, EnvelopeToolEndStatus,
     HydratedMessage, InputItem, MessageDeltaEvent, MessagePersistedEvent, Payload,
-    ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult, SessionOpenParams,
+    ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult, SessionListParams,
+    SessionListResult, SessionOpenParams, SessionRollbackParams, SessionRollbackResult,
     TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState,
     TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent, TurnId,
     TurnInterruptParams, TurnLifecycleState, TurnSpawnCompleteEvent, TurnStartParams,
@@ -38,11 +39,12 @@ use crate::{
         OnboardingProviderSaveTarget, ProfileLlmCatalogParams, ProfileLlmListParams,
         ProfileLlmListResult, ProfileLocalCreateParams, ProfileSkillsInstallParams,
         ProfileSkillsListParams, ProfileSkillsRegistrySearchParams, ProfileSkillsRemoveParams,
-        ReviewStartParams, ReviewStartResult, SecretString, SessionMcpCatalog, SessionModelCatalog,
-        SessionRuntimeStatus, SessionToolCatalog, SessionView, TaskView, ToolConfigDeleteParams,
-        ToolConfigListParams, ToolConfigSetEnabledParams, ToolConfigTestParams,
-        ToolConfigUpsertParams, UserQuestionPickerState, complete_plan_steps_in_text,
-        task_state_label, terminal_task_state_from_agent_status,
+        ResumeSessionRow, ReviewStartParams, ReviewStartResult, RewindTurnRow, SecretString,
+        SessionMcpCatalog, SessionModelCatalog, SessionRuntimeStatus, SessionToolCatalog,
+        SessionView, TaskView, ToolConfigDeleteParams, ToolConfigListParams,
+        ToolConfigSetEnabledParams, ToolConfigTestParams, ToolConfigUpsertParams,
+        UserQuestionPickerState, complete_plan_steps_in_text, task_state_label,
+        terminal_task_state_from_agent_status,
     },
 };
 
@@ -1167,6 +1169,51 @@ impl Store {
                 self.copy_last_reply();
                 None
             }
+            LocalAction::OpenResumePicker => {
+                let arg = inline_args.unwrap_or_default().trim();
+                if arg.is_empty() {
+                    // Open the picker (it renders `Loading` until data lands)
+                    // and fetch the session list; the `SessionList` result
+                    // refreshes the open menu into `Ready` rows.
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_RESUME));
+                    Some(AppUiCommand::ListSessions(SessionListParams {}))
+                } else {
+                    // `/resume <query>` shortcut: resolve to a session id by
+                    // case-insensitive substring match and switch directly,
+                    // reusing the same guard + hydrate path as a picker pick.
+                    match self.resolve_resume_session(arg) {
+                        Some(id) => self.resume_session_command(id),
+                        None => {
+                            self.state.status = format!(
+                                "No prior session matches \"{arg}\"; run /resume with no argument to browse."
+                            );
+                            None
+                        }
+                    }
+                }
+            }
+            LocalAction::ResumeSession(id) => self.resume_session_command(id),
+            LocalAction::OpenRewindPicker => {
+                // Guard: rewinding mid-turn would drop turns out from under a
+                // streaming reply (same guard as `/resume`). Refuse with a
+                // status line and open no menu.
+                if self.state.active_turn().is_some() {
+                    self.state.status =
+                        "Finish or stop the active turn before rewinding the conversation.".into();
+                    None
+                } else {
+                    // No fetch needed: the user turns are already in the local
+                    // transcript. Snapshot them (newest-first) and open the
+                    // picker, which renders `Ready` immediately (or
+                    // `Unavailable` when there are none).
+                    self.state.rewind_turns = self.collect_rewind_turns();
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_REWIND));
+                    None
+                }
+            }
+            LocalAction::RewindToTurn { num_turns, prefill } => {
+                self.rewind_to_turn_command(num_turns, prefill)
+            }
             LocalAction::Custom(name) => {
                 self.state.status = t!("status.local_action_not_wired", name = name).into_owned();
                 None
@@ -1175,6 +1222,129 @@ impl Store {
         // Every non-`/stop` local action ran (the dispatcher accepted it),
         // regardless of whether it produced a backend command.
         SlashDispatchOutcome::accepted(command)
+    }
+
+    /// Case-insensitive substring resolve of a `/resume <query>` argument to a
+    /// known session id. Scans `resume_sessions` in its current (newest-first)
+    /// order, matching the id and the optional title, and returns the first
+    /// hit. `None` when nothing matches (or the list has not been fetched yet).
+    fn resolve_resume_session(&self, query: &str) -> Option<String> {
+        let needle = query.to_lowercase();
+        self.state
+            .resume_sessions
+            .iter()
+            .find(|row| {
+                row.id.to_lowercase().contains(&needle)
+                    || row
+                        .title
+                        .as_deref()
+                        .is_some_and(|title| title.to_lowercase().contains(&needle))
+            })
+            .map(|row| row.id.clone())
+    }
+
+    /// Switch the active session to `session_id` and hydrate its transcript via
+    /// the existing `session/hydrate` render path. Reuses the active-turn guard
+    /// (`/stop`'s check): resuming mid-turn would swap the transcript out from
+    /// under a streaming reply, so while a turn is live this refuses — status
+    /// only, no command. Shared by the `/resume` picker selection and the
+    /// `/resume <query>` inline shortcut.
+    fn resume_session_command(&mut self, session_id: String) -> Option<AppUiCommand> {
+        if self.state.active_turn().is_some() {
+            self.state.status =
+                "Finish or stop the active turn before resuming another session.".into();
+            return None;
+        }
+        let session_id = SessionKey(session_id);
+        // Select the existing SessionView, or create a placeholder so the
+        // switch is immediate; `apply_session_hydrate_result` also
+        // find-or-creates when the hydrate result lands and fills in the real
+        // transcript.
+        if let Some(index) = self
+            .state
+            .sessions
+            .iter()
+            .position(|session| session.id == session_id)
+        {
+            self.state.selected_session = index;
+        } else {
+            let profile_id = self.active_session_profile_id();
+            self.state.sessions.push(SessionView {
+                id: session_id.clone(),
+                title: session_id.0.clone(),
+                profile_id,
+                messages: Vec::new(),
+                tasks: Vec::new(),
+                live_reply: None,
+            });
+            self.state.selected_session = self.state.sessions.len().saturating_sub(1);
+        }
+        self.state.status = format!("Resuming {}…", session_id.0);
+        Some(AppUiCommand::HydrateSession(SessionHydrateParams {
+            session_id,
+            after: None,
+            include: vec![
+                "messages".into(),
+                "turns".into(),
+                "pending_approvals".into(),
+                "pending_questions".into(),
+            ],
+        }))
+    }
+
+    /// Snapshot the ACTIVE session's user messages into `/rewind` picker rows,
+    /// newest-first. `preview` is the first line of the message truncated for
+    /// the row label; `prefill` is the full text (put back in the composer after
+    /// the rewind); `num_turns` is how many trailing user turns
+    /// `session/rollback` drops to reach this one — the newest user message is
+    /// `1` (drop the last exchange and re-edit it), the next-oldest `2`, and so
+    /// on. Returns an empty vec when there is no active session or no user
+    /// messages, which makes `rewind_menu` render `Unavailable`.
+    fn collect_rewind_turns(&self) -> Vec<RewindTurnRow> {
+        let Some(session) = self.state.active_session() else {
+            return Vec::new();
+        };
+        session
+            .messages
+            .iter()
+            .filter(|message| message.role.as_str() == "user")
+            .rev()
+            .enumerate()
+            .map(|(index, message)| RewindTurnRow {
+                // `compact_first_line` = first non-empty line, trimmed and
+                // char-truncated (UTF-8 safe) for the row label.
+                preview: compact_first_line(&message.content, 60),
+                num_turns: (index as u32) + 1,
+                prefill: message.content.clone(),
+            })
+            .collect()
+    }
+
+    /// Handle a `/rewind` pick: drop the last `num_turns` user turns from the
+    /// active session via `session/rollback`, stashing `prefill` so the chosen
+    /// message can be restored to the composer once the rollback result lands
+    /// (rewind-and-edit). Guards against rewinding mid-turn (same guard as
+    /// `/resume`): a live turn means refuse with a status line and no command.
+    fn rewind_to_turn_command(&mut self, num_turns: u32, prefill: String) -> Option<AppUiCommand> {
+        if self.state.active_turn().is_some() {
+            self.state.status =
+                "Finish or stop the active turn before rewinding the conversation.".into();
+            return None;
+        }
+        let Some(session_id) = self
+            .state
+            .active_session()
+            .map(|session| session.id.clone())
+        else {
+            self.state.status = "No active session to rewind.".into();
+            return None;
+        };
+        self.state.pending_rewind_prefill = Some(prefill);
+        self.state.status = format!("Rewinding {num_turns} turn(s)…");
+        Some(AppUiCommand::SessionRollback(SessionRollbackParams {
+            session_id,
+            num_turns,
+        }))
     }
 
     /// `/lang <code>` — switch the UI display language at runtime. Empty arg
@@ -3418,6 +3588,8 @@ impl Store {
                 })
                 .count(),
             pinned_scroll: self.state.pinned_scroll,
+            resume_sessions: &self.state.resume_sessions,
+            rewind_turns: &self.state.rewind_turns,
         }
     }
 
@@ -4253,6 +4425,16 @@ impl Store {
                 self.refresh_active_menu_if_open();
                 None
             }
+            ClientEvent::SessionList(result) => {
+                self.apply_session_list_result(result);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::SessionRollback(result) => {
+                self.apply_session_rollback_result(result);
+                self.refresh_active_menu_if_open();
+                None
+            }
             ClientEvent::ReviewStart(result) => {
                 self.apply_review_start_result(result);
                 self.refresh_active_menu_if_open();
@@ -4842,6 +5024,16 @@ impl Store {
                 // (otherwise a reconnect drops you out of Vim mid-edit).
                 let vim_mode = self.state.vim_mode;
                 let composer_mode = self.state.composer_mode;
+                // Local-only: the `/resume` picker list is client-fetched via
+                // `session/list`; the server never echoes it in a snapshot, so
+                // `from_snapshot` would drop it. Preserve it across replays
+                // (reconnect/refresh) so an open picker doesn't blank out.
+                let resume_sessions = self.state.resume_sessions.clone();
+                // Local-only: the `/rewind` picker rows are derived from the
+                // transcript and the pending prefill is in-flight; neither is
+                // echoed in a snapshot, so preserve both across replays.
+                let rewind_turns = self.state.rewind_turns.clone();
+                let pending_rewind_prefill = self.state.pending_rewind_prefill.clone();
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
@@ -4877,6 +5069,9 @@ impl Store {
                 state.pinned_scroll = pinned_scroll;
                 state.vim_mode = vim_mode;
                 state.composer_mode = composer_mode;
+                state.resume_sessions = resume_sessions;
+                state.rewind_turns = rewind_turns;
+                state.pending_rewind_prefill = pending_rewind_prefill;
                 state.restore_optimistic_user_messages();
                 self.state = state;
                 None
@@ -5223,6 +5418,50 @@ impl Store {
             event.message.clone(),
         ));
         self.state.status = event.message;
+    }
+
+    /// Fold a `session/list` result into `resume_sessions` (newest-first) for
+    /// the `/resume` picker, then let any open menu repaint. Tolerant of missing
+    /// fields: each entry parses as a [`ResumeSessionRow`] whose non-`id` fields
+    /// default, so a short/legacy `SessionInfo` still lands. A payload that is
+    /// not an array of objects leaves the previous list untouched and records a
+    /// status line rather than clearing the picker.
+    fn apply_session_list_result(&mut self, result: SessionListResult) {
+        match serde_json::from_value::<Vec<ResumeSessionRow>>(result.sessions) {
+            Ok(mut rows) => {
+                // Stable sort by `updated_at` DESC. `Option<String>` orders
+                // `None` below `Some`, so `b.cmp(a)` puts the most-recent first
+                // and pushes timestamp-less rows to the end while preserving
+                // their server order (the documented fallback).
+                rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                let count = rows.len();
+                self.state.resume_sessions = rows;
+                self.state.status = format!("Loaded {count} prior session(s) for /resume.");
+            }
+            Err(err) => {
+                self.state.status = format!("Could not parse the session list: {err}");
+            }
+        }
+    }
+
+    /// Apply a `session/rollback` result (`/rewind`): re-render the trimmed
+    /// transcript through the exact same path `session/hydrate` uses, then
+    /// restore the chosen user message to the composer (the stashed
+    /// `pending_rewind_prefill`) so the user can edit and resend it. The stash
+    /// is cleared and the status reports how many turns were dropped.
+    fn apply_session_rollback_result(&mut self, result: SessionRollbackResult) {
+        let dropped = result.dropped_turns;
+        // The server returns the trimmed session as a `SessionHydrateResult`, so
+        // reuse the hydrate render path verbatim to repaint the transcript.
+        self.apply_session_hydrate_result(result.thread);
+        // Put the chosen message back in the composer to edit and resend
+        // (rewind-and-edit), using the same composer-set mechanism as
+        // `LocalAction::EditComposer`.
+        if let Some(prefill) = self.state.pending_rewind_prefill.take() {
+            self.state.set_composer_text(prefill);
+            self.state.focus = FocusPane::Composer;
+        }
+        self.state.status = format!("Rewound {dropped} turn(s) — edit and resend");
     }
 
     fn apply_session_hydrate_result(&mut self, result: SessionHydrateResult) {
@@ -6494,6 +6733,12 @@ impl Store {
                 }
                 None
             }
+            // UPCR-2026-025 voice-exit intent: a voice-turn "goodbye/mute"
+            // signal. This terminal client renders no voice UI, so there is
+            // nothing to do — ignore it. (Pre-existing drift: the path-overridden
+            // octos-core is ahead of this crate and added `VoiceExit`; handling
+            // it here keeps the match exhaustive so the workspace compiles.)
+            UiNotification::VoiceExit(_) => None,
         }
     }
 
@@ -8565,6 +8810,314 @@ mod tests {
         assert_eq!(
             store.state.pending_clipboard.as_deref(),
             Some("final answer")
+        );
+    }
+
+    #[test]
+    fn resume_picker_dispatch_opens_menu_and_lists_sessions() {
+        let mut store = store_with_empty_session();
+
+        let command = store
+            .dispatch_local_action(LocalAction::OpenResumePicker, None)
+            .into_command();
+
+        assert!(
+            matches!(command, Some(AppUiCommand::ListSessions(_))),
+            "/resume must fetch session/list, got: {command:?}"
+        );
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_RESUME),
+            "/resume opens the resume picker menu (rendered Loading until data lands)"
+        );
+    }
+
+    #[test]
+    fn session_list_result_populates_and_sorts_resume_sessions() {
+        let mut store = store_with_empty_session();
+
+        store.apply_client_event(ClientEvent::SessionList(SessionListResult {
+            sessions: serde_json::json!([
+                { "id": "s:old", "message_count": 1, "updated_at": "2026-06-01T00:00:00Z" },
+                { "id": "s:new", "message_count": 9, "title": "Newest", "updated_at": "2026-07-01T00:00:00Z" },
+                { "id": "s:legacy", "message_count": 3 }
+            ]),
+        }));
+
+        let ids: Vec<&str> = store
+            .state
+            .resume_sessions
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        // Newest-first by `updated_at` DESC; the timestamp-less row sorts last
+        // (fallback: server order preserved via a stable sort).
+        assert_eq!(ids, vec!["s:new", "s:old", "s:legacy"]);
+        assert_eq!(
+            store.state.resume_sessions[0].title.as_deref(),
+            Some("Newest")
+        );
+        // A short/legacy entry still parses (missing title/updated_at default).
+        assert_eq!(store.state.resume_sessions[2].message_count, 3);
+    }
+
+    #[test]
+    fn resume_session_switches_and_returns_hydrate_command() {
+        let mut store = store_with_empty_session();
+
+        let command = store
+            .dispatch_local_action(LocalAction::ResumeSession("coding:api:prior".into()), None)
+            .into_command();
+
+        match command {
+            Some(AppUiCommand::HydrateSession(params)) => {
+                assert_eq!(params.session_id, SessionKey("coding:api:prior".into()));
+                assert!(
+                    params.include.iter().any(|section| section == "messages"),
+                    "hydrate must request the messages section"
+                );
+            }
+            other => panic!("expected HydrateSession, got {other:?}"),
+        }
+        // The SessionView was created + selected so the switch is immediate; the
+        // hydrate result then fills in the real transcript.
+        assert_eq!(
+            store
+                .state
+                .active_session()
+                .map(|session| session.id.0.as_str()),
+            Some("coding:api:prior")
+        );
+    }
+
+    #[test]
+    fn resume_session_is_refused_while_a_turn_is_active() {
+        let mut store = store_with_live_reply(TurnId::new(), "streaming");
+        let before = store.state.sessions.len();
+
+        let command = store
+            .dispatch_local_action(LocalAction::ResumeSession("coding:api:other".into()), None)
+            .into_command();
+
+        assert!(command.is_none(), "resume must not hydrate mid-turn");
+        assert_eq!(
+            store.state.sessions.len(),
+            before,
+            "no placeholder session is created while a turn is live"
+        );
+    }
+
+    #[test]
+    fn resume_inline_query_resolves_to_a_session_and_hydrates() {
+        let mut store = store_with_empty_session();
+        store.state.resume_sessions = vec![
+            ResumeSessionRow {
+                id: "coding:api:alpha".into(),
+                title: Some("Alpha deck".into()),
+                message_count: 4,
+                updated_at: None,
+            },
+            ResumeSessionRow {
+                id: "coding:api:bravo".into(),
+                title: None,
+                message_count: 1,
+                updated_at: None,
+            },
+        ];
+
+        // `/resume <query>`: case-insensitive substring over the title here.
+        let command = store
+            .dispatch_local_action(LocalAction::OpenResumePicker, Some("ALPHA"))
+            .into_command();
+
+        match command {
+            Some(AppUiCommand::HydrateSession(params)) => {
+                assert_eq!(params.session_id, SessionKey("coding:api:alpha".into()));
+            }
+            other => panic!("expected inline /resume to hydrate the match, got {other:?}"),
+        }
+    }
+
+    /// Build a store whose single active session has one user+assistant
+    /// exchange per `content`, in order — so the newest user message is last.
+    fn store_with_user_turns(contents: &[&str]) -> Store {
+        let messages = contents
+            .iter()
+            .flat_map(|content| vec![Message::user(*content), Message::assistant("ok")])
+            .collect();
+        let session = SessionView {
+            id: SessionKey("local:test".into()),
+            title: "test".into(),
+            profile_id: Some("coding".into()),
+            messages,
+            tasks: vec![],
+            live_reply: None,
+        };
+        Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        }
+    }
+
+    #[test]
+    fn rewind_picker_dispatch_populates_turns_newest_first_and_opens_menu() {
+        let mut store =
+            store_with_user_turns(&["first question", "second question", "third question"]);
+
+        let command = store
+            .dispatch_local_action(LocalAction::OpenRewindPicker, None)
+            .into_command();
+
+        assert!(
+            command.is_none(),
+            "/rewind opens a local picker, it sends no backend command"
+        );
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_REWIND),
+            "/rewind opens the rewind picker menu"
+        );
+
+        // Newest-first: row 0 is the last user message → num_turns 1 (drop the
+        // last exchange); the oldest user message is last → num_turns 3.
+        let turns = &store.state.rewind_turns;
+        assert_eq!(turns.len(), 3, "one row per user message");
+        assert_eq!(turns[0].num_turns, 1);
+        assert_eq!(turns[0].preview, "third question");
+        assert_eq!(turns[0].prefill, "third question");
+        assert_eq!(turns[2].num_turns, 3);
+        assert_eq!(turns[2].preview, "first question");
+    }
+
+    #[test]
+    fn rewind_picker_is_refused_while_a_turn_is_active() {
+        let mut store = store_with_live_reply(TurnId::new(), "streaming");
+
+        let command = store
+            .dispatch_local_action(LocalAction::OpenRewindPicker, None)
+            .into_command();
+
+        assert!(command.is_none());
+        assert!(
+            store.state.menu_stack.active().is_none(),
+            "no picker opens while a turn is live"
+        );
+        assert!(
+            store.state.rewind_turns.is_empty(),
+            "no rewind rows are snapshotted mid-turn"
+        );
+    }
+
+    #[test]
+    fn rewind_to_turn_returns_rollback_command_and_stashes_prefill() {
+        let mut store = store_with_empty_session();
+
+        let command = store
+            .dispatch_local_action(
+                LocalAction::RewindToTurn {
+                    num_turns: 2,
+                    prefill: "edit me and resend".into(),
+                },
+                None,
+            )
+            .into_command();
+
+        match command {
+            Some(AppUiCommand::SessionRollback(params)) => {
+                assert_eq!(params.session_id, SessionKey("local:test".into()));
+                assert_eq!(params.num_turns, 2);
+            }
+            other => panic!("expected SessionRollback, got {other:?}"),
+        }
+        assert_eq!(
+            store.state.pending_rewind_prefill.as_deref(),
+            Some("edit me and resend"),
+            "the chosen message is stashed for restore after the rollback lands"
+        );
+    }
+
+    #[test]
+    fn rewind_to_turn_is_refused_while_a_turn_is_active() {
+        let mut store = store_with_live_reply(TurnId::new(), "streaming");
+
+        let command = store
+            .dispatch_local_action(
+                LocalAction::RewindToTurn {
+                    num_turns: 1,
+                    prefill: "nope".into(),
+                },
+                None,
+            )
+            .into_command();
+
+        assert!(command.is_none(), "rewind must not roll back mid-turn");
+        assert!(
+            store.state.pending_rewind_prefill.is_none(),
+            "no prefill is stashed when the rewind is refused"
+        );
+    }
+
+    #[test]
+    fn session_rollback_result_applies_trimmed_thread_and_prefills_composer() {
+        use crate::client_event::ClientEvent;
+
+        let mut store = store_with_user_turns(&["first question", "second question"]);
+        let session_id = store.state.sessions[0].id.clone();
+        // Simulate the pending pick: RewindToTurn stashed the chosen message.
+        store.state.pending_rewind_prefill = Some("second question".into());
+
+        // Server drops 1 user turn and returns the trimmed transcript (the first
+        // exchange only), shaped exactly like a session/hydrate result.
+        store.apply_client_event(ClientEvent::SessionRollback(SessionRollbackResult {
+            dropped_turns: 1,
+            thread: SessionHydrateResult {
+                session_id: session_id.clone(),
+                cursor: octos_core::ui_protocol::UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 1,
+                },
+                context: None,
+                context_state: None,
+                messages: Some(vec![HydratedMessage {
+                    seq: 1,
+                    role: "user".into(),
+                    content: "first question".into(),
+                    turn_id: None,
+                    thread_id: None,
+                    client_message_id: None,
+                    persisted_at: chrono::Utc::now(),
+                    message_id: None,
+                    source: None,
+                    media: Vec::new(),
+                }]),
+                threads: None,
+                turns: None,
+                pending_approvals: None,
+                pending_questions: None,
+                replayed_envelopes: None,
+            },
+        }));
+
+        // The trimmed transcript replaced the session's messages via the hydrate
+        // render path.
+        let messages = &store.state.sessions[0].messages;
+        assert_eq!(messages.len(), 1, "only the surviving turn remains");
+        assert_eq!(messages[0].content, "first question");
+        // The chosen message is back in the composer to edit and resend, and the
+        // stash is cleared.
+        assert_eq!(store.state.composer, "second question");
+        assert!(store.state.pending_rewind_prefill.is_none());
+        assert!(
+            store.state.status.contains("Rewound 1"),
+            "status reports how many turns were dropped: {}",
+            store.state.status
         );
     }
 
