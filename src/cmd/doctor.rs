@@ -715,12 +715,31 @@ fn color_check(term: Option<&str>, colorterm: Option<&str>) -> Check {
 const CAT_CONFIG: &str = "Config & data";
 
 fn config_checks(args: &DoctorArgs) -> Vec<Check> {
-    let data_dir = args
-        .data_dir
-        .clone()
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".octos")))
-        .unwrap_or_else(|| PathBuf::from(".octos"));
+    let data_dir = data_dir_from_env(
+        args.data_dir.clone(),
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+    );
     vec![writability_check("octos data dir", &data_dir)]
+}
+
+/// Pure resolver for the octos data dir: explicit `--data-dir` first, then
+/// `HOME`, then `USERPROFILE`. Native Windows shells set no `HOME`, so the old
+/// HOME-only probe silently fell back to a CWD-relative `.octos` there.
+/// Mirrors `crate::history`'s home resolution (empty values ignored); split
+/// out so it is testable without mutating process env.
+fn data_dir_from_env(
+    override_dir: Option<PathBuf>,
+    home: Option<std::ffi::OsString>,
+    userprofile: Option<std::ffi::OsString>,
+) -> PathBuf {
+    override_dir
+        .or_else(|| {
+            home.filter(|value| !value.is_empty())
+                .or_else(|| userprofile.filter(|value| !value.is_empty()))
+                .map(|base| PathBuf::from(base).join(".octos"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".octos"))
 }
 
 /// Check that a directory exists and is writable (or creatable). A missing dir
@@ -961,9 +980,21 @@ fn stdio_command_check(command: &str) -> Check {
 }
 
 const WS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Overall deadline for the capabilities receive loop. The per-frame
+/// `WS_PROBE_TIMEOUT` resets on EVERY incoming frame, so a chatty
+/// non-conforming endpoint that streams unrelated notifications could keep
+/// the probe alive forever without this.
+const WS_PROBE_OVERALL_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_PROBE_ID: &str = "octos-tui-doctor-capabilities";
 
 fn probe_ws_capabilities(endpoint: &str) -> std::result::Result<UiProtocolCapabilities, String> {
+    probe_ws_capabilities_with_deadline(endpoint, WS_PROBE_OVERALL_TIMEOUT)
+}
+
+fn probe_ws_capabilities_with_deadline(
+    endpoint: &str,
+    overall: Duration,
+) -> std::result::Result<UiProtocolCapabilities, String> {
     let runtime = TokioRuntimeBuilder::new_current_thread()
         .enable_all()
         .build()
@@ -1000,38 +1031,52 @@ fn probe_ws_capabilities(endpoint: &str) -> std::result::Result<UiProtocolCapabi
         .map_err(|_| "timed out sending config/capabilities/list".to_string())?
         .map_err(|err| format!("failed to send config/capabilities/list: {err}"))?;
 
-        loop {
-            let Some(message) = tokio::time::timeout(WS_PROBE_TIMEOUT, ws.next())
-                .await
-                .map_err(|_| {
-                    "timed out waiting for config/capabilities/list response".to_string()
-                })?
-            else {
-                return Err("server closed before config/capabilities/list response".to_string());
-            };
-            let message =
-                message.map_err(|err| format!("failed to read capabilities response: {err}"))?;
-            match message {
-                WsMessage::Text(text) => {
-                    if let Some(capabilities) = decode_matching_capabilities_response(&text)? {
-                        return Ok(capabilities);
-                    }
-                }
-                WsMessage::Binary(bytes) => {
-                    let text = String::from_utf8(bytes.to_vec())
-                        .map_err(|err| format!("capabilities response is not UTF-8: {err}"))?;
-                    if let Some(capabilities) = decode_matching_capabilities_response(&text)? {
-                        return Ok(capabilities);
-                    }
-                }
-                WsMessage::Ping(_) | WsMessage::Pong(_) => {}
-                WsMessage::Close(_) => {
+        // The per-frame timeout resets on every frame; the whole receive loop
+        // additionally runs under ONE overall deadline so a chatty endpoint
+        // that never answers the request cannot keep the probe alive forever.
+        let receive = async {
+            loop {
+                let Some(message) = tokio::time::timeout(WS_PROBE_TIMEOUT, ws.next())
+                    .await
+                    .map_err(|_| {
+                        "timed out waiting for config/capabilities/list response".to_string()
+                    })?
+                else {
                     return Err(
                         "server closed before config/capabilities/list response".to_string()
                     );
+                };
+                let message = message
+                    .map_err(|err| format!("failed to read capabilities response: {err}"))?;
+                match message {
+                    WsMessage::Text(text) => {
+                        if let Some(capabilities) = decode_matching_capabilities_response(&text)? {
+                            return Ok(capabilities);
+                        }
+                    }
+                    WsMessage::Binary(bytes) => {
+                        let text = String::from_utf8(bytes.to_vec())
+                            .map_err(|err| format!("capabilities response is not UTF-8: {err}"))?;
+                        if let Some(capabilities) = decode_matching_capabilities_response(&text)? {
+                            return Ok(capabilities);
+                        }
+                    }
+                    WsMessage::Ping(_) | WsMessage::Pong(_) => {}
+                    WsMessage::Close(_) => {
+                        return Err(
+                            "server closed before config/capabilities/list response".to_string()
+                        );
+                    }
+                    WsMessage::Frame(_) => {}
                 }
-                WsMessage::Frame(_) => {}
             }
+        };
+        match tokio::time::timeout(overall, receive).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "timed out waiting for config/capabilities/list response \
+                 ({overall:?} overall deadline)"
+            )),
         }
     })
 }
@@ -1352,6 +1397,102 @@ mod tests {
             .expect("doctor probe returns capabilities");
         thread.join().expect("test websocket exits");
         assert_eq!(caps.version.protocol, UI_PROTOCOL_V1);
+    }
+
+    #[test]
+    fn ws_probe_chatty_endpoint_hits_the_overall_deadline() {
+        // Fix #10 (b): the per-frame 2s timeout resets on EVERY frame, so an
+        // endpoint that streams unrelated notifications forever kept the probe
+        // alive indefinitely. The receive loop must give up at the overall
+        // deadline (shortened here so the test stays fast).
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind test websocket server: {err}"),
+        };
+        listener
+            .set_nonblocking(true)
+            .expect("test websocket listener nonblocking");
+        let addr = listener.local_addr().expect("test websocket addr");
+
+        let thread = std::thread::spawn(move || {
+            let runtime = TokioRuntimeBuilder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test websocket runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("wrap test websocket listener");
+                let (stream, _) = listener.accept().await.expect("accept doctor probe");
+                let mut ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("accept doctor websocket");
+                let _ = ws.next().await; // the probe's capabilities request
+                // Spam unrelated frames until the probe hangs up.
+                loop {
+                    let sent = ws
+                        .send(WsMessage::Text(
+                            serde_json::json!({
+                                "jsonrpc": JSON_RPC_VERSION,
+                                "method": "server/heartbeat",
+                                "params": {}
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await;
+                    if sent.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            });
+        });
+
+        let started = std::time::Instant::now();
+        let err = probe_ws_capabilities_with_deadline(
+            &format!("ws://{addr}/ui-protocol"),
+            Duration::from_millis(500),
+        )
+        .expect_err("chatty endpoint must hit the overall deadline");
+        assert!(
+            err.contains("overall deadline"),
+            "expected the overall-deadline error, got: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "probe must give up promptly, took {:?}",
+            started.elapsed()
+        );
+        thread.join().expect("test websocket exits");
+    }
+
+    #[test]
+    fn data_dir_resolver_prefers_override_then_home_then_userprofile() {
+        // Fix #10 (a): only HOME was consulted, so native Windows (no HOME)
+        // probed a CWD-relative `.octos` instead of the real user data dir.
+        assert_eq!(
+            data_dir_from_env(
+                Some(PathBuf::from("/custom")),
+                Some("/home/u".into()),
+                Some("C:\\Users\\u".into())
+            ),
+            PathBuf::from("/custom")
+        );
+        assert_eq!(
+            data_dir_from_env(None, Some("/home/u".into()), Some("C:\\Users\\u".into())),
+            PathBuf::from("/home/u").join(".octos")
+        );
+        assert_eq!(
+            data_dir_from_env(None, None, Some("C:\\Users\\u".into())),
+            PathBuf::from("C:\\Users\\u").join(".octos")
+        );
+        // Empty values are ignored; with nothing set, fall back to CWD-relative.
+        assert_eq!(
+            data_dir_from_env(None, Some("".into()), Some("".into())),
+            PathBuf::from(".octos")
+        );
+        assert_eq!(data_dir_from_env(None, None, None), PathBuf::from(".octos"));
     }
 
     #[test]
