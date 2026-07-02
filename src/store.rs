@@ -5036,6 +5036,19 @@ impl Store {
                 // echoed in a snapshot, so preserve both across replays.
                 let rewind_turns = self.state.rewind_turns.clone();
                 let pending_rewind_prefill = self.state.pending_rewind_prefill.clone();
+                // Local-only turn-lifecycle guards the server never echoes.
+                // Dropping `completed_turns` across a replay reopens the #218
+                // late-delta wedge on reconnect: `is_turn_completed` forgets a
+                // pre-replay terminal, so a late delta resurrects the dead turn
+                // into `live_reply`. `finalized_by_switch` and `live_reasoning`
+                // are the same class of in-flight guard/accumulator, and
+                // `session_usage`/`session_context_window` back the honest
+                // context gauge until the next `token_cost` update arrives.
+                let completed_turns = self.state.completed_turns.clone();
+                let finalized_by_switch = self.state.finalized_by_switch.clone();
+                let live_reasoning = self.state.live_reasoning.clone();
+                let session_usage = self.state.session_usage.clone();
+                let session_context_window = self.state.session_context_window.clone();
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
@@ -5075,6 +5088,11 @@ impl Store {
                 state.resume_list_loaded = resume_list_loaded;
                 state.rewind_turns = rewind_turns;
                 state.pending_rewind_prefill = pending_rewind_prefill;
+                state.completed_turns = completed_turns;
+                state.finalized_by_switch = finalized_by_switch;
+                state.live_reasoning = live_reasoning;
+                state.session_usage = session_usage;
+                state.session_context_window = session_context_window;
                 state.restore_optimistic_user_messages();
                 self.state = state;
                 None
@@ -7234,6 +7252,20 @@ impl Store {
         // terminal for an already-finalized turn still dismisses the picker
         // instead of leaving it wedged (nit).
         self.clear_question_for_turn(&event.session_id, &event.turn_id);
+        // Idempotence vs a DUPLICATE terminal (e.g. a replayed turn/completed
+        // after reconnect): the turn already went through a terminal handler,
+        // so its card/fallback and run-state transition already happened.
+        // Without this guard the replay hits the `None` arm (the live reply was
+        // consumed by the first terminal) and pushes a FALSE "completed with no
+        // final answer" card. Safe cleanup (the picker clear above) still ran;
+        // everything else is a no-op. The staged-message drain stays: it is
+        // idle-guarded and must not miss a wake-up.
+        if self
+            .state
+            .is_turn_completed(&event.session_id, &event.turn_id)
+        {
+            return self.submit_next_pending_if_idle();
+        }
         // Mark this turn terminal so a late delta for it is dropped rather than
         // resurrecting it into `live_reply` (the wedge fix). Done before the
         // finalized-by-switch early return so it always records.
@@ -7359,18 +7391,41 @@ impl Store {
         // completed (live_reply == None → the `None` arm pushes the failure
         // card) and B still live (the `Some(mismatched)` arm preserves B's
         // live_reply but still surfaces A's failure via the run-state error).
-        let was_finalized_by_switch = self
-            .state
-            .take_turn_finalized_by_switch(&event.session_id, &event.turn_id);
         // A turn error cancels any pending AskUserQuestion picker for this turn
         // (design §4.2: the turn-interrupt/error path is Phase-1's cancellation).
         self.clear_question_for_turn(&event.session_id, &event.turn_id);
+        // Idempotence vs a DUPLICATE terminal (mirror `commit_live_reply`): the
+        // turn already terminated through a terminal handler (completed OR
+        // errored), so a late/replayed error for it must not push a second
+        // failure card or flip the run state of whatever is active now. This is
+        // distinct from the finalized-BY-SWITCH case below (a switch commits
+        // the text but is NOT a terminal — a genuine first error afterwards
+        // must still surface). Safe cleanup (the picker clear above) still ran.
+        if self
+            .state
+            .is_turn_completed(&event.session_id, &event.turn_id)
+        {
+            return self.submit_next_pending_if_idle();
+        }
+        let was_finalized_by_switch = self
+            .state
+            .take_turn_finalized_by_switch(&event.session_id, &event.turn_id);
         // Mark this turn terminal so a late delta for it is dropped rather than
         // resurrecting it into `live_reply` (the wedge fix).
         self.state
             .mark_turn_completed(&event.session_id, &event.turn_id);
         self.state
             .clear_live_reply_segment_boundaries(&event.session_id, &event.turn_id);
+        // Streamed reasoning for this turn leaves the accumulator on the error
+        // terminal too (mirror `commit_live_reply`): it attaches to the failure
+        // card below so the "· reasoning" block renders above the error, and
+        // the entry cannot leak. The stale arm restores it (the errored turn
+        // did not close here).
+        let reasoning = self
+            .state
+            .live_reasoning
+            .remove(&(event.session_id.clone(), event.turn_id.clone()))
+            .filter(|reasoning| !reasoning.trim().is_empty());
         let follow_tail = self.state.transcript_scroll == 0;
         let fallback_summary =
             self.turn_error_fallback_message(&event.turn_id, &event.code, &event.message);
@@ -7382,53 +7437,74 @@ impl Store {
         // coincide except for a switch-finalized turn whose error arrives while
         // a DIFFERENT successor turn is still live: there we surface the failure
         // (card + error run-state) without disturbing the live successor.
-        let (status, failed_current_turn, surfaced_failure) = match session.live_reply.take() {
-            Some(live_reply) if live_reply.turn_id == event.turn_id => {
-                let partial = compact_first_line(&live_reply.text, 120);
-                let text = if partial.is_empty() {
-                    fallback_summary
-                } else {
-                    format!("{fallback_summary}\n- Partial response: {partial}")
-                };
-                session.messages.push(Message::assistant(text));
-                (
-                    format!("Turn error {}: {}", event.code, event.message),
-                    true,
-                    true,
-                )
-            }
-            Some(live_reply) if was_finalized_by_switch => {
-                // A switch-finalized turn (A) errors while a different successor
-                // turn (B) is still live: surface A's failure card but PRESERVE
-                // B's in-flight live_reply untouched — the error is A's, not B's.
-                // A's (partial) text was already committed at switch time, so
-                // the card is the bare error summary (no partial-response tail
-                // here; that tail belongs to the live-turn arm above).
-                session.messages.push(Message::assistant(fallback_summary));
-                session.live_reply = Some(live_reply);
-                (
-                    format!("Turn error {}: {}", event.code, event.message),
-                    false,
-                    true,
-                )
-            }
-            Some(live_reply) => {
-                session.live_reply = Some(live_reply);
-                (
-                    format!("Ignored stale turn error in {title}: {}", event.code),
-                    false,
-                    false,
-                )
-            }
-            None => {
-                session.messages.push(Message::assistant(fallback_summary));
-                (
-                    format!("Turn error {}: {}", event.code, event.message),
-                    true,
-                    true,
-                )
-            }
-        };
+        let (status, failed_current_turn, surfaced_failure, restore_reasoning) =
+            match session.live_reply.take() {
+                Some(live_reply) if live_reply.turn_id == event.turn_id => {
+                    let partial = compact_first_line(&live_reply.text, 120);
+                    let text = if partial.is_empty() {
+                        fallback_summary
+                    } else {
+                        format!("{fallback_summary}\n- Partial response: {partial}")
+                    };
+                    let mut message = Message::assistant(text);
+                    message.reasoning_content = reasoning;
+                    session.messages.push(message);
+                    (
+                        format!("Turn error {}: {}", event.code, event.message),
+                        true,
+                        true,
+                        None,
+                    )
+                }
+                Some(live_reply) if was_finalized_by_switch => {
+                    // A switch-finalized turn (A) errors while a different successor
+                    // turn (B) is still live: surface A's failure card but PRESERVE
+                    // B's in-flight live_reply untouched — the error is A's, not B's.
+                    // A's (partial) text was already committed at switch time, so
+                    // the card is the bare error summary (no partial-response tail
+                    // here; that tail belongs to the live-turn arm above). Any
+                    // reasoning that accumulated for A AFTER the switch drained it
+                    // still surfaces on this card.
+                    let mut message = Message::assistant(fallback_summary);
+                    message.reasoning_content = reasoning;
+                    session.messages.push(message);
+                    session.live_reply = Some(live_reply);
+                    (
+                        format!("Turn error {}: {}", event.code, event.message),
+                        false,
+                        true,
+                        None,
+                    )
+                }
+                Some(live_reply) => {
+                    // Stale terminal (a different turn's reply is live): this turn
+                    // did not close here, so preserve its reasoning for the real
+                    // terminal rather than dropping it (mirror `commit_live_reply`).
+                    session.live_reply = Some(live_reply);
+                    (
+                        format!("Ignored stale turn error in {title}: {}", event.code),
+                        false,
+                        false,
+                        reasoning,
+                    )
+                }
+                None => {
+                    let mut message = Message::assistant(fallback_summary);
+                    message.reasoning_content = reasoning;
+                    session.messages.push(message);
+                    (
+                        format!("Turn error {}: {}", event.code, event.message),
+                        true,
+                        true,
+                        None,
+                    )
+                }
+            };
+        if let Some(reasoning) = restore_reasoning {
+            self.state
+                .live_reasoning
+                .insert((event.session_id.clone(), event.turn_id.clone()), reasoning);
+        }
         if surfaced_failure {
             if follow_tail {
                 self.state.scroll_transcript_to_latest();
@@ -13560,6 +13636,279 @@ mod tests {
             reasoning,
             Some("no answer came"),
             "reasoning must attach to the fallback message even with no answer"
+        );
+    }
+
+    /// Local-only turn-lifecycle guards must survive a snapshot replay
+    /// (reconnect/refresh), like `composer_history` does. Losing
+    /// `completed_turns` reopens the #218 late-delta wedge after reconnect:
+    /// `is_turn_completed` returns false for a turn that terminated before the
+    /// replay, so a late delta resurrects the dead turn into `live_reply`.
+    #[test]
+    fn turn_lifecycle_guards_survive_snapshot_replay() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let turn_id = TurnId::new();
+        let switched_turn = TurnId::new();
+        store.state.mark_turn_completed(&session_id, &turn_id);
+        store
+            .state
+            .mark_turn_finalized_by_switch(&session_id, &switched_turn);
+        store.state.live_reasoning.insert(
+            (session_id.clone(), turn_id.clone()),
+            "carried thinking".into(),
+        );
+        store
+            .state
+            .session_usage
+            .insert(session_id.clone(), (Some(10), Some(20), Some(0.5)));
+        store
+            .state
+            .session_context_window
+            .insert(session_id.clone(), 200_000);
+
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            selected_session: 0,
+            status: "replayed".into(),
+            target: None,
+            readonly: false,
+        }));
+
+        assert!(
+            store.state.is_turn_completed(&session_id, &turn_id),
+            "completed_turns must survive a snapshot replay"
+        );
+        assert!(
+            store
+                .state
+                .take_turn_finalized_by_switch(&session_id, &switched_turn),
+            "finalized_by_switch must survive a snapshot replay"
+        );
+        assert_eq!(
+            store
+                .state
+                .live_reasoning
+                .get(&(session_id.clone(), turn_id.clone()))
+                .map(String::as_str),
+            Some("carried thinking"),
+            "live_reasoning must survive a snapshot replay"
+        );
+        assert_eq!(
+            store.state.session_usage.get(&session_id),
+            Some(&(Some(10), Some(20), Some(0.5))),
+            "session_usage must survive a snapshot replay"
+        );
+        assert_eq!(
+            store.state.session_context_window.get(&session_id),
+            Some(&200_000),
+            "session_context_window must survive a snapshot replay"
+        );
+    }
+
+    /// `fail_live_reply` must drain the turn's streamed reasoning like
+    /// `commit_live_reply` does: attach it to the failure card (partial-answer
+    /// arm) and remove the accumulator entry — otherwise the entry leaks and
+    /// the reasoning is missing from the card.
+    #[test]
+    fn turn_error_drains_live_reasoning_onto_failure_card() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "partial answer");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.live_reasoning.insert(
+            (session_id.clone(), turn_id.clone()),
+            "weighing the options".into(),
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                code: "internal".into(),
+                message: "boom".into(),
+            },
+        )));
+
+        let card = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("failure card pushed");
+        assert_eq!(
+            card.reasoning_content.as_deref(),
+            Some("weighing the options"),
+            "the failure card must carry the streamed reasoning"
+        );
+        assert!(
+            !store
+                .state
+                .live_reasoning
+                .contains_key(&(session_id, turn_id)),
+            "the accumulator entry must be drained on the error terminal"
+        );
+    }
+
+    /// The no-live-reply error arm (fallback card) must also surface the
+    /// streamed reasoning, mirroring `commit_live_reply`'s None arm.
+    #[test]
+    fn turn_error_without_live_reply_attaches_reasoning_to_fallback_card() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.live_reasoning.insert(
+            (session_id.clone(), turn_id.clone()),
+            "no answer came".into(),
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                code: "internal".into(),
+                message: "boom".into(),
+            },
+        )));
+
+        let card = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("failure card pushed");
+        assert_eq!(card.reasoning_content.as_deref(), Some("no answer came"));
+        assert!(
+            !store
+                .state
+                .live_reasoning
+                .contains_key(&(session_id, turn_id)),
+            "the accumulator entry must be drained on the fallback error arm"
+        );
+    }
+
+    /// A STALE turn error (a different turn's reply is live, no
+    /// finalized-by-switch marker) commits nothing — the errored turn's
+    /// reasoning must be preserved for its real terminal, mirroring
+    /// `commit_live_reply`'s stale arm.
+    #[test]
+    fn stale_turn_error_preserves_other_turns_reasoning() {
+        let live_turn = TurnId::new();
+        let errored_turn = TurnId::new();
+        let mut store = store_with_live_reply(live_turn.clone(), "still streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.live_reasoning.insert(
+            (session_id.clone(), errored_turn.clone()),
+            "keep me".into(),
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: errored_turn.clone(),
+                code: "internal".into(),
+                message: "boom".into(),
+            },
+        )));
+
+        assert_eq!(
+            store
+                .state
+                .live_reasoning
+                .get(&(session_id, errored_turn))
+                .map(String::as_str),
+            Some("keep me"),
+            "a stale error must not drop the errored turn's reasoning"
+        );
+    }
+
+    /// Duplicate terminal idempotence: a second `turn/completed` for a turn
+    /// that already terminated (e.g. replayed after reconnect) must be a
+    /// no-op — exactly one committed card, no false "no final answer"
+    /// fallback, no run-state flip.
+    #[test]
+    fn duplicate_turn_completed_is_a_noop() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "the answer");
+        let session_id = store.state.sessions[0].id.clone();
+        let completed = TurnCompletedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: turn_id.clone(),
+            cursor: None,
+            tokens_in: None,
+            tokens_out: None,
+            session_result: None,
+        };
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            completed.clone(),
+        )));
+        assert_eq!(store.state.sessions[0].messages.len(), 1);
+        assert_eq!(store.state.sessions[0].messages[0].content, "the answer");
+        let status_after_first = store.state.status.clone();
+
+        // Replayed duplicate: live_reply is now None, so without the guard the
+        // None arm would push a FALSE "completed with no final answer" card.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            completed,
+        )));
+        assert_eq!(
+            store.state.sessions[0].messages.len(),
+            1,
+            "the duplicate terminal must not push a second card"
+        );
+        assert_eq!(
+            store.state.status, status_after_first,
+            "the duplicate terminal must not rewrite the status line"
+        );
+    }
+
+    /// A late/replayed `turn/error` for a turn that already completed must
+    /// not push a failure card or flip the run state to Error.
+    #[test]
+    fn turn_error_after_completed_terminal_is_a_noop() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "the answer");
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert_eq!(store.state.sessions[0].messages.len(), 1);
+        assert_eq!(store.state.run_state.label(), "done");
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                code: "internal".into(),
+                message: "late replayed error".into(),
+            },
+        )));
+        assert_eq!(
+            store.state.sessions[0].messages.len(),
+            1,
+            "a replayed error for an already-terminal turn must not push a failure card"
+        );
+        assert_ne!(
+            store.state.run_state.label(),
+            "error",
+            "a replayed error must not flip the run state"
         );
     }
 
