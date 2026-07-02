@@ -3507,6 +3507,21 @@ impl Store {
         if frame.id.as_str() == crate::menu::registry::MENU_REWIND {
             self.state.rewind_turns = self.collect_rewind_turns();
         }
+        // The cursor is positional, but an async refresh (a list reload chasing
+        // an mcp/tools/skills mutation) can shift rows underneath it — landing
+        // it on a DIFFERENT row, worst case an unconfirmed destructive one.
+        // Capture the selected item's ID from the outgoing build (only when it
+        // is a build of the SAME menu — on open/replace the outgoing build
+        // belongs to another menu whose row ids must not anchor this one) and
+        // re-anchor to it after the rebuild; fall back to the positional clamp
+        // when the item vanished.
+        let previous_selected_id = self.state.active_menu.as_ref().and_then(|menu| match menu {
+            MenuBuildResult::Ready(spec) if spec.id == frame.id => spec
+                .items
+                .get(frame.selected_index)
+                .map(|item| item.id.clone()),
+            _ => None,
+        });
         let path = self.state.menu_stack.path();
         let app = self.menu_app_snapshot();
         let availability = self.state.availability_context();
@@ -3525,7 +3540,15 @@ impl Store {
         if len > 0
             && let Some(frame) = self.state.menu_stack.active_mut()
         {
-            frame.selected_index = frame.selected_index.min(len.saturating_sub(1));
+            let re_anchored = previous_selected_id.and_then(|prev_id| match &result {
+                MenuBuildResult::Ready(spec) => {
+                    spec.items.iter().position(|item| item.id == prev_id)
+                }
+                _ => None,
+            });
+            frame.selected_index = re_anchored
+                .unwrap_or(frame.selected_index)
+                .min(len.saturating_sub(1));
         }
         self.state.active_menu = Some(result);
     }
@@ -9321,6 +9344,64 @@ mod tests {
         assert!(
             store.state.pending_messages.is_empty(),
             "the drained prompt left B's queue"
+        );
+    }
+
+    /// A mid-open list refresh (e.g. a mutation chasing a list reload) can
+    /// shift rows under the cursor. The cursor is positional, so without
+    /// re-anchoring it lands on a DIFFERENT row — worst case an unconfirmed
+    /// destructive one. The refresh must re-anchor the selection to the
+    /// previously-selected item's ID, falling back to the clamp only when
+    /// that item vanished.
+    #[test]
+    fn menu_refresh_re_anchors_selection_to_item_id_when_rows_shift() {
+        let row = |id: &str| ResumeSessionRow {
+            id: id.into(),
+            title: Some(id.to_uppercase()),
+            message_count: 1,
+            updated_at: None,
+        };
+        let mut store = store_with_empty_session();
+        store.state.resume_list_loaded = true;
+        store.state.resume_sessions =
+            vec![row("alpha"), row("bravo"), row("charlie"), row("delta")];
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_RESUME));
+
+        // Put the cursor on "bravo" (index 1).
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("open frame")
+            .selected_index = 1;
+        store.refresh_active_menu();
+
+        // A row ABOVE the cursor vanishes on the next refresh.
+        store.state.resume_sessions.remove(0);
+        store.refresh_active_menu();
+
+        let frame = store.state.menu_stack.active().expect("open frame");
+        let selected_id = match store.state.active_menu.as_ref() {
+            Some(MenuBuildResult::Ready(spec)) => spec
+                .items
+                .get(frame.selected_index)
+                .map(|item| item.id.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            selected_id.as_deref(),
+            Some("bravo"),
+            "the same item must stay selected when rows above it vanish"
+        );
+        assert_eq!(frame.selected_index, 0, "bravo moved up to index 0");
+
+        // When the selected item itself vanishes, fall back to the clamp.
+        store.state.resume_sessions.remove(0);
+        store.refresh_active_menu();
+        let frame = store.state.menu_stack.active().expect("open frame");
+        assert!(
+            frame.selected_index < 2,
+            "a vanished selection falls back to a clamped index"
         );
     }
 
