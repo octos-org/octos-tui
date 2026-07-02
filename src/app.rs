@@ -321,7 +321,8 @@ fn render_live_tail_with_finalization(
     let total_rows = transcript_visual_rows(&lines, wrap_width);
     let max_scroll = total_rows.saturating_sub(visible_height);
     let scroll_from_bottom = app.transcript_scroll.min(max_scroll);
-    let scroll_top = max_scroll.saturating_sub(scroll_from_bottom) as u16;
+    let scroll_top =
+        u16::try_from(max_scroll.saturating_sub(scroll_from_bottom)).unwrap_or(u16::MAX);
 
     Paragraph::new(Text::from(lines))
         .block(
@@ -2911,7 +2912,7 @@ fn transcript_render_model(app: &AppState, palette: Palette, area: Rect) -> Tran
             scroll_top = scroll_top.min(context_row);
         }
     }
-    let scroll_top = scroll_top as u16;
+    let scroll_top = u16::try_from(scroll_top).unwrap_or(u16::MAX);
 
     // In the pager the transcript blends with the terminal's DEFAULT
     // background, exactly like the inline live tail: pinned-mode wheel
@@ -2991,8 +2992,17 @@ fn pager_scrollbar_track(area: Rect) -> Option<Rect> {
     ))
 }
 
+/// Visible content rows of the transcript surfaces. Both callers — the inline
+/// live tail and the fullscreen `transcript_render_model` path — render a
+/// BORDERLESS Paragraph (`Block::default().style(..).border_style(..)` draws
+/// no border glyphs without `.borders()`), so every area row is a content row.
+/// The old `-2` "border allowance" was phantom: with the live tail sized
+/// exactly to its content it forced `max_scroll = 2`, permanently scrolling
+/// the top 2 tail rows out of the area and leaving 2 dead rows at the bottom.
+/// (The bordered detail modals compute their own `-2` next to their
+/// `titled_block(..)` calls, where a border really exists.)
 fn transcript_visible_height(area: Rect) -> usize {
-    usize::from(area.height.saturating_sub(2)).max(1)
+    usize::from(area.height).max(1)
 }
 
 fn transcript_wrap_width(area: Rect) -> usize {
@@ -4845,15 +4855,27 @@ fn user_question_action_labels(picker: &UserQuestionPickerState) -> Vec<String> 
 }
 
 fn fit_card_text(text: &str, width: usize) -> String {
-    // Reserve the 4-space prefix added by the caller.
+    // Reserve the 4-space prefix added by the caller. The budget is DISPLAY
+    // COLUMNS (unicode-width), not chars — CJK glyphs are double-width, so a
+    // char-count budget let CJK options overflow the card (mirror of
+    // `clip_line_spans`).
     let budget = width.saturating_sub(4).max(1);
-    if text.chars().count() <= budget {
+    if text.width() <= budget {
         return text.to_string();
     }
-    text.chars()
-        .take(budget.saturating_sub(1))
-        .collect::<String>()
-        + "…"
+    let cut = budget.saturating_sub(1); // leave a column for the ellipsis
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_w > cut {
+            break;
+        }
+        out.push(ch);
+        used += ch_w;
+    }
+    out.push('…');
+    out
 }
 
 fn push_prefixed_line(
@@ -7554,7 +7576,8 @@ fn render_task_output_modal(
     let visible_height = usize::from(area.height.saturating_sub(2)).max(1);
     let max_scroll = lines.len().saturating_sub(visible_height);
     let scroll_from_bottom = output.scroll.min(max_scroll);
-    let scroll_top = max_scroll.saturating_sub(scroll_from_bottom) as u16;
+    let scroll_top =
+        u16::try_from(max_scroll.saturating_sub(scroll_from_bottom)).unwrap_or(u16::MAX);
 
     let pane = Paragraph::new(Text::from(lines))
         .block(
@@ -7595,7 +7618,8 @@ fn render_artifact_detail_modal(
     let visible_height = usize::from(area.height.saturating_sub(2)).max(1);
     let max_scroll = lines.len().saturating_sub(visible_height);
     let scroll_from_bottom = artifact.scroll.min(max_scroll);
-    let scroll_top = max_scroll.saturating_sub(scroll_from_bottom) as u16;
+    let scroll_top =
+        u16::try_from(max_scroll.saturating_sub(scroll_from_bottom)).unwrap_or(u16::MAX);
 
     let pane = Paragraph::new(Text::from(lines))
         .block(
@@ -7636,7 +7660,8 @@ fn render_thread_graph_detail_modal(
     let visible_height = usize::from(area.height.saturating_sub(2)).max(1);
     let max_scroll = lines.len().saturating_sub(visible_height);
     let scroll_from_bottom = graph.scroll.min(max_scroll);
-    let scroll_top = max_scroll.saturating_sub(scroll_from_bottom) as u16;
+    let scroll_top =
+        u16::try_from(max_scroll.saturating_sub(scroll_from_bottom)).unwrap_or(u16::MAX);
 
     let pane = Paragraph::new(Text::from(lines))
         .block(
@@ -7676,7 +7701,8 @@ fn render_turn_state_detail_modal(
     let visible_height = usize::from(area.height.saturating_sub(2)).max(1);
     let max_scroll = lines.len().saturating_sub(visible_height);
     let scroll_from_bottom = turn.scroll.min(max_scroll);
-    let scroll_top = max_scroll.saturating_sub(scroll_from_bottom) as u16;
+    let scroll_top =
+        u16::try_from(max_scroll.saturating_sub(scroll_from_bottom)).unwrap_or(u16::MAX);
 
     let pane = Paragraph::new(Text::from(lines))
         .block(
@@ -8663,6 +8689,22 @@ mod tests {
         // The always-present free-text "Other" row.
         assert!(text.contains("Other"));
         assert!(text.contains("Enter = submit answer(s)"));
+    }
+
+    #[test]
+    fn fit_card_text_truncates_by_display_columns_not_chars() {
+        // Fix #8: CJK glyphs are double-width; measuring chars() let a CJK
+        // question option overflow the card. Budget is width - 4 (the caller's
+        // 4-space prefix): width 12 -> 8 columns. "中文选项测试" is 6 chars
+        // but 12 columns, so it must truncate (with the ellipsis) to <= 8.
+        let fitted = fit_card_text("中文选项测试", 12);
+        assert_eq!(fitted, "中文选…");
+        assert!(fitted.width() <= 8, "fitted {fitted:?} overflows the card");
+
+        // Within-budget text (by COLUMNS) is untouched: ASCII and a CJK string
+        // sitting exactly on the budget.
+        assert_eq!(fit_card_text("plain", 12), "plain");
+        assert_eq!(fit_card_text("四字选项", 12), "四字选项");
     }
 
     #[test]
@@ -13042,6 +13084,36 @@ mod tests {
             live.contains("cargo clippy --all-targets") && live.contains("Orchestrating"),
             "running activity should remain as the small live tail:\n{live}"
         );
+
+        // Fix #7: EVERY live-tail row must be visible, top rows included. The
+        // borderless live tail used to reserve a phantom 2-row border
+        // allowance, scrolling its top 2 rows out of the area and leaving 2
+        // dead rows at the bottom whenever the tail was >= 2 rows.
+        let tail_lines = live_tail_lines_with_finalization(
+            &app,
+            Palette::for_theme(ThemeName::Slate),
+            98,
+            update.live_tail_finalization.as_ref(),
+        );
+        assert!(
+            tail_lines.len() >= 2,
+            "precondition: the phantom allowance only bites on a >=2-row tail"
+        );
+        for line in &tail_lines {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            assert!(
+                live.contains(text),
+                "live-tail row {text:?} must be rendered (top rows included):\n{live}"
+            );
+        }
     }
 
     #[test]

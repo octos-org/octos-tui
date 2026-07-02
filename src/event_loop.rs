@@ -562,6 +562,32 @@ fn is_plain_text_key(key: &KeyEvent) -> bool {
         && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
 }
 
+/// True while a modal overlay (not a menu) owns the keyboard — the same set,
+/// in the same order, that `handle_plain_key` routes to before the menu/global
+/// arms: the activity navigator, the approval modal, the AskUserQuestion
+/// picker, and the task-output / artifact / thread-graph / turn-state detail
+/// viewers. While any of these is up, global composer edits (Ctrl+U, modified
+/// cursor/word keys) and pastes must not mutate the composer hidden underneath
+/// — `show_pending_approval` force-focuses the composer, so a focus check
+/// alone cannot catch this.
+fn modal_owns_keyboard(store: &Store) -> bool {
+    store.state.activity_navigator.active
+        || store
+            .state
+            .approval
+            .as_ref()
+            .is_some_and(|approval| approval.visible)
+        || store
+            .state
+            .user_question
+            .as_ref()
+            .is_some_and(|picker| picker.visible)
+        || store.state.task_output.active
+        || store.state.artifact_detail.active
+        || store.state.thread_graph_detail.active
+        || store.state.turn_state_detail.active
+}
+
 pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     if key.kind != KeyEventKind::Press {
         return KeyAction::Continue;
@@ -578,7 +604,12 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     }
 
     if is_control_char(&key, 'u') {
-        store.clear_composer_or_staged_messages();
+        // Swallowed (not cleared) while a modal owns the keyboard: clearing
+        // staged messages / the hidden draft under a dialog is invisible data
+        // loss.
+        if !modal_owns_keyboard(store) {
+            store.clear_composer_or_staged_messages();
+        }
         return KeyAction::Continue;
     }
 
@@ -601,7 +632,15 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
-    if store.state.focus == FocusPane::Composer && handle_composer_modified_key(store, key) {
+    // Modified-key composer edits are gated on no modal owning the keyboard:
+    // the approval/question modals force-focus the composer, so without the
+    // gate Ctrl+W / Alt+b / Shift+Enter kept mutating the hidden draft while a
+    // dialog was up. Menus are NOT gated here — `handle_menu_key` routes to
+    // `handle_composer_modified_key` itself where composer editing is intended.
+    if store.state.focus == FocusPane::Composer
+        && !modal_owns_keyboard(store)
+        && handle_composer_modified_key(store, key)
+    {
         return KeyAction::Continue;
     }
 
@@ -623,12 +662,12 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     }
 
     if is_alt_char(&key, 'j') {
-        move_down(&mut store.state);
+        move_down(store);
         return KeyAction::Continue;
     }
 
     if is_alt_char(&key, 'k') {
-        move_up(&mut store.state);
+        move_up(store);
         return KeyAction::Continue;
     }
 
@@ -650,10 +689,52 @@ fn handle_paste(store: &mut Store, text: &str) -> KeyAction {
         return KeyAction::Continue;
     }
 
-    // A paste is literal text and must NEVER trigger a slash command — a pasted
-    // file path ("/Users/...") or multi-line snippet beginning with '/' is not a
-    // command. Unlike a typed leading '/', we do not open the slash-command menu
-    // here. (Regression: pasting a path opened/ran the slash menu.)
+    // Route the paste to whoever owns the keyboard, mirroring the plain-key
+    // dispatch order — a paste used to bypass every modal and land invisibly
+    // in the force-focused composer underneath.
+    //
+    // (a) The AskUserQuestion free-text "Other" box is actively capturing:
+    // append there, exactly like the per-char capture arm (newlines flattened —
+    // the box is single-line and Enter means "advance/submit" in the picker).
+    if store
+        .state
+        .user_question
+        .as_ref()
+        .is_some_and(|picker| picker.visible)
+        && store.user_question_editing_free_text()
+    {
+        for ch in text.chars() {
+            store.user_question_push_free_text(if ch == '\n' { ' ' } else { ch });
+        }
+        return KeyAction::Continue;
+    }
+
+    // (b) Any other keyboard-owning modal (approval, question without its
+    // free-text box active, detail viewers, activity navigator): dropping the
+    // paste with a visible status beats silently editing the hidden composer.
+    if modal_owns_keyboard(store) {
+        store.state.status = "Paste ignored while a dialog is open".to_string();
+        return KeyAction::Continue;
+    }
+
+    // (c) A searchable menu is filtering (and the composer is not the menu's
+    // text target — slash-popup drafts and menu composer-edit fields still
+    // paste into the composer below): extend the search query, the same target
+    // the plain-char capture arm feeds.
+    if store.state.menu_stack.is_active()
+        && !slash_help_capture_active(store)
+        && !menu_composer_edit_active(store)
+        && active_menu_searchable(store)
+    {
+        append_active_menu_search_text(store, &text);
+        return KeyAction::Continue;
+    }
+
+    // (d) Default: the composer. A paste is literal text and must NEVER trigger
+    // a slash command — a pasted file path ("/Users/...") or multi-line snippet
+    // beginning with '/' is not a command. Unlike a typed leading '/', we do
+    // not open the slash-command menu here. (Regression: pasting a path
+    // opened/ran the slash menu.)
     store.state.insert_composer_text(&text);
     store.state.focus = FocusPane::Composer;
 
@@ -872,10 +953,10 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             return KeyAction::Quit;
         }
         KeyCode::Char('j') if store.state.focus != FocusPane::Composer => {
-            move_down(&mut store.state);
+            move_down(store);
         }
         KeyCode::Char('k') if store.state.focus != FocusPane::Composer => {
-            move_up(&mut store.state);
+            move_up(store);
         }
         KeyCode::Down if store.state.transcript_pager_active => {
             store.state.scroll_transcript_down(1);
@@ -927,10 +1008,10 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             }
         }
         KeyCode::Down => {
-            move_down(&mut store.state);
+            move_down(store);
         }
         KeyCode::Up => {
-            move_up(&mut store.state);
+            move_up(store);
         }
         KeyCode::PageDown => match store.state.focus {
             FocusPane::Workspace => store.state.workspace.scroll_down(8),
@@ -1051,7 +1132,16 @@ fn handle_activity_navigator_key(store: &mut Store, key: KeyEvent) -> KeyAction 
                     .iter()
                     .position(|session| session.id == session_id)
             {
-                store.state.selected_session = idx;
+                // Full switch bundle (drafts, staged-message stash, task/scroll
+                // resets) — a bare `selected_session` assignment here left the
+                // OLD session's staged prompts on the active queue, so a later
+                // terminal event would submit them into the newly selected
+                // session (codex P1 on the per-session staged-queue fix).
+                store.state.switch_selected_session(idx);
+                // ...and drain the incoming session's restored staged queue
+                // (codex round-2 P2: without this a staged prompt sits stuck
+                // until an unrelated turn event).
+                store.drain_staged_after_direct_switch();
                 store.state.status = t!(
                     "status.activity_navigator_selected_session",
                     title = store.state.sessions[idx].title.clone()
@@ -1188,10 +1278,16 @@ fn handle_composer_vim_key(store: &mut Store, key: &KeyEvent) -> Option<KeyActio
         store.state.composer_vim_pending = None;
         return None;
     }
-    // Esc clears any pending operator and stays in Normal (a no-op otherwise).
+    // Esc with a pending operator clears it and stays in Normal. Without one,
+    // fall through (None) to the global Esc arms: Esc in Normal mode is a vim
+    // no-op, but globally it interrupts the running turn, cancels a background
+    // task, or exits the transcript pager — swallowing it here made vim mode
+    // permanently eat all of those.
     if key.code == KeyCode::Esc {
-        store.state.composer_vim_pending = None;
-        return Some(KeyAction::Continue);
+        if store.state.composer_vim_pending.take().is_some() {
+            return Some(KeyAction::Continue);
+        }
+        return None;
     }
     // Non-character keys (arrows, etc.) fall through so they keep moving the
     // cursor via the normal composer arms.
@@ -1306,6 +1402,30 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
                 store.state.insert_composer_char(ch);
             }
             _ => {}
+        }
+        return KeyAction::Continue;
+    }
+
+    // Numeric shortcuts: menus RENDER a "1".."9" column but had no dispatch
+    // arm, so the advertised digit was dead — and in searchable menus it
+    // corrupted the filter instead. Resolve the digit against the ACTIVE
+    // (already search-filtered) spec and accept the item exactly like Enter.
+    // Deliberately after slash-help capture (digits there are composer
+    // filter/argument text) and skipped when no enabled item advertises the
+    // digit, so it falls through to the existing search-capture behavior.
+    if let KeyCode::Char(ch) = key.code
+        && !slash_help_capture_active(store)
+        && let Some(index) = active_menu_digit_shortcut_index(store, ch)
+    {
+        if let Some(frame) = store.state.menu_stack.active_mut() {
+            frame.selected_index = index;
+        }
+        let command = store.accept_active_menu_item();
+        if store.state.exit_requested {
+            return KeyAction::Quit;
+        }
+        if let Some(command) = command {
+            return KeyAction::send(command);
         }
         return KeyAction::Continue;
     }
@@ -1459,6 +1579,25 @@ fn active_menu_should_capture_search_char(store: &Store, ch: char) -> bool {
         && (active_menu_search_has_query(store) || !matches!(ch, 'j' | 'k'))
 }
 
+/// Index of the ENABLED item in the active (search-filtered) menu spec whose
+/// advertised shortcut is exactly the plain digit `ch` ('1'..='9'), or `None`
+/// (not a digit / no menu / nothing advertises it) so the caller falls through
+/// to search capture.
+fn active_menu_digit_shortcut_index(store: &Store, ch: char) -> Option<usize> {
+    if !ch.is_ascii_digit() || ch == '0' {
+        return None;
+    }
+    let Some(crate::menu::MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+        return None;
+    };
+    spec.items.iter().position(|item| {
+        item.is_enabled()
+            && item.shortcut.as_ref().is_some_and(|binding| {
+                binding.code == KeyCode::Char(ch) && binding.modifiers.is_empty()
+            })
+    })
+}
+
 fn active_menu_searchable(store: &Store) -> bool {
     matches!(
         store.state.active_menu.as_ref(),
@@ -1475,8 +1614,18 @@ fn active_menu_search_has_query(store: &Store) -> bool {
 }
 
 fn append_active_menu_search_char(store: &mut Store, ch: char) {
+    let mut buf = [0u8; 4];
+    append_active_menu_search_text(store, ch.encode_utf8(&mut buf));
+}
+
+/// Append text to the active menu frame's search query (single refresh — a
+/// paste must not rebuild the menu once per character). The query is a
+/// single-line filter, so newlines flatten to spaces.
+fn append_active_menu_search_text(store: &mut Store, text: &str) {
     if let Some(frame) = store.state.menu_stack.active_mut() {
-        frame.search_query.push(ch);
+        for ch in text.chars() {
+            frame.search_query.push(if ch == '\n' { ' ' } else { ch });
+        }
         frame.selected_index = 0;
     }
     store.refresh_active_menu();
@@ -1674,25 +1823,34 @@ fn handle_turn_state_detail_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     KeyAction::Continue
 }
 
-fn move_down(state: &mut crate::model::AppState) {
-    match state.focus {
-        FocusPane::Sessions => state.select_next_session(),
-        FocusPane::Tasks => state.select_next_task(),
-        FocusPane::Artifacts => state.select_next_artifact(),
-        FocusPane::Workspace => state.select_next_workspace_entry(),
-        FocusPane::Git => state.select_next_git_entry(),
-        FocusPane::Transcript | FocusPane::Composer => state.scroll_transcript_down(1),
+fn move_down(store: &mut Store) {
+    match store.state.focus {
+        FocusPane::Sessions => {
+            store.state.select_next_session();
+            // A direct switch restores the incoming session's staged queue;
+            // drain it (as a follow-up command) or a staged prompt sits stuck
+            // until an unrelated turn event (codex round-2 P2).
+            store.drain_staged_after_direct_switch();
+        }
+        FocusPane::Tasks => store.state.select_next_task(),
+        FocusPane::Artifacts => store.state.select_next_artifact(),
+        FocusPane::Workspace => store.state.select_next_workspace_entry(),
+        FocusPane::Git => store.state.select_next_git_entry(),
+        FocusPane::Transcript | FocusPane::Composer => store.state.scroll_transcript_down(1),
     }
 }
 
-fn move_up(state: &mut crate::model::AppState) {
-    match state.focus {
-        FocusPane::Sessions => state.select_prev_session(),
-        FocusPane::Tasks => state.select_prev_task(),
-        FocusPane::Artifacts => state.select_prev_artifact(),
-        FocusPane::Workspace => state.select_prev_workspace_entry(),
-        FocusPane::Git => state.select_prev_git_entry(),
-        FocusPane::Transcript | FocusPane::Composer => state.scroll_transcript_up(1),
+fn move_up(store: &mut Store) {
+    match store.state.focus {
+        FocusPane::Sessions => {
+            store.state.select_prev_session();
+            store.drain_staged_after_direct_switch();
+        }
+        FocusPane::Tasks => store.state.select_prev_task(),
+        FocusPane::Artifacts => store.state.select_prev_artifact(),
+        FocusPane::Workspace => store.state.select_prev_workspace_entry(),
+        FocusPane::Git => store.state.select_prev_git_entry(),
+        FocusPane::Transcript | FocusPane::Composer => store.state.scroll_transcript_up(1),
     }
 }
 
@@ -2667,7 +2825,11 @@ mod tests {
     }
 
     #[test]
-    fn terminal_paste_appends_literal_text_without_shortcut_dispatch() {
+    fn terminal_paste_while_approval_modal_visible_is_dropped_with_status() {
+        // Fix #2 (c): while the approval modal owns the keyboard, a paste used
+        // to land invisibly in the force-focused composer. It must be dropped
+        // with a visible status — and must never dispatch approval shortcuts
+        // ('y'/'n') either.
         let (mut store, _) = store_with_visible_approval();
 
         assert!(matches!(
@@ -2675,15 +2837,91 @@ mod tests {
             KeyAction::Continue
         ));
 
-        assert_eq!(store.state.composer, "y\n/safe");
-        assert_eq!(store.state.focus, FocusPane::Composer);
+        assert!(
+            store.state.composer.is_empty(),
+            "paste must not mutate the composer hidden under the modal: {:?}",
+            store.state.composer
+        );
         assert!(
             store
                 .state
                 .approval
                 .as_ref()
-                .is_some_and(|modal| modal.visible)
+                .is_some_and(|modal| modal.visible),
+            "the pasted 'y' must not answer the approval"
         );
+        assert!(
+            store.state.status.contains("dialog"),
+            "dropping a paste needs a visible status, got: {:?}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn terminal_paste_lands_in_question_free_text_when_editing() {
+        // Fix #2 (a): with the AskUserQuestion free-text "Other" box active,
+        // a paste belongs there (mirroring the plain-char capture path), not
+        // in the composer hidden underneath.
+        let (mut store, _) = store_with_visible_user_question();
+        handle_key(&mut store, key(KeyCode::Char('m')));
+        assert!(store.user_question_editing_free_text());
+
+        handle_terminal_event(&mut store, Event::Paste("y paste\ntail".into()));
+
+        let entry = &store
+            .state
+            .user_question
+            .as_ref()
+            .expect("picker")
+            .questions[0];
+        assert_eq!(
+            entry.free_text, "my paste tail",
+            "paste appends to the free-text box (newlines flattened)"
+        );
+        assert!(
+            store.state.composer.is_empty(),
+            "composer must not receive the paste"
+        );
+    }
+
+    #[test]
+    fn terminal_paste_while_question_modal_visible_without_free_text_is_dropped() {
+        let (mut store, _) = store_with_visible_user_question();
+        assert!(!store.user_question_editing_free_text());
+
+        handle_terminal_event(&mut store, Event::Paste("stray".into()));
+
+        assert!(store.state.composer.is_empty());
+        let entry = &store
+            .state
+            .user_question
+            .as_ref()
+            .expect("picker")
+            .questions[0];
+        assert!(entry.free_text.is_empty());
+        assert!(store.state.status.contains("dialog"));
+    }
+
+    #[test]
+    fn terminal_paste_appends_to_open_searchable_menu_filter() {
+        // Fix #2 (b): with a searchable menu open, a paste extends the menu's
+        // search query (the same target the plain-char path feeds), not the
+        // composer hidden behind the menu.
+        let mut store = store_with_sessions(1);
+        store.open_menu(crate::menu::MenuId::from(crate::menu::registry::MENU_THEME));
+
+        handle_terminal_event(&mut store, Event::Paste("sol".into()));
+
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .expect("menu open")
+                .search_query,
+            "sol"
+        );
+        assert!(store.state.composer.is_empty());
     }
 
     #[test]
@@ -2761,6 +2999,106 @@ mod tests {
         let mut store = store_with_sessions(1);
         handle_terminal_event(&mut store, Event::Paste("\u{9b}31mred\u{9d}0;t\u{7}END".into()));
         assert_eq!(store.state.composer, "redEND");
+    }
+
+    #[test]
+    fn ctrl_u_while_approval_modal_visible_keeps_staged_messages_and_draft() {
+        // Fix #3: the global Ctrl+U ran before overlay dispatch, so it cleared
+        // staged messages / the composer draft invisibly while a modal owned
+        // the keyboard (the approval modal force-focuses the composer).
+        let (mut store, _) = store_with_visible_approval();
+        store.state.pending_messages.push("staged".into());
+        store.state.set_composer_text("draft");
+
+        let action = handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(store.state.pending_messages, vec!["staged".to_string()]);
+        assert_eq!(store.state.composer, "draft");
+    }
+
+    #[test]
+    fn composer_modified_keys_do_not_edit_hidden_composer_while_modal_visible() {
+        // Fix #3: Ctrl+W (delete word) and friends must not mutate the hidden
+        // composer while the approval modal owns the keyboard.
+        let (mut store, _) = store_with_visible_approval();
+        store.state.set_composer_text("two words");
+        store.state.focus = FocusPane::Composer;
+
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(store.state.composer, "two words");
+    }
+
+    #[test]
+    fn ctrl_u_without_modal_still_clears_staged_messages() {
+        let mut store = store_with_sessions(1);
+        store.state.pending_messages.push("staged".into());
+
+        let action = handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert!(store.state.pending_messages.is_empty());
+    }
+
+    #[test]
+    fn menu_digit_shortcut_dispatches_matching_item() {
+        // Fix #4: menus render "1".."9" numeric shortcuts but had no dispatch
+        // arm. The digit must select + accept the advertised item exactly like
+        // Enter ('5' -> the theme menu's 5th item, "solarized").
+        let mut store = store_with_sessions(1);
+        store.open_menu(crate::menu::MenuId::from(crate::menu::registry::MENU_THEME));
+
+        let action = handle_key(&mut store, key(KeyCode::Char('5')));
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(store.state.theme, crate::cli::ThemeName::Solarized);
+    }
+
+    #[test]
+    fn menu_digit_without_matching_shortcut_still_types_into_search() {
+        // The theme menu advertises only "1".."5"; '9' matches no item, so it
+        // must keep the existing searchable-menu capture behavior.
+        let mut store = store_with_sessions(1);
+        store.open_menu(crate::menu::MenuId::from(crate::menu::registry::MENU_THEME));
+
+        let action = handle_key(&mut store, key(KeyCode::Char('9')));
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .expect("menu open")
+                .search_query,
+            "9"
+        );
+        assert_eq!(store.state.theme, crate::cli::ThemeName::default());
+    }
+
+    #[test]
+    fn slash_popup_digit_stays_in_composer_draft() {
+        // In the slash popup the composer is a command line where digits are
+        // legitimate filter/argument text; the help menu's advertised numeric
+        // shortcuts must NOT hijack them.
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        handle_key(&mut store, key(KeyCode::Char('/')));
+        assert!(store.state.menu_stack.is_active());
+
+        handle_key(&mut store, key(KeyCode::Char('1')));
+
+        assert_eq!(store.state.composer, "/1");
     }
 
     #[test]
@@ -3515,6 +3853,173 @@ mod tests {
         assert_eq!(
             params.task_id, running_id,
             "must cancel the running task, not the selected completed one"
+        );
+    }
+
+    #[test]
+    fn vim_normal_esc_falls_through_to_interrupt_active_turn() {
+        // Fix #1: with vim mode on and the composer in Normal mode, Esc used to
+        // be swallowed unconditionally, so it could never interrupt a running
+        // turn (mirror of `esc_interrupts_active_turn_without_staged_messages`).
+        let turn_id = TurnId::new();
+        let mut store = store_with_sessions(1);
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: turn_id.clone(),
+            text: "streaming".into(),
+        });
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Normal;
+        store.state.focus = FocusPane::Composer;
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+
+        let AppUiCommand::InterruptTurn(params) = sent_command(action) else {
+            panic!("expected InterruptTurn command");
+        };
+        assert_eq!(params.turn_id, turn_id);
+    }
+
+    #[test]
+    fn vim_normal_esc_with_pending_operator_clears_it_without_interrupting() {
+        let mut store = store_with_sessions(1);
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: TurnId::new(),
+            text: "streaming".into(),
+        });
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Normal;
+        store.state.focus = FocusPane::Composer;
+        store.state.composer_vim_pending = Some('d');
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(store.state.composer_vim_pending, None);
+        assert!(
+            store.state.active_turn().is_some(),
+            "Esc with a pending operator only clears it; the turn keeps running"
+        );
+    }
+
+    #[test]
+    fn activity_navigator_enter_runs_the_full_session_switch_bundle() {
+        // codex P1 (deep-review wave): the navigator Enter path assigned
+        // `selected_session` directly, bypassing `switch_selected_session` —
+        // the outgoing session's draft was never persisted (and with
+        // per-session staged queues, the old session's staged prompts stayed
+        // on the active queue, misdelivering into the picked session).
+        let mut store = store_with_sessions(2);
+        store.state.set_composer_text("draft for zero");
+        // A task row is unambiguously linked to its owning session (activity
+        // items without a turn also match the ACTIVE session via the
+        // belongs-to fallback, which would make row 0 a self-switch).
+        store.state.sessions[1].tasks.push(TaskView {
+            id: TaskId::new(),
+            title: "background probe".into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: None,
+            output_tail: String::new(),
+            turn_id: None,
+        });
+        store.state.activity_navigator.active = true;
+        store.state.activity_navigator.selected = 0;
+
+        handle_activity_navigator_key(&mut store, key(KeyCode::Enter));
+
+        assert_eq!(
+            store.state.selected_session, 1,
+            "navigator pick lands on the target session"
+        );
+        assert!(
+            store.state.composer.is_empty(),
+            "outgoing draft must not bleed into the picked session"
+        );
+        // Switching back restores the stashed draft — proof the full bundle ran.
+        store.state.switch_selected_session(0);
+        assert_eq!(store.state.composer, "draft for zero");
+    }
+
+    #[test]
+    fn sessions_pane_switch_back_drains_the_staged_queue() {
+        // codex round-2 P2: switch_selected_session restores the incoming
+        // session's staged queue, but the Sessions-pane Up/Down path never
+        // drained it — the staged prompt sat stuck until an unrelated turn
+        // event. The direct-switch paths now enqueue the drained submit on
+        // the follow-up queue.
+        let mut store = store_with_sessions(2);
+        // Switch away FIRST (the outgoing bundle stashes session 0's — empty —
+        // active queue), THEN seed session 0's stash: a staged prompt left
+        // behind when its terminal fired while session 1 was active.
+        store.state.switch_selected_session(1);
+        store.state.pending_messages_by_session.insert(
+            store.state.sessions[0].id.clone(),
+            vec!["staged for zero".into()],
+        );
+        store.state.focus = FocusPane::Sessions;
+
+        // Down wraps 1 -> 0 (two sessions): the direct switch back must drain.
+        handle_key(&mut store, key(KeyCode::Down));
+
+        assert_eq!(store.state.selected_session, 0);
+        let follow_up = store
+            .state
+            .pending_autonomy_hydration
+            .iter()
+            .find_map(|command| match command {
+                AppUiCommand::SubmitPrompt(params) => {
+                    params.input.iter().find_map(|item| match item {
+                        octos_core::ui_protocol::InputItem::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            });
+        assert_eq!(
+            follow_up.as_deref(),
+            Some("staged for zero"),
+            "the restored staged prompt must be submitted as a follow-up"
+        );
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "the staged queue drained"
+        );
+    }
+
+    #[test]
+    fn vim_insert_esc_switches_to_normal_without_interrupting() {
+        let mut store = store_with_sessions(1);
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: TurnId::new(),
+            text: "streaming".into(),
+        });
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Insert;
+        store.state.focus = FocusPane::Composer;
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(
+            store.state.composer_mode,
+            crate::model::ComposerMode::Normal
+        );
+        assert!(store.state.active_turn().is_some());
+    }
+
+    #[test]
+    fn vim_normal_esc_exits_transcript_pager() {
+        let mut store = store_with_sessions(1);
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Normal;
+        store.state.focus = FocusPane::Composer;
+        store.state.transcript_pager_active = true;
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert!(
+            !store.state.transcript_pager_active,
+            "Esc in vim Normal mode must still exit the transcript pager"
         );
     }
 

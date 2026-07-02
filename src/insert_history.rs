@@ -62,10 +62,22 @@ fn reset_scroll_region<W: Write>(w: &mut W) -> io::Result<()> {
 /// otherwise). Updates `terminal.viewport_area` so the next draw paints in the
 /// viewport's new position. Cursor-position-neutral: restores the cursor to
 /// where it was on entry.
-pub fn insert_history_lines<B>(terminal: &mut Terminal<B>, lines: Vec<Line>) -> io::Result<()>
+pub fn insert_history_lines<B>(terminal: &mut Terminal<B>, mut lines: Vec<Line>) -> io::Result<()>
 where
     B: Backend + Write,
 {
+    // SANITIZE FIRST, wrap after: span content is later Printed verbatim into
+    // the terminal mid-DECSTBM-dance (`write_spans` does no escaping), so raw
+    // control bytes in untrusted transcript content would execute there — a
+    // stray `CSI r` / `CSI 2J` corrupts the screen, an OSC retitles the
+    // window. Tabs additionally count width 0 in `wrap_line` but advance up to
+    // 8 columns on a real terminal, breaking the one-Line-one-row invariant
+    // the row math below depends on. This is the single chokepoint: every
+    // scrollback write goes through this function.
+    for line in &mut lines {
+        sanitize_line_in_place(line);
+    }
+
     let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
     let mut area = terminal.viewport_area;
     let last_cursor_pos = terminal.last_known_cursor_pos;
@@ -78,7 +90,7 @@ where
     for line in &lines {
         wrapped.extend(wrap_line(line, wrap_width));
     }
-    let wrapped_rows = wrapped.len() as u16;
+    let wrapped_rows = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
     if wrapped_rows == 0 {
         return Ok(());
     }
@@ -167,6 +179,36 @@ where
     // history to insert, so an idle TUI still emits nothing.
     Backend::flush(terminal.backend_mut())?;
     Ok(())
+}
+
+/// Replace each span's content with a terminal-safe version: tabs expand to 4
+/// spaces (fixed expansion — scrollback lines are wrapped by column, so
+/// tabstop-relative expansion has no anchor here) and every other control
+/// char — C0 (including `\r`, `\n`, ESC), DEL, and C1 (U+0080–U+009F, the
+/// 8-bit CSI/OSC forms) — is removed. Removing the introducer defuses the
+/// whole escape sequence (its params become inert printable text). Styling
+/// and span boundaries are preserved. Clean spans are left unallocated.
+fn sanitize_line_in_place(line: &mut Line<'_>) {
+    for span in &mut line.spans {
+        let content = span.content.as_ref();
+        if content.chars().any(char::is_control) {
+            span.content = std::borrow::Cow::Owned(sanitize_span_content(content));
+        }
+    }
+}
+
+/// `char::is_control` matches Unicode `Cc` — exactly C0 (U+0000–U+001F), DEL
+/// (U+007F) and C1 (U+0080–U+009F).
+fn sanitize_span_content(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    for ch in content.chars() {
+        if ch == '\t' {
+            out.push_str("    ");
+        } else if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Word-wrap a [`Line`] to `width` display columns, preserving per-span style.
@@ -915,6 +957,83 @@ mod tests {
             split_rows,
             vec!["first", "", "second", ""],
             "redrawing a leading-blank live tail between inserts must not add a second blank"
+        );
+    }
+
+    #[test]
+    fn insert_history_strips_raw_escapes_and_controls_from_span_content() {
+        // Fix #5: span content is Printed verbatim into the terminal mid-
+        // DECSTBM dance; raw ESC/CSI/OSC or C1 bytes in untrusted transcript
+        // content (tool output, `cat` of a binary, model-echoed escapes) would
+        // corrupt the screen / retitle the window. Every control char must be
+        // removed at the chokepoint (the introducer gone, the sequence is
+        // inert text).
+        let mut t = term(40, 8);
+        let line = Line::from(vec![Span::raw(
+            "a\u{1b}[31mred\u{1b}]0;evil\u{7}b\rc\u{9b}2Jd\u{7f}e",
+        )]);
+        insert_history_lines(&mut t, vec![line]).expect("insert history");
+
+        let out = t.backend().output();
+        assert!(!out.contains("\x1b[31m"), "raw CSI color leaked: {out:?}");
+        assert!(!out.contains("\x1b[2J"), "raw CSI clear leaked: {out:?}");
+        assert!(!out.contains("\x1b]"), "raw OSC leaked: {out:?}");
+        assert!(!out.contains('\u{9b}'), "raw C1 CSI leaked: {out:?}");
+        assert!(!out.contains('\u{7}'), "raw BEL leaked: {out:?}");
+        assert!(!out.contains('\u{7f}'), "raw DEL leaked: {out:?}");
+        // The printable payload survives with the introducers/controls gone
+        // (defused sequence params render as inert text).
+        assert!(
+            out.contains("a[31mred]0;evilbc2Jde"),
+            "sanitized payload missing: {out:?}"
+        );
+    }
+
+    #[test]
+    fn insert_history_expands_tabs_so_wrapping_matches_terminal_columns() {
+        // Fix #5 (tab drift): `wrap_line` counted '\t' as width 0 while a real
+        // terminal advances up to 8 columns, breaking the one-Line-one-row
+        // invariant the DECSTBM row math depends on (#220 zone). Tabs expand to
+        // 4 spaces BEFORE wrapping, so "aaaa\tbbbb" (12 expanded columns) must
+        // occupy two physical rows at width 8 — not one.
+        let width = 8;
+        let height = 8;
+        let viewport = Rect::new(0, 4, width, 2);
+        let mut t = screen_term(width, height, viewport);
+
+        insert_history_lines(&mut t, vec![text_line("aaaa\tbbbb")]).expect("insert history");
+
+        let rows = t.backend().screen_rows_above(t.viewport_area.top());
+        assert_eq!(
+            rows,
+            vec!["aaaa", "bbbb"],
+            "tab-expanded content must wrap into two physical rows"
+        );
+
+        // No wrap needed: the tab still renders as spaces (single row).
+        let mut t = screen_term(12, height, Rect::new(0, 4, 12, 2));
+        insert_history_lines(&mut t, vec![text_line("a\tb")]).expect("insert history");
+        let rows = t.backend().screen_rows_above(t.viewport_area.top());
+        assert_eq!(rows, vec!["a    b"]);
+    }
+
+    #[test]
+    fn insert_history_row_count_saturates_instead_of_wrapping_at_u16_max() {
+        // Fix #6: `wrapped.len() as u16` wrapped modulo 65536, so 65_537
+        // one-row lines truncated to 1 and the viewport slid by a single row
+        // even with 2 spare rows below it. Saturating keeps the full (clamped)
+        // row count in play.
+        let mut t = Terminal::new(RecordingBackend::new(10, 8)).expect("terminal");
+        t.set_viewport_area(Rect::new(0, 5, 10, 1)); // 2 spare rows below
+
+        let lines: Vec<Line> = (0..=usize::from(u16::MAX))
+            .map(|_| Line::from("x"))
+            .collect();
+        insert_history_lines(&mut t, lines).expect("insert history");
+
+        assert_eq!(
+            t.viewport_area.y, 7,
+            "viewport must slide by the full spare gap (2 rows), not by len % 65536"
         );
     }
 

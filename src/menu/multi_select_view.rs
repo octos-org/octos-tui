@@ -386,11 +386,10 @@ fn render_footer(area: Rect, buf: &mut Buffer, palette: Palette, view: &MultiSel
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let fallback = if view.reorder_enabled {
-        "Space toggle | Enter confirm | Esc cancel | Alt+Up/Alt+Down reorder"
-    } else {
-        "Space toggle | Enter confirm | Esc cancel | Up/Down move"
-    };
+    // Promise only what is wired: there is no Space-toggle or Alt+Up/Alt+Down
+    // reorder handling anywhere (checkboxes render read-only), so the footer
+    // must not advertise them.
+    let fallback = "Up/Down move | Enter confirm | Esc cancel";
     let text = view.footer_hint.as_deref().unwrap_or(fallback);
     Paragraph::new(Line::from(Span::styled(
         fit_text(text, usize::from(area.width)),
@@ -462,7 +461,11 @@ mod tests {
 
         assert!(text.contains("[x] 01 State"));
         assert!(text.contains(">  [ ] 02 Working directory"));
-        assert!(text.contains("Alt+Up/Alt+Down reorder"));
+        // The footer must not promise interactions that are not wired: no
+        // Space-toggle and no Alt+Up/Alt+Down reorder handling exists.
+        assert!(!text.contains("Alt+Up/Alt+Down reorder"));
+        assert!(!text.contains("Space toggle"));
+        assert!(text.contains("Up/Down move | Enter confirm | Esc cancel"));
     }
 
     #[test]

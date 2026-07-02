@@ -20,6 +20,19 @@
 
 use crate::model::AppState;
 
+/// Maximum size, in bytes, of the base64 payload inside the OSC 52 sequence.
+///
+/// Common terminals silently drop OSC 52 sequences past an internal limit —
+/// xterm historically caps the whole sequence near 100 KB, and tmux's
+/// passthrough adds framing on top — so a multi-hundred-KB copy would no-op
+/// with no feedback. 72 KB of encoded payload (~54 KB of text) stays well
+/// under every known cap while still fitting any realistic answer.
+pub const OSC52_MAX_ENCODED_BYTES: usize = 72 * 1024;
+
+/// Maximum input bytes so `base64(input)` never exceeds
+/// [`OSC52_MAX_ENCODED_BYTES`]: base64 emits 4 output bytes per 3 input bytes.
+const OSC52_MAX_INPUT_BYTES: usize = OSC52_MAX_ENCODED_BYTES / 4 * 3;
+
 /// Build the OSC 52 escape sequence that sets the system clipboard to `text`.
 ///
 /// Shape: `ESC ] 52 ; c ; <base64(text)> BEL`. The `c` selection targets the
@@ -30,6 +43,8 @@ use crate::model::AppState;
 ///
 /// The payload is standard base64 (RFC 4648, `+`/`/`, `=` padding) with **no**
 /// line wrapping — line breaks in an OSC string would terminate the sequence.
+/// Oversized input is truncated (head kept) to [`OSC52_MAX_ENCODED_BYTES`];
+/// use [`osc52_copy_sequence_capped`] to learn whether truncation happened.
 pub fn osc52_copy_sequence(text: &str) -> String {
     osc52_copy_sequence_for(text, std::env::var_os("TMUX").is_some())
 }
@@ -46,15 +61,52 @@ pub fn osc52_copy_sequence(text: &str) -> String {
 /// Detection is by the `TMUX` env var (set by tmux for its child processes);
 /// `tmux` is the parameterized seam so the behaviour is unit-testable.
 pub fn osc52_copy_sequence_for(text: &str, tmux: bool) -> String {
+    osc52_copy_sequence_capped(text, tmux).0
+}
+
+/// [`osc52_copy_sequence_for`] plus a truncation signal.
+///
+/// Returns `(sequence, truncated)`: when `text` encodes past
+/// [`OSC52_MAX_ENCODED_BYTES`] the input is cut at the largest char boundary
+/// that fits (keeping the head — the start of an answer is the part the user
+/// asked for) and `truncated` is `true`, so callers can surface a "copied
+/// first N KB" hint instead of a silent whole-copy no-op in the terminal.
+pub fn osc52_copy_sequence_capped(text: &str, tmux: bool) -> (String, bool) {
+    let (text, truncated) = truncate_at_char_boundary(text, OSC52_MAX_INPUT_BYTES);
     let encoded = base64_encode(text.as_bytes());
     let bare = format!("\x1b]52;c;{encoded}\x07");
-    if tmux {
+    let sequence = if tmux {
         // Double every ESC inside the payload, then wrap in the tmux DCS frame.
         let escaped = bare.replace('\x1b', "\x1b\x1b");
         format!("\x1bPtmux;{escaped}\x1b\\")
     } else {
         bare
+    };
+    (sequence, truncated)
+}
+
+/// How many CHARACTERS of `text` will actually reach the clipboard once the
+/// OSC 52 input cap is applied, or `None` when the whole text fits. Lets the
+/// `/copy` status line report a truncated copy honestly instead of claiming
+/// the full length (the emit-time cap in [`osc52_copy_sequence_capped`] is
+/// otherwise invisible to the caller that stages the status).
+pub fn osc52_truncated_chars(text: &str) -> Option<usize> {
+    let (kept, truncated) = truncate_at_char_boundary(text, OSC52_MAX_INPUT_BYTES);
+    truncated.then(|| kept.chars().count())
+}
+
+/// Truncate `text` to at most `max_bytes`, backing off to a UTF-8 char
+/// boundary so the kept head is always valid UTF-8. Returns the (possibly
+/// shortened) slice and whether anything was dropped.
+fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> (&str, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
     }
+    let mut cut = max_bytes;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (&text[..cut], true)
 }
 
 /// The text to copy when the user invokes the copy command: the most recent
@@ -179,6 +231,73 @@ mod tests {
     fn should_emit_bare_osc52_when_not_in_tmux() {
         let seq = osc52_copy_sequence_for("foobar", /*tmux*/ false);
         assert_eq!(seq, "\x1b]52;c;Zm9vYmFy\x07");
+    }
+
+    // --- OSC 52 payload cap ---
+
+    fn payload_of(seq: &str) -> &str {
+        seq.strip_prefix("\x1b]52;c;")
+            .and_then(|s| s.strip_suffix('\x07'))
+            .expect("bare OSC 52 frame present")
+    }
+
+    #[test]
+    fn should_not_truncate_input_at_or_below_the_cap() {
+        let text = "a".repeat(OSC52_MAX_INPUT_BYTES);
+        let (seq, truncated) = osc52_copy_sequence_capped(&text, false);
+        assert!(!truncated);
+        assert_eq!(payload_of(&seq), base64_encode(text.as_bytes()));
+        assert!(payload_of(&seq).len() <= OSC52_MAX_ENCODED_BYTES);
+    }
+
+    #[test]
+    fn should_cap_oversized_payload_keeping_the_head() {
+        // Multi-hundred-KB copy: terminals cap OSC 52 (~100 KB) and would
+        // silently no-op. The sequence must stay under the documented cap.
+        let text = "x".repeat(300 * 1024);
+        let (seq, truncated) = osc52_copy_sequence_capped(&text, false);
+        assert!(truncated);
+        let payload = payload_of(&seq);
+        assert!(payload.len() <= OSC52_MAX_ENCODED_BYTES);
+        // Head is kept: payload is exactly base64 of the input's prefix.
+        assert_eq!(
+            payload,
+            base64_encode(&text.as_bytes()[..OSC52_MAX_INPUT_BYTES])
+        );
+        // Valid base64: length is a multiple of 4 (whole input, no padding split).
+        assert_eq!(payload.len() % 4, 0);
+    }
+
+    #[test]
+    fn should_truncate_on_a_char_boundary() {
+        // 2-byte codepoints: with an odd byte cap the cut would land
+        // mid-character; the cap must back off to a boundary, never panic.
+        let ch = "é"; // 2 bytes
+        let text = ch.repeat(OSC52_MAX_INPUT_BYTES); // ~110 KB, boundary at every even byte
+        let (seq, truncated) = osc52_copy_sequence_capped(&text, false);
+        assert!(truncated);
+        let mut cut = OSC52_MAX_INPUT_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        assert_eq!(payload_of(&seq), base64_encode(&text.as_bytes()[..cut]));
+    }
+
+    #[test]
+    fn should_cap_the_tmux_wrapped_variant_too() {
+        let text = "y".repeat(300 * 1024);
+        let (seq, truncated) = osc52_copy_sequence_capped(&text, true);
+        assert!(truncated);
+        assert!(seq.starts_with("\x1bPtmux;"));
+        // The whole wrapped sequence stays within cap + framing overhead.
+        assert!(seq.len() <= OSC52_MAX_ENCODED_BYTES + 32);
+    }
+
+    #[test]
+    fn public_uncapped_helpers_apply_the_same_cap() {
+        let text = "z".repeat(300 * 1024);
+        let seq = osc52_copy_sequence_for(&text, false);
+        assert!(payload_of(&seq).len() <= OSC52_MAX_ENCODED_BYTES);
     }
 
     #[test]

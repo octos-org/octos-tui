@@ -532,7 +532,14 @@ fn component_menu(
         tabs: Vec::new(),
         searchable: true,
         search_placeholder: Some(t!("menu.component.search").into_owned()),
-        footer_hint: Some(t!("menu.component.footer").into_owned()),
+        // Honest footer: the checkboxes are a read-only preview of the
+        // build-time layout — no Space toggle / reorder handling is wired and
+        // Enter reports "not wired" — so promise only navigation (plain
+        // English, no i18n key; the localized `menu.component.footer` still
+        // advertises the unwired Space toggle).
+        footer_hint: Some(
+            "Up/Down move | Esc close — read-only preview, save not wired yet".into(),
+        ),
         preview: Some(MenuPreview::Text {
             title: Some(t!("menu.component.preview_title").into_owned()),
             body: selected.join(" | "),
@@ -884,6 +891,14 @@ fn rewind_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         });
     }
 
+    // Bind every row to the session the rows were built from: the dispatch
+    // side refuses a pick whose session no longer matches the active one (the
+    // user switched sessions while the picker was open).
+    let session_id = ctx
+        .app
+        .selected_session_id
+        .map(|key| key.0.clone())
+        .unwrap_or_default();
     let items = ctx
         .app
         .rewind_turns
@@ -893,6 +908,7 @@ fn rewind_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 format!("rewind:{}", row.num_turns),
                 row.preview.clone(),
                 MenuAction::Local(LocalAction::RewindToTurn {
+                    session_id: session_id.clone(),
                     num_turns: row.num_turns,
                     prefill: row.prefill.clone(),
                 }),
@@ -6742,10 +6758,12 @@ mod tests {
             },
         ];
         let capabilities = CapabilitySet::from_methods([methods::SESSION_ROLLBACK]);
+        let session_id = SessionKey("local:test".into());
         let ctx = MenuContext {
             availability: AvailabilityContext::protocol(&capabilities),
             app: MenuAppSnapshot {
                 rewind_turns: &rows,
+                selected_session_id: Some(&session_id),
                 ..MenuAppSnapshot::default()
             },
             terminal: TerminalSize::default(),
@@ -6763,14 +6781,17 @@ mod tests {
 
         // Row 0 is the newest user message → num_turns 1 (drop the last
         // exchange), label is the preview, description reports the drop count,
-        // and the action carries num_turns + the full prefill.
+        // and the action carries the source session + num_turns + the full
+        // prefill (dispatch refuses a pick whose session no longer matches).
         let newest = &spec.items[0];
         assert_eq!(newest.label, "third question");
         assert_eq!(newest.description.as_deref(), Some("drops 1 turn(s)"));
         assert!(matches!(
             &newest.action,
-            MenuAction::Local(LocalAction::RewindToTurn { num_turns, prefill })
-                if *num_turns == 1 && prefill == "third question in full"
+            MenuAction::Local(LocalAction::RewindToTurn { session_id, num_turns, prefill })
+                if *num_turns == 1
+                    && prefill == "third question in full"
+                    && session_id == "local:test"
         ));
 
         // The oldest user message is last → num_turns 3.

@@ -30,8 +30,9 @@ use octos_core::ui_protocol::{
 use octos_core::{Message, SessionKey, TaskId};
 use serde_json::Value;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncWriteExt, BufReader},
     process::Command,
     runtime::Runtime,
     sync::mpsc,
@@ -202,6 +203,7 @@ pub struct ProtocolAppUiBackend {
     runtime_error: Option<String>,
     driver: Option<ProtocolTransportDriver>,
     connection_state: ProtocolConnectionState,
+    reconnect: ReconnectBackoff,
     disconnected_status_reported: bool,
     refresh_capabilities_on_reconnect: bool,
     queue: VecDeque<ClientEvent>,
@@ -218,6 +220,113 @@ pub struct ProtocolAppUiBackend {
 enum ProtocolConnectionState {
     Disconnected,
     Connected,
+}
+
+/// Delay before the first reconnect retry; doubles per consecutive failure.
+const RECONNECT_BACKOFF_BASE: Duration = Duration::from_millis(500);
+/// Ceiling for the exponential reconnect delay.
+const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(5);
+/// A connection that dies within this window of connecting counts as a
+/// failed attempt even though `connect()` itself succeeded — an instantly
+/// exiting stdio child (typo'd `--stdio-command`, crash-looping server)
+/// "connects" successfully every time, so a reset-on-connect policy would
+/// never let the backoff grow.
+const RECONNECT_SHORT_LIVED_WINDOW: Duration = Duration::from_secs(1);
+/// Wall-clock budget for the WebSocket connect + handshake. Without it, a
+/// blackholed endpoint blocks the UI thread for the OS TCP timeout on every
+/// reconnect attempt.
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Reconnect backoff state machine for the protocol transport.
+///
+/// `ensure_connected` runs on every event-loop tick (~25 ms) *and* on every
+/// send, so without gating, a dead endpoint is re-dialed tens of times per
+/// second forever. This struct schedules attempts at
+/// `RECONNECT_BACKOFF_BASE * 2^(failures-1)` (capped at
+/// `RECONNECT_BACKOFF_CAP`) after each consecutive failure.
+///
+/// Failure-reset choice (documented per review): failures are **not** reset
+/// merely because `connect()` succeeded — a spawn that exits instantly still
+/// "connects". Instead a connection proves itself by either
+///  - delivering a data frame ([`Self::record_frame`]), or
+///  - surviving at least [`RECONNECT_SHORT_LIVED_WINDOW`] before dying
+///    (checked in [`Self::record_disconnect`]).
+///
+/// Until proven, a connection that dies young counts as one more consecutive
+/// failure, so a spawn/exit crash-loop keeps backing off exponentially.
+#[derive(Debug, Default)]
+struct ReconnectBackoff {
+    last_attempt: Option<Instant>,
+    consecutive_failures: u32,
+    connected_at: Option<Instant>,
+}
+
+impl ReconnectBackoff {
+    /// Whether a reconnect may be attempted at `now`. Never blocks the first
+    /// attempt; afterwards gates on the failure-scaled delay since the last
+    /// attempt.
+    fn should_attempt(&self, now: Instant) -> bool {
+        match self.last_attempt {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= self.current_delay(),
+        }
+    }
+
+    /// Delay implied by the current consecutive-failure count.
+    fn current_delay(&self) -> Duration {
+        if self.consecutive_failures == 0 {
+            return Duration::ZERO;
+        }
+        // Exponent is clamped so the shift cannot overflow; the cap keeps
+        // the effective delay at RECONNECT_BACKOFF_CAP anyway.
+        let exponent = self.consecutive_failures.saturating_sub(1).min(8);
+        RECONNECT_BACKOFF_BASE
+            .saturating_mul(1u32 << exponent)
+            .min(RECONNECT_BACKOFF_CAP)
+    }
+
+    /// A connect attempt failed outright (spawn error, TCP/WS failure).
+    fn record_failure(&mut self, now: Instant) {
+        self.last_attempt = Some(now);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.connected_at = None;
+    }
+
+    /// A connect attempt succeeded. Does NOT reset the failure count — see
+    /// the type docs; the connection still has to prove itself.
+    fn record_success(&mut self, now: Instant) {
+        self.last_attempt = Some(now);
+        self.connected_at = Some(now);
+    }
+
+    /// The connection delivered a data frame: it is proven good, so the
+    /// failure streak resets and a later death is treated as fresh.
+    fn record_frame(&mut self) {
+        self.consecutive_failures = 0;
+        self.connected_at = None;
+    }
+
+    /// An established connection dropped. Deaths within
+    /// [`RECONNECT_SHORT_LIVED_WINDOW`] of the connect count as one more
+    /// consecutive failure (crash-loop); longer-lived connections reset the
+    /// streak so a healthy server restart reconnects immediately. Calls
+    /// while already disconnected are no-ops, so the quiet backing-off
+    /// `ensure_connected` error path cannot push the schedule forward.
+    fn record_disconnect(&mut self, now: Instant) {
+        let Some(connected_at) = self.connected_at.take() else {
+            return;
+        };
+        if now.saturating_duration_since(connected_at) < RECONNECT_SHORT_LIVED_WINDOW {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            self.last_attempt = Some(now);
+        } else {
+            self.consecutive_failures = 0;
+        }
+    }
+
+    fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,8 +585,18 @@ impl WebSocketTransportDriver {
             self.auth_token.as_deref(),
             self.profile_id.as_deref(),
         )?;
+        // `connect` runs on the UI thread (block_on), so the TCP connect +
+        // WS handshake must be time-bounded: a blackholed endpoint would
+        // otherwise freeze the interface for the OS TCP timeout.
         let (stream, _) = runtime
-            .block_on(async { connect_async(request).await })
+            .block_on(async {
+                tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(request))
+                    .await
+                    .map_err(|_| {
+                        eyre!("connect timed out after {}s", WS_CONNECT_TIMEOUT.as_secs())
+                    })?
+                    .map_err(eyre::Report::from)
+            })
             .wrap_err_with(|| {
                 format!("failed to connect UI protocol endpoint {}", self.endpoint)
             })?;
@@ -701,9 +820,14 @@ impl StdioTransportDriver {
             .take()
             .ok_or_else(|| eyre!("UI protocol stdio child stderr was not piped"))?;
         let mut stdin = stdin;
-        let mut lines = BufReader::new(stdout).lines();
-        let mut stderr_lines = BufReader::new(stderr).lines();
+        // Capped line readers instead of `lines()`: `next_line()` accumulates
+        // a whole line in memory before any size check can run, so a single
+        // giant (or endless, never-newline) stdout line would balloon the
+        // process before the MAX_TEXT_FRAME_BYTES check ever saw it.
+        let mut stdout_lines = CappedLineReader::new(BufReader::new(stdout), MAX_TEXT_FRAME_BYTES);
+        let mut stderr_lines = CappedLineReader::new(BufReader::new(stderr), STDIO_STDERR_LINE_CAP);
         let mut stderr_open = true;
+        let mut stderr_ring = StderrRing::default();
         let (command_tx, mut command_rx) = mpsc::channel(PROTOCOL_TRANSPORT_QUEUE_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(PROTOCOL_TRANSPORT_QUEUE_CAPACITY);
 
@@ -736,17 +860,59 @@ impl StdioTransportDriver {
                             break;
                         }
                     }
-                    line = lines.next_line() => {
+                    line = stdout_lines.next_line() => {
                         match line {
-                            Ok(Some(text)) => {
+                            Ok(CappedLine::Line(text)) => {
                                 if event_tx.send(stdio_text_frame_event(text)).await.is_err() {
                                     break;
                                 }
                             }
-                            Ok(None) => {
-                                let _ = event_tx.send(TransportEvent::Disconnected(
-                                    "UI protocol stdio stdout closed; reconnect will relaunch on next send/read.".into(),
-                                )).await;
+                            Ok(CappedLine::TooLong { discarded }) => {
+                                // One oversized frame is dropped, not fatal: a
+                                // stdio disconnect respawns a FRESH server and
+                                // loses all session state, which is strictly
+                                // worse than skipping a single frame.
+                                if event_tx
+                                    .send(stdio_frame_too_large_skipped_event(discarded))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(CappedLine::NotUtf8 { lossy }) => {
+                                // A mangled frame's request id is unknowable;
+                                // forwarding the lossy text would just decode
+                                // as malformed_json and silently leak its
+                                // pending-request entry. Skip it like TooLong
+                                // (the backend cancels pending requests).
+                                if event_tx
+                                    .send(stdio_frame_not_utf8_skipped_event(lossy.len()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(CappedLine::Eof) => {
+                                // stdout closed: the child is usually exiting.
+                                // Reap it (bounded) so the disconnect message
+                                // carries exit status + stderr tail instead of
+                                // a bare "closed".
+                                let status =
+                                    tokio::time::timeout(STDIO_EXIT_DRAIN_BUDGET, child.wait())
+                                        .await;
+                                if stderr_open {
+                                    drain_stderr_to_eof(&mut stderr_lines, &mut stderr_ring).await;
+                                }
+                                let message = match status {
+                                    Ok(status) => stdio_exit_disconnect_message(
+                                        &status,
+                                        stderr_ring.tail(),
+                                    ),
+                                    Err(_) => "UI protocol stdio stdout closed; reconnect will relaunch on next send/read.".to_string(),
+                                };
+                                let _ = event_tx.send(TransportEvent::Disconnected(message)).await;
                                 break;
                             }
                             Err(err) => {
@@ -761,8 +927,17 @@ impl StdioTransportDriver {
                     }
                     line = stderr_lines.next_line(), if stderr_open => {
                         match line {
-                            Ok(Some(_)) => {}
-                            Ok(None) => {
+                            Ok(CappedLine::Line(text)) => {
+                                stderr_ring.push(text);
+                            }
+                            Ok(CappedLine::TooLong { discarded }) => {
+                                stderr_ring.push(format!("[stderr line dropped: {discarded} bytes]"));
+                            }
+                            Ok(CappedLine::NotUtf8 { lossy }) => {
+                                // Diagnostics keep best-effort text.
+                                stderr_ring.push(lossy);
+                            }
+                            Ok(CappedLine::Eof) => {
                                 stderr_open = false;
                             }
                             Err(err) => {
@@ -776,15 +951,17 @@ impl StdioTransportDriver {
                         }
                     }
                     status = child.wait() => {
-                        let message = match status {
-                            Ok(status) => format!(
-                                "UI protocol stdio child exited with {status}; reconnect will relaunch on next send/read."
-                            ),
-                            Err(err) => format!(
-                                "failed to wait for UI protocol stdio child: {err}; reconnect will relaunch on next send/read."
-                            ),
-                        };
-                        let _ = event_tx.send(TransportEvent::Disconnected(message)).await;
+                        // Pipe contents survive child death: drain buffered
+                        // stdout to EOF first (bounded) so final responses are
+                        // delivered before the disconnect, then collect the
+                        // stderr tail for the exit report.
+                        drain_stdout_to_eof(&mut stdout_lines, &event_tx).await;
+                        if stderr_open {
+                            drain_stderr_to_eof(&mut stderr_lines, &mut stderr_ring).await;
+                        }
+                        let _ = event_tx.send(TransportEvent::Disconnected(
+                            stdio_exit_disconnect_message(&status, stderr_ring.tail()),
+                        )).await;
                         break;
                     }
                 }
@@ -865,6 +1042,297 @@ fn stdio_text_frame_event(text: String) -> TransportEvent {
     TransportEvent::Frame(TransportFrame::Text(text))
 }
 
+/// Per-line cap for child stderr: diagnostics only, so a small bound is fine.
+const STDIO_STDERR_LINE_CAP: usize = 8 * 1024;
+/// Ring bounds for retained child stderr (most recent wins).
+const STDIO_STDERR_RING_MAX_LINES: usize = 20;
+const STDIO_STDERR_RING_MAX_BYTES: usize = 8 * 1024;
+/// Wall-clock budget for post-exit pipe drains and the bounded `child.wait()`
+/// reap. Pipe data survives child death, but a grandchild inheriting the
+/// write end could keep the pipe open forever — the budget guarantees the
+/// Disconnected event is still emitted promptly.
+const STDIO_EXIT_DRAIN_BUDGET: Duration = Duration::from_secs(2);
+
+/// Outcome of reading one line through [`CappedLineReader`].
+#[derive(Debug, PartialEq, Eq)]
+enum CappedLine {
+    /// A complete line (newline / trailing `\r` stripped, strict UTF-8).
+    Line(String),
+    /// The line exceeded the cap and was discarded up to (and including) its
+    /// terminating newline; `discarded` counts the dropped bytes.
+    TooLong { discarded: u64 },
+    /// A complete line whose bytes were not valid UTF-8. Carries the lossy
+    /// decoding for DIAGNOSTIC consumers (the stderr ring); the stdout frame
+    /// path must NOT forward it as a frame — a mangled response's id is
+    /// untrustworthy, so it is skipped with pending requests cancelled
+    /// (same treatment as `TooLong`, codex round-2 P2).
+    NotUtf8 { lossy: String },
+    /// End of stream.
+    Eof,
+}
+
+/// Line reader that never buffers more than `cap` bytes for a single line,
+/// unlike `AsyncBufReadExt::lines()`, which accumulates the entire line in
+/// memory before any size check can run. Once a line crosses the cap the
+/// remainder is discarded (streamed, not buffered) until the next newline
+/// and reported as [`CappedLine::TooLong`], so the reader recovers on the
+/// following line.
+///
+/// Cancel-safe by construction: partial-line state lives in the struct, not
+/// the future, so dropping a `next_line` future at a `select!` never loses
+/// consumed bytes — the same guarantee `tokio::io::Lines` documents.
+///
+/// Non-UTF-8 bytes are decoded lossily (U+FFFD) instead of erroring the
+/// transport down: one bad byte in a frame surfaces as a JSON decode error
+/// for that frame rather than killing the child session.
+struct CappedLineReader<R> {
+    reader: R,
+    cap: usize,
+    buf: Vec<u8>,
+    /// `Some(bytes_discarded_so_far)` while skipping an over-cap line to its
+    /// terminating newline.
+    discarding: Option<u64>,
+}
+
+impl<R: tokio::io::AsyncBufRead + Unpin> CappedLineReader<R> {
+    fn new(reader: R, cap: usize) -> Self {
+        Self {
+            reader,
+            cap,
+            buf: Vec::new(),
+            discarding: None,
+        }
+    }
+
+    async fn next_line(&mut self) -> std::io::Result<CappedLine> {
+        use tokio::io::AsyncBufReadExt;
+
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                // EOF: flush discard state, then any final unterminated line.
+                if let Some(discarded) = self.discarding.take() {
+                    return Ok(CappedLine::TooLong { discarded });
+                }
+                if self.buf.is_empty() {
+                    return Ok(CappedLine::Eof);
+                }
+                return Ok(take_line(&mut self.buf));
+            }
+
+            let newline = available.iter().position(|&byte| byte == b'\n');
+            match (self.discarding.is_some(), newline) {
+                (true, Some(pos)) => {
+                    let discarded = self.discarding.take().unwrap_or(0) + (pos as u64) + 1;
+                    self.reader.consume(pos + 1);
+                    return Ok(CappedLine::TooLong { discarded });
+                }
+                (true, None) => {
+                    let chunk = available.len();
+                    if let Some(discarded) = self.discarding.as_mut() {
+                        *discarded += chunk as u64;
+                    }
+                    self.reader.consume(chunk);
+                }
+                (false, Some(pos)) => {
+                    if self.buf.len() + pos > self.cap {
+                        // Complete line, but over cap: drop it without ever
+                        // materializing the full copy.
+                        let discarded = (self.buf.len() + pos + 1) as u64;
+                        self.buf = Vec::new();
+                        self.reader.consume(pos + 1);
+                        return Ok(CappedLine::TooLong { discarded });
+                    }
+                    self.buf.extend_from_slice(&available[..pos]);
+                    self.reader.consume(pos + 1);
+                    return Ok(take_line(&mut self.buf));
+                }
+                (false, None) => {
+                    let chunk = available.len();
+                    if self.buf.len() + chunk > self.cap {
+                        // Crossed the cap mid-line: release the partial buffer
+                        // and stream-discard until the newline.
+                        self.discarding = Some((self.buf.len() + chunk) as u64);
+                        self.buf = Vec::new();
+                    } else {
+                        self.buf.extend_from_slice(available);
+                    }
+                    self.reader.consume(chunk);
+                }
+            }
+        }
+    }
+}
+
+/// Take the accumulated line bytes: strips one trailing `\r` (CRLF input).
+/// Strict UTF-8 yields [`CappedLine::Line`]; invalid bytes yield
+/// [`CappedLine::NotUtf8`] with a lossy decoding for diagnostic consumers —
+/// forwarding a lossily-mangled frame would decode as `malformed_json` with
+/// an unknowable request id, silently leaking its pending-request entry.
+fn take_line(buf: &mut Vec<u8>) -> CappedLine {
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    let bytes = std::mem::take(buf);
+    match String::from_utf8(bytes) {
+        Ok(line) => CappedLine::Line(line),
+        Err(err) => CappedLine::NotUtf8 {
+            lossy: String::from_utf8_lossy(err.as_bytes()).into_owned(),
+        },
+    }
+}
+
+/// Error event for a skipped over-cap stdio line. `disconnect: false` on
+/// purpose: the child stays alive and the reader has already resynced to the
+/// next line.
+fn stdio_frame_too_large_skipped_event(discarded: u64) -> TransportEvent {
+    TransportEvent::Error {
+        code: "frame_too_large".into(),
+        message: format!(
+            "UI protocol stdio frame exceeded {MAX_TEXT_FRAME_BYTES} bytes ({discarded} bytes discarded); skipped to next line"
+        ),
+        disconnect: false,
+    }
+}
+
+/// Error event for a skipped invalid-UTF-8 stdio line. Same non-fatal
+/// semantics as [`stdio_frame_too_large_skipped_event`], and the same
+/// pending-request cancellation in the backend: the frame may have been a
+/// response whose id is now unknowable.
+fn stdio_frame_not_utf8_skipped_event(lossy_len: usize) -> TransportEvent {
+    TransportEvent::Error {
+        code: "frame_not_utf8".into(),
+        message: format!(
+            "UI protocol stdio frame was not valid UTF-8 (~{lossy_len} bytes); skipped to next line"
+        ),
+        disconnect: false,
+    }
+}
+
+/// Bounded ring of the most recent child stderr lines, kept so a nonzero
+/// exit can report *why* the child died (previously stderr was read and
+/// dropped).
+#[derive(Debug, Default)]
+struct StderrRing {
+    lines: VecDeque<String>,
+    bytes: usize,
+}
+
+impl StderrRing {
+    fn push(&mut self, line: String) {
+        self.bytes += line.len();
+        self.lines.push_back(line);
+        // Always keep at least the newest line, even if it alone exceeds the
+        // byte budget.
+        while self.lines.len() > 1
+            && (self.lines.len() > STDIO_STDERR_RING_MAX_LINES
+                || self.bytes > STDIO_STDERR_RING_MAX_BYTES)
+        {
+            if let Some(evicted) = self.lines.pop_front() {
+                self.bytes -= evicted.len();
+            }
+        }
+    }
+
+    fn tail(&self) -> Option<String> {
+        (!self.lines.is_empty()).then(|| {
+            self.lines
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    }
+}
+
+/// Disconnect message for a reaped stdio child: exit status plus, on failure,
+/// the retained stderr tail (the actionable part of "my server won't start").
+fn stdio_exit_disconnect_message(
+    status: &std::io::Result<std::process::ExitStatus>,
+    stderr_tail: Option<String>,
+) -> String {
+    let (base, failed) = match status {
+        Ok(status) => (
+            format!(
+                "UI protocol stdio child exited with {status}; reconnect will relaunch on next send/read."
+            ),
+            !status.success(),
+        ),
+        Err(err) => (
+            format!(
+                "failed to wait for UI protocol stdio child: {err}; reconnect will relaunch on next send/read."
+            ),
+            true,
+        ),
+    };
+    match stderr_tail {
+        Some(tail) if failed => format!("{base}\nstderr tail:\n{tail}"),
+        _ => base,
+    }
+}
+
+/// Drain remaining stdout lines to EOF after child exit, forwarding them as
+/// frames so responses already written to the pipe are not dropped. Bounded
+/// by [`STDIO_EXIT_DRAIN_BUDGET`].
+async fn drain_stdout_to_eof<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut CappedLineReader<R>,
+    event_tx: &mpsc::Sender<TransportEvent>,
+) {
+    let _ = tokio::time::timeout(STDIO_EXIT_DRAIN_BUDGET, async {
+        loop {
+            match reader.next_line().await {
+                Ok(CappedLine::Line(text)) => {
+                    if event_tx.send(stdio_text_frame_event(text)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(CappedLine::TooLong { discarded }) => {
+                    if event_tx
+                        .send(stdio_frame_too_large_skipped_event(discarded))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(CappedLine::NotUtf8 { lossy }) => {
+                    if event_tx
+                        .send(stdio_frame_not_utf8_skipped_event(lossy.len()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(CappedLine::Eof) | Err(_) => break,
+            }
+        }
+    })
+    .await;
+}
+
+/// Drain remaining stderr lines to EOF into the ring after child exit so the
+/// final error output (written just before death) reaches the disconnect
+/// message. Bounded by [`STDIO_EXIT_DRAIN_BUDGET`].
+async fn drain_stderr_to_eof<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut CappedLineReader<R>,
+    ring: &mut StderrRing,
+) {
+    let _ = tokio::time::timeout(STDIO_EXIT_DRAIN_BUDGET, async {
+        loop {
+            match reader.next_line().await {
+                Ok(CappedLine::Line(text)) => ring.push(text),
+                Ok(CappedLine::TooLong { discarded }) => {
+                    ring.push(format!("[stderr line dropped: {discarded} bytes]"));
+                }
+                Ok(CappedLine::NotUtf8 { lossy }) => ring.push(lossy),
+                Ok(CappedLine::Eof) | Err(_) => break,
+            }
+        }
+    })
+    .await;
+}
+
 fn bounded_send_error(
     label: &str,
     err: mpsc::error::TrySendError<TransportCommand>,
@@ -908,6 +1376,7 @@ impl ProtocolAppUiBackend {
             runtime_error,
             driver: None,
             connection_state: ProtocolConnectionState::Disconnected,
+            reconnect: ReconnectBackoff::default(),
             disconnected_status_reported: false,
             refresh_capabilities_on_reconnect: false,
             queue: VecDeque::new(),
@@ -985,6 +1454,17 @@ impl ProtocolAppUiBackend {
             return Ok(());
         }
 
+        // Backoff gate: `ensure_connected` runs on every event-loop tick and
+        // every send, so a dead endpoint must not be re-dialed each time —
+        // return a quiet error without attempting until the schedule allows.
+        let now = Instant::now();
+        if !self.reconnect.should_attempt(now) {
+            return Err(eyre!(
+                "reconnect is backing off after {} consecutive failure(s)",
+                self.reconnect.consecutive_failures()
+            ));
+        }
+
         self.ensure_driver()?;
         let runtime = self
             .runtime
@@ -997,7 +1477,11 @@ impl ProtocolAppUiBackend {
 
         let should_reopen_session =
             self.disconnected_status_reported && self.launch.session_id.is_some();
-        driver.connect(runtime)?;
+        if let Err(err) = driver.connect(runtime) {
+            self.reconnect.record_failure(now);
+            return Err(err);
+        }
+        self.reconnect.record_success(now);
         let endpoint = driver.label().to_string();
         self.mark_connected(&endpoint);
         self.refresh_capabilities_after_reconnect()?;
@@ -1034,6 +1518,10 @@ impl ProtocolAppUiBackend {
         if let Some(driver) = self.driver.as_mut() {
             driver.disconnect();
         }
+        // No-op when there was no live connection, so the repeated
+        // mark_disconnected calls made while backing off cannot push the
+        // reconnect schedule forward.
+        self.reconnect.record_disconnect(Instant::now());
         self.refresh_capabilities_on_reconnect = true;
         let cancelled_requests = self.protocol.cancel_pending_requests(&message);
 
@@ -1119,6 +1607,7 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ReadTaskArtifact(_)
                 | AppUiCommand::HydrateSession(_)
                 | AppUiCommand::ListSessions(_)
+                | AppUiCommand::ListTasks(_)
                 | AppUiCommand::GetThreadGraph(_)
                 | AppUiCommand::GetTurnState(_)
                 | AppUiCommand::AuthStatus(_)
@@ -1175,7 +1664,21 @@ impl ProtocolAppUiBackend {
             .poll_event();
 
         match read_result {
-            Ok(event) => Ok(event),
+            Ok(event) => {
+                // A delivered data frame proves the connection is real, so
+                // the reconnect failure streak resets (control frames such as
+                // WS Close don't count — a connect/close loop must still back
+                // off).
+                if matches!(
+                    event,
+                    Some(TransportEvent::Frame(
+                        TransportFrame::Text(_) | TransportFrame::Binary(_)
+                    ))
+                ) {
+                    self.reconnect.record_frame();
+                }
+                Ok(event)
+            }
             Err(err) => {
                 self.mark_disconnected(
                     "UI protocol disconnected while reading; reconnect will retry on next send/read.",
@@ -1208,6 +1711,25 @@ impl ProtocolAppUiBackend {
                     self.mark_disconnected(
                         "UI protocol disconnected; reconnect will retry on next send/read.",
                     );
+                } else if code == "frame_too_large" || code == "frame_not_utf8" {
+                    // A skipped stdio line (over-cap, or invalid UTF-8) may
+                    // have BEEN the response to an in-flight request — its id
+                    // is unknowable (the frame was discarded before decode),
+                    // so the matching `pending_requests` entry would otherwise
+                    // leak forever and repeated bad responses would wedge
+                    // sends at MAX_PENDING_REQUESTS. Cancel pending requests
+                    // like the disconnect path does, but keep the connection
+                    // up.
+                    let reason = if code == "frame_not_utf8" {
+                        "response may have been discarded (frame was not valid UTF-8)"
+                    } else {
+                        "response may have been discarded (frame too large)"
+                    };
+                    let cancelled = self.protocol.cancel_pending_requests(reason);
+                    self.queue
+                        .extend(cancelled.into_iter().filter_map(|cancelled| {
+                            (!cancelled.is_capabilities_probe()).then_some(cancelled.event.into())
+                        }));
                 }
                 self.queue
                     .push_back(AppUiEvent::Error(AppUiError { code, message }).into());
@@ -1304,7 +1826,25 @@ impl ProtocolAppUiBackend {
             | AppUiCommand::SetToolConfigEnabled(_)
             | AppUiCommand::UpsertToolConfig(_)
             | AppUiCommand::DeleteToolConfig(_)
-            | AppUiCommand::TestToolConfig(_) => {
+            | AppUiCommand::TestToolConfig(_)
+            // M15-era + session/review/model mutations: expected readonly
+            // blocks, labeled like the set above. Without these arms they
+            // fell into the `_` fallback, which mislabels the block as an
+            // "unexpectedly blocked read-style" readonly_policy bug.
+            | AppUiCommand::SessionRollback(_)
+            | AppUiCommand::StartReview(_)
+            | AppUiCommand::SelectModel(_)
+            | AppUiCommand::CancelTask(_)
+            | AppUiCommand::RestartTaskFromNode(_)
+            | AppUiCommand::InterruptAgent(_)
+            | AppUiCommand::CloseAgent(_)
+            | AppUiCommand::SetSessionGoal(_)
+            | AppUiCommand::ClearSessionGoal(_)
+            | AppUiCommand::CreateLoop(_)
+            | AppUiCommand::DeleteLoop(_)
+            | AppUiCommand::PauseLoop(_)
+            | AppUiCommand::ResumeLoop(_)
+            | AppUiCommand::FireLoopNow(_) => {
                 self.queue.push_back(
                     AppUiEvent::Error(AppUiError {
                         code: "readonly".into(),
@@ -2711,8 +3251,33 @@ fn success_response_to_app_event(
                 ))),
             }
         }
+        crate::model::APPUI_METHOD_PROFILE_LLM_FETCH_MODELS => {
+            Ok(Some(profile_llm_fetch_models_event(&result)))
+        }
         _ => Ok(None),
     }
+}
+
+/// `profile/llm/fetch_models` result → status event.
+///
+/// The server result (`{profile_id, family_id, models: [String], reason?}` —
+/// see `raw_profile_llm_fetch_models` in octos-cli's `ui_protocol.rs`)
+/// carries a plain model-id list, not the provider configuration
+/// `ProfileLlmListResult` describes, and this client cannot add new
+/// `ClientEvent` variants, so the outcome surfaces as a status line the way
+/// `approval/respond` acks do. Without this arm the response was silently
+/// dropped and onboarding's "Fetch models" button looked dead on a real
+/// backend.
+fn profile_llm_fetch_models_event(result: &Value) -> ClientEvent {
+    let count = result
+        .get("models")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let message = match result.get("reason").and_then(Value::as_str) {
+        Some(reason) => format!("Fetched {count} models ({reason})"),
+        None => format!("Fetched {count} models"),
+    };
+    AppUiEvent::Status(AppUiStatus { message }).into()
 }
 
 fn autonomy_event(result: AutonomyResult) -> ClientEvent {
@@ -3706,12 +4271,14 @@ impl AppUiBackend for MockAppUiBackend {
                 Ok(())
             }
             AppUiCommand::ProfileLlmFetchModels(_) => {
-                self.queue.push_back(
-                    AppUiEvent::Status(AppUiStatus {
-                        message: "Mock fetch_models returned no additional models".into(),
-                    })
-                    .into(),
-                );
+                // Same event shape as the real decode arm
+                // (profile_llm_fetch_models_event) so the mock cannot mask a
+                // missing real-backend mapping.
+                self.queue
+                    .push_back(profile_llm_fetch_models_event(&serde_json::json!({
+                        "models": [],
+                        "reason": "mock backend",
+                    })));
                 Ok(())
             }
             AppUiCommand::ProfileSkillsList(_) => {
@@ -5936,6 +6503,142 @@ mod tests {
         }
     }
 
+    /// `task/list` is a pure read (M15-E inspection); `--readonly` viewers
+    /// must keep it, like the other task/agent/goal/loop reads.
+    #[test]
+    fn readonly_allows_task_list() {
+        assert!(ProtocolAppUiBackend::readonly_allows_command(
+            &AppUiCommand::ListTasks(TaskListParams {
+                session_id: SessionKey("local:test".into()),
+                topic: None,
+            })
+        ));
+    }
+
+    /// M15-era mutating commands blocked in readonly mode must be labeled as
+    /// ordinary readonly blocks (code "readonly"), not fall into the
+    /// "unexpectedly blocked read-style" readonly_policy arm that claims a
+    /// policy bug.
+    #[test]
+    fn readonly_blocks_m15_mutations_with_proper_label() {
+        let session_id = SessionKey("local:test".into());
+        let mutations = [
+            AppUiCommand::SessionRollback(octos_core::ui_protocol::SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            }),
+            AppUiCommand::StartReview(ReviewStartParams {
+                session_id: session_id.clone(),
+                profile_id: None,
+                turn_id: None,
+                target: None,
+                prompt: None,
+                instructions: None,
+                delivery: None,
+            }),
+            AppUiCommand::SelectModel(ModelSelectParams {
+                session_id: session_id.clone(),
+                model: "deepseek-v4-pro".into(),
+                provider: None,
+                route: None,
+            }),
+            AppUiCommand::CancelTask(TaskCancelParams {
+                task_id: TaskId::new(),
+                session_id: Some(session_id.clone()),
+                profile_id: None,
+            }),
+            AppUiCommand::RestartTaskFromNode(TaskRestartFromNodeParams {
+                session_id: Some(session_id.clone()),
+                task_id: TaskId::new(),
+                node_id: Some("node-1".into()),
+                profile_id: None,
+            }),
+            AppUiCommand::InterruptAgent(crate::model::AgentInterruptParams {
+                session_id: session_id.clone(),
+                agent_id: "ag-1".into(),
+            }),
+            AppUiCommand::CloseAgent(crate::model::AgentCloseParams {
+                session_id: session_id.clone(),
+                agent_id: "ag-1".into(),
+            }),
+            AppUiCommand::SetSessionGoal(crate::model::SessionGoalSetParams {
+                session_id: session_id.clone(),
+                profile_id: None,
+                objective: "goal".into(),
+                status: None,
+                token_budget: None,
+                transition_actor: None,
+                action: Default::default(),
+            }),
+            AppUiCommand::ClearSessionGoal(crate::model::SessionGoalClearParams {
+                session_id: session_id.clone(),
+                profile_id: None,
+            }),
+            AppUiCommand::CreateLoop(crate::model::LoopCreateParams {
+                session_id: session_id.clone(),
+                profile_id: None,
+                prompt: "poll".into(),
+                mode: crate::model::LoopMode::FixedInterval,
+                interval_seconds: Some(60),
+            }),
+            AppUiCommand::DeleteLoop(crate::model::LoopIdParams {
+                session_id: session_id.clone(),
+                loop_id: "loop-1".into(),
+            }),
+            AppUiCommand::PauseLoop(crate::model::LoopIdParams {
+                session_id: session_id.clone(),
+                loop_id: "loop-1".into(),
+            }),
+            AppUiCommand::ResumeLoop(crate::model::LoopIdParams {
+                session_id: session_id.clone(),
+                loop_id: "loop-1".into(),
+            }),
+            AppUiCommand::FireLoopNow(crate::model::LoopIdParams {
+                session_id: session_id.clone(),
+                loop_id: "loop-1".into(),
+            }),
+        ];
+
+        for command in mutations {
+            let method = command.method().to_string();
+            assert!(
+                !ProtocolAppUiBackend::readonly_allows_command(&command),
+                "{method} must be blocked in read-only mode"
+            );
+
+            let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+                endpoint: Some(AppUiEndpoint::websocket(
+                    "wss://example.test/ui-protocol",
+                    None,
+                )),
+                readonly: true,
+                ..AppUiLaunch::default()
+            });
+            backend
+                .send(command)
+                .expect("readonly block is reported as an app event");
+            let event = backend.next_event().expect("poll").expect("queued event");
+            let AppUiEvent::Error(error) = unwrap_app_event(event) else {
+                panic!("expected readonly error event for {method}");
+            };
+            assert_eq!(
+                error.code, "readonly",
+                "{method} must use the ordinary readonly label, got {}: {}",
+                error.code, error.message
+            );
+            assert!(
+                error.message.contains(&method),
+                "message names the blocked method: {}",
+                error.message
+            );
+            assert!(
+                !error.message.contains("unexpectedly"),
+                "{method} is an expected block, not a policy bug: {}",
+                error.message
+            );
+        }
+    }
+
     #[test]
     fn protocol_notification_maps_to_app_event() {
         let turn_id = TurnId::new();
@@ -6044,6 +6747,211 @@ mod tests {
         );
     }
 
+    // --- ReconnectBackoff state machine (no networks involved) ---
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn reconnect_backoff_allows_first_attempt_immediately() {
+        let backoff = ReconnectBackoff::default();
+        assert!(backoff.should_attempt(Instant::now()));
+    }
+
+    #[test]
+    fn reconnect_backoff_schedule_doubles_and_caps_at_five_seconds() {
+        let t0 = Instant::now();
+        let mut backoff = ReconnectBackoff::default();
+
+        // Failure 1 → wait 500ms.
+        backoff.record_failure(t0);
+        assert!(!backoff.should_attempt(t0 + ms(499)));
+        assert!(backoff.should_attempt(t0 + ms(500)));
+
+        // Failure 2 → wait 1s.
+        let t1 = t0 + ms(500);
+        backoff.record_failure(t1);
+        assert!(!backoff.should_attempt(t1 + ms(999)));
+        assert!(backoff.should_attempt(t1 + ms(1000)));
+
+        // Failures 3/4 → 2s/4s.
+        let t2 = t1 + ms(1000);
+        backoff.record_failure(t2);
+        assert!(!backoff.should_attempt(t2 + ms(1999)));
+        assert!(backoff.should_attempt(t2 + ms(2000)));
+        let t3 = t2 + ms(2000);
+        backoff.record_failure(t3);
+        assert!(!backoff.should_attempt(t3 + ms(3999)));
+        assert!(backoff.should_attempt(t3 + ms(4000)));
+
+        // Failure 5+ → capped at 5s (8s uncapped).
+        let t4 = t3 + ms(4000);
+        backoff.record_failure(t4);
+        assert!(!backoff.should_attempt(t4 + ms(4999)));
+        assert!(backoff.should_attempt(t4 + ms(5000)));
+        let t5 = t4 + ms(5000);
+        backoff.record_failure(t5);
+        assert!(!backoff.should_attempt(t5 + ms(4999)));
+        assert!(backoff.should_attempt(t5 + ms(5000)));
+    }
+
+    #[test]
+    fn reconnect_backoff_treats_instant_exit_loop_as_failures() {
+        // The storm scenario: spawn always "succeeds", the child dies
+        // instantly. Successful connects must NOT reset the streak; the
+        // short-lived disconnect keeps growing it.
+        let t0 = Instant::now();
+        let mut backoff = ReconnectBackoff::default();
+
+        assert!(backoff.should_attempt(t0));
+        backoff.record_success(t0);
+        backoff.record_disconnect(t0 + ms(10)); // died 10ms after connect
+        assert_eq!(backoff.consecutive_failures(), 1);
+        let t1 = t0 + ms(10);
+        assert!(!backoff.should_attempt(t1 + ms(489)));
+        assert!(backoff.should_attempt(t1 + ms(500)));
+
+        backoff.record_success(t1 + ms(500));
+        backoff.record_disconnect(t1 + ms(510));
+        assert_eq!(backoff.consecutive_failures(), 2);
+        let t2 = t1 + ms(510);
+        assert!(!backoff.should_attempt(t2 + ms(999)));
+        assert!(backoff.should_attempt(t2 + ms(1000)));
+    }
+
+    #[test]
+    fn reconnect_backoff_long_lived_connection_resets_failures() {
+        let t0 = Instant::now();
+        let mut backoff = ReconnectBackoff::default();
+        backoff.record_failure(t0);
+        backoff.record_failure(t0 + ms(500));
+        assert_eq!(backoff.consecutive_failures(), 2);
+
+        // Connection survives past the short-lived window before dying.
+        let connect = t0 + ms(1500);
+        backoff.record_success(connect);
+        backoff.record_disconnect(connect + ms(1500));
+        assert_eq!(backoff.consecutive_failures(), 0);
+        assert!(backoff.should_attempt(connect + ms(1500)));
+    }
+
+    #[test]
+    fn reconnect_backoff_frame_delivery_resets_failures() {
+        let t0 = Instant::now();
+        let mut backoff = ReconnectBackoff::default();
+        backoff.record_failure(t0);
+        backoff.record_failure(t0 + ms(500));
+
+        // Connect, receive a data frame, die 100ms in: the frame proved the
+        // connection, so the quick death does not count as a failure.
+        let connect = t0 + ms(1500);
+        backoff.record_success(connect);
+        backoff.record_frame();
+        backoff.record_disconnect(connect + ms(100));
+        assert_eq!(backoff.consecutive_failures(), 0);
+        assert!(backoff.should_attempt(connect + ms(100)));
+    }
+
+    #[test]
+    fn reconnect_backoff_ignores_disconnects_while_already_disconnected() {
+        // The quiet ensure_connected error path calls mark_disconnected on
+        // every tick; that must not slide the schedule forward.
+        let t0 = Instant::now();
+        let mut backoff = ReconnectBackoff::default();
+        backoff.record_success(t0);
+        backoff.record_disconnect(t0 + ms(10));
+        assert_eq!(backoff.consecutive_failures(), 1);
+
+        for tick in 1..100u64 {
+            backoff.record_disconnect(t0 + ms(10 + tick * 25));
+        }
+        assert_eq!(backoff.consecutive_failures(), 1);
+        assert!(backoff.should_attempt(t0 + ms(10) + ms(500)));
+    }
+
+    /// End-to-end storm guard: an instantly-exiting stdio child must be
+    /// respawned on the backoff schedule, not once per event-loop poll.
+    #[cfg(unix)]
+    #[test]
+    fn stdio_reconnect_backs_off_for_instantly_exiting_child() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is valid")
+            .as_nanos();
+        let marker = std::env::temp_dir().join(format!("octos-tui-backoff-{nonce}.log"));
+        let command = format!("echo spawned >> {}; exit 7", marker.display());
+
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::stdio(command)),
+            ..AppUiLaunch::default()
+        });
+
+        // Bootstrap performs the first connect; then poll aggressively for
+        // ~1.2s the way the event loop would.
+        let _ = backend.bootstrap();
+        let deadline = Instant::now() + Duration::from_millis(1200);
+        while Instant::now() < deadline {
+            let _ = backend.next_event();
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let spawns = std::fs::read_to_string(&marker)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            (1..=4).contains(&spawns),
+            "instantly-exiting stdio child should respawn on the backoff \
+             schedule (expected 1..=4 spawns in 1.2s, got {spawns})"
+        );
+    }
+
+    /// The WS connect path must give up after WS_CONNECT_TIMEOUT instead of
+    /// blocking the UI thread until the OS TCP timeout: a listener that
+    /// accepts but never answers the handshake simulates a blackholed
+    /// endpoint.
+    #[test]
+    fn websocket_connect_times_out_against_unresponsive_endpoint() {
+        let listener = match StdTcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind test listener: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener addr");
+        let hold = thread::spawn(move || {
+            // Accept the TCP connection and then never answer the WS
+            // handshake until the client hangs up.
+            if let Ok((stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut buf = [0u8; 1024];
+                use std::io::Read;
+                let mut stream = stream;
+                while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+            }
+        });
+
+        let runtime = Runtime::new().expect("test runtime");
+        let mut driver = WebSocketTransportDriver::new(format!("ws://{addr}/ui"), None, None);
+        let started = Instant::now();
+        let err = driver
+            .connect(&runtime)
+            .expect_err("handshake-less endpoint must not connect");
+        let elapsed = started.elapsed();
+
+        assert!(
+            format!("{err:#}").contains("timed out"),
+            "expected connect timeout error, got: {err:#}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "connect must be bounded by WS_CONNECT_TIMEOUT, took {elapsed:?}"
+        );
+        drop(driver);
+        hold.join().expect("hold thread exits");
+    }
+
     #[test]
     fn stdio_transport_driver_rejects_empty_command() {
         let err = match StdioTransportDriver::new("   ".into()) {
@@ -6064,6 +6972,303 @@ mod tests {
 
         assert_eq!(driver.label(), "octos serve --stdio");
         assert!(!driver.is_connected());
+    }
+
+    // --- CappedLineReader: bounded stdio line buffering ---
+
+    #[tokio::test]
+    async fn capped_line_reader_discards_giant_line_and_recovers() {
+        // A 3 MB line (newline-terminated) followed by a normal line: the
+        // giant line must be discarded without ever buffering it whole, and
+        // the reader must resync on the next line.
+        let giant = 3 * 1024 * 1024;
+        let mut input = vec![b'a'; giant];
+        input.push(b'\n');
+        input.extend_from_slice(b"next line\n");
+
+        let mut reader = CappedLineReader::new(BufReader::new(&input[..]), 1024);
+        match reader.next_line().await.expect("read giant line") {
+            CappedLine::TooLong { discarded } => {
+                assert_eq!(discarded, (giant + 1) as u64, "content + newline discarded");
+            }
+            other => panic!("expected TooLong for the giant line, got {other:?}"),
+        }
+        assert_eq!(
+            reader.next_line().await.expect("read next line"),
+            CappedLine::Line("next line".into())
+        );
+        assert_eq!(reader.next_line().await.expect("read eof"), CappedLine::Eof);
+    }
+
+    #[tokio::test]
+    async fn capped_line_reader_discards_giant_line_without_trailing_newline() {
+        // Giant input with NO newline at all (the pathological
+        // never-newline stream): must terminate with TooLong at EOF, not
+        // accumulate unboundedly. A small BufReader capacity exercises the
+        // incremental chunked path a real pipe produces.
+        let input = vec![b'b'; 256 * 1024];
+        let mut reader = CappedLineReader::new(BufReader::with_capacity(64, &input[..]), 1024);
+
+        match reader.next_line().await.expect("read") {
+            CappedLine::TooLong { discarded } => {
+                assert_eq!(discarded, input.len() as u64);
+            }
+            other => panic!("expected TooLong, got {other:?}"),
+        }
+        assert_eq!(reader.next_line().await.expect("read eof"), CappedLine::Eof);
+    }
+
+    #[tokio::test]
+    async fn capped_line_reader_keeps_lines_at_the_cap_boundary() {
+        // len == cap passes; len == cap+1 is dropped.
+        let mut input = vec![b'x'; 8];
+        input.push(b'\n');
+        input.extend_from_slice(&[b'y'; 9]);
+        input.push(b'\n');
+        let mut reader = CappedLineReader::new(BufReader::new(&input[..]), 8);
+
+        assert_eq!(
+            reader.next_line().await.expect("read"),
+            CappedLine::Line("xxxxxxxx".into())
+        );
+        assert!(matches!(
+            reader.next_line().await.expect("read"),
+            CappedLine::TooLong { discarded: 10 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn capped_line_reader_handles_crlf_final_partial_and_non_utf8() {
+        let input: &[u8] = b"first\r\ncaf\xE9 latte\nlast-no-newline";
+        let mut reader = CappedLineReader::new(BufReader::new(input), 1024);
+
+        assert_eq!(
+            reader.next_line().await.expect("read"),
+            CappedLine::Line("first".into()),
+            "trailing CR is stripped"
+        );
+        assert_eq!(
+            reader.next_line().await.expect("read"),
+            CappedLine::NotUtf8 {
+                lossy: "caf\u{FFFD} latte".into()
+            },
+            "invalid UTF-8 is surfaced as NotUtf8 (skipped on the frame path, \
+             lossy for stderr diagnostics) — delivering it lossily decoded as \
+             malformed_json and leaked the pending request (codex round-2 P2)"
+        );
+        assert_eq!(
+            reader.next_line().await.expect("read"),
+            CappedLine::Line("last-no-newline".into()),
+            "final unterminated line is still delivered"
+        );
+        assert_eq!(reader.next_line().await.expect("read"), CappedLine::Eof);
+    }
+
+    /// Shell snippet emitting one giant `x…x` line (`over` bytes, newline
+    /// terminated) followed by `after-too-long`. head/tr instead of awk: BSD
+    /// awk's gsub is quadratic on a 1 MB string (~9 s), which starves test
+    /// deadlines.
+    #[cfg(unix)]
+    fn giant_line_script(over: usize) -> String {
+        format!("head -c {over} /dev/zero | tr '\\000' 'x'; echo; echo after-too-long")
+    }
+
+    /// Same discard-and-recover contract, but over a real child pipe (chunked
+    /// delivery + backpressure) rather than an in-memory slice.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capped_line_reader_discards_giant_line_on_a_real_pipe() {
+        let over = MAX_TEXT_FRAME_BYTES + 512;
+        let script = giant_line_script(over);
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn awk child");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let mut reader = CappedLineReader::new(BufReader::new(stdout), MAX_TEXT_FRAME_BYTES);
+
+        match tokio::time::timeout(Duration::from_secs(5), reader.next_line())
+            .await
+            .expect("giant line read within budget")
+            .expect("read")
+        {
+            CappedLine::TooLong { discarded } => assert_eq!(discarded, (over + 1) as u64),
+            other => panic!("expected TooLong, got {other:?}"),
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), reader.next_line())
+                .await
+                .expect("next line within budget")
+                .expect("read"),
+            CappedLine::Line("after-too-long".into())
+        );
+        let _ = child.wait().await;
+    }
+
+    #[test]
+    fn stdio_skipped_frame_error_does_not_disconnect() {
+        let TransportEvent::Error {
+            code,
+            message,
+            disconnect,
+        } = stdio_frame_too_large_skipped_event(2048)
+        else {
+            panic!("expected error event");
+        };
+        assert_eq!(code, "frame_too_large");
+        assert!(message.contains("2048 bytes discarded"));
+        assert!(!disconnect, "a skipped frame must keep the child session");
+    }
+
+    // --- StderrRing + exit disconnect message ---
+
+    #[test]
+    fn stderr_ring_keeps_only_the_most_recent_lines() {
+        let mut ring = StderrRing::default();
+        for index in 0..40 {
+            ring.push(format!("line-{index}"));
+        }
+        let tail = ring.tail().expect("tail present");
+        assert!(!tail.contains("line-19"), "old lines evicted: {tail}");
+        assert!(tail.contains("line-20") && tail.contains("line-39"));
+        assert_eq!(tail.lines().count(), STDIO_STDERR_RING_MAX_LINES);
+    }
+
+    #[test]
+    fn stderr_ring_bounds_bytes_but_keeps_newest_line() {
+        let mut ring = StderrRing::default();
+        ring.push("first".into());
+        ring.push("z".repeat(STDIO_STDERR_RING_MAX_BYTES + 100));
+        let tail = ring.tail().expect("tail present");
+        assert!(!tail.contains("first"), "byte budget evicts older lines");
+        assert!(tail.starts_with("zzz"), "newest line survives even if huge");
+    }
+
+    #[test]
+    fn stdio_exit_message_attaches_stderr_tail_only_on_failure() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            let failing = std::process::ExitStatus::from_raw(3 << 8);
+            let message =
+                stdio_exit_disconnect_message(&Ok(failing), Some("boom: bad config".into()));
+            assert!(message.contains("exited with"));
+            assert!(message.contains("stderr tail:"));
+            assert!(message.contains("boom: bad config"));
+
+            let clean = std::process::ExitStatus::from_raw(0);
+            let message = stdio_exit_disconnect_message(&Ok(clean), Some("noise".into()));
+            assert!(!message.contains("stderr tail:"), "clean exit stays terse");
+            assert!(!message.contains("noise"));
+        }
+
+        let message = stdio_exit_disconnect_message(
+            &Err(std::io::Error::other("wait failed")),
+            Some("diagnostic".into()),
+        );
+        assert!(message.contains("wait failed"));
+        assert!(
+            message.contains("diagnostic"),
+            "wait errors count as failure"
+        );
+    }
+
+    // --- stdio driver end-to-end: exit race + stderr tail + oversized skip ---
+
+    fn drive_stdio_until_disconnect(
+        command: &str,
+    ) -> (Vec<String>, Vec<(String, String, bool)>, String) {
+        let runtime = Runtime::new().expect("test runtime");
+        let mut driver = StdioTransportDriver::new(command.into()).expect("driver builds");
+        driver.connect(&runtime).expect("stdio child spawns");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut frames = Vec::new();
+        let mut errors = Vec::new();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for stdio disconnect; frames={frames:?} errors={errors:?}"
+            );
+            match driver.poll_event().expect("poll stdio driver") {
+                Some(TransportEvent::Frame(TransportFrame::Text(text))) => frames.push(text),
+                Some(TransportEvent::Frame(_)) => {}
+                Some(TransportEvent::Error {
+                    code,
+                    message,
+                    disconnect,
+                }) => errors.push((code, message, disconnect)),
+                Some(TransportEvent::Disconnected(message)) => return (frames, errors, message),
+                None => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
+
+    /// Child-exit race: the final stdout line written right before death must
+    /// be delivered before Disconnected, and a nonzero exit must carry the
+    /// stderr tail instead of discarding it.
+    #[cfg(unix)]
+    #[test]
+    fn stdio_child_exit_delivers_final_stdout_and_stderr_tail() {
+        let (frames, _errors, message) = drive_stdio_until_disconnect(
+            "echo final-response; echo 'boom: config invalid' >&2; exit 3",
+        );
+
+        assert_eq!(
+            frames,
+            vec!["final-response".to_string()],
+            "final stdout line survives the child-exit race"
+        );
+        assert!(
+            message.contains("exited with") && message.contains("3"),
+            "exit status reported: {message}"
+        );
+        assert!(
+            message.contains("boom: config invalid"),
+            "stderr tail attached on nonzero exit: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_clean_exit_reports_no_stderr_tail() {
+        let (frames, _errors, message) =
+            drive_stdio_until_disconnect("echo done; echo routine-noise >&2; exit 0");
+
+        assert_eq!(frames, vec!["done".to_string()]);
+        assert!(
+            message.contains("exited with"),
+            "status reported: {message}"
+        );
+        assert!(
+            !message.contains("routine-noise"),
+            "clean exits stay terse: {message}"
+        );
+    }
+
+    /// An oversized stdout line must surface as a non-fatal frame_too_large
+    /// error and the stream must keep delivering subsequent lines.
+    #[cfg(unix)]
+    #[test]
+    fn stdio_oversized_line_is_skipped_without_killing_the_session() {
+        let over = MAX_TEXT_FRAME_BYTES + 512;
+        let command = giant_line_script(over);
+        let (frames, errors, _message) = drive_stdio_until_disconnect(&command);
+
+        let (code, message, disconnect) = errors
+            .iter()
+            .find(|(code, _, _)| code == "frame_too_large")
+            .expect("oversized line reported");
+        assert_eq!(code, "frame_too_large");
+        assert!(message.contains("discarded"));
+        assert!(!disconnect, "skip must not tear down the session");
+        assert_eq!(
+            frames,
+            vec!["after-too-long".to_string()],
+            "stream recovers on the next line"
+        );
     }
 
     #[test]
@@ -6109,6 +7314,100 @@ mod tests {
                 .as_ref()
                 .map(|endpoint| endpoint.label().to_string()),
             Some("octos serve --stdio".into())
+        );
+    }
+
+    /// `profile/llm/fetch_models` responses must produce an event: this arm
+    /// was missing, so the result was silently dropped and onboarding's
+    /// "Fetch models" button appeared dead against a real backend (the mock
+    /// faked a status, masking it).
+    #[test]
+    fn protocol_decodes_profile_llm_fetch_models_result_as_status() {
+        let mut exchange = ProtocolExchange::default();
+        let request = exchange
+            .build_tracked_request(AppUiCommand::ProfileLlmFetchModels(
+                crate::model::ProfileLlmFetchModelsParams {
+                    profile_id: Some("ada".into()),
+                    selection: Default::default(),
+                    api_key: None,
+                },
+            ))
+            .expect("request builds");
+
+        // Server result shape (see raw_profile_llm_fetch_models in
+        // octos-cli's ui_protocol.rs): profile_id/family_id/models[String]
+        // plus an optional reason. It does NOT carry provider config, so it
+        // must not be decoded as ProfileLlmListResult.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": {
+                "profile_id": "ada",
+                "family_id": "openai",
+                "models": ["gpt-a", "gpt-b", "gpt-c"],
+            }
+        })
+        .to_string();
+
+        let event = exchange
+            .decode_rpc_text(&response)
+            .expect("response decodes")
+            .expect("fetch_models result must yield an event, not be dropped");
+        let AppUiEvent::Status(status) = unwrap_app_event(event) else {
+            panic!("expected a status event for fetch_models");
+        };
+        assert!(
+            status.message.contains("Fetched 3 models"),
+            "count surfaces: {}",
+            status.message
+        );
+        assert!(exchange.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn protocol_fetch_models_status_reports_server_reason() {
+        let event = profile_llm_fetch_models_event(&json!({
+            "profile_id": "ada",
+            "family_id": "openai",
+            "models": [],
+            "reason": "no_api_key",
+        }));
+        let AppUiEvent::Status(status) = unwrap_app_event(event) else {
+            panic!("expected a status event");
+        };
+        assert!(
+            status.message.contains("Fetched 0 models") && status.message.contains("no_api_key"),
+            "reason surfaces: {}",
+            status.message
+        );
+    }
+
+    /// The mock backend must produce the same event shape as the real decode
+    /// arm so it cannot mask a missing real-backend mapping again.
+    #[test]
+    fn mock_fetch_models_matches_real_decode_arm_shape() {
+        let mut backend = MockAppUiBackend::new(AppUiLaunch::default());
+        backend
+            .send(AppUiCommand::ProfileLlmFetchModels(
+                crate::model::ProfileLlmFetchModelsParams {
+                    profile_id: Some("ada".into()),
+                    selection: Default::default(),
+                    api_key: None,
+                },
+            ))
+            .expect("mock accepts fetch_models");
+
+        let event = backend
+            .next_event()
+            .expect("poll mock")
+            .expect("mock emits an event");
+        let AppUiEvent::Status(status) = unwrap_app_event(event) else {
+            panic!("expected a status event from the mock");
+        };
+        assert!(
+            status.message.starts_with("Fetched 0 models"),
+            "mock aligns with the real arm: {}",
+            status.message
         );
     }
 
@@ -6362,6 +7661,110 @@ mod tests {
         assert!(error.message.contains(methods::DIFF_PREVIEW_GET));
         assert!(error.message.contains(&request.id));
         assert!(error.message.contains("transport closed for test"));
+    }
+
+    #[test]
+    fn skipped_oversized_frame_cancels_pending_requests_without_disconnect() {
+        // codex P2 (deep-review wave): a skipped over-cap stdio line may have
+        // BEEN the response to an in-flight request — its id is unknowable, so
+        // the pending entry leaked forever and repeated large responses wedged
+        // sends at MAX_PENDING_REQUESTS. The skip now cancels pending requests
+        // like the disconnect path does, while keeping the connection up.
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        let request = backend
+            .build_tracked_request(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+            }))
+            .expect("request builds");
+        backend.mark_connected("wss://example.test/ui-protocol");
+
+        let first = backend
+            .handle_transport_event(stdio_frame_too_large_skipped_event(2_000_000))
+            .expect("event handled")
+            .expect("event surfaced");
+
+        assert!(backend.protocol.pending_requests.is_empty());
+        let AppUiEvent::Error(error) = unwrap_app_event(first) else {
+            panic!("expected cancellation error first");
+        };
+        assert_eq!(error.code, "request_cancelled");
+        assert!(error.message.contains(&request.id));
+
+        let next = backend.queue.pop_front().expect("frame_too_large error");
+        let AppUiEvent::Error(error) = unwrap_app_event(next) else {
+            panic!("expected frame_too_large error");
+        };
+        assert_eq!(error.code, "frame_too_large");
+        assert!(
+            matches!(backend.connection_state, ProtocolConnectionState::Connected),
+            "the child stays alive; a skipped frame must not disconnect"
+        );
+        assert!(
+            backend.queue.is_empty(),
+            "no disconnect status may be queued"
+        );
+    }
+
+    #[test]
+    fn skipped_not_utf8_frame_cancels_pending_requests_without_disconnect() {
+        // codex round-2 P2: an invalid-UTF-8 stdio line used to be delivered
+        // LOSSILY — decoding as malformed_json with an unknowable id and
+        // silently leaking its pending-request entry. It is now skipped like
+        // an over-cap frame, with pending requests cancelled.
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        let request = backend
+            .build_tracked_request(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+            }))
+            .expect("request builds");
+        backend.mark_connected("wss://example.test/ui-protocol");
+
+        let first = backend
+            .handle_transport_event(stdio_frame_not_utf8_skipped_event(42))
+            .expect("event handled")
+            .expect("event surfaced");
+
+        assert!(backend.protocol.pending_requests.is_empty());
+        let AppUiEvent::Error(error) = unwrap_app_event(first) else {
+            panic!("expected cancellation error first");
+        };
+        assert_eq!(error.code, "request_cancelled");
+        assert!(error.message.contains(&request.id));
+        let next = backend.queue.pop_front().expect("frame_not_utf8 error");
+        let AppUiEvent::Error(error) = unwrap_app_event(next) else {
+            panic!("expected frame_not_utf8 error");
+        };
+        assert_eq!(error.code, "frame_not_utf8");
+        assert!(matches!(
+            backend.connection_state,
+            ProtocolConnectionState::Connected
+        ));
+    }
+
+    #[test]
+    fn take_line_yields_not_utf8_for_invalid_bytes() {
+        let mut buf = vec![0xf0, 0x9f, b'x', 0xff, b'\r'];
+        let CappedLine::NotUtf8 { lossy } = take_line(&mut buf) else {
+            panic!("expected NotUtf8 for invalid bytes");
+        };
+        assert!(lossy.contains('x'), "lossy text keeps readable bytes");
+        // Strict UTF-8 still yields Line.
+        let mut ok = b"hello\r".to_vec();
+        assert_eq!(take_line(&mut ok), CappedLine::Line("hello".into()));
     }
 
     #[test]

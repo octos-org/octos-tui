@@ -1109,20 +1109,16 @@ impl Store {
                 }
                 None
             }
-            LocalAction::SaveStatusLine(items) => {
-                self.state.status = t!(
-                    "status.statusline_layout_selected",
-                    items = items.join(", ")
-                )
-                .into_owned();
+            // Honesty over a false success: nothing applies these layouts —
+            // the menu checkboxes are build-time constants and no Space/
+            // reorder handling exists — so mirror SaveKeymap's explicit
+            // not-wired wording instead of claiming "layout selected".
+            LocalAction::SaveStatusLine(_) => {
+                self.state.status = "Status line layout save is not wired yet".into();
                 None
             }
-            LocalAction::SaveTerminalTitle(items) => {
-                self.state.status = t!(
-                    "status.terminal_title_layout_selected",
-                    items = items.join(", ")
-                )
-                .into_owned();
+            LocalAction::SaveTerminalTitle(_) => {
+                self.state.status = "Terminal title layout save is not wired yet".into();
                 None
             }
             LocalAction::SaveKeymap => {
@@ -1177,6 +1173,19 @@ impl Store {
                     // refreshes the open menu into `Ready` rows.
                     self.open_menu(MenuId::from(crate::menu::registry::MENU_RESUME));
                     Some(AppUiCommand::ListSessions(SessionListParams {}))
+                } else if !self.state.resume_list_loaded {
+                    // `/resume <query>` before the list ever loaded: the local
+                    // resolve below would ALWAYS fail (`resume_sessions` is only
+                    // populated by a fetch). Fetch-then-filter instead: open the
+                    // picker with the query pre-seeded as its search filter and
+                    // request the list — when the `SessionList` result lands it
+                    // refreshes the open menu already narrowed to the query.
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_RESUME));
+                    if let Some(frame) = self.state.menu_stack.active_mut() {
+                        frame.search_query = arg.to_owned();
+                    }
+                    self.refresh_active_menu();
+                    Some(AppUiCommand::ListSessions(SessionListParams {}))
                 } else {
                     // `/resume <query>` shortcut: resolve to a session id by
                     // case-insensitive substring match and switch directly,
@@ -1211,9 +1220,11 @@ impl Store {
                     None
                 }
             }
-            LocalAction::RewindToTurn { num_turns, prefill } => {
-                self.rewind_to_turn_command(num_turns, prefill)
-            }
+            LocalAction::RewindToTurn {
+                session_id,
+                num_turns,
+                prefill,
+            } => self.rewind_to_turn_command(session_id, num_turns, prefill),
             LocalAction::Custom(name) => {
                 self.state.status = t!("status.local_action_not_wired", name = name).into_owned();
                 None
@@ -1259,14 +1270,17 @@ impl Store {
         // Select the existing SessionView, or create a placeholder so the
         // switch is immediate; `apply_session_hydrate_result` also
         // find-or-creates when the hydrate result lands and fills in the real
-        // transcript.
+        // transcript. Both branches run the full switch bundle
+        // (`switch_selected_session`) — assigning `selected_session` directly
+        // would silently delete the outgoing session's composer draft and
+        // strand/misdeliver its staged messages.
         if let Some(index) = self
             .state
             .sessions
             .iter()
             .position(|session| session.id == session_id)
         {
-            self.state.selected_session = index;
+            self.state.switch_selected_session(index);
         } else {
             let profile_id = self.active_session_profile_id();
             self.state.sessions.push(SessionView {
@@ -1277,8 +1291,13 @@ impl Store {
                 tasks: Vec::new(),
                 live_reply: None,
             });
-            self.state.selected_session = self.state.sessions.len().saturating_sub(1);
+            self.state
+                .switch_selected_session(self.state.sessions.len().saturating_sub(1));
         }
+        // The incoming session may be idle with staged messages waiting (they
+        // were left queued when a terminal fired while another session was
+        // active) — drain them now that it is active again.
+        self.enqueue_staged_drain_after_switch();
         self.state.status = format!("Resuming {}…", session_id.0);
         Some(AppUiCommand::HydrateSession(SessionHydrateParams {
             session_id,
@@ -1321,11 +1340,25 @@ impl Store {
     }
 
     /// Handle a `/rewind` pick: drop the last `num_turns` user turns from the
-    /// active session via `session/rollback`, stashing `prefill` so the chosen
-    /// message can be restored to the composer once the rollback result lands
-    /// (rewind-and-edit). Guards against rewinding mid-turn (same guard as
-    /// `/resume`): a live turn means refuse with a status line and no command.
-    fn rewind_to_turn_command(&mut self, num_turns: u32, prefill: String) -> Option<AppUiCommand> {
+    /// active session via `session/rollback`, stashing `prefill` (keyed by the
+    /// session) so the chosen message can be restored to the composer once the
+    /// rollback result lands (rewind-and-edit). Guards, in order:
+    /// - a live turn means refuse with a status line and no command (same
+    ///   guard as `/resume`);
+    /// - `picked_session_id` (the session the picker rows were built from)
+    ///   must still be the active session — the user may have switched
+    ///   sessions while the picker was open, and a stale pick must never roll
+    ///   back the wrong session;
+    /// - the pick must still match the CURRENT transcript: the picker rows are
+    ///   a snapshot, so if the transcript changed underneath (hydrate, another
+    ///   rollback, new turns) the carried `num_turns`/`prefill` pair may now
+    ///   point at a different turn. Recompute and require an exact match.
+    fn rewind_to_turn_command(
+        &mut self,
+        picked_session_id: String,
+        num_turns: u32,
+        prefill: String,
+    ) -> Option<AppUiCommand> {
         if self.state.active_turn().is_some() {
             self.state.status =
                 "Finish or stop the active turn before rewinding the conversation.".into();
@@ -1339,7 +1372,19 @@ impl Store {
             self.state.status = "No active session to rewind.".into();
             return None;
         };
-        self.state.pending_rewind_prefill = Some(prefill);
+        if session_id.0 != picked_session_id {
+            self.state.status = "Rewind pick belongs to another session — reopen /rewind.".into();
+            return None;
+        }
+        let fresh_rows = self.collect_rewind_turns();
+        let pick_is_current = fresh_rows
+            .get((num_turns as usize).saturating_sub(1))
+            .is_some_and(|row| row.prefill == prefill);
+        if !pick_is_current {
+            self.state.status = "Transcript changed — reopen /rewind.".into();
+            return None;
+        }
+        self.state.pending_rewind_prefill = Some((session_id.clone(), prefill));
         self.state.status = format!("Rewinding {num_turns} turn(s)…");
         Some(AppUiCommand::SessionRollback(SessionRollbackParams {
             session_id,
@@ -1976,7 +2021,21 @@ impl Store {
                 self.state.onboarding.last_message =
                     Some(t!("status.profile_updated").into_owned());
                 self.state.status = t!("status.onboarding_profile_updated").into_owned();
-                self.refresh_active_menu_and_advance();
+                // Setting the profile id can swap the wizard from the
+                // local-profile step to the provider (LLM config) step IN
+                // PLACE on the same menu frame — the same transition the
+                // ProfileLocalCreate result path handles. A blind advance
+                // would leave the stale row index pointing at an arbitrary
+                // provider row (e.g. API key), so anchor the cursor on the
+                // provider start row like that path does; when the rebuilt
+                // menu has no provider rows (no step swap happened), keep the
+                // wizard's usual advance-to-next-row behavior.
+                if self.state.menu_stack.is_active() {
+                    self.refresh_active_menu();
+                    if !self.focus_provider_start_row() {
+                        self.advance_active_menu_selection();
+                    }
+                }
                 // The wizard just advanced to provider setup for this profile;
                 // hydrate its saved provider so the rows reflect server truth.
                 self.onboarding_hydrate_saved_provider_command()
@@ -3462,6 +3521,29 @@ impl Store {
             self.state.active_menu = None;
             return;
         };
+        // The `/rewind` rows are a transcript snapshot taken at picker open;
+        // any refresh while the picker is up (session switch, hydrate landing,
+        // rollback result) must recompute them from the CURRENT active
+        // transcript so the menu never offers rows for turns that no longer
+        // exist (dispatch re-validates too, but stale rows should not render).
+        if frame.id.as_str() == crate::menu::registry::MENU_REWIND {
+            self.state.rewind_turns = self.collect_rewind_turns();
+        }
+        // The cursor is positional, but an async refresh (a list reload chasing
+        // an mcp/tools/skills mutation) can shift rows underneath it — landing
+        // it on a DIFFERENT row, worst case an unconfirmed destructive one.
+        // Capture the selected item's ID from the outgoing build (only when it
+        // is a build of the SAME menu — on open/replace the outgoing build
+        // belongs to another menu whose row ids must not anchor this one) and
+        // re-anchor to it after the rebuild; fall back to the positional clamp
+        // when the item vanished.
+        let previous_selected_id = self.state.active_menu.as_ref().and_then(|menu| match menu {
+            MenuBuildResult::Ready(spec) if spec.id == frame.id => spec
+                .items
+                .get(frame.selected_index)
+                .map(|item| item.id.clone()),
+            _ => None,
+        });
         let path = self.state.menu_stack.path();
         let app = self.menu_app_snapshot();
         let availability = self.state.availability_context();
@@ -3480,7 +3562,15 @@ impl Store {
         if len > 0
             && let Some(frame) = self.state.menu_stack.active_mut()
         {
-            frame.selected_index = frame.selected_index.min(len.saturating_sub(1));
+            let re_anchored = previous_selected_id.and_then(|prev_id| match &result {
+                MenuBuildResult::Ready(spec) => {
+                    spec.items.iter().position(|item| item.id == prev_id)
+                }
+                _ => None,
+            });
+            frame.selected_index = re_anchored
+                .unwrap_or(frame.selected_index)
+                .min(len.saturating_sub(1));
         }
         self.state.active_menu = Some(result);
     }
@@ -3924,8 +4014,17 @@ impl Store {
         match crate::clipboard::copyable_assistant_text(&self.state) {
             Some(text) => {
                 let chars = text.chars().count();
+                // OSC 52 payloads are capped at emit time (terminal limits);
+                // don't claim a full copy when only the head will reach the
+                // clipboard (codex P2 on the OSC 52 cap).
+                let status = match crate::clipboard::osc52_truncated_chars(&text) {
+                    Some(kept) => {
+                        format!("Copied first {kept} of {chars} chars (terminal clipboard cap)")
+                    }
+                    None => t!("status.copied_last_reply", chars = chars).into_owned(),
+                };
                 self.state.pending_clipboard = Some(text);
-                self.state.status = t!("status.copied_last_reply", chars = chars).into_owned();
+                self.state.status = status;
             }
             None => {
                 self.state.status = t!("status.nothing_to_copy").into_owned();
@@ -4984,6 +5083,7 @@ impl Store {
                 // entries across replays (reconnect/refresh) and reset browsing.
                 let composer_history = self.state.composer_history.clone();
                 let pending_messages = self.state.pending_messages.clone();
+                let pending_messages_by_session = self.state.pending_messages_by_session.clone();
                 let optimistic_user_messages = self.state.optimistic_user_messages.clone();
                 let turn_prompt_anchors = self.state.turn_prompt_anchors.clone();
                 let live_reply_segment_boundaries =
@@ -5036,6 +5136,19 @@ impl Store {
                 // echoed in a snapshot, so preserve both across replays.
                 let rewind_turns = self.state.rewind_turns.clone();
                 let pending_rewind_prefill = self.state.pending_rewind_prefill.clone();
+                // Local-only turn-lifecycle guards the server never echoes.
+                // Dropping `completed_turns` across a replay reopens the #218
+                // late-delta wedge on reconnect: `is_turn_completed` forgets a
+                // pre-replay terminal, so a late delta resurrects the dead turn
+                // into `live_reply`. `finalized_by_switch` and `live_reasoning`
+                // are the same class of in-flight guard/accumulator, and
+                // `session_usage`/`session_context_window` back the honest
+                // context gauge until the next `token_cost` update arrives.
+                let completed_turns = self.state.completed_turns.clone();
+                let finalized_by_switch = self.state.finalized_by_switch.clone();
+                let live_reasoning = self.state.live_reasoning.clone();
+                let session_usage = self.state.session_usage.clone();
+                let session_context_window = self.state.session_context_window.clone();
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
@@ -5046,6 +5159,7 @@ impl Store {
                 state.composer_history = composer_history;
                 state.composer_history.reset_navigation();
                 state.pending_messages = pending_messages;
+                state.pending_messages_by_session = pending_messages_by_session;
                 state.optimistic_user_messages = optimistic_user_messages;
                 state.turn_prompt_anchors = turn_prompt_anchors;
                 state.live_reply_segment_boundaries = live_reply_segment_boundaries;
@@ -5075,6 +5189,11 @@ impl Store {
                 state.resume_list_loaded = resume_list_loaded;
                 state.rewind_turns = rewind_turns;
                 state.pending_rewind_prefill = pending_rewind_prefill;
+                state.completed_turns = completed_turns;
+                state.finalized_by_switch = finalized_by_switch;
+                state.live_reasoning = live_reasoning;
+                state.session_usage = session_usage;
+                state.session_context_window = session_context_window;
                 state.restore_optimistic_user_messages();
                 self.state = state;
                 None
@@ -5455,11 +5574,12 @@ impl Store {
 
     /// Apply a `session/rollback` result (`/rewind`): re-render the trimmed
     /// transcript through the exact same path `session/hydrate` uses, then
-    /// restore the chosen user message to the composer (the stashed
+    /// restore the chosen user message (the stashed, session-keyed
     /// `pending_rewind_prefill`) so the user can edit and resend it. The stash
     /// is cleared and the status reports how many turns were dropped.
     fn apply_session_rollback_result(&mut self, result: SessionRollbackResult) {
         let dropped = result.dropped_turns;
+        let rolled_session = result.thread.session_id.clone();
         // The server returns the trimmed session as a `SessionHydrateResult`, so
         // reuse the hydrate render path verbatim to repaint the transcript.
         self.apply_session_hydrate_result(result.thread);
@@ -5469,12 +5589,47 @@ impl Store {
         // `refresh_active_menu_if_open`) it would otherwise offer already-dropped
         // turns. Recomputing keeps `rewind_turns` consistent with the transcript.
         self.state.rewind_turns = self.collect_rewind_turns();
-        // Put the chosen message back in the composer to edit and resend
-        // (rewind-and-edit), using the same composer-set mechanism as
-        // `LocalAction::EditComposer`.
-        if let Some(prefill) = self.state.pending_rewind_prefill.take() {
-            self.state.set_composer_text(prefill);
-            self.state.focus = FocusPane::Composer;
+        // Rewind-and-edit: only the rollback we actually stashed for may consume
+        // the stash (a result for a DIFFERENT session leaves it in place for the
+        // matching result). The prefill lands in the LIVE composer only when the
+        // rewound session is still the active one — if the user switched
+        // sessions while the rollback was in flight it becomes that session's
+        // composer draft (restored on switch-back) instead of clobbering the
+        // composer of whatever session is active now.
+        if self
+            .state
+            .pending_rewind_prefill
+            .as_ref()
+            .is_some_and(|(key, _)| key == &rolled_session)
+        {
+            let (key, prefill) = self
+                .state
+                .pending_rewind_prefill
+                .take()
+                .expect("checked above");
+            let key_is_active = self
+                .state
+                .active_session()
+                .is_some_and(|session| session.id == key);
+            if key_is_active {
+                // Same composer-set mechanism as `LocalAction::EditComposer`.
+                self.state.set_composer_text(prefill);
+                self.state.focus = FocusPane::Composer;
+            } else if let Some(draft) = self
+                .state
+                .composer_drafts
+                .iter_mut()
+                .find(|draft| draft.session_id == key)
+            {
+                draft.text = prefill;
+            } else if !prefill.is_empty() {
+                self.state
+                    .composer_drafts
+                    .push(crate::model::ComposerDraft {
+                        session_id: key,
+                        text: prefill,
+                    });
+            }
         }
         self.state.status = format!("Rewound {dropped} turn(s) — edit and resend");
     }
@@ -5506,7 +5661,10 @@ impl Store {
                     tasks: Vec::new(),
                     live_reply: None,
                 });
-                self.state.selected_session = self.state.sessions.len().saturating_sub(1);
+                // Full switch bundle (draft + staged-queue housekeeping), not a
+                // bare `selected_session` assignment — see `switch_selected_session`.
+                self.state
+                    .switch_selected_session(self.state.sessions.len().saturating_sub(1));
             }
             self.state
                 .optimistic_user_messages
@@ -6102,13 +6260,18 @@ impl Store {
                 if let Some(workspace_root) = event.workspace_root {
                     self.state.workspace.root = workspace_root;
                 }
+                // Both branches run the full switch bundle
+                // (`switch_selected_session`) so the outgoing session's
+                // composer draft is persisted (not silently deleted or
+                // attributed to the incoming session) and staged messages
+                // stay bound to the session they were staged in.
                 if let Some(index) = self
                     .state
                     .sessions
                     .iter()
                     .position(|session| session.id == session_id)
                 {
-                    self.state.selected_session = index;
+                    self.state.switch_selected_session(index);
                     self.state.sessions[index].profile_id = event.active_profile_id.clone();
                 } else {
                     self.state.sessions.push(SessionView {
@@ -6119,11 +6282,17 @@ impl Store {
                         tasks: Vec::new(),
                         live_reply: None,
                     });
-                    self.state.selected_session = self.state.sessions.len().saturating_sub(1);
+                    self.state
+                        .switch_selected_session(self.state.sessions.len().saturating_sub(1));
                 }
                 if self.state.active_turn().is_none() {
                     self.state.set_run_state_idle();
                 }
+                // Idle incoming session with staged messages → drain them now
+                // that it is active again (queued on the follow-up queue; this
+                // arm has its own return value). After the idle reset above so
+                // a drained submit's in-progress run state is not clobbered.
+                self.enqueue_staged_drain_after_switch();
                 // Issue #4: finishing the setup wizard must drop the user into a
                 // clean, ready coding surface — not leave the onboarding menu
                 // stacked over the chat. When a session opens while an
@@ -7234,6 +7403,20 @@ impl Store {
         // terminal for an already-finalized turn still dismisses the picker
         // instead of leaving it wedged (nit).
         self.clear_question_for_turn(&event.session_id, &event.turn_id);
+        // Idempotence vs a DUPLICATE terminal (e.g. a replayed turn/completed
+        // after reconnect): the turn already went through a terminal handler,
+        // so its card/fallback and run-state transition already happened.
+        // Without this guard the replay hits the `None` arm (the live reply was
+        // consumed by the first terminal) and pushes a FALSE "completed with no
+        // final answer" card. Safe cleanup (the picker clear above) still ran;
+        // everything else is a no-op. The staged-message drain stays: it is
+        // idle-guarded and must not miss a wake-up.
+        if self
+            .state
+            .is_turn_completed(&event.session_id, &event.turn_id)
+        {
+            return self.submit_next_pending_if_idle();
+        }
         // Mark this turn terminal so a late delta for it is dropped rather than
         // resurrecting it into `live_reply` (the wedge fix). Done before the
         // finalized-by-switch early return so it always records.
@@ -7359,18 +7542,41 @@ impl Store {
         // completed (live_reply == None → the `None` arm pushes the failure
         // card) and B still live (the `Some(mismatched)` arm preserves B's
         // live_reply but still surfaces A's failure via the run-state error).
-        let was_finalized_by_switch = self
-            .state
-            .take_turn_finalized_by_switch(&event.session_id, &event.turn_id);
         // A turn error cancels any pending AskUserQuestion picker for this turn
         // (design §4.2: the turn-interrupt/error path is Phase-1's cancellation).
         self.clear_question_for_turn(&event.session_id, &event.turn_id);
+        // Idempotence vs a DUPLICATE terminal (mirror `commit_live_reply`): the
+        // turn already terminated through a terminal handler (completed OR
+        // errored), so a late/replayed error for it must not push a second
+        // failure card or flip the run state of whatever is active now. This is
+        // distinct from the finalized-BY-SWITCH case below (a switch commits
+        // the text but is NOT a terminal — a genuine first error afterwards
+        // must still surface). Safe cleanup (the picker clear above) still ran.
+        if self
+            .state
+            .is_turn_completed(&event.session_id, &event.turn_id)
+        {
+            return self.submit_next_pending_if_idle();
+        }
+        let was_finalized_by_switch = self
+            .state
+            .take_turn_finalized_by_switch(&event.session_id, &event.turn_id);
         // Mark this turn terminal so a late delta for it is dropped rather than
         // resurrecting it into `live_reply` (the wedge fix).
         self.state
             .mark_turn_completed(&event.session_id, &event.turn_id);
         self.state
             .clear_live_reply_segment_boundaries(&event.session_id, &event.turn_id);
+        // Streamed reasoning for this turn leaves the accumulator on the error
+        // terminal too (mirror `commit_live_reply`): it attaches to the failure
+        // card below so the "· reasoning" block renders above the error, and
+        // the entry cannot leak. The stale arm restores it (the errored turn
+        // did not close here).
+        let reasoning = self
+            .state
+            .live_reasoning
+            .remove(&(event.session_id.clone(), event.turn_id.clone()))
+            .filter(|reasoning| !reasoning.trim().is_empty());
         let follow_tail = self.state.transcript_scroll == 0;
         let fallback_summary =
             self.turn_error_fallback_message(&event.turn_id, &event.code, &event.message);
@@ -7382,53 +7588,74 @@ impl Store {
         // coincide except for a switch-finalized turn whose error arrives while
         // a DIFFERENT successor turn is still live: there we surface the failure
         // (card + error run-state) without disturbing the live successor.
-        let (status, failed_current_turn, surfaced_failure) = match session.live_reply.take() {
-            Some(live_reply) if live_reply.turn_id == event.turn_id => {
-                let partial = compact_first_line(&live_reply.text, 120);
-                let text = if partial.is_empty() {
-                    fallback_summary
-                } else {
-                    format!("{fallback_summary}\n- Partial response: {partial}")
-                };
-                session.messages.push(Message::assistant(text));
-                (
-                    format!("Turn error {}: {}", event.code, event.message),
-                    true,
-                    true,
-                )
-            }
-            Some(live_reply) if was_finalized_by_switch => {
-                // A switch-finalized turn (A) errors while a different successor
-                // turn (B) is still live: surface A's failure card but PRESERVE
-                // B's in-flight live_reply untouched — the error is A's, not B's.
-                // A's (partial) text was already committed at switch time, so
-                // the card is the bare error summary (no partial-response tail
-                // here; that tail belongs to the live-turn arm above).
-                session.messages.push(Message::assistant(fallback_summary));
-                session.live_reply = Some(live_reply);
-                (
-                    format!("Turn error {}: {}", event.code, event.message),
-                    false,
-                    true,
-                )
-            }
-            Some(live_reply) => {
-                session.live_reply = Some(live_reply);
-                (
-                    format!("Ignored stale turn error in {title}: {}", event.code),
-                    false,
-                    false,
-                )
-            }
-            None => {
-                session.messages.push(Message::assistant(fallback_summary));
-                (
-                    format!("Turn error {}: {}", event.code, event.message),
-                    true,
-                    true,
-                )
-            }
-        };
+        let (status, failed_current_turn, surfaced_failure, restore_reasoning) =
+            match session.live_reply.take() {
+                Some(live_reply) if live_reply.turn_id == event.turn_id => {
+                    let partial = compact_first_line(&live_reply.text, 120);
+                    let text = if partial.is_empty() {
+                        fallback_summary
+                    } else {
+                        format!("{fallback_summary}\n- Partial response: {partial}")
+                    };
+                    let mut message = Message::assistant(text);
+                    message.reasoning_content = reasoning;
+                    session.messages.push(message);
+                    (
+                        format!("Turn error {}: {}", event.code, event.message),
+                        true,
+                        true,
+                        None,
+                    )
+                }
+                Some(live_reply) if was_finalized_by_switch => {
+                    // A switch-finalized turn (A) errors while a different successor
+                    // turn (B) is still live: surface A's failure card but PRESERVE
+                    // B's in-flight live_reply untouched — the error is A's, not B's.
+                    // A's (partial) text was already committed at switch time, so
+                    // the card is the bare error summary (no partial-response tail
+                    // here; that tail belongs to the live-turn arm above). Any
+                    // reasoning that accumulated for A AFTER the switch drained it
+                    // still surfaces on this card.
+                    let mut message = Message::assistant(fallback_summary);
+                    message.reasoning_content = reasoning;
+                    session.messages.push(message);
+                    session.live_reply = Some(live_reply);
+                    (
+                        format!("Turn error {}: {}", event.code, event.message),
+                        false,
+                        true,
+                        None,
+                    )
+                }
+                Some(live_reply) => {
+                    // Stale terminal (a different turn's reply is live): this turn
+                    // did not close here, so preserve its reasoning for the real
+                    // terminal rather than dropping it (mirror `commit_live_reply`).
+                    session.live_reply = Some(live_reply);
+                    (
+                        format!("Ignored stale turn error in {title}: {}", event.code),
+                        false,
+                        false,
+                        reasoning,
+                    )
+                }
+                None => {
+                    let mut message = Message::assistant(fallback_summary);
+                    message.reasoning_content = reasoning;
+                    session.messages.push(message);
+                    (
+                        format!("Turn error {}: {}", event.code, event.message),
+                        true,
+                        true,
+                        None,
+                    )
+                }
+            };
+        if let Some(reasoning) = restore_reasoning {
+            self.state
+                .live_reasoning
+                .insert((event.session_id.clone(), event.turn_id.clone()), reasoning);
+        }
         if surfaced_failure {
             if follow_tail {
                 self.state.scroll_transcript_to_latest();
@@ -7459,6 +7686,32 @@ impl Store {
         self.submit_next_pending_if_idle()
     }
 
+    /// After an explicit session switch the incoming session may be idle with
+    /// staged messages waiting (they were left queued when its terminal fired
+    /// while another session was active). The switch sites return their own
+    /// command, so a drained submit is enqueued on the follow-up queue the
+    /// event loop drains next tick.
+    fn enqueue_staged_drain_after_switch(&mut self) {
+        if let Some(command) = self.submit_next_pending_if_idle() {
+            self.state.enqueue_autonomy_hydration(command);
+        }
+    }
+
+    /// Event-loop hook for DIRECT session switches that bypass the store
+    /// dispatch paths (Sessions-pane Up/Down, the activity navigator):
+    /// `AppState::switch_selected_session` restores the incoming session's
+    /// staged queue, but only a store-level drain can turn it into a
+    /// `turn/start` — without this, a prompt staged in an idle session sat
+    /// stuck until some unrelated turn event (codex round-2 P2).
+    pub fn drain_staged_after_direct_switch(&mut self) {
+        self.enqueue_staged_drain_after_switch();
+    }
+
+    /// Submit the ACTIVE session's next staged prompt when it is idle.
+    /// `pending_messages` holds the active session's queue only (other
+    /// sessions' queues are stashed per-session and reloaded on switch), so a
+    /// terminal firing here can never submit another session's staged prompt
+    /// into this one.
     fn submit_next_pending_if_idle(&mut self) -> Option<AppUiCommand> {
         if self.state.active_turn().is_some() || self.state.pending_messages.is_empty() {
             return None;
@@ -8797,6 +9050,34 @@ mod tests {
     }
 
     #[test]
+    fn copy_last_reply_reports_truncated_copy_for_oversized_replies() {
+        // codex P2 (deep-review wave): OSC 52 caps the payload at emit time
+        // (terminal clipboard limits), but the status claimed the full char
+        // count — the user pasted only the head with no indication. The
+        // status must report a partial copy for over-cap replies.
+        let huge = "x".repeat(60 * 1024); // > the 54KB OSC 52 input cap
+        let mut store = store_with_assistant_message(&huge);
+
+        store.copy_last_reply();
+
+        assert!(
+            store.state.status.contains("Copied first"),
+            "status must surface truncation, got: {}",
+            store.state.status
+        );
+        assert!(
+            store.state.status.contains("terminal clipboard cap"),
+            "status must explain why, got: {}",
+            store.state.status
+        );
+        // The staged text is still the full reply; the cap applies at emit.
+        assert_eq!(
+            store.state.pending_clipboard.as_deref(),
+            Some(huge.as_str())
+        );
+    }
+
+    #[test]
     fn copy_last_reply_reports_when_there_is_nothing_to_copy() {
         let mut store = store_with_empty_session();
 
@@ -8926,9 +9207,88 @@ mod tests {
         );
     }
 
+    /// `/statusline` and `/title` picks apply NOTHING (the checkboxes are
+    /// build-time constants; no Space/reorder handling exists), so their
+    /// statuses must say so explicitly — mirroring SaveKeymap — instead of
+    /// reporting a false "layout selected" success.
+    #[test]
+    fn statusline_and_title_saves_report_not_wired() {
+        let mut store = store_with_empty_session();
+
+        let command = store
+            .dispatch_local_action(LocalAction::SaveStatusLine(vec!["state".into()]), None)
+            .into_command();
+        assert!(command.is_none());
+        assert!(
+            store.state.status.contains("not wired"),
+            "SaveStatusLine must not claim success: {}",
+            store.state.status
+        );
+
+        let command = store
+            .dispatch_local_action(LocalAction::SaveTerminalTitle(vec!["model".into()]), None)
+            .into_command();
+        assert!(command.is_none());
+        assert!(
+            store.state.status.contains("not wired"),
+            "SaveTerminalTitle must not claim success: {}",
+            store.state.status
+        );
+    }
+
+    /// The `/statusline` picker's footer must not promise the unwired Space
+    /// toggle / reorder interactions (read-only checkboxes are kept).
+    #[test]
+    fn statusline_menu_footer_does_not_promise_unwired_interactions() {
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_STATUS_LINE));
+
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected the statusline menu to build");
+        };
+        let footer = spec.footer_hint.as_deref().unwrap_or_default();
+        assert!(
+            !footer.contains("Space toggle") && !footer.contains("reorder"),
+            "footer must not advertise unwired interactions: {footer}"
+        );
+        assert!(
+            footer.contains("not wired"),
+            "footer should surface the read-only state: {footer}"
+        );
+    }
+
+    /// `/resume <query>` typed before the session list ever loaded must not
+    /// dead-end on "No prior session matches" (the list is only populated by
+    /// the no-arg picker). It opens the picker with the query pre-seeded and
+    /// fetches the list — fetch-then-filter.
+    #[test]
+    fn resume_query_before_list_load_opens_seeded_picker_and_fetches() {
+        let mut store = store_with_empty_session();
+        assert!(
+            !store.state.resume_list_loaded,
+            "fresh store: nothing fetched"
+        );
+
+        let command = store
+            .dispatch_local_action(LocalAction::OpenResumePicker, Some("alpha"))
+            .into_command();
+
+        assert!(
+            matches!(command, Some(AppUiCommand::ListSessions(_))),
+            "the unfetched-list path must fetch instead of resolving locally"
+        );
+        let frame = store.state.menu_stack.active().expect("picker open");
+        assert_eq!(frame.id.as_str(), crate::menu::registry::MENU_RESUME);
+        assert_eq!(
+            frame.search_query, "alpha",
+            "the query is pre-seeded so the fetched list arrives filtered"
+        );
+    }
+
     #[test]
     fn resume_inline_query_resolves_to_a_session_and_hydrates() {
         let mut store = store_with_empty_session();
+        store.state.resume_list_loaded = true;
         store.state.resume_sessions = vec![
             ResumeSessionRow {
                 id: "coding:api:alpha".into(),
@@ -8955,6 +9315,280 @@ mod tests {
             }
             other => panic!("expected inline /resume to hydrate the match, got {other:?}"),
         }
+    }
+
+    /// A composer draft typed in session A must survive `/resume`-ing away and
+    /// back: `resume_session_command` runs the full switch bundle, so the
+    /// outgoing draft is persisted under A (not deleted or attributed to the
+    /// incoming session) and restored on return.
+    #[test]
+    fn resume_persists_outgoing_draft_and_restores_it_on_return() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.set_composer_text("draft for A");
+
+        // /resume into B: A's draft is persisted, B starts with an empty composer.
+        store
+            .dispatch_local_action(LocalAction::ResumeSession("local:b".into()), None)
+            .into_command()
+            .expect("hydrate command for B");
+        assert_eq!(
+            store.state.active_session().map(|s| s.id.0.as_str()),
+            Some("local:b")
+        );
+        assert!(
+            store.state.composer.is_empty(),
+            "B has no draft; A's draft must not bleed into B"
+        );
+
+        // /resume back into A: the draft is restored.
+        store
+            .dispatch_local_action(LocalAction::ResumeSession("local:a".into()), None)
+            .into_command()
+            .expect("hydrate command for A");
+        assert_eq!(
+            store.state.composer, "draft for A",
+            "the draft persisted on the way out must be restored on return"
+        );
+    }
+
+    /// A server-initiated `session/opened` switch must persist the outgoing
+    /// session's composer draft under the OLD session, exactly like a manual
+    /// switch does.
+    #[test]
+    fn session_opened_switch_persists_outgoing_draft_under_old_session() {
+        use octos_core::ui_protocol::SessionOpened;
+
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.set_composer_text("draft for A");
+
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": SessionKey("local:b".into()),
+            "active_profile_id": "coding",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        assert_eq!(
+            store.state.active_session().map(|s| s.id.0.as_str()),
+            Some("local:b")
+        );
+        assert!(
+            store.state.composer.is_empty(),
+            "the incoming session must not inherit A's draft"
+        );
+        assert_eq!(
+            store
+                .state
+                .composer_drafts
+                .iter()
+                .find(|draft| draft.session_id == SessionKey("local:a".into()))
+                .map(|draft| draft.text.as_str()),
+            Some("draft for A"),
+            "the outgoing draft must be persisted under the OLD session"
+        );
+    }
+
+    /// Cross-session staged-message delivery: a prompt staged in session A
+    /// while A's turn ran must NOT submit into session B when A's terminal
+    /// fires while B is active — it stays queued for A and drains only once A
+    /// is active (and idle) again.
+    #[test]
+    fn staged_messages_stay_with_their_session_across_switches() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: turn_id.clone(),
+            text: "streaming in A".into(),
+        });
+        // Stage while A's turn is live (the compose path's staging branch).
+        store.state.set_composer_text("staged for A");
+        assert!(
+            store.compose_command().is_none(),
+            "a mid-turn submit stages instead of starting a turn"
+        );
+        assert_eq!(store.state.pending_messages, vec!["staged for A"]);
+
+        // Tab-switch to B while A's turn is still running.
+        store.state.switch_selected_session(1);
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "B's queue starts empty; A's staged prompt is stashed under A"
+        );
+
+        // A's terminal fires while B is active: nothing may submit into B.
+        let command = store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: SessionKey("local:a".into()),
+                topic: None,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            command.is_none(),
+            "A's terminal must not drain A's staged prompt into active session B"
+        );
+        assert!(
+            store.state.sessions[1]
+                .messages
+                .iter()
+                .all(|message| message.content != "staged for A"),
+            "the staged prompt must not appear in B's transcript"
+        );
+
+        // Switching back to (now idle) A restores its queue; the drain then
+        // submits it into A.
+        store.state.switch_selected_session(0);
+        assert_eq!(store.state.pending_messages, vec!["staged for A"]);
+        let command = store
+            .submit_next_pending_if_idle()
+            .expect("idle A drains its own staged prompt");
+        let AppUiCommand::SubmitPrompt(params) = command else {
+            panic!("expected staged prompt submission");
+        };
+        assert_eq!(params.session_id, SessionKey("local:a".into()));
+        assert!(store.state.pending_messages.is_empty());
+    }
+
+    /// `/resume`-ing into an idle session with staged messages submits them:
+    /// the switch site drains the reloaded queue onto the follow-up queue
+    /// (the resume itself returns the hydrate command).
+    #[test]
+    fn resuming_idle_session_with_staged_messages_enqueues_the_submit() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        // A stashed queue for B (staged earlier while B's turn ran, then the
+        // user switched away before it drained).
+        store
+            .state
+            .pending_messages_by_session
+            .insert(SessionKey("local:b".into()), vec!["queued for B".into()]);
+
+        let command = store
+            .dispatch_local_action(LocalAction::ResumeSession("local:b".into()), None)
+            .into_command();
+        assert!(
+            matches!(command, Some(AppUiCommand::HydrateSession(_))),
+            "resume still returns the hydrate command"
+        );
+
+        let queued = store
+            .state
+            .pending_autonomy_hydration
+            .iter()
+            .find_map(|command| match command {
+                AppUiCommand::SubmitPrompt(params) => Some(params.clone()),
+                _ => None,
+            })
+            .expect("the staged prompt submit is enqueued as a follow-up");
+        assert_eq!(queued.session_id, SessionKey("local:b".into()));
+        assert_eq!(
+            queued.input,
+            vec![InputItem::Text {
+                text: "queued for B".into()
+            }]
+        );
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "the drained prompt left B's queue"
+        );
+    }
+
+    /// A mid-open list refresh (e.g. a mutation chasing a list reload) can
+    /// shift rows under the cursor. The cursor is positional, so without
+    /// re-anchoring it lands on a DIFFERENT row — worst case an unconfirmed
+    /// destructive one. The refresh must re-anchor the selection to the
+    /// previously-selected item's ID, falling back to the clamp only when
+    /// that item vanished.
+    #[test]
+    fn menu_refresh_re_anchors_selection_to_item_id_when_rows_shift() {
+        let row = |id: &str| ResumeSessionRow {
+            id: id.into(),
+            title: Some(id.to_uppercase()),
+            message_count: 1,
+            updated_at: None,
+        };
+        let mut store = store_with_empty_session();
+        store.state.resume_list_loaded = true;
+        store.state.resume_sessions =
+            vec![row("alpha"), row("bravo"), row("charlie"), row("delta")];
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_RESUME));
+
+        // Put the cursor on "bravo" (index 1).
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("open frame")
+            .selected_index = 1;
+        store.refresh_active_menu();
+
+        // A row ABOVE the cursor vanishes on the next refresh.
+        store.state.resume_sessions.remove(0);
+        store.refresh_active_menu();
+
+        let frame = store.state.menu_stack.active().expect("open frame");
+        let selected_id = match store.state.active_menu.as_ref() {
+            Some(MenuBuildResult::Ready(spec)) => spec
+                .items
+                .get(frame.selected_index)
+                .map(|item| item.id.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            selected_id.as_deref(),
+            Some("bravo"),
+            "the same item must stay selected when rows above it vanish"
+        );
+        assert_eq!(frame.selected_index, 0, "bravo moved up to index 0");
+
+        // When the selected item itself vanishes, fall back to the clamp.
+        store.state.resume_sessions.remove(0);
+        store.refresh_active_menu();
+        let frame = store.state.menu_stack.active().expect("open frame");
+        assert!(
+            frame.selected_index < 2,
+            "a vanished selection falls back to a clamped index"
+        );
+    }
+
+    /// The per-session staged-queue stash is local-only (like
+    /// `pending_messages` itself) and must survive a snapshot replay.
+    #[test]
+    fn stashed_staged_queues_survive_snapshot_replay() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .pending_messages_by_session
+            .insert(SessionKey("local:other".into()), vec!["stashed".into()]);
+
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![SessionView {
+                id: session_id,
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            selected_session: 0,
+            status: "replayed".into(),
+            target: None,
+            readonly: false,
+        }));
+
+        assert_eq!(
+            store
+                .state
+                .pending_messages_by_session
+                .get(&SessionKey("local:other".into()))
+                .map(Vec::as_slice),
+            Some(&["stashed".to_string()][..]),
+            "stashed per-session staged queues must survive a snapshot replay"
+        );
     }
 
     /// Build a store whose single active session has one user+assistant
@@ -9032,13 +9666,15 @@ mod tests {
 
     #[test]
     fn rewind_to_turn_returns_rollback_command_and_stashes_prefill() {
-        let mut store = store_with_empty_session();
+        let mut store = store_with_user_turns(&["first question", "second question"]);
 
+        // Rows are newest-first: num_turns 2 targets "first question".
         let command = store
             .dispatch_local_action(
                 LocalAction::RewindToTurn {
+                    session_id: "local:test".into(),
                     num_turns: 2,
-                    prefill: "edit me and resend".into(),
+                    prefill: "first question".into(),
                 },
                 None,
             )
@@ -9052,9 +9688,9 @@ mod tests {
             other => panic!("expected SessionRollback, got {other:?}"),
         }
         assert_eq!(
-            store.state.pending_rewind_prefill.as_deref(),
-            Some("edit me and resend"),
-            "the chosen message is stashed for restore after the rollback lands"
+            store.state.pending_rewind_prefill,
+            Some((SessionKey("local:test".into()), "first question".into())),
+            "the chosen message is stashed (keyed by session) for restore after the rollback lands"
         );
     }
 
@@ -9065,6 +9701,7 @@ mod tests {
         let command = store
             .dispatch_local_action(
                 LocalAction::RewindToTurn {
+                    session_id: "local:test".into(),
                     num_turns: 1,
                     prefill: "nope".into(),
                 },
@@ -9079,6 +9716,165 @@ mod tests {
         );
     }
 
+    /// A pick carried from a picker built for ANOTHER session (the user
+    /// switched sessions while the picker was open) must be refused: rolling
+    /// back `num_turns` of whatever session is active now would drop the
+    /// wrong turns.
+    #[test]
+    fn rewind_pick_bound_to_another_session_is_refused() {
+        let mut store = store_with_user_turns(&["first question", "second question"]);
+
+        let command = store
+            .dispatch_local_action(
+                LocalAction::RewindToTurn {
+                    session_id: "local:other".into(),
+                    num_turns: 1,
+                    prefill: "second question".into(),
+                },
+                None,
+            )
+            .into_command();
+
+        assert!(
+            command.is_none(),
+            "a pick bound to another session must not roll back the active one"
+        );
+        assert!(store.state.pending_rewind_prefill.is_none());
+        assert!(
+            store.state.status.contains("another session"),
+            "the refusal is surfaced: {}",
+            store.state.status
+        );
+    }
+
+    /// The picker rows are a snapshot; if the transcript changed while the
+    /// picker was open (hydrate landing, another rollback), the carried
+    /// `num_turns`/`prefill` pair may point at a DIFFERENT turn now. Dispatch
+    /// re-validates against the current transcript and refuses on mismatch.
+    #[test]
+    fn rewind_pick_is_refused_when_transcript_changed_under_the_picker() {
+        let mut store = store_with_user_turns(&["first question", "second question"]);
+
+        // The pick says "drop 1 turn to re-edit 'second question'", but a new
+        // exchange landed since the rows were built — num_turns 1 now targets
+        // "third question".
+        store.state.sessions[0]
+            .messages
+            .push(Message::user("third question"));
+        store.state.sessions[0]
+            .messages
+            .push(Message::assistant("ok"));
+
+        let command = store
+            .dispatch_local_action(
+                LocalAction::RewindToTurn {
+                    session_id: "local:test".into(),
+                    num_turns: 1,
+                    prefill: "second question".into(),
+                },
+                None,
+            )
+            .into_command();
+
+        assert!(
+            command.is_none(),
+            "a stale pick must not roll back a different turn than the user chose"
+        );
+        assert!(store.state.pending_rewind_prefill.is_none());
+        assert!(
+            store.state.status.contains("Transcript changed"),
+            "the refusal is surfaced: {}",
+            store.state.status
+        );
+    }
+
+    /// While the `/rewind` picker is open, any menu refresh recomputes the
+    /// rows from the CURRENT transcript so the picker never renders rows for
+    /// turns that no longer exist.
+    #[test]
+    fn rewind_rows_recompute_on_menu_refresh() {
+        let mut store =
+            store_with_user_turns(&["first question", "second question", "third question"]);
+        store.dispatch_local_action(LocalAction::OpenRewindPicker, None);
+        assert_eq!(store.state.rewind_turns.len(), 3);
+
+        // The transcript shrinks underneath the open picker (e.g. a hydrate
+        // replaced it).
+        store.state.sessions[0].messages = vec![Message::user("first question")];
+        store.refresh_active_menu();
+
+        assert_eq!(
+            store.state.rewind_turns.len(),
+            1,
+            "the open picker's rows must track the current transcript"
+        );
+        assert_eq!(store.state.rewind_turns[0].prefill, "first question");
+    }
+
+    /// A rollback result landing AFTER the user switched sessions must not
+    /// clobber the now-active session's composer: the prefill becomes the
+    /// rewound session's composer draft instead (restored on switch-back).
+    #[test]
+    fn rollback_result_after_session_switch_lands_prefill_as_draft() {
+        use crate::client_event::ClientEvent;
+
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.sessions[0].messages =
+            vec![Message::user("first question"), Message::assistant("ok")];
+        // The rewind was issued in A…
+        store.state.pending_rewind_prefill =
+            Some((SessionKey("local:a".into()), "second question".into()));
+        // …but the user switched to B before the result landed.
+        store.state.switch_selected_session(1);
+        store.state.set_composer_text("typing in B");
+
+        store.apply_client_event(ClientEvent::SessionRollback(SessionRollbackResult {
+            dropped_turns: 1,
+            thread: SessionHydrateResult {
+                session_id: SessionKey("local:a".into()),
+                cursor: octos_core::ui_protocol::UiCursor {
+                    stream: "local:a".into(),
+                    seq: 1,
+                },
+                context: None,
+                context_state: None,
+                messages: Some(vec![HydratedMessage {
+                    seq: 1,
+                    role: "user".into(),
+                    content: "first question".into(),
+                    turn_id: None,
+                    thread_id: None,
+                    client_message_id: None,
+                    persisted_at: chrono::Utc::now(),
+                    message_id: None,
+                    source: None,
+                    media: Vec::new(),
+                }]),
+                threads: None,
+                turns: None,
+                pending_approvals: None,
+                pending_questions: None,
+                replayed_envelopes: None,
+            },
+        }));
+
+        assert_eq!(
+            store.state.composer, "typing in B",
+            "the active session's composer must not be clobbered by A's prefill"
+        );
+        assert_eq!(
+            store
+                .state
+                .composer_drafts
+                .iter()
+                .find(|draft| draft.session_id == SessionKey("local:a".into()))
+                .map(|draft| draft.text.as_str()),
+            Some("second question"),
+            "the prefill lands as A's composer draft instead"
+        );
+        assert!(store.state.pending_rewind_prefill.is_none());
+    }
+
     #[test]
     fn session_rollback_result_applies_trimmed_thread_and_prefills_composer() {
         use crate::client_event::ClientEvent;
@@ -9086,7 +9882,8 @@ mod tests {
         let mut store = store_with_user_turns(&["first question", "second question"]);
         let session_id = store.state.sessions[0].id.clone();
         // Simulate the pending pick: RewindToTurn stashed the chosen message.
-        store.state.pending_rewind_prefill = Some("second question".into());
+        store.state.pending_rewind_prefill =
+            Some((SessionKey("local:test".into()), "second question".into()));
 
         // Server drops 1 user turn and returns the trimmed transcript (the first
         // exchange only), shaped exactly like a session/hydrate result.
@@ -9152,7 +9949,8 @@ mod tests {
             "the open picker snapshots one row per user turn"
         );
         // Simulate the pending pick of turn 3 (drop the last two exchanges).
-        store.state.pending_rewind_prefill = Some("second question".into());
+        store.state.pending_rewind_prefill =
+            Some((SessionKey("local:test".into()), "second question".into()));
 
         // Server drops 2 user turns and returns the trimmed transcript (the first
         // exchange only), shaped like a session/hydrate result.
@@ -10358,6 +11156,66 @@ mod tests {
         assert_eq!(
             spec.items[selected].id, "onboard.provider.family",
             "fresh provider step must land on Model family, not the stale row carried over from the local-profile Continue button"
+        );
+    }
+
+    /// The same in-place local-profile→provider step swap happens when the
+    /// profile id is set directly (`/onboard profile <id>` → SetProfileId),
+    /// not just via the ProfileLocalCreate result — the cursor must be
+    /// re-anchored on the provider start row on this path too, not blindly
+    /// advanced from the stale local-step index.
+    #[test]
+    fn provider_step_opens_on_model_family_after_set_profile_id() {
+        let mut store = protocol_store_without_sessions();
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[
+                        crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+                        crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+                    ],
+                    &[],
+                ),
+            },
+            message: "Octos UI capabilities refreshed".into(),
+        }));
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected local-profile onboarding menu");
+        };
+        let create_index = spec
+            .items
+            .iter()
+            .position(|item| item.id == "onboard.local.create")
+            .expect("local create row");
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("active menu")
+            .selected_index = create_index;
+
+        // `/onboard profile ada-server`: the wizard swaps to the provider step
+        // in place on the same frame.
+        store.dispatch_onboarding_action(OnboardingAction::SetProfileId("ada-server".into()), None);
+
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected provider setup menu after profile id set");
+        };
+        assert!(
+            spec.items
+                .iter()
+                .any(|item| item.id == "onboard.provider.family"),
+            "expected provider step with the Model family row"
+        );
+        let selected = store
+            .state
+            .menu_stack
+            .active()
+            .expect("active menu")
+            .selected_index;
+        assert_eq!(
+            spec.items[selected].id, "onboard.provider.family",
+            "the provider step must land on Model family, not a stale/advanced index"
         );
     }
 
@@ -13560,6 +14418,279 @@ mod tests {
             reasoning,
             Some("no answer came"),
             "reasoning must attach to the fallback message even with no answer"
+        );
+    }
+
+    /// Local-only turn-lifecycle guards must survive a snapshot replay
+    /// (reconnect/refresh), like `composer_history` does. Losing
+    /// `completed_turns` reopens the #218 late-delta wedge after reconnect:
+    /// `is_turn_completed` returns false for a turn that terminated before the
+    /// replay, so a late delta resurrects the dead turn into `live_reply`.
+    #[test]
+    fn turn_lifecycle_guards_survive_snapshot_replay() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let turn_id = TurnId::new();
+        let switched_turn = TurnId::new();
+        store.state.mark_turn_completed(&session_id, &turn_id);
+        store
+            .state
+            .mark_turn_finalized_by_switch(&session_id, &switched_turn);
+        store.state.live_reasoning.insert(
+            (session_id.clone(), turn_id.clone()),
+            "carried thinking".into(),
+        );
+        store
+            .state
+            .session_usage
+            .insert(session_id.clone(), (Some(10), Some(20), Some(0.5)));
+        store
+            .state
+            .session_context_window
+            .insert(session_id.clone(), 200_000);
+
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            selected_session: 0,
+            status: "replayed".into(),
+            target: None,
+            readonly: false,
+        }));
+
+        assert!(
+            store.state.is_turn_completed(&session_id, &turn_id),
+            "completed_turns must survive a snapshot replay"
+        );
+        assert!(
+            store
+                .state
+                .take_turn_finalized_by_switch(&session_id, &switched_turn),
+            "finalized_by_switch must survive a snapshot replay"
+        );
+        assert_eq!(
+            store
+                .state
+                .live_reasoning
+                .get(&(session_id.clone(), turn_id.clone()))
+                .map(String::as_str),
+            Some("carried thinking"),
+            "live_reasoning must survive a snapshot replay"
+        );
+        assert_eq!(
+            store.state.session_usage.get(&session_id),
+            Some(&(Some(10), Some(20), Some(0.5))),
+            "session_usage must survive a snapshot replay"
+        );
+        assert_eq!(
+            store.state.session_context_window.get(&session_id),
+            Some(&200_000),
+            "session_context_window must survive a snapshot replay"
+        );
+    }
+
+    /// `fail_live_reply` must drain the turn's streamed reasoning like
+    /// `commit_live_reply` does: attach it to the failure card (partial-answer
+    /// arm) and remove the accumulator entry — otherwise the entry leaks and
+    /// the reasoning is missing from the card.
+    #[test]
+    fn turn_error_drains_live_reasoning_onto_failure_card() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "partial answer");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.live_reasoning.insert(
+            (session_id.clone(), turn_id.clone()),
+            "weighing the options".into(),
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                code: "internal".into(),
+                message: "boom".into(),
+            },
+        )));
+
+        let card = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("failure card pushed");
+        assert_eq!(
+            card.reasoning_content.as_deref(),
+            Some("weighing the options"),
+            "the failure card must carry the streamed reasoning"
+        );
+        assert!(
+            !store
+                .state
+                .live_reasoning
+                .contains_key(&(session_id, turn_id)),
+            "the accumulator entry must be drained on the error terminal"
+        );
+    }
+
+    /// The no-live-reply error arm (fallback card) must also surface the
+    /// streamed reasoning, mirroring `commit_live_reply`'s None arm.
+    #[test]
+    fn turn_error_without_live_reply_attaches_reasoning_to_fallback_card() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.live_reasoning.insert(
+            (session_id.clone(), turn_id.clone()),
+            "no answer came".into(),
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                code: "internal".into(),
+                message: "boom".into(),
+            },
+        )));
+
+        let card = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("failure card pushed");
+        assert_eq!(card.reasoning_content.as_deref(), Some("no answer came"));
+        assert!(
+            !store
+                .state
+                .live_reasoning
+                .contains_key(&(session_id, turn_id)),
+            "the accumulator entry must be drained on the fallback error arm"
+        );
+    }
+
+    /// A STALE turn error (a different turn's reply is live, no
+    /// finalized-by-switch marker) commits nothing — the errored turn's
+    /// reasoning must be preserved for its real terminal, mirroring
+    /// `commit_live_reply`'s stale arm.
+    #[test]
+    fn stale_turn_error_preserves_other_turns_reasoning() {
+        let live_turn = TurnId::new();
+        let errored_turn = TurnId::new();
+        let mut store = store_with_live_reply(live_turn.clone(), "still streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .live_reasoning
+            .insert((session_id.clone(), errored_turn.clone()), "keep me".into());
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: errored_turn.clone(),
+                code: "internal".into(),
+                message: "boom".into(),
+            },
+        )));
+
+        assert_eq!(
+            store
+                .state
+                .live_reasoning
+                .get(&(session_id, errored_turn))
+                .map(String::as_str),
+            Some("keep me"),
+            "a stale error must not drop the errored turn's reasoning"
+        );
+    }
+
+    /// Duplicate terminal idempotence: a second `turn/completed` for a turn
+    /// that already terminated (e.g. replayed after reconnect) must be a
+    /// no-op — exactly one committed card, no false "no final answer"
+    /// fallback, no run-state flip.
+    #[test]
+    fn duplicate_turn_completed_is_a_noop() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "the answer");
+        let session_id = store.state.sessions[0].id.clone();
+        let completed = TurnCompletedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: turn_id.clone(),
+            cursor: None,
+            tokens_in: None,
+            tokens_out: None,
+            session_result: None,
+        };
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            completed.clone(),
+        )));
+        assert_eq!(store.state.sessions[0].messages.len(), 1);
+        assert_eq!(store.state.sessions[0].messages[0].content, "the answer");
+        let status_after_first = store.state.status.clone();
+
+        // Replayed duplicate: live_reply is now None, so without the guard the
+        // None arm would push a FALSE "completed with no final answer" card.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            completed,
+        )));
+        assert_eq!(
+            store.state.sessions[0].messages.len(),
+            1,
+            "the duplicate terminal must not push a second card"
+        );
+        assert_eq!(
+            store.state.status, status_after_first,
+            "the duplicate terminal must not rewrite the status line"
+        );
+    }
+
+    /// A late/replayed `turn/error` for a turn that already completed must
+    /// not push a failure card or flip the run state to Error.
+    #[test]
+    fn turn_error_after_completed_terminal_is_a_noop() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "the answer");
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert_eq!(store.state.sessions[0].messages.len(), 1);
+        assert_eq!(store.state.run_state.label(), "done");
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                code: "internal".into(),
+                message: "late replayed error".into(),
+            },
+        )));
+        assert_eq!(
+            store.state.sessions[0].messages.len(),
+            1,
+            "a replayed error for an already-terminal turn must not push a failure card"
+        );
+        assert_ne!(
+            store.state.run_state.label(),
+            "error",
+            "a replayed error must not flip the run state"
         );
     }
 
