@@ -6339,6 +6339,9 @@ impl Store {
                 None
             }
             UiNotification::TurnStarted(event) => {
+                // The staged-drain submit (if any) has materialized into a
+                // real turn; from here live_reply gates further drains.
+                self.state.staged_submit_in_flight.remove(&event.session_id);
                 // A new turn for the active session starts a fresh live_reply
                 // UNCONDITIONALLY — server-INITIATED master-continuation turns
                 // (reason=child_completed / scatter_join_complete) carry no
@@ -7389,6 +7392,10 @@ impl Store {
     }
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
+        // Any staged-drain submit for this session has settled (terminal
+        // observed) — allow the tail drain below to submit the NEXT staged
+        // prompt (FIFO, one per settled turn).
+        self.state.staged_submit_in_flight.remove(&event.session_id);
         // Idempotence vs a turn-switch: if this turn was ALREADY finalized
         // (committed or dropped) by `commit_pending_live_reply_for_turn_switch`,
         // its late terminal is a no-op. Without this the late terminal would hit
@@ -7529,6 +7536,9 @@ impl Store {
     }
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
+        // Any staged-drain submit for this session has settled (error
+        // terminal) — release the FIFO gate (see `commit_live_reply`).
+        self.state.staged_submit_in_flight.remove(&event.session_id);
         // Idempotence vs a turn-switch (see `commit_live_reply`): the
         // finalized-by-switch marker suppresses only a false COMPLETION
         // fallback — it must NEVER hide a real ERROR. A turn finalized at a
@@ -7716,6 +7726,18 @@ impl Store {
         if self.state.active_turn().is_some() || self.state.pending_messages.is_empty() {
             return None;
         }
+        // A staged submit is already in flight for this session but its
+        // turn/started has not arrived — the session LOOKS idle, yet draining
+        // again here would submit a second prompt concurrently instead of
+        // FIFO-after-each-turn (codex P2: rapid switch-away-and-back inside
+        // that window). The marker clears on turn/started or any terminal.
+        let session_id = self
+            .state
+            .active_session()
+            .map(|session| session.id.clone())?;
+        if self.state.staged_submit_in_flight.contains(&session_id) {
+            return None;
+        }
 
         let prompt = self.state.pending_messages.remove(0);
         let mut remaining_pending = std::mem::take(&mut self.state.pending_messages);
@@ -7725,6 +7747,8 @@ impl Store {
         );
         if command.is_none() {
             remaining_pending.insert(0, prompt);
+        } else {
+            self.state.staged_submit_in_flight.insert(session_id);
         }
         self.state.pending_messages = remaining_pending;
         command
@@ -9450,6 +9474,75 @@ mod tests {
             panic!("expected staged prompt submission");
         };
         assert_eq!(params.session_id, SessionKey("local:a".into()));
+        assert!(store.state.pending_messages.is_empty());
+    }
+
+    /// codex P2 on the drain-after-switch fix: between the drained submit and
+    /// its `turn/started`, the session still LOOKS idle (no live_reply) — a
+    /// rapid switch-away-and-back must NOT drain a second staged prompt
+    /// concurrently. FIFO resumes after the turn settles.
+    #[test]
+    fn rapid_switch_drain_submits_one_staged_prompt_until_the_turn_settles() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        store.state.switch_selected_session(1);
+        store.state.pending_messages_by_session.insert(
+            a.clone(),
+            vec!["first staged".into(), "second staged".into()],
+        );
+
+        // Switch back to idle A: the drain submits the FIRST staged prompt.
+        store.state.switch_selected_session(0);
+        let command = store
+            .submit_next_pending_if_idle()
+            .expect("idle A drains its first staged prompt");
+        let AppUiCommand::SubmitPrompt(_) = command else {
+            panic!("expected staged prompt submission");
+        };
+
+        // Rapid switch away and back BEFORE turn/started: A still has no
+        // live_reply, but the in-flight gate must block a second drain.
+        store.state.switch_selected_session(1);
+        store.state.switch_selected_session(0);
+        assert!(
+            store.submit_next_pending_if_idle().is_none(),
+            "no second concurrent submit while the first is in flight"
+        );
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["second staged"],
+            "the second prompt stays queued"
+        );
+
+        // The submitted turn starts, then completes: the terminal's tail
+        // drain submits the SECOND prompt (FIFO, one per settled turn).
+        let turn_id = TurnId::new();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: a.clone(),
+                turn_id: turn_id.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        let command = store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: a.clone(),
+                topic: None,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        let Some(AppUiCommand::SubmitPrompt(params)) = command else {
+            panic!("terminal drain must submit the second staged prompt");
+        };
+        assert!(params.input.iter().any(|item| matches!(
+            item,
+            octos_core::ui_protocol::InputItem::Text { text } if text == "second staged"
+        )));
         assert!(store.state.pending_messages.is_empty());
     }
 

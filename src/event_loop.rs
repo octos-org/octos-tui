@@ -1414,6 +1414,11 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     // filter/argument text) and skipped when no enabled item advertises the
     // digit, so it falls through to the existing search-capture behavior.
     if let KeyCode::Char(ch) = key.code
+        // Unmodified digits only: some terminals report Shift+digit as
+        // Char(digit)+SHIFT, and handle_key routes SHIFT through the
+        // plain-key path — shifted input in a searchable menu must filter,
+        // not fire the shortcut (codex P3).
+        && key.modifiers.is_empty()
         && !slash_help_capture_active(store)
         && let Some(index) = active_menu_digit_shortcut_index(store, ch)
     {
@@ -3937,6 +3942,42 @@ mod tests {
         // Switching back restores the stashed draft — proof the full bundle ran.
         store.state.switch_selected_session(0);
         assert_eq!(store.state.composer, "draft for zero");
+    }
+
+    #[test]
+    fn shifted_digit_does_not_fire_menu_shortcut() {
+        // codex P3: some terminals report Shift+digit as Char(digit)+SHIFT,
+        // and handle_key routes SHIFT through the plain-key path — shifted
+        // input in a searchable menu must go to the filter, not dispatch the
+        // advertised numeric shortcut.
+        let mut store = store_with_sessions(1);
+        store.open_menu(crate::menu::MenuId::from(crate::menu::registry::MENU_HELP));
+        assert!(store.state.active_menu.is_some(), "help menu open");
+        let before = store
+            .state
+            .menu_stack
+            .active()
+            .map(|frame| frame.selected_index);
+
+        let action = handle_key(
+            &mut store,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::SHIFT),
+        );
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.selected_index),
+            before,
+            "shifted digit must not move/dispatch the shortcut selection"
+        );
+        assert!(
+            store.state.active_menu.is_some(),
+            "menu stays open (nothing dispatched)"
+        );
     }
 
     #[test]
