@@ -3300,10 +3300,7 @@ fn push_thinking_indicator(lines: &mut Vec<Line<'static>>, palette: Palette) {
     let bg = chat_message_bg(palette, "reasoning");
     let style = palette.muted().add_modifier(Modifier::DIM).bg(bg);
     lines.push(chat_line(
-        vec![Span::styled(
-            format!("· {THINKING_INDICATOR_TEXT}"),
-            style,
-        )],
+        vec![Span::styled(format!("· {THINKING_INDICATOR_TEXT}"), style)],
         Some(bg),
     ));
 }
@@ -13998,8 +13995,7 @@ mod tests {
     fn committed_assistant_reasoning_content_is_not_rendered_in_scrollback() {
         // Codex-style committed render: a finalized assistant message carrying
         // reasoning_content must NOT spill the verbose reasoning into scrollback.
-        const VERBOSE: &str =
-            "Here is my long winded committed reasoning that should never show";
+        const VERBOSE: &str = "Here is my long winded committed reasoning that should never show";
         let mut assistant = Message::assistant("The final answer.");
         assistant.reasoning_content = Some(VERBOSE.to_string());
 

@@ -6114,6 +6114,12 @@ impl AppState {
         duration_ms: Option<u64>,
     ) {
         let status = status.into();
+        // Tool output previews carry raw ANSI/control bytes from dev servers
+        // and CLIs; sanitize at this shared chokepoint (agent tools AND the
+        // `!` local shell both land here) so the transcript never renders
+        // escape sequences.
+        let output_preview = output_preview
+            .map(|preview| crate::sanitize::strip_terminal_controls(&preview).into_owned());
         let mut updated = false;
         if let Some(item) = self
             .activity

@@ -67,6 +67,13 @@ pub enum ClientEvent {
     /// never blocks on a running command. The store folds this back into
     /// the matching "running" activity chip via its `local_id`.
     LocalShellResult(LocalShellResultEvent),
+    /// The stdio transport relaunched its `serve --stdio` child after a
+    /// disconnect. A freshly spawned child has no in-flight turns by
+    /// construction, so any turn the client still shows as live belongs to
+    /// the dead process and its terminal event will never arrive — the store
+    /// must fail those latched turns and drain the staged prompt queue, or
+    /// every subsequent prompt wedges behind the phantom turn forever.
+    BackendRelaunched,
 }
 
 impl From<AppUiEvent> for ClientEvent {

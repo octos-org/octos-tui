@@ -357,6 +357,16 @@ enum ProtocolTransportDriver {
     Stdio(StdioTransportDriver),
 }
 
+impl ProtocolTransportDriver {
+    /// True for the stdio child-process driver. A reconnect on this driver
+    /// means the previous `serve --stdio` child is GONE (a new process was
+    /// spawned), unlike a WebSocket reconnect where the server — and any
+    /// in-flight turn — kept running across the socket drop.
+    fn is_stdio_child(&self) -> bool {
+        matches!(self, Self::Stdio(_))
+    }
+}
+
 enum TransportCommand {
     Text(String),
     Pong(Vec<u8>),
@@ -1510,6 +1520,18 @@ impl ProtocolAppUiBackend {
                 })
                 .into(),
             );
+            // A stdio reconnect spawned a NEW child process: no turn can be
+            // in flight there, but the app may still show one as live from
+            // the dead child (its terminal event died with the process).
+            // Tell the store to reconcile, or the composer queues every
+            // subsequent prompt behind the phantom turn.
+            if self
+                .driver
+                .as_ref()
+                .is_some_and(ProtocolTransportDriver::is_stdio_child)
+            {
+                self.queue.push_back(ClientEvent::BackendRelaunched);
+            }
         }
     }
 

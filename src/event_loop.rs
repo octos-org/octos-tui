@@ -3002,7 +3002,10 @@ mod tests {
         // instead of ESC[ / ESC]. The whole sequence must drop, not just the
         // introducer (else the params/text like "31m…" leak into the composer).
         let mut store = store_with_sessions(1);
-        handle_terminal_event(&mut store, Event::Paste("\u{9b}31mred\u{9d}0;t\u{7}END".into()));
+        handle_terminal_event(
+            &mut store,
+            Event::Paste("\u{9b}31mred\u{9d}0;t\u{7}END".into()),
+        );
         assert_eq!(store.state.composer, "redEND");
     }
 
