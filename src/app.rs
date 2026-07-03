@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, LineGauge, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, LineGauge, List, ListItem, ListState, Paragraph, StatefulWidget, Wrap},
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -2248,7 +2248,13 @@ fn render_activity_navigator_overlay(frame: &mut impl FrameLike, app: &AppState,
         render_activity_navigator_toolbar(&model, palette),
         areas.toolbar,
     );
-    frame.render_widget(render_activity_navigator_list(&model, palette), areas.list);
+    let mut list_state = ListState::default().with_selected(Some(model.selected));
+    StatefulWidget::render(
+        render_activity_navigator_list(&model, palette),
+        areas.list,
+        frame.buffer_mut(),
+        &mut list_state,
+    );
     frame.render_widget(
         render_activity_navigator_detail(&model, palette),
         areas.detail,
@@ -2356,15 +2362,17 @@ fn render_activity_navigator_list(
             .collect()
     };
 
-    List::new(items).block(
-        titled_block(
-            "Results".to_string(),
-            palette,
-            true,
-            Some("j/k".to_string()),
+    List::new(items)
+        .highlight_style(Style::default())
+        .block(
+            titled_block(
+                "Results".to_string(),
+                palette,
+                true,
+                Some("j/k".to_string()),
+            )
+            .border_style(palette.border()),
         )
-        .border_style(palette.border()),
-    )
 }
 
 fn render_activity_navigator_detail(
