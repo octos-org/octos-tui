@@ -51,6 +51,15 @@ use crate::{
 const TASK_OUTPUT_TAIL_BYTES: usize = 600;
 const TASK_OUTPUT_READ_LIMIT_BYTES: u64 = 4096;
 const TASK_ARTIFACT_READ_LIMIT_BYTES: u64 = 4096;
+/// How long a staged-submit FIFO gate stays authoritative without its
+/// turn/started or terminal arriving. Past this, `submit_next_pending_if_idle`
+/// treats the marker as stale (the in-flight turn/start died in some way the
+/// wire errors couldn't attribute) — the backstop that keeps a staged queue
+/// from wedging behind an unattributable transport death, without an
+/// ever-growing error-code taxonomy. A turn/started normally arrives well
+/// under a second after submit; 10s is far outside that while still short
+/// enough that a stuck queue self-heals promptly.
+pub(crate) const STAGED_SUBMIT_GATE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Default)]
 struct TurnActivitySummary {
@@ -5245,7 +5254,7 @@ impl Store {
                         .state
                         .active_session()
                         .map(|session| session.id.clone())
-                        .is_some_and(|id| self.state.staged_submit_in_flight.remove(&id)),
+                        .is_some_and(|id| self.state.staged_submit_in_flight.remove(&id).is_some()),
                     _ => false,
                 };
                 if released && let Some(command) = self.submit_next_pending_if_idle() {
@@ -7771,12 +7780,19 @@ impl Store {
         // turn/started has not arrived — the session LOOKS idle, yet draining
         // again here would submit a second prompt concurrently instead of
         // FIFO-after-each-turn (codex P2: rapid switch-away-and-back inside
-        // that window). The marker clears on turn/started or any terminal.
+        // that window). The marker clears on turn/started or any terminal —
+        // and, as a STRUCTURAL backstop, a marker older than
+        // [`STAGED_SUBMIT_GATE_TTL`] is treated as stale: transport-level
+        // deaths of the in-flight turn/start are only partially attributable
+        // from wire errors, so any missed release self-heals here instead of
+        // wedging the queue behind an ever-growing error-code taxonomy.
         let session_id = self
             .state
             .active_session()
             .map(|session| session.id.clone())?;
-        if self.state.staged_submit_in_flight.contains(&session_id) {
+        if let Some(stamp) = self.state.staged_submit_in_flight.get(&session_id)
+            && stamp.elapsed() < STAGED_SUBMIT_GATE_TTL
+        {
             return None;
         }
 
@@ -7789,7 +7805,9 @@ impl Store {
         if command.is_none() {
             remaining_pending.insert(0, prompt);
         } else {
-            self.state.staged_submit_in_flight.insert(session_id);
+            self.state
+                .staged_submit_in_flight
+                .insert(session_id, std::time::Instant::now());
         }
         self.state.pending_messages = remaining_pending;
         command
@@ -9606,7 +9624,7 @@ mod tests {
             .submit_next_pending_if_idle()
             .expect("first staged prompt drains");
         assert!(
-            store.state.staged_submit_in_flight.contains(&a),
+            store.state.staged_submit_in_flight.contains_key(&a),
             "gate armed while the submit is in flight"
         );
 
@@ -9618,7 +9636,7 @@ mod tests {
             message: "UI protocol frame was not valid JSON".into(),
         }));
         assert!(
-            store.state.staged_submit_in_flight.contains(&a),
+            store.state.staged_submit_in_flight.contains_key(&a),
             "recoverable noise keeps the FIFO gate armed"
         );
 
@@ -9630,7 +9648,7 @@ mod tests {
         }));
 
         assert!(
-            store.state.staged_submit_in_flight.contains(&a),
+            store.state.staged_submit_in_flight.contains_key(&a),
             "the woken drain re-arms the gate for the NEXT submit"
         );
         let woken =
@@ -9653,6 +9671,43 @@ mod tests {
             "the release must wake the drain — the remaining prompt is submitted, not wedged"
         );
         assert!(store.state.pending_messages.is_empty());
+    }
+
+    /// The TTL backstop (codex round-4): some in-flight deaths are
+    /// UNATTRIBUTABLE from wire errors (e.g. an outbound over-cap turn/start
+    /// emits only `frame_too_large`, no `request_cancelled`) — instead of an
+    /// ever-growing error-code taxonomy, a gate older than the TTL goes
+    /// stale so the staged queue can never wedge for more than seconds.
+    #[test]
+    fn stale_staged_submit_gate_expires_after_the_ttl() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        store.state.switch_selected_session(1);
+        store
+            .state
+            .pending_messages_by_session
+            .insert(a.clone(), vec!["queued".into()]);
+        store.state.switch_selected_session(0);
+        // An in-flight marker whose lifecycle events never arrived, aged
+        // past the TTL.
+        store.state.staged_submit_in_flight.insert(
+            a.clone(),
+            std::time::Instant::now()
+                .checked_sub(STAGED_SUBMIT_GATE_TTL + std::time::Duration::from_secs(1))
+                .expect("instant in the past"),
+        );
+
+        let command = store
+            .submit_next_pending_if_idle()
+            .expect("a stale gate must not wedge the staged queue");
+        assert!(matches!(command, AppUiCommand::SubmitPrompt(_)));
+        // The new submit re-arms a FRESH gate.
+        let stamp = store
+            .state
+            .staged_submit_in_flight
+            .get(&a)
+            .expect("fresh gate re-armed");
+        assert!(stamp.elapsed() < STAGED_SUBMIT_GATE_TTL);
     }
 
     /// `/resume`-ing into an idle session with staged messages submits them:
