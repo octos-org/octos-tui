@@ -3312,6 +3312,22 @@ pub struct AppState {
     /// Stashed/loaded by [`Self::switch_selected_session`]. Local-only client
     /// state the server never echoes — preserved across snapshot replays.
     pub pending_messages_by_session: std::collections::HashMap<SessionKey, Vec<String>>,
+    /// Sessions with a staged-queue submit ENQUEUED whose turn has not yet
+    /// been observed (no `turn/started` or terminal), stamped with WHEN the
+    /// submit was enqueued. Gates `submit_next_pending_if_idle`: inside the
+    /// enqueue→turn/started window the session still LOOKS idle (no
+    /// `live_reply`), so rapid session switches would drain a SECOND staged
+    /// prompt concurrently — queued prompts must flow FIFO, one per settled
+    /// turn (codex P2 on the drain-after-switch fix).
+    ///
+    /// The timestamp is a STRUCTURAL backstop: transport-level deaths of the
+    /// in-flight `turn/start` are only partially attributable from error
+    /// events (no request/session ids on the wire errors), so instead of an
+    /// ever-growing error-code taxonomy, a gate older than
+    /// [`crate::store::STAGED_SUBMIT_GATE_TTL`] is treated as stale and
+    /// ignored — any missed death self-heals in seconds. Deliberately NOT
+    /// snapshot-preserved: a replay clears it outright.
+    pub staged_submit_in_flight: std::collections::HashMap<SessionKey, std::time::Instant>,
     pub optimistic_user_messages: Vec<OptimisticUserMessage>,
     pub turn_prompt_anchors: Vec<TurnPromptAnchor>,
     /// Byte offsets in `live_reply.text` where one persisted assistant content
@@ -5022,6 +5038,7 @@ impl AppState {
             composer_history: crate::history::ComposerHistory::default(),
             pending_messages: Vec::new(),
             pending_messages_by_session: std::collections::HashMap::new(),
+            staged_submit_in_flight: std::collections::HashMap::new(),
             optimistic_user_messages: Vec::new(),
             turn_prompt_anchors: Vec::new(),
             live_reply_segment_boundaries: std::collections::HashMap::new(),

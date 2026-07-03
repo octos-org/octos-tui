@@ -51,6 +51,15 @@ use crate::{
 const TASK_OUTPUT_TAIL_BYTES: usize = 600;
 const TASK_OUTPUT_READ_LIMIT_BYTES: u64 = 4096;
 const TASK_ARTIFACT_READ_LIMIT_BYTES: u64 = 4096;
+/// How long a staged-submit FIFO gate stays authoritative without its
+/// turn/started or terminal arriving. Past this, `submit_next_pending_if_idle`
+/// treats the marker as stale (the in-flight turn/start died in some way the
+/// wire errors couldn't attribute) — the backstop that keeps a staged queue
+/// from wedging behind an unattributable transport death, without an
+/// ever-growing error-code taxonomy. A turn/started normally arrives well
+/// under a second after submit; 10s is far outside that while still short
+/// enough that a stuck queue self-heals promptly.
+pub(crate) const STAGED_SUBMIT_GATE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Default)]
 struct TurnActivitySummary {
@@ -5210,6 +5219,47 @@ impl Store {
                 None
             }
             AppUiEvent::Error(error) => {
+                // A staged-drain SubmitPrompt can die at the TRANSPORT layer —
+                // no turn/started or terminal will ever arrive for it, so the
+                // FIFO in-flight gate would wedge the session's remaining
+                // staged queue (codex P2 on the gate). Release PRECISELY
+                // (codex round-3: an over-broad clear drops gates whose
+                // turn/start is still alive → concurrent submits), then WAKE
+                // the drain (the arm otherwise returns no follow-up, so the
+                // queue would sit until an unrelated switch/terminal):
+                //
+                // * `request_cancelled` carries "{method} request {id}
+                //   cancelled: {reason}" — only a dead `turn/start` affects
+                //   the gate, and cancellation is cancel-ALL (disconnect /
+                //   skipped frame), so every in-flight turn/start died with
+                //   it: clear all gates.
+                // * send-layer refusals (`send_failed`,
+                //   `too_many_pending_requests`, `transport_send`) carry no
+                //   method attribution; the staged submit rides the ACTIVE
+                //   session's follow-up queue, so release that gate only.
+                // * recoverable parser noise (`malformed_frame`, skipped
+                //   frames themselves) cancels nothing — their pending
+                //   requests emit their own `request_cancelled` events.
+                let released = match error.code.as_str() {
+                    "request_cancelled"
+                        if error
+                            .message
+                            .starts_with(octos_core::ui_protocol::methods::TURN_START) =>
+                    {
+                        let had = !self.state.staged_submit_in_flight.is_empty();
+                        self.state.staged_submit_in_flight.clear();
+                        had
+                    }
+                    "send_failed" | "too_many_pending_requests" | "transport_send" => self
+                        .state
+                        .active_session()
+                        .map(|session| session.id.clone())
+                        .is_some_and(|id| self.state.staged_submit_in_flight.remove(&id).is_some()),
+                    _ => false,
+                };
+                if released && let Some(command) = self.submit_next_pending_if_idle() {
+                    self.state.enqueue_autonomy_hydration(command);
+                }
                 // M22-B: route `profile/local/create` failures back
                 // into the onboarding step so the user lands on a
                 // typed recovery instead of a generic status line.
@@ -6339,6 +6389,9 @@ impl Store {
                 None
             }
             UiNotification::TurnStarted(event) => {
+                // The staged-drain submit (if any) has materialized into a
+                // real turn; from here live_reply gates further drains.
+                self.state.staged_submit_in_flight.remove(&event.session_id);
                 // A new turn for the active session starts a fresh live_reply
                 // UNCONDITIONALLY — server-INITIATED master-continuation turns
                 // (reason=child_completed / scatter_join_complete) carry no
@@ -7389,6 +7442,10 @@ impl Store {
     }
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
+        // Any staged-drain submit for this session has settled (terminal
+        // observed) — allow the tail drain below to submit the NEXT staged
+        // prompt (FIFO, one per settled turn).
+        self.state.staged_submit_in_flight.remove(&event.session_id);
         // Idempotence vs a turn-switch: if this turn was ALREADY finalized
         // (committed or dropped) by `commit_pending_live_reply_for_turn_switch`,
         // its late terminal is a no-op. Without this the late terminal would hit
@@ -7529,6 +7586,9 @@ impl Store {
     }
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
+        // Any staged-drain submit for this session has settled (error
+        // terminal) — release the FIFO gate (see `commit_live_reply`).
+        self.state.staged_submit_in_flight.remove(&event.session_id);
         // Idempotence vs a turn-switch (see `commit_live_reply`): the
         // finalized-by-switch marker suppresses only a false COMPLETION
         // fallback — it must NEVER hide a real ERROR. A turn finalized at a
@@ -7716,6 +7776,25 @@ impl Store {
         if self.state.active_turn().is_some() || self.state.pending_messages.is_empty() {
             return None;
         }
+        // A staged submit is already in flight for this session but its
+        // turn/started has not arrived — the session LOOKS idle, yet draining
+        // again here would submit a second prompt concurrently instead of
+        // FIFO-after-each-turn (codex P2: rapid switch-away-and-back inside
+        // that window). The marker clears on turn/started or any terminal —
+        // and, as a STRUCTURAL backstop, a marker older than
+        // [`STAGED_SUBMIT_GATE_TTL`] is treated as stale: transport-level
+        // deaths of the in-flight turn/start are only partially attributable
+        // from wire errors, so any missed release self-heals here instead of
+        // wedging the queue behind an ever-growing error-code taxonomy.
+        let session_id = self
+            .state
+            .active_session()
+            .map(|session| session.id.clone())?;
+        if let Some(stamp) = self.state.staged_submit_in_flight.get(&session_id)
+            && stamp.elapsed() < STAGED_SUBMIT_GATE_TTL
+        {
+            return None;
+        }
 
         let prompt = self.state.pending_messages.remove(0);
         let mut remaining_pending = std::mem::take(&mut self.state.pending_messages);
@@ -7725,6 +7804,10 @@ impl Store {
         );
         if command.is_none() {
             remaining_pending.insert(0, prompt);
+        } else {
+            self.state
+                .staged_submit_in_flight
+                .insert(session_id, std::time::Instant::now());
         }
         self.state.pending_messages = remaining_pending;
         command
@@ -9451,6 +9534,180 @@ mod tests {
         };
         assert_eq!(params.session_id, SessionKey("local:a".into()));
         assert!(store.state.pending_messages.is_empty());
+    }
+
+    /// codex P2 on the drain-after-switch fix: between the drained submit and
+    /// its `turn/started`, the session still LOOKS idle (no live_reply) — a
+    /// rapid switch-away-and-back must NOT drain a second staged prompt
+    /// concurrently. FIFO resumes after the turn settles.
+    #[test]
+    fn rapid_switch_drain_submits_one_staged_prompt_until_the_turn_settles() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        store.state.switch_selected_session(1);
+        store.state.pending_messages_by_session.insert(
+            a.clone(),
+            vec!["first staged".into(), "second staged".into()],
+        );
+
+        // Switch back to idle A: the drain submits the FIRST staged prompt.
+        store.state.switch_selected_session(0);
+        let command = store
+            .submit_next_pending_if_idle()
+            .expect("idle A drains its first staged prompt");
+        let AppUiCommand::SubmitPrompt(_) = command else {
+            panic!("expected staged prompt submission");
+        };
+
+        // Rapid switch away and back BEFORE turn/started: A still has no
+        // live_reply, but the in-flight gate must block a second drain.
+        store.state.switch_selected_session(1);
+        store.state.switch_selected_session(0);
+        assert!(
+            store.submit_next_pending_if_idle().is_none(),
+            "no second concurrent submit while the first is in flight"
+        );
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["second staged"],
+            "the second prompt stays queued"
+        );
+
+        // The submitted turn starts, then completes: the terminal's tail
+        // drain submits the SECOND prompt (FIFO, one per settled turn).
+        let turn_id = TurnId::new();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: a.clone(),
+                turn_id: turn_id.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        let command = store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: a.clone(),
+                topic: None,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        let Some(AppUiCommand::SubmitPrompt(params)) = command else {
+            panic!("terminal drain must submit the second staged prompt");
+        };
+        assert!(params.input.iter().any(|item| matches!(
+            item,
+            octos_core::ui_protocol::InputItem::Text { text } if text == "second staged"
+        )));
+        assert!(store.state.pending_messages.is_empty());
+    }
+
+    /// codex P2 on the FIFO gate itself: a staged submit that dies at the
+    /// TRANSPORT layer (request cancelled / send failure) never produces
+    /// turn/started or a terminal — the gate must release on those error
+    /// events or the session's remaining staged queue wedges.
+    #[test]
+    fn transport_error_releases_the_staged_submit_gate() {
+        use octos_core::app_ui::AppUiError;
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        store.state.switch_selected_session(1);
+        store.state.pending_messages_by_session.insert(
+            a.clone(),
+            vec!["first staged".into(), "second staged".into()],
+        );
+        store.state.switch_selected_session(0);
+        store
+            .submit_next_pending_if_idle()
+            .expect("first staged prompt drains");
+        assert!(
+            store.state.staged_submit_in_flight.contains_key(&a),
+            "gate armed while the submit is in flight"
+        );
+
+        // Recoverable parser noise must NOT release the gate (codex round-3:
+        // an over-broad clear lets a still-alive turn/start's session submit
+        // concurrently on the next drain).
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "malformed_frame".into(),
+            message: "UI protocol frame was not valid JSON".into(),
+        }));
+        assert!(
+            store.state.staged_submit_in_flight.contains_key(&a),
+            "recoverable noise keeps the FIFO gate armed"
+        );
+
+        // The submit's cancellation arrives (cancel-all path) — release AND
+        // wake the drain: the next staged prompt rides the follow-up queue.
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "request_cancelled".into(),
+            message: "turn/start request tui-9 cancelled: response may have been discarded".into(),
+        }));
+
+        assert!(
+            store.state.staged_submit_in_flight.contains_key(&a),
+            "the woken drain re-arms the gate for the NEXT submit"
+        );
+        let woken =
+            store
+                .state
+                .pending_autonomy_hydration
+                .iter()
+                .find_map(|command| match command {
+                    AppUiCommand::SubmitPrompt(params) => {
+                        params.input.iter().find_map(|item| match item {
+                            octos_core::ui_protocol::InputItem::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                });
+        assert_eq!(
+            woken.as_deref(),
+            Some("second staged"),
+            "the release must wake the drain — the remaining prompt is submitted, not wedged"
+        );
+        assert!(store.state.pending_messages.is_empty());
+    }
+
+    /// The TTL backstop (codex round-4): some in-flight deaths are
+    /// UNATTRIBUTABLE from wire errors (e.g. an outbound over-cap turn/start
+    /// emits only `frame_too_large`, no `request_cancelled`) — instead of an
+    /// ever-growing error-code taxonomy, a gate older than the TTL goes
+    /// stale so the staged queue can never wedge for more than seconds.
+    #[test]
+    fn stale_staged_submit_gate_expires_after_the_ttl() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        store.state.switch_selected_session(1);
+        store
+            .state
+            .pending_messages_by_session
+            .insert(a.clone(), vec!["queued".into()]);
+        store.state.switch_selected_session(0);
+        // An in-flight marker whose lifecycle events never arrived, aged
+        // past the TTL.
+        store.state.staged_submit_in_flight.insert(
+            a.clone(),
+            std::time::Instant::now()
+                .checked_sub(STAGED_SUBMIT_GATE_TTL + std::time::Duration::from_secs(1))
+                .expect("instant in the past"),
+        );
+
+        let command = store
+            .submit_next_pending_if_idle()
+            .expect("a stale gate must not wedge the staged queue");
+        assert!(matches!(command, AppUiCommand::SubmitPrompt(_)));
+        // The new submit re-arms a FRESH gate.
+        let stamp = store
+            .state
+            .staged_submit_in_flight
+            .get(&a)
+            .expect("fresh gate re-armed");
+        assert!(stamp.elapsed() < STAGED_SUBMIT_GATE_TTL);
     }
 
     /// `/resume`-ing into an idle session with staged messages submits them:
