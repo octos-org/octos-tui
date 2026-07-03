@@ -600,7 +600,7 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     if is_control_char(&key, 'c') {
         return store
             .interrupt_command()
-            .map_or(KeyAction::Continue, KeyAction::send);
+            .map_or(KeyAction::Quit, KeyAction::send);
     }
 
     if is_control_char(&key, 'u') {
