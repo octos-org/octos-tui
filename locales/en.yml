@@ -419,6 +419,7 @@ status:
   tool_started: "Tool started: %{name} (%{id})"
   question_asked: "Question asked: %{title}"
   turn_completed: "Turn completed in %{title} at seq %{seq}"
+  backend_relaunched_turn_lost: "Backend process restarted — the in-flight turn was lost; staged prompts go to the new backend."
   turn_completed_stale: "Ignored completed stale turn in %{title}"
   # Read-only mode feedback
   readonly_turn_disabled: "Read-only mode: turn/start disabled"

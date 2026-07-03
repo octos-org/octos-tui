@@ -4473,6 +4473,7 @@ impl Store {
     pub fn apply_client_event(&mut self, event: ClientEvent) -> Option<AppUiCommand> {
         match event {
             ClientEvent::App(event) => self.apply_event(*event),
+            ClientEvent::BackendRelaunched => self.reconcile_after_backend_relaunch(),
             ClientEvent::Capabilities(event) => {
                 let follow_up = self.apply_capabilities_event(event);
                 self.refresh_active_menu_if_open();
@@ -6467,7 +6468,12 @@ impl Store {
                         text: String::new(),
                     });
                     if live_reply.turn_id == turn_id {
-                        live_reply.text.push_str(&text);
+                        // Server text can quote raw tool output (dev servers,
+                        // vite, npm) — strip escape/control sequences before
+                        // they reach the styled transcript renderer.
+                        live_reply
+                            .text
+                            .push_str(&crate::sanitize::strip_terminal_controls(&text));
                         reset_scroll = true;
                     }
                 }
@@ -7008,7 +7014,12 @@ impl Store {
                 None
             }
             Payload::AssistantDelta { text } => {
-                self.upsert_envelope_assistant_message(&session_id, &thread_id, text, false);
+                self.upsert_envelope_assistant_message(
+                    &session_id,
+                    &thread_id,
+                    crate::sanitize::strip_terminal_controls(&text).into_owned(),
+                    false,
+                );
                 // Streaming deltas arrive many times per second; writing the
                 // status bar each time flooded the bottom line with "Assistant
                 // delta projected for <thread_id>". The streamed text is already
@@ -7016,7 +7027,12 @@ impl Store {
                 None
             }
             Payload::AssistantPersisted { text, .. } => {
-                self.upsert_envelope_assistant_message(&session_id, &thread_id, text, true);
+                self.upsert_envelope_assistant_message(
+                    &session_id,
+                    &thread_id,
+                    crate::sanitize::strip_terminal_controls(&text).into_owned(),
+                    true,
+                );
                 // Same as AssistantDelta: internal projection, not status-bar news.
                 None
             }
@@ -7811,6 +7827,50 @@ impl Store {
         }
         self.state.pending_messages = remaining_pending;
         command
+    }
+
+    /// The stdio transport relaunched its `serve --stdio` child. The new
+    /// process has no in-flight turns, so any `live_reply` still latched
+    /// belongs to the dead child and its terminal event will never arrive.
+    /// Fail each latched turn through the normal turn-error path — that
+    /// preserves the partially streamed text on a failure card, releases the
+    /// staged-submit FIFO gate, and marks the turn terminal so a late delta
+    /// cannot resurrect it — then wake the staged drain so queued prompts
+    /// flow to the new child instead of wedging forever.
+    pub fn reconcile_after_backend_relaunch(&mut self) -> Option<AppUiCommand> {
+        let latched: Vec<(octos_core::SessionKey, TurnId)> = self
+            .state
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                session
+                    .live_reply
+                    .as_ref()
+                    .map(|live_reply| (session.id.clone(), live_reply.turn_id.clone()))
+            })
+            .collect();
+        // In-flight `turn/start` submits died with the old child too; without
+        // this, their gates block the staged drain until the TTL backstop.
+        self.state.staged_submit_in_flight.clear();
+        let mut follow_up = None;
+        for (session_id, turn_id) in latched {
+            // An approval modal for the dead turn will never receive its
+            // cancellation event from the new child — clear it here.
+            if self.state.approval.as_ref().is_some_and(|approval| {
+                approval.session_id == session_id && approval.turn_id == turn_id
+            }) {
+                self.state.approval = None;
+            }
+            let command = self.fail_live_reply(TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                code: "backend_relaunched".to_owned(),
+                message: t!("status.backend_relaunched_turn_lost").into_owned(),
+            });
+            follow_up = follow_up.or(command);
+        }
+        follow_up.or_else(|| self.submit_next_pending_if_idle())
     }
 
     fn find_session_mut(
@@ -8670,7 +8730,7 @@ fn hydrated_row_is_covered_by_envelope(
 fn hydrated_row_to_message(row: HydratedMessage) -> Message {
     Message {
         role: hydrated_role(&row.role),
-        content: row.content,
+        content: crate::sanitize::strip_terminal_controls(&row.content).into_owned(),
         media: row.media,
         tool_calls: None,
         tool_call_id: None,
@@ -8682,9 +8742,10 @@ fn hydrated_row_to_message(row: HydratedMessage) -> Message {
 }
 
 fn spawn_complete_to_message(event: TurnSpawnCompleteEvent) -> Message {
+    let content = crate::sanitize::strip_terminal_controls(&event.content).into_owned();
     let mut message = match event.thread_id {
-        Some(thread_id) => Message::assistant_with_thread(event.content, ThreadId::new(thread_id)),
-        None => Message::assistant(event.content),
+        Some(thread_id) => Message::assistant_with_thread(content, ThreadId::new(thread_id)),
+        None => Message::assistant(content),
     };
     message.media = event.media;
     message.timestamp = event.persisted_at;
@@ -10590,6 +10651,64 @@ mod tests {
                 false,
             ),
         }
+    }
+
+    /// A stdio child relaunch must fail the latched live turn (its terminal
+    /// event died with the old process) and drain the staged queue into the
+    /// NEW child — otherwise every subsequent prompt queues behind the
+    /// phantom turn forever (the "stopped responding to my prompts" wedge).
+    #[test]
+    fn backend_relaunch_fails_latched_turn_and_drains_staged_queue() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let dead_turn = TurnId::new();
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: dead_turn.clone(),
+            text: "partial answer from the dead child".into(),
+        });
+        store.state.pending_messages = vec!["queued prompt".into()];
+        store
+            .state
+            .staged_submit_in_flight
+            .insert(SessionKey("local:a".into()), std::time::Instant::now());
+
+        let command = store.apply_client_event(ClientEvent::BackendRelaunched);
+
+        assert!(
+            store.state.active_turn().is_none(),
+            "the phantom turn must be cleared"
+        );
+        assert!(
+            store
+                .state
+                .is_turn_completed(&SessionKey("local:a".into()), &dead_turn),
+            "the dead turn must be terminal so a late delta cannot resurrect it"
+        );
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "the staged prompt must drain to the new child"
+        );
+        let command = command.expect("draining the staged prompt must produce a turn/start");
+        assert!(
+            format!("{command:?}").contains("queued prompt"),
+            "the drained command must carry the staged prompt, got {command:?}"
+        );
+    }
+
+    /// Without a latched turn, a relaunch is a no-op for turn state and must
+    /// not fabricate failure cards.
+    #[test]
+    fn backend_relaunch_without_latched_turn_is_quiet() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let activity_before = store.state.activity.len();
+
+        let command = store.apply_client_event(ClientEvent::BackendRelaunched);
+
+        assert!(command.is_none());
+        assert_eq!(
+            store.state.activity.len(),
+            activity_before,
+            "no failure card without a latched turn"
+        );
     }
 
     fn protocol_store_with_methods(methods: &[&str]) -> Store {

@@ -19,6 +19,7 @@ pub mod insert_history;
 pub mod keymap;
 pub mod menu;
 pub mod model;
+pub mod sanitize;
 pub mod store;
 pub mod theme;
 pub mod transport;
