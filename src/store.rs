@@ -5210,25 +5210,46 @@ impl Store {
                 None
             }
             AppUiEvent::Error(error) => {
-                // A staged-drain SubmitPrompt can die at the TRANSPORT layer
-                // (request_cancelled after a skipped frame / disconnect,
-                // send failure, pending-cap refusal) — no turn/started or
-                // terminal will ever arrive for it, so the FIFO in-flight
-                // gate would wedge the session's remaining staged queue
-                // (codex P2 on the gate). Release the gate on those codes;
-                // worst case is one extra drain attempt, never a stuck queue.
-                if matches!(
-                    error.code.as_str(),
+                // A staged-drain SubmitPrompt can die at the TRANSPORT layer —
+                // no turn/started or terminal will ever arrive for it, so the
+                // FIFO in-flight gate would wedge the session's remaining
+                // staged queue (codex P2 on the gate). Release PRECISELY
+                // (codex round-3: an over-broad clear drops gates whose
+                // turn/start is still alive → concurrent submits), then WAKE
+                // the drain (the arm otherwise returns no follow-up, so the
+                // queue would sit until an unrelated switch/terminal):
+                //
+                // * `request_cancelled` carries "{method} request {id}
+                //   cancelled: {reason}" — only a dead `turn/start` affects
+                //   the gate, and cancellation is cancel-ALL (disconnect /
+                //   skipped frame), so every in-flight turn/start died with
+                //   it: clear all gates.
+                // * send-layer refusals (`send_failed`,
+                //   `too_many_pending_requests`, `transport_send`) carry no
+                //   method attribution; the staged submit rides the ACTIVE
+                //   session's follow-up queue, so release that gate only.
+                // * recoverable parser noise (`malformed_frame`, skipped
+                //   frames themselves) cancels nothing — their pending
+                //   requests emit their own `request_cancelled` events.
+                let released = match error.code.as_str() {
                     "request_cancelled"
-                        | "transport_send"
-                        | "transport_read"
-                        | "send_failed"
-                        | "too_many_pending_requests"
-                        | "frame_too_large"
-                        | "frame_not_utf8"
-                        | "malformed_frame"
-                ) {
-                    self.state.staged_submit_in_flight.clear();
+                        if error
+                            .message
+                            .starts_with(octos_core::ui_protocol::methods::TURN_START) =>
+                    {
+                        let had = !self.state.staged_submit_in_flight.is_empty();
+                        self.state.staged_submit_in_flight.clear();
+                        had
+                    }
+                    "send_failed" | "too_many_pending_requests" | "transport_send" => self
+                        .state
+                        .active_session()
+                        .map(|session| session.id.clone())
+                        .is_some_and(|id| self.state.staged_submit_in_flight.remove(&id)),
+                    _ => false,
+                };
+                if released && let Some(command) = self.submit_next_pending_if_idle() {
+                    self.state.enqueue_autonomy_hydration(command);
                 }
                 // M22-B: route `profile/local/create` failures back
                 // into the onboarding step so the user lands on a
@@ -9589,26 +9610,49 @@ mod tests {
             "gate armed while the submit is in flight"
         );
 
-        // The submit dies at the transport layer — no turn lifecycle events.
+        // Recoverable parser noise must NOT release the gate (codex round-3:
+        // an over-broad clear lets a still-alive turn/start's session submit
+        // concurrently on the next drain).
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "malformed_frame".into(),
+            message: "UI protocol frame was not valid JSON".into(),
+        }));
+        assert!(
+            store.state.staged_submit_in_flight.contains(&a),
+            "recoverable noise keeps the FIFO gate armed"
+        );
+
+        // The submit's cancellation arrives (cancel-all path) — release AND
+        // wake the drain: the next staged prompt rides the follow-up queue.
         store.apply_event(AppUiEvent::Error(AppUiError {
             code: "request_cancelled".into(),
-            message: "turn/start request tui-9 failed: response may have been discarded".into(),
+            message: "turn/start request tui-9 cancelled: response may have been discarded".into(),
         }));
 
         assert!(
-            store.state.staged_submit_in_flight.is_empty(),
-            "transport-death error must release the gate"
+            store.state.staged_submit_in_flight.contains(&a),
+            "the woken drain re-arms the gate for the NEXT submit"
         );
-        let command = store
-            .submit_next_pending_if_idle()
-            .expect("the remaining staged prompt is not wedged");
-        let AppUiCommand::SubmitPrompt(params) = command else {
-            panic!("expected the second staged prompt");
-        };
-        assert!(params.input.iter().any(|item| matches!(
-            item,
-            octos_core::ui_protocol::InputItem::Text { text } if text == "second staged"
-        )));
+        let woken =
+            store
+                .state
+                .pending_autonomy_hydration
+                .iter()
+                .find_map(|command| match command {
+                    AppUiCommand::SubmitPrompt(params) => {
+                        params.input.iter().find_map(|item| match item {
+                            octos_core::ui_protocol::InputItem::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                });
+        assert_eq!(
+            woken.as_deref(),
+            Some("second staged"),
+            "the release must wake the drain — the remaining prompt is submitted, not wedged"
+        );
+        assert!(store.state.pending_messages.is_empty());
     }
 
     /// `/resume`-ing into an idle session with staged messages submits them:
