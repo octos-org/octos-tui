@@ -5210,6 +5210,26 @@ impl Store {
                 None
             }
             AppUiEvent::Error(error) => {
+                // A staged-drain SubmitPrompt can die at the TRANSPORT layer
+                // (request_cancelled after a skipped frame / disconnect,
+                // send failure, pending-cap refusal) — no turn/started or
+                // terminal will ever arrive for it, so the FIFO in-flight
+                // gate would wedge the session's remaining staged queue
+                // (codex P2 on the gate). Release the gate on those codes;
+                // worst case is one extra drain attempt, never a stuck queue.
+                if matches!(
+                    error.code.as_str(),
+                    "request_cancelled"
+                        | "transport_send"
+                        | "transport_read"
+                        | "send_failed"
+                        | "too_many_pending_requests"
+                        | "frame_too_large"
+                        | "frame_not_utf8"
+                        | "malformed_frame"
+                ) {
+                    self.state.staged_submit_in_flight.clear();
+                }
                 // M22-B: route `profile/local/create` failures back
                 // into the onboarding step so the user lands on a
                 // typed recovery instead of a generic status line.
@@ -9544,6 +9564,51 @@ mod tests {
             octos_core::ui_protocol::InputItem::Text { text } if text == "second staged"
         )));
         assert!(store.state.pending_messages.is_empty());
+    }
+
+    /// codex P2 on the FIFO gate itself: a staged submit that dies at the
+    /// TRANSPORT layer (request cancelled / send failure) never produces
+    /// turn/started or a terminal — the gate must release on those error
+    /// events or the session's remaining staged queue wedges.
+    #[test]
+    fn transport_error_releases_the_staged_submit_gate() {
+        use octos_core::app_ui::AppUiError;
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        store.state.switch_selected_session(1);
+        store.state.pending_messages_by_session.insert(
+            a.clone(),
+            vec!["first staged".into(), "second staged".into()],
+        );
+        store.state.switch_selected_session(0);
+        store
+            .submit_next_pending_if_idle()
+            .expect("first staged prompt drains");
+        assert!(
+            store.state.staged_submit_in_flight.contains(&a),
+            "gate armed while the submit is in flight"
+        );
+
+        // The submit dies at the transport layer — no turn lifecycle events.
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "request_cancelled".into(),
+            message: "turn/start request tui-9 failed: response may have been discarded".into(),
+        }));
+
+        assert!(
+            store.state.staged_submit_in_flight.is_empty(),
+            "transport-death error must release the gate"
+        );
+        let command = store
+            .submit_next_pending_if_idle()
+            .expect("the remaining staged prompt is not wedged");
+        let AppUiCommand::SubmitPrompt(params) = command else {
+            panic!("expected the second staged prompt");
+        };
+        assert!(params.input.iter().any(|item| matches!(
+            item,
+            octos_core::ui_protocol::InputItem::Text { text } if text == "second staged"
+        )));
     }
 
     /// `/resume`-ing into an idle session with staged messages submits them:
