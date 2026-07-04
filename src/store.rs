@@ -755,9 +755,30 @@ impl Store {
                     agent_id,
                 }))
             }
-            // Dispatch for /agents spawn is deferred until the backend
-            // exposes an agent/spawn Octos UI method.
-            AgentsCommand::Spawn { .. } => None,
+            AgentsCommand::Spawn { count, prompt } => {
+                if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_LIST) {
+                    return None;
+                }
+                self.state.enqueue_autonomy_hydration(AppUiCommand::ListAgents(
+                    crate::model::AgentListParams {
+                        session_id: session_id.clone(),
+                        parent_agent_id: None,
+                    },
+                ));
+                let text = t!(
+                    "status.spawn_agents_turn",
+                    count = count,
+                    prompt = prompt
+                )
+                .into_owned();
+                let status = t!(
+                    "status.spawning_agents",
+                    count = count,
+                    prompt = prompt
+                )
+                .into_owned();
+                self.start_prompt_turn(text, status)
+            }
         }
     }
 
@@ -19135,6 +19156,92 @@ mod tests {
             }
             other => panic!("expected ListAgents, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn spawn_dispatches_submit_prompt_with_formatted_text() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.set_composer_text("/agents spawn 3 run integration tests");
+        let command = store.compose_command().expect("spawn emits a command");
+        match command {
+            AppUiCommand::SubmitPrompt(params) => {
+                let text = match params.input.first().expect("input has text") {
+                    octos_core::ui_protocol::InputItem::Text { text } => text.clone(),
+                    other => panic!("expected Text input item, got {other:?}"),
+                };
+                assert!(
+                    text.contains("3"),
+                    "turn text must contain the count, got: {text}"
+                );
+                assert!(
+                    text.contains("run integration tests"),
+                    "turn text must contain the prompt, got: {text}"
+                );
+            }
+            other => panic!("expected SubmitPrompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_enqueues_agent_list_refresh() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.set_composer_text("/agents spawn 2 do work");
+        let _command = store.compose_command();
+        let queued: Vec<_> =
+            std::iter::from_fn(|| store.state.dequeue_autonomy_hydration()).collect();
+        assert!(
+            queued.iter().any(|c| matches!(c, AppUiCommand::ListAgents(_))),
+            "spawn must enqueue a ListAgents refresh, got: {queued:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_rejected_when_agent_list_not_advertised() {
+        use crate::menu::CapabilitySet;
+        let session = crate::model::SessionView {
+            id: octos_core::SessionKey("local:test".into()),
+            title: "test".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: crate::model::AppState::new(
+                vec![session],
+                0,
+                "ready".into(),
+                Some("ws://example.test/ui-protocol".into()),
+                false,
+            ),
+        };
+        store.state.capabilities = Some(CapabilitySet::from_methods_and_features(
+            [] as [&str; 0],
+            [crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1],
+        ));
+        store.state.set_composer_text("/agents spawn 2 do work");
+        let command = store.compose_command();
+        assert!(
+            command.is_none(),
+            "spawn must be rejected when agent/list is not advertised"
+        );
+        assert!(
+            store.state.status.contains("agent/list"),
+            "status must name the missing method, got: {:?}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn spawn_not_recorded_in_history() {
+        assert!(
+            !should_record_in_history("/agents spawn 3 run tests"),
+            "/agents spawn has non-empty args so it must never be recorded"
+        );
+        assert!(
+            !should_record_in_history("/agents spawn 1 fix lint errors"),
+            "single-agent spawn with a long prompt must not be recorded"
+        );
     }
 
     #[test]
