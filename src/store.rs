@@ -756,7 +756,7 @@ impl Store {
                 }))
             }
             AgentsCommand::Spawn { count, prompt } => {
-                if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_LIST) {
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_AGENT_LIST) {
                     return None;
                 }
                 self.state.enqueue_autonomy_hydration(AppUiCommand::ListAgents(
@@ -19241,6 +19241,22 @@ mod tests {
         assert!(
             !should_record_in_history("/agents spawn 1 fix lint errors"),
             "single-agent spawn with a long prompt must not be recorded"
+        );
+    }
+
+    #[test]
+    fn spawn_rejected_in_readonly_mode() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.readonly = true;
+        store.state.set_composer_text("/agents spawn 2 do work");
+        let command = store.compose_command();
+        assert!(
+            command.is_none(),
+            "spawn must be rejected in readonly mode, got {command:?}"
+        );
+        assert!(
+            store.state.composer_history.entries().is_empty(),
+            "a readonly-rejected spawn must not reach history"
         );
     }
 
