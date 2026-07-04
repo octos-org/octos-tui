@@ -840,16 +840,31 @@ fn resume_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         .resume_sessions
         .iter()
         .map(|row| {
-            let label = row
-                .title
-                .clone()
-                .filter(|title| !title.is_empty())
-                .unwrap_or_else(|| row.id.clone());
+            // Label: `{short_id}  {prompt}` — the short id doubles as the
+            // `/resume <id>` prefix handle; the prompt prefers the last user
+            // message, then the title, then a placeholder.
+            let short_id = short_session_id(&row.id);
+            let prompt = row
+                .last_prompt
+                .as_deref()
+                .filter(|prompt| !prompt.trim().is_empty())
+                .or_else(|| {
+                    row.title
+                        .as_deref()
+                        .filter(|title| !title.trim().is_empty())
+                })
+                .unwrap_or("(no preview)");
+            let label = format!("{short_id}  {}", truncate_display_width(prompt, 60));
+            // Description: relative datetime (when the server sent one) + count.
             let description = match row.updated_at.as_deref() {
                 Some(updated) if !updated.is_empty() => {
-                    format!("{} messages · {}", row.message_count, updated)
+                    format!(
+                        "{} · {} msgs",
+                        crate::store::relative_time(updated),
+                        row.message_count
+                    )
                 }
-                _ => format!("{} messages", row.message_count),
+                _ => format!("{} msgs", row.message_count),
             };
             MenuItem::new(
                 row.id.clone(),
@@ -868,10 +883,54 @@ fn resume_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         tabs: Vec::new(),
         searchable: true,
         search_placeholder: Some("Search sessions…".into()),
-        footer_hint: Some("Enter to resume · Esc to close".into()),
+        footer_hint: Some("Enter resume · /resume <id> · Esc".into()),
         preview: None,
         mode: MenuMode::SingleSelect,
     })
+}
+
+/// A short, human-meaningful, usually-unique handle for a session id of the
+/// canonical `channel:profile:base#topic` shape. The topic (after `#`) is what
+/// users recognize and is unique per base — a far better `/resume <id>` handle
+/// than a fixed 6-char prefix, which collides for every id sharing a namespace
+/// prefix (`dev:local:tui#a` / `#b` both → `dev:lo`, codex P2). Falls back to
+/// the base segment (after the last `:`), then the whole id. `resolve_resume_
+/// session` matches this handle via an exact-topic step.
+fn short_session_id(id: &str) -> String {
+    if let Some((_, topic)) = id.rsplit_once('#')
+        && !topic.is_empty()
+    {
+        return topic.to_string();
+    }
+    if let Some((_, base)) = id.rsplit_once(':')
+        && !base.is_empty()
+    {
+        return base.to_string();
+    }
+    id.to_string()
+}
+
+/// Truncate `text` to at most `max_cols` display columns (unicode-width aware,
+/// so CJK/emoji don't overrun the row), collapsing to the first non-blank line
+/// and appending `…` when it overflows.
+fn truncate_display_width(text: &str, max_cols: usize) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let mut out = String::new();
+    let mut width = 0usize;
+    for ch in line.chars() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > max_cols {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out
 }
 
 /// `/rewind` turn picker. Unlike `/resume` this needs no async fetch — the
@@ -904,16 +963,29 @@ fn rewind_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         .rewind_turns
         .iter()
         .map(|row| {
+            // Label: `#{checkpoint}  {preview}`; description: relative datetime
+            // (when the source message carried one) + the explicit drop count.
+            let label = format!("#{}  {}", row.checkpoint, row.preview);
+            let description = match row.timestamp.as_deref() {
+                Some(timestamp) if !timestamp.is_empty() => {
+                    format!(
+                        "{} · drops {} turn(s)",
+                        crate::store::relative_time(timestamp),
+                        row.num_turns
+                    )
+                }
+                _ => format!("drops {} turn(s)", row.num_turns),
+            };
             MenuItem::new(
                 format!("rewind:{}", row.num_turns),
-                row.preview.clone(),
+                label,
                 MenuAction::Local(LocalAction::RewindToTurn {
                     session_id: session_id.clone(),
                     num_turns: row.num_turns,
                     prefill: row.prefill.clone(),
                 }),
             )
-            .with_description(format!("drops {} turn(s)", row.num_turns))
+            .with_description(description)
         })
         .collect();
 
@@ -925,7 +997,7 @@ fn rewind_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         tabs: Vec::new(),
         searchable: true,
         search_placeholder: Some("Search messages…".into()),
-        footer_hint: Some("Enter to rewind · Esc to close".into()),
+        footer_hint: Some("Enter rewind · /rewind <n> · Esc".into()),
         preview: None,
         mode: MenuMode::SingleSelect,
     })
@@ -6668,13 +6740,18 @@ mod tests {
                 id: "local:alpha".into(),
                 title: Some("Alpha".into()),
                 message_count: 5,
-                updated_at: Some("2026-07-01T00:00:00Z".into()),
+                // Ancient timestamp → the relative-time helper's deterministic
+                // date fallback, so this row assertion never drifts with wall
+                // clock. Recent-bucket rendering is covered separately below.
+                updated_at: Some("2020-05-01T00:00:00Z".into()),
+                last_prompt: Some("Draft the Q3 deck".into()),
             },
             crate::model::ResumeSessionRow {
                 id: "local:bravo".into(),
                 title: None,
                 message_count: 2,
                 updated_at: None,
+                last_prompt: None,
             },
         ];
         let capabilities = CapabilitySet::from_methods([methods::SESSION_LIST]);
@@ -6695,25 +6772,65 @@ mod tests {
         };
         assert!(spec.searchable, "the picker is searchable");
         assert_eq!(spec.items.len(), 2);
+        assert_eq!(
+            spec.footer_hint.as_deref(),
+            Some("Enter resume · /resume <id> · Esc")
+        );
 
-        // Row 0: titled, "N messages · <updated>" description, and a
-        // ResumeSession action carrying the session id.
+        // Row 0: `{short_id}  {prompt}` label (last_prompt wins over title),
+        // "<relative> · N msgs" description, ResumeSession action with the id.
         let alpha = &spec.items[0];
         assert_eq!(alpha.id, "local:alpha");
-        assert_eq!(alpha.label, "Alpha");
-        assert_eq!(
-            alpha.description.as_deref(),
-            Some("5 messages · 2026-07-01T00:00:00Z")
-        );
+        // Handle = the id's last segment (no `#topic` here → after the last
+        // `:`), so "alpha" — unique, unlike the old shared 6-char prefix.
+        assert_eq!(alpha.label, "alpha  Draft the Q3 deck");
+        assert_eq!(alpha.description.as_deref(), Some("2020-05-01 · 5 msgs"));
         assert!(matches!(
             &alpha.action,
             MenuAction::Local(LocalAction::ResumeSession(id)) if id == "local:alpha"
         ));
 
-        // Row 1: no title → label falls back to the id; no updated_at → bare count.
+        // Row 1: no prompt/title → "(no preview)"; no updated_at → bare count.
         let bravo = &spec.items[1];
-        assert_eq!(bravo.label, "local:bravo");
-        assert_eq!(bravo.description.as_deref(), Some("2 messages"));
+        assert_eq!(bravo.label, "bravo  (no preview)");
+        assert_eq!(bravo.description.as_deref(), Some("2 msgs"));
+    }
+
+    /// The resume row's description renders a recent `updated_at` through the
+    /// relative-time helper (not the raw timestamp), and the label leads with
+    /// the short id. Uses an offset from `now` well inside the "hours" bucket so
+    /// it stays deterministic across the test's runtime.
+    #[test]
+    fn resume_menu_row_shows_short_id_and_relative_time() {
+        let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let rows = vec![crate::model::ResumeSessionRow {
+            id: "dev:local:tui#alpha".into(),
+            title: None,
+            message_count: 3,
+            updated_at: Some(two_hours_ago),
+            last_prompt: Some("Investigate the flaky test".into()),
+        }];
+        let capabilities = CapabilitySet::from_methods([methods::SESSION_LIST]);
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                resume_sessions: &rows,
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) =
+            core_menu_registry().build(&MenuId::from(MENU_RESUME), &ctx)
+        else {
+            panic!("expected a ready resume menu");
+        };
+        let row = &spec.items[0];
+        // Handle is the TOPIC (`#alpha`), not a 6-char id prefix — unique and
+        // human-meaningful for canonical `channel:profile:base#topic` ids.
+        assert_eq!(row.label, "alpha  Investigate the flaky test");
+        assert_eq!(row.description.as_deref(), Some("2h ago · 3 msgs"));
     }
 
     #[test]
@@ -6745,16 +6862,26 @@ mod tests {
                 preview: "third question".into(),
                 num_turns: 1,
                 prefill: "third question in full".into(),
+                checkpoint: 1,
+                // Ancient timestamp → deterministic date fallback for the row
+                // assertion below (recent buckets are covered by the pure
+                // relative_time unit tests in store.rs).
+                timestamp: Some("2020-05-01T00:00:00Z".into()),
             },
             crate::model::RewindTurnRow {
                 preview: "second question".into(),
                 num_turns: 2,
                 prefill: "second question in full".into(),
+                checkpoint: 2,
+                // No timestamp → the description omits the datetime.
+                timestamp: None,
             },
             crate::model::RewindTurnRow {
                 preview: "first question".into(),
                 num_turns: 3,
                 prefill: "first question in full".into(),
+                checkpoint: 3,
+                timestamp: Some("2020-05-01T00:00:00Z".into()),
             },
         ];
         let capabilities = CapabilitySet::from_methods([methods::SESSION_ROLLBACK]);
@@ -6778,14 +6905,22 @@ mod tests {
         assert!(spec.searchable, "the picker is searchable");
         assert_eq!(spec.mode, MenuMode::SingleSelect);
         assert_eq!(spec.items.len(), 3);
+        assert_eq!(
+            spec.footer_hint.as_deref(),
+            Some("Enter rewind · /rewind <n> · Esc")
+        );
 
-        // Row 0 is the newest user message → num_turns 1 (drop the last
-        // exchange), label is the preview, description reports the drop count,
-        // and the action carries the source session + num_turns + the full
-        // prefill (dispatch refuses a pick whose session no longer matches).
+        // Row 0 is the newest user message → checkpoint #1 / num_turns 1 (drop
+        // the last exchange): `#N  preview` label, "<relative> · drops N turn(s)"
+        // description, and the action carries the source session + num_turns +
+        // the full prefill (dispatch refuses a pick whose session no longer
+        // matches).
         let newest = &spec.items[0];
-        assert_eq!(newest.label, "third question");
-        assert_eq!(newest.description.as_deref(), Some("drops 1 turn(s)"));
+        assert_eq!(newest.label, "#1  third question");
+        assert_eq!(
+            newest.description.as_deref(),
+            Some("2020-05-01 · drops 1 turn(s)")
+        );
         assert!(matches!(
             &newest.action,
             MenuAction::Local(LocalAction::RewindToTurn { session_id, num_turns, prefill })
@@ -6794,8 +6929,14 @@ mod tests {
                     && session_id == "local:test"
         ));
 
-        // The oldest user message is last → num_turns 3.
+        // Row 1 has no timestamp → the description omits the datetime.
+        let middle = &spec.items[1];
+        assert_eq!(middle.label, "#2  second question");
+        assert_eq!(middle.description.as_deref(), Some("drops 2 turn(s)"));
+
+        // The oldest user message is last → checkpoint #3 / num_turns 3.
         let oldest = &spec.items[2];
+        assert_eq!(oldest.label, "#3  first question");
         assert!(matches!(
             &oldest.action,
             MenuAction::Local(LocalAction::RewindToTurn { num_turns, .. }) if *num_turns == 3

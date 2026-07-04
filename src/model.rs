@@ -787,6 +787,11 @@ pub struct ResumeSessionRow {
     pub message_count: usize,
     #[serde(default)]
     pub updated_at: Option<String>,
+    /// First line of the session's most recent user prompt, used as the row's
+    /// codex-style preview. The server may or may not emit it (older builds
+    /// don't), so it defaults to `None` and the picker falls back to `title`.
+    #[serde(default)]
+    pub last_prompt: Option<String>,
 }
 
 /// One row in the `/rewind` turn picker, projected from the ACTIVE session's
@@ -802,6 +807,14 @@ pub struct RewindTurnRow {
     pub preview: String,
     pub num_turns: u32,
     pub prefill: String,
+    /// Codex-style checkpoint ordinal shown in the row (`#1` = newest). Equals
+    /// `num_turns` by construction; carried explicitly so the render layer and
+    /// `/rewind <n>` inline both speak in "checkpoint N" without re-deriving it.
+    pub checkpoint: u32,
+    /// RFC3339 timestamp of the user message this row rewinds to, for the row's
+    /// relative-time description. `Some` in practice (octos-core `Message`
+    /// always carries a `timestamp`); `None` only if a source ever omits it.
+    pub timestamp: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

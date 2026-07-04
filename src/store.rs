@@ -117,6 +117,63 @@ fn compact_first_line(value: &str, max_chars: usize) -> String {
     out
 }
 
+/// The topic segment (after `#`) of a canonical `channel:profile:base#topic`
+/// session id, or `None` when the id carries no topic. This is the
+/// human-facing `/resume <id>` handle (`short_session_id` shows it), matched
+/// exactly by `resolve_resume_session`.
+pub(crate) fn session_topic(id: &str) -> Option<&str> {
+    id.rsplit_once('#')
+        .map(|(_, topic)| topic)
+        .filter(|topic| !topic.is_empty())
+}
+
+/// Render an RFC3339 timestamp as a compact, codex-style relative time for menu
+/// rows: `"just now"` (< 1 min), `"5m ago"`, `"2h ago"`, `"3d ago"`, and
+/// anything a week or older falls back to the calendar date (`YYYY-MM-DD`).
+/// Unparseable input is returned verbatim (best-effort display — never panics).
+/// The time-dependent `Utc::now()` lookup is isolated here so the pure
+/// [`relative_time_from`] can be unit-tested deterministically.
+pub(crate) fn relative_time(rfc3339: &str) -> String {
+    relative_time_from(rfc3339, chrono::Utc::now())
+}
+
+/// Pure core of [`relative_time`]: bucket `rfc3339`'s age relative to `now`.
+/// Split out so tests can pin `now` and exercise every bucket without a clock.
+/// Future/clock-skewed timestamps read as `"just now"` rather than a negative
+/// age.
+fn relative_time_from(rfc3339: &str, now: chrono::DateTime<chrono::Utc>) -> String {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return rfc3339.to_string();
+    };
+    let then = parsed.with_timezone(&chrono::Utc);
+    let secs = now.signed_duration_since(then).num_seconds();
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3_600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3_600)
+    } else if secs < 7 * 86_400 {
+        format!("{}d ago", secs / 86_400)
+    } else {
+        then.format("%Y-%m-%d").to_string()
+    }
+}
+
+/// Outcome of resolving a `/resume <query>` argument against the fetched
+/// session list. Separating "ambiguous" from "no match" lets the dispatcher
+/// tell the user to disambiguate (rather than silently picking one, or
+/// dead-ending as if nothing matched).
+enum ResumeResolution {
+    /// Exactly one session resolved — switch to it.
+    Resolved(String),
+    /// A prefix matched more than one session id — list them so the user can
+    /// type a longer id.
+    Ambiguous(Vec<String>),
+    /// Nothing matched.
+    NoMatch,
+}
+
 /// Compact token-count for the compaction activity notice: `31200` -> `31.2k`,
 /// small counts stay verbatim.
 fn humanize_token_count(tokens: usize) -> String {
@@ -1196,12 +1253,20 @@ impl Store {
                     self.refresh_active_menu();
                     Some(AppUiCommand::ListSessions(SessionListParams {}))
                 } else {
-                    // `/resume <query>` shortcut: resolve to a session id by
-                    // case-insensitive substring match and switch directly,
-                    // reusing the same guard + hydrate path as a picker pick.
+                    // `/resume <query>` shortcut: resolve to a session id
+                    // (exact / prefix / substring) and switch directly, reusing
+                    // the same guard + hydrate path as a picker pick.
                     match self.resolve_resume_session(arg) {
-                        Some(id) => self.resume_session_command(id),
-                        None => {
+                        ResumeResolution::Resolved(id) => self.resume_session_command(id),
+                        ResumeResolution::Ambiguous(ids) => {
+                            self.state.status = format!(
+                                "\"{arg}\" matches {} sessions ({}); type more of the id to pick one.",
+                                ids.len(),
+                                ids.join(", ")
+                            );
+                            None
+                        }
+                        ResumeResolution::NoMatch => {
                             self.state.status = format!(
                                 "No prior session matches \"{arg}\"; run /resume with no argument to browse."
                             );
@@ -1212,14 +1277,16 @@ impl Store {
             }
             LocalAction::ResumeSession(id) => self.resume_session_command(id),
             LocalAction::OpenRewindPicker => {
+                let arg = inline_args.unwrap_or_default().trim();
                 // Guard: rewinding mid-turn would drop turns out from under a
                 // streaming reply (same guard as `/resume`). Refuse with a
-                // status line and open no menu.
+                // status line and open no menu — covers both the picker and the
+                // `/rewind <n>` inline shortcut.
                 if self.state.active_turn().is_some() {
                     self.state.status =
                         "Finish or stop the active turn before rewinding the conversation.".into();
                     None
-                } else {
+                } else if arg.is_empty() {
                     // No fetch needed: the user turns are already in the local
                     // transcript. Snapshot them (newest-first) and open the
                     // picker, which renders `Ready` immediately (or
@@ -1227,6 +1294,11 @@ impl Store {
                     self.state.rewind_turns = self.collect_rewind_turns();
                     self.open_menu(MenuId::from(crate::menu::registry::MENU_REWIND));
                     None
+                } else {
+                    // `/rewind <n>` shortcut: roll back to checkpoint `n`
+                    // directly, reusing the same validate + dispatch path as
+                    // picking that row.
+                    self.rewind_inline_command(arg)
                 }
             }
             LocalAction::RewindToTurn {
@@ -1244,11 +1316,54 @@ impl Store {
         SlashDispatchOutcome::accepted(command)
     }
 
-    /// Case-insensitive substring resolve of a `/resume <query>` argument to a
-    /// known session id. Scans `resume_sessions` in its current (newest-first)
-    /// order, matching the id and the optional title, and returns the first
-    /// hit. `None` when nothing matches (or the list has not been fetched yet).
-    fn resolve_resume_session(&self, query: &str) -> Option<String> {
+    /// Resolve a `/resume <query>` argument to a known session id, in priority
+    /// order: (a) an exact session-id match, (b) a session-id PREFIX match (so
+    /// the short id shown in a picker row resolves; >1 prefix hit is ambiguous
+    /// and reported rather than guessed), then (c) a case-insensitive substring
+    /// over the id / title / last prompt (fuzzy fallback, first hit wins).
+    /// Scans `resume_sessions` in its current (newest-first) order.
+    fn resolve_resume_session(&self, query: &str) -> ResumeResolution {
+        // (a) Exact id — an unambiguous win regardless of any looser matches.
+        if let Some(row) = self
+            .state
+            .resume_sessions
+            .iter()
+            .find(|row| row.id == query)
+        {
+            return ResumeResolution::Resolved(row.id.clone());
+        }
+        // (b) Exact TOPIC — the row handle shown to the user is the session
+        // topic (`…#<topic>`, see `short_session_id`), so `/resume <topic>`
+        // lands here. Unique per base; >1 (same topic, different base) is
+        // ambiguous and reported rather than guessed.
+        let topic_hits: Vec<String> = self
+            .state
+            .resume_sessions
+            .iter()
+            .filter(|row| session_topic(&row.id) == Some(query))
+            .map(|row| row.id.clone())
+            .collect();
+        match topic_hits.len() {
+            0 => {}
+            1 => return ResumeResolution::Resolved(topic_hits.into_iter().next().unwrap()),
+            _ => return ResumeResolution::Ambiguous(topic_hits),
+        }
+        // (c) Id prefix — a raw id prefix (e.g. pasting the head of a full id).
+        // One hit resolves; more than one is ambiguous (list the candidates
+        // instead of silently picking one).
+        let prefix_hits: Vec<String> = self
+            .state
+            .resume_sessions
+            .iter()
+            .filter(|row| row.id.starts_with(query))
+            .map(|row| row.id.clone())
+            .collect();
+        match prefix_hits.len() {
+            0 => {}
+            1 => return ResumeResolution::Resolved(prefix_hits.into_iter().next().unwrap()),
+            _ => return ResumeResolution::Ambiguous(prefix_hits),
+        }
+        // (c) Case-insensitive substring over id / title / last prompt.
         let needle = query.to_lowercase();
         self.state
             .resume_sessions
@@ -1259,8 +1374,13 @@ impl Store {
                         .title
                         .as_deref()
                         .is_some_and(|title| title.to_lowercase().contains(&needle))
+                    || row
+                        .last_prompt
+                        .as_deref()
+                        .is_some_and(|prompt| prompt.to_lowercase().contains(&needle))
             })
-            .map(|row| row.id.clone())
+            .map(|row| ResumeResolution::Resolved(row.id.clone()))
+            .unwrap_or(ResumeResolution::NoMatch)
     }
 
     /// Switch the active session to `session_id` and hydrate its transcript via
@@ -1338,12 +1458,20 @@ impl Store {
             .filter(|message| message.role.as_str() == "user")
             .rev()
             .enumerate()
-            .map(|(index, message)| RewindTurnRow {
-                // `compact_first_line` = first non-empty line, trimmed and
-                // char-truncated (UTF-8 safe) for the row label.
-                preview: compact_first_line(&message.content, 60),
-                num_turns: (index as u32) + 1,
-                prefill: message.content.clone(),
+            .map(|(index, message)| {
+                let num_turns = (index as u32) + 1;
+                RewindTurnRow {
+                    // `compact_first_line` = first non-empty line, trimmed and
+                    // char-truncated (UTF-8 safe) for the row label.
+                    preview: compact_first_line(&message.content, 60),
+                    num_turns,
+                    prefill: message.content.clone(),
+                    // Checkpoint ordinal shown as `#N` equals `num_turns`.
+                    checkpoint: num_turns,
+                    // octos-core `Message` always carries a `timestamp`; render
+                    // it as the row's relative-time description.
+                    timestamp: Some(message.timestamp.to_rfc3339()),
+                }
             })
             .collect()
     }
@@ -1399,6 +1527,45 @@ impl Store {
             session_id,
             num_turns,
         }))
+    }
+
+    /// Handle `/rewind <n>` (the inline shortcut for picking checkpoint `n`).
+    /// The active-turn guard has already run in the dispatcher. `n` is the
+    /// checkpoint ordinal (`= num_turns`): it must parse as a positive integer
+    /// and index a checkpoint in the CURRENT transcript (`1..=turn_count`). A
+    /// non-integer, `0`, or out-of-range `n` reports a status line and rolls
+    /// back nothing; a valid `n` dispatches through `rewind_to_turn_command`
+    /// (the exact same path as a picker pick, so its guards apply too).
+    fn rewind_inline_command(&mut self, arg: &str) -> Option<AppUiCommand> {
+        let Ok(n) = arg.parse::<u32>() else {
+            self.state.status =
+                format!("/rewind expects a checkpoint number like /rewind 2 (got \"{arg}\").");
+            return None;
+        };
+        if n == 0 {
+            self.state.status = "/rewind needs a checkpoint of 1 or more.".into();
+            return None;
+        }
+        // Validate against the CURRENT transcript, not a stale snapshot.
+        let rows = self.collect_rewind_turns();
+        let turn_count = rows.len();
+        let Some(row) = rows.get((n as usize) - 1) else {
+            self.state.status = format!(
+                "/rewind {n} is out of range — this session has {turn_count} checkpoint(s)."
+            );
+            return None;
+        };
+        let num_turns = row.num_turns;
+        let prefill = row.prefill.clone();
+        let Some(session_id) = self
+            .state
+            .active_session()
+            .map(|session| session.id.0.clone())
+        else {
+            self.state.status = "No active session to rewind.".into();
+            return None;
+        };
+        self.rewind_to_turn_command(session_id, num_turns, prefill)
     }
 
     /// `/lang <code>` — switch the UI display language at runtime. Empty arg
@@ -9439,12 +9606,14 @@ mod tests {
                 title: Some("Alpha deck".into()),
                 message_count: 4,
                 updated_at: None,
+                last_prompt: None,
             },
             ResumeSessionRow {
                 id: "coding:api:bravo".into(),
                 title: None,
                 message_count: 1,
                 updated_at: None,
+                last_prompt: None,
             },
         ];
 
@@ -9458,6 +9627,132 @@ mod tests {
                 assert_eq!(params.session_id, SessionKey("coding:api:alpha".into()));
             }
             other => panic!("expected inline /resume to hydrate the match, got {other:?}"),
+        }
+    }
+
+    /// Seed a loaded resume list with two ids sharing a prefix, for the
+    /// exact / prefix / ambiguous / substring resolution tests.
+    fn store_with_two_resume_sessions() -> Store {
+        let mut store = store_with_empty_session();
+        store.state.resume_list_loaded = true;
+        store.state.resume_sessions = vec![
+            ResumeSessionRow {
+                id: "coding:api:alpha".into(),
+                title: Some("Alpha deck".into()),
+                message_count: 4,
+                updated_at: None,
+                last_prompt: Some("Draft the launch plan".into()),
+            },
+            ResumeSessionRow {
+                id: "coding:api:bravo".into(),
+                title: None,
+                message_count: 1,
+                updated_at: None,
+                last_prompt: None,
+            },
+        ];
+        store
+    }
+
+    #[test]
+    fn resume_inline_topic_handle_resolves() {
+        // The handle shown in a row is the TOPIC (`…#<topic>`). `/resume
+        // <topic>` must resolve it — unique per base, ambiguous only when two
+        // sessions share a topic across bases (codex P2: 6-char prefix collided).
+        let mut store = store_with_empty_session();
+        store.state.resume_list_loaded = true;
+        store.state.resume_sessions = vec![
+            ResumeSessionRow {
+                id: "dev:local:tui#coding".into(),
+                title: None,
+                message_count: 3,
+                updated_at: None,
+                last_prompt: Some("wire the parser".into()),
+            },
+            ResumeSessionRow {
+                id: "dev:local:tui#research".into(),
+                title: None,
+                message_count: 2,
+                updated_at: None,
+                last_prompt: None,
+            },
+        ];
+        // Both share the `dev:local:tui` prefix (the old 6-char handle
+        // `dev:lo` was ambiguous), but the topic handle resolves uniquely.
+        let command = store
+            .dispatch_local_action(LocalAction::OpenResumePicker, Some("research"))
+            .into_command();
+        match command {
+            Some(AppUiCommand::HydrateSession(params)) => {
+                assert_eq!(
+                    params.session_id,
+                    SessionKey("dev:local:tui#research".into())
+                );
+            }
+            other => panic!("expected topic `research` to hydrate its session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_inline_exact_id_resolves() {
+        let mut store = store_with_two_resume_sessions();
+        let command = store
+            .dispatch_local_action(LocalAction::OpenResumePicker, Some("coding:api:bravo"))
+            .into_command();
+        match command {
+            Some(AppUiCommand::HydrateSession(params)) => {
+                assert_eq!(params.session_id, SessionKey("coding:api:bravo".into()));
+            }
+            other => panic!("expected an exact id to hydrate bravo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_inline_unique_prefix_resolves() {
+        let mut store = store_with_two_resume_sessions();
+        // The short id shown in the row is a prefix; a unique prefix resolves.
+        let command = store
+            .dispatch_local_action(LocalAction::OpenResumePicker, Some("coding:api:al"))
+            .into_command();
+        match command {
+            Some(AppUiCommand::HydrateSession(params)) => {
+                assert_eq!(params.session_id, SessionKey("coding:api:alpha".into()));
+            }
+            other => panic!("expected a unique prefix to hydrate alpha, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_inline_ambiguous_prefix_is_reported_not_resolved() {
+        let mut store = store_with_two_resume_sessions();
+        // `coding:api:` prefixes BOTH ids → ambiguous: no switch, and the
+        // status lists the candidates so the user can disambiguate.
+        let command = store
+            .dispatch_local_action(LocalAction::OpenResumePicker, Some("coding:api:"))
+            .into_command();
+        assert!(command.is_none(), "an ambiguous prefix must not switch");
+        assert!(
+            store.state.status.contains("matches 2 sessions")
+                && store.state.status.contains("coding:api:alpha")
+                && store.state.status.contains("coding:api:bravo"),
+            "ambiguous status must list the candidates, got: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn resume_inline_substring_falls_back_over_prompt_and_title() {
+        let mut store = store_with_two_resume_sessions();
+        // No id starts with "launch", but alpha's last_prompt contains it →
+        // the substring fallback resolves to alpha.
+        let command = store
+            .dispatch_local_action(LocalAction::OpenResumePicker, Some("LAUNCH"))
+            .into_command();
+        match command {
+            Some(AppUiCommand::HydrateSession(params)) => {
+                assert_eq!(params.session_id, SessionKey("coding:api:alpha".into()));
+            }
+            other => panic!("expected a prompt substring to hydrate alpha, got {other:?}"),
         }
     }
 
@@ -9827,6 +10122,7 @@ mod tests {
             title: Some(id.to_uppercase()),
             message_count: 1,
             updated_at: None,
+            last_prompt: None,
         };
         let mut store = store_with_empty_session();
         store.state.resume_list_loaded = true;
@@ -9961,6 +10257,120 @@ mod tests {
         assert_eq!(turns[0].prefill, "third question");
         assert_eq!(turns[2].num_turns, 3);
         assert_eq!(turns[2].preview, "first question");
+    }
+
+    #[test]
+    fn collect_rewind_turns_populates_checkpoint_and_timestamp() {
+        let store = store_with_user_turns(&["first question", "second question"]);
+        let turns = store.collect_rewind_turns();
+        assert_eq!(turns.len(), 2);
+        // checkpoint mirrors num_turns (the `#N` ordinal shown in the row).
+        assert_eq!(turns[0].checkpoint, 1);
+        assert_eq!(turns[1].checkpoint, 2);
+        // octos-core `Message` always carries a timestamp, so every row has one.
+        assert!(
+            turns.iter().all(|row| row.timestamp.is_some()),
+            "each rewind row carries the user message timestamp"
+        );
+    }
+
+    #[test]
+    fn rewind_inline_dispatches_rollback_for_a_valid_checkpoint() {
+        let mut store = store_with_user_turns(&["first question", "second question"]);
+
+        // `/rewind 2` targets checkpoint 2 (the oldest of the two) → drop 2 turns.
+        let command = store
+            .dispatch_local_action(LocalAction::OpenRewindPicker, Some("2"))
+            .into_command();
+
+        match command {
+            Some(AppUiCommand::SessionRollback(params)) => {
+                assert_eq!(params.session_id, SessionKey("local:test".into()));
+                assert_eq!(params.num_turns, 2);
+            }
+            other => panic!("expected /rewind 2 to dispatch SessionRollback, got {other:?}"),
+        }
+        assert_eq!(
+            store.state.pending_rewind_prefill,
+            Some((SessionKey("local:test".into()), "first question".into())),
+            "the targeted message is stashed for restore after the rollback lands"
+        );
+    }
+
+    #[test]
+    fn rewind_inline_rejects_zero() {
+        let mut store = store_with_user_turns(&["first question", "second question"]);
+        let command = store
+            .dispatch_local_action(LocalAction::OpenRewindPicker, Some("0"))
+            .into_command();
+        assert!(command.is_none(), "/rewind 0 must roll back nothing");
+        assert!(
+            store.state.status.contains("1 or more"),
+            "status explains the minimum, got: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn rewind_inline_rejects_non_integer() {
+        let mut store = store_with_user_turns(&["first question", "second question"]);
+        let command = store
+            .dispatch_local_action(LocalAction::OpenRewindPicker, Some("abc"))
+            .into_command();
+        assert!(command.is_none(), "/rewind abc must roll back nothing");
+        assert!(
+            store.state.status.contains("checkpoint number"),
+            "status explains the expected form, got: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn rewind_inline_rejects_out_of_range() {
+        let mut store = store_with_user_turns(&["first question", "second question"]);
+        let command = store
+            .dispatch_local_action(LocalAction::OpenRewindPicker, Some("99"))
+            .into_command();
+        assert!(command.is_none(), "/rewind 99 must roll back nothing");
+        assert!(
+            store.state.status.contains("out of range"),
+            "status explains the range, got: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn rewind_inline_is_refused_while_a_turn_is_active() {
+        let mut store = store_with_live_reply(TurnId::new(), "streaming");
+        let command = store
+            .dispatch_local_action(LocalAction::OpenRewindPicker, Some("1"))
+            .into_command();
+        assert!(command.is_none(), "no rollback dispatches mid-turn");
+        assert!(
+            store.state.status.contains("Finish or stop"),
+            "the active-turn guard covers /rewind <n> too, got: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn relative_time_from_buckets_each_age() {
+        // Pin `now` so every bucket is deterministic (the wrapper's `Utc::now`
+        // is exercised indirectly by the menu-render tests).
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-04T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let at = |rfc: &str| relative_time_from(rfc, now);
+
+        assert_eq!(at("2026-07-04T11:59:30Z"), "just now"); // 30s
+        assert_eq!(at("2026-07-04T11:55:00Z"), "5m ago"); // 5m
+        assert_eq!(at("2026-07-04T10:00:00Z"), "2h ago"); // 2h
+        assert_eq!(at("2026-07-01T12:00:00Z"), "3d ago"); // 3d
+        assert_eq!(at("2026-06-01T00:00:00Z"), "2026-06-01"); // > a week → date
+        // Future timestamps read as "just now" rather than a negative age.
+        assert_eq!(at("2026-07-04T13:00:00Z"), "just now");
+        // Unparseable input is echoed back verbatim.
+        assert_eq!(at("not-a-timestamp"), "not-a-timestamp");
     }
 
     #[test]
