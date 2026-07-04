@@ -20453,7 +20453,8 @@ mod tests {
             }),
         }));
         assert_eq!(store.state.activity.len(), 1);
-        assert!(store.state.activity[0].status.to_lowercase().contains("no"));
+        assert_eq!(store.state.activity[0].title, "agent list");
+        assert_eq!(store.state.activity[0].status, "No active agents");
         assert!(store.state.status.contains("0 agent"));
     }
 

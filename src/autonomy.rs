@@ -213,7 +213,7 @@ impl std::fmt::Display for AutonomyParseError {
             }
             Self::InvalidSpawnCount(raw) => write!(
                 f,
-                "spawn count must be a positive integer, got \"{raw}\""
+                "spawn count must be a positive integer, got `{raw}`"
             ),
             Self::EmptySpawnPrompt => {
                 f.write_str("/agents spawn requires a prompt after the count")
@@ -302,7 +302,7 @@ fn parse_agents_spawn(args: &str) -> Result<AgentsCommand, AutonomyParseError> {
     if count == 0 {
         return Err(AutonomyParseError::InvalidSpawnCount(count_token.to_string()));
     }
-    let prompt = prompt_rest.trim().to_string();
+    let prompt = prompt_rest.to_string();
     if prompt.is_empty() {
         return Err(AutonomyParseError::EmptySpawnPrompt);
     }
