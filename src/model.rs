@@ -7071,12 +7071,13 @@ pub fn activity_status_is_running(status: &str) -> bool {
 ///
 /// The server's `background_task_agent_status` emits `running` / `completed` /
 /// `failed` / `interrupted` (the last is the wire form of a cancelled task).
+/// `done` is the alternate terminal wire value used by some agent backends.
 /// Used by the stuck-chip reconcile so a task whose terminal `task/updated`
 /// never arrived (per-turn channel torn down) still flips off "Orchestrating…"
 /// once the durable terminal agent record lands.
 pub fn terminal_task_state_from_agent_status(status: &str) -> Option<TaskRuntimeState> {
     match status {
-        "completed" => Some(TaskRuntimeState::Completed),
+        "completed" | "done" => Some(TaskRuntimeState::Completed),
         "failed" => Some(TaskRuntimeState::Failed),
         "interrupted" | "cancelled" => Some(TaskRuntimeState::Cancelled),
         _ => None,

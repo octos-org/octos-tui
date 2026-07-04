@@ -4752,7 +4752,6 @@ impl Store {
         use crate::client_event::AutonomyResult;
         match event.result {
             AutonomyResult::AgentList(result) => {
-                let count = result.agents.len();
                 // Stuck-chip reconnect safety net: on session reopen the
                 // `agent/list` snapshot carries the authoritative terminal
                 // status for each background agent. Reconcile any stale
@@ -4763,6 +4762,16 @@ impl Store {
                 for agent in &result.agents {
                     self.reconcile_task_from_agent_record(&result.session_id, agent);
                 }
+                // Count only non-terminal agents so the reported count goes to
+                // 0 once all spawned agents complete (rather than staying at N
+                // forever because terminal agents are still in the list).
+                let count = result
+                    .agents
+                    .iter()
+                    .filter(|a| {
+                        crate::model::terminal_task_state_from_agent_status(&a.status).is_none()
+                    })
+                    .count();
                 if result.agents.is_empty() {
                     self.state.push_activity(ActivityItem::new(
                         ActivityKind::Progress,
@@ -20651,7 +20660,8 @@ mod tests {
             .session_autonomy_for(&session_id)
             .expect("mirror");
         assert_eq!(mirror.agents.len(), 2);
-        assert!(store.state.status.contains("2 agent"));
+        // "done" is terminal — only the 1 "running" reviewer is active.
+        assert!(store.state.status.contains("1 agent"));
 
         // One chip per agent.
         assert_eq!(store.state.activity.len(), 2);
@@ -20667,6 +20677,62 @@ mod tests {
         assert_eq!(coder_chip.title, "cod");
         assert_eq!(coder_chip.status, "done");
         assert_eq!(coder_chip.detail.as_deref(), Some("coder"));
+    }
+
+    #[test]
+    fn agent_list_count_goes_to_zero_when_all_terminal() {
+        // Regression: when every agent in the list is in a terminal state the
+        // status bar must report "0 agent(s)", not the total agent count.
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        use octos_core::ui_protocol::UiAgentRecord;
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+
+        let make_agent = |id: &str, status: &str| UiAgentRecord {
+            agent_id: id.into(),
+            parent_agent_id: None,
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "/root".into(),
+            role: "worker".into(),
+            nickname: id.into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: status.into(),
+            last_task: None,
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::AgentList(crate::model::AgentListResult {
+                session_id: session_id.clone(),
+                agents: vec![
+                    make_agent("ag-1", "completed"),
+                    make_agent("ag-2", "done"),
+                    make_agent("ag-3", "failed"),
+                ],
+            }),
+        }));
+
+        assert!(
+            store.state.status.contains("0 agent"),
+            "all-terminal agent list must report 0 active agents, got: {}",
+            store.state.status
+        );
+        // All three agents still stored in the mirror.
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror");
+        assert_eq!(mirror.agents.len(), 3);
     }
 
     #[test]
