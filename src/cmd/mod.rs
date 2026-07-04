@@ -137,6 +137,9 @@ struct DoctorCli {
     /// WS endpoint to record for the connectivity check.
     #[arg(long = "endpoint", value_name = "WS_URL")]
     endpoint: Option<String>,
+    /// Bearer token for UI Protocol authentication. Falls back to OCTOS_AUTH_TOKEN.
+    #[arg(long = "auth-token", value_name = "TOKEN")]
+    auth_token: Option<String>,
     /// Data dir to check (defaults to ~/.octos).
     #[arg(long = "data-dir", value_name = "DIR")]
     data_dir: Option<std::path::PathBuf>,
@@ -150,6 +153,7 @@ impl DoctorCli {
             strict: self.strict,
             stdio_command: self.stdio_command,
             endpoint: self.endpoint,
+            auth_token: self.auth_token,
             data_dir: self.data_dir,
         }
     }
