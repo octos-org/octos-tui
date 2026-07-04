@@ -755,6 +755,9 @@ impl Store {
                     agent_id,
                 }))
             }
+            // Dispatch for /agents spawn is deferred until the backend
+            // exposes an agent/spawn Octos UI method.
+            AgentsCommand::Spawn { .. } => None,
         }
     }
 
@@ -4738,6 +4741,33 @@ impl Store {
                 // disconnected.
                 for agent in &result.agents {
                     self.reconcile_task_from_agent_record(&result.session_id, agent);
+                }
+                if result.agents.is_empty() {
+                    self.state.push_activity(ActivityItem::new(
+                        ActivityKind::Progress,
+                        t!("status.activity_agent_list").into_owned(),
+                        t!("status.no_agents").into_owned(),
+                    ));
+                } else {
+                    for agent in &result.agents {
+                        let title = agent
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| agent.nickname.clone());
+                        let detail = agent
+                            .summary
+                            .clone()
+                            .or_else(|| agent.last_task.clone())
+                            .unwrap_or_else(|| agent.role.clone());
+                        self.state.push_activity(
+                            ActivityItem::new(
+                                ActivityKind::Progress,
+                                title,
+                                agent.status.clone(),
+                            )
+                            .with_detail(detail),
+                        );
+                    }
                 }
                 self.state
                     .set_session_agents(&result.session_id, result.agents);
@@ -20405,6 +20435,114 @@ mod tests {
             .expect("mirror");
         assert_eq!(mirror.agents.len(), 1);
         assert!(store.state.status.contains("1 agent"));
+        // Each agent in the list result must produce an activity chip so the
+        // user sees the agents in the transcript, not only the status bar.
+        assert_eq!(store.state.activity.len(), 1);
+        assert_eq!(store.state.activity[0].status, "running");
+    }
+
+    #[test]
+    fn autonomy_agent_list_empty_pushes_no_agents_chip() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::AgentList(crate::model::AgentListResult {
+                session_id: session_id.clone(),
+                agents: vec![],
+            }),
+        }));
+        assert_eq!(store.state.activity.len(), 1);
+        assert!(store.state.activity[0].status.to_lowercase().contains("no"));
+        assert!(store.state.status.contains("0 agent"));
+    }
+
+    #[test]
+    fn autonomy_agent_list_non_empty_shows_chip_per_agent() {
+        // Scenario: a loop is running and the backend has spawned two agents —
+        // a reviewer (running, has a title and summary) and a coder (done,
+        // falls back to nickname/role). `/agents list` returns both; we verify
+        // that one activity chip appears per agent with the correct fields, and
+        // that both are stored in the session mirror.
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        use octos_core::ui_protocol::UiAgentRecord;
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+
+        let reviewer = UiAgentRecord {
+            agent_id: "ag-reviewer".into(),
+            parent_agent_id: None,
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "/root".into(),
+            role: "reviewer".into(),
+            nickname: "rev".into(),
+            title: Some("Code Reviewer".into()),
+            backend_kind: "native".into(),
+            status: "running".into(),
+            last_task: None,
+            summary: Some("Reviewing PR #42".into()),
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        let coder = UiAgentRecord {
+            agent_id: "ag-coder".into(),
+            parent_agent_id: None,
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "/root".into(),
+            role: "coder".into(),
+            nickname: "cod".into(),
+            title: None,    // falls back to nickname
+            backend_kind: "native".into(),
+            status: "done".into(),
+            last_task: None,
+            summary: None,  // falls back to role
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 3,
+            updated_at_ms: 4,
+        };
+
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::AgentList(crate::model::AgentListResult {
+                session_id: session_id.clone(),
+                agents: vec![reviewer, coder],
+            }),
+        }));
+
+        // Both agents stored in the mirror.
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror");
+        assert_eq!(mirror.agents.len(), 2);
+        assert!(store.state.status.contains("2 agent"));
+
+        // One chip per agent.
+        assert_eq!(store.state.activity.len(), 2);
+
+        // Reviewer chip uses explicit title and summary.
+        let reviewer_chip = &store.state.activity[0];
+        assert_eq!(reviewer_chip.title, "Code Reviewer");
+        assert_eq!(reviewer_chip.status, "running");
+        assert_eq!(reviewer_chip.detail.as_deref(), Some("Reviewing PR #42"));
+
+        // Coder chip falls back to nickname (title absent) and role (summary absent).
+        let coder_chip = &store.state.activity[1];
+        assert_eq!(coder_chip.title, "cod");
+        assert_eq!(coder_chip.status, "done");
+        assert_eq!(coder_chip.detail.as_deref(), Some("coder"));
     }
 
     #[test]
