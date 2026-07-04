@@ -5155,6 +5155,23 @@ impl AppState {
             .expect("just pushed autonomy entry")
     }
 
+    /// Loop counts `(active, paused)` for `session_id`'s autonomy mirror.
+    /// Drives the status-bar loop chip: an ACTIVE loop fires real model
+    /// turns on an interval, which the operator must be able to see at a
+    /// glance (a forgotten loop otherwise burns tokens invisibly).
+    pub fn session_loop_counts(&self, session_id: &SessionKey) -> (usize, usize) {
+        let Some(entry) = self
+            .session_autonomy
+            .iter()
+            .find(|entry| &entry.session_id == session_id)
+        else {
+            return (0, 0);
+        };
+        let active = entry.loops.iter().filter(|l| l.status == "active").count();
+        let paused = entry.loops.iter().filter(|l| l.status == "paused").count();
+        (active, paused)
+    }
+
     /// Replace the entire agent list for a session. Used by the
     /// `agent/list` response and after reconnect-hydration.
     pub fn set_session_agents(

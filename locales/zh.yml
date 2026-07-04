@@ -88,6 +88,8 @@ app:
     retrying_attempt: "重试中（第 %{attempt} 次）"
     retrying: "重试中"
     msgs_tasks: "%{msgs} 条消息/%{tasks} 个任务"
+    loops_active: "⟳ %{count} 个活动循环 — /loop pause 可停止"
+    loops_paused: "%{count} 个已暂停循环 — /loop resume 可恢复"
     background_tasks: "%{count} 个后台任务"
     ps_to_view: "/ps 查看"
     esc_interrupt: "Esc 中断"

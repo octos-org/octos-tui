@@ -7129,6 +7129,26 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
             .into_owned()
         })
         .unwrap_or_else(|| t!("app.status.no_session").to_string());
+    // Loop chip: an ACTIVE loop fires real model turns on an interval —
+    // the operator must see that at a glance, or a forgotten loop burns
+    // tokens invisibly (it only ever showed in the server log). Paused
+    // loops (e.g. parked by the solo-boot safety) surface too so the
+    // operator knows `/loop resume` is available.
+    let loop_chip = app
+        .active_session()
+        .map(|session| app.session_loop_counts(&session.id))
+        .filter(|(active, paused)| *active > 0 || *paused > 0)
+        .map(|(active, paused)| {
+            if active > 0 {
+                t!("app.statusbar.loops_active", count = active).into_owned()
+            } else {
+                t!("app.statusbar.loops_paused", count = paused).into_owned()
+            }
+        });
+    let context = match loop_chip {
+        Some(chip) => format!("{context} | {chip}"),
+        None => context,
+    };
     let work = status_bar_work_text(app);
     let key_hint = hint_bar_text(hint_bar_model(app));
 
@@ -10169,6 +10189,64 @@ mod tests {
         assert!(text.contains("running"));
         assert!(text.contains("approval"));
         assert!(text.contains("1 msgs/0 tasks"));
+    }
+
+    /// An armed loop fires real model turns on an interval — the status bar
+    /// must say so at a glance (a forgotten loop otherwise burns tokens
+    /// invisibly). Paused loops surface too so `/loop resume` is
+    /// discoverable.
+    #[test]
+    fn status_bar_shows_loop_chip_when_session_has_loops() {
+        fn loop_record(status: &str) -> octos_core::ui_protocol::UiLoopRecord {
+            serde_json::from_value(serde_json::json!({
+                "loop_id": "loop-1",
+                "session_id": "local:loops",
+                "prompt": "keep poking",
+                "mode": "interval",
+                "interval_seconds": 60,
+                "status": status,
+                "expires_at_ms": 0,
+                "created_at_ms": 0,
+                "updated_at_ms": 0,
+            }))
+            .expect("loop record")
+        }
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:loops".into()),
+                title: "loops".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let session_id = SessionKey("local:loops".into());
+
+        app.set_session_loops(&session_id, vec![loop_record("active")]);
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("1 active loop"),
+            "active loop chip missing: {text}"
+        );
+
+        app.set_session_loops(&session_id, vec![loop_record("paused")]);
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("1 paused loop"),
+            "paused loop chip missing: {text}"
+        );
+
+        app.set_session_loops(&session_id, vec![]);
+        let text = rendered_text(&app);
+        assert!(
+            !text.contains("loop(s)"),
+            "chip must vanish with no loops: {text}"
+        );
     }
 
     #[test]
