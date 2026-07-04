@@ -623,7 +623,9 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             // advertising `session/rollback`.
             availability: CommandAvailability::app_ui_mutating(&[])
                 .with_required_methods_any(APPUI_REWIND_MENU_METHODS_ANY),
-            inline_args: InlineArgMode::None,
+            // `Optional` so `/rewind <n>` rolls back to checkpoint `n` inline
+            // (bare `/rewind` still opens the picker).
+            inline_args: InlineArgMode::Optional,
             entry: CommandEntry::LocalAction(LocalAction::OpenRewindPicker),
         },
         CommandSpec {
