@@ -909,8 +909,6 @@ status:
   refreshing_agent_list: "正在刷新智能体列表"
   spawning_agents: "正在派遣 %{count} 个智能体：%{prompt}"
   spawn_agents_turn: "派遣 %{count} 个智能体并行完成：%{prompt}"
-  spawn_count_invalid: "派遣数量必须为正整数，收到 `%{raw}`"
-  spawn_prompt_empty: "/agents spawn 需要在数量后面提供提示语"
   reading_agent_status: "正在读取 %{id} 的状态"
   reading_agent_output: "正在读取 %{id} 的输出"
   listing_agent_artifacts: "正在列出 %{id} 的制品"
