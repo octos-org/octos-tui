@@ -205,6 +205,14 @@ pub struct ProtocolAppUiBackend {
     connection_state: ProtocolConnectionState,
     reconnect: ReconnectBackoff,
     disconnected_status_reported: bool,
+    /// The session to re-open after a reconnect: the MOST RECENTLY opened
+    /// session, which tracks the user's current selection (set by `/resume`, a
+    /// tab-switch, or the initial launch open) — NOT the fixed launch
+    /// `--session`. Reopening the launch session instead silently yanked the
+    /// selection back to it (and, with no launch `--session`, never re-opened
+    /// the current session at all). Falls back to the launch session when
+    /// nothing has been opened yet.
+    reopen_session: Option<SessionOpenParams>,
     refresh_capabilities_on_reconnect: bool,
     queue: VecDeque<ClientEvent>,
     protocol: ProtocolExchange,
@@ -1388,6 +1396,7 @@ impl ProtocolAppUiBackend {
             connection_state: ProtocolConnectionState::Disconnected,
             reconnect: ReconnectBackoff::default(),
             disconnected_status_reported: false,
+            reopen_session: None,
             refresh_capabilities_on_reconnect: false,
             queue: VecDeque::new(),
             protocol: ProtocolExchange::default(),
@@ -1476,6 +1485,13 @@ impl ProtocolAppUiBackend {
         }
 
         self.ensure_driver()?;
+        // Compute the reconnect reopen target BEFORE borrowing `driver` mutably
+        // (and before `mark_connected` clears `disconnected_status_reported`).
+        let reopen_command = if self.disconnected_status_reported {
+            self.reopen_session_open_command()
+        } else {
+            None
+        };
         let runtime = self
             .runtime
             .as_ref()
@@ -1485,8 +1501,6 @@ impl ProtocolAppUiBackend {
             .as_mut()
             .ok_or_else(|| eyre!("UI protocol transport driver is not initialized"))?;
 
-        let should_reopen_session =
-            self.disconnected_status_reported && self.launch.session_id.is_some();
         if let Err(err) = driver.connect(runtime) {
             self.reconnect.record_failure(now);
             return Err(err);
@@ -1495,8 +1509,8 @@ impl ProtocolAppUiBackend {
         let endpoint = driver.label().to_string();
         self.mark_connected(&endpoint);
         self.refresh_capabilities_after_reconnect()?;
-        if should_reopen_session {
-            self.send_launch_session_open()?;
+        if let Some(command) = reopen_command {
+            self.send(command)?;
         }
         Ok(())
     }
@@ -1575,11 +1589,53 @@ impl ProtocolAppUiBackend {
         })
     }
 
-    fn send_launch_session_open(&mut self) -> Result<()> {
-        let Some(command) = self.launch_session_open_command() else {
-            return Ok(());
+    /// Record the reconnect reopen target from an outgoing command so a
+    /// reconnect re-opens the user's CURRENT session, not the fixed launch
+    /// `--session`.
+    ///
+    /// Both `OpenSession` (initial launch open, explicit open) and
+    /// `HydrateSession` (the `/resume` path — store.rs returns a
+    /// `HydrateSession`, never an `OpenSession`) mark the session the user has
+    /// switched their attention to. The reconnect always re-subscribes via
+    /// `OpenSession`, so a recorded `HydrateSession` is stored as an
+    /// `OpenSession` carrying the launch profile/cwd (a hydrate request does not
+    /// carry them; the server keys an existing session on its id).
+    ///
+    /// The resume cursor is reset — `command_with_resume_cursor` refills it from
+    /// `session_cursors` at reopen time so we resume from the latest seq rather
+    /// than a stale one captured here.
+    ///
+    /// Known gap: a purely-local session-pane tab-switch to an already-loaded
+    /// session sends no command, so the transport cannot observe it here; a
+    /// reconnect then reopens the last EXPLICITLY opened/resumed session. The
+    /// reported wedge (/resume then backend restart) is covered.
+    fn record_reopen_target(&mut self, command: &AppUiCommand) {
+        let params = match command {
+            AppUiCommand::OpenSession(params) => SessionOpenParams {
+                after: None,
+                ..params.clone()
+            },
+            AppUiCommand::HydrateSession(params) => SessionOpenParams {
+                session_id: params.session_id.clone(),
+                topic: None,
+                profile_id: self.launch.profile_id.clone(),
+                cwd: self.launch.cwd.clone(),
+                sandbox: None,
+                after: None,
+            },
+            _ => return,
         };
-        self.send(command)
+        self.reopen_session = Some(params);
+    }
+
+    /// The session to re-open after a reconnect: the most recently opened
+    /// session (tracks the current selection), falling back to the launch
+    /// `--session` when nothing has been opened yet.
+    fn reopen_session_open_command(&self) -> Option<AppUiCommand> {
+        self.reopen_session
+            .clone()
+            .map(AppUiCommand::OpenSession)
+            .or_else(|| self.launch_session_open_command())
     }
 
     fn send_capabilities_request(&mut self) -> Result<()> {
@@ -1966,6 +2022,11 @@ impl AppUiBackend for ProtocolAppUiBackend {
             );
             return Ok(());
         }
+
+        // Record the reconnect reopen target AFTER the readonly/pending-cap
+        // gates (so a genuinely-rejected command never becomes the reopen
+        // target) and before `build_tracked_request` consumes `command`.
+        self.record_reopen_target(&command);
 
         let request = self.build_tracked_request(command)?;
         let request_id = request.id.clone();
@@ -8931,6 +8992,96 @@ mod tests {
         assert_eq!(request.params["cwd"], "/tmp/workspace");
         assert_eq!(request.params["after"]["stream"], "local:test");
         assert_eq!(request.params["after"]["seq"], 42);
+    }
+
+    #[test]
+    fn reconnect_reopens_current_session_not_launch_session() {
+        // Regression: a reconnect must re-open the session the user is CURRENTLY
+        // on (set by /resume, tab-switch, …), not the fixed launch `--session`.
+        // The old code always re-sent the launch session, silently yanking the
+        // selection back to it and auto-draining its staged prompts.
+        let launch_session = SessionKey("local:launch".into());
+        let resumed_session = SessionKey("local:resumed".into());
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            profile_id: Some("coding".into()),
+            session_id: Some(launch_session.clone()),
+            cwd: Some("/tmp/workspace".into()),
+            ..AppUiLaunch::default()
+        });
+
+        // Before any open, reconnect falls back to the launch session.
+        let fallback = backend
+            .reopen_session_open_command()
+            .expect("launch session is the fallback reopen target");
+        let AppUiCommand::OpenSession(fallback) = fallback else {
+            panic!("reopen command must be an OpenSession");
+        };
+        assert_eq!(fallback.session_id, launch_session);
+
+        // The user /resumes a different session (profile differs too). `send`
+        // records the reopen target via `record_reopen_target` before any
+        // network I/O; drive that helper directly so the test never dials out.
+        backend.record_reopen_target(&AppUiCommand::OpenSession(SessionOpenParams {
+            session_id: resumed_session.clone(),
+            topic: None,
+            profile_id: Some("research".into()),
+            cwd: Some("/tmp/other".into()),
+            sandbox: None,
+            after: Some(UiCursor {
+                stream: resumed_session.0.clone(),
+                seq: 7,
+            }),
+        }));
+
+        let reopen = backend
+            .reopen_session_open_command()
+            .expect("a reopen target is recorded after opening a session");
+        let AppUiCommand::OpenSession(reopen) = reopen else {
+            panic!("reopen command must be an OpenSession");
+        };
+        assert_eq!(
+            reopen.session_id, resumed_session,
+            "reconnect must reopen the currently-selected session, not the launch session"
+        );
+        assert_eq!(
+            reopen.profile_id.as_deref(),
+            Some("research"),
+            "the reopen carries the resumed session's own profile"
+        );
+        assert!(
+            reopen.after.is_none(),
+            "the stored reopen resets the cursor; command_with_resume_cursor refills it at send time"
+        );
+
+        // /resume emits a HydrateSession (NOT an OpenSession); it must also
+        // update the reopen target, else a reconnect after /resume reopens the
+        // stale prior session (codex P1). The reopen is re-expressed as an
+        // OpenSession carrying the launch profile/cwd.
+        let hydrated_session = SessionKey("local:hydrated".into());
+        backend.record_reopen_target(&AppUiCommand::HydrateSession(SessionHydrateParams {
+            session_id: hydrated_session.clone(),
+            after: None,
+            include: vec!["messages".into(), "turns".into()],
+        }));
+        let reopen = backend
+            .reopen_session_open_command()
+            .expect("a HydrateSession updates the reopen target");
+        let AppUiCommand::OpenSession(reopen) = reopen else {
+            panic!("reopen command must be an OpenSession");
+        };
+        assert_eq!(
+            reopen.session_id, hydrated_session,
+            "a /resume (HydrateSession) must become the reconnect reopen target"
+        );
+        assert_eq!(
+            reopen.profile_id.as_deref(),
+            Some("coding"),
+            "a hydrate-sourced reopen carries the launch profile (hydrate has none)"
+        );
     }
 
     #[test]
