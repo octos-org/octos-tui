@@ -4698,9 +4698,9 @@ impl Store {
                 None
             }
             ClientEvent::SessionHydrate(result) => {
-                self.apply_session_hydrate_result(result);
+                let drain = self.apply_session_hydrate_result(result);
                 self.refresh_active_menu_if_open();
-                None
+                drain
             }
             ClientEvent::SessionList(result) => {
                 self.apply_session_list_result(result);
@@ -5799,8 +5799,11 @@ impl Store {
         let dropped = result.dropped_turns;
         let rolled_session = result.thread.session_id.clone();
         // The server returns the trimmed session as a `SessionHydrateResult`, so
-        // reuse the hydrate render path verbatim to repaint the transcript.
-        self.apply_session_hydrate_result(result.thread);
+        // reuse the hydrate render path verbatim to repaint the transcript. A
+        // deliberate rollback must NOT auto-submit a stale staged prompt into the
+        // just-trimmed session, so the drain command is discarded here (the stale
+        // live_reply is still cleared, which is what matters for the repaint).
+        let _ = self.apply_session_hydrate_result(result.thread);
         // Rebuild the `/rewind` picker rows from the now-trimmed transcript. The
         // snapshot taken when the picker opened still lists the just-dropped
         // turns; if the picker is still open (the caller then calls
@@ -5852,8 +5855,65 @@ impl Store {
         self.state.status = format!("Rewound {dropped} turn(s) — edit and resend");
     }
 
-    fn apply_session_hydrate_result(&mut self, result: SessionHydrateResult) {
+    /// Finalize a hydrated turn the server reports TERMINAL that is still latched
+    /// locally as the session's `live_reply` (the backend-restart wedge).
+    ///
+    /// The GAP-1 reconcile deliberately skips the live turn — correct for a
+    /// transient mid-stream reconnect where `live_reply` is genuinely still
+    /// streaming. But when the authoritative hydrate snapshot says that very turn
+    /// is already `Completed`/`Errored`/`Interrupted`, the local `live_reply` is
+    /// STALE: the backend died mid-stream and will never send the rest of the
+    /// deltas or a terminal event. Left latched, `active_turn()` reports a phantom
+    /// in-flight turn forever and every new prompt stages instead of starting a
+    /// turn (the composer wedges).
+    ///
+    /// Drop the stale `live_reply` (its committed answer, if any, is already in
+    /// the authoritative `messages` the hydrate just installed — re-committing it
+    /// here would duplicate the card), run the same terminal cleanup the live
+    /// `TurnCompleted`/`TurnError` chokepoint does, and mark the turn terminal so
+    /// a late delta cannot resurrect it. Returns the staged-queue drain command so
+    /// a prompt queued behind the dead turn is released.
+    fn finalize_stale_hydrated_live_turn(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> Option<AppUiCommand> {
+        let session = self.find_session_mut(session_id)?;
+        match session.live_reply.as_ref() {
+            Some(live) if &live.turn_id == turn_id => session.live_reply = None,
+            // Not the live turn (or already cleared, e.g. by a prior
+            // `reconcile_after_backend_relaunch`) — nothing to finalize here.
+            _ => return None,
+        }
+        self.state
+            .live_reasoning
+            .remove(&(session_id.clone(), turn_id.clone()));
+        self.state
+            .clear_live_reply_segment_boundaries(session_id, turn_id);
+        self.state.staged_submit_in_flight.remove(session_id);
+        self.state.mark_turn_completed(session_id, turn_id);
+        self.state
+            .reconcile_terminal_turn_running_activity(turn_id);
+        // A pending approval/question for the dead turn is stale.
+        if self
+            .state
+            .approval
+            .as_ref()
+            .is_some_and(|approval| &approval.session_id == session_id && &approval.turn_id == turn_id)
+        {
+            self.state.approval = None;
+        }
+        self.clear_question_for_turn(session_id, turn_id);
+        self.submit_next_pending_if_idle()
+    }
+
+    fn apply_session_hydrate_result(
+        &mut self,
+        result: SessionHydrateResult,
+    ) -> Option<AppUiCommand> {
         let session_id = result.session_id.clone();
+        // Staged-queue drain released when a stale live turn is finalized below.
+        let mut drain: Option<AppUiCommand> = None;
         let projected_messages = hydrated_projection_messages(&result);
         let message_count = projected_messages.as_ref().map_or(0, Vec::len);
         let thread_count = result.threads.as_ref().map_or(0, Vec::len);
@@ -5918,10 +5978,13 @@ impl Store {
             // the live `TurnCompleted`/`TurnError` chokepoint does. Reconcile each
             // genuinely-terminal hydrated turn here, sharing the exact same sweep.
             //
-            // NEVER reconcile the session's currently-active/live turn: its
-            // running work is legitimately in-flight. The local `live_reply` turn
-            // is the source of truth for "still streaming", so we skip it even if
-            // the snapshot were to mislabel it terminal.
+            // The session's currently-live turn is special: for a transient
+            // mid-stream reconnect its running work is legitimately in-flight and
+            // must NOT be reconciled. But when the AUTHORITATIVE snapshot reports
+            // that very turn terminal, the backend died mid-stream and the local
+            // `live_reply` is stale — finalize it (drop the latch, drain the
+            // staged queue) so the composer un-wedges instead of latching a
+            // phantom active turn forever.
             let live_turn_id = self
                 .state
                 .sessions
@@ -5936,7 +5999,14 @@ impl Store {
                         | TurnLifecycleState::Errored
                         | TurnLifecycleState::Interrupted
                 );
-                if is_terminal && live_turn_id.as_ref() != Some(&turn.turn_id) {
+                if !is_terminal {
+                    continue;
+                }
+                if live_turn_id.as_ref() == Some(&turn.turn_id) {
+                    let command =
+                        self.finalize_stale_hydrated_live_turn(&session_id, &turn.turn_id);
+                    drain = drain.or(command);
+                } else {
                     self.state
                         .reconcile_terminal_turn_running_activity(&turn.turn_id);
                 }
@@ -5988,6 +6058,7 @@ impl Store {
             sections.join(", ")
         };
         self.state.status = t!("status.session_hydrated", summary = summary).into_owned();
+        drain
     }
 
     fn apply_review_start_result(&mut self, result: ReviewStartResult) {
@@ -21509,6 +21580,88 @@ mod tests {
                 leaked.status,
                 crate::model::ACTIVITY_STATUS_INTERRUPTED,
                 "a {terminal:?} hydrated turn's stranded running item must be reconciled"
+            );
+        }
+    }
+
+    #[test]
+    fn hydrate_clears_stale_live_reply_when_live_turn_is_terminal() {
+        use crate::client_event::ClientEvent;
+        // Backend-restart wedge: a turn was streaming (`live_reply` latched) when
+        // the backend died mid-stream. On reconnect the authoritative hydrate
+        // snapshot replaces committed history AND reports that very turn as
+        // TERMINAL — it will never emit the rest of its deltas or a `TurnCompleted`.
+        // The prior GAP-1 loop deliberately skipped reconciling the LIVE turn, so
+        // `live_reply` stayed latched forever: `active_turn()` reported a phantom
+        // in-flight turn and every new prompt staged instead of starting a turn
+        // (the composer wedged — "it stopped responding to my prompt").
+        for terminal in [
+            TurnLifecycleState::Completed,
+            TurnLifecycleState::Errored,
+            TurnLifecycleState::Interrupted,
+        ] {
+            let turn_id = TurnId::new();
+            let mut store = store_with_empty_session();
+            let session_id = store.state.sessions[0].id.clone();
+            store.state.sessions[0].live_reply = Some(LiveReply {
+                turn_id: turn_id.clone(),
+                text: "partial streamed answer".into(),
+            });
+            // A leaked running chip and a prompt queued behind the dead turn.
+            store.state.push_activity(
+                ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                    .with_turn(turn_id.clone())
+                    .with_tool_call("call-leaked"),
+            );
+            store
+                .state
+                .pending_messages
+                .push("queued behind dead turn".into());
+
+            let result = SessionHydrateResult {
+                session_id: session_id.clone(),
+                cursor: octos_core::ui_protocol::UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 1,
+                },
+                context: None,
+                context_state: None,
+                messages: None,
+                threads: None,
+                turns: Some(vec![HydratedTurn {
+                    turn_id: turn_id.clone(),
+                    state: terminal,
+                    started_at: None,
+                    completed_at: None,
+                    thread_id: Some("thread-1".into()),
+                }]),
+                pending_approvals: None,
+                pending_questions: None,
+                replayed_envelopes: None,
+            };
+            store.apply_client_event(ClientEvent::SessionHydrate(result));
+
+            assert!(
+                store.state.sessions[0].live_reply.is_none(),
+                "a {terminal:?} hydrated turn matching the live reply must clear the stale live_reply"
+            );
+            assert!(
+                store.state.active_turn().is_none(),
+                "with live_reply cleared the composer must no longer see a phantom active turn ({terminal:?})"
+            );
+            assert!(
+                store.state.is_turn_completed(&session_id, &turn_id),
+                "the finalized turn must be marked completed so a late delta cannot resurrect it ({terminal:?})"
+            );
+            let leaked = store
+                .state
+                .activity
+                .iter()
+                .find(|item| item.tool_call_id.as_deref() == Some("call-leaked"))
+                .expect("leaked item retained");
+            assert!(
+                !crate::model::activity_status_is_running(&leaked.status),
+                "the dead turn's stranded running chip must be reconciled ({terminal:?})"
             );
         }
     }
