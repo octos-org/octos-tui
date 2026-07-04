@@ -196,3 +196,26 @@ fn session_open_does_not_hydrate_without_autonomy_feature() {
     store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
     assert_eq!(store.state.pending_autonomy_hydration.len(), 0);
 }
+
+/// `/agents spawn N <prompt>` dispatches a `SubmitPrompt` turn and
+/// simultaneously enqueues an `agent/list` refresh in the hydration queue.
+/// The TUI must never emit a hypothetical generic `agent/spawn` RPC.
+#[test]
+fn agents_spawn_dispatches_turn_and_queues_list_refresh() {
+    let mut store = store_with_autonomy_session();
+    store.state.composer = "/agents spawn 2 do work".into();
+
+    let command = store.compose_command().expect("spawn emits a command");
+
+    assert!(
+        matches!(command, AppUiCommand::SubmitPrompt(_)),
+        "expected SubmitPrompt, got {command:?}"
+    );
+
+    let queued: Vec<_> =
+        std::iter::from_fn(|| store.state.dequeue_autonomy_hydration()).collect();
+    assert!(
+        queued.iter().any(|c| matches!(c, AppUiCommand::ListAgents(_))),
+        "spawn must enqueue ListAgents in the hydration queue, got: {queued:?}"
+    );
+}
