@@ -173,11 +173,19 @@ pub fn live_ui_height_with_finalization(
 
     // Never let the live UI eat the whole screen: leave at least a few rows of
     // scrollback visible above it (so the user always sees prior output and can
-    // start a selection there). Always at least the chrome.
+    // start a selection there). Always at least the chrome — but HARD-capped
+    // at height-2 (#232 #3, codex fold 4): a full-screen viewport has no
+    // scroll region above it, and a ONE-row region is equally unusable
+    // (DECSTBM requires top < bottom; xterm ignores `CSI 1;1r`), so flushed
+    // history lines had nowhere to go and were silently repainted over on
+    // tiny panes. Two rows above keep the DECSTBM region valid; the
+    // degenerate 1–2-row terminals fall back to insert_history's full-screen
+    // streaming path.
+    let max_live = height.saturating_sub(2).max(1);
     let cap = height
         .saturating_sub(LIVE_VIEWPORT_MIN_SCROLLBACK)
-        .max(chrome.min(height));
-    total.clamp(chrome.min(height).max(1), cap.max(1))
+        .max(chrome.min(max_live));
+    total.clamp(chrome.min(max_live).max(1), cap.max(1))
 }
 
 /// Minimum rows of scrollback to keep visible above the inline viewport.
@@ -10069,6 +10077,40 @@ mod tests {
             cursor,
             composer_cursor_position(&app, Rect::new(0, 36, 120, 5)).expect("cursor")
         );
+    }
+
+    /// P2 (tri-repo #246 ⊃ #232 #3, codex fold 4): the live viewport must
+    /// leave at least TWO rows above it on terminals tall enough — DECSTBM
+    /// requires top < bottom, so both a full-screen viewport (`CSI 1;0r`)
+    /// and a one-row region (`CSI 1;1r`) are unusable for history flushes.
+    /// The degenerate 1–2-row terminals keep one live row and are handled by
+    /// insert_history's streaming fallback.
+    #[test]
+    fn live_ui_height_leaves_a_valid_scroll_region_above_the_viewport() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        for height in 3..=10u16 {
+            let live = live_ui_height(&app, 80, height);
+            assert!(
+                live <= height - 2,
+                "live UI must leave ≥2 history rows above the viewport: height={height} live={live}"
+            );
+        }
+        // Degenerate 1–2-row terminals: the streaming fallback owns these.
+        assert_eq!(live_ui_height(&app, 80, 2), 1);
+        assert_eq!(live_ui_height(&app, 80, 1), 1);
     }
 
     #[test]

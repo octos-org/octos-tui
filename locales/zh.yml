@@ -902,6 +902,7 @@ status:
   list_more: "，+%{count} 项更多"
   no_session_send_prompt: "没有打开的编码会话。发送提示前请运行 /onboard open-session。"
   message_staged: "消息已暂存；将在当前回合结束后提交。按 Esc 可中断/发送。"
+  staged_submit_requeued: "提交在传输层失败；暂存消息已重新入队，稍后自动重试。"
   queued_turn_start: "已排队 回合/启动"
   command_unavailable: "命令不可用"
   no_session_runtime: "没有打开的编码会话。运行命令前请运行 /onboard open-session。"

@@ -3338,9 +3338,18 @@ pub struct AppState {
     /// events (no request/session ids on the wire errors), so instead of an
     /// ever-growing error-code taxonomy, a gate older than
     /// [`crate::store::STAGED_SUBMIT_GATE_TTL`] is treated as stale and
-    /// ignored — any missed death self-heals in seconds. Deliberately NOT
-    /// snapshot-preserved: a replay clears it outright.
-    pub staged_submit_in_flight: std::collections::HashMap<SessionKey, std::time::Instant>,
+    /// ignored — any missed death self-heals in seconds (and, since the gate
+    /// carries the prompt, the stale-gate path RE-STAGES it rather than
+    /// dropping it). Snapshot-PRESERVED (codex fold): the gate may hold the
+    /// only copy of a drained prompt, so a reconnect replay carries the map
+    /// over like the staged queues; a gate whose turn died with the old
+    /// connection self-heals via the TTL re-stage.
+    ///
+    /// The gate also carries the in-flight PROMPT (P2 tri-repo #246): a
+    /// staged submit that dies at the transport layer is re-staged from the
+    /// gate instead of vanishing — the drain had already pulled it off the
+    /// queue, so the gate is the only place its text survives.
+    pub staged_submit_in_flight: std::collections::HashMap<SessionKey, StagedSubmitGate>,
     pub optimistic_user_messages: Vec<OptimisticUserMessage>,
     pub turn_prompt_anchors: Vec<TurnPromptAnchor>,
     /// Byte offsets in `live_reply.text` where one persisted assistant content
@@ -3510,6 +3519,48 @@ pub struct TurnPromptAnchor {
     pub prior_matching_user_count: usize,
 }
 
+/// FIFO gate for a staged-drain submit that is between enqueue and its
+/// `turn/started` (see [`AppState::staged_submit_in_flight`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedSubmitGate {
+    /// When the submit was enqueued — drives the
+    /// [`crate::store::STAGED_SUBMIT_GATE_TTL`] staleness backstop.
+    pub submitted_at: Instant,
+    /// The prompt (and its optimistic turn) still in flight. `Some` until the
+    /// submit settles; consumed to RE-STAGE the prompt when the submit dies at
+    /// the transport layer. `None` marks a backoff-only gate left behind by
+    /// such a re-stage: it keeps the drain closed for the TTL so a dead
+    /// transport is retried on the TTL cadence instead of every UI tick, and
+    /// a repeat wire error cannot re-stage the same prompt twice.
+    pub in_flight: Option<StagedSubmitInFlight>,
+}
+
+impl StagedSubmitGate {
+    /// A live gate for a just-enqueued staged submit.
+    pub fn in_flight(turn_id: TurnId, prompt: String) -> Self {
+        Self {
+            submitted_at: Instant::now(),
+            in_flight: Some(StagedSubmitInFlight { turn_id, prompt }),
+        }
+    }
+
+    /// A backoff-only gate left behind after a transport-death re-stage.
+    pub fn backoff() -> Self {
+        Self {
+            submitted_at: Instant::now(),
+            in_flight: None,
+        }
+    }
+}
+
+/// The prompt a [`StagedSubmitGate`] is protecting, with the optimistic turn
+/// id its transcript row / prompt anchor were recorded under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedSubmitInFlight {
+    pub turn_id: TurnId,
+    pub prompt: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnActivityLog {
     pub session_id: SessionKey,
@@ -3633,14 +3684,18 @@ pub struct ActivityItem {
     pub duration_ms: Option<u64>,
     pub turn_id: Option<TurnId>,
     pub tool_call_id: Option<String>,
-    /// Owning session for items created on a session-scoped path. Only set by
-    /// the projection-envelope `ToolStart` emit (`apply_envelope`), which is the
-    /// one path whose items carry NO turn identity and so cannot be reconciled
-    /// by `turn_id`. The envelope `TurnCompleted` self-heal
-    /// ([`AppState::reconcile_envelope_thread_running_activity`]) filters on
-    /// this so a thread_id shared across sessions cannot over-suppress a sibling
-    /// session's genuinely-active chip. Left `None` for all turn-scoped items
-    /// (which reconcile via `turn_id`).
+    /// Owning session for items created on a session-scoped path. Set by the
+    /// projection-envelope `ToolStart` emit (`apply_envelope`) — the one path
+    /// whose items carry NO turn identity and so cannot be reconciled by
+    /// `turn_id` (the envelope `TurnCompleted` self-heal,
+    /// [`AppState::reconcile_envelope_thread_running_activity`], filters on it
+    /// so a thread_id shared across sessions cannot over-suppress a sibling
+    /// session's genuinely-active chip) — and by the session-scoped protocol
+    /// arms (`ToolStarted`, progress events), where
+    /// [`AppState::push_activity`] / [`AppState::update_tool_activity`] use it
+    /// to keep a background session's activity from drifting the ACTIVE
+    /// transcript's scroll (P2 tri-repo #246). `None` = unattributed (treated
+    /// as active-view content).
     pub session_id: Option<SessionKey>,
 }
 
@@ -5706,6 +5761,121 @@ impl AppState {
         self.optimistic_user_messages = retained;
     }
 
+    /// Settle staged-submit gates that a freshly-replayed snapshot already
+    /// REFLECTS (codex fold): if the replayed session contains the in-flight
+    /// prompt as a user message beyond the pre-submit baseline, the submit
+    /// reached the server before the replay — no later TurnStarted/terminal
+    /// will arrive on this connection to clear the gate, and letting it
+    /// TTL-expire would re-stage and submit a DUPLICATE turn. Gates with no
+    /// echo stay armed (a genuinely dead submit self-heals via the TTL
+    /// re-stage).
+    ///
+    /// MUST run BEFORE [`Self::restore_optimistic_user_messages`]: the
+    /// restore re-inserts un-echoed optimistic rows, which would inflate the
+    /// match count and settle (lose) a gate whose submit never landed.
+    pub fn settle_staged_gates_reflected_by_snapshot(&mut self) {
+        let mut settled: Vec<SessionKey> = Vec::new();
+        for (session_id, gate) in &self.staged_submit_in_flight {
+            let Some(in_flight) = gate.in_flight.as_ref() else {
+                continue;
+            };
+            let Some(session) = self
+                .sessions
+                .iter()
+                .find(|session| &session.id == session_id)
+            else {
+                continue;
+            };
+            // Baseline = matching rows that existed BEFORE this submit, from
+            // the surviving optimistic tracking entry or (codex fold 4) the
+            // turn-prompt anchor recorded for the same turn — the two caches
+            // evict independently. With NO baseline at all the gate stays
+            // ARMED: assuming 0 would make any OLDER identical user message
+            // look like a snapshot echo and settle away the only copy of the
+            // prompt (data loss); an armed gate at worst re-stages via the
+            // TTL and duplicates a turn the server already ran — recoverable,
+            // and only reachable when both caches evicted the entry.
+            let baseline = self
+                .optimistic_user_messages
+                .iter()
+                .find(|optimistic| {
+                    &optimistic.session_id == session_id && optimistic.turn_id == in_flight.turn_id
+                })
+                .map(|optimistic| optimistic.prior_matching_user_count)
+                .or_else(|| {
+                    self.turn_prompt_anchors
+                        .iter()
+                        .find(|anchor| {
+                            &anchor.session_id == session_id && anchor.turn_id == in_flight.turn_id
+                        })
+                        .map(|anchor| anchor.prior_matching_user_count)
+                });
+            let Some(baseline) = baseline else {
+                continue;
+            };
+            if matching_user_message_count(session, &in_flight.prompt) > baseline {
+                settled.push(session_id.clone());
+            }
+        }
+        for session_id in settled {
+            self.staged_submit_in_flight.remove(&session_id);
+        }
+    }
+
+    /// Withdraw the optimistic user prompt recorded for `turn_id`: its submit
+    /// died at the transport layer, so the turn will never start and the
+    /// prompt is being RE-STAGED (P2 tri-repo #246). Removes the optimistic
+    /// tracking entry, the turn-prompt anchor, and the transcript row the
+    /// tracking inserted — otherwise the re-submit records the same content a
+    /// second time and the transcript shows a duplicate user row.
+    pub fn withdraw_optimistic_user_prompt(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        let Some(position) = self.optimistic_user_messages.iter().position(|optimistic| {
+            &optimistic.session_id == session_id && &optimistic.turn_id == turn_id
+        }) else {
+            return;
+        };
+        let optimistic = self.optimistic_user_messages.remove(position);
+        self.turn_prompt_anchors
+            .retain(|anchor| !(&anchor.session_id == session_id && &anchor.turn_id == turn_id));
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| &session.id == session_id)
+        else {
+            return;
+        };
+        // Only remove a row that is genuinely OUR optimistic insert (count
+        // above the pre-insert baseline). The send died at the transport, so
+        // no server echo can account for the extra match; take the LAST one —
+        // the optimistic row is the most recent insert of this content.
+        if matching_user_message_count(session, &optimistic.content)
+            > optimistic.prior_matching_user_count
+            && let Some(row) = session.messages.iter().rposition(|message| {
+                message.role.as_str() == "user" && message.content == optimistic.content
+            })
+        {
+            session.messages.remove(row);
+        }
+    }
+
+    /// Put a transport-dead staged submit's prompt back at the FRONT of its
+    /// session's staged queue so FIFO order survives the retry (P2 tri-repo
+    /// #246). The active session's queue lives in `pending_messages`; other
+    /// sessions' queues are stashed per-session.
+    pub fn restage_staged_prompt_front(&mut self, session_id: &SessionKey, prompt: String) {
+        let is_active = self
+            .active_session()
+            .is_some_and(|session| &session.id == session_id);
+        if is_active {
+            self.pending_messages.insert(0, prompt);
+        } else {
+            self.pending_messages_by_session
+                .entry(session_id.clone())
+                .or_default()
+                .insert(0, prompt);
+        }
+    }
+
     pub fn record_turn_prompt_anchor_from_latest_user(
         &mut self,
         session_id: &SessionKey,
@@ -6117,11 +6287,53 @@ impl AppState {
             .map(|entry| entry.cursor)
     }
 
+    /// Whether an activity row with this attribution can render in the
+    /// CURRENT view — the gate for scroll preservation on activity writes
+    /// (P2 tri-repo #246 fold). Mirrors the flow's filter shape
+    /// (`flow_activity_items` filters by the active turn):
+    ///
+    /// * unattributed (`session_id == None`) → assume visible (old behavior);
+    /// * the active session's own rows → visible;
+    /// * a background row tied to a TURN → renders only under its own turn's
+    ///   flow, never the active one → invisible here;
+    /// * a background TURNLESS row → renders in the active flow exactly when
+    ///   no turn is active (codex fold: skipping these lost the read
+    ///   position for rows that were on screen). May over-preserve for the
+    ///   few turnless rows `is_subagent_progress` folds away — the safe
+    ///   direction.
+    fn activity_renders_in_active_view(
+        &self,
+        session_id: Option<&SessionKey>,
+        turn_id: Option<&TurnId>,
+    ) -> bool {
+        let Some(session_id) = session_id else {
+            return true;
+        };
+        if self
+            .active_session()
+            .is_some_and(|session| &session.id == session_id)
+        {
+            return true;
+        }
+        match turn_id {
+            Some(_) => false,
+            None => self.active_turn().is_none(),
+        }
+    }
+
     pub fn push_activity(&mut self, item: ActivityItem) {
         const MAX_ACTIVITY_ITEMS: usize = 80;
+        // Preserving the scroll for a row that renders nowhere in the current
+        // view would drift the active transcript's read position; skipping it
+        // for a row that IS visible loses the position instead — gate on the
+        // render-accurate predicate (P2 tri-repo #246 fold).
+        let renders_in_active_view =
+            self.activity_renders_in_active_view(item.session_id.as_ref(), item.turn_id.as_ref());
         let estimated_rows = estimated_activity_rows(&item);
         self.activity.push(item);
-        self.preserve_transcript_position_after_append(estimated_rows);
+        if renders_in_active_view {
+            self.preserve_transcript_position_after_append(estimated_rows);
+        }
         if self.activity.len() > MAX_ACTIVITY_ITEMS {
             let excess = self.activity.len() - MAX_ACTIVITY_ITEMS;
             self.activity.drain(0..excess);
@@ -6150,7 +6362,7 @@ impl AppState {
         // escape sequences.
         let output_preview = output_preview
             .map(|preview| crate::sanitize::strip_terminal_controls(&preview).into_owned());
-        let mut updated = false;
+        let mut updated: Option<(Option<SessionKey>, Option<TurnId>)> = None;
         if let Some(item) = self
             .activity
             .iter_mut()
@@ -6170,9 +6382,14 @@ impl AppState {
             if duration_ms.is_some() {
                 item.duration_ms = duration_ms;
             }
-            updated = true;
+            updated = Some((item.session_id.clone(), item.turn_id.clone()));
         }
-        if updated {
+        // Mirror `push_activity`: only an update to a row that can render in
+        // the current view may adjust the read position (P2 tri-repo #246
+        // fold).
+        if let Some((item_session, item_turn)) = updated
+            && self.activity_renders_in_active_view(item_session.as_ref(), item_turn.as_ref())
+        {
             self.preserve_transcript_position_after_append(1);
         }
     }

@@ -445,6 +445,7 @@ status:
   list_more: ", +%{count} more"
   no_session_send_prompt: "No coding session open. Run /onboard open-session before sending a prompt."
   message_staged: "Message staged; it will submit after the active turn. Press Esc to interrupt/send."
+  staged_submit_requeued: "Submit failed at the transport; the staged message was re-queued and will retry."
   queued_turn_start: "Queued turn/start"
   command_unavailable: "command is unavailable"
   no_session_runtime: "No coding session open. Run /onboard open-session before runtime commands."
