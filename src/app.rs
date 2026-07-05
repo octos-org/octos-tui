@@ -173,11 +173,17 @@ pub fn live_ui_height_with_finalization(
 
     // Never let the live UI eat the whole screen: leave at least a few rows of
     // scrollback visible above it (so the user always sees prior output and can
-    // start a selection there). Always at least the chrome.
+    // start a selection there). Always at least the chrome — but HARD-capped
+    // at height-1 (#232 #3): a full-screen viewport leaves no scroll region
+    // above it, so flushed history lines had nowhere to go and were silently
+    // repainted over on tiny panes. One row above keeps the DECSTBM region
+    // valid and streams every flush into scrollback; the degenerate 1-row
+    // terminal falls back to insert_history's full-screen streaming path.
+    let max_live = height.saturating_sub(1).max(1);
     let cap = height
         .saturating_sub(LIVE_VIEWPORT_MIN_SCROLLBACK)
-        .max(chrome.min(height));
-    total.clamp(chrome.min(height).max(1), cap.max(1))
+        .max(chrome.min(max_live));
+    total.clamp(chrome.min(max_live).max(1), cap.max(1))
 }
 
 /// Minimum rows of scrollback to keep visible above the inline viewport.
@@ -10069,6 +10075,39 @@ mod tests {
             cursor,
             composer_cursor_position(&app, Rect::new(0, 36, 120, 5)).expect("cursor")
         );
+    }
+
+    /// P2 (tri-repo #246 ⊃ #232 #3): the live viewport must never cover the
+    /// FULL screen on a multi-row terminal — a full-screen viewport has no
+    /// scroll region above it, so flushed history lines were printed inside
+    /// the viewport and silently repainted over on tiny panes. At least one
+    /// row must remain above (the degenerate 1-row terminal keeps 1 and is
+    /// handled by insert_history's streaming fallback).
+    #[test]
+    fn live_ui_height_never_covers_the_full_screen_on_multi_row_terminals() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        for height in 2..=10u16 {
+            let live = live_ui_height(&app, 80, height);
+            assert!(
+                live < height,
+                "live UI must leave ≥1 history row above the viewport: height={height} live={live}"
+            );
+        }
+        // Degenerate single-row terminal: the viewport takes the row.
+        assert_eq!(live_ui_height(&app, 80, 1), 1);
     }
 
     #[test]
