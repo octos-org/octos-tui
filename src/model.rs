@@ -3340,7 +3340,12 @@ pub struct AppState {
     /// [`crate::store::STAGED_SUBMIT_GATE_TTL`] is treated as stale and
     /// ignored — any missed death self-heals in seconds. Deliberately NOT
     /// snapshot-preserved: a replay clears it outright.
-    pub staged_submit_in_flight: std::collections::HashMap<SessionKey, std::time::Instant>,
+    ///
+    /// The gate also carries the in-flight PROMPT (P2 tri-repo #246): a
+    /// staged submit that dies at the transport layer is re-staged from the
+    /// gate instead of vanishing — the drain had already pulled it off the
+    /// queue, so the gate is the only place its text survives.
+    pub staged_submit_in_flight: std::collections::HashMap<SessionKey, StagedSubmitGate>,
     pub optimistic_user_messages: Vec<OptimisticUserMessage>,
     pub turn_prompt_anchors: Vec<TurnPromptAnchor>,
     /// Byte offsets in `live_reply.text` where one persisted assistant content
@@ -3508,6 +3513,48 @@ pub struct TurnPromptAnchor {
     pub content: String,
     pub anchor_index: usize,
     pub prior_matching_user_count: usize,
+}
+
+/// FIFO gate for a staged-drain submit that is between enqueue and its
+/// `turn/started` (see [`AppState::staged_submit_in_flight`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedSubmitGate {
+    /// When the submit was enqueued — drives the
+    /// [`crate::store::STAGED_SUBMIT_GATE_TTL`] staleness backstop.
+    pub submitted_at: Instant,
+    /// The prompt (and its optimistic turn) still in flight. `Some` until the
+    /// submit settles; consumed to RE-STAGE the prompt when the submit dies at
+    /// the transport layer. `None` marks a backoff-only gate left behind by
+    /// such a re-stage: it keeps the drain closed for the TTL so a dead
+    /// transport is retried on the TTL cadence instead of every UI tick, and
+    /// a repeat wire error cannot re-stage the same prompt twice.
+    pub in_flight: Option<StagedSubmitInFlight>,
+}
+
+impl StagedSubmitGate {
+    /// A live gate for a just-enqueued staged submit.
+    pub fn in_flight(turn_id: TurnId, prompt: String) -> Self {
+        Self {
+            submitted_at: Instant::now(),
+            in_flight: Some(StagedSubmitInFlight { turn_id, prompt }),
+        }
+    }
+
+    /// A backoff-only gate left behind after a transport-death re-stage.
+    pub fn backoff() -> Self {
+        Self {
+            submitted_at: Instant::now(),
+            in_flight: None,
+        }
+    }
+}
+
+/// The prompt a [`StagedSubmitGate`] is protecting, with the optimistic turn
+/// id its transcript row / prompt anchor were recorded under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedSubmitInFlight {
+    pub turn_id: TurnId,
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5704,6 +5751,60 @@ impl AppState {
             retained.push(optimistic);
         }
         self.optimistic_user_messages = retained;
+    }
+
+    /// Withdraw the optimistic user prompt recorded for `turn_id`: its submit
+    /// died at the transport layer, so the turn will never start and the
+    /// prompt is being RE-STAGED (P2 tri-repo #246). Removes the optimistic
+    /// tracking entry, the turn-prompt anchor, and the transcript row the
+    /// tracking inserted — otherwise the re-submit records the same content a
+    /// second time and the transcript shows a duplicate user row.
+    pub fn withdraw_optimistic_user_prompt(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        let Some(position) = self.optimistic_user_messages.iter().position(|optimistic| {
+            &optimistic.session_id == session_id && &optimistic.turn_id == turn_id
+        }) else {
+            return;
+        };
+        let optimistic = self.optimistic_user_messages.remove(position);
+        self.turn_prompt_anchors
+            .retain(|anchor| !(&anchor.session_id == session_id && &anchor.turn_id == turn_id));
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| &session.id == session_id)
+        else {
+            return;
+        };
+        // Only remove a row that is genuinely OUR optimistic insert (count
+        // above the pre-insert baseline). The send died at the transport, so
+        // no server echo can account for the extra match; take the LAST one —
+        // the optimistic row is the most recent insert of this content.
+        if matching_user_message_count(session, &optimistic.content)
+            > optimistic.prior_matching_user_count
+            && let Some(row) = session.messages.iter().rposition(|message| {
+                message.role.as_str() == "user" && message.content == optimistic.content
+            })
+        {
+            session.messages.remove(row);
+        }
+    }
+
+    /// Put a transport-dead staged submit's prompt back at the FRONT of its
+    /// session's staged queue so FIFO order survives the retry (P2 tri-repo
+    /// #246). The active session's queue lives in `pending_messages`; other
+    /// sessions' queues are stashed per-session.
+    pub fn restage_staged_prompt_front(&mut self, session_id: &SessionKey, prompt: String) {
+        let is_active = self
+            .active_session()
+            .is_some_and(|session| &session.id == session_id);
+        if is_active {
+            self.pending_messages.insert(0, prompt);
+        } else {
+            self.pending_messages_by_session
+                .entry(session_id.clone())
+                .or_default()
+                .insert(0, prompt);
+        }
     }
 
     pub fn record_turn_prompt_anchor_from_latest_user(

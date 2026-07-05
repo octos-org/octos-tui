@@ -200,6 +200,15 @@ pub fn run(cli: Cli) -> Result<()> {
             dirty = true;
         }
 
+        // Tick-driven staged-drain backstop: a prompt re-staged after a
+        // transport-death (and any staged prompt whose wake site was missed)
+        // flows once its gate TTL clears, without needing a turn event or a
+        // session switch. The enqueued submit is sent by
+        // `drain_backend_events` below via the follow-up queue.
+        if store.drain_staged_backstop() {
+            dirty = true;
+        }
+
         if drain_backend_events(backend.as_mut(), &mut store)? {
             dirty = true;
         }

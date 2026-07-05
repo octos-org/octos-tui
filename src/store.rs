@@ -41,7 +41,7 @@ use crate::{
         ProfileSkillsListParams, ProfileSkillsRegistrySearchParams, ProfileSkillsRemoveParams,
         ResumeSessionRow, ReviewStartParams, ReviewStartResult, RewindTurnRow, SecretString,
         SessionMcpCatalog, SessionModelCatalog, SessionRuntimeStatus, SessionToolCatalog,
-        SessionView, TaskView, ToolConfigDeleteParams, ToolConfigListParams,
+        SessionView, StagedSubmitGate, TaskView, ToolConfigDeleteParams, ToolConfigListParams,
         ToolConfigSetEnabledParams, ToolConfigTestParams, ToolConfigUpsertParams,
         UserQuestionPickerState, complete_plan_steps_in_text, task_state_label,
         terminal_task_state_from_agent_status,
@@ -5392,15 +5392,17 @@ impl Store {
                 // FIFO in-flight gate would wedge the session's remaining
                 // staged queue (codex P2 on the gate). Release PRECISELY
                 // (codex round-3: an over-broad clear drops gates whose
-                // turn/start is still alive → concurrent submits), then WAKE
-                // the drain (the arm otherwise returns no follow-up, so the
-                // queue would sit until an unrelated switch/terminal):
+                // turn/start is still alive → concurrent submits), and
+                // RE-STAGE the dead submit's prompt from the gate (P2 tri-repo
+                // #246: the drain already pulled it off the queue, so a bare
+                // release LOST it — "queue 3 prompts, hit a reconnect burst →
+                // the drained one vanishes"):
                 //
                 // * `request_cancelled` carries "{method} request {id}
                 //   cancelled: {reason}" — only a dead `turn/start` affects
                 //   the gate, and cancellation is cancel-ALL (disconnect /
                 //   skipped frame), so every in-flight turn/start died with
-                //   it: clear all gates.
+                //   it: re-stage every gate's prompt into its own session.
                 // * send-layer refusals (`send_failed`,
                 //   `too_many_pending_requests`, `transport_send`) carry no
                 //   method attribution; the staged submit rides the ACTIVE
@@ -5408,26 +5410,54 @@ impl Store {
                 // * recoverable parser noise (`malformed_frame`, skipped
                 //   frames themselves) cancels nothing — their pending
                 //   requests emit their own `request_cancelled` events.
-                let released = match error.code.as_str() {
+                //
+                // Each re-stage leaves a BACKOFF-only gate and deliberately
+                // does NOT wake the drain: the transport just failed, so an
+                // immediate resubmit would spin submit→fail→re-stage at
+                // event-loop speed (and a repeat wire error before the retry
+                // must not re-stage the same prompt twice). The per-tick
+                // `drain_staged_backstop` retries on the gate-TTL cadence.
+                let restaged = match error.code.as_str() {
                     "request_cancelled"
                         if error
                             .message
                             .starts_with(octos_core::ui_protocol::methods::TURN_START) =>
                     {
-                        let had = !self.state.staged_submit_in_flight.is_empty();
-                        self.state.staged_submit_in_flight.clear();
-                        had
+                        let gates: Vec<(SessionKey, StagedSubmitGate)> =
+                            self.state.staged_submit_in_flight.drain().collect();
+                        let mut restaged = false;
+                        for (session_id, gate) in gates {
+                            if self.restage_dead_staged_submit(&session_id, gate) {
+                                self.state
+                                    .staged_submit_in_flight
+                                    .insert(session_id, StagedSubmitGate::backoff());
+                                restaged = true;
+                            }
+                        }
+                        restaged
                     }
-                    "send_failed" | "too_many_pending_requests" | "transport_send" => self
-                        .state
-                        .active_session()
-                        .map(|session| session.id.clone())
-                        .is_some_and(|id| self.state.staged_submit_in_flight.remove(&id).is_some()),
+                    "send_failed" | "too_many_pending_requests" | "transport_send" => {
+                        let active = self
+                            .state
+                            .active_session()
+                            .map(|session| session.id.clone());
+                        if let Some(session_id) = active
+                            && let Some(gate) =
+                                self.state.staged_submit_in_flight.remove(&session_id)
+                        {
+                            let restaged = self.restage_dead_staged_submit(&session_id, gate);
+                            if restaged {
+                                self.state
+                                    .staged_submit_in_flight
+                                    .insert(session_id, StagedSubmitGate::backoff());
+                            }
+                            restaged
+                        } else {
+                            false
+                        }
+                    }
                     _ => false,
                 };
-                if released && let Some(command) = self.submit_next_pending_if_idle() {
-                    self.state.enqueue_autonomy_hydration(command);
-                }
                 // M22-B: route `profile/local/create` failures back
                 // into the onboarding step so the user lands on a
                 // typed recovery instead of a generic status line.
@@ -5593,6 +5623,12 @@ impl Store {
                     )
                     .with_detail("app-ui error"),
                 );
+                // Written LAST so the re-queue outcome is what the user reads
+                // (the raw error stays visible on the activity feed and the
+                // run-state chip below).
+                if restaged {
+                    self.state.status = t!("status.staged_submit_requeued").into_owned();
+                }
                 if error.code == "frame_too_large" {
                     // Recoverable — keep the session usable (idle) instead of
                     // wedging it in Error on an oversized inline send.
@@ -8088,8 +8124,8 @@ impl Store {
             .state
             .active_session()
             .map(|session| session.id.clone())?;
-        if let Some(stamp) = self.state.staged_submit_in_flight.get(&session_id)
-            && stamp.elapsed() < STAGED_SUBMIT_GATE_TTL
+        if let Some(gate) = self.state.staged_submit_in_flight.get(&session_id)
+            && gate.submitted_at.elapsed() < STAGED_SUBMIT_GATE_TTL
         {
             return None;
         }
@@ -8100,15 +8136,64 @@ impl Store {
             prompt.clone(),
             t!("status.submitted_staged_message").into_owned(),
         );
-        if command.is_none() {
-            remaining_pending.insert(0, prompt);
-        } else {
-            self.state
-                .staged_submit_in_flight
-                .insert(session_id, std::time::Instant::now());
+        match &command {
+            // The gate carries the prompt + its optimistic turn id so a
+            // transport-level death of this submit can RE-STAGE it — the
+            // queue no longer holds it, so the gate is the only surviving
+            // copy of the text (P2 tri-repo #246).
+            Some(AppUiCommand::SubmitPrompt(params)) => {
+                self.state.staged_submit_in_flight.insert(
+                    session_id,
+                    StagedSubmitGate::in_flight(params.turn_id.clone(), prompt),
+                );
+            }
+            // `start_prompt_turn` only builds SubmitPrompt; any other shape
+            // has no turn to gate on — leave the gate unarmed.
+            Some(_) => {}
+            None => {
+                remaining_pending.insert(0, prompt);
+            }
         }
         self.state.pending_messages = remaining_pending;
         command
+    }
+
+    /// A staged-drain submit died at the TRANSPORT layer (send failure,
+    /// cancel-all, backend relaunch): its `turn/started` will never arrive,
+    /// and the drain already pulled the prompt off the queue — the gate holds
+    /// the only surviving copy. Re-stage it at the FRONT of its session's
+    /// queue (FIFO order survives the retry) and withdraw the optimistic
+    /// transcript row so the re-submit cannot render a duplicate. Returns
+    /// true when a prompt was re-staged (false for a backoff-only gate).
+    fn restage_dead_staged_submit(
+        &mut self,
+        session_id: &SessionKey,
+        gate: StagedSubmitGate,
+    ) -> bool {
+        let Some(in_flight) = gate.in_flight else {
+            return false;
+        };
+        self.state
+            .withdraw_optimistic_user_prompt(session_id, &in_flight.turn_id);
+        self.state
+            .restage_staged_prompt_front(session_id, in_flight.prompt);
+        true
+    }
+
+    /// Per-tick backstop for the staged drain (P2 tri-repo #246). The
+    /// enumerated wake sites (turn events, switches, relaunch reconcile)
+    /// cover the common paths, but a transport-death re-stage deliberately
+    /// does NOT wake the drain — with the transport still down that would
+    /// spin submit→fail→re-stage at event-loop speed. This tick-driven drain
+    /// retries on the gate-TTL cadence instead, and structurally closes any
+    /// remaining wake-site gap (idle active session + staged prompt always
+    /// flows within a tick). O(1) when there is nothing to do.
+    pub fn drain_staged_backstop(&mut self) -> bool {
+        if let Some(command) = self.submit_next_pending_if_idle() {
+            self.state.enqueue_autonomy_hydration(command);
+            return true;
+        }
+        false
     }
 
     /// The stdio transport relaunched its `serve --stdio` child. The new
@@ -8131,9 +8216,17 @@ impl Store {
                     .map(|live_reply| (session.id.clone(), live_reply.turn_id.clone()))
             })
             .collect();
-        // In-flight `turn/start` submits died with the old child too; without
-        // this, their gates block the staged drain until the TTL backstop.
-        self.state.staged_submit_in_flight.clear();
+        // In-flight `turn/start` submits died with the old child too. RE-STAGE
+        // their prompts (P2 tri-repo #246: the queue is the only path back to
+        // the NEW child — these turns never latched a live_reply, so the
+        // failure cards below cannot cover them) and DROP the gates entirely
+        // (no backoff marker): the fresh child's transport is healthy by
+        // construction, so the drain at the end resubmits immediately.
+        let dead_gates: Vec<(SessionKey, StagedSubmitGate)> =
+            self.state.staged_submit_in_flight.drain().collect();
+        for (session_id, gate) in dead_gates {
+            self.restage_dead_staged_submit(&session_id, gate);
+        }
         let mut follow_up = None;
         for (session_id, turn_id) in latched {
             // An approval modal for the dead turn will never receive its
@@ -10099,12 +10192,13 @@ mod tests {
         assert!(store.state.pending_messages.is_empty());
     }
 
-    /// codex P2 on the FIFO gate itself: a staged submit that dies at the
-    /// TRANSPORT layer (request cancelled / send failure) never produces
-    /// turn/started or a terminal — the gate must release on those error
-    /// events or the session's remaining staged queue wedges.
+    /// P2 (tri-repo #246): a staged submit that dies at the TRANSPORT layer
+    /// (cancel-all) never produces turn/started or a terminal. The gate must
+    /// release — AND the drained prompt must be RE-STAGED at the queue front,
+    /// not dropped: "queue prompts, hit a reconnect burst → the drained one
+    /// vanishes without a trace".
     #[test]
-    fn transport_error_releases_the_staged_submit_gate() {
+    fn transport_death_restages_the_in_flight_staged_prompt() {
         use octos_core::app_ui::AppUiError;
         let mut store = store_with_two_sessions("local:a", "local:b");
         let a = SessionKey("local:a".into());
@@ -10121,6 +10215,7 @@ mod tests {
             store.state.staged_submit_in_flight.contains_key(&a),
             "gate armed while the submit is in flight"
         );
+        assert_eq!(store.state.pending_messages, vec!["second staged"]);
 
         // Recoverable parser noise must NOT release the gate (codex round-3:
         // an over-broad clear lets a still-alive turn/start's session submit
@@ -10133,19 +10228,73 @@ mod tests {
             store.state.staged_submit_in_flight.contains_key(&a),
             "recoverable noise keeps the FIFO gate armed"
         );
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["second staged"],
+            "recoverable noise must not re-stage anything"
+        );
 
-        // The submit's cancellation arrives (cancel-all path) — release AND
-        // wake the drain: the next staged prompt rides the follow-up queue.
+        // The submit's cancellation arrives (cancel-all path): the in-flight
+        // prompt goes BACK to the queue front (FIFO preserved), its optimistic
+        // transcript row is withdrawn, and NO immediate resubmit fires — the
+        // transport just failed, so the retry waits for the gate-TTL backstop
+        // instead of spinning submit→fail→re-stage.
         store.apply_event(AppUiEvent::Error(AppUiError {
             code: "request_cancelled".into(),
             message: "turn/start request tui-9 cancelled: response may have been discarded".into(),
         }));
 
-        assert!(
-            store.state.staged_submit_in_flight.contains_key(&a),
-            "the woken drain re-arms the gate for the NEXT submit"
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["first staged", "second staged"],
+            "the dead submit's prompt is re-staged at the FRONT, not dropped"
         );
-        let woken =
+        assert!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .all(|message| message.content != "first staged"),
+            "the optimistic user row is withdrawn on re-stage"
+        );
+        let backoff = store
+            .state
+            .staged_submit_in_flight
+            .get(&a)
+            .expect("a backoff gate holds the drain to the TTL cadence");
+        assert!(
+            backoff.in_flight.is_none(),
+            "the backoff gate carries no prompt — a repeat wire error cannot re-stage twice"
+        );
+        assert!(
+            store.state.pending_autonomy_hydration.is_empty(),
+            "no immediate resubmit against the transport that just failed"
+        );
+
+        // A REPEAT wire error before the retry must be a no-op (the prompt is
+        // already back in the queue; double re-stage would duplicate it).
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "request_cancelled".into(),
+            message: "turn/start request tui-10 cancelled: response may have been discarded".into(),
+        }));
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["first staged", "second staged"],
+            "a repeat transport error must not duplicate the re-staged prompt"
+        );
+
+        // Once the backoff gate ages past the TTL, the tick backstop retries
+        // the SAME prompt — FIFO order survives the whole failure.
+        store.state.staged_submit_in_flight.insert(
+            a.clone(),
+            StagedSubmitGate {
+                submitted_at: std::time::Instant::now()
+                    .checked_sub(STAGED_SUBMIT_GATE_TTL + std::time::Duration::from_secs(1))
+                    .expect("instant in the past"),
+                in_flight: None,
+            },
+        );
+        assert!(store.drain_staged_backstop(), "the tick backstop retries");
+        let retried =
             store
                 .state
                 .pending_autonomy_hydration
@@ -10160,11 +10309,170 @@ mod tests {
                     _ => None,
                 });
         assert_eq!(
-            woken.as_deref(),
-            Some("second staged"),
-            "the release must wake the drain — the remaining prompt is submitted, not wedged"
+            retried.as_deref(),
+            Some("first staged"),
+            "the retry submits the RE-STAGED prompt first (FIFO), not the one behind it"
         );
+        assert_eq!(store.state.pending_messages, vec!["second staged"]);
+        assert_eq!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .filter(|message| message.content == "first staged")
+                .count(),
+            1,
+            "the retry records exactly ONE user row — the withdraw prevented a duplicate"
+        );
+    }
+
+    /// P2 (tri-repo #246), send-layer variant: `send_failed` /
+    /// `transport_send` carry no method attribution and release only the
+    /// ACTIVE session's gate — its in-flight prompt must be re-staged there.
+    #[test]
+    fn send_failure_restages_only_the_active_sessions_prompt() {
+        use octos_core::app_ui::AppUiError;
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        let b = SessionKey("local:b".into());
+        store.state.pending_messages = vec!["for A".into()];
+        store
+            .submit_next_pending_if_idle()
+            .expect("A's staged prompt drains");
+        // A second in-flight gate for BACKGROUND session B must survive a
+        // send-layer failure untouched (no attribution → active-session only).
+        store.state.staged_submit_in_flight.insert(
+            b.clone(),
+            StagedSubmitGate::in_flight(TurnId::new(), "for B".into()),
+        );
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "send_failed".into(),
+            message: "failed to send command".into(),
+        }));
+
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["for A"],
+            "the active session's dead submit is re-staged"
+        );
+        assert!(
+            store
+                .state
+                .staged_submit_in_flight
+                .get(&a)
+                .is_some_and(|gate| gate.in_flight.is_none()),
+            "A holds a backoff-only gate"
+        );
+        assert!(
+            store
+                .state
+                .staged_submit_in_flight
+                .get(&b)
+                .is_some_and(|gate| gate.in_flight.is_some()),
+            "B's unrelated in-flight gate is untouched"
+        );
+        assert!(
+            store
+                .state
+                .pending_messages_by_session
+                .get(&b)
+                .is_none_or(|queue| queue.is_empty()),
+            "nothing is re-staged into B"
+        );
+    }
+
+    /// P2 (tri-repo #246), relaunch variant: an in-flight staged submit that
+    /// died with the old stdio child never latched a live_reply, so the
+    /// failure-card path cannot cover it — the relaunch reconcile must
+    /// re-stage its prompt and the tail drain resubmits it against the fresh
+    /// child immediately (healthy transport → no backoff).
+    #[test]
+    fn backend_relaunch_restages_and_resubmits_the_in_flight_staged_prompt() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        store.state.pending_messages = vec!["queued prompt".into()];
+        store
+            .submit_next_pending_if_idle()
+            .expect("staged prompt drains into the doomed child");
         assert!(store.state.pending_messages.is_empty());
+        let rows_before = store.state.sessions[0]
+            .messages
+            .iter()
+            .filter(|message| message.content == "queued prompt")
+            .count();
+        assert_eq!(rows_before, 1, "optimistic row recorded for the submit");
+
+        let command = store.apply_client_event(ClientEvent::BackendRelaunched);
+
+        let command = command.expect("the reconcile drain must resubmit the re-staged prompt");
+        assert!(
+            format!("{command:?}").contains("queued prompt"),
+            "the resubmit carries the re-staged prompt, got {command:?}"
+        );
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "the re-staged prompt drained straight into the fresh child"
+        );
+        assert_eq!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .filter(|message| message.content == "queued prompt")
+                .count(),
+            1,
+            "withdraw + re-record leaves exactly ONE user row, not a duplicate"
+        );
+        assert!(
+            store
+                .state
+                .staged_submit_in_flight
+                .get(&a)
+                .is_some_and(|gate| gate.in_flight.is_some()),
+            "the resubmit re-arms a live gate for the fresh child"
+        );
+    }
+
+    /// Success path unchanged by the re-stage fix: turn/started consumes the
+    /// gate WITHOUT re-staging (the prompt reached the server) and the
+    /// optimistic transcript row stays.
+    #[test]
+    fn turn_started_consumes_gate_without_restaging() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        store.state.pending_messages = vec!["delivered".into()];
+        let command = store
+            .submit_next_pending_if_idle()
+            .expect("staged prompt drains");
+        let AppUiCommand::SubmitPrompt(params) = command else {
+            panic!("staged drain must submit");
+        };
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: a.clone(),
+                turn_id: params.turn_id,
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+
+        assert!(
+            !store.state.staged_submit_in_flight.contains_key(&a),
+            "turn/started settles the gate"
+        );
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "nothing is re-staged on the success path"
+        );
+        assert_eq!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .filter(|message| message.content == "delivered")
+                .count(),
+            1,
+            "the optimistic user row stays on the success path"
+        );
     }
 
     /// The TTL backstop (codex round-4): some in-flight deaths are
@@ -10186,9 +10494,12 @@ mod tests {
         // past the TTL.
         store.state.staged_submit_in_flight.insert(
             a.clone(),
-            std::time::Instant::now()
-                .checked_sub(STAGED_SUBMIT_GATE_TTL + std::time::Duration::from_secs(1))
-                .expect("instant in the past"),
+            StagedSubmitGate {
+                submitted_at: std::time::Instant::now()
+                    .checked_sub(STAGED_SUBMIT_GATE_TTL + std::time::Duration::from_secs(1))
+                    .expect("instant in the past"),
+                in_flight: None,
+            },
         );
 
         let command = store
@@ -10196,12 +10507,12 @@ mod tests {
             .expect("a stale gate must not wedge the staged queue");
         assert!(matches!(command, AppUiCommand::SubmitPrompt(_)));
         // The new submit re-arms a FRESH gate.
-        let stamp = store
+        let gate = store
             .state
             .staged_submit_in_flight
             .get(&a)
             .expect("fresh gate re-armed");
-        assert!(stamp.elapsed() < STAGED_SUBMIT_GATE_TTL);
+        assert!(gate.submitted_at.elapsed() < STAGED_SUBMIT_GATE_TTL);
     }
 
     /// `/resume`-ing into an idle session with staged messages submits them:
@@ -11406,7 +11717,7 @@ mod tests {
         store
             .state
             .staged_submit_in_flight
-            .insert(SessionKey("local:a".into()), std::time::Instant::now());
+            .insert(SessionKey("local:a".into()), StagedSubmitGate::backoff());
 
         let command = store.apply_client_event(ClientEvent::BackendRelaunched);
 
