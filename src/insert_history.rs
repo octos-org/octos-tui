@@ -146,6 +146,14 @@ where
         }
         reset_scroll_region(writer)?;
         queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
+        // The grow step above may have slid the viewport down (a top-0 area
+        // with spare rows below lands here at top 1) — apply the pending move
+        // before returning or the stored viewport stays on the old row while
+        // the screen shifted, and the next draw repaints the wrong rows
+        // (codex fold 5).
+        if should_update_area {
+            terminal.set_viewport_area(area);
+        }
         terminal.set_visible_history_extent(0, 0);
         // The scroll shifted the on-screen viewport content; force the next
         // draw to repaint it fully instead of diffing against a stale buffer.
@@ -1115,6 +1123,25 @@ mod tests {
         assert_eq!(
             t.viewport_area.y, 7,
             "viewport must slide by the full spare gap (2 rows), not by len % 65536"
+        );
+    }
+
+    /// Codex fold 5: a viewport at row 0 with spare rows below first GROWS
+    /// down (area.y bumps, `should_update_area` set) and can then land in the
+    /// degenerate-region streaming fallback (`area.top() <= 1`) — which used
+    /// to return WITHOUT applying the pending `set_viewport_area`, leaving
+    /// the stored viewport at the old row while the screen had shifted (the
+    /// next draw repainted the wrong rows).
+    #[test]
+    fn fallback_after_grow_applies_the_pending_viewport_move() {
+        let mut t = Terminal::new(RecordingBackend::new(10, 6)).expect("terminal");
+        t.set_viewport_area(Rect::new(0, 0, 10, 1)); // top row, 5 spare below
+
+        insert_history_lines(&mut t, vec![text_line("x")]).expect("insert history");
+
+        assert_eq!(
+            t.viewport_area.y, 1,
+            "the grow step's viewport move must be applied even when the streaming fallback returns early"
         );
     }
 
