@@ -5761,6 +5761,51 @@ impl AppState {
         self.optimistic_user_messages = retained;
     }
 
+    /// Settle staged-submit gates that a freshly-replayed snapshot already
+    /// REFLECTS (codex fold): if the replayed session contains the in-flight
+    /// prompt as a user message beyond the pre-submit baseline, the submit
+    /// reached the server before the replay — no later TurnStarted/terminal
+    /// will arrive on this connection to clear the gate, and letting it
+    /// TTL-expire would re-stage and submit a DUPLICATE turn. Gates with no
+    /// echo stay armed (a genuinely dead submit self-heals via the TTL
+    /// re-stage).
+    ///
+    /// MUST run BEFORE [`Self::restore_optimistic_user_messages`]: the
+    /// restore re-inserts un-echoed optimistic rows, which would inflate the
+    /// match count and settle (lose) a gate whose submit never landed.
+    pub fn settle_staged_gates_reflected_by_snapshot(&mut self) {
+        let mut settled: Vec<SessionKey> = Vec::new();
+        for (session_id, gate) in &self.staged_submit_in_flight {
+            let Some(in_flight) = gate.in_flight.as_ref() else {
+                continue;
+            };
+            let Some(session) = self
+                .sessions
+                .iter()
+                .find(|session| &session.id == session_id)
+            else {
+                continue;
+            };
+            // Baseline from the surviving optimistic tracking entry (matching
+            // rows that existed BEFORE this submit); a capped-out entry falls
+            // back to 0 — conservative toward settling (never duplicates).
+            let baseline = self
+                .optimistic_user_messages
+                .iter()
+                .find(|optimistic| {
+                    &optimistic.session_id == session_id && optimistic.turn_id == in_flight.turn_id
+                })
+                .map(|optimistic| optimistic.prior_matching_user_count)
+                .unwrap_or(0);
+            if matching_user_message_count(session, &in_flight.prompt) > baseline {
+                settled.push(session_id.clone());
+            }
+        }
+        for session_id in settled {
+            self.staged_submit_in_flight.remove(&session_id);
+        }
+    }
+
     /// Withdraw the optimistic user prompt recorded for `turn_id`: its submit
     /// died at the transport layer, so the turn will never start and the
     /// prompt is being RE-STAGED (P2 tri-repo #246). Removes the optimistic
@@ -6226,17 +6271,48 @@ impl AppState {
             .map(|entry| entry.cursor)
     }
 
+    /// Whether an activity row with this attribution can render in the
+    /// CURRENT view — the gate for scroll preservation on activity writes
+    /// (P2 tri-repo #246 fold). Mirrors the flow's filter shape
+    /// (`flow_activity_items` filters by the active turn):
+    ///
+    /// * unattributed (`session_id == None`) → assume visible (old behavior);
+    /// * the active session's own rows → visible;
+    /// * a background row tied to a TURN → renders only under its own turn's
+    ///   flow, never the active one → invisible here;
+    /// * a background TURNLESS row → renders in the active flow exactly when
+    ///   no turn is active (codex fold: skipping these lost the read
+    ///   position for rows that were on screen). May over-preserve for the
+    ///   few turnless rows `is_subagent_progress` folds away — the safe
+    ///   direction.
+    fn activity_renders_in_active_view(
+        &self,
+        session_id: Option<&SessionKey>,
+        turn_id: Option<&TurnId>,
+    ) -> bool {
+        let Some(session_id) = session_id else {
+            return true;
+        };
+        if self
+            .active_session()
+            .is_some_and(|session| &session.id == session_id)
+        {
+            return true;
+        }
+        match turn_id {
+            Some(_) => false,
+            None => self.active_turn().is_none(),
+        }
+    }
+
     pub fn push_activity(&mut self, item: ActivityItem) {
         const MAX_ACTIVITY_ITEMS: usize = 80;
-        // An item attributed to a NON-active session renders nowhere in the
-        // current view (the flow filters by the active turn, the navigator by
-        // session), so preserving the scroll for it would drift the active
-        // transcript's read position (P2 tri-repo #246 fold). Unattributed
-        // items keep the old behavior — they may render in the active flow.
-        let renders_in_active_view = item.session_id.as_ref().is_none_or(|session_id| {
-            self.active_session()
-                .is_some_and(|session| &session.id == session_id)
-        });
+        // Preserving the scroll for a row that renders nowhere in the current
+        // view would drift the active transcript's read position; skipping it
+        // for a row that IS visible loses the position instead — gate on the
+        // render-accurate predicate (P2 tri-repo #246 fold).
+        let renders_in_active_view =
+            self.activity_renders_in_active_view(item.session_id.as_ref(), item.turn_id.as_ref());
         let estimated_rows = estimated_activity_rows(&item);
         self.activity.push(item);
         if renders_in_active_view {
@@ -6270,7 +6346,7 @@ impl AppState {
         // escape sequences.
         let output_preview = output_preview
             .map(|preview| crate::sanitize::strip_terminal_controls(&preview).into_owned());
-        let mut updated_session: Option<Option<SessionKey>> = None;
+        let mut updated: Option<(Option<SessionKey>, Option<TurnId>)> = None;
         if let Some(item) = self
             .activity
             .iter_mut()
@@ -6290,19 +6366,15 @@ impl AppState {
             if duration_ms.is_some() {
                 item.duration_ms = duration_ms;
             }
-            updated_session = Some(item.session_id.clone());
+            updated = Some((item.session_id.clone(), item.turn_id.clone()));
         }
-        // Mirror `push_activity`: an update to a NON-active session's item
-        // renders nowhere in the current view, so it must not drift the
-        // active transcript's read position (P2 tri-repo #246 fold).
-        if let Some(item_session) = updated_session {
-            let renders_in_active_view = item_session.as_ref().is_none_or(|session_id| {
-                self.active_session()
-                    .is_some_and(|session| &session.id == session_id)
-            });
-            if renders_in_active_view {
-                self.preserve_transcript_position_after_append(1);
-            }
+        // Mirror `push_activity`: only an update to a row that can render in
+        // the current view may adjust the read position (P2 tri-repo #246
+        // fold).
+        if let Some((item_session, item_turn)) = updated
+            && self.activity_renders_in_active_view(item_session.as_ref(), item_turn.as_ref())
+        {
+            self.preserve_transcript_position_after_append(1);
         }
     }
 

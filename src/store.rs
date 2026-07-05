@@ -5380,6 +5380,10 @@ impl Store {
                 state.session_usage = session_usage;
                 state.session_context_window = session_context_window;
                 state.staged_submit_in_flight = staged_submit_in_flight;
+                // Settle gates the snapshot already reflects BEFORE the
+                // optimistic restore below re-inserts un-echoed rows (which
+                // would inflate the echo count and mis-settle live gates).
+                state.settle_staged_gates_reflected_by_snapshot();
                 state.restore_optimistic_user_messages();
                 self.state = state;
                 None
@@ -10702,6 +10706,116 @@ mod tests {
                 .get(&a)
                 .is_some_and(|gate| gate.in_flight.is_some()),
             "the prompt-bearing gate must survive a snapshot replay"
+        );
+    }
+
+    /// Codex fold 3 (P1): a reconnect snapshot that already REFLECTS the
+    /// in-flight staged submit (its user message echoed into the session's
+    /// replayed messages) means the submit reached the server — no later
+    /// TurnStarted/terminal will clear the preserved gate, so after the TTL
+    /// it would re-stage and submit a DUPLICATE turn. The replay must settle
+    /// such gates; a gate with no echo stays armed (genuine deaths self-heal
+    /// via the TTL re-stage).
+    #[test]
+    fn snapshot_reflecting_the_in_flight_submit_settles_its_gate() {
+        let a = SessionKey("local:a".into());
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.pending_messages = vec!["hello".into()];
+        store
+            .submit_next_pending_if_idle()
+            .expect("staged prompt drains");
+        assert!(
+            store
+                .state
+                .staged_submit_in_flight
+                .get(&a)
+                .is_some_and(|gate| gate.in_flight.is_some()),
+            "prompt-bearing gate armed"
+        );
+
+        // The replayed session ALREADY contains the server-echoed user
+        // message for the in-flight submit.
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![
+                SessionView {
+                    id: a.clone(),
+                    title: "local:a".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::user("hello".to_string())],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+                SessionView {
+                    id: SessionKey("local:b".into()),
+                    title: "local:b".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+            ],
+            selected_session: 0,
+            status: "replayed".into(),
+            target: None,
+            readonly: false,
+        }));
+
+        assert!(
+            !store.state.staged_submit_in_flight.contains_key(&a),
+            "a gate whose submit the snapshot already reflects must settle, not TTL-expire into a duplicate"
+        );
+        // And the settled prompt is NOT re-staged — it was delivered.
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "a delivered prompt must not be re-queued"
+        );
+        assert_eq!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .filter(|message| message.content == "hello")
+                .count(),
+            1,
+            "exactly the server-echoed row remains (no optimistic duplicate)"
+        );
+    }
+
+    /// Codex fold 3 (P2): TURNLESS activity renders in the active flow when
+    /// no turn is active — regardless of which session it belongs to
+    /// (`flow_activity_items` filters by turn only). A background turnless
+    /// row is therefore VISIBLE and must still preserve the scrolled-up read
+    /// position; only background rows tied to a (non-active) turn render
+    /// nowhere.
+    #[test]
+    fn background_turnless_activity_preserves_scroll_when_it_renders() {
+        let a = SessionKey("local:a".into());
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.switch_selected_session(1);
+        store.state.transcript_scroll = 7; // user scrolled up in idle B
+
+        // Turnless progress from background A renders in B's idle flow.
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Progress, "bg-sweep", "running")
+                .with_session(a.clone()),
+        );
+        assert!(
+            store.state.transcript_scroll > 7,
+            "a VISIBLE turnless background row must preserve the read position"
+        );
+
+        // While B has an active turn, that same background turnless row does
+        // NOT render (the flow shows B's turn items) — no preserve.
+        let scroll_before = store.state.transcript_scroll;
+        store.state.sessions[1].live_reply = Some(LiveReply {
+            turn_id: TurnId::new(),
+            text: "streaming".into(),
+        });
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Progress, "bg-sweep-2", "running").with_session(a),
+        );
+        assert_eq!(
+            store.state.transcript_scroll, scroll_before,
+            "an invisible turnless background row must not drift the read position"
         );
     }
 
