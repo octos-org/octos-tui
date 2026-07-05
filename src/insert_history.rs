@@ -115,17 +115,26 @@ where
         should_update_area = true;
     }
 
-    // A full-screen viewport leaves NO rows above it: `CSI 1;top r` would be
-    // the invalid `CSI 1;0r` (xterm reads the 0 param as "default", i.e. the
-    // whole screen) and the lines would print inside the viewport, only to be
-    // repainted over by the next draw — silently lost on tiny panes (#232
-    // #3). Stream them through the bottom row of an explicit full-screen
-    // region instead: each `\r\n` at the bottom margin scrolls one row out
-    // through the top into scrollback. The trailing feeds push every printed
-    // line the rest of the way out — the next draw repaints the (full-screen)
-    // viewport regardless, so rows left on screen would be lost, not saved.
-    if area.top() == 0 {
+    // A viewport with fewer than TWO rows above it cannot use the DECSTBM
+    // path: `CSI 1;0r` is invalid (xterm reads the 0 param as "default",
+    // i.e. the whole screen) and `CSI 1;1r` is equally rejected (DECSTBM
+    // requires top < bottom), so the region never narrows and the scroll ops
+    // would hit the live viewport — flushed lines were printed inside it and
+    // silently repainted over on tiny panes (#232 #3, codex fold 4). Stream
+    // the lines through the bottom row of an explicit full-screen region
+    // instead: each `\r\n` at the bottom margin scrolls one row out through
+    // the top into scrollback, and the trailing feeds push every printed
+    // line (plus any preserved rows above the viewport) the rest of the way
+    // out — the next draw repaints the viewport regardless, so rows left on
+    // screen would be lost, not saved. The VIEWPORT rows are cleared first so
+    // the displaced chrome (composer/status) streams out as blanks, never as
+    // copyable text in scrollback; rows ABOVE the viewport are genuine
+    // history/shell content and stream out intact.
+    if area.top() <= 1 {
         let bottom = screen_size.height.max(1);
+        for row in area.top()..bottom {
+            queue!(writer, MoveTo(0, row), Clear(ClearType::UntilNewLine))?;
+        }
         set_scroll_region(writer, 1, bottom)?;
         queue!(writer, MoveTo(0, bottom.saturating_sub(1)))?;
         for line in &wrapped {
@@ -681,7 +690,11 @@ mod tests {
                     if parsed.len() >= 2 {
                         let top = parsed[0].max(1).saturating_sub(1);
                         let bottom = parsed[1].max(1).min(self.size.height).saturating_sub(1);
-                        if top <= bottom {
+                        // DECSTBM requires top < bottom (xterm IGNORES a
+                        // degenerate one-row region like `CSI 1;1r`) — mirror
+                        // that so the harness cannot mask real-terminal
+                        // failures (codex fold 4).
+                        if top < bottom {
                             self.margin_top = top;
                             self.margin_bottom = bottom;
                         }
@@ -851,7 +864,11 @@ mod tests {
         height: u16,
         final_viewport: Rect,
     ) -> Terminal<ScreenBackend> {
-        let seed_top = final_viewport.y.saturating_sub(1).max(1);
+        // Seed with a top ≥ 2 so the seeding itself stays on the normal
+        // DECSTBM path — a top ≤ 1 seed would route through the full-screen
+        // streaming fallback (codex fold 4) and pollute the combos that then
+        // assert exact normal-path row layouts.
+        let seed_top = final_viewport.y.saturating_sub(1).max(2);
         let seed_viewport = Rect::new(0, seed_top, width, height - seed_top);
         let mut term = screen_term(width, height, seed_viewport);
         insert_history_lines(&mut term, vec![text_line("old")]).expect("seed old history");
@@ -963,6 +980,31 @@ mod tests {
                 let combined_rows = combined
                     .backend()
                     .screen_rows_above(combined.viewport_area.top());
+
+                if viewport_top < 2 {
+                    // Degenerate region (`area.top() <= 1`, codex fold 4):
+                    // these route through the full-screen STREAMING fallback,
+                    // which trades blank-noise for guaranteed scrollback
+                    // delivery — exact row equivalence doesn't hold. The seed
+                    // row sits INSIDE the final one-row-above viewport here
+                    // (the helper moved the viewport up over it), i.e. it is
+                    // live-area territory the next draw repaints regardless —
+                    // only the flushed inserts are recoverable content.
+                    let readable = |rows: &[String]| -> Vec<String> {
+                        rows.iter().filter(|row| !row.is_empty()).cloned().collect()
+                    };
+                    assert_eq!(
+                        readable(&split_rows),
+                        vec!["first", "second"],
+                        "streaming-path split inserts must deliver the flushed content in order: height={height} viewport_top={viewport_top}"
+                    );
+                    assert_eq!(
+                        readable(&split_rows),
+                        readable(&combined_rows),
+                        "streaming-path chunked and combined inserts must deliver the same content: height={height} viewport_top={viewport_top}"
+                    );
+                    continue;
+                }
 
                 assert_eq!(
                     split_rows,
@@ -1208,6 +1250,69 @@ mod tests {
             readable,
             vec!["alpha", "beta"],
             "flushed lines must reach scrollback, not be repainted over inside the viewport"
+        );
+    }
+
+    /// Codex fold 4: DECSTBM requires top < bottom — xterm IGNORES
+    /// `CSI 1;1r`, so with the viewport at row 1 the "normal" path scrolled
+    /// the WHOLE screen (region never narrowed) and clobbered/leaked the live
+    /// viewport. A one-row-above viewport must use the streaming fallback,
+    /// never emit the degenerate region.
+    #[test]
+    fn one_row_above_viewport_streams_instead_of_degenerate_region() {
+        let width = 24;
+        let height = 6;
+        let mut term = screen_term(width, height, Rect::new(0, 1, width, height - 1));
+        seed_screen_row(&mut term, 0, "shell-top");
+
+        insert_history_lines(&mut term, vec![text_line("h-one"), text_line("h-two")])
+            .expect("one-row flush");
+
+        assert!(
+            !String::from_utf8_lossy(&term.backend().buf).contains("\x1b[1;1r"),
+            "must not emit the xterm-invalid CSI 1;1r one-row region"
+        );
+        let readable: Vec<&String> = term
+            .backend()
+            .scrollback
+            .iter()
+            .filter(|row| !row.is_empty())
+            .collect();
+        assert_eq!(
+            readable,
+            vec!["shell-top", "h-one", "h-two"],
+            "the pre-existing shell row and both flushed lines must reach scrollback"
+        );
+    }
+
+    /// Codex fold 4: the full-screen streaming fallback scrolled the OLD
+    /// viewport rows (composer/status chrome) into scrollback ahead of the
+    /// history lines. The region is cleared first so the displaced rows
+    /// stream out as blanks, never as copyable chrome text.
+    #[test]
+    fn full_screen_streaming_does_not_leak_viewport_chrome_into_scrollback() {
+        let width = 24;
+        let height = 4;
+        let mut term = screen_term(width, height, Rect::new(0, 0, width, height));
+        for row in 0..height {
+            seed_screen_row(&mut term, row, "CHROME-ROW");
+        }
+
+        insert_history_lines(&mut term, vec![text_line("alpha")]).expect("full-screen flush");
+
+        assert!(
+            !term
+                .backend()
+                .scrollback
+                .iter()
+                .any(|row| row.contains("CHROME-ROW")),
+            "old viewport chrome must not leak into scrollback: {:?}",
+            term.backend().scrollback
+        );
+        assert!(
+            term.backend().scrollback.iter().any(|row| row == "alpha"),
+            "the flushed line still reaches scrollback: {:?}",
+            term.backend().scrollback
         );
     }
 

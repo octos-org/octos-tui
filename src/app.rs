@@ -174,12 +174,14 @@ pub fn live_ui_height_with_finalization(
     // Never let the live UI eat the whole screen: leave at least a few rows of
     // scrollback visible above it (so the user always sees prior output and can
     // start a selection there). Always at least the chrome — but HARD-capped
-    // at height-1 (#232 #3): a full-screen viewport leaves no scroll region
-    // above it, so flushed history lines had nowhere to go and were silently
-    // repainted over on tiny panes. One row above keeps the DECSTBM region
-    // valid and streams every flush into scrollback; the degenerate 1-row
-    // terminal falls back to insert_history's full-screen streaming path.
-    let max_live = height.saturating_sub(1).max(1);
+    // at height-2 (#232 #3, codex fold 4): a full-screen viewport has no
+    // scroll region above it, and a ONE-row region is equally unusable
+    // (DECSTBM requires top < bottom; xterm ignores `CSI 1;1r`), so flushed
+    // history lines had nowhere to go and were silently repainted over on
+    // tiny panes. Two rows above keep the DECSTBM region valid; the
+    // degenerate 1–2-row terminals fall back to insert_history's full-screen
+    // streaming path.
+    let max_live = height.saturating_sub(2).max(1);
     let cap = height
         .saturating_sub(LIVE_VIEWPORT_MIN_SCROLLBACK)
         .max(chrome.min(max_live));
@@ -10077,14 +10079,14 @@ mod tests {
         );
     }
 
-    /// P2 (tri-repo #246 ⊃ #232 #3): the live viewport must never cover the
-    /// FULL screen on a multi-row terminal — a full-screen viewport has no
-    /// scroll region above it, so flushed history lines were printed inside
-    /// the viewport and silently repainted over on tiny panes. At least one
-    /// row must remain above (the degenerate 1-row terminal keeps 1 and is
-    /// handled by insert_history's streaming fallback).
+    /// P2 (tri-repo #246 ⊃ #232 #3, codex fold 4): the live viewport must
+    /// leave at least TWO rows above it on terminals tall enough — DECSTBM
+    /// requires top < bottom, so both a full-screen viewport (`CSI 1;0r`)
+    /// and a one-row region (`CSI 1;1r`) are unusable for history flushes.
+    /// The degenerate 1–2-row terminals keep one live row and are handled by
+    /// insert_history's streaming fallback.
     #[test]
-    fn live_ui_height_never_covers_the_full_screen_on_multi_row_terminals() {
+    fn live_ui_height_leaves_a_valid_scroll_region_above_the_viewport() {
         let app = AppState::new(
             vec![SessionView {
                 id: SessionKey("local:test".into()),
@@ -10099,14 +10101,15 @@ mod tests {
             None,
             false,
         );
-        for height in 2..=10u16 {
+        for height in 3..=10u16 {
             let live = live_ui_height(&app, 80, height);
             assert!(
-                live < height,
-                "live UI must leave ≥1 history row above the viewport: height={height} live={live}"
+                live <= height - 2,
+                "live UI must leave ≥2 history rows above the viewport: height={height} live={live}"
             );
         }
-        // Degenerate single-row terminal: the viewport takes the row.
+        // Degenerate 1–2-row terminals: the streaming fallback owns these.
+        assert_eq!(live_ui_height(&app, 80, 2), 1);
         assert_eq!(live_ui_height(&app, 80, 1), 1);
     }
 

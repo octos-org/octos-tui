@@ -5786,9 +5786,15 @@ impl AppState {
             else {
                 continue;
             };
-            // Baseline from the surviving optimistic tracking entry (matching
-            // rows that existed BEFORE this submit); a capped-out entry falls
-            // back to 0 — conservative toward settling (never duplicates).
+            // Baseline = matching rows that existed BEFORE this submit, from
+            // the surviving optimistic tracking entry or (codex fold 4) the
+            // turn-prompt anchor recorded for the same turn — the two caches
+            // evict independently. With NO baseline at all the gate stays
+            // ARMED: assuming 0 would make any OLDER identical user message
+            // look like a snapshot echo and settle away the only copy of the
+            // prompt (data loss); an armed gate at worst re-stages via the
+            // TTL and duplicates a turn the server already ran — recoverable,
+            // and only reachable when both caches evicted the entry.
             let baseline = self
                 .optimistic_user_messages
                 .iter()
@@ -5796,7 +5802,17 @@ impl AppState {
                     &optimistic.session_id == session_id && optimistic.turn_id == in_flight.turn_id
                 })
                 .map(|optimistic| optimistic.prior_matching_user_count)
-                .unwrap_or(0);
+                .or_else(|| {
+                    self.turn_prompt_anchors
+                        .iter()
+                        .find(|anchor| {
+                            &anchor.session_id == session_id && anchor.turn_id == in_flight.turn_id
+                        })
+                        .map(|anchor| anchor.prior_matching_user_count)
+                });
+            let Some(baseline) = baseline else {
+                continue;
+            };
             if matching_user_message_count(session, &in_flight.prompt) > baseline {
                 settled.push(session_id.clone());
             }

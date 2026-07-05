@@ -10780,6 +10780,64 @@ mod tests {
         );
     }
 
+    /// Codex fold 4: with BOTH baseline caches evicted (optimistic entry and
+    /// turn-prompt anchor), an OLDER identical user message in the replayed
+    /// session must NOT look like a snapshot echo — assuming baseline 0
+    /// settled away the gate, i.e. the only copy of the drained prompt. With
+    /// no baseline the gate stays armed (worst case: a recoverable duplicate
+    /// via the TTL re-stage; never data loss).
+    #[test]
+    fn snapshot_settle_keeps_gate_armed_when_baseline_is_missing() {
+        let a = SessionKey("local:a".into());
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        // The session already contains an OLD user message with the same text.
+        store.state.sessions[0]
+            .messages
+            .push(Message::user("hello".to_string()));
+        store.state.pending_messages = vec!["hello".into()];
+        store
+            .submit_next_pending_if_idle()
+            .expect("staged prompt drains");
+        // Simulate cap eviction of BOTH baseline caches.
+        store.state.optimistic_user_messages.clear();
+        store.state.turn_prompt_anchors.clear();
+
+        // Replay includes only the OLD "hello", not the in-flight one.
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![
+                SessionView {
+                    id: a.clone(),
+                    title: "local:a".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::user("hello".to_string())],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+                SessionView {
+                    id: SessionKey("local:b".into()),
+                    title: "local:b".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+            ],
+            selected_session: 0,
+            status: "replayed".into(),
+            target: None,
+            readonly: false,
+        }));
+
+        assert!(
+            store
+                .state
+                .staged_submit_in_flight
+                .get(&a)
+                .is_some_and(|gate| gate.in_flight.is_some()),
+            "with no baseline, an older identical message must not settle the gate away"
+        );
+    }
+
     /// Codex fold 3 (P2): TURNLESS activity renders in the active flow when
     /// no turn is active — regardless of which session it belongs to
     /// (`flow_activity_items` filters by turn only). A background turnless
