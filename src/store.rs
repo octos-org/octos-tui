@@ -5892,15 +5892,11 @@ impl Store {
             .clear_live_reply_segment_boundaries(session_id, turn_id);
         self.state.staged_submit_in_flight.remove(session_id);
         self.state.mark_turn_completed(session_id, turn_id);
-        self.state
-            .reconcile_terminal_turn_running_activity(turn_id);
+        self.state.reconcile_terminal_turn_running_activity(turn_id);
         // A pending approval/question for the dead turn is stale.
-        if self
-            .state
-            .approval
-            .as_ref()
-            .is_some_and(|approval| &approval.session_id == session_id && &approval.turn_id == turn_id)
-        {
+        if self.state.approval.as_ref().is_some_and(|approval| {
+            &approval.session_id == session_id && &approval.turn_id == turn_id
+        }) {
             self.state.approval = None;
         }
         self.clear_question_for_turn(session_id, turn_id);
@@ -6087,7 +6083,7 @@ impl Store {
                 result.session_id
             )),
         );
-        if result.accepted {
+        if result.accepted && self.event_targets_active_session(&result.session_id) {
             self.state.set_run_state_in_progress();
         }
         self.state.status = status;
@@ -6489,7 +6485,7 @@ impl Store {
             }
             self.state.push_activity(item);
         }
-        if event.turn_id.is_some() {
+        if event.turn_id.is_some() && self.event_targets_active_session(&event.session_id) {
             self.state.set_run_state_in_progress();
         }
 
@@ -6643,6 +6639,7 @@ impl Store {
                 self.commit_pending_live_reply_for_turn_switch(&event.session_id, &event.turn_id);
                 self.state
                     .record_turn_prompt_anchor_from_latest_user(&event.session_id, &event.turn_id);
+                let targets_active = self.event_targets_active_session(&event.session_id);
                 if let Some(session) = self.find_session_mut(&event.session_id) {
                     // Out-of-order lifecycle (nit 1): a MessageDelta may have
                     // already lazy-bound THIS turn before its TurnStarted was
@@ -6662,7 +6659,12 @@ impl Store {
                         });
                     }
                     self.state.status = format!("Turn started in {}", session.title);
-                    self.state.set_run_state_in_progress();
+                    // The chip is global — only the ACTIVE session's turn
+                    // drives it (the status line above stays: it names the
+                    // session, so it is not ambiguous cross-session).
+                    if targets_active {
+                        self.state.set_run_state_in_progress();
+                    }
                 }
                 None
             }
@@ -6681,6 +6683,10 @@ impl Store {
                 if self.state.is_turn_completed(&session_id, &turn_id) {
                     return None;
                 }
+                // Global chip + scroll belong to the ACTIVE session; a
+                // background session's stream must not move them (its text
+                // still accumulates into its own live_reply below).
+                let targets_active = self.event_targets_active_session(&session_id);
                 let follow_tail = self.state.transcript_scroll == 0;
                 // Lazy-bind: a delta whose turn_id has no current live_reply
                 // binding (None, or a binding for an OLDER turn) must still be
@@ -6715,17 +6721,19 @@ impl Store {
                         reset_scroll = true;
                     }
                 }
-                if needs_bind && reset_scroll {
+                if needs_bind && reset_scroll && targets_active {
                     // A delta-first continuation turn (its TurnStarted was not
                     // delivered) is genuinely streaming — reflect the active run.
                     self.state.set_run_state_in_progress();
                 }
-                if reset_scroll && follow_tail {
-                    self.state.scroll_transcript_to_latest();
-                } else if reset_scroll {
-                    self.state.preserve_transcript_position_after_append(
-                        text.lines().count().saturating_sub(1),
-                    );
+                if reset_scroll && targets_active {
+                    if follow_tail {
+                        self.state.scroll_transcript_to_latest();
+                    } else {
+                        self.state.preserve_transcript_position_after_append(
+                            text.lines().count().saturating_sub(1),
+                        );
+                    }
                 }
                 None
             }
@@ -6752,7 +6760,9 @@ impl Store {
                     item = item.with_arguments(arguments);
                 }
                 self.state.push_activity(item);
-                self.state.set_run_state_in_progress();
+                if self.event_targets_active_session(&event.session_id) {
+                    self.state.set_run_state_in_progress();
+                }
                 self.state.status = t!(
                     "status.tool_started",
                     name = event.tool_name,
@@ -6774,7 +6784,9 @@ impl Store {
                     None,
                     None,
                 );
-                self.state.set_run_state_in_progress();
+                if self.event_targets_active_session(&event.session_id) {
+                    self.state.set_run_state_in_progress();
+                }
                 self.state.status = event
                     .message
                     .unwrap_or_else(|| format!("Tool progress {}", event.tool_call_id));
@@ -7288,7 +7300,9 @@ impl Store {
                         .with_session(session_id.clone())
                         .with_detail(AppState::envelope_tool_detail_for_thread(&thread_id)),
                 );
-                self.state.set_run_state_in_progress();
+                if self.event_targets_active_session(&session_id) {
+                    self.state.set_run_state_in_progress();
+                }
                 self.state.status =
                     t!("status.tool_started", name = name, id = tool_call_id).into_owned();
                 None
@@ -7305,7 +7319,9 @@ impl Store {
                     None,
                     None,
                 );
-                self.state.set_run_state_in_progress();
+                if self.event_targets_active_session(&session_id) {
+                    self.state.set_run_state_in_progress();
+                }
                 self.state.status = message;
                 None
             }
@@ -7356,7 +7372,9 @@ impl Store {
                 self.state
                     .reconcile_envelope_thread_running_activity(&session_id, &thread_id);
                 self.state.status = format!("Turn completed for {thread_id}");
-                self.state.set_run_state_success();
+                if self.event_targets_active_session(&session_id) {
+                    self.state.set_run_state_success();
+                }
                 self.submit_next_pending_if_idle()
             }
         }
@@ -7369,6 +7387,9 @@ impl Store {
         text: String,
         replace: bool,
     ) {
+        // Scroll belongs to the ACTIVE transcript; an envelope append into a
+        // background session must not move it.
+        let targets_active = self.event_targets_active_session(session_id);
         let follow_tail = self.state.transcript_scroll == 0;
         let Some(session) = self.find_session_mut(session_id) else {
             return;
@@ -7388,10 +7409,12 @@ impl Store {
                 ThreadId::new(thread_id.to_owned()),
             ));
         }
-        if follow_tail {
-            self.state.scroll_transcript_to_latest();
-        } else {
-            self.state.preserve_transcript_position_after_append(1);
+        if targets_active {
+            if follow_tail {
+                self.state.scroll_transcript_to_latest();
+            } else {
+                self.state.preserve_transcript_position_after_append(1);
+            }
         }
     }
 
@@ -7516,7 +7539,10 @@ impl Store {
             .with_turn(event.turn_id)
             .with_detail(format!("scope={scope} match={scope_match}")),
         );
-        if cleared {
+        if cleared
+            .as_ref()
+            .is_some_and(|session_id| self.event_targets_active_session(session_id))
+        {
             self.state.set_run_state_in_progress();
         }
         self.state.status = format!("Approval auto-resolved ({decision}) by scope policy");
@@ -7536,7 +7562,10 @@ impl Store {
                 .with_turn(event.turn_id)
                 .with_detail(detail.clone()),
         );
-        if cleared {
+        if cleared
+            .as_ref()
+            .is_some_and(|session_id| self.event_targets_active_session(session_id))
+        {
             self.state.set_run_state_in_progress();
         }
         self.state.status = format!("Approval decided: {decision} ({detail})");
@@ -7550,7 +7579,10 @@ impl Store {
             ActivityItem::new(ActivityKind::Approval, "cancelled", reason.clone())
                 .with_turn(event.turn_id),
         );
-        if cleared {
+        if cleared
+            .as_ref()
+            .is_some_and(|session_id| self.event_targets_active_session(session_id))
+        {
             self.state.set_run_state_in_progress();
         }
         self.state.status = format!("Approval cancelled: {reason}");
@@ -7755,6 +7787,10 @@ impl Store {
             .remove(&(event.session_id.clone(), event.turn_id.clone()))
             .filter(|reasoning| !reasoning.trim().is_empty());
         let seq = event.cursor.map(|cursor| cursor.seq).unwrap_or(0);
+        // Global chip + scroll belong to the ACTIVE session; a background
+        // session's terminal commits into its own transcript below without
+        // repainting them.
+        let targets_active = self.event_targets_active_session(&event.session_id);
         let follow_tail = self.state.transcript_scroll == 0;
         let complete_live_plan = self.turn_had_completion_activity(&event.turn_id);
         let fallback_summary = self.turn_completion_fallback_message(&event.turn_id);
@@ -7813,7 +7849,7 @@ impl Store {
                 .live_reasoning
                 .insert((event.session_id.clone(), event.turn_id.clone()), reasoning);
         }
-        if reset_scroll {
+        if reset_scroll && targets_active {
             if follow_tail {
                 self.state.scroll_transcript_to_latest();
             } else {
@@ -7834,7 +7870,9 @@ impl Store {
             self.state.session_retry.remove(&event.session_id);
             self.state
                 .capture_completed_turn_activity(&event.session_id, &event.turn_id);
-            self.state.set_run_state_success();
+            if targets_active {
+                self.state.set_run_state_success();
+            }
         }
         self.submit_next_pending_if_idle()
     }
@@ -7891,6 +7929,10 @@ impl Store {
             .live_reasoning
             .remove(&(event.session_id.clone(), event.turn_id.clone()))
             .filter(|reasoning| !reasoning.trim().is_empty());
+        // Global chip + scroll belong to the ACTIVE session (mirror
+        // `commit_live_reply`) — a background session's failure card renders
+        // in its own transcript without repainting them.
+        let targets_active = self.event_targets_active_session(&event.session_id);
         let follow_tail = self.state.transcript_scroll == 0;
         let fallback_summary =
             self.turn_error_fallback_message(&event.turn_id, &event.code, &event.message);
@@ -7971,10 +8013,12 @@ impl Store {
                 .insert((event.session_id.clone(), event.turn_id.clone()), reasoning);
         }
         if surfaced_failure {
-            if follow_tail {
-                self.state.scroll_transcript_to_latest();
-            } else {
-                self.state.preserve_transcript_position_after_append(3);
+            if targets_active {
+                if follow_tail {
+                    self.state.scroll_transcript_to_latest();
+                } else {
+                    self.state.preserve_transcript_position_after_append(3);
+                }
             }
             self.state
                 .capture_completed_turn_activity(&event.session_id, &event.turn_id);
@@ -7993,7 +8037,7 @@ impl Store {
             // turn's retry alone.
             self.state.session_retry.remove(&event.session_id);
         }
-        if surfaced_failure {
+        if surfaced_failure && targets_active {
             self.state
                 .set_run_state_error(format!("{}: {}", event.code, event.message));
         }
@@ -8109,6 +8153,21 @@ impl Store {
             follow_up = follow_up.or(command);
         }
         follow_up.or_else(|| self.submit_next_pending_if_idle())
+    }
+
+    /// True when `session_id` is the ACTIVE (selected) session — the only
+    /// session whose events may drive the GLOBAL run-state chip and the
+    /// transcript scroll offset. Background sessions' events still update
+    /// their own session's transcript and bookkeeping, but must not repaint
+    /// state the user is looking at for a different session (P2 tri-repo
+    /// #246: run_state/scroll bleed after a fast mid-turn switch). Switch
+    /// paths re-derive the chip via `refresh_run_state_from_selection`, so
+    /// gating here cannot strand a stale chip when the user switches INTO a
+    /// streaming session.
+    fn event_targets_active_session(&self, session_id: &SessionKey) -> bool {
+        self.state
+            .active_session()
+            .is_some_and(|session| &session.id == session_id)
     }
 
     fn find_session_mut(
@@ -8343,16 +8402,24 @@ impl Store {
         })
     }
 
-    fn clear_matching_approval(&mut self, approval_id: &ApprovalId) -> bool {
+    /// Clear the pending approval modal when it matches `approval_id`.
+    /// Returns the cleared approval's session so callers can gate the global
+    /// run-state transition on it (a background session's approval resolving
+    /// must not repaint the ACTIVE session's chip).
+    fn clear_matching_approval(&mut self, approval_id: &ApprovalId) -> Option<SessionKey> {
         let matches = self
             .state
             .approval
             .as_ref()
             .is_some_and(|approval| &approval.approval_id == approval_id);
         if matches {
-            self.state.approval = None;
+            return self
+                .state
+                .approval
+                .take()
+                .map(|approval| approval.session_id);
         }
-        matches
+        None
     }
 
     /// Phase-1 AskUserQuestion has no dedicated `user_question/cancelled`
@@ -9283,7 +9350,7 @@ mod tests {
         McpConfigMutationResult, McpStatusSummary, ModelStatus, OnboardingProviderPending,
         OnboardingProviderSaveTarget, ProfileLlmMutationResult, ProfileLocalCreateResult,
         RuntimeHealthStatus, RuntimePolicyMcpServer, RuntimePolicyStamp, SessionCursorStatus,
-        SessionStatusReadResult, SessionUsageStatus, ToolConfigMutationResult,
+        SessionRunState, SessionStatusReadResult, SessionUsageStatus, ToolConfigMutationResult,
     };
     use octos_core::SessionKey;
     use octos_core::ui_protocol::{
@@ -11132,6 +11199,195 @@ mod tests {
                 false,
             ),
         }
+    }
+
+    /// P2 (tri-repo #246): the global run-state chip reflects the ACTIVE
+    /// session only. A background session's turn lifecycle (started /
+    /// streaming deltas / tool activity / completion) must not flip the chip
+    /// the user sees for the session they switched to.
+    #[test]
+    fn background_session_lifecycle_does_not_drive_active_run_state() {
+        let a = SessionKey("local:a".into());
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.switch_selected_session(1);
+        assert!(matches!(store.state.run_state, SessionRunState::Idle));
+
+        let turn = TurnId::new();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: a.clone(),
+                turn_id: turn.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        assert!(
+            matches!(store.state.run_state, SessionRunState::Idle),
+            "background TurnStarted must not flip the active chip"
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: a.clone(),
+                topic: None,
+                turn_id: turn.clone(),
+                text: "streaming in background A".into(),
+            },
+        )));
+        assert!(
+            matches!(store.state.run_state, SessionRunState::Idle),
+            "background MessageDelta must not flip the active chip"
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
+            ToolStartedEvent {
+                session_id: a.clone(),
+                topic: None,
+                turn_id: turn.clone(),
+                tool_call_id: "call-bg".into(),
+                tool_name: "shell".into(),
+                arguments: None,
+            },
+        )));
+        assert!(
+            matches!(store.state.run_state, SessionRunState::Idle),
+            "background ToolStarted must not flip the active chip"
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: a.clone(),
+                topic: None,
+                turn_id: turn,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            matches!(store.state.run_state, SessionRunState::Idle),
+            "background TurnCompleted must not flip the active chip to Success"
+        );
+    }
+
+    /// P2 (tri-repo #246): a background session's turn ERROR must not flip
+    /// the active session's chip to Error — the failure card renders in the
+    /// background session's own transcript.
+    #[test]
+    fn background_session_error_does_not_drive_active_run_state() {
+        let a = SessionKey("local:a".into());
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let turn = TurnId::new();
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: turn.clone(),
+            text: "partial".into(),
+        });
+        store.state.switch_selected_session(1);
+        assert!(matches!(store.state.run_state, SessionRunState::Idle));
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: a,
+                topic: None,
+                turn_id: turn,
+                code: "boom".into(),
+                message: "background failure".into(),
+            },
+        )));
+        assert!(
+            matches!(store.state.run_state, SessionRunState::Idle),
+            "background TurnError must not flip the active chip to Error; got {:?}",
+            store.state.run_state
+        );
+    }
+
+    /// P2 (tri-repo #246): a background session's stream/terminal must not
+    /// move the ACTIVE transcript's scroll offset. The user has scrolled up
+    /// in B; A's multi-line deltas and terminal land in A's transcript, which
+    /// is not on screen — B's read position must hold exactly.
+    #[test]
+    fn background_session_stream_does_not_move_active_scroll() {
+        let a = SessionKey("local:a".into());
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.switch_selected_session(1);
+        store.state.transcript_scroll = 7; // user scrolled up in B
+
+        let turn = TurnId::new();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: a.clone(),
+                topic: None,
+                turn_id: turn.clone(),
+                text: "line1\nline2\nline3".into(),
+            },
+        )));
+        assert_eq!(
+            store.state.transcript_scroll, 7,
+            "background delta must not adjust the active scroll offset"
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: a,
+                topic: None,
+                turn_id: turn,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert_eq!(
+            store.state.transcript_scroll, 7,
+            "background terminal must not adjust the active scroll offset"
+        );
+    }
+
+    /// Over-gating guard for the cross-session bleed fix: the ACTIVE
+    /// session's own lifecycle must keep driving the chip exactly as before.
+    #[test]
+    fn active_session_lifecycle_still_drives_run_state() {
+        let a = SessionKey("local:a".into());
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let turn = TurnId::new();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: a.clone(),
+                turn_id: turn.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        assert!(
+            matches!(store.state.run_state, SessionRunState::InProgress),
+            "active TurnStarted drives the chip"
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: a.clone(),
+                topic: None,
+                turn_id: turn.clone(),
+                text: "answer".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: a,
+                topic: None,
+                turn_id: turn,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            matches!(store.state.run_state, SessionRunState::Success),
+            "active terminal drives the chip to Success"
+        );
     }
 
     /// A stdio child relaunch must fail the latched live turn (its terminal
