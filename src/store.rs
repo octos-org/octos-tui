@@ -5326,6 +5326,14 @@ impl Store {
                 let live_reasoning = self.state.live_reasoning.clone();
                 let session_usage = self.state.session_usage.clone();
                 let session_context_window = self.state.session_context_window.clone();
+                // Local-only, and since the re-stage fix the gate holds the
+                // ONLY copy of a drained staged prompt (codex fold): a replay
+                // landing inside the submit→turn/started window must carry it
+                // over like the staged queues, or the prompt is lost and the
+                // tick backstop double-submits the successor. A gate whose
+                // turn genuinely died with the old connection self-heals via
+                // the TTL re-stage path.
+                let staged_submit_in_flight = self.state.staged_submit_in_flight.clone();
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
@@ -5371,6 +5379,7 @@ impl Store {
                 state.live_reasoning = live_reasoning;
                 state.session_usage = session_usage;
                 state.session_context_window = session_context_window;
+                state.staged_submit_in_flight = staged_submit_in_flight;
                 state.restore_optimistic_user_messages();
                 self.state = state;
                 None
@@ -5427,12 +5436,14 @@ impl Store {
                             self.state.staged_submit_in_flight.drain().collect();
                         let mut restaged = false;
                         for (session_id, gate) in gates {
-                            if self.restage_dead_staged_submit(&session_id, gate) {
-                                self.state
-                                    .staged_submit_in_flight
-                                    .insert(session_id, StagedSubmitGate::backoff());
-                                restaged = true;
-                            }
+                            restaged |= self.restage_dead_staged_submit(&session_id, gate);
+                            // EVERY drained gate comes back as a FRESH backoff
+                            // — including backoff-only ones (codex fold: a
+                            // repeat error must extend the backoff, not strip
+                            // it and let the tick backstop retry immediately).
+                            self.state
+                                .staged_submit_in_flight
+                                .insert(session_id, StagedSubmitGate::backoff());
                         }
                         restaged
                     }
@@ -5446,11 +5457,10 @@ impl Store {
                                 self.state.staged_submit_in_flight.remove(&session_id)
                         {
                             let restaged = self.restage_dead_staged_submit(&session_id, gate);
-                            if restaged {
-                                self.state
-                                    .staged_submit_in_flight
-                                    .insert(session_id, StagedSubmitGate::backoff());
-                            }
+                            // Fresh backoff for BOTH gate kinds (see above).
+                            self.state
+                                .staged_submit_in_flight
+                                .insert(session_id, StagedSubmitGate::backoff());
                             restaged
                         } else {
                             false
@@ -6512,7 +6522,10 @@ impl Store {
                     .clone()
                     .unwrap_or_else(|| event.metadata.kind.clone()),
                 status.clone(),
-            );
+            )
+            // Session attribution: a background session's progress rows must
+            // not drift the active transcript's scroll (see push_activity).
+            .with_session(event.session_id.clone());
             if let Some(turn_id) = event.turn_id.clone() {
                 item = item.with_turn(turn_id);
             }
@@ -6787,6 +6800,10 @@ impl Store {
                     .record_live_reply_segment_boundary(&event.session_id, &event.turn_id);
                 let mut item =
                     ActivityItem::new(ActivityKind::Tool, event.tool_name.clone(), "running")
+                        // Session attribution keeps a BACKGROUND session's tool
+                        // rows from drifting the active transcript's scroll
+                        // (push_activity / update_tool_activity gate on it).
+                        .with_session(event.session_id.clone())
                         .with_turn(event.turn_id)
                         .with_tool_call(event.tool_call_id.clone());
                 if let Some(arguments) = event.arguments {
@@ -8107,7 +8124,7 @@ impl Store {
     /// terminal firing here can never submit another session's staged prompt
     /// into this one.
     fn submit_next_pending_if_idle(&mut self) -> Option<AppUiCommand> {
-        if self.state.active_turn().is_some() || self.state.pending_messages.is_empty() {
+        if self.state.active_turn().is_some() {
             return None;
         }
         // A staged submit is already in flight for this session but its
@@ -8124,9 +8141,23 @@ impl Store {
             .state
             .active_session()
             .map(|session| session.id.clone())?;
-        if let Some(gate) = self.state.staged_submit_in_flight.get(&session_id)
-            && gate.submitted_at.elapsed() < STAGED_SUBMIT_GATE_TTL
-        {
+        match self.state.staged_submit_in_flight.get(&session_id) {
+            Some(gate) if gate.submitted_at.elapsed() < STAGED_SUBMIT_GATE_TTL => return None,
+            Some(_) => {
+                // Stale gate: the in-flight death was UNATTRIBUTABLE (no wire
+                // error matched a release arm). If the gate still carries its
+                // prompt, that is the ONLY surviving copy — re-stage it at the
+                // queue front so THIS drain retries it (FIFO), instead of
+                // treating the gate as a bare timestamp and letting the next
+                // submit overwrite it (prompt lost; codex fold). Runs BEFORE
+                // the emptiness check so an empty queue cannot strand it.
+                if let Some(gate) = self.state.staged_submit_in_flight.remove(&session_id) {
+                    self.restage_dead_staged_submit(&session_id, gate);
+                }
+            }
+            None => {}
+        }
+        if self.state.pending_messages.is_empty() {
             return None;
         }
 
@@ -8370,7 +8401,11 @@ impl Store {
         // genuinely-empty no-activity case is unaffected.
         self.state
             .capture_completed_turn_activity(session_id, &prior_turn);
-        if committed {
+        // Scroll belongs to the ACTIVE transcript: a turn-switch commit for a
+        // BACKGROUND session (continuation delta / TurnStarted arriving while
+        // another session is selected) lands in that session's own transcript
+        // and must not move the active read position (P2 tri-repo #246 fold).
+        if committed && self.event_targets_active_session(session_id) {
             if follow_tail {
                 self.state.scroll_transcript_to_latest();
             } else {
@@ -10475,6 +10510,201 @@ mod tests {
         );
     }
 
+    /// Codex fold: an UNATTRIBUTED in-flight death (no wire error matched any
+    /// release arm) leaves the gate holding the only copy of the prompt until
+    /// the TTL. The TTL path must RE-STAGE that prompt — treating the stale
+    /// gate as a bare timestamp either loses the prompt outright (empty
+    /// queue: nothing to drain) or lets the next drain overwrite the gate
+    /// with a successor submit (queued successor: prompt dropped).
+    #[test]
+    fn stale_in_flight_gate_restages_its_prompt_instead_of_dropping_it() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        store.state.pending_messages = vec!["protected".into()];
+        store
+            .submit_next_pending_if_idle()
+            .expect("staged prompt drains");
+        assert!(store.state.pending_messages.is_empty());
+        // Age the prompt-bearing gate past the TTL without ANY wire error.
+        let gate = store
+            .state
+            .staged_submit_in_flight
+            .get_mut(&a)
+            .expect("gate armed");
+        gate.submitted_at = std::time::Instant::now()
+            .checked_sub(STAGED_SUBMIT_GATE_TTL + std::time::Duration::from_secs(1))
+            .expect("instant in the past");
+
+        // EMPTY queue: the stale gate is the only copy — the drain must
+        // re-stage and resubmit it, not return None and strand it.
+        let command = store
+            .submit_next_pending_if_idle()
+            .expect("a stale in-flight gate must re-stage its prompt, not drop it");
+        assert!(
+            format!("{command:?}").contains("protected"),
+            "the retry submits the protected prompt, got {command:?}"
+        );
+        assert_eq!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .filter(|message| message.content == "protected")
+                .count(),
+            1,
+            "withdraw + re-record leaves exactly ONE user row"
+        );
+
+        // QUEUED-successor variant: the stale gate's prompt must go FIRST
+        // (FIFO), not be overwritten by the successor's fresh gate.
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.pending_messages = vec!["first".into(), "second".into()];
+        store
+            .submit_next_pending_if_idle()
+            .expect("first staged prompt drains");
+        let gate = store
+            .state
+            .staged_submit_in_flight
+            .get_mut(&a)
+            .expect("gate armed");
+        gate.submitted_at = std::time::Instant::now()
+            .checked_sub(STAGED_SUBMIT_GATE_TTL + std::time::Duration::from_secs(1))
+            .expect("instant in the past");
+        let command = store
+            .submit_next_pending_if_idle()
+            .expect("stale gate drains");
+        assert!(
+            format!("{command:?}").contains("first"),
+            "the stale gate's own prompt retries before the queued successor, got {command:?}"
+        );
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["second"],
+            "the successor stays queued behind the retried prompt"
+        );
+    }
+
+    /// Codex fold: a REPEAT transport error while a re-staged prompt waits
+    /// behind a backoff-only gate must PRESERVE the backoff — the old drain()
+    /// removed the gate and only re-inserted prompt-bearing ones, so a cancel
+    /// burst stripped the backoff and the next tick retried immediately.
+    #[test]
+    fn repeat_transport_error_preserves_the_backoff_gate() {
+        use octos_core::app_ui::AppUiError;
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        store.state.pending_messages = vec!["p1".into()];
+        store
+            .submit_next_pending_if_idle()
+            .expect("staged prompt drains");
+
+        // First failure: re-stage + backoff gate.
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "send_failed".into(),
+            message: "failed to send command".into(),
+        }));
+        assert!(
+            store
+                .state
+                .staged_submit_in_flight
+                .get(&a)
+                .is_some_and(|gate| gate.in_flight.is_none()),
+            "first failure leaves a backoff-only gate"
+        );
+
+        // Repeat failures (send-layer AND cancel-all) must keep the backoff
+        // gate armed so the tick backstop stays on the TTL cadence.
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "send_failed".into(),
+            message: "failed to send command".into(),
+        }));
+        assert!(
+            store
+                .state
+                .staged_submit_in_flight
+                .get(&a)
+                .is_some_and(|gate| gate.in_flight.is_none()),
+            "a repeat send failure must not strip the backoff gate"
+        );
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "request_cancelled".into(),
+            message: "turn/start request tui-9 cancelled: response may have been discarded".into(),
+        }));
+        assert!(
+            store
+                .state
+                .staged_submit_in_flight
+                .get(&a)
+                .is_some_and(|gate| gate.in_flight.is_none()),
+            "a cancel burst must not strip the backoff gate"
+        );
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["p1"],
+            "repeat errors never duplicate the re-staged prompt"
+        );
+        assert!(
+            !store.drain_staged_backstop(),
+            "the tick backstop stays blocked by the (fresh) backoff gate"
+        );
+    }
+
+    /// Codex fold: the gate map now holds the ONLY copy of a drained staged
+    /// prompt, so a snapshot replay (reconnect/refresh) landing inside the
+    /// submit→turn/started window must carry it over like the staged queues —
+    /// dropping it loses the prompt (a dead submit can then never re-stage
+    /// via the TTL path, and the tick backstop double-submits the successor).
+    #[test]
+    fn snapshot_replay_preserves_staged_submit_gates() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        store.state.pending_messages = vec!["in flight".into()];
+        store
+            .submit_next_pending_if_idle()
+            .expect("staged prompt drains");
+        assert!(
+            store
+                .state
+                .staged_submit_in_flight
+                .get(&a)
+                .is_some_and(|gate| gate.in_flight.is_some()),
+            "prompt-bearing gate armed before the replay"
+        );
+
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![
+                SessionView {
+                    id: a.clone(),
+                    title: "local:a".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+                SessionView {
+                    id: SessionKey("local:b".into()),
+                    title: "local:b".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+            ],
+            selected_session: 0,
+            status: "replayed".into(),
+            target: None,
+            readonly: false,
+        }));
+
+        assert!(
+            store
+                .state
+                .staged_submit_in_flight
+                .get(&a)
+                .is_some_and(|gate| gate.in_flight.is_some()),
+            "the prompt-bearing gate must survive a snapshot replay"
+        );
+    }
+
     /// The TTL backstop (codex round-4): some in-flight deaths are
     /// UNATTRIBUTABLE from wire errors (e.g. an outbound over-cap turn/start
     /// emits only `frame_too_large`, no `request_cancelled`) — instead of an
@@ -11652,6 +11882,107 @@ mod tests {
         assert_eq!(
             store.state.transcript_scroll, 7,
             "background terminal must not adjust the active scroll offset"
+        );
+    }
+
+    /// Codex fold on the bleed fix: `push_activity` / `update_tool_activity`
+    /// preserved the scroll BEFORE the chip gate ran, so a background
+    /// session's tool activity still drifted the active transcript's read
+    /// position (the activity row renders nowhere in the active view — flow
+    /// and navigator both filter it out).
+    #[test]
+    fn background_tool_activity_does_not_move_active_scroll() {
+        let a = SessionKey("local:a".into());
+        let b = SessionKey("local:b".into());
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.switch_selected_session(1);
+        store.state.transcript_scroll = 7; // user scrolled up in B
+
+        let turn = TurnId::new();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
+            ToolStartedEvent {
+                session_id: a.clone(),
+                topic: None,
+                turn_id: turn.clone(),
+                tool_call_id: "call-bg-scroll".into(),
+                tool_name: "shell".into(),
+                arguments: None,
+            },
+        )));
+        assert_eq!(
+            store.state.transcript_scroll, 7,
+            "a background ToolStarted's activity row must not adjust the active scroll"
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolProgress(
+            octos_core::ui_protocol::ToolProgressEvent {
+                session_id: a,
+                topic: None,
+                turn_id: turn,
+                tool_call_id: "call-bg-scroll".into(),
+                message: Some("halfway".into()),
+                progress_pct: Some(50.0),
+            },
+        )));
+        assert_eq!(
+            store.state.transcript_scroll, 7,
+            "a background ToolProgress update must not adjust the active scroll"
+        );
+
+        // Over-gating guard: the ACTIVE session's own tool activity renders in
+        // the current view, so its preserve must still fire.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
+            ToolStartedEvent {
+                session_id: b,
+                topic: None,
+                turn_id: TurnId::new(),
+                tool_call_id: "call-active-scroll".into(),
+                tool_name: "shell".into(),
+                arguments: None,
+            },
+        )));
+        assert!(
+            store.state.transcript_scroll > 7,
+            "the active session's tool activity still preserves the read position"
+        );
+    }
+
+    /// Codex fold on the bleed fix: a continuation event for a background
+    /// session with an OLDER live_reply bound runs the turn-switch commit,
+    /// which pushed the prior answer into the BACKGROUND transcript but
+    /// adjusted the ACTIVE transcript's scroll.
+    #[test]
+    fn background_turn_switch_commit_does_not_move_active_scroll() {
+        let a = SessionKey("local:a".into());
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: TurnId::new(),
+            text: "prior answer".into(),
+        });
+        store.state.switch_selected_session(1);
+        store.state.transcript_scroll = 7; // user scrolled up in B
+
+        // A continuation delta for a DIFFERENT turn in background A commits
+        // the prior live reply (turn-switch path) before binding the new turn.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: a.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                text: "continuation".into(),
+            },
+        )));
+
+        assert!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("prior answer")),
+            "the prior reply commits into the background session's transcript"
+        );
+        assert_eq!(
+            store.state.transcript_scroll, 7,
+            "the background turn-switch commit must not adjust the active scroll"
         );
     }
 

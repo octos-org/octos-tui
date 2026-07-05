@@ -3338,8 +3338,12 @@ pub struct AppState {
     /// events (no request/session ids on the wire errors), so instead of an
     /// ever-growing error-code taxonomy, a gate older than
     /// [`crate::store::STAGED_SUBMIT_GATE_TTL`] is treated as stale and
-    /// ignored — any missed death self-heals in seconds. Deliberately NOT
-    /// snapshot-preserved: a replay clears it outright.
+    /// ignored — any missed death self-heals in seconds (and, since the gate
+    /// carries the prompt, the stale-gate path RE-STAGES it rather than
+    /// dropping it). Snapshot-PRESERVED (codex fold): the gate may hold the
+    /// only copy of a drained prompt, so a reconnect replay carries the map
+    /// over like the staged queues; a gate whose turn died with the old
+    /// connection self-heals via the TTL re-stage.
     ///
     /// The gate also carries the in-flight PROMPT (P2 tri-repo #246): a
     /// staged submit that dies at the transport layer is re-staged from the
@@ -3680,14 +3684,18 @@ pub struct ActivityItem {
     pub duration_ms: Option<u64>,
     pub turn_id: Option<TurnId>,
     pub tool_call_id: Option<String>,
-    /// Owning session for items created on a session-scoped path. Only set by
-    /// the projection-envelope `ToolStart` emit (`apply_envelope`), which is the
-    /// one path whose items carry NO turn identity and so cannot be reconciled
-    /// by `turn_id`. The envelope `TurnCompleted` self-heal
-    /// ([`AppState::reconcile_envelope_thread_running_activity`]) filters on
-    /// this so a thread_id shared across sessions cannot over-suppress a sibling
-    /// session's genuinely-active chip. Left `None` for all turn-scoped items
-    /// (which reconcile via `turn_id`).
+    /// Owning session for items created on a session-scoped path. Set by the
+    /// projection-envelope `ToolStart` emit (`apply_envelope`) — the one path
+    /// whose items carry NO turn identity and so cannot be reconciled by
+    /// `turn_id` (the envelope `TurnCompleted` self-heal,
+    /// [`AppState::reconcile_envelope_thread_running_activity`], filters on it
+    /// so a thread_id shared across sessions cannot over-suppress a sibling
+    /// session's genuinely-active chip) — and by the session-scoped protocol
+    /// arms (`ToolStarted`, progress events), where
+    /// [`AppState::push_activity`] / [`AppState::update_tool_activity`] use it
+    /// to keep a background session's activity from drifting the ACTIVE
+    /// transcript's scroll (P2 tri-repo #246). `None` = unattributed (treated
+    /// as active-view content).
     pub session_id: Option<SessionKey>,
 }
 
@@ -6220,9 +6228,20 @@ impl AppState {
 
     pub fn push_activity(&mut self, item: ActivityItem) {
         const MAX_ACTIVITY_ITEMS: usize = 80;
+        // An item attributed to a NON-active session renders nowhere in the
+        // current view (the flow filters by the active turn, the navigator by
+        // session), so preserving the scroll for it would drift the active
+        // transcript's read position (P2 tri-repo #246 fold). Unattributed
+        // items keep the old behavior — they may render in the active flow.
+        let renders_in_active_view = item.session_id.as_ref().is_none_or(|session_id| {
+            self.active_session()
+                .is_some_and(|session| &session.id == session_id)
+        });
         let estimated_rows = estimated_activity_rows(&item);
         self.activity.push(item);
-        self.preserve_transcript_position_after_append(estimated_rows);
+        if renders_in_active_view {
+            self.preserve_transcript_position_after_append(estimated_rows);
+        }
         if self.activity.len() > MAX_ACTIVITY_ITEMS {
             let excess = self.activity.len() - MAX_ACTIVITY_ITEMS;
             self.activity.drain(0..excess);
@@ -6251,7 +6270,7 @@ impl AppState {
         // escape sequences.
         let output_preview = output_preview
             .map(|preview| crate::sanitize::strip_terminal_controls(&preview).into_owned());
-        let mut updated = false;
+        let mut updated_session: Option<Option<SessionKey>> = None;
         if let Some(item) = self
             .activity
             .iter_mut()
@@ -6271,10 +6290,19 @@ impl AppState {
             if duration_ms.is_some() {
                 item.duration_ms = duration_ms;
             }
-            updated = true;
+            updated_session = Some(item.session_id.clone());
         }
-        if updated {
-            self.preserve_transcript_position_after_append(1);
+        // Mirror `push_activity`: an update to a NON-active session's item
+        // renders nowhere in the current view, so it must not drift the
+        // active transcript's read position (P2 tri-repo #246 fold).
+        if let Some(item_session) = updated_session {
+            let renders_in_active_view = item_session.as_ref().is_none_or(|session_id| {
+                self.active_session()
+                    .is_some_and(|session| &session.id == session_id)
+            });
+            if renders_in_active_view {
+                self.preserve_transcript_position_after_append(1);
+            }
         }
     }
 
