@@ -2683,7 +2683,9 @@ mod tests {
             .resize_viewport_to(4)
             .expect("resize restored inline viewport");
         assert_eq!(terminal.viewport_area, Rect::new(0, 16, 60, 4));
-        assert_eq!(terminal.backend().cursor, Position { x: 0, y: 16 });
+        // Codex-rs clear_for_viewport_change clears from the OLD viewport top (y=20),
+        // not the new one. The subsequent draw() repaints the viewport at its new position.
+        assert_eq!(terminal.backend().cursor, Position { x: 0, y: 20 });
         assert_eq!(
             terminal.backend().clears,
             vec![ClearType::All, ClearType::AfterCursor]

@@ -242,62 +242,64 @@ where
         self.resize_viewport_to_size(height, size)
     }
 
-    /// Whether [`Terminal::resize_viewport_to`] would move/clear the viewport
+    /// Whether [`Terminal::resize_viewport_to`] would emit any terminal writes
     /// for the supplied screen size. Used by the event loop to decide whether
     /// DEC synchronized update wrapping is needed before the draw.
     pub fn viewport_resize_needed(&self, height: u16, size: Size) -> bool {
-        self.target_viewport_area(height, size) != self.viewport_area
+        let mut area = self.viewport_area;
+        area.height = height.min(size.height).max(1);
+        area.width = size.width;
+        // Overflow triggers a scroll + reanchor, which writes bytes.
+        if area.bottom() > size.height {
+            return true;
+        }
+        // No overflow: area.y is left unchanged (codex-rs: terminal Y growth is
+        // handled by insert_history_lines, not here). Only height/width changes
+        // require a clear + set_viewport_area.
+        area != self.viewport_area
     }
 
+    /// Reposition the viewport to match the requested `height` within `size`.
+    ///
+    /// Mirrors the resize logic in codex-rs `Tui::draw`:
+    ///
+    /// - If the viewport overflows below the screen (`area.bottom() > size.height`
+    ///   — covers both terminal shrink and viewport-height increases that don't
+    ///   fit), scroll the rows above the viewport up into scrollback and reanchor
+    ///   the viewport at the new screen bottom.
+    /// - Otherwise (`area.bottom() <= size.height`, i.e. terminal grew in Y or
+    ///   nothing changed), leave `area.y` alone. `insert_history_lines` will slide
+    ///   the viewport toward the screen bottom via ESC M (Reverse Index) in its
+    ///   Standard mode as history arrives — this is the exact mechanism codex-rs
+    ///   relies on and requires no explicit reposition here.
     fn resize_viewport_to_size(&mut self, height: u16, size: Size) -> io::Result<()> {
-        let old_area = self.viewport_area;
-        let target = self.target_viewport_area(height, size);
-        let terminal_height_shrank = size.height < self.last_known_screen_size.height;
+        let mut area = self.viewport_area;
+        area.height = height.min(size.height).max(1);
+        area.width = size.width;
 
-        if target != old_area {
-            let old_bottom_with_new_height = old_area
-                .y
-                .saturating_add(target.height)
-                .saturating_sub(size.height);
-            if old_bottom_with_new_height > 0 && !terminal_height_shrank && !old_area.is_empty() {
-                // Push the rows above the viewport up into scrollback so the
-                // viewport fits at the bottom, using a DECSTBM scroll region
-                // over the rows above the old viewport top + Index (`ESC D`).
-                // On a real terminal shrink the old y can be below the new
-                // screen; scrolling that stale region corrupts the resized
-                // screen, so shrink reflow just clears and repaints.
-                scroll_region_up(
-                    &mut self.backend,
-                    old_area.top(),
-                    old_bottom_with_new_height,
-                )?;
-                self.visible_history_bottom = self
-                    .visible_history_bottom
-                    .saturating_sub(old_bottom_with_new_height);
-                self.visible_history_rows =
-                    self.visible_history_rows.min(self.visible_history_bottom);
-            }
-
-            // A terminal shrink can leave `old_area.y` outside the new visible
-            // screen. Clear from the earlier visible top of the old/new
-            // viewport so rows vacated by either layout cannot survive as a
-            // second composer or fragmented overlay.
-            let clear_y = if old_area.is_empty() {
-                target.y
-            } else {
-                old_area.y.min(target.y)
-            }
-            .min(size.height.saturating_sub(1));
-            self.set_viewport_area(target);
-            self.clear_after_position(Position { x: 0, y: clear_y })?;
+        if area.bottom() > size.height {
+            let scroll_by = area.bottom() - size.height;
+            scroll_region_up(&mut self.backend, area.top(), scroll_by)?;
+            self.visible_history_bottom = self.visible_history_bottom.saturating_sub(scroll_by);
+            self.visible_history_rows = self.visible_history_rows.min(self.visible_history_bottom);
+            area.y = size.height.saturating_sub(area.height);
         }
+
+        if area != self.viewport_area {
+            // Clear from the old viewport top (codex-rs `clear_for_viewport_change`).
+            // On first draw the old area is empty; clear from the new top instead so
+            // stale shell cells don't show through the initial render.
+            let clear_position = if self.viewport_area.is_empty() {
+                area.as_position()
+            } else {
+                self.viewport_area.as_position()
+            };
+            self.clear_after_position(clear_position)?;
+            self.set_viewport_area(area);
+        }
+
         self.last_known_screen_size = size;
         Ok(())
-    }
-
-    fn target_viewport_area(&self, height: u16, size: Size) -> Rect {
-        let height = height.min(size.height).max(1);
-        Rect::new(0, size.height.saturating_sub(height), size.width, height)
     }
 
     /// Draw a single frame into the inline viewport. Only the cells that changed
@@ -780,7 +782,12 @@ mod tests {
     }
 
     #[test]
-    fn terminal_shrink_reanchors_and_clears_from_new_viewport_top() {
+    fn terminal_shrink_reanchors_and_clears() {
+        // Codex-rs Tui::draw logic: on terminal shrink the overflow branch fires,
+        // scroll_region_up (ESC D) is emitted, and the viewport is reanchored at
+        // the new bottom. The clear position is the OLD viewport top (codex-rs
+        // clear_for_viewport_change), so the cursor lands there, not the new top.
+        // Real terminals clamp out-of-bounds DECSTBM regions to the visible screen.
         let mut terminal = Terminal::new(RecordingBackend::new(200, 50)).expect("terminal");
         terminal.set_viewport_area(Rect::new(0, 46, 200, 4));
         terminal.last_known_screen_size = Size::new(200, 50);
@@ -789,12 +796,14 @@ mod tests {
         terminal.resize_viewport_to(4).expect("resize viewport");
 
         assert_eq!(terminal.viewport_area, Rect::new(0, 34, 130, 4));
-        assert_eq!(terminal.backend().cursor, Position { x: 0, y: 34 });
+        // Cursor is at old viewport top (codex-rs clear_for_viewport_change uses
+        // the old viewport position; real terminals clamp row 46 to the last row).
+        assert_eq!(terminal.backend().cursor, Position { x: 0, y: 46 });
         assert_eq!(terminal.backend().clears, vec![ClearType::AfterCursor]);
         let written = String::from_utf8_lossy(&terminal.backend().buf);
         assert!(
-            !written.contains("\u{1b}D"),
-            "terminal shrink must not scroll a stale off-screen region; wrote {written:?}"
+            written.contains("\u{1b}D"),
+            "overflow path must scroll rows above the viewport up; wrote {written:?}"
         );
     }
 
@@ -810,6 +819,33 @@ mod tests {
         assert_eq!(terminal.viewport_area, Rect::new(0, 45, 130, 5));
         assert_eq!(terminal.backend().cursor, Position { x: 0, y: 45 });
         assert_eq!(terminal.backend().clears, vec![ClearType::AfterCursor]);
+    }
+
+    #[test]
+    fn terminal_y_grow_keeps_viewport_in_place_no_clear() {
+        // When the terminal grows in Y only (same width, same TUI height), the
+        // viewport must NOT jump to the new bottom row or clear anything. Codex-rs
+        // never has explicit reposition logic for this; insert_history_lines
+        // slides the viewport down via ESC M as history arrives.
+        let mut terminal = Terminal::new(RecordingBackend::new(200, 50)).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 25, 200, 25));
+        terminal.last_known_screen_size = Size::new(200, 50);
+        terminal.backend_mut().size = Size::new(200, 55); // Y grew by 5
+
+        terminal.resize_viewport_to(25).expect("resize viewport");
+
+        // Viewport must stay at old position (Y=25), not jump to new ideal (Y=30).
+        assert_eq!(
+            terminal.viewport_area,
+            Rect::new(0, 25, 200, 25),
+            "viewport should not move when only terminal Y grew"
+        );
+        // No clears should have been emitted.
+        assert!(
+            terminal.backend().clears.is_empty(),
+            "no clear should be emitted on terminal Y grow: {:?}",
+            terminal.backend().clears
+        );
     }
 
     #[test]
