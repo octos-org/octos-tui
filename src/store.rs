@@ -5940,7 +5940,7 @@ impl Store {
             .remove(&(session_id.clone(), turn_id.clone()));
         self.state
             .clear_live_reply_segment_boundaries(session_id, turn_id);
-        self.state.staged_submit_in_flight.remove(session_id);
+        self.release_staged_gate_for_turn(session_id, turn_id);
         self.state.mark_turn_completed(session_id, turn_id);
         self.state.reconcile_terminal_turn_running_activity(turn_id);
         // A pending approval/question for the dead turn is stale.
@@ -6678,8 +6678,10 @@ impl Store {
             }
             UiNotification::TurnStarted(event) => {
                 // The staged-drain submit (if any) has materialized into a
-                // real turn; from here live_reply gates further drains.
-                self.state.staged_submit_in_flight.remove(&event.session_id);
+                // real turn; from here live_reply gates further drains. Match
+                // on turn so a stale/continuation TurnStarted for a DIFFERENT
+                // turn cannot drop a newer staged submit's gate.
+                self.release_staged_gate_for_turn(&event.session_id, &event.turn_id);
                 // A new turn for the active session starts a fresh live_reply
                 // UNCONDITIONALLY — server-INITIATED master-continuation turns
                 // (reason=child_completed / scatter_join_complete) carry no
@@ -7785,10 +7787,11 @@ impl Store {
     }
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
-        // Any staged-drain submit for this session has settled (terminal
-        // observed) — allow the tail drain below to submit the NEXT staged
-        // prompt (FIFO, one per settled turn).
-        self.state.staged_submit_in_flight.remove(&event.session_id);
+        // The staged-drain submit for THIS turn has settled — allow the tail
+        // drain below to submit the NEXT staged prompt (FIFO, one per settled
+        // turn). Match on turn so a late/duplicate terminal for an already-
+        // finished earlier turn cannot drop a newer staged submit's gate.
+        self.release_staged_gate_for_turn(&event.session_id, &event.turn_id);
         // Idempotence vs a turn-switch: if this turn was ALREADY finalized
         // (committed or dropped) by `commit_pending_live_reply_for_turn_switch`,
         // its late terminal is a no-op. Without this the late terminal would hit
@@ -7935,9 +7938,11 @@ impl Store {
     }
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
-        // Any staged-drain submit for this session has settled (error
-        // terminal) — release the FIFO gate (see `commit_live_reply`).
-        self.state.staged_submit_in_flight.remove(&event.session_id);
+        // The staged-drain submit for THIS turn has settled (error terminal) —
+        // release the FIFO gate (see `commit_live_reply`). Match on turn so a
+        // stale/duplicate error for an earlier turn cannot drop a newer staged
+        // submit's gate.
+        self.release_staged_gate_for_turn(&event.session_id, &event.turn_id);
         // Idempotence vs a turn-switch (see `commit_live_reply`): the
         // finalized-by-switch marker suppresses only a false COMPLETION
         // fallback — it must NEVER hide a real ERROR. A turn finalized at a
@@ -8120,6 +8125,30 @@ impl Store {
     /// stuck until some unrelated turn event (codex round-2 P2).
     pub fn drain_staged_after_direct_switch(&mut self) {
         self.enqueue_staged_drain_after_switch();
+    }
+
+    /// Release the staged-submit gate for `session_id` ONLY when it guards
+    /// `turn_id` — i.e. the lifecycle event is the one for the very turn this
+    /// gate is holding open. Since the gate now carries the ONLY copy of a
+    /// drained staged prompt, a session-keyed clear on a STALE or duplicate
+    /// terminal for an already-finished EARLIER turn (arriving after the
+    /// staged submit was enqueued but before its own `TurnStarted`) would drop
+    /// the guard — letting a successor submit concurrently and, if the
+    /// original send later dies, leaving nothing to re-stage (codex squash
+    /// review). Backoff-only gates (`in_flight == None`, awaiting a TTL
+    /// re-stage) never match a live turn and are left for the TTL path.
+    /// Returns true when a gate was released.
+    fn release_staged_gate_for_turn(&mut self, session_id: &SessionKey, turn_id: &TurnId) -> bool {
+        let matches = self
+            .state
+            .staged_submit_in_flight
+            .get(session_id)
+            .and_then(|gate| gate.in_flight.as_ref())
+            .is_some_and(|in_flight| &in_flight.turn_id == turn_id);
+        if matches {
+            self.state.staged_submit_in_flight.remove(session_id);
+        }
+        matches
     }
 
     /// Submit the ACTIVE session's next staged prompt when it is idle.
@@ -10181,7 +10210,9 @@ mod tests {
         let command = store
             .submit_next_pending_if_idle()
             .expect("idle A drains its first staged prompt");
-        let AppUiCommand::SubmitPrompt(_) = command else {
+        // The lifecycle events below MUST carry the submit's own turn id —
+        // the gate is now released only by its guarded turn's terminal.
+        let AppUiCommand::SubmitPrompt(first_params) = command else {
             panic!("expected staged prompt submission");
         };
 
@@ -10201,7 +10232,7 @@ mod tests {
 
         // The submitted turn starts, then completes: the terminal's tail
         // drain submits the SECOND prompt (FIFO, one per settled turn).
-        let turn_id = TurnId::new();
+        let turn_id = first_params.turn_id.clone();
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
             TurnStartedEvent {
                 session_id: a.clone(),
@@ -10511,6 +10542,95 @@ mod tests {
                 .count(),
             1,
             "the optimistic user row stays on the success path"
+        );
+    }
+
+    /// Codex squash review (P2): the gate now holds the ONLY copy of a drained
+    /// staged prompt, so a stale/duplicate terminal for an already-finished
+    /// EARLIER turn (arriving after this staged submit is enqueued but before
+    /// its own TurnStarted) must NOT drop the gate — a session-keyed clear did,
+    /// letting a successor submit concurrently and losing the prompt if the
+    /// original send later died. Gate release is now keyed by turn.
+    #[test]
+    fn stale_terminal_for_earlier_turn_does_not_drop_a_newer_staged_gate() {
+        let a = SessionKey("local:a".into());
+        // An earlier turn that has already completed in this session.
+        let old_turn = TurnId::new();
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.mark_turn_completed(&a, &old_turn);
+
+        // Stage + drain a prompt: gate armed with the NEW turn.
+        store.state.pending_messages = vec!["queued".into()];
+        let command = store
+            .submit_next_pending_if_idle()
+            .expect("staged prompt drains");
+        let AppUiCommand::SubmitPrompt(params) = command else {
+            panic!("staged drain must submit");
+        };
+        let new_turn = params.turn_id.clone();
+        assert!(
+            store
+                .state
+                .staged_submit_in_flight
+                .get(&a)
+                .and_then(|gate| gate.in_flight.as_ref())
+                .is_some_and(|in_flight| in_flight.turn_id == new_turn),
+            "gate armed with the new staged submit's turn"
+        );
+
+        // A late/duplicate TurnCompleted for the OLD turn arrives before the
+        // new turn's TurnStarted.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: a.clone(),
+                topic: None,
+                turn_id: old_turn.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            store
+                .state
+                .staged_submit_in_flight
+                .get(&a)
+                .and_then(|gate| gate.in_flight.as_ref())
+                .is_some_and(|in_flight| in_flight.turn_id == new_turn),
+            "a stale TurnCompleted for an earlier turn must NOT drop the newer gate"
+        );
+
+        // Same for a stale TurnError.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: a.clone(),
+                topic: None,
+                turn_id: old_turn,
+                code: "boom".into(),
+                message: "stale".into(),
+            },
+        )));
+        assert!(
+            store.state.staged_submit_in_flight.contains_key(&a),
+            "a stale TurnError for an earlier turn must NOT drop the newer gate"
+        );
+
+        // The gate's OWN terminal still releases it (FIFO preserved).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: a.clone(),
+                topic: None,
+                turn_id: new_turn,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            !store.state.staged_submit_in_flight.contains_key(&a),
+            "the matching terminal releases the gate"
         );
     }
 
