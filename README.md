@@ -2,6 +2,13 @@
 
 <div align="center">
 <pre>
+             .---.
+            / o o \
+            \  ~  /
+        .-._/`---'\_.-.
+       ( ( (  ) (  ) ) )
+        `-´ (_) (_) `-´
+
  ██████╗  ██████╗████████╗ ██████╗ ███████╗
 ██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔════╝
 ██║   ██║██║        ██║   ██║   ██║███████╗
@@ -12,10 +19,50 @@
 <em>Welcome to Octos — Your Coding Buddy</em>
 </div>
 
-`octos-tui` is a standalone terminal UI client for the Octos UI Protocol.
-It is a chat-first coding client that you point at an `octos serve` backend; the
-server owns the agent, providers, and tools, and the TUI renders the
-conversation, command/tool cards, diffs, and approvals.
+`octos-tui` is the terminal app for [Octos](https://github.com/octos-org/octos)
+— an AI coding assistant in your terminal, in the spirit of Claude Code and
+Codex. The Octos server runs the agent, the models, and the tools; `octos-tui`
+is the fast, keyboard-driven way to talk to it: chat, diffs, tool approvals,
+background tasks — all without leaving the shell.
+
+## Start here
+
+Two pieces: the Octos **server** (the brain) and this **TUI** (the terminal
+client). One command installs both:
+
+```bash
+npm install -g @octos-org/octos @octos-org/octos-tui
+# or with Homebrew:
+#   brew install octos-org/tap/octos octos-org/tap/octos-tui
+```
+
+Then start the TUI with its own private local server:
+
+```bash
+octos-tui --mode protocol \
+  --stdio-command "octos serve --stdio --solo --data-dir ~/.octos-tui-data"
+```
+
+You'll land on the **"Welcome to Octos"** screen. In the next five minutes:
+create your local profile (three fields — the email is local metadata only),
+pick an AI provider, paste its API key, and open your first coding chat.
+The [Quickstart](#quickstart-solo-onboarding) below walks every screen.
+
+> **Heads-up:** plain `octos-tui` with no flags opens a **mock demo** with
+> canned replies — nice for a look around, but not connected to anything.
+> Use the command above for the real thing.
+
+### If something looks wrong
+
+| Symptom | Fix |
+|---|---|
+| `command not found: octos` | The server isn't installed — `npm install -g @octos-org/octos` (or the [server install guide](https://github.com/octos-org/octos#start-here)). |
+| Replies are instant and feel canned | You're in mock mode (no flags). Start with the `--stdio-command ...` command above. |
+| "Test provider" fails during onboarding | Re-check the API key and the provider choice; you can redo it anytime with `/onboard` or `/setup`. |
+
+More in the full [Troubleshooting](#troubleshooting) table below.
+
+---
 
 On a fresh first launch the main window shows the **OCTOS** block-letter
 wordmark with the tagline *"Welcome to Octos — Your Coding Buddy"* above a
@@ -80,9 +127,14 @@ cargo install octos-tui
 A copy-pasteable, first-time walkthrough. By the end you have a local profile,
 an LLM provider, and a live coding session — no dashboard, no email OTP.
 
-### 1. Get the source and build
+### 1. Install the binaries
 
-`octos-tui` is a single binary. `octos-core` (the shared protocol crate) is
+Install the TUI and the server as shown in [Start here](#start-here) — the
+npm and brew routes install **both** pieces. (The shell/PowerShell installers
+in [Install](#install) ship the TUI **only**; pair them with a server install
+from the [octos repo](https://github.com/octos-org/octos#start-here).)
+
+Building from source works too — `octos-core` (the shared protocol crate) is
 pulled automatically as a git dependency, so a plain clone builds with **no
 sibling checkout** required (needs Rust 1.85+):
 
@@ -90,7 +142,7 @@ sibling checkout** required (needs Rust 1.85+):
 git clone https://github.com/octos-org/octos-tui.git
 cd octos-tui
 cargo build --release
-# produces ./target/release/octos-tui
+# produces ./target/release/octos-tui — substitute it for `octos-tui` below
 ```
 
 > **Developing against a local `octos`?** To build against an uncommitted
@@ -106,7 +158,7 @@ empty** data directory and pass **no** `--profile-id`. The TUI launches the
 server as a child process over stdio, so you only run one command:
 
 ```bash
-./target/release/octos-tui \
+octos-tui \
   --mode protocol \
   --stdio-command "octos serve --stdio --solo --data-dir ./octos-data"
 ```
