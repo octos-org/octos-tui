@@ -54,9 +54,11 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/octos-org/octos-tui/releases/latest/download/octos-tui-installer.ps1 | iex"
 ```
 
-Once installed, the binary manages itself: `octos-tui update` checks for (and
-installs) a newer release, and `octos-tui doctor` diagnoses the local
-environment and connection prerequisites.
+Once installed, `octos-tui update` checks for a newer release — and for
+shell/PowerShell-installer installs it self-updates in place; npm/brew/cargo
+installs are owned by their package manager, so it prints the matching
+upgrade command instead. `octos-tui doctor` diagnoses the local environment
+and connection prerequisites.
 
 ### From source with Cargo (needs Rust 1.85+)
 
@@ -319,10 +321,11 @@ you can edit and resend from there. When a session has loops, the status bar
 shows a loop chip (active/paused), and the context gauge reflects the **real
 per-model context window** reported by the server, not a fixed default.
 
-Further capability-gated commands (`/provider`, `/permissions`, `/mcp`,
-`/tools`, `/skills`, `/task`, `/threads`, `/turn`, `/agents`, `/activity`,
-`/review`, `/statusline`) appear in the `/` popup only when the connected
-server supports them — `/help` always lists what is live.
+`/activity` (search sessions/tasks/activity) and `/statusline` (status-bar
+items) are always available. Further capability-gated commands
+(`/provider`, `/permissions`, `/mcp`, `/tools`, `/skills`, `/task`,
+`/threads`, `/turn`, `/agents`, `/review`) appear in the `/` popup only when
+the connected server supports them — `/help` always lists what is live.
 
 `/model`, `/theme`, `/lang`, and `/thinking` open a selection menu when run with
 no argument (or apply inline with an arg). In every selection menu the **active
@@ -342,11 +345,11 @@ the model.
 The composer is multi-line: **Enter** sends, **Shift+Enter** (or **Ctrl+J** as a
 portable fallback) inserts a newline, and the box grows as you add lines.
 
-Arrow **Up/Down** from an **empty** composer recall your command history —
-newest first, persisted across sessions, shell-style. With text present they
-move the cursor between lines (and fall back to scrolling the transcript at
-the first/last line). Emacs-style keys also work (Ctrl+A/E, Alt+B/F, Ctrl+W,
-Ctrl+K, …).
+Arrow **Up** from an **empty** composer recalls your command history —
+newest first, persisted across sessions, shell-style; once browsing, **Down**
+steps back toward newer entries. With text present the arrows move the cursor
+between lines (and fall back to scrolling the transcript at the first/last
+line). Emacs-style keys also work (Ctrl+A/E, Alt+B/F, Ctrl+W, Ctrl+K, …).
 
 **Vim mode** is opt-in — `--vim-mode`, config `"vim-mode": true`, or `/vimmode`
 at runtime; the composer title then shows `NORMAL` / `INSERT`. It implements a
