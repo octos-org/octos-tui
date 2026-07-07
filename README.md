@@ -129,8 +129,10 @@ an LLM provider, and a live coding session — no dashboard, no email OTP.
 
 ### 1. Install the binaries
 
-Install the TUI and the server as shown in [Start here](#start-here) (npm,
-brew, or the shell/PowerShell installers — see [Install](#install)).
+Install the TUI and the server as shown in [Start here](#start-here) — the
+npm and brew routes install **both** pieces. (The shell/PowerShell installers
+in [Install](#install) ship the TUI **only**; pair them with a server install
+from the [octos repo](https://github.com/octos-org/octos#start-here).)
 
 Building from source works too — `octos-core` (the shared protocol crate) is
 pulled automatically as a git dependency, so a plain clone builds with **no
