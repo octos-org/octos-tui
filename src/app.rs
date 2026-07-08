@@ -4849,36 +4849,29 @@ fn push_user_question_entry(
         Line::from(Span::styled(entry.question.clone(), palette.text())),
     );
 
-    let marker_open = if entry.multi_select { "[" } else { "(" };
-    let marker_close = if entry.multi_select { "]" } else { ")" };
     for (idx, option) in entry.options.iter().enumerate() {
         let highlighted = idx == entry.cursor;
         let checked = entry.option_selected.get(idx).copied().unwrap_or(false);
-        let mark = if checked { "x" } else { " " };
-        let cursor = if highlighted { ">" } else { " " };
-        let mut text = format!(
-            "{cursor} {marker_open}{mark}{marker_close} {}",
-            option.label
-        );
+        let mut text = option.label.clone();
         if !option.description.is_empty() {
-            text.push_str(" - ");
+            text.push_str(" — ");
             text.push_str(&option.description);
         }
-        let style = if highlighted {
-            palette.selected().add_modifier(Modifier::BOLD)
-        } else {
-            palette.text()
-        };
-        lines.push(Line::from(vec![
-            Span::styled("    ", palette.muted()),
-            Span::styled(fit_card_text(&text, width), style),
-        ]));
+        push_user_question_option_row(
+            lines,
+            palette,
+            highlighted,
+            checked,
+            entry.multi_select,
+            &text,
+            width,
+        );
     }
 
     // Always-present free-text "Other" row (server forces allow_free_text).
     let other_highlighted = entry.cursor >= entry.free_text_row();
     let editing = entry.editing_free_text;
-    let cursor = if other_highlighted { ">" } else { " " };
+    let has_text = !entry.free_text.trim().is_empty();
     let body = if entry.free_text.is_empty() {
         if editing {
             t!("app.question.type_answer").into_owned()
@@ -4888,23 +4881,68 @@ fn push_user_question_entry(
     } else {
         entry.free_text.clone()
     };
-    let mark = if editing {
-        "*"
-    } else if !entry.free_text.trim().is_empty() {
-        "x"
-    } else {
-        " "
-    };
     let other_prefix = t!("app.question.other_prefix").to_string();
-    let text = format!("{cursor} {marker_open}{mark}{marker_close} {other_prefix}: {body}");
-    let style = if other_highlighted {
+    let text = format!("{other_prefix}: {body}");
+    // "Other" counts as chosen when it has text (or is being edited).
+    push_user_question_option_row(
+        lines,
+        palette,
+        other_highlighted,
+        has_text || editing,
+        entry.multi_select,
+        &text,
+        width,
+    );
+}
+
+/// Render one selectable option row (or the free-text "Other" row) for the
+/// AskUserQuestion picker. A prominent left accent bar marks the highlighted
+/// row; a filled/hollow marker (● / ○ for single-select, ▣ / ▢ for
+/// multi-select) shows what's chosen. The label is bold+highlighted on the
+/// active row, accent-coloured when chosen-but-not-active, plain otherwise —
+/// so the current choice reads at a glance without arrow-hunting.
+fn push_user_question_option_row(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    highlighted: bool,
+    chosen: bool,
+    multi_select: bool,
+    text: &str,
+    width: usize,
+) {
+    let (bar, bar_style) = if highlighted {
+        ("▌ ", palette.title().add_modifier(Modifier::BOLD))
+    } else {
+        ("  ", palette.muted())
+    };
+    let marker = match (multi_select, chosen) {
+        (true, true) => "▣ ",
+        (true, false) => "▢ ",
+        (false, true) => "● ",
+        (false, false) => "○ ",
+    };
+    let marker_style = if chosen {
+        palette.title()
+    } else {
+        palette.muted()
+    };
+    let label_style = if highlighted {
         palette.selected().add_modifier(Modifier::BOLD)
+    } else if chosen {
+        palette.title()
     } else {
         palette.text()
     };
+    // Budget the label to the remaining width after the bar + marker prefixes
+    // (2 cols each). `fit_card_text` already reserves the 4-space indent, so
+    // subtract only the extra 4 columns here — subtracting 6 clipped labels
+    // two columns early (codex review).
+    let label = fit_card_text(text, width.saturating_sub(4));
     lines.push(Line::from(vec![
         Span::styled("    ", palette.muted()),
-        Span::styled(fit_card_text(&text, width), style),
+        Span::styled(bar, bar_style),
+        Span::styled(marker, marker_style),
+        Span::styled(label, label_style),
     ]));
 }
 
@@ -8773,9 +8811,14 @@ mod tests {
         assert!(text.contains("Agent asked a question"));
         assert!(text.contains("Pick a framework"));
         assert!(text.contains("Which web framework?"));
-        // Single-select uses radio parens, not checkbox brackets.
-        assert!(text.contains("( ) axum"));
-        assert!(text.contains("( ) actix"));
+        // Single-select uses a hollow radio marker, not a checkbox.
+        assert!(text.contains("○ axum"));
+        assert!(text.contains("○ actix"));
+        assert!(!text.contains("▣ axum")); // not the multi-select marker
+        // Prominence: the highlighted row (cursor defaults to the first
+        // option) carries the ▌ accent bar; a non-active row does not.
+        assert!(text.contains("▌ ○ axum"));
+        assert!(!text.contains("▌ ○ actix"));
         // The always-present free-text "Other" row.
         assert!(text.contains("Other"));
         assert!(text.contains("Enter = submit answer(s)"));
@@ -8808,9 +8851,10 @@ mod tests {
 
         let text = rendered_text(&app);
 
-        // Multi-select uses checkbox brackets.
-        assert!(text.contains("[ ] stable"));
-        assert!(text.contains("[ ] nightly"));
+        // Multi-select uses a hollow square marker (distinct from the radio).
+        assert!(text.contains("▢ stable"));
+        assert!(text.contains("▢ nightly"));
+        assert!(!text.contains("○ stable")); // not the single-select marker
         assert!(text.contains("Other"));
     }
 
