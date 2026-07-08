@@ -71,6 +71,8 @@ pub struct DoctorArgs {
     pub stdio_command: Option<String>,
     /// WS endpoint, if configured.
     pub endpoint: Option<String>,
+    /// Bearer token for UI Protocol authentication. Falls back to OCTOS_AUTH_TOKEN.
+    pub auth_token: Option<String>,
     /// Data dir override (defaults to `~/.octos`).
     pub data_dir: Option<PathBuf>,
 }
@@ -809,7 +811,11 @@ fn backend_checks(args: &DoctorArgs) -> Vec<Check> {
     if let Some(cmd) = &args.stdio_command {
         checks.push(stdio_command_check(cmd));
     } else if let Some(endpoint) = &args.endpoint {
-        match probe_ws_capabilities(endpoint) {
+        let auth_token = args
+            .auth_token
+            .clone()
+            .or_else(|| std::env::var("OCTOS_AUTH_TOKEN").ok().filter(|t| !t.is_empty()));
+        match probe_ws_capabilities(endpoint, auth_token) {
             Ok(capabilities) => {
                 checks.push(
                     Check::pass(
@@ -987,12 +993,16 @@ const WS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const WS_PROBE_OVERALL_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_PROBE_ID: &str = "octos-tui-doctor-capabilities";
 
-fn probe_ws_capabilities(endpoint: &str) -> std::result::Result<UiProtocolCapabilities, String> {
-    probe_ws_capabilities_with_deadline(endpoint, WS_PROBE_OVERALL_TIMEOUT)
+fn probe_ws_capabilities(
+    endpoint: &str,
+    auth_token: Option<String>,
+) -> std::result::Result<UiProtocolCapabilities, String> {
+    probe_ws_capabilities_with_deadline(endpoint, auth_token, WS_PROBE_OVERALL_TIMEOUT)
 }
 
 fn probe_ws_capabilities_with_deadline(
     endpoint: &str,
+    auth_token: Option<String>,
     overall: Duration,
 ) -> std::result::Result<UiProtocolCapabilities, String> {
     let runtime = TokioRuntimeBuilder::new_current_thread()
@@ -1011,6 +1021,16 @@ fn probe_ws_capabilities_with_deadline(
                 .parse()
                 .map_err(|err| format!("failed to build feature header: {err}"))?,
         );
+        if let Some(token) = auth_token {
+            request
+                .headers_mut()
+                .insert(
+                    "Authorization",
+                    format!("Bearer {token}")
+                        .parse()
+                        .map_err(|err| format!("failed to build Authorization header: {err}"))?,
+                );
+        }
 
         let (mut ws, _) = tokio::time::timeout(WS_PROBE_TIMEOUT, connect_async(request))
             .await
@@ -1393,7 +1413,7 @@ mod tests {
             });
         });
 
-        let caps = probe_ws_capabilities(&format!("ws://{addr}/ui-protocol"))
+        let caps = probe_ws_capabilities(&format!("ws://{addr}/ui-protocol"), None)
             .expect("doctor probe returns capabilities");
         thread.join().expect("test websocket exits");
         assert_eq!(caps.version.protocol, UI_PROTOCOL_V1);
@@ -1452,6 +1472,7 @@ mod tests {
         let started = std::time::Instant::now();
         let err = probe_ws_capabilities_with_deadline(
             &format!("ws://{addr}/ui-protocol"),
+            None,
             Duration::from_millis(500),
         )
         .expect_err("chatty endpoint must hit the overall deadline");
