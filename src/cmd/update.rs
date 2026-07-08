@@ -423,7 +423,7 @@ mod tests {
         // Guards the exact strings the update advisor prints.
         assert_eq!(
             InstallMethod::Homebrew.upgrade_command().unwrap(),
-            "brew update && brew upgrade octos-org/tap/octos-tui"
+            "brew update && brew upgrade octos-org/octos-tui/octos-tui"
         );
         assert_eq!(
             InstallMethod::Npm.upgrade_command().unwrap(),

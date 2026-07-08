@@ -1,48 +1,66 @@
 name: Publish Homebrew Formula
-# The octos-tui Homebrew formula lives IN THIS REPO at Formula/octos-tui.rb
-# (this repo is its own tap -> `brew tap octos-org/octos-tui https://github.com/octos-org/octos-tui`).
+# Custom `dist` publish job (referenced as "./publish-homebrew" in
+# dist-workspace.toml's publish-jobs). dist invokes this reusable workflow
+# during the release pipeline's publish stage — AFTER the host job has uploaded
+# the release tarballs — so it runs in the same run as the release that created
+# them. (A standalone `release: published` trigger would NOT fire, because dist
+# creates the release with the built-in GITHUB_TOKEN and GitHub suppresses
+# workflow runs from token-created events.)
 #
-# dist (cargo-dist) no longer generates/pushes the formula — it only builds the
-# release tarballs. This workflow renders Formula/octos-tui.rb from those
-# tarballs' checksums on a stable release and pushes it back to main directly
-# (main is NOT branch-protected, mirroring how the old separate tap was pushed).
-#
-# Runs on every published release; skips prereleases (rc/beta tags) so the
-# stable formula never tracks a prerelease. Uses the built-in GITHUB_TOKEN —
-# no HOMEBREW_TAP_TOKEN needed.
+# The octos-tui formula lives IN THIS REPO at Formula/octos-tui.rb (this repo is
+# its own tap -> `brew tap octos-org/octos-tui https://github.com/octos-org/octos-tui`).
+# This job renders it from the released tarballs' checksums and pushes it to
+# main (main is NOT branch-protected). Uses the built-in GITHUB_TOKEN — no
+# HOMEBREW_TAP_TOKEN needed. Prereleases are skipped so the stable formula never
+# tracks an rc/beta.
 
 on:
-  release:
-    types: [published]
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      tag:
-        description: 'Release tag to publish (e.g. v0.1.5)'
+      plan:
         required: true
         type: string
 
-permissions:
-  contents: write
-
 jobs:
-  homebrew:
+  publish-homebrew:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
-      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      PLAN: ${{ inputs.plan }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Derive tag from the dist plan
+        id: meta
+        run: |
+          set -euo pipefail
+          tag=$(echo "$PLAN" | jq -r '.announcement_tag')
+          is_pre=$(echo "$PLAN" | jq -r '.announcement_is_prerelease')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$is_pre" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $tag (prerelease=$is_pre)"
+
+      - name: Skip formula update for prereleases
+        if: ${{ steps.meta.outputs.is_prerelease == 'true' }}
+        run: echo "::notice::${{ steps.meta.outputs.tag }} is a prerelease — Formula/octos-tui.rb tracks stable only; skipping."
+
+      # Check out main (the release pipeline runs on the tag; the formula must
+      # land on the default branch, which is what `brew tap` reads).
       - uses: actions/checkout@v4
+        if: ${{ steps.meta.outputs.is_prerelease != 'true' }}
         with:
           ref: main
 
       - name: Download release tarballs for the tag
+        if: ${{ steps.meta.outputs.is_prerelease != 'true' }}
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
         run: |
           set -euo pipefail
           mkdir -p artifacts
           triples="aarch64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu"
-          # `release: published` can fire before dist has finished uploading every
-          # asset. Poll until all expected tarballs exist (up to ~5 min) so we
-          # never render a formula from a partial asset set.
+          # The host job uploads assets just before this publish stage; poll a bit
+          # in case they aren't all visible yet (draft release is fine for gh).
           for attempt in $(seq 1 30); do
             missing=0
             for triple in $triples; do
@@ -62,7 +80,10 @@ jobs:
           done
           ls -la artifacts
 
-      - name: Render formula from template
+      - name: Render formula and commit to main
+        if: ${{ steps.meta.outputs.is_prerelease != 'true' }}
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
         run: |
           set -euo pipefail
           version="${TAG#v}"
@@ -81,14 +102,6 @@ jobs:
           echo "----- rendered Formula/octos-tui.rb -----"
           cat Formula/octos-tui.rb
 
-      - name: Skip formula update for prereleases
-        if: ${{ contains(env.TAG, '-') }}
-        run: echo "::notice::${TAG} is a prerelease — formula rendered + validated above, but NOT committed (Formula/octos-tui.rb tracks stable only)."
-
-      - name: Commit formula to main
-        if: ${{ !contains(env.TAG, '-') }}
-        run: |
-          set -euo pipefail
           if git diff --quiet -- Formula/octos-tui.rb; then
             echo "Formula/octos-tui.rb unchanged; nothing to commit."
             exit 0

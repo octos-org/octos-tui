@@ -19,8 +19,11 @@ npm-scope = "@octos-org"
 # Ship the self-updater + install receipt so `octos-tui update` can self-update
 # in-place (and defer to brew/npm when installed that way).
 install-updater = true
-# npm is published by dist; Homebrew is handled by publish-homebrew.yml.
-publish-jobs = ["npm"]
+# npm is published by dist; Homebrew runs as a custom publish job
+# (.github/workflows/publish-homebrew.yml) so it executes inside the release
+# pipeline — a standalone `release: published` workflow would not fire, since
+# dist creates the release with GITHUB_TOKEN.
+publish-jobs = ["npm", "./publish-homebrew"]
 # Prereleases (rc/beta tags) get a GitHub prerelease + installers but are NOT
 # pushed to npm/Homebrew, so they don't take the npm `latest` tag or move the
 # stable formula. (Flip to true temporarily when you want to test an rc's
