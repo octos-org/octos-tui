@@ -2908,6 +2908,8 @@ fn transcript_render_model(app: &AppState, palette: Palette, area: Rect) -> Tran
         )));
     }
 
+    collapse_blank_runs(&mut lines);
+
     let visible_height = transcript_visible_height(area);
     let total_rows = transcript_visual_rows(&lines, wrap_width);
     let max_scroll = total_rows.saturating_sub(visible_height);
@@ -4924,7 +4926,7 @@ fn push_activity_section_with_finalization(
     if flow_activity.is_empty() {
         return;
     }
-    if !lines.is_empty() {
+    if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
     let shown_limit = if app.expanded_tool_outputs { 12 } else { 3 };
@@ -5084,7 +5086,7 @@ fn push_turn_activity_log_section(
     if log.items.is_empty() {
         return;
     }
-    if !lines.is_empty() {
+    if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
     let shown_limit = if app.expanded_tool_outputs { 12 } else { 3 };
@@ -5163,7 +5165,7 @@ fn push_finalized_activity_items_section(
     if items.is_empty() {
         return;
     }
-    if !lines.is_empty() {
+    if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
     push_agent_task_group(
