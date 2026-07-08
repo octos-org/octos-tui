@@ -27,10 +27,10 @@ use octos_core::ui_protocol::{
     JSON_RPC_VERSION, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
-    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
-    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_KNOWN_FEATURES, UI_PROTOCOL_SCHEMA_VERSION,
-    UI_PROTOCOL_V1, UiProtocolCapabilities,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    UI_PROTOCOL_KNOWN_FEATURES, UI_PROTOCOL_SCHEMA_VERSION, UI_PROTOCOL_V1, UiProtocolCapabilities,
 };
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio_tungstenite::{
@@ -56,6 +56,7 @@ pub const TUI_REQUIRED_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
     UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
     UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
 ];
 
 /// Parsed `octos-tui doctor` flags.
@@ -811,10 +812,11 @@ fn backend_checks(args: &DoctorArgs) -> Vec<Check> {
     if let Some(cmd) = &args.stdio_command {
         checks.push(stdio_command_check(cmd));
     } else if let Some(endpoint) = &args.endpoint {
-        let auth_token = args
-            .auth_token
-            .clone()
-            .or_else(|| std::env::var("OCTOS_AUTH_TOKEN").ok().filter(|t| !t.is_empty()));
+        let auth_token = args.auth_token.clone().or_else(|| {
+            std::env::var("OCTOS_AUTH_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+        });
         match probe_ws_capabilities(endpoint, auth_token) {
             Ok(capabilities) => {
                 checks.push(
@@ -1022,14 +1024,12 @@ fn probe_ws_capabilities_with_deadline(
                 .map_err(|err| format!("failed to build feature header: {err}"))?,
         );
         if let Some(token) = auth_token {
-            request
-                .headers_mut()
-                .insert(
-                    "Authorization",
-                    format!("Bearer {token}")
-                        .parse()
-                        .map_err(|err| format!("failed to build Authorization header: {err}"))?,
-                );
+            request.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {token}")
+                    .parse()
+                    .map_err(|err| format!("failed to build Authorization header: {err}"))?,
+            );
         }
 
         let (mut ws, _) = tokio::time::timeout(WS_PROBE_TIMEOUT, connect_async(request))

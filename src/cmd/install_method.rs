@@ -552,7 +552,10 @@ mod tests {
     fn parse_cargo_source_is_git_returns_none_for_malformed_json() {
         assert_eq!(parse_cargo_source_is_git("not json at all"), None);
         assert_eq!(parse_cargo_source_is_git(""), None);
-        assert_eq!(parse_cargo_source_is_git(r#"{"installs": "wrong_type"}"#), None);
+        assert_eq!(
+            parse_cargo_source_is_git(r#"{"installs": "wrong_type"}"#),
+            None
+        );
     }
 
     #[test]
@@ -587,7 +590,8 @@ mod tests {
 
     #[test]
     fn detect_with_no_receipt_npm_path_returns_npm() {
-        let mut i = input("/home/u/.nvm/versions/node/v20/lib/node_modules/octos-tui/bin/octos-tui");
+        let mut i =
+            input("/home/u/.nvm/versions/node/v20/lib/node_modules/octos-tui/bin/octos-tui");
         i.npm_global_roots = vec![PathBuf::from(
             "/home/u/.nvm/versions/node/v20/lib/node_modules",
         )];
