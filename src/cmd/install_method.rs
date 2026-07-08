@@ -195,10 +195,16 @@ fn path_has_segments(path: &Path, segments: &[&str]) -> bool {
 /// shell-installed copy sits elsewhere while this binary came from a package
 /// manager) does NOT match and we fall through to [`classify_path`].
 pub fn detect() -> InstallMethod {
-    if receipt_for_this_executable() {
+    detect_with(receipt_for_this_executable(), &live_classifier_input())
+}
+
+/// Pure core of [`detect`]: separated so it is testable without touching the
+/// live receipt or process environment.
+fn detect_with(has_receipt: bool, input: &PathClassifierInput) -> InstallMethod {
+    if has_receipt {
         return InstallMethod::CargoDistInstaller;
     }
-    classify_path(&live_classifier_input())
+    classify_path(input)
 }
 
 /// Probe for a loadable cargo-dist install receipt that belongs to the running
@@ -313,10 +319,17 @@ fn cargo_home() -> Option<PathBuf> {
 fn cargo_source_is_git() -> Option<bool> {
     let path = cargo_home()?.join(".crates2.json");
     let contents = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    parse_cargo_source_is_git(&contents)
+}
+
+/// Pure core of [`cargo_source_is_git`]: parse the `.crates2.json` content
+/// string and return whether the recorded `octos-tui` source is a git URL.
+///
+/// Keys look like `octos-tui 0.1.1 (registry+https://…)` or
+/// `octos-tui 0.1.1 (git+https://…)`.
+fn parse_cargo_source_is_git(contents: &str) -> Option<bool> {
+    let value: serde_json::Value = serde_json::from_str(contents).ok()?;
     let installs = value.get("installs")?.as_object()?;
-    // Keys look like `octos-tui 0.1.1 (registry+https://…)` or
-    // `octos-tui 0.1.1 (git+https://…)`.
     for key in installs.keys() {
         if key.starts_with("octos-tui ") {
             return Some(key.contains("(git+"));
@@ -498,5 +511,117 @@ mod tests {
             Path::new("/opt/homebrew"),
             Path::new("/opt/homebrew/bin/octos-tui")
         ));
+    }
+
+    // --- parse_cargo_source_is_git ---
+
+    #[test]
+    fn parse_cargo_source_is_git_returns_false_for_registry_source() {
+        let json = r#"{
+            "installs": {
+                "octos-tui 0.1.1 (registry+https://github.com-crates-io-sparse+https://github.com/rust-lang/crates.io-index/)": {}
+            }
+        }"#;
+        assert_eq!(parse_cargo_source_is_git(json), Some(false));
+    }
+
+    #[test]
+    fn parse_cargo_source_is_git_returns_true_for_git_source() {
+        let json = r#"{
+            "installs": {
+                "octos-tui 0.1.2 (git+https://github.com/octos-org/octos-tui#abc123)": {}
+            }
+        }"#;
+        assert_eq!(parse_cargo_source_is_git(json), Some(true));
+    }
+
+    #[test]
+    fn parse_cargo_source_is_git_returns_none_when_crate_absent() {
+        // Another crate is present but not octos-tui.
+        let json = r#"{"installs": {"other-crate 1.0.0 (registry+https://…)": {}}}"#;
+        assert_eq!(parse_cargo_source_is_git(json), None);
+    }
+
+    #[test]
+    fn parse_cargo_source_is_git_returns_none_for_empty_installs() {
+        let json = r#"{"installs": {}}"#;
+        assert_eq!(parse_cargo_source_is_git(json), None);
+    }
+
+    #[test]
+    fn parse_cargo_source_is_git_returns_none_for_malformed_json() {
+        assert_eq!(parse_cargo_source_is_git("not json at all"), None);
+        assert_eq!(parse_cargo_source_is_git(""), None);
+        assert_eq!(parse_cargo_source_is_git(r#"{"installs": "wrong_type"}"#), None);
+    }
+
+    #[test]
+    fn parse_cargo_source_is_git_ignores_missing_installs_key() {
+        let json = r#"{"other_key": {}}"#;
+        assert_eq!(parse_cargo_source_is_git(json), None);
+    }
+
+    // --- detect_with ---
+
+    #[test]
+    fn detect_with_receipt_returns_cargo_dist_installer() {
+        let empty_input = PathClassifierInput::default();
+        assert_eq!(
+            detect_with(true, &empty_input),
+            InstallMethod::CargoDistInstaller,
+            "a valid receipt must short-circuit to CargoDistInstaller regardless of path"
+        );
+    }
+
+    #[test]
+    fn detect_with_no_receipt_falls_through_to_classify_path() {
+        // With an empty input (no prefixes, no cargo bin), no receipt →
+        // unknown method.
+        let empty_input = PathClassifierInput::default();
+        assert_eq!(
+            detect_with(false, &empty_input),
+            InstallMethod::Unknown,
+            "no receipt + no matching prefix → Unknown"
+        );
+    }
+
+    #[test]
+    fn detect_with_no_receipt_npm_path_returns_npm() {
+        let mut i = input("/home/u/.nvm/versions/node/v20/lib/node_modules/octos-tui/bin/octos-tui");
+        i.npm_global_roots = vec![PathBuf::from(
+            "/home/u/.nvm/versions/node/v20/lib/node_modules",
+        )];
+        assert_eq!(detect_with(false, &i), InstallMethod::Npm);
+    }
+
+    #[test]
+    fn detect_with_no_receipt_homebrew_path_returns_homebrew() {
+        let mut i = input("/opt/homebrew/bin/octos-tui");
+        i.brew_prefixes = vec![PathBuf::from("/opt/homebrew")];
+        assert_eq!(detect_with(false, &i), InstallMethod::Homebrew);
+    }
+
+    #[test]
+    fn detect_with_no_receipt_cargo_registry_returns_cargo_registry() {
+        let mut i = input("/home/u/.cargo/bin/octos-tui");
+        i.cargo_bin = Some(PathBuf::from("/home/u/.cargo/bin"));
+        i.cargo_source_is_git = Some(false);
+        assert_eq!(detect_with(false, &i), InstallMethod::CargoRegistry);
+    }
+
+    #[test]
+    fn detect_with_no_receipt_cargo_git_returns_cargo_git() {
+        let mut i = input("/home/u/.cargo/bin/octos-tui");
+        i.cargo_bin = Some(PathBuf::from("/home/u/.cargo/bin"));
+        i.cargo_source_is_git = Some(true);
+        assert_eq!(detect_with(false, &i), InstallMethod::CargoGit);
+    }
+
+    #[test]
+    fn detect_does_not_panic_on_live_environment() {
+        // Smoke test: detect() must not panic in any environment. We cannot
+        // assert a specific method because the host varies, but it must return
+        // a valid variant without unwinding.
+        let _ = detect();
     }
 }
