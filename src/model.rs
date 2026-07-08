@@ -1308,6 +1308,10 @@ pub struct LiveCompaction {
     pub token_estimate_before: u64,
     pub threshold_tokens: u64,
     pub trigger: String,
+    /// The turn that was live when compaction started — terminal-driven
+    /// cleanup only clears a block owned by THAT turn (a stale/duplicate
+    /// terminal must not clear a newer turn's block).
+    pub turn_id: Option<TurnId>,
 }
 
 /// M16-G2 last-compaction record summary (truncated). The full record

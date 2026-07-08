@@ -7161,6 +7161,11 @@ impl Store {
                 // pass is synchronous today, so completed may arrive in the
                 // same batch — the block then only flashes; the durable
                 // notice below still records the outcome.
+                let turn_id = self
+                    .find_session_mut(&event.session_id)
+                    .and_then(|session| {
+                        session.live_reply.as_ref().map(|live| live.turn_id.clone())
+                    });
                 self.state.live_compaction.insert(
                     event.session_id.clone(),
                     crate::model::LiveCompaction {
@@ -7168,6 +7173,7 @@ impl Store {
                         token_estimate_before: event.context_state.token_estimate as u64,
                         threshold_tokens: event.threshold_tokens as u64,
                         trigger: event.trigger.clone(),
+                        turn_id,
                     },
                 );
                 self.state.status = t!("status.compacting_context").into_owned();
@@ -7847,8 +7853,18 @@ impl Store {
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
         // Hang safety (the #218 lesson): a compaction block must never
-        // outlive its turn, even if completed was dropped/filtered.
-        self.state.live_compaction.remove(&event.session_id);
+        // outlive ITS turn — but a stale/duplicate terminal for an older
+        // turn must not clear a newer turn's block.
+        if self
+            .state
+            .live_compaction
+            .get(&event.session_id)
+            .is_some_and(|live| {
+                live.turn_id.is_none() || live.turn_id.as_ref() == Some(&event.turn_id)
+            })
+        {
+            self.state.live_compaction.remove(&event.session_id);
+        }
         // The staged-drain submit for THIS turn has settled — allow the tail
         // drain below to submit the NEXT staged prompt (FIFO, one per settled
         // turn). Match on turn so a late/duplicate terminal for an already-
@@ -8000,7 +8016,16 @@ impl Store {
     }
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
-        self.state.live_compaction.remove(&event.session_id);
+        if self
+            .state
+            .live_compaction
+            .get(&event.session_id)
+            .is_some_and(|live| {
+                live.turn_id.is_none() || live.turn_id.as_ref() == Some(&event.turn_id)
+            })
+        {
+            self.state.live_compaction.remove(&event.session_id);
+        }
         // The staged-drain submit for THIS turn has settled (error terminal) —
         // release the FIFO gate (see `commit_live_reply`). Match on turn so a
         // stale/duplicate error for an earlier turn cannot drop a newer staged
@@ -20370,11 +20395,37 @@ mod tests {
 
         // A turn terminal clears a dangling block (hang safety) even when
         // completed never arrives.
+        // A STALE terminal (different turn) must NOT clear a block owned
+        // by the live turn.
+        let owner_turn = TurnId::new();
+        store
+            .state
+            .live_compaction
+            .get_mut(&session_id)
+            .expect("armed")
+            .turn_id = Some(owner_turn.clone());
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: TurnId::new(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            store.state.live_compaction.contains_key(&session_id),
+            "stale terminal must not clear the newer turn's block"
+        );
+
+        // The OWNING turn's terminal clears it.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: owner_turn,
                 cursor: None,
                 tokens_in: None,
                 tokens_out: None,
