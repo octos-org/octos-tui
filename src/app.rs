@@ -2,7 +2,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, LineGauge, List, ListItem, ListState, Paragraph, StatefulWidget, Wrap},
+    widgets::{
+        Block, Borders, Clear, LineGauge, List, ListItem, ListState, Paragraph, StatefulWidget,
+        Wrap,
+    },
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -2370,17 +2373,15 @@ fn render_activity_navigator_list(
             .collect()
     };
 
-    List::new(items)
-        .highlight_style(Style::default())
-        .block(
-            titled_block(
-                "Results".to_string(),
-                palette,
-                true,
-                Some("j/k".to_string()),
-            )
-            .border_style(palette.border()),
+    List::new(items).highlight_style(Style::default()).block(
+        titled_block(
+            "Results".to_string(),
+            palette,
+            true,
+            Some("j/k".to_string()),
         )
+        .border_style(palette.border()),
+    )
 }
 
 fn render_activity_navigator_detail(

@@ -811,10 +811,11 @@ fn backend_checks(args: &DoctorArgs) -> Vec<Check> {
     if let Some(cmd) = &args.stdio_command {
         checks.push(stdio_command_check(cmd));
     } else if let Some(endpoint) = &args.endpoint {
-        let auth_token = args
-            .auth_token
-            .clone()
-            .or_else(|| std::env::var("OCTOS_AUTH_TOKEN").ok().filter(|t| !t.is_empty()));
+        let auth_token = args.auth_token.clone().or_else(|| {
+            std::env::var("OCTOS_AUTH_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+        });
         match probe_ws_capabilities(endpoint, auth_token) {
             Ok(capabilities) => {
                 checks.push(
@@ -1022,14 +1023,12 @@ fn probe_ws_capabilities_with_deadline(
                 .map_err(|err| format!("failed to build feature header: {err}"))?,
         );
         if let Some(token) = auth_token {
-            request
-                .headers_mut()
-                .insert(
-                    "Authorization",
-                    format!("Bearer {token}")
-                        .parse()
-                        .map_err(|err| format!("failed to build Authorization header: {err}"))?,
-                );
+            request.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {token}")
+                    .parse()
+                    .map_err(|err| format!("failed to build Authorization header: {err}"))?,
+            );
         }
 
         let (mut ws, _) = tokio::time::timeout(WS_PROBE_TIMEOUT, connect_async(request))

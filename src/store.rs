@@ -20353,7 +20353,7 @@ mod tests {
                 session_result: None,
             },
         )));
-        assert!(store.state.live_compaction.get(&session_id).is_none());
+        assert!(!store.state.live_compaction.contains_key(&session_id));
     }
 
     /// The fixed-width fraction bar used by the compaction UX.
