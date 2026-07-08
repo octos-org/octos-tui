@@ -1301,6 +1301,15 @@ pub struct ContextLifecycleState {
     pub last_compaction_id: Option<String>,
 }
 
+/// In-flight context compaction (UPCR-2026-026).
+#[derive(Debug, Clone)]
+pub struct LiveCompaction {
+    pub started_at: std::time::Instant,
+    pub token_estimate_before: u64,
+    pub threshold_tokens: u64,
+    pub trigger: String,
+}
+
 /// M16-G2 last-compaction record summary (truncated). The full record
 /// carries hashes and counts the TUI never renders to chat — only the
 /// bounded labels reach the status surface.
@@ -3362,6 +3371,11 @@ pub struct AppState {
     /// message's `reasoning_content`, which the transcript renders as a separate
     /// `· reasoning` block above the answer.
     pub live_reasoning: std::collections::HashMap<(SessionKey, TurnId), String>,
+    /// In-flight context compaction per session (UPCR-2026-026): set on
+    /// `context/compaction_started`, cleared on completed / turn end.
+    /// Renders the "Compacting conversation…" block with an honest
+    /// fullness bar.
+    pub live_compaction: std::collections::HashMap<SessionKey, LiveCompaction>,
     pub status: String,
     pub target: Option<String>,
     pub readonly: bool,
@@ -5111,6 +5125,7 @@ impl AppState {
             turn_prompt_anchors: Vec::new(),
             live_reply_segment_boundaries: std::collections::HashMap::new(),
             live_reasoning: std::collections::HashMap::new(),
+            live_compaction: std::collections::HashMap::new(),
             status,
             target,
             readonly,

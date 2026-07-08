@@ -1178,6 +1178,7 @@ status:
   activity_agent_output: "智能体输出"
   activity_agent_artifacts: "智能体制品"
   activity_session_goal: "会话目标"
+  compacting_context: "正在压缩对话上下文…"
   activity_context_compacted: "上下文已压缩"
   local_stop: "本地 /stop"
   local_ps: "本地 /ps"

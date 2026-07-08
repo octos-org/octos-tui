@@ -722,6 +722,7 @@ status:
   activity_agent_output: "agent output"
   activity_agent_artifacts: "agent artifacts"
   activity_session_goal: "session goal"
+  compacting_context: "Compacting conversation…"
   activity_context_compacted: "context compacted"
   # Local-command activity titles (slash-name kept literal)
   local_stop: "local /stop"

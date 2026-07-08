@@ -3202,6 +3202,15 @@ fn push_turn_flow(
     width: usize,
     live_finalization: Option<&LiveTurnFinalization>,
 ) {
+    if let Some(comp) = app.live_compaction.get(&session.id) {
+        push_live_compaction_block(
+            lines,
+            palette,
+            comp,
+            app.session_context_window.get(&session.id).copied(),
+        );
+    }
+
     if let Some(approval) = app.approval.as_ref().filter(|approval| approval.visible) {
         push_inline_approval_card(lines, palette, approval);
     }
@@ -3306,6 +3315,51 @@ fn push_user_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, con
 /// live reasoning text. Reuses the `reasoning` role styling (`· ` prefix +
 /// surface background) so it reads as a dimmed continuation of that lane.
 const THINKING_INDICATOR_TEXT: &str = "thinking…";
+
+/// `▰▰▰▰▱▱▱▱` fixed-width fraction bar for the compaction/context UX.
+pub(crate) fn progress_bar(frac: f64, width: usize) -> String {
+    let filled = ((frac.clamp(0.0, 1.0)) * width as f64).round() as usize;
+    let filled = filled.min(width);
+    format!("{}{}", "▰".repeat(filled), "▱".repeat(width - filled))
+}
+
+/// The in-progress compaction block (UPCR-2026-026):
+/// ```text
+/// ✶ Compacting conversation… (12s · 87.4k tokens)
+///   ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱ 49%
+/// ```
+/// The percentage is honest: pre-compaction tokens over the session's
+/// context window (threshold as the fallback denominator).
+fn push_live_compaction_block(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    comp: &crate::model::LiveCompaction,
+    context_window: Option<u64>,
+) {
+    let elapsed = comp.started_at.elapsed().as_secs();
+    let denominator = context_window
+        .filter(|w| *w > 0)
+        .unwrap_or_else(|| comp.threshold_tokens.max(1));
+    let frac = comp.token_estimate_before as f64 / denominator as f64;
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "✶ {} ({}s · {} tokens)",
+            t!("status.compacting_context"),
+            elapsed,
+            humanize_token_count(comp.token_estimate_before),
+        ),
+        Style::default().fg(palette.accent),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "  {} {:>3}%",
+            progress_bar(frac, 40),
+            (frac.clamp(0.0, 1.0) * 100.0).round() as u64
+        ),
+        Style::default().fg(palette.muted),
+    )]));
+    lines.push(Line::from(""));
+}
 
 /// Push a single dimmed `· thinking…` line. Mirrors the `reasoning` role's
 /// prefix/background from [`push_message_block`] / [`chat_message_bg`] but

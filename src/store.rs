@@ -7156,8 +7156,26 @@ impl Store {
                 ));
                 None
             }
+            UiNotification::ContextCompactionStarted(event) => {
+                // UPCR-2026-026: in-progress compaction state. The serve
+                // pass is synchronous today, so completed may arrive in the
+                // same batch — the block then only flashes; the durable
+                // notice below still records the outcome.
+                self.state.live_compaction.insert(
+                    event.session_id.clone(),
+                    crate::model::LiveCompaction {
+                        started_at: std::time::Instant::now(),
+                        token_estimate_before: event.context_state.token_estimate as u64,
+                        threshold_tokens: event.threshold_tokens as u64,
+                        trigger: event.trigger.clone(),
+                    },
+                );
+                self.state.status = t!("status.compacting_context").into_owned();
+                None
+            }
             UiNotification::ContextCompactionCompleted(event) => {
                 let session_id = event.session_id.clone();
+                self.state.live_compaction.remove(&session_id);
                 let state = crate::model::ContextLifecycleState {
                     session_id: event.context_state.session_id.clone(),
                     thread_id: event.context_state.thread_id.clone(),
@@ -7220,8 +7238,21 @@ impl Store {
                             humanize_token_count(after)
                         ),
                     );
+                    // Mockup-style honest fullness bar: after-size over the
+                    // session's context window (falls back to the before
+                    // size, which renders a fully-drained-relative bar).
+                    let denominator = self
+                        .state
+                        .session_context_window
+                        .get(&session_id)
+                        .copied()
+                        .filter(|w| *w > 0)
+                        .unwrap_or(before.max(1) as u64);
+                    let frac = after as f64 / denominator as f64;
                     notice.detail = Some(format!(
-                        "kept {} message(s), dropped {} (trigger: {})",
+                        "{} {:>3}%\nkept {} message(s), dropped {} (trigger: {})",
+                        crate::app::progress_bar(frac, 40),
+                        (frac * 100.0).round() as u64,
                         event.compaction.retained_count,
                         event.compaction.dropped_count,
                         event.compaction.trigger,
@@ -7787,6 +7818,9 @@ impl Store {
     }
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
+        // Hang safety (the #218 lesson): a compaction block must never
+        // outlive its turn, even if completed was dropped/filtered.
+        self.state.live_compaction.remove(&event.session_id);
         // The staged-drain submit for THIS turn has settled — allow the tail
         // drain below to submit the NEXT staged prompt (FIFO, one per settled
         // turn). Match on turn so a late/duplicate terminal for an already-
@@ -7938,6 +7972,7 @@ impl Store {
     }
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
+        self.state.live_compaction.remove(&event.session_id);
         // The staged-drain submit for THIS turn has settled (error terminal) —
         // release the FIFO gate (see `commit_live_reply`). Match on turn so a
         // stale/duplicate error for an earlier turn cannot drop a newer staged
@@ -20255,6 +20290,79 @@ mod tests {
 
         assert_eq!(store.state.sessions[0].tasks[0].output_tail, retained_tail);
         assert!(store.state.sessions[0].tasks[0].output_tail.len() <= TASK_OUTPUT_TAIL_BYTES);
+    }
+
+    /// UPCR-2026-026: `context/compaction_started` arms the in-progress
+    /// block; completed (or a turn terminal — the hang-safety path) clears
+    /// it, and the durable notice carries the fullness bar.
+    #[test]
+    fn compaction_started_arms_live_block_and_terminal_clears_it() {
+        use octos_core::ui_protocol::{ContextCompactionStartedEvent, UiContextState};
+
+        let session_id = SessionKey("local:test".into());
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "test".into(),
+            profile_id: None,
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        };
+
+        let context_state = UiContextState {
+            session_id: session_id.clone(),
+            thread_id: Some("thread-1".into()),
+            generation: 4,
+            transcript_hash: "abc123".into(),
+            item_count: 42,
+            token_estimate: 91_000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        };
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionStarted(ContextCompactionStartedEvent {
+                session_id: session_id.clone(),
+                context_state,
+                trigger: "preflight".into(),
+                threshold_tokens: 96_000,
+            }),
+        ));
+        let live = store
+            .state
+            .live_compaction
+            .get(&session_id)
+            .expect("started must arm the live block");
+        assert_eq!(live.token_estimate_before, 91_000);
+        assert_eq!(live.threshold_tokens, 96_000);
+        assert_eq!(live.trigger, "preflight");
+
+        // A turn terminal clears a dangling block (hang safety) even when
+        // completed never arrives.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(store.state.live_compaction.get(&session_id).is_none());
+    }
+
+    /// The fixed-width fraction bar used by the compaction UX.
+    #[test]
+    fn progress_bar_renders_fraction() {
+        assert_eq!(crate::app::progress_bar(0.0, 8), "▱▱▱▱▱▱▱▱");
+        assert_eq!(crate::app::progress_bar(0.5, 8), "▰▰▰▰▱▱▱▱");
+        assert_eq!(crate::app::progress_bar(1.0, 8), "▰▰▰▰▰▰▰▰");
+        assert_eq!(crate::app::progress_bar(7.5, 8), "▰▰▰▰▰▰▰▰");
     }
 
     /// M16-G2 wiring guard: `context/compaction_completed` events must
