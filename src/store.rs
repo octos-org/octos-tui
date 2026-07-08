@@ -7175,7 +7175,7 @@ impl Store {
             }
             UiNotification::ContextCompactionCompleted(event) => {
                 let session_id = event.session_id.clone();
-                self.state.live_compaction.remove(&session_id);
+                let live_compaction = self.state.live_compaction.remove(&session_id);
                 let state = crate::model::ContextLifecycleState {
                     session_id: event.context_state.session_id.clone(),
                     thread_id: event.context_state.thread_id.clone(),
@@ -7239,20 +7239,48 @@ impl Store {
                         ),
                     );
                     // Mockup-style honest fullness bar: after-size over the
-                    // session's context window (falls back to the before
-                    // size, which renders a fully-drained-relative bar).
-                    let denominator = self
+                    // session's REAL context window when known; else the
+                    // started event's threshold (labeled as such); else no
+                    // bar — dividing by the before-size lies whenever a
+                    // tiny-threshold compaction grows the estimate.
+                    // Activity detail renders as ONE line.
+                    let window = self
                         .state
                         .session_context_window
                         .get(&session_id)
                         .copied()
-                        .filter(|w| *w > 0)
-                        .unwrap_or(before.max(1) as u64);
-                    let frac = after as f64 / denominator as f64;
+                        .filter(|w| *w > 0);
+                    let threshold = live_compaction
+                        .as_ref()
+                        .map(|live| live.threshold_tokens)
+                        .filter(|t| *t > 0);
+                    let bar = match (window, threshold) {
+                        (Some(window), _) => {
+                            let frac = (after as f64 / window as f64).clamp(0.0, 1.0);
+                            let pct = if frac > 0.0 && frac < 0.01 {
+                                "<1%".to_string()
+                            } else {
+                                format!("{}%", (frac * 100.0).round() as u64)
+                            };
+                            format!(
+                                "{} {} of context — ",
+                                crate::app::progress_bar(frac, 24),
+                                pct
+                            )
+                        }
+                        (None, Some(threshold)) => {
+                            let frac = (after as f64 / threshold as f64).clamp(0.0, 1.0);
+                            format!(
+                                "{} {}% of compact threshold — ",
+                                crate::app::progress_bar(frac, 24),
+                                (frac * 100.0).round() as u64
+                            )
+                        }
+                        (None, None) => String::new(),
+                    };
                     notice.detail = Some(format!(
-                        "{} {:>3}%\nkept {} message(s), dropped {} (trigger: {})",
-                        crate::app::progress_bar(frac, 40),
-                        (frac * 100.0).round() as u64,
+                        "{}kept {} message(s), dropped {} (trigger: {})",
+                        bar,
                         event.compaction.retained_count,
                         event.compaction.dropped_count,
                         event.compaction.trigger,
