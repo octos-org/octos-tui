@@ -1,67 +1,68 @@
 name: Publish Homebrew Formula
-# Custom `dist` publish job (referenced as "./publish-homebrew" in
-# dist-workspace.toml's publish-jobs). dist invokes this reusable workflow
-# during the release pipeline's publish stage — AFTER the host job has uploaded
-# the release tarballs — so it runs in the same run as the release that created
-# them. (A standalone `release: published` trigger would NOT fire, because dist
-# creates the release with the built-in GITHUB_TOKEN and GitHub suppresses
-# workflow runs from token-created events.)
+# The octos-tui Homebrew formula lives IN THIS REPO at Formula/octos-tui.rb
+# (this repo is its own tap -> `brew tap octos-org/octos-tui https://github.com/octos-org/octos-tui`).
 #
-# The octos-tui formula lives IN THIS REPO at Formula/octos-tui.rb (this repo is
-# its own tap -> `brew tap octos-org/octos-tui https://github.com/octos-org/octos-tui`).
-# This job renders it from the released tarballs' checksums and pushes it to
-# main (main is NOT branch-protected). Uses the built-in GITHUB_TOKEN — no
-# HOMEBREW_TAP_TOKEN needed. Prereleases are skipped so the stable formula never
-# tracks an rc/beta.
+# This is a STANDALONE workflow triggered by the same version tag push that
+# starts release.yml — NOT a dist custom publish job and NOT `release: published`:
+#   - `release: published` would never fire, because dist creates the release
+#     with the built-in GITHUB_TOKEN and GitHub suppresses token-created events.
+#   - a dist custom publish job cannot get contents:write — dist caps custom-job
+#     permissions to id-token/packages and a reusable workflow can't elevate.
+# A tag push is human-initiated, so it fires reliably, exposes the tag as
+# `ref_name`, and lets this workflow own its `contents: write`.
+#
+# It runs in parallel with release.yml and polls the release until dist has
+# uploaded all the tarballs (Rust cross-compiles for 4 targets can take a
+# while), then renders Formula/octos-tui.rb from their checksums and pushes it
+# to main (main is NOT branch-protected). Prereleases (tags with a '-') are
+# skipped so the stable formula never tracks an rc/beta. GITHUB_TOKEN only.
 
 on:
-  workflow_call:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
     inputs:
-      plan:
+      tag:
+        description: 'Release tag to publish (e.g. v0.1.5)'
         required: true
         type: string
 
+permissions:
+  contents: write
+
 jobs:
-  publish-homebrew:
+  homebrew:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     env:
-      PLAN: ${{ inputs.plan }}
+      TAG: ${{ inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Derive tag from the dist plan
-        id: meta
+      - name: Skip prereleases
+        id: gate
         run: |
-          set -euo pipefail
-          tag=$(echo "$PLAN" | jq -r '.announcement_tag')
-          is_pre=$(echo "$PLAN" | jq -r '.announcement_is_prerelease')
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "is_prerelease=$is_pre" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $tag (prerelease=$is_pre)"
+          if [[ "$TAG" == *-* ]]; then
+            echo "::notice::$TAG is a prerelease — Formula/octos-tui.rb tracks stable only; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Skip formula update for prereleases
-        if: ${{ steps.meta.outputs.is_prerelease == 'true' }}
-        run: echo "::notice::${{ steps.meta.outputs.tag }} is a prerelease — Formula/octos-tui.rb tracks stable only; skipping."
-
-      # Check out main (the release pipeline runs on the tag; the formula must
-      # land on the default branch, which is what `brew tap` reads).
       - uses: actions/checkout@v4
-        if: ${{ steps.meta.outputs.is_prerelease != 'true' }}
+        if: ${{ steps.gate.outputs.skip != 'true' }}
         with:
           ref: main
 
       - name: Download release tarballs for the tag
-        if: ${{ steps.meta.outputs.is_prerelease != 'true' }}
-        env:
-          TAG: ${{ steps.meta.outputs.tag }}
+        if: ${{ steps.gate.outputs.skip != 'true' }}
         run: |
           set -euo pipefail
           mkdir -p artifacts
           triples="aarch64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu"
-          # The host job uploads assets just before this publish stage; poll a bit
-          # in case they aren't all visible yet (draft release is fine for gh).
-          for attempt in $(seq 1 30); do
+          # This workflow starts at the same instant as release.yml, so the
+          # tarballs won't exist yet. Poll generously — a 4-target Rust release
+          # build commonly takes 10-20 min. 60 * 30s = 30 min.
+          for attempt in $(seq 1 60); do
             missing=0
             for triple in $triples; do
               asset="octos-tui-${triple}.tar.xz"
@@ -71,19 +72,17 @@ jobs:
               [ -f "artifacts/$asset" ] || missing=1
             done
             [ "$missing" = 0 ] && break
-            echo "attempt $attempt: waiting for all tarball assets to publish..."
-            sleep 10
+            echo "attempt $attempt/60: waiting for release.yml to upload all tarballs..."
+            sleep 30
           done
           for triple in $triples; do
             test -f "artifacts/octos-tui-${triple}.tar.xz" \
-              || { echo "::error::missing octos-tui-${triple}.tar.xz after wait"; exit 1; }
+              || { echo "::error::missing octos-tui-${triple}.tar.xz after wait (did release.yml fail?)"; exit 1; }
           done
           ls -la artifacts
 
       - name: Render formula and commit to main
-        if: ${{ steps.meta.outputs.is_prerelease != 'true' }}
-        env:
-          TAG: ${{ steps.meta.outputs.tag }}
+        if: ${{ steps.gate.outputs.skip != 'true' }}
         run: |
           set -euo pipefail
           version="${TAG#v}"
