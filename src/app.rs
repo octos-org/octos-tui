@@ -4933,9 +4933,11 @@ fn push_user_question_option_row(
     } else {
         palette.text()
     };
-    // Budget the label to the remaining width after the 4-space indent + bar +
-    // marker prefixes (2 cols each).
-    let label = fit_card_text(text, width.saturating_sub(6));
+    // Budget the label to the remaining width after the bar + marker prefixes
+    // (2 cols each). `fit_card_text` already reserves the 4-space indent, so
+    // subtract only the extra 4 columns here — subtracting 6 clipped labels
+    // two columns early (codex review).
+    let label = fit_card_text(text, width.saturating_sub(4));
     lines.push(Line::from(vec![
         Span::styled("    ", palette.muted()),
         Span::styled(bar, bar_style),
