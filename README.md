@@ -32,8 +32,10 @@ client). One command installs both:
 
 ```bash
 npm install -g @octos-org/octos @octos-org/octos-tui
-# or with Homebrew:
-#   brew install octos-org/tap/octos octos-org/tap/octos-tui
+# or with Homebrew (each repo is its own tap):
+#   brew tap octos-org/octos     https://github.com/octos-org/octos
+#   brew tap octos-org/octos-tui https://github.com/octos-org/octos-tui
+#   brew install octos-org/octos/octos octos-org/octos-tui/octos-tui
 ```
 
 Then start the TUI with its own private local server:
@@ -90,8 +92,9 @@ arm64), and Windows (x86-64), distributed via:
 # npm
 npm install -g @octos-org/octos-tui
 
-# Homebrew
-brew install octos-org/tap/octos-tui
+# Homebrew (this repo is its own tap)
+brew tap octos-org/octos-tui https://github.com/octos-org/octos-tui
+brew install octos-org/octos-tui/octos-tui
 
 # shell installer (macOS / Linux)
 curl --proto '=https' --tlsv1.2 -LsSf \
