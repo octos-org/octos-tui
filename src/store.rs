@@ -8478,6 +8478,20 @@ impl Store {
         // fallback card or mishandling the dropped-empty case.
         self.state
             .mark_turn_finalized_by_switch(session_id, &prior_turn);
+        // The switch finalizes the prior turn WITHOUT a terminal — a
+        // compaction block owned by that turn would otherwise strand (its
+        // completed may also have been missed, and later terminals carry
+        // the NEW turn's id).
+        if self
+            .state
+            .live_compaction
+            .get(session_id)
+            .is_some_and(|live| {
+                live.turn_id.is_none() || live.turn_id.as_ref() == Some(&prior_turn)
+            })
+        {
+            self.state.live_compaction.remove(session_id);
+        }
         self.state
             .clear_live_reply_segment_boundaries(session_id, &prior_turn);
         // The prior turn's streamed reasoning commits with its message below (or is
@@ -20425,7 +20439,7 @@ mod tests {
             TurnCompletedEvent {
                 session_id: session_id.clone(),
                 topic: None,
-                turn_id: owner_turn,
+                turn_id: owner_turn.clone(),
                 cursor: None,
                 tokens_in: None,
                 tokens_out: None,
@@ -20433,6 +20447,30 @@ mod tests {
             },
         )));
         assert!(!store.state.live_compaction.contains_key(&session_id));
+
+        // Turn-switch recovery finalizes turns WITHOUT terminals: a block
+        // owned by the prior live turn must be cleared by the switch.
+        store.state.live_compaction.insert(
+            session_id.clone(),
+            crate::model::LiveCompaction {
+                started_at: std::time::Instant::now(),
+                token_estimate_before: 1_000,
+                threshold_tokens: 800,
+                trigger: "preflight".into(),
+                turn_id: Some(owner_turn.clone()),
+            },
+        );
+        if let Some(session) = store.find_session_mut(&session_id) {
+            session.live_reply = Some(LiveReply {
+                turn_id: owner_turn,
+                text: "in flight".into(),
+            });
+        }
+        store.commit_pending_live_reply_for_turn_switch(&session_id, &TurnId::new());
+        assert!(
+            !store.state.live_compaction.contains_key(&session_id),
+            "turn-switch finalization must clear the prior turn's block"
+        );
     }
 
     /// The fixed-width fraction bar used by the compaction UX.
