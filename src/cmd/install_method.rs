@@ -21,7 +21,7 @@ pub enum InstallMethod {
     /// Installed by the cargo-dist shell/PowerShell installer — a receipt is
     /// present and we can self-update in place.
     CargoDistInstaller,
-    /// Installed via Homebrew (`brew install octos-org/tap/octos-tui`).
+    /// Installed via Homebrew (`brew install octos-org/octos-tui/octos-tui`).
     Homebrew,
     /// Installed via npm global (`npm i -g @octos-org/octos-tui`).
     Npm,
@@ -64,7 +64,7 @@ impl InstallMethod {
     pub fn upgrade_command(&self) -> Option<&'static str> {
         match self {
             InstallMethod::CargoDistInstaller => None,
-            InstallMethod::Homebrew => Some("brew update && brew upgrade octos-org/tap/octos-tui"),
+            InstallMethod::Homebrew => Some("brew update && brew upgrade octos-org/octos-tui/octos-tui"),
             InstallMethod::Npm => Some("npm update -g @octos-org/octos-tui"),
             InstallMethod::CargoRegistry => Some("cargo install octos-tui --force"),
             InstallMethod::CargoGit => {
@@ -463,7 +463,7 @@ mod tests {
         );
         assert_eq!(
             InstallMethod::Homebrew.upgrade_command(),
-            Some("brew update && brew upgrade octos-org/tap/octos-tui")
+            Some("brew update && brew upgrade octos-org/octos-tui/octos-tui")
         );
         assert_eq!(
             InstallMethod::Npm.upgrade_command(),

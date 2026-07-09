@@ -71,7 +71,7 @@ Detection order (first match wins):
 | Detected method | `update` does | `--check` does |
 |---|---|---|
 | cargo-dist installer (receipt) | self-update in place via axoupdater (verify + atomic swap; respects `--version`/`--tag`/`--prerelease`/`--force`) | `query_new_version()`; print + exit 10 if newer |
-| Homebrew | print `brew update && brew upgrade octos-org/tap/octos-tui`; exit 3 | best-effort `brew outdated --json`; else print command, exit 0 |
+| Homebrew | print `brew update && brew upgrade octos-org/octos-tui/octos-tui`; exit 3 | best-effort `brew outdated --json`; else print command, exit 0 |
 | npm (`-g`) | print `npm update -g @octos-org/octos-tui`; exit 3 | `npm outdated -g @octos-org/octos-tui` |
 | cargo install (registry) | print `cargo install octos-tui --force` (+ suggest `cargo install-update`); exit 3 | compare to crates.io / latest tag |
 | cargo install --git | print `cargo install --git https://github.com/octos-org/octos-tui octos-tui --force`; exit 3 | compare `CARGO_PKG_VERSION` to repo latest tag |

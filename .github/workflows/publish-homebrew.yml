@@ -1,0 +1,112 @@
+name: Publish Homebrew Formula
+# The octos-tui Homebrew formula lives IN THIS REPO at Formula/octos-tui.rb
+# (this repo is its own tap -> `brew tap octos-org/octos-tui https://github.com/octos-org/octos-tui`).
+#
+# This is a STANDALONE workflow triggered by the same version tag push that
+# starts release.yml — NOT a dist custom publish job and NOT `release: published`:
+#   - `release: published` would never fire, because dist creates the release
+#     with the built-in GITHUB_TOKEN and GitHub suppresses token-created events.
+#   - a dist custom publish job cannot get contents:write — dist caps custom-job
+#     permissions to id-token/packages and a reusable workflow can't elevate.
+# A tag push is human-initiated, so it fires reliably, exposes the tag as
+# `ref_name`, and lets this workflow own its `contents: write`.
+#
+# It runs in parallel with release.yml and polls the release until dist has
+# uploaded all the tarballs (Rust cross-compiles for 4 targets can take a
+# while), then renders Formula/octos-tui.rb from their checksums and pushes it
+# to main (main is NOT branch-protected). Prereleases (tags with a '-') are
+# skipped so the stable formula never tracks an rc/beta. GITHUB_TOKEN only.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v0.1.5)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  homebrew:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Skip prereleases
+        id: gate
+        run: |
+          if [[ "$TAG" == *-* ]]; then
+            echo "::notice::$TAG is a prerelease — Formula/octos-tui.rb tracks stable only; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: ${{ steps.gate.outputs.skip != 'true' }}
+        with:
+          ref: main
+
+      - name: Download release tarballs for the tag
+        if: ${{ steps.gate.outputs.skip != 'true' }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          triples="aarch64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu"
+          # This workflow starts at the same instant as release.yml, so the
+          # tarballs won't exist yet. Poll generously — a 4-target Rust release
+          # build commonly takes 10-20 min. 60 * 30s = 30 min.
+          for attempt in $(seq 1 60); do
+            missing=0
+            for triple in $triples; do
+              asset="octos-tui-${triple}.tar.xz"
+              [ -f "artifacts/$asset" ] && continue
+              gh release download "$TAG" --repo "${{ github.repository }}" \
+                --pattern "$asset" --dir artifacts 2>/dev/null || true
+              [ -f "artifacts/$asset" ] || missing=1
+            done
+            [ "$missing" = 0 ] && break
+            echo "attempt $attempt/60: waiting for release.yml to upload all tarballs..."
+            sleep 30
+          done
+          for triple in $triples; do
+            test -f "artifacts/octos-tui-${triple}.tar.xz" \
+              || { echo "::error::missing octos-tui-${triple}.tar.xz after wait (did release.yml fail?)"; exit 1; }
+          done
+          ls -la artifacts
+
+      - name: Render formula and commit to main
+        if: ${{ steps.gate.outputs.skip != 'true' }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          sha_darwin_arm=$(sha256sum artifacts/octos-tui-aarch64-apple-darwin.tar.xz | awk '{print $1}')
+          sha_linux_arm=$(sha256sum artifacts/octos-tui-aarch64-unknown-linux-gnu.tar.xz | awk '{print $1}')
+          sha_linux_x64=$(sha256sum artifacts/octos-tui-x86_64-unknown-linux-gnu.tar.xz | awk '{print $1}')
+
+          mkdir -p Formula
+          cp packaging/homebrew/octos-tui.rb Formula/octos-tui.rb
+          sed -i "s|__VERSION__|${version}|g" Formula/octos-tui.rb
+          sed -i "s|__TAG__|${TAG}|g" Formula/octos-tui.rb
+          sed -i "s|__SHA_DARWIN_ARM__|${sha_darwin_arm}|g" Formula/octos-tui.rb
+          sed -i "s|__SHA_LINUX_ARM__|${sha_linux_arm}|g" Formula/octos-tui.rb
+          sed -i "s|__SHA_LINUX_X64__|${sha_linux_x64}|g" Formula/octos-tui.rb
+
+          echo "----- rendered Formula/octos-tui.rb -----"
+          cat Formula/octos-tui.rb
+
+          if git diff --quiet -- Formula/octos-tui.rb; then
+            echo "Formula/octos-tui.rb unchanged; nothing to commit."
+            exit 0
+          fi
+          git config user.name "octos-release-bot"
+          git config user.email "151983+ymote@users.noreply.github.com"
+          git add Formula/octos-tui.rb
+          git commit -m "octos-tui ${TAG}: update Homebrew formula"
+          git push origin HEAD:main
