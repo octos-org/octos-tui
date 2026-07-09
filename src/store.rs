@@ -1423,6 +1423,9 @@ impl Store {
             self.state
                 .switch_selected_session(self.state.sessions.len().saturating_sub(1));
         }
+        // A session opened before the capabilities response never got its
+        // open-time status probe — probe it lazily now that it is active.
+        self.probe_active_session_status_if_missing();
         // The incoming session may be idle with staged messages waiting (they
         // were left queued when a terminal fired while another session was
         // active) — drain them now that it is active again.
@@ -5324,6 +5327,10 @@ impl Store {
                 let completed_turns = self.state.completed_turns.clone();
                 let finalized_by_switch = self.state.finalized_by_switch.clone();
                 let live_reasoning = self.state.live_reasoning.clone();
+                // Per-turn wall clocks are local-only too: a snapshot landing
+                // mid-turn must not un-time the live turn (its completion would
+                // lose the committed status report's duration).
+                let turn_started_at = self.state.turn_started_at.clone();
                 let session_usage = self.state.session_usage.clone();
                 let session_context_window = self.state.session_context_window.clone();
                 // Local-only, and since the re-stage fix the gate holds the
@@ -5377,6 +5384,7 @@ impl Store {
                 state.completed_turns = completed_turns;
                 state.finalized_by_switch = finalized_by_switch;
                 state.live_reasoning = live_reasoning;
+                state.turn_started_at = turn_started_at;
                 state.session_usage = session_usage;
                 state.session_context_window = session_context_window;
                 state.staged_submit_in_flight = staged_submit_in_flight;
@@ -5673,31 +5681,38 @@ impl Store {
         .into_owned();
     }
 
+    /// Enqueue a `session/status/read` for the ACTIVE session when the server
+    /// advertises it and no runtime status is cached yet. One entry at a time —
+    /// bulk-probing every open session could overflow the capped
+    /// autonomy-hydration queue and evict unrelated pending commands. Sessions
+    /// probe on open in the normal flow; this covers the ones that raced the
+    /// capabilities response, lazily, whenever they become (or already are)
+    /// active — the composer footer only ever reads the active session anyway.
+    fn probe_active_session_status_if_missing(&mut self) {
+        if self.state.capabilities.as_ref().is_some_and(|caps| {
+            caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ)
+        }) && let Some(session_id) = self
+            .state
+            .active_session()
+            .map(|session| session.id.clone())
+            .filter(|session_id| self.state.runtime_status_for(session_id).is_none())
+        {
+            self.state
+                .enqueue_autonomy_hydration(AppUiCommand::ReadSessionStatus(
+                    crate::model::SessionStatusReadParams { session_id },
+                ));
+        }
+    }
+
     fn apply_capabilities_event(&mut self, event: CapabilitiesClientEvent) -> Option<AppUiCommand> {
         self.state.set_capabilities(event.result.capabilities);
         // `session/opened` can validly land BEFORE this capabilities response
         // (restored and server-initiated opens race the handshake), and the
         // open-time status probe is capability-gated. Now that the method set
-        // is known, probe runtime status for any already-open session that
-        // still lacks one — otherwise the composer footer's model stays blank
-        // until the user opens a status/model menu.
-        if self.state.capabilities.as_ref().is_some_and(|caps| {
-            caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ)
-        }) {
-            let missing: Vec<octos_core::SessionKey> = self
-                .state
-                .sessions
-                .iter()
-                .map(|session| session.id.clone())
-                .filter(|session_id| self.state.runtime_status_for(session_id).is_none())
-                .collect();
-            for session_id in missing {
-                self.state
-                    .enqueue_autonomy_hydration(AppUiCommand::ReadSessionStatus(
-                        crate::model::SessionStatusReadParams { session_id },
-                    ));
-            }
-        }
+        // is known, probe the active session if it still lacks a status —
+        // otherwise the composer footer's model stays blank until the user
+        // opens a status/model menu.
+        self.probe_active_session_status_if_missing();
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
             "capabilities",
@@ -16544,6 +16559,73 @@ mod tests {
         assert!(
             saw_status_read,
             "capabilities arriving after session open must requeue session/status/read"
+        );
+    }
+
+    /// The late-capabilities probe covers ONLY the active session — one queue
+    /// entry. Bulk-probing every open session could overflow the 16-entry
+    /// autonomy-hydration queue and evict unrelated pending commands; inactive
+    /// sessions probe lazily when they become active.
+    #[test]
+    fn capabilities_probe_targets_only_the_active_session() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[crate::model::APPUI_METHOD_SESSION_STATUS_READ],
+                    &[],
+                ),
+            },
+            message: "Octos UI capabilities refreshed".into(),
+        }));
+
+        let mut status_reads = Vec::new();
+        while let Some(command) = store.state.dequeue_autonomy_hydration() {
+            if let AppUiCommand::ReadSessionStatus(params) = command {
+                status_reads.push(params.session_id);
+            }
+        }
+        assert_eq!(
+            status_reads,
+            vec![SessionKey("local:a".into())],
+            "exactly one probe, for the active session"
+        );
+    }
+
+    /// A snapshot replay landing mid-turn must not un-time the live turn — the
+    /// per-turn clock is local-only state, carried over like `live_reasoning`.
+    #[test]
+    fn per_turn_clock_survives_snapshot_replay() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        let turn_id = TurnId::new();
+        store.state.note_turn_started(&a, &turn_id);
+
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![SessionView {
+                id: a.clone(),
+                title: "local:a".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            selected_session: 0,
+            status: "replayed".into(),
+            target: None,
+            readonly: false,
+        }));
+
+        assert!(
+            store
+                .state
+                .turn_started_at
+                .contains_key(&(a.clone(), turn_id.clone())),
+            "the per-turn clock must survive a snapshot replay"
+        );
+        assert!(
+            store.state.take_turn_elapsed_secs(&a, &turn_id).is_some(),
+            "the surviving clock still yields an elapsed duration"
         );
     }
 
