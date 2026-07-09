@@ -7156,29 +7156,6 @@ impl Store {
                 ));
                 None
             }
-            UiNotification::ContextCompactionStarted(event) => {
-                // UPCR-2026-026: in-progress compaction state. The serve
-                // pass is synchronous today, so completed may arrive in the
-                // same batch — the block then only flashes; the durable
-                // notice below still records the outcome.
-                let turn_id = self
-                    .find_session_mut(&event.session_id)
-                    .and_then(|session| {
-                        session.live_reply.as_ref().map(|live| live.turn_id.clone())
-                    });
-                self.state.live_compaction.insert(
-                    event.session_id.clone(),
-                    crate::model::LiveCompaction {
-                        started_at: std::time::Instant::now(),
-                        token_estimate_before: event.context_state.token_estimate as u64,
-                        threshold_tokens: event.threshold_tokens as u64,
-                        trigger: event.trigger.clone(),
-                        turn_id,
-                    },
-                );
-                self.state.status = t!("status.compacting_context").into_owned();
-                None
-            }
             UiNotification::ContextCompactionCompleted(event) => {
                 let session_id = event.session_id.clone();
                 let live_compaction = self.state.live_compaction.remove(&session_id);
@@ -20359,13 +20336,10 @@ mod tests {
         assert!(store.state.sessions[0].tasks[0].output_tail.len() <= TASK_OUTPUT_TAIL_BYTES);
     }
 
-    /// UPCR-2026-026: `context/compaction_started` arms the in-progress
-    /// block; completed (or a turn terminal — the hang-safety path) clears
-    /// it, and the durable notice carries the fullness bar.
+    /// UPCR-2026-026: a turn terminal (hang-safety path) clears a dangling
+    /// live-compaction block; the durable notice carries the fullness bar.
     #[test]
-    fn compaction_started_arms_live_block_and_terminal_clears_it() {
-        use octos_core::ui_protocol::{ContextCompactionStartedEvent, UiContextState};
-
+    fn compaction_live_block_cleared_by_turn_terminal() {
         let session_id = SessionKey("local:test".into());
         let session = SessionView {
             id: session_id.clone(),
@@ -20379,45 +20353,21 @@ mod tests {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
         };
 
-        let context_state = UiContextState {
-            session_id: session_id.clone(),
-            thread_id: Some("thread-1".into()),
-            generation: 4,
-            transcript_hash: "abc123".into(),
-            item_count: 42,
-            token_estimate: 91_000,
-            recovery_state: "healthy".into(),
-            last_checkpoint_id: None,
-            last_compaction_id: None,
-        };
-        store.apply_event(AppUiEvent::Protocol(
-            UiNotification::ContextCompactionStarted(ContextCompactionStartedEvent {
-                session_id: session_id.clone(),
-                context_state,
-                trigger: "preflight".into(),
-                threshold_tokens: 96_000,
-            }),
-        ));
-        let live = store
-            .state
-            .live_compaction
-            .get(&session_id)
-            .expect("started must arm the live block");
-        assert_eq!(live.token_estimate_before, 91_000);
-        assert_eq!(live.threshold_tokens, 96_000);
-        assert_eq!(live.trigger, "preflight");
-
         // A turn terminal clears a dangling block (hang safety) even when
         // completed never arrives.
         // A STALE terminal (different turn) must NOT clear a block owned
         // by the live turn.
         let owner_turn = TurnId::new();
-        store
-            .state
-            .live_compaction
-            .get_mut(&session_id)
-            .expect("armed")
-            .turn_id = Some(owner_turn.clone());
+        store.state.live_compaction.insert(
+            session_id.clone(),
+            crate::model::LiveCompaction {
+                started_at: std::time::Instant::now(),
+                token_estimate_before: 91_000,
+                threshold_tokens: 96_000,
+                trigger: "preflight".into(),
+                turn_id: Some(owner_turn.clone()),
+            },
+        );
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
                 session_id: session_id.clone(),
