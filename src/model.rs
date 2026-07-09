@@ -3399,6 +3399,7 @@ pub struct AppState {
     pub diff_preview: DiffPreviewPaneState,
     pub activity: Vec<ActivityItem>,
     pub turn_activity_logs: Vec<TurnActivityLog>,
+    pub turn_activity_summaries: Vec<TurnActivitySummary>,
     pub expanded_tool_outputs: bool,
     pub menu_stack: MenuStack,
     pub active_menu: Option<MenuBuildResult>,
@@ -3586,6 +3587,19 @@ pub struct TurnActivityLog {
     pub request: Option<String>,
     pub anchor_index: Option<usize>,
     pub items: Vec<ActivityItem>,
+}
+
+/// A committed per-turn status report (`✻ Ran for 5m 19s · 2 background tasks
+/// still running`) rendered at the tail of a finalized turn in the transcript.
+/// Captured at `TurnCompleted` (a snapshot — the running-task count reflects the
+/// moment the turn ended). Stored parallel to [`TurnActivityLog`] and looked up
+/// by `turn_id` so tool-less turns (no activity log items) still get a summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnActivitySummary {
+    pub session_id: SessionKey,
+    pub turn_id: TurnId,
+    pub elapsed_secs: u64,
+    pub background_tasks: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5148,6 +5162,7 @@ impl AppState {
             diff_preview: DiffPreviewPaneState::default(),
             activity: Vec::new(),
             turn_activity_logs: Vec::new(),
+            turn_activity_summaries: Vec::new(),
             expanded_tool_outputs: false,
             menu_stack: MenuStack::new(),
             active_menu: None,
@@ -6046,6 +6061,120 @@ impl AppState {
         self.activity
             .retain(|item| item.turn_id.as_ref() != Some(turn_id));
         true
+    }
+
+    /// The committed status report for a completed turn, if one was captured.
+    pub fn turn_summary_for(&self, turn_id: &TurnId) -> Option<&TurnActivitySummary> {
+        self.turn_activity_summaries
+            .iter()
+            .find(|summary| &summary.turn_id == turn_id)
+    }
+
+    /// Count of the session's still-running background work (pending/running
+    /// tasks and sub-agents) — the `N still running` half of a turn summary.
+    pub fn running_background_task_count(&self, session_id: &SessionKey) -> usize {
+        self.sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .map(|session| {
+                session
+                    .tasks
+                    .iter()
+                    .filter(|task| matches!(task_state_label(task.state), "pending" | "running"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Record the committed per-turn status report captured at `TurnCompleted`.
+    /// Upserts by `turn_id`, and ensures a [`TurnActivityLog`] exists to anchor
+    /// the summary line in the transcript — for a tool-less turn (no activity
+    /// items) a summary-only log is synthesized so the report still renders
+    /// after the assistant reply. Bounded to the same window as the logs.
+    pub fn attach_turn_summary(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+        elapsed_secs: u64,
+        background_tasks: usize,
+    ) {
+        let summary = TurnActivitySummary {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            elapsed_secs,
+            background_tasks,
+        };
+        if let Some(existing) = self
+            .turn_activity_summaries
+            .iter_mut()
+            .find(|existing| &existing.turn_id == turn_id)
+        {
+            *existing = summary;
+        } else {
+            self.turn_activity_summaries.push(summary);
+        }
+
+        // A tool-less turn has no activity log to hang the summary on; synthesize
+        // an empty-items log anchored like `capture_completed_turn_activity`
+        // anchors real ones (optimistic user message, then prompt anchor, then
+        // the session's latest user message) so the report still renders after
+        // the assistant reply.
+        if !self
+            .turn_activity_logs
+            .iter()
+            .any(|log| &log.session_id == session_id && &log.turn_id == turn_id)
+        {
+            let optimistic =
+                self.optimistic_user_messages.iter().rev().find(|message| {
+                    &message.session_id == session_id && &message.turn_id == turn_id
+                });
+            let prompt_anchor = self
+                .turn_prompt_anchors
+                .iter()
+                .rev()
+                .find(|anchor| &anchor.session_id == session_id && &anchor.turn_id == turn_id);
+            let request = optimistic
+                .map(|message| message.content.clone())
+                .or_else(|| prompt_anchor.map(|anchor| anchor.content.clone()))
+                .or_else(|| {
+                    self.sessions
+                        .iter()
+                        .find(|session| &session.id == session_id)
+                        .and_then(|session| {
+                            session
+                                .messages
+                                .iter()
+                                .rev()
+                                .find(|message| message.role == octos_core::MessageRole::User)
+                                .map(|message| message.content.clone())
+                        })
+                });
+            let anchor_index = optimistic.map(|message| message.anchor_index).or_else(|| {
+                prompt_anchor.and_then(|anchor| resolve_turn_prompt_anchor(&self.sessions, anchor))
+            });
+            self.turn_activity_logs.push(TurnActivityLog {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                request,
+                anchor_index,
+                items: Vec::new(),
+            });
+            const MAX_TURN_ACTIVITY_LOGS: usize = 32;
+            if self.turn_activity_logs.len() > MAX_TURN_ACTIVITY_LOGS {
+                let excess = self.turn_activity_logs.len() - MAX_TURN_ACTIVITY_LOGS;
+                self.turn_activity_logs.drain(0..excess);
+            }
+        }
+
+        // Keep summaries bounded to the surviving logs so the two lists cannot
+        // drift (a summary whose log was trimmed away can never render).
+        let live_turns: std::collections::HashSet<TurnId> = self
+            .turn_activity_logs
+            .iter()
+            .map(|log| log.turn_id.clone())
+            .collect();
+        self.turn_activity_summaries
+            .retain(|summary| live_turns.contains(&summary.turn_id));
     }
 
     /// Detail marker stamped on activity items created by the M9-γ

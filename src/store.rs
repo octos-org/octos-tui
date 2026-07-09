@@ -6653,6 +6653,23 @@ impl Store {
                 for command in hydration {
                     self.state.enqueue_autonomy_hydration(command);
                 }
+                // The composer footer shows the current model, which lives on
+                // the per-session runtime status. That status is only ever
+                // created by a `session/status/read`, so probe for it on open
+                // (when advertised) — otherwise the model never appears until
+                // the user happens to open a status/model menu. Cheap,
+                // idempotent, and gated on the capability so older servers that
+                // do not advertise it are left untouched.
+                if self.state.capabilities.as_ref().is_some_and(|caps| {
+                    caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ)
+                }) {
+                    self.state
+                        .enqueue_autonomy_hydration(AppUiCommand::ReadSessionStatus(
+                            crate::model::SessionStatusReadParams {
+                                session_id: session_id.clone(),
+                            },
+                        ));
+                }
                 // M22-D: if the user staged a permission profile in
                 // onboarding, apply it now that we have a session id.
                 // Server authority is preserved — the follow-up RPC
@@ -8009,6 +8026,19 @@ impl Store {
             self.state
                 .capture_completed_turn_activity(&event.session_id, &event.turn_id);
             if targets_active {
+                // Snapshot the turn's elapsed time BEFORE `set_run_state_success`
+                // clears `run_state_started_at`, and the still-running background
+                // task count, into a committed status report for the scrollback.
+                if let Some(elapsed_secs) = self.state.run_state_elapsed_secs() {
+                    let background_tasks =
+                        self.state.running_background_task_count(&event.session_id);
+                    self.state.attach_turn_summary(
+                        &event.session_id,
+                        &event.turn_id,
+                        elapsed_secs,
+                        background_tasks,
+                    );
+                }
                 self.state.set_run_state_success();
             }
         }
@@ -16324,6 +16354,117 @@ mod tests {
         assert_eq!(store.state.sessions[0].messages.len(), 1);
         assert!(store.state.sessions[0].live_reply.is_none());
         assert_eq!(store.state.run_state.label(), "done");
+    }
+
+    #[test]
+    fn completed_turn_records_a_status_summary_with_running_task_count() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "done");
+        let session_id = store.state.sessions[0].id.clone();
+        // Two background tasks still running when the turn completes.
+        store.state.sessions[0].tasks = vec![
+            TaskView {
+                id: octos_core::TaskId::new(),
+                title: "shell a".into(),
+                state: TaskRuntimeState::Running,
+                runtime_detail: None,
+                output_tail: String::new(),
+                turn_id: None,
+            },
+            TaskView {
+                id: octos_core::TaskId::new(),
+                title: "shell b".into(),
+                state: TaskRuntimeState::Running,
+                runtime_detail: None,
+                output_tail: String::new(),
+                turn_id: None,
+            },
+        ];
+        store.state.set_run_state_in_progress();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let summary = store
+            .state
+            .turn_summary_for(&turn_id)
+            .expect("a completed turn records a status summary");
+        assert_eq!(summary.session_id, session_id);
+        assert_eq!(
+            summary.background_tasks, 2,
+            "summary snapshots the still-running background task count"
+        );
+    }
+
+    /// The composer footer shows the current model, which lives on the
+    /// per-session runtime status — and that status is only ever created by a
+    /// `session/status/read`. So opening a session must queue one (when the
+    /// server advertises it), otherwise the model never appears until the user
+    /// happens to open a status/model menu.
+    #[test]
+    fn session_open_enqueues_session_status_read_when_supported() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::SessionOpened;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_SESSION_STATUS_READ]);
+        let session_id = SessionKey("dev:local:soak#main".into());
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": session_id.clone(),
+            "active_profile_id": "dev",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        let mut saw_status_read = false;
+        while let Some(command) = store.state.dequeue_autonomy_hydration() {
+            if let AppUiCommand::ReadSessionStatus(params) = command {
+                if params.session_id == session_id {
+                    saw_status_read = true;
+                }
+            }
+        }
+        assert!(
+            saw_status_read,
+            "session open should enqueue session/status/read so the composer footer can show the current model"
+        );
+    }
+
+    /// A server that does not advertise `session/status/read` must not be
+    /// probed on session open — old backends stay untouched.
+    #[test]
+    fn session_open_skips_status_read_when_capability_absent() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::SessionOpened;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": SessionKey("dev:local:soak#main".into()),
+            "active_profile_id": "dev",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        let mut commands = Vec::new();
+        while let Some(command) = store.state.dequeue_autonomy_hydration() {
+            commands.push(command);
+        }
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, AppUiCommand::ReadSessionStatus(_))),
+            "no session/status/read should be queued when the capability is unadvertised; got {commands:?}"
+        );
     }
 
     #[test]

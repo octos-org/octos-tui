@@ -104,6 +104,9 @@ app:
     esc_interrupt: "Esc interrupt"
     stop_to_close: "/stop to close"
     tool_output_expanded: "tool output expanded"
+  turn_summary:
+    ran_for: "Ran for %{duration}"
+    tasks_still_running: "%{count} background task(s) still running"
   status:
     state_label: "state"
     idle: "Idle"
