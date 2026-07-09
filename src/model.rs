@@ -3400,6 +3400,11 @@ pub struct AppState {
     pub activity: Vec<ActivityItem>,
     pub turn_activity_logs: Vec<TurnActivityLog>,
     pub turn_activity_summaries: Vec<TurnActivitySummary>,
+    /// Wall-clock starts of in-flight turns, keyed by (session, turn). The
+    /// committed per-turn status report reads its duration here — the global
+    /// `run_state_started_at` clock resets whenever the selection changes, so
+    /// it cannot time a turn the user switched away from and back.
+    pub turn_started_at: std::collections::HashMap<(SessionKey, TurnId), std::time::Instant>,
     pub expanded_tool_outputs: bool,
     pub menu_stack: MenuStack,
     pub active_menu: Option<MenuBuildResult>,
@@ -5163,6 +5168,7 @@ impl AppState {
             activity: Vec::new(),
             turn_activity_logs: Vec::new(),
             turn_activity_summaries: Vec::new(),
+            turn_started_at: std::collections::HashMap::new(),
             expanded_tool_outputs: false,
             menu_stack: MenuStack::new(),
             active_menu: None,
@@ -6068,6 +6074,42 @@ impl AppState {
         self.turn_activity_summaries
             .iter()
             .find(|summary| &summary.turn_id == turn_id)
+    }
+
+    /// Stamp the wall-clock start of a turn. Idempotent — a replayed
+    /// `TurnStarted` for a turn already being timed keeps the original start.
+    /// Bounded: turns drain their entry at every terminal event, so growth
+    /// only comes from turns that never terminate; evict the oldest past 64.
+    pub fn note_turn_started(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        const MAX_TRACKED_TURN_STARTS: usize = 64;
+        if self.turn_started_at.len() >= MAX_TRACKED_TURN_STARTS
+            && !self
+                .turn_started_at
+                .contains_key(&(session_id.clone(), turn_id.clone()))
+            && let Some(oldest) = self
+                .turn_started_at
+                .iter()
+                .min_by_key(|(_, started)| **started)
+                .map(|(key, _)| key.clone())
+        {
+            self.turn_started_at.remove(&oldest);
+        }
+        self.turn_started_at
+            .entry((session_id.clone(), turn_id.clone()))
+            .or_insert_with(std::time::Instant::now);
+    }
+
+    /// Take the elapsed seconds of a turn's per-turn clock, removing the entry
+    /// (terminal events consume it exactly once). `None` when this client never
+    /// saw the turn's `TurnStarted` (e.g. attached mid-turn).
+    pub fn take_turn_elapsed_secs(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> Option<u64> {
+        self.turn_started_at
+            .remove(&(session_id.clone(), turn_id.clone()))
+            .map(|started| started.elapsed().as_secs())
     }
 
     /// Count of the session's still-running background work (pending/running

@@ -7067,23 +7067,39 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
     // Surface the working directory (bottom-left) and current model
     // (bottom-right) right on the composer's bottom border. Both stay visible
     // at the input without consuming a content row — the bottom border already
-    // exists — and the cwd mirrors the status bar's own cwd source
-    // (`workspace.root`) so the two never diverge.
-    block = block.title_bottom(
-        Line::from(Span::styled(
-            format!(" {} ", short_path(app.workspace.root.as_str())),
-            palette.muted(),
-        ))
-        .left_aligned(),
-    );
+    // exists. The cwd prefers the active session's server-confirmed workspace
+    // root (populated by `session/status/read`), so after a session switch the
+    // footer shows THAT session's workspace; the client-side `workspace.root`
+    // is the fallback until a runtime status arrives.
+    let cwd = app
+        .active_session()
+        .and_then(|session| app.runtime_status_for(&session.id))
+        .and_then(|status| {
+            status
+                .workspace_root
+                .as_deref()
+                .or(status.cwd.as_deref())
+                .filter(|root| !root.trim().is_empty())
+        })
+        .unwrap_or(app.workspace.root.as_str());
+    let cwd_title = format!(" {} ", short_path(cwd));
+    block = block
+        .title_bottom(Line::from(Span::styled(cwd_title.clone(), palette.muted())).left_aligned());
     if let Some(model) = composer_footer_model(app) {
-        block = block.title_bottom(
-            Line::from(Span::styled(
-                format!(" {} ", truncate_terminal_line(&model, 28)),
-                Style::default().fg(palette.accent),
-            ))
-            .right_aligned(),
-        );
+        let model_title = format!(" {} ", truncate_terminal_line(&model, 28));
+        // Both bottom titles share one border row and ratatui paints
+        // overlapping titles over each other — on a composer too narrow for
+        // both, drop the model rather than colliding with the cwd.
+        let inner_width = area.width.saturating_sub(2) as usize;
+        if cwd_title.width() + model_title.width() <= inner_width {
+            block = block.title_bottom(
+                Line::from(Span::styled(
+                    model_title,
+                    Style::default().fg(palette.accent),
+                ))
+                .right_aligned(),
+            );
+        }
     }
 
     Paragraph::new(Text::from(lines))
@@ -7497,21 +7513,25 @@ fn short_id(id: &str) -> String {
     }
 }
 
-/// Resolve the current user's home directory from `HOME`, if set and non-empty.
+/// Resolve the current user's home directory from `HOME`, falling back to
+/// `USERPROFILE` (Windows normally sets only the latter), if set and non-empty.
 fn home_dir_str() -> Option<String> {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .and_then(|home| home.into_string().ok())
+    ["HOME", "USERPROFILE"].into_iter().find_map(|var| {
+        std::env::var_os(var)
+            .filter(|home| !home.is_empty())
+            .and_then(|home| home.into_string().ok())
+    })
 }
 
 /// Collapse a leading home-directory prefix to `~` the way a shell does
 /// (`/Users/me/proj` → `~/proj`, `/Users/me` → `~`). A no-op when `home` is
 /// absent/empty or is not a path-boundary prefix of `path` (so `/Users/mentor`
-/// is never mangled by a `/Users/me` home). Pure over `home` so it is testable
-/// without touching the process environment.
+/// is never mangled by a `/Users/me` home). Both `/` and `\` count as the
+/// boundary so native Windows paths collapse too. Pure over `home` so it is
+/// testable without touching the process environment.
 fn collapse_home_prefix(path: &str, home: Option<&str>) -> String {
     let Some(home) = home
-        .map(|home| home.trim_end_matches('/'))
+        .map(|home| home.trim_end_matches(['/', '\\']))
         .filter(|home| !home.is_empty())
     else {
         return path.to_string();
@@ -7520,7 +7540,7 @@ fn collapse_home_prefix(path: &str, home: Option<&str>) -> String {
         return "~".to_string();
     }
     match path.strip_prefix(home) {
-        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        Some(rest) if rest.starts_with('/') || rest.starts_with('\\') => format!("~{rest}"),
         _ => path.to_string(),
     }
 }
@@ -8531,6 +8551,109 @@ mod tests {
         // Absent/empty HOME is a no-op.
         assert_eq!(collapse_home_prefix("/Users/me/x", None), "/Users/me/x");
         assert_eq!(collapse_home_prefix("/Users/me/x", Some("")), "/Users/me/x");
+    }
+
+    #[test]
+    fn collapse_home_prefix_handles_windows_separators() {
+        // Native Windows paths use `\` as the boundary (USERPROFILE homes).
+        assert_eq!(
+            collapse_home_prefix(r"C:\Users\me\proj", Some(r"C:\Users\me")),
+            r"~\proj"
+        );
+        assert_eq!(
+            collapse_home_prefix(r"C:\Users\me", Some(r"C:\Users\me")),
+            "~"
+        );
+        // Trailing backslash on the home is tolerated; boundary still enforced.
+        assert_eq!(
+            collapse_home_prefix(r"C:\Users\me\x", Some(r"C:\Users\me\")),
+            r"~\x"
+        );
+        assert_eq!(
+            collapse_home_prefix(r"C:\Users\mentor\x", Some(r"C:\Users\me")),
+            r"C:\Users\mentor\x"
+        );
+    }
+
+    #[test]
+    fn composer_footer_prefers_session_workspace_root_over_global() {
+        // A canonicalized/global `workspace.root` must not shadow the ACTIVE
+        // session's server-confirmed workspace (from session/status/read) —
+        // switching between sessions with different workspaces shows each
+        // session's own root.
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.workspace.root = "/srv/global-root".into();
+        app.set_runtime_status(runtime_status_with_model_cwd(
+            session_id,
+            "kimi-k2",
+            "/srv/session-root",
+        ));
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let rows = rendered_rows(&rendered_buffer(&app, palette));
+        let footer = row_containing(&rows, "kimi-k2");
+        assert!(
+            footer.contains("/srv/session-root"),
+            "footer should show the session's server-confirmed workspace root; got {footer:?}"
+        );
+        assert!(
+            !footer.contains("/srv/global-root"),
+            "the global workspace root must not shadow the session's; got {footer:?}"
+        );
+    }
+
+    #[test]
+    fn composer_footer_drops_model_when_too_narrow_for_both_titles() {
+        // Ratatui paints overlapping border titles over each other; when the
+        // composer cannot fit cwd + model side by side the model is dropped —
+        // never a collision.
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.workspace.root = "/srv/quite/long/workspace/path/here".into();
+        app.set_runtime_status(runtime_status_with_model_cwd(
+            session_id,
+            "moonshotai-kimi-k2-instruct",
+            "/srv/quite/long/workspace/path/here",
+        ));
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let narrow = rendered_rows(&rendered_buffer_with_size(&app, palette, 40, 30));
+        assert!(
+            !narrow.iter().any(|row| row.contains("kimi")),
+            "model must be dropped when both footer titles cannot fit; got {narrow:?}"
+        );
+        let wide = rendered_rows(&rendered_buffer_with_size(&app, palette, 120, 30));
+        assert!(
+            wide.iter().any(|row| row.contains("kimi")),
+            "model renders again once the composer is wide enough"
+        );
     }
 
     fn row_index_containing(rows: &[String], needle: &str) -> usize {
