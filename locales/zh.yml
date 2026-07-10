@@ -1230,6 +1230,9 @@ status:
   summary_none_observed: "未观察到"
   summary_not_reported: "未报告"
   summary_none_recorded: "未记录"
+  # 用户主动中断（Esc/Ctrl+C）自己的轮次时的状态行与简短转录提示。刻意从简：
+  # 用户主动停止不是失败，因此不显示真正错误才有的详细“会话摘要”卡片。
+  turn_interrupted: "轮次已中断"
 saveconfig:
   saved: "设置已保存到 %{path}。"
   failed: "保存配置失败：%{error}"

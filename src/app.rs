@@ -557,7 +557,7 @@ pub fn finalized_history_lines_range(
             .iter()
             .filter(|(anchor_idx, _)| *anchor_idx == idx)
         {
-            push_turn_activity_log_section(&mut lines, palette, log, app, false);
+            push_turn_activity_log_section(&mut lines, palette, log, app, false, wrap_width);
         }
     }
     // Scrollback content must render on the terminal's NATIVE background, not the
@@ -668,9 +668,11 @@ pub fn finalized_history_lines_range_dedup_live(
                 .iter()
                 .find(|coverage| coverage.matches_turn(&log.session_id, &log.turn_id))
             {
-                push_turn_activity_log_section_unflushed(&mut lines, palette, log, app, coverage);
+                push_turn_activity_log_section_unflushed(
+                    &mut lines, palette, log, app, coverage, wrap_width,
+                );
             } else {
-                push_turn_activity_log_section(&mut lines, palette, log, app, false);
+                push_turn_activity_log_section(&mut lines, palette, log, app, false, wrap_width);
             }
         }
     }
@@ -914,6 +916,7 @@ pub fn finalized_live_turn_lines_between(
             app,
             Some(turn_id),
             &new_activity,
+            wrap_width,
         );
     }
 
@@ -1041,7 +1044,7 @@ fn push_live_reply_segment_separator(
 pub fn finalized_late_activity_lines_for_coverages(
     app: &AppState,
     palette: Palette,
-    _wrap_width: usize,
+    wrap_width: usize,
     live_coverages: &[LiveTurnFinalization],
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -1057,7 +1060,9 @@ pub fn finalized_late_activity_lines_for_coverages(
             .iter()
             .find(|coverage| coverage.matches_turn(&log.session_id, &log.turn_id))
         {
-            push_turn_activity_log_section_unflushed(&mut lines, palette, log, app, coverage);
+            push_turn_activity_log_section_unflushed(
+                &mut lines, palette, log, app, coverage, wrap_width,
+            );
         }
     }
     strip_lines_background(&mut lines);
@@ -2897,7 +2902,7 @@ fn transcript_render_model(app: &AppState, palette: Palette, area: Rect) -> Tran
                 .iter()
                 .filter(|(anchor_idx, _)| *anchor_idx == idx)
             {
-                push_turn_activity_log_section(&mut lines, palette, log, app, true);
+                push_turn_activity_log_section(&mut lines, palette, log, app, true, wrap_width);
             }
 
             if turn_flow_visible && Some(idx) == latest_user_index {
@@ -3249,7 +3254,7 @@ fn push_turn_flow(
     // verbose "thinking" text. The deltas still accumulate in `live_reasoning`
     // (so a future /thinking toggle can reveal them and commit_live_reply can
     // hand them to the message's reasoning_content); we only surface a single
-    // dimmed `· thinking…` indicator, and ONLY while the model is still
+    // dimmed swimming-octopus indicator, and ONLY while the model is still
     // reasoning — once the answer has started streaming (`live_reply.text` has
     // non-empty content for the active turn) we drop the indicator too.
     if let Some((session_id, turn_id)) = app.active_turn()
@@ -3262,7 +3267,7 @@ fn push_turn_flow(
             .as_ref()
             .is_none_or(|live_reply| live_reply.text.trim().is_empty())
     {
-        push_thinking_indicator(lines, palette);
+        push_thinking_indicator(lines, palette, width);
     }
 
     if let Some(live_reply) = &session.live_reply {
@@ -3283,7 +3288,7 @@ fn push_turn_flow(
         }
     }
 
-    push_activity_section_with_finalization(lines, palette, app, live_finalization);
+    push_activity_section_with_finalization(lines, palette, app, live_finalization, width);
 
     if live_turn_diff_preview_visible(app) {
         push_inline_diff_preview(lines, palette, &app.diff_preview, app.expanded_tool_outputs);
@@ -3337,10 +3342,60 @@ fn push_user_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, con
     }
 }
 
-/// The terse codex-style "thinking" indicator shown in place of the verbose
-/// live reasoning text. Reuses the `reasoning` role styling (`· ` prefix +
-/// surface background) so it reads as a dimmed continuation of that lane.
-const THINKING_INDICATOR_TEXT: &str = "thinking…";
+/// A horizontal ASCII octopus that "swims" across the thinking line: a `[⇔]`
+/// head flanked by the tilted-line glyphs `彡`/`ミ` (one arm per side). The two
+/// frames now encode travel *direction* rather than an in-place paddle — the
+/// octopus ping-pongs left↔right (see [`octopus_swim`]) and faces the way it
+/// moves: `彡[⇔]ミ` swimming right, `ミ[⇔]彡` swimming left.
+///
+///   `彡[⇔]ミ`   `ミ[⇔]彡`
+const OCTOPUS_SWIM_FRAMES: [&str; 2] = ["彡[⇔]ミ", "ミ[⇔]彡"];
+
+/// Milliseconds the octopus spends per display column. ~150ms/col reads as a
+/// calm swim (a full left→right→left sweep is a couple of seconds on a typical
+/// terminal) rather than a strobe.
+const OCTOPUS_SWIM_STEP_MS: u128 = 150;
+
+/// Cap on the ping-pong travel so the sweep stays legible on very wide
+/// terminals — a full-width dash would read as teleporting, not swimming.
+const OCTOPUS_SWIM_MAX_OFFSET: usize = 28;
+
+/// Pure elapsed→(leading-space offset, frame) mapping for the swimming octopus.
+///
+/// The octopus travels horizontally as a triangle wave: the leading-space
+/// offset climbs `0 → MAX` (swimming right, `彡[⇔]ミ`), then falls `MAX → 0`
+/// (swimming left, `ミ[⇔]彡`), forever. `MAX` keeps the octopus plus a one-column
+/// right margin inside `wrap_width`, measured in display *columns* via
+/// `unicode-width` (the CJK arm glyphs are double-width), and is capped at
+/// [`OCTOPUS_SWIM_MAX_OFFSET`]. On a terminal too narrow to travel, `MAX` is 0
+/// and the octopus sits still (facing right) rather than panicking. All
+/// arithmetic is overflow-safe: `offset` is bounded by `MAX`, so the caller's
+/// `" ".repeat(offset)` can never run away.
+fn octopus_swim(elapsed_ms: u128, wrap_width: usize) -> (usize, &'static str) {
+    let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
+    let max = wrap_width
+        .saturating_sub(octopus_width + 1)
+        .min(OCTOPUS_SWIM_MAX_OFFSET);
+    if max == 0 {
+        return (0, OCTOPUS_SWIM_FRAMES[0]);
+    }
+    let cycle = 2 * max;
+    // Reduce modulo in u128 first so a huge uptime can never truncate badly.
+    let pos = ((elapsed_ms / OCTOPUS_SWIM_STEP_MS) % cycle as u128) as usize;
+    let (offset, moving_right) = if pos <= max {
+        (pos, true) // rising: swim right →
+    } else {
+        (cycle - pos, false) // falling: swim left ←
+    };
+    // Direction↔frame mapping — a single flippable line if the facing should
+    // ever be swapped.
+    let frame = if moving_right {
+        OCTOPUS_SWIM_FRAMES[0]
+    } else {
+        OCTOPUS_SWIM_FRAMES[1]
+    };
+    (offset, frame)
+}
 
 /// `▰▰▰▰▱▱▱▱` fixed-width fraction bar for the compaction/context UX.
 pub(crate) fn progress_bar(frac: f64, width: usize) -> String {
@@ -3414,10 +3469,22 @@ fn push_live_compaction_block(
     lines.push(Line::from(""));
 }
 
-/// Push a single dimmed `· thinking…` line. Mirrors the `reasoning` role's
-/// prefix/background from [`push_message_block`] / [`chat_message_bg`] but
-/// renders one fixed line instead of the model's full reasoning prose.
-fn push_thinking_indicator(lines: &mut Vec<Line<'static>>, palette: Palette) {
+/// Push a single dimmed line carrying only the swimming octopus — no text. The
+/// octopus alone signals the thinking phase, traveling left↔right across the
+/// line (see [`octopus_swim`]). Mirrors the `reasoning` role's background from
+/// [`push_message_block`] / [`chat_message_bg`] so it reads as a dimmed
+/// continuation of that lane. `wrap_width` bounds the travel so the octopus
+/// never runs past the transcript's wrap edge.
+fn push_thinking_indicator(lines: &mut Vec<Line<'static>>, palette: Palette, wrap_width: usize) {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    // Same process-lifetime clock pattern as the spinner. The event loop
+    // redraws ~every 120ms during an active turn, so the elapsed-driven travel
+    // animates smoothly.
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    let (offset, frame) = octopus_swim(elapsed, wrap_width);
+
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
@@ -3425,7 +3492,10 @@ fn push_thinking_indicator(lines: &mut Vec<Line<'static>>, palette: Palette) {
     let bg = chat_message_bg(palette, "reasoning");
     let style = palette.muted().add_modifier(Modifier::DIM).bg(bg);
     lines.push(chat_line(
-        vec![Span::styled(format!("· {THINKING_INDICATOR_TEXT}"), style)],
+        vec![Span::styled(
+            format!("{}{}", " ".repeat(offset), frame),
+            style,
+        )],
         Some(bg),
     ));
 }
@@ -4339,6 +4409,35 @@ fn truncate_terminal_line(text: &str, max_chars: usize) -> String {
     preview
 }
 
+/// Truncate `text` to at most `max_cols` terminal *display* columns
+/// (unicode-width aware), appending a `…` when it overflows. Unlike
+/// [`truncate_terminal_line`] this counts double-width CJK/emoji glyphs as 2
+/// columns, so a row built from the result can never exceed its column budget
+/// and wrap. Never splits a char and never byte-slices, so it cannot panic on
+/// a multibyte boundary. The returned string's display width is `<= max_cols`.
+fn truncate_to_display_width(text: &str, max_cols: usize) -> String {
+    if text.width() <= max_cols {
+        return text.to_string();
+    }
+    if max_cols == 0 {
+        return String::new();
+    }
+    // Reserve one column for the ellipsis marker.
+    let budget = max_cols - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_w > budget {
+            break;
+        }
+        out.push(ch);
+        used += ch_w;
+    }
+    out.push('…');
+    out
+}
+
 fn line_is_blank(line: Option<&Line<'static>>) -> bool {
     line.map(|line| line.spans.iter().all(|span| span.content.trim().is_empty()))
         .unwrap_or(false)
@@ -4686,44 +4785,78 @@ fn compact_file_path(path: &str) -> String {
 }
 
 /// octos exposes several shell-family tools that all run a command string:
-/// `shell`/`exec`/`exec_command` (field `command`) and the codex-compatible
-/// `bash` (field `cmd`, falling back to `command`). They should all render as
-/// a real `$ command` line, not the raw JSON arguments blob. Kept in sync with
-/// the projection-side extraction in [`crate::store::tool_invocation_detail`].
+/// `shell`/`sh`/`exec`/`exec_command` (field `command`) and the
+/// codex-compatible `bash` (field `cmd`, falling back to `command`). They all
+/// render as a real command line, never the raw JSON arguments blob. Kept in
+/// sync with the projection-side extraction in
+/// [`crate::store::tool_invocation_detail`].
 pub(crate) fn is_shell_family_tool(title: &str) -> bool {
-    matches!(title, "shell" | "exec" | "exec_command" | "bash")
+    matches!(
+        title.to_ascii_lowercase().as_str(),
+        "shell" | "sh" | "exec" | "exec_command" | "bash"
+    )
 }
 
-/// Pull the command string out of a shell-family tool's arguments so the card
-/// shows `$ find …` instead of `{"cmd":"find …"}`. Empty fields are skipped so
-/// `{"cmd":"","command":"cargo test"}` still falls back to the real command.
-fn shell_command_arg(item: &ActivityItem) -> Option<String> {
-    let arguments = item.arguments.as_ref()?;
-    ["cmd", "command"]
-        .into_iter()
-        .find_map(|key| {
-            arguments
-                .get(key)
-                .and_then(|value| value.as_str())
-                .filter(|command| !command.is_empty())
-        })
-        .map(str::to_owned)
-}
+/// Longest raw-JSON fallback (display columns) `tool_invocation_text` will emit
+/// when it has no better human rendering — a hard cap so a pathological args
+/// blob can never be handed to the row builder unbounded. The per-row width
+/// budget truncates further; this only bounds the worst case.
+const RAW_ARG_FALLBACK_COLS: usize = 512;
 
+/// A human-readable one-line invocation for a tool activity, preferring a real
+/// command string over the raw serialized arguments (which used to leak into
+/// the card as `{"cmd":…}`). Order: an explicit `detail`, then a shell-family
+/// tool's command string, then a compact `key=value` of the first meaningful
+/// object field, then a bounded raw-JSON fallback.
 fn tool_invocation_text(item: &ActivityItem) -> Option<String> {
     if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
         return Some(detail.to_string());
     }
+    let arguments = item.arguments.as_ref()?;
+    // Shell-family tools carry their command under `cmd`/`command`; surface
+    // that (untruncated — the card builder applies the display-width budget)
+    // instead of the JSON envelope. Empty fields are skipped so
+    // `{"cmd":"","command":"cargo test"}` still falls back to the real command.
     if is_shell_family_tool(&item.title) {
-        if let Some(command) = shell_command_arg(item) {
-            return Some(command);
+        if let Some(command) = ["cmd", "command"].into_iter().find_map(|key| {
+            arguments
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+        }) {
+            return Some(command.to_string());
         }
     }
-    item.arguments
-        .as_ref()
-        .and_then(|arguments| serde_json::to_string(arguments).ok())
+    // Other tools with an object payload: show a compact `key=value` of the
+    // first meaningful string/number field rather than the whole JSON blob.
+    if let Some(map) = arguments.as_object() {
+        if let Some(rendered) = first_meaningful_arg(map) {
+            return Some(rendered);
+        }
+    }
+    // Last resort: bounded raw JSON (never an unbounded dump).
+    serde_json::to_string(arguments)
+        .ok()
+        .map(|json| truncate_to_display_width(&json, RAW_ARG_FALLBACK_COLS))
 }
 
+/// Render the first meaningful field of an args object as a compact
+/// `key=value`, bounded so a huge value can't blow up the row. Returns `None`
+/// when no scalar (string/number/bool) field is present.
+fn first_meaningful_arg(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    for (key, value) in map {
+        let rendered = match value {
+            serde_json::Value::String(s) if !s.trim().is_empty() => s.trim().to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            _ => continue,
+        };
+        let value = truncate_to_display_width(&rendered, RAW_ARG_FALLBACK_COLS);
+        return Some(format!("{key}={value}"));
+    }
+    None
+}
 fn meaningful_output_lines(output: &str) -> Vec<&str> {
     output
         .lines()
@@ -5137,6 +5270,7 @@ fn push_activity_section_with_finalization(
     palette: Palette,
     app: &AppState,
     live_finalization: Option<&LiveTurnFinalization>,
+    wrap_width: usize,
 ) {
     let mut flow_activity = flow_activity_items(app);
     if let Some(finalization) = active_live_finalization(app, live_finalization) {
@@ -5193,6 +5327,7 @@ fn push_activity_section_with_finalization(
                     is_active_group(app, last_turn),
                     app.expanded_tool_outputs,
                     true,
+                    wrap_width,
                 );
                 group.clear();
             }
@@ -5212,6 +5347,7 @@ fn push_activity_section_with_finalization(
             is_active_group(app, last_turn),
             app.expanded_tool_outputs,
             true,
+            wrap_width,
         );
     }
     if flow_activity.len() > recent.len() {
@@ -5310,6 +5446,7 @@ fn push_turn_activity_log_section(
     log: &TurnActivityLog,
     app: &AppState,
     collapse_settled: bool,
+    wrap_width: usize,
 ) {
     let summary = app.turn_summary_for(&log.turn_id);
     // A tool-less turn carries only a summary (no activity items); still render
@@ -5343,6 +5480,7 @@ fn push_turn_activity_log_section(
             is_active_group(app, Some(&log.turn_id)),
             app.expanded_tool_outputs,
             collapse_settled,
+            wrap_width,
         );
         if full.len() > shown.len() {
             let hidden = full.len() - shown.len();
@@ -5374,6 +5512,7 @@ fn push_turn_activity_log_section_unflushed(
     log: &TurnActivityLog,
     app: &AppState,
     coverage: &LiveTurnFinalization,
+    wrap_width: usize,
 ) {
     let items = log
         .items
@@ -5386,7 +5525,14 @@ fn push_turn_activity_log_section_unflushed(
         })
         .map(|(_, item)| item)
         .collect::<Vec<_>>();
-    push_finalized_activity_items_section(lines, palette, app, Some(&log.turn_id), &items);
+    push_finalized_activity_items_section(
+        lines,
+        palette,
+        app,
+        Some(&log.turn_id),
+        &items,
+        wrap_width,
+    );
     // The settling flush routes a still-covered log through this path, so emit
     // the committed turn summary here too (a no-op until the turn completes).
     push_turn_summary_line(lines, palette, app, &log.turn_id);
@@ -5441,6 +5587,7 @@ fn push_finalized_activity_items_section(
     app: &AppState,
     turn_id: Option<&octos_core::ui_protocol::TurnId>,
     items: &[&ActivityItem],
+    wrap_width: usize,
 ) {
     if items.is_empty() {
         return;
@@ -5460,6 +5607,7 @@ fn push_finalized_activity_items_section(
         app.expanded_tool_outputs,
         // Scrollback flush path: the archive never collapses.
         false,
+        wrap_width,
     );
 }
 
@@ -5598,6 +5746,7 @@ fn push_agent_task_group(
     is_active_group: bool,
     expanded: bool,
     collapse_settled: bool,
+    wrap_width: usize,
 ) {
     let active_subagents = subagent_titles.len();
     if items.is_empty() && subagent_titles.is_empty() {
@@ -5659,7 +5808,15 @@ fn push_agent_task_group(
     }
 
     for (idx, item) in items.iter().enumerate() {
-        push_agent_task_child(lines, palette, item, idx == 0, expanded, !collapse_settled);
+        push_agent_task_child(
+            lines,
+            palette,
+            item,
+            idx == 0,
+            expanded,
+            wrap_width,
+            !collapse_settled,
+        );
     }
 
     // List this turn's running sub-agents (from session.tasks, attributed by
@@ -5669,12 +5826,18 @@ fn push_agent_task_group(
     for (idx, title) in subagent_titles.iter().enumerate() {
         let first = items.is_empty() && idx == 0;
         let prefix = if first { "  ⎿  " } else { "     " };
-        lines.push(Line::from(vec![
-            Span::styled(prefix, palette.border()),
-            Span::styled("◻ ", palette.selected()),
-            Span::styled(title.clone(), palette.muted()),
-            Span::styled(format!("  {}", t!("app.activity.running")), palette.muted()),
-        ]));
+        // Clip to `wrap_width` like every other child row so a long sub-agent
+        // title cannot overflow and wrap to column 0.
+        let spans = clip_line_spans(
+            vec![
+                Span::styled(prefix, palette.border()),
+                Span::styled("◻ ", palette.selected()),
+                Span::styled(title.clone(), palette.muted()),
+                Span::styled(format!("  {}", t!("app.activity.running")), palette.muted()),
+            ],
+            wrap_width,
+        );
+        lines.push(Line::from(spans));
     }
 }
 
@@ -5724,8 +5887,15 @@ fn tool_card_bullet(item: &ActivityItem, palette: Palette) -> (String, Style) {
 
 /// Claude-Code-style tool-card header: `⏺ Bash(cmd)`. The invocation (shell
 /// command, spawn task, file path, …) renders in parens with raw JSON and the
-/// call-id stripped; multi-line commands indent to align under `(`.
-fn push_tool_card_header(lines: &mut Vec<Line<'static>>, palette: Palette, item: &ActivityItem) {
+/// call-id stripped; multi-line commands indent to align under `(`. Every
+/// emitted line is budgeted + clipped to `wrap_width` display columns so it
+/// can never overflow and wrap to column 0 (the indent-not-honored bug).
+fn push_tool_card_header(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    item: &ActivityItem,
+    wrap_width: usize,
+) {
     let (bullet, bullet_style) = tool_card_bullet(item, palette);
     let name = tool_display_name(&item.title);
     let duration = item
@@ -5743,7 +5913,7 @@ fn push_tool_card_header(lines: &mut Vec<Line<'static>>, palette: Palette, item:
         if !duration.is_empty() {
             spans.push(Span::styled(duration, palette.muted()));
         }
-        lines.push(Line::from(spans));
+        lines.push(Line::from(clip_line_spans(spans, wrap_width)));
         return;
     };
 
@@ -5753,11 +5923,18 @@ fn push_tool_card_header(lines: &mut Vec<Line<'static>>, palette: Palette, item:
     let max_lines = 10usize;
     let shown = cmd_lines.len().min(max_lines).max(1);
     let clipped = cmd_lines.len() > shown;
+    // Budget the command text so lead-in + text + `)` + duration fit within
+    // `wrap_width` (unicode-width, so CJK commands stay exact).
+    let lead_width = cont_indent.width();
+    let text_budget = wrap_width
+        .saturating_sub(lead_width)
+        .saturating_sub(duration.width() + 2)
+        .max(8);
 
     for idx in 0..shown {
         let raw = cmd_lines.get(idx).copied().unwrap_or_default();
         let last = idx + 1 == shown;
-        let mut text = truncate_terminal_line(raw, 100);
+        let mut text = truncate_to_display_width(raw, text_budget);
         if last {
             if clipped {
                 text.push('…');
@@ -5776,7 +5953,7 @@ fn push_tool_card_header(lines: &mut Vec<Line<'static>>, palette: Palette, item:
         if last && !duration.is_empty() {
             spans.push(Span::styled(duration.clone(), palette.muted()));
         }
-        lines.push(Line::from(spans));
+        lines.push(Line::from(clip_line_spans(spans, wrap_width)));
     }
 }
 
@@ -5786,28 +5963,45 @@ fn push_agent_task_child(
     item: &ActivityItem,
     first: bool,
     expanded: bool,
+    wrap_width: usize,
     in_scrollback: bool,
 ) {
     // Tool calls render as Claude-Code-style `⏺ Tool(arg)` cards; other
     // activity rows (file mutations, progress) keep the `⎿ ✓ …` tree form.
     if item.kind == ActivityKind::Tool {
-        push_tool_card_header(lines, palette, item);
-        push_compact_tool_preview(lines, palette, item, expanded, in_scrollback);
+        push_tool_card_header(lines, palette, item, wrap_width);
+        push_compact_tool_preview(lines, palette, item, expanded, wrap_width, in_scrollback);
         return;
     }
 
     let (icon, icon_style) = activity_status_icon(item, palette);
     let prefix = if first { "  ⎿  " } else { "     " };
+    // Display width consumed by the fixed lead-in (prefix + icon + one space);
+    // the content spans get the remaining budget so the whole row fits within
+    // `wrap_width` and ratatui never wraps it to column 0 (the indent-not-honored
+    // bug). Measured with unicode-width so CJK/emoji prefixes stay exact.
+    let lead_width = prefix.width() + icon.width() + 1;
+    let content_budget = wrap_width.saturating_sub(lead_width);
     let mut spans = vec![
         Span::styled(prefix, palette.border()),
         Span::styled(icon, icon_style),
         Span::styled(" ", palette.muted()),
     ];
-    spans.extend(compact_activity_spans(item, palette));
+    spans.extend(compact_activity_spans(item, palette, content_budget));
+    // Backstop: hard-clip the assembled row to `wrap_width` display columns so
+    // no child line can EVER exceed the transcript width (and wrap to column 0),
+    // even if a branch left an unbudgeted variable part (e.g. a long
+    // recovery-suggestion status). A budgeted row already fits, so this is a
+    // no-op there; it only bites pathological cases.
+    let spans = clip_line_spans(spans, wrap_width);
     lines.push(Line::from(spans));
 }
 
-fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'static>> {
+fn compact_activity_spans(
+    item: &ActivityItem,
+    palette: Palette,
+    content_budget: usize,
+) -> Vec<Span<'static>> {
     if let Some(mutation) = FileMutationActivity::from_item(item) {
         // Activity rows render uniformly muted, no bold: the runtime log must
         // never outweigh the reply prose or the user's own words.
@@ -5842,14 +6036,19 @@ fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'st
             ),
             Span::styled(format!("  {}", item.status), palette.muted()),
         ];
+        // Reserve the trailing metadata (duration) width up front so the
+        // detail is truncated to fit BEFORE it, keeping the duration visible.
+        let mut meta = Vec::new();
+        push_compact_metadata_spans(&mut meta, palette, item);
         if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
             spans.push(Span::styled("  ", palette.muted()));
+            let detail_budget = remaining_content_budget(content_budget, &spans, &meta);
             spans.push(Span::styled(
-                truncate_terminal_line(detail, 96),
+                truncate_to_display_width(detail, detail_budget),
                 palette.muted(),
             ));
         }
-        push_compact_metadata_spans(&mut spans, palette, item);
+        spans.extend(meta);
         return spans;
     }
 
@@ -5857,15 +6056,35 @@ fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'st
         Span::styled(item.title.clone(), palette.muted()),
         Span::styled(format!("  {}", item.status), palette.muted()),
     ];
+    let mut meta = Vec::new();
+    push_compact_metadata_spans(&mut meta, palette, item);
     if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
         spans.push(Span::styled("  ", palette.muted()));
+        let detail_budget = remaining_content_budget(content_budget, &spans, &meta);
         spans.push(Span::styled(
-            truncate_terminal_line(detail, 96),
+            truncate_to_display_width(detail, detail_budget),
             palette.muted(),
         ));
     }
-    push_compact_metadata_spans(&mut spans, palette, item);
+    spans.extend(meta);
     spans
+}
+
+/// Display columns still available for a row's variable part, given the total
+/// `content_budget`, the fixed leading spans already built, and the trailing
+/// metadata spans reserved after it. Saturating so an over-tight budget yields
+/// 0 (the variable part vanishes) rather than underflowing.
+fn remaining_content_budget(
+    content_budget: usize,
+    leading: &[Span<'static>],
+    trailing: &[Span<'static>],
+) -> usize {
+    let used: usize = leading
+        .iter()
+        .chain(trailing.iter())
+        .map(|span| span.content.as_ref().width())
+        .sum();
+    content_budget.saturating_sub(used)
 }
 
 fn push_compact_metadata_spans(
@@ -5879,6 +6098,9 @@ fn push_compact_metadata_spans(
             palette.muted(),
         ));
     }
+    // No `call <tool_call_id>` span: #267 established "no call-id" for CC-style
+    // activity cards. The `tool_call_id` FIELD is retained (used for keying /
+    // reconciliation); only the noisy display suffix is dropped.
 }
 
 fn push_compact_tool_preview(
@@ -5886,8 +6108,13 @@ fn push_compact_tool_preview(
     palette: Palette,
     item: &ActivityItem,
     expanded: bool,
+    wrap_width: usize,
     in_scrollback: bool,
 ) {
+    // The preview prefix `  ⎿ ` is 4 display columns; budget the content so a
+    // preview line fits within `wrap_width` and never wraps to column 0.
+    const PREVIEW_PREFIX_COLS: usize = 4;
+    let preview_budget = wrap_width.saturating_sub(PREVIEW_PREFIX_COLS);
     let Some(output_preview) = item
         .output_preview
         .as_deref()
@@ -5916,7 +6143,10 @@ fn push_compact_tool_preview(
     for line in preview_lines.iter().take(shown) {
         lines.push(Line::from(vec![
             Span::styled("  ⎿ ", palette.border()),
-            Span::styled(truncate_terminal_line(line, 110), palette.text()),
+            Span::styled(
+                truncate_to_display_width(line, preview_budget),
+                palette.text(),
+            ),
         ]));
     }
     if in_scrollback {
@@ -5929,26 +6159,32 @@ fn push_compact_tool_preview(
         } else {
             t!("app.hint.ctrl_o_expand").into_owned()
         };
-        lines.push(Line::from(vec![
-            Span::styled("  ⎿ ", palette.border()),
-            Span::styled(
-                t!(
-                    "app.activity.more_lines_hidden",
-                    count = total - shown,
-                    action = action
-                )
-                .into_owned(),
-                palette.muted(),
-            ),
-        ]));
+        lines.push(Line::from(clip_line_spans(
+            vec![
+                Span::styled("  ⎿ ", palette.border()),
+                Span::styled(
+                    t!(
+                        "app.activity.more_lines_hidden",
+                        count = total - shown,
+                        action = action
+                    )
+                    .into_owned(),
+                    palette.muted(),
+                ),
+            ],
+            wrap_width,
+        )));
     } else if expanded && total > COLLAPSED_TOOL_PREVIEW_LINES {
-        lines.push(Line::from(vec![
-            Span::styled("  ⎿ ", palette.border()),
-            Span::styled(
-                t!("app.activity.expanded_hint").into_owned(),
-                palette.muted(),
-            ),
-        ]));
+        lines.push(Line::from(clip_line_spans(
+            vec![
+                Span::styled("  ⎿ ", palette.border()),
+                Span::styled(
+                    t!("app.activity.expanded_hint").into_owned(),
+                    palette.muted(),
+                ),
+            ],
+            wrap_width,
+        )));
     }
 }
 
@@ -6764,6 +7000,21 @@ fn active_session_autonomy(app: &AppState) -> Option<&SessionAutonomyState> {
 
 /// Number of rows the sticky autonomy indicator needs: 0 when both goal
 /// and loops are absent, 1 when only one is present, 2 when both are.
+/// Max plan items rendered in the sticky panel before collapsing to a
+/// `… +N more` summary line, so a long checklist can't dominate the screen.
+const PLAN_PANEL_MAX_ITEMS: usize = 8;
+
+/// Rows the plan checklist adds to the sticky panel: a header line plus one
+/// row per shown item (capped), plus a `+N more` line when truncated.
+fn plan_panel_rows(plan: &octos_core::ui_protocol::UiPlanRecord) -> u16 {
+    if plan.items.is_empty() {
+        return 0;
+    }
+    let shown = plan.items.len().min(PLAN_PANEL_MAX_ITEMS);
+    let overflow = usize::from(plan.items.len() > PLAN_PANEL_MAX_ITEMS);
+    (1 + shown + overflow) as u16
+}
+
 fn autonomy_indicator_height(app: &AppState) -> u16 {
     match active_session_autonomy(app) {
         Some(state) => {
@@ -6773,6 +7024,9 @@ fn autonomy_indicator_height(app: &AppState) -> u16 {
             }
             if !state.loops.is_empty() {
                 rows += 1;
+            }
+            if let Some(plan) = state.plan.as_ref() {
+                rows += plan_panel_rows(plan);
             }
             rows
         }
@@ -6908,6 +7162,99 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
             spans.pop();
         }
         lines.push(Line::from(spans));
+    }
+    if let Some(plan) = state.plan.as_ref() {
+        lines.extend(plan_indicator_lines(plan, palette));
+    }
+    lines
+}
+
+/// Render the model-authored plan/todo checklist as a header line
+/// (`✶ <activity> (done/total)`) plus a `⎿`-anchored tree of items with a
+/// per-status glyph. Mirrors the sub-agent task-group tree visual.
+fn plan_indicator_lines(
+    plan: &octos_core::ui_protocol::UiPlanRecord,
+    palette: Palette,
+) -> Vec<Line<'static>> {
+    use octos_core::ui_protocol::PlanItemStatus;
+    if plan.items.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let total = plan.items.len();
+    let done = plan
+        .items
+        .iter()
+        .filter(|item| item.status == PlanItemStatus::Completed)
+        .count();
+    // Header: prefer the model's activity label, else the in-progress item,
+    // else a generic fallback.
+    let title = plan
+        .title
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| {
+            plan.items
+                .iter()
+                .find(|item| item.status == PlanItemStatus::InProgress)
+                .map(|item| item.title.clone())
+        })
+        .unwrap_or_else(|| "Plan".to_string());
+    lines.push(Line::from(vec![
+        Span::styled(
+            "✶ ",
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+                .bg(palette.surface),
+        ),
+        Span::styled(title, palette.title().bg(palette.surface)),
+        Span::styled(
+            format!("  ({done}/{total})"),
+            palette.muted().bg(palette.surface),
+        ),
+    ]));
+    for (idx, item) in plan.items.iter().take(PLAN_PANEL_MAX_ITEMS).enumerate() {
+        let (glyph, glyph_style) = match item.status {
+            PlanItemStatus::Completed => (
+                "✔",
+                Style::default().fg(palette.success).bg(palette.surface),
+            ),
+            PlanItemStatus::InProgress => (
+                "▸",
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(palette.surface),
+            ),
+            PlanItemStatus::Pending => ("◼", palette.muted().bg(palette.surface)),
+        };
+        // `⎿` anchors the first child; the rest align under the glyph.
+        let prefix = if idx == 0 { "  ⎿  " } else { "     " };
+        let mut spans = vec![
+            Span::styled(prefix, palette.muted().bg(palette.surface)),
+            Span::styled(format!("{glyph} "), glyph_style),
+        ];
+        if let Some(priority) = item.priority.as_ref().filter(|p| !p.trim().is_empty()) {
+            spans.push(Span::styled(
+                format!("{priority} "),
+                palette.muted().bg(palette.surface),
+            ));
+        }
+        let item_style = if item.status == PlanItemStatus::Completed {
+            palette.muted().bg(palette.surface)
+        } else {
+            palette.text().bg(palette.surface)
+        };
+        spans.push(Span::styled(item.title.clone(), item_style));
+        lines.push(Line::from(spans));
+    }
+    if plan.items.len() > PLAN_PANEL_MAX_ITEMS {
+        let more = plan.items.len() - PLAN_PANEL_MAX_ITEMS;
+        lines.push(Line::from(Span::styled(
+            format!("     … +{more} more"),
+            palette.muted().bg(palette.surface),
+        )));
     }
     lines
 }
@@ -7762,7 +8109,12 @@ fn run_state_style(state: &SessionRunState, palette: Palette) -> Style {
 
 fn run_state_marker(state: &SessionRunState) -> &'static str {
     match state {
-        SessionRunState::InProgress => "•",
+        // Pin the swimming octopus to the always-visible status bar: on a big
+        // turn the transcript's "Orchestrating" chip scrolls above the fold, so
+        // this is the reliable "still working" signal that never scrolls away.
+        // Time-based like the transcript spinner; the status bar redraws every
+        // frame so it animates smoothly.
+        SessionRunState::InProgress => spinner_frame(),
         SessionRunState::Blocked { .. } => "!",
         SessionRunState::Success => "✓",
         SessionRunState::Error { .. } => "x",
@@ -8643,6 +8995,123 @@ mod tests {
     }
 
     #[test]
+    fn in_progress_status_marker_is_the_octopus_spinner() {
+        // The pinned "still working" signal: the in-progress status marker is
+        // one of the octopus spinner frames (not a static bullet), so it stays
+        // visible in the status bar even when the transcript chip scrolls off.
+        let marker = run_state_marker(&SessionRunState::InProgress);
+        assert!(
+            SPINNER_FRAMES.contains(&marker),
+            "in-progress marker must be an octopus spinner frame, got {marker:?}"
+        );
+        // Settled states keep their static, non-animated markers.
+        assert_eq!(run_state_marker(&SessionRunState::Success), "✓");
+        assert_eq!(run_state_marker(&SessionRunState::Idle), "·");
+    }
+
+    #[test]
+    fn swimming_octopus_frames_have_boxed_eyes_four_arms_and_flip_direction() {
+        // Each frame: a `[⇔]` head with one tilted-line arm glyph per side (彡/ミ).
+        for frame in OCTOPUS_SWIM_FRAMES {
+            assert!(frame.contains("[⇔]"), "[⇔] head: {frame}");
+            let (left, right) = frame.split_once("[⇔]").expect("head splits arms");
+            assert_eq!(left.chars().count(), 1, "one arm glyph left: {frame}");
+            assert_eq!(right.chars().count(), 1, "one arm glyph right: {frame}");
+        }
+        // The two frames face opposite ways — now the travel *direction*:
+        // 彡[⇔]ミ swims right, ミ[⇔]彡 swims left.
+        assert_eq!(OCTOPUS_SWIM_FRAMES[0], "彡[⇔]ミ");
+        assert_eq!(OCTOPUS_SWIM_FRAMES[1], "ミ[⇔]彡");
+    }
+
+    #[test]
+    fn octopus_swim_starts_at_origin_facing_right() {
+        // elapsed=0 → sitting at the left margin, swimming right.
+        let (offset, frame) = octopus_swim(0, 80);
+        assert_eq!(offset, 0, "starts flush-left");
+        assert_eq!(frame, "彡[⇔]ミ", "the first phase faces right");
+        assert_eq!(frame, OCTOPUS_SWIM_FRAMES[0]);
+    }
+
+    #[test]
+    fn octopus_swim_ping_pongs_a_clean_triangle_wave() {
+        // Sample one full period, one column-step at a time, and confirm the
+        // offset traces 0→MAX→0 (a triangle) while the frame faces the way it
+        // travels: right on the rise, left on the fall.
+        let wrap_width = 40usize;
+        let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
+        let max = wrap_width
+            .saturating_sub(octopus_width + 1)
+            .min(OCTOPUS_SWIM_MAX_OFFSET);
+        assert!(max > 0, "test needs a non-trivial sweep (got MAX={max})");
+
+        // The triangle we expect, built independently of the implementation:
+        // rise 0..=MAX, then fall MAX-1..=1 (the trough 0 opens the next period).
+        let mut expected = Vec::new();
+        expected.extend(0..=max); // rising, swimming right
+        expected.extend((1..max).rev()); // falling, swimming left
+        let cycle = expected.len();
+        assert_eq!(cycle, 2 * max, "one period spans 2·MAX column-steps");
+
+        for (step, &want_offset) in expected.iter().enumerate() {
+            let elapsed = (step as u128) * OCTOPUS_SWIM_STEP_MS;
+            let (offset, frame) = octopus_swim(elapsed, wrap_width);
+            assert_eq!(offset, want_offset, "offset at step {step}");
+            // Never overshoots the peak, never underflows below the margin.
+            assert!(
+                offset <= max,
+                "offset {offset} exceeded MAX {max} at {step}"
+            );
+            // Facing matches direction: rising (step<=max) → right, else left.
+            let want_frame = if step <= max {
+                OCTOPUS_SWIM_FRAMES[0]
+            } else {
+                OCTOPUS_SWIM_FRAMES[1]
+            };
+            assert_eq!(frame, want_frame, "facing at step {step}");
+        }
+
+        // The period repeats: step `cycle` lands back at the origin, facing right.
+        let (wrapped, frame) = octopus_swim((cycle as u128) * OCTOPUS_SWIM_STEP_MS, wrap_width);
+        assert_eq!(wrapped, 0, "period wraps back to the left margin");
+        assert_eq!(frame, OCTOPUS_SWIM_FRAMES[0]);
+    }
+
+    #[test]
+    fn octopus_swim_never_overflows_the_wrap_width() {
+        // The octopus (plus a one-column right margin) always stays inside the
+        // wrap boundary, across a long stretch of the animation, for a range of
+        // terminal widths — including the huge-terminal cap.
+        let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
+        for wrap_width in [octopus_width + 2, 20, 40, 80, 200, 1000] {
+            for step in 0..400u128 {
+                let (offset, _frame) = octopus_swim(step * OCTOPUS_SWIM_STEP_MS, wrap_width);
+                assert!(
+                    offset + octopus_width <= wrap_width,
+                    "octopus overflowed wrap_width={wrap_width}: offset={offset}",
+                );
+                assert!(
+                    offset <= OCTOPUS_SWIM_MAX_OFFSET,
+                    "offset {offset} exceeded the sweep cap at wrap_width={wrap_width}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn octopus_swim_tiny_terminal_sits_still_without_panicking() {
+        // A terminal too narrow to travel: MAX collapses to 0, so the octopus
+        // holds the left margin (facing right) instead of panicking or wrapping.
+        let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
+        for wrap_width in [0usize, 1, 2, octopus_width, octopus_width + 1] {
+            // A large elapsed value also exercises the u128→usize math safely.
+            let (offset, frame) = octopus_swim(9_999_999_999, wrap_width);
+            assert_eq!(offset, 0, "no travel at wrap_width={wrap_width}");
+            assert_eq!(frame, OCTOPUS_SWIM_FRAMES[0], "faces right when still");
+        }
+    }
+
+    #[test]
     fn render_composer_collapses_home_dir_in_cwd_footer() {
         // Build the cwd from the runner's actual HOME so the assertion is
         // deterministic across machines and exercises the real render path.
@@ -8822,7 +9291,7 @@ mod tests {
         let palette = Palette::for_theme(ThemeName::Codex);
         let mut lines = Vec::new();
         let coverage = LiveTurnFinalization::new(&session_id, &turn_id);
-        push_turn_activity_log_section_unflushed(&mut lines, palette, &log, &app, &coverage);
+        push_turn_activity_log_section_unflushed(&mut lines, palette, &log, &app, &coverage, 80);
 
         let text = lines
             .iter()
@@ -10103,7 +10572,14 @@ mod tests {
             .sum::<usize>();
 
         assert!(text.contains("Working on it."));
-        assert!(text.contains("state • Working"));
+        // The in-progress status marker is the animated octopus spinner now
+        // (pinned so it survives a transcript that scrolls the chip off).
+        assert!(
+            SPINNER_FRAMES
+                .iter()
+                .any(|frame| text.contains(&format!("state {frame} Working"))),
+            "status bar shows an octopus-spinner + Working:\n{text}"
+        );
         assert!(!text.contains("Progress"));
         assert!(!text.contains("Work  sticky"));
         assert_eq!(
@@ -11402,12 +11878,148 @@ mod tests {
         assert!(text.contains("1.2s"));
         assert!(!text.contains("Progress"));
         assert!(!text.contains("Work  sticky"));
+        // #267 no-call-id: the activity card must NOT display the `call <id>`
+        // suffix (the tool_call_id field is retained, only the display is gone).
         assert!(!text.contains("call call-1"));
         assert!(text.contains("gpt-5-codex"));
         assert!(text.contains("state"));
         assert!(text.contains("running"));
         assert!(text.contains("approval"));
         assert!(text.contains("1 msgs/0 tasks"));
+    }
+
+    /// Regression (indent-not-honored): the agent-task child row used to be one
+    /// long ratatui `Line` that overflowed the terminal width and wrapped back
+    /// to column 0 (the transcript renders with `Wrap { trim: false }`, which
+    /// has no hanging indent). Every rendered child line — the invocation row
+    /// AND its output-preview lines — must now fit within `wrap_width` at ANY
+    /// terminal width, measured with unicode-width so a long CJK command
+    /// (double-width glyphs) still fits and never panics at a multibyte cut.
+    #[test]
+    fn agent_task_child_row_never_exceeds_wrap_width() {
+        let long_ascii = format!("echo {}", "abcdefgh ".repeat(40));
+        let long_cjk = format!("echo {}", "数据处理与网络请求".repeat(20));
+        let items = [
+            ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+                .with_arguments(serde_json::json!({ "cmd": long_ascii }))
+                .with_tool_call("call_01_ABCDEFGHIJKLMNOP")
+                .with_output_preview("=== 1. teams ===\nsome very long output line that keeps going and going and going and going and going")
+                .with_success(true)
+                .with_duration_ms(21),
+            ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+                .with_arguments(serde_json::json!({ "cmd": long_cjk }))
+                .with_tool_call("call_02_ZYXWVUTSRQPONMLK")
+                .with_success(true)
+                .with_duration_ms(21),
+        ];
+        for wrap_width in [20usize, 32, 48, 60, 80, 120] {
+            for item in &items {
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                push_agent_task_child(
+                    &mut lines,
+                    Palette::for_theme(ThemeName::Slate),
+                    item,
+                    true,
+                    false,
+                    wrap_width,
+                    false,
+                );
+                assert!(
+                    !lines.is_empty(),
+                    "child row should render at least one line"
+                );
+                for line in &lines {
+                    let w: usize = line
+                        .spans
+                        .iter()
+                        .map(|span| span.content.as_ref().width())
+                        .sum();
+                    assert!(
+                        w <= wrap_width,
+                        "child line width {w} exceeds wrap_width {wrap_width}: {:?}",
+                        lines_text(&lines)
+                    );
+                }
+            }
+        }
+    }
+
+    /// The bash row must surface the actual command (`$ echo …`), never the raw
+    /// serialized arguments (`{"cmd":…}`), and must not append the `call <id>`
+    /// noise (#267 established "no call-id" for CC-style activity cards; this
+    /// agent-task-group child path predated that work and still leaked both).
+    #[test]
+    fn agent_task_bash_row_shows_command_not_raw_json_or_call_id() {
+        let item = ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+            .with_arguments(serde_json::json!({
+                "cmd": "echo \"=== 1. teams ===\" && curl -sX POST http://localhost:4000/"
+            }))
+            .with_tool_call("call_01_UVIa9EBA331xAfxbPFPM4446")
+            .with_success(false)
+            .with_duration_ms(21);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        push_agent_task_child(
+            &mut lines,
+            Palette::for_theme(ThemeName::Slate),
+            &item,
+            true,
+            false,
+            120,
+            false,
+        );
+        let text = lines_text(&lines);
+        assert!(
+            text.contains("Bash(echo"),
+            "bash row must show the command: {text:?}"
+        );
+        assert!(
+            !text.contains("{\"cmd\""),
+            "bash row must not show raw JSON args: {text:?}"
+        );
+        assert!(
+            !text.contains("call call_"),
+            "bash row must not show call-id noise: {text:?}"
+        );
+        assert!(
+            !text.contains("call_01_UVIa9EBA331xAfxbPFPM4446"),
+            "the call-id must not be displayed: {text:?}"
+        );
+    }
+
+    /// The recovery-suggestion row (a non-Tool `Warning` activity) also predated
+    /// the no-call-id convention — it must not append `call <id>` either (the
+    /// exact fragment that wrapped to column 0 in the reported bug).
+    #[test]
+    fn agent_task_recovery_row_drops_call_id() {
+        let item = ActivityItem::new(
+            ActivityKind::Warning,
+            "Recovery suggestion",
+            "permission blocked; ask for the exact permission/escalation",
+        )
+        .with_tool_call("call_01_UVIa9EBA331xAfxbPFPM4446");
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        push_agent_task_child(
+            &mut lines,
+            Palette::for_theme(ThemeName::Slate),
+            &item,
+            false,
+            false,
+            120,
+            false,
+        );
+        let text = lines_text(&lines);
+        assert!(
+            text.contains("Recovery suggestion"),
+            "recovery row should render: {text:?}"
+        );
+        assert!(
+            !text.contains("call call_"),
+            "recovery row must not show call-id noise: {text:?}"
+        );
+        assert!(
+            !text.contains("call_01_"),
+            "recovery row call-id must not be displayed: {text:?}"
+        );
     }
 
     /// An armed loop fires real model turns on an interval — the status bar
@@ -13954,6 +14566,113 @@ mod tests {
     }
 
     #[test]
+    fn plan_indicator_renders_checklist_tree_with_glyphs() {
+        use octos_core::ui_protocol::{PlanItemStatus, UiPlanItem, UiPlanRecord};
+        let mut app = autonomy_app_state();
+        let session_id = SessionKey("local:test".into());
+        app.set_session_plan(
+            &session_id,
+            Some(UiPlanRecord {
+                title: Some("Building memory panel".into()),
+                updated_at_ms: 0,
+                items: vec![
+                    UiPlanItem {
+                        id: "1".into(),
+                        title: "PWA manifest".into(),
+                        status: PlanItemStatus::Completed,
+                        priority: None,
+                    },
+                    UiPlanItem {
+                        id: "2".into(),
+                        title: "memory panel".into(),
+                        status: PlanItemStatus::InProgress,
+                        priority: Some("P3".into()),
+                    },
+                    UiPlanItem {
+                        id: "3".into(),
+                        title: "cron toggle".into(),
+                        status: PlanItemStatus::Pending,
+                        priority: None,
+                    },
+                ],
+            }),
+            None,
+        );
+
+        // header + 3 item rows, no goal/loops.
+        assert_eq!(autonomy_indicator_height(&app), 4);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        assert_eq!(lines.len(), 4);
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Building memory panel"),
+            "header activity title"
+        );
+        assert!(text.contains("(1/3)"), "done/total counter");
+        assert!(text.contains('⎿'), "tree anchor glyph");
+        assert!(text.contains('✔'), "completed glyph");
+        assert!(text.contains('◼'), "pending glyph");
+        assert!(text.contains("PWA manifest"));
+        assert!(text.contains("P3"), "priority chip on the in-progress item");
+    }
+
+    #[test]
+    fn plan_cleared_only_when_its_authoring_turn_completes() {
+        use octos_core::ui_protocol::{PlanItemStatus, UiPlanItem, UiPlanRecord};
+        let mut app = autonomy_app_state();
+        let session_id = SessionKey("local:test".into());
+        let turn = TurnId::new();
+        let other_turn = TurnId::new();
+        let plan = Some(UiPlanRecord {
+            title: Some("plan".into()),
+            updated_at_ms: 0,
+            items: vec![UiPlanItem {
+                id: "1".into(),
+                title: "do it".into(),
+                status: PlanItemStatus::InProgress,
+                priority: None,
+            }],
+        });
+        app.set_session_plan(&session_id, plan, Some(turn.clone()));
+        assert_eq!(autonomy_indicator_height(&app), 2);
+
+        // A completion for a DIFFERENT turn must not clear the panel.
+        app.clear_session_plan_for_turn(&session_id, &other_turn);
+        assert_eq!(autonomy_indicator_height(&app), 2);
+
+        // The authoring turn's completion clears it.
+        app.clear_session_plan_for_turn(&session_id, &turn);
+        assert_eq!(autonomy_indicator_height(&app), 0);
+    }
+
+    #[test]
+    fn plan_indicator_truncates_long_checklist() {
+        use octos_core::ui_protocol::{PlanItemStatus, UiPlanItem, UiPlanRecord};
+        let mut app = autonomy_app_state();
+        let items: Vec<_> = (0..12)
+            .map(|i| UiPlanItem {
+                id: i.to_string(),
+                title: format!("item {i}"),
+                status: PlanItemStatus::Pending,
+                priority: None,
+            })
+            .collect();
+        app.set_session_plan(
+            &SessionKey("local:test".into()),
+            Some(UiPlanRecord {
+                title: Some("big plan".into()),
+                updated_at_ms: 0,
+                items,
+            }),
+            None,
+        );
+        // header + 8 shown + 1 overflow line.
+        assert_eq!(autonomy_indicator_height(&app), 10);
+        assert!(rendered_text(&app).contains("+4 more"));
+    }
+
+    #[test]
     fn render_autonomy_indicator_goal_only_renders_one_row() {
         let mut app = autonomy_app_state();
         let session_id = SessionKey("local:test".into());
@@ -15586,10 +16305,10 @@ mod tests {
     }
 
     #[test]
-    fn live_reasoning_before_answer_renders_terse_thinking_not_verbose_text() {
+    fn live_reasoning_before_answer_renders_swimming_octopus_without_text() {
         // Codex-style live render: with non-empty live_reasoning and NO answer
-        // streamed yet, push_turn_flow surfaces a single dimmed `· thinking…`
-        // indicator and NEVER the verbose reasoning prose.
+        // streamed yet, push_turn_flow surfaces a single dimmed swimming-octopus
+        // indicator (no "thinking" label) and NEVER the verbose reasoning prose.
         const VERBOSE: &str =
             "Let me carefully reason step by step about the user's request in great detail";
         // Empty live_reply.text => the answer has not started streaming yet.
@@ -15609,12 +16328,15 @@ mod tests {
         let rendered = lines_text(&lines);
 
         assert!(
-            rendered.contains(THINKING_INDICATOR_TEXT),
-            "live render should show the terse `thinking` indicator; got: {rendered:?}"
+            OCTOPUS_SWIM_FRAMES
+                .iter()
+                .any(|frame| rendered.contains(frame)),
+            "the indicator should show the swimming octopus; got: {rendered:?}"
         );
+        // The octopus alone signals the thinking phase — no "thinking" label.
         assert!(
-            rendered.contains("· "),
-            "terse indicator should reuse the reasoning `· ` prefix; got: {rendered:?}"
+            !rendered.to_lowercase().contains("thinking"),
+            "the indicator must carry no `thinking` text; got: {rendered:?}"
         );
         assert!(
             !rendered.contains(VERBOSE),
@@ -15644,8 +16366,10 @@ mod tests {
         let rendered = lines_text(&lines);
 
         assert!(
-            !rendered.contains(THINKING_INDICATOR_TEXT),
-            "thinking indicator must drop once the answer streams; got: {rendered:?}"
+            !OCTOPUS_SWIM_FRAMES
+                .iter()
+                .any(|frame| rendered.contains(frame)),
+            "the swimming-octopus indicator must drop once the answer streams; got: {rendered:?}"
         );
         assert!(
             !rendered.contains(VERBOSE),

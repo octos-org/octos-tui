@@ -521,6 +521,12 @@ pub struct SessionAutonomyState {
     pub goal: Option<octos_core::ui_protocol::UiGoalRecord>,
     pub goal_transition_actor: Option<String>,
     pub loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
+    /// Latest model-authored plan/todo checklist (`plan/updated`). `None` until
+    /// the agent calls `update_plan` this session.
+    pub plan: Option<octos_core::ui_protocol::UiPlanRecord>,
+    /// Turn that authored the current `plan`, when known. The plan is per-turn
+    /// working state, so it is cleared when this turn completes.
+    pub plan_turn_id: Option<TurnId>,
 }
 
 impl SessionAutonomyState {
@@ -533,6 +539,8 @@ impl SessionAutonomyState {
             goal: None,
             goal_transition_actor: None,
             loops: Vec::new(),
+            plan: None,
+            plan_turn_id: None,
         }
     }
 }
@@ -5444,6 +5452,37 @@ impl AppState {
         entry.goal_transition_actor = transition_actor;
     }
 
+    /// Replace the cached plan/todo checklist for a session. The `update_plan`
+    /// tool sends the full ordered list each call, so this is a wholesale swap.
+    /// `turn_id` is the authoring turn (when known) so the panel can be cleared
+    /// on that turn's completion.
+    pub fn set_session_plan(
+        &mut self,
+        session_id: &SessionKey,
+        plan: Option<octos_core::ui_protocol::UiPlanRecord>,
+        turn_id: Option<TurnId>,
+    ) {
+        let entry = self.session_autonomy_mut(session_id);
+        entry.plan = plan;
+        entry.plan_turn_id = turn_id;
+    }
+
+    /// Clear a session's plan panel once the turn that authored it completes.
+    /// A plan with no known authoring turn (`plan_turn_id == None`) is left in
+    /// place — there is no terminal event to key its removal on.
+    pub fn clear_session_plan_for_turn(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        if let Some(entry) = self
+            .session_autonomy
+            .iter_mut()
+            .find(|s| &s.session_id == session_id)
+        {
+            if entry.plan_turn_id.as_ref() == Some(turn_id) {
+                entry.plan = None;
+                entry.plan_turn_id = None;
+            }
+        }
+    }
+
     /// Replace the cached output tail for an agent. The backend is
     /// authoritative; deltas are appended via [`append_agent_output`].
     pub fn set_agent_output(
@@ -5879,6 +5918,45 @@ impl AppState {
             retained.push(optimistic);
         }
         self.optimistic_user_messages = retained;
+    }
+
+    /// The user prompt that started `turn_id` in `session_id`. Used to restore
+    /// the prompt into the composer when a turn is interrupted (Esc/Ctrl+C) so
+    /// it can be edited and resent. Mirrors the turn-activity log's request
+    /// resolution (the same three fallbacks it anchors a report on): the
+    /// optimistic echo first, then the persisted turn-prompt anchor (which
+    /// survives the turn — it is only reaped by an explicit withdraw or the
+    /// per-session cap), then the session's latest user message.
+    pub fn submitted_prompt_for_turn(
+        &self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> Option<String> {
+        self.optimistic_user_messages
+            .iter()
+            .rev()
+            .find(|message| &message.session_id == session_id && &message.turn_id == turn_id)
+            .map(|message| message.content.clone())
+            .or_else(|| {
+                self.turn_prompt_anchors
+                    .iter()
+                    .rev()
+                    .find(|anchor| &anchor.session_id == session_id && &anchor.turn_id == turn_id)
+                    .map(|anchor| anchor.content.clone())
+            })
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .find(|session| &session.id == session_id)
+                    .and_then(|session| {
+                        session
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == octos_core::MessageRole::User)
+                            .map(|message| message.content.clone())
+                    })
+            })
     }
 
     /// Settle staged-submit gates that a freshly-replayed snapshot already

@@ -778,6 +778,10 @@ status:
   summary_none_observed: "none observed"
   summary_not_reported: "not reported"
   summary_none_recorded: "none recorded"
+  # Shown (status line + terse transcript note) when the user interrupts their
+  # own turn (Esc/Ctrl+C). Deliberately terse: a user stop is not a failure, so
+  # it does not get the verbose Session-Summary card that genuine errors do.
+  turn_interrupted: "Turn interrupted"
 
 # --- menu chrome + command descriptions (full i18n pass) ---
 command:

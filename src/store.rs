@@ -4221,6 +4221,19 @@ impl Store {
             return None;
         };
 
+        // A user Esc/Ctrl+C is a "stop and let me edit/resend" gesture, so put
+        // the interrupted turn's prompt back into the composer. Only when the
+        // composer is empty — never clobber text the user has since typed. This
+        // is the single user-initiated interrupt chokepoint (both Esc and
+        // Ctrl+C route here), so the restore fires exactly once and is always
+        // user-driven; genuine turn errors never reach it.
+        if self.state.composer.is_empty()
+            && let Some(prompt) = self.state.submitted_prompt_for_turn(&session_id, &turn_id)
+            && !prompt.trim().is_empty()
+        {
+            self.state.set_composer_text(prompt);
+        }
+
         self.state.status = t!("status.interrupt_requested_active_turn").into_owned();
         Some(AppUiCommand::InterruptTurn(TurnInterruptParams {
             session_id,
@@ -7511,6 +7524,24 @@ impl Store {
                 ));
                 None
             }
+            UiNotification::PlanUpdated(event) => {
+                let count = event.plan.items.len();
+                let done = event
+                    .plan
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        item.status == octos_core::ui_protocol::PlanItemStatus::Completed
+                    })
+                    .count();
+                self.state.set_session_plan(
+                    &event.session_id,
+                    Some(event.plan.clone()),
+                    event.turn_id.clone(),
+                );
+                self.state.status = format!("Plan updated: {done}/{count} done");
+                None
+            }
             UiNotification::SessionGoalUpdated(event) => {
                 let objective = event.goal.objective.clone();
                 let status_label = event.goal.status.clone();
@@ -8365,6 +8396,13 @@ impl Store {
         // terminal for an already-finalized turn still dismisses the picker
         // instead of leaving it wedged (nit).
         self.clear_question_for_turn(&event.session_id, &event.turn_id);
+        // The plan/todo checklist is per-turn working state — drop it once its
+        // authoring turn completes so a finished checklist doesn't stay sticky
+        // (and keep it turn-matched so a stale/replayed terminal for a different
+        // turn can't clear a newer plan). Runs before the duplicate-terminal
+        // early return so a session-open `turn/completed` replay clears it too.
+        self.state
+            .clear_session_plan_for_turn(&event.session_id, &event.turn_id);
         // Idempotence vs a DUPLICATE terminal (e.g. a replayed turn/completed
         // after reconnect): the turn already went through a terminal handler,
         // so its card/fallback and run-state transition already happened.
@@ -8556,6 +8594,11 @@ impl Store {
         // A turn error cancels any pending AskUserQuestion picker for this turn
         // (design §4.2: the turn-interrupt/error path is Phase-1's cancellation).
         self.clear_question_for_turn(&event.session_id, &event.turn_id);
+        // Mirror `commit_live_reply`: a plan/todo checklist is per-turn state, so
+        // an errored/interrupted turn must drop its panel too (turn-matched, and
+        // before the duplicate-terminal return so a replayed error clears it).
+        self.state
+            .clear_session_plan_for_turn(&event.session_id, &event.turn_id);
         // Idempotence vs a DUPLICATE terminal (mirror `commit_live_reply`): the
         // turn already terminated through a terminal handler (completed OR
         // errored), so a late/replayed error for it must not push a second
@@ -8595,6 +8638,12 @@ impl Store {
         let follow_tail = self.state.transcript_scroll == 0;
         let fallback_summary =
             self.turn_error_fallback_message(&event.turn_id, &event.code, &event.message);
+        // A user-initiated interrupt (Esc/Ctrl+C → server `TurnError` with code
+        // "interrupted") is a STOP, not a failure. It suppresses the verbose
+        // Session-Summary card (bug 3), reads as idle rather than a red error
+        // (bug 1), and drops the whole-job "Working"/octopus indicator (bug 1).
+        let is_interrupt = event.code == "interrupted";
+        let turn_interrupted_note = t!("status.turn_interrupted").into_owned();
         let session = self.find_session_mut(&event.session_id)?;
         let title = session.title.clone();
         // `failed_current_turn`: this error terminates the LIVE turn — it owns
@@ -8606,21 +8655,34 @@ impl Store {
         let (status, failed_current_turn, surfaced_failure, restore_reasoning) =
             match session.live_reply.take() {
                 Some(live_reply) if live_reply.turn_id == event.turn_id => {
-                    let partial = compact_first_line(&live_reply.text, 120);
-                    let text = if partial.is_empty() {
-                        fallback_summary
+                    let (text, status) = if is_interrupt {
+                        // Bug 3: keep the partial answer the user already saw as
+                        // a normal (if incomplete) reply, and drop the verbose
+                        // Session-Summary card. When nothing streamed yet, a
+                        // terse note stands in so the stopped turn is not a
+                        // silent void.
+                        let text = if live_reply.text.trim().is_empty() {
+                            turn_interrupted_note.clone()
+                        } else {
+                            live_reply.text.clone()
+                        };
+                        (text, turn_interrupted_note.clone())
                     } else {
-                        format!("{fallback_summary}\n- Partial response: {partial}")
+                        let partial = compact_first_line(&live_reply.text, 120);
+                        let text = if partial.is_empty() {
+                            fallback_summary
+                        } else {
+                            format!("{fallback_summary}\n- Partial response: {partial}")
+                        };
+                        (
+                            text,
+                            format!("Turn error {}: {}", event.code, event.message),
+                        )
                     };
                     let mut message = Message::assistant(text);
                     message.reasoning_content = reasoning;
                     session.messages.push(message);
-                    (
-                        format!("Turn error {}: {}", event.code, event.message),
-                        true,
-                        true,
-                        None,
-                    )
+                    (status, true, true, None)
                 }
                 Some(live_reply) if was_finalized_by_switch => {
                     // A switch-finalized turn (A) errors while a different successor
@@ -8655,15 +8717,21 @@ impl Store {
                     )
                 }
                 None => {
-                    let mut message = Message::assistant(fallback_summary);
+                    // No live reply (already committed or empty). A user
+                    // interrupt still drops the verbose card (bug 3); a terse
+                    // note stands in.
+                    let (text, status) = if is_interrupt {
+                        (turn_interrupted_note.clone(), turn_interrupted_note.clone())
+                    } else {
+                        (
+                            fallback_summary,
+                            format!("Turn error {}: {}", event.code, event.message),
+                        )
+                    };
+                    let mut message = Message::assistant(text);
                     message.reasoning_content = reasoning;
                     session.messages.push(message);
-                    (
-                        format!("Turn error {}: {}", event.code, event.message),
-                        true,
-                        true,
-                        None,
-                    )
+                    (status, true, true, None)
                 }
             };
         if let Some(reasoning) = restore_reasoning {
@@ -8695,10 +8763,30 @@ impl Store {
             // turn is live (`!failed_current_turn`) likewise leaves the live
             // turn's retry alone.
             self.state.session_retry.remove(&event.session_id);
+            // Bug 1: a user interrupt terminates the live turn as a STOP — drop
+            // the whole-job "Working"/octopus indicator now. The server may send
+            // orchestration `active:false` late or not at all, so the harness
+            // line + status-bar spinner would otherwise linger past the Esc.
+            // Gated on `failed_current_turn` so a stale/duplicate interrupt for
+            // an already-finished turn cannot clear the indicator of whatever is
+            // live in this session now.
+            if is_interrupt {
+                self.state.orchestration.remove(&event.session_id);
+            }
         }
         if surfaced_failure && targets_active {
-            self.state
-                .set_run_state_error(format!("{}: {}", event.code, event.message));
+            if is_interrupt && failed_current_turn {
+                // Bug 1: an interrupt is a user stop, not a failure — it reads
+                // idle (no red error state, no lingering spinner), which also
+                // takes `harness_status_active` false so the "Working" line
+                // hides. A stale/switch-finalized interrupt that did not fail
+                // the live turn falls through to the error branch (it should not
+                // silently blank an unrelated live turn's run-state).
+                self.state.set_run_state_idle();
+            } else {
+                self.state
+                    .set_run_state_error(format!("{}: {}", event.code, event.message));
+            }
         }
         self.submit_next_pending_if_idle()
     }
@@ -21480,6 +21568,63 @@ mod tests {
         let turn_id = TurnId::new();
         let mut store = store_with_live_reply(turn_id.clone(), "streaming");
         let session_id = store.state.sessions[0].id.clone();
+        // A user interrupt arrives while the whole-job "Working"/octopus
+        // indicator is active and the run reads in-progress.
+        store.state.orchestration.insert(
+            session_id.clone(),
+            octos_core::ui_protocol::SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 1,
+                pending_continuations: 0,
+                phase: Some("working".into()),
+            },
+        );
+        store.state.set_run_state_in_progress();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id,
+                code: "interrupted".into(),
+                message: "turn interrupted by client".into(),
+            },
+        )));
+
+        assert!(store.state.sessions[0].live_reply.is_none());
+        // Bug 3: no verbose Session-Summary failure card for a user Esc — the
+        // partial answer the user already saw is kept as a normal reply instead.
+        let messages = &store.state.sessions[0].messages;
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.content.contains("Session Summary")),
+            "a user interrupt must not push the verbose Session Summary card"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.contains("streaming")),
+            "the partial streamed text must be preserved"
+        );
+        // Bug 1: the Working/orchestration indicator drops and the run reads
+        // idle (an interrupt is a stop, not an error).
+        assert!(
+            !store.state.orchestration.contains_key(&session_id),
+            "the orchestration/Working indicator must clear on interrupt"
+        );
+        assert!(!store.state.run_state.is_active());
+        assert_eq!(store.state.run_state.label(), "idle");
+        assert_eq!(store.state.run_state.detail(), None);
+        assert_eq!(store.state.status, "Turn interrupted");
+    }
+
+    #[test]
+    fn interrupt_with_no_partial_text_pushes_terse_note_not_summary_card() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "");
+        let session_id = store.state.sessions[0].id.clone();
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
             TurnErrorEvent {
@@ -21491,26 +21636,101 @@ mod tests {
             },
         )));
 
-        assert!(store.state.sessions[0].live_reply.is_none());
-        let message = store.state.sessions[0]
-            .messages
-            .last()
-            .expect("fallback assistant message");
-        assert!(message.content.contains("Session Summary"));
+        let messages = &store.state.sessions[0].messages;
         assert!(
-            message
-                .content
-                .contains("interrupted: turn interrupted by client")
+            messages
+                .iter()
+                .all(|message| !message.content.contains("Session Summary")),
+            "no verbose card even when nothing streamed before the interrupt"
         );
-        assert!(message.content.contains("Partial response: streaming"));
-        assert_eq!(
-            store.state.status,
-            "Turn error interrupted: turn interrupted by client"
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.contains("Turn interrupted")),
+            "a terse interrupted note stands in for the empty turn"
+        );
+    }
+
+    #[test]
+    fn non_interrupt_turn_error_keeps_full_summary_card_and_error_state() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.orchestration.insert(
+            session_id.clone(),
+            octos_core::ui_protocol::SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 1,
+                pending_continuations: 0,
+                phase: Some("working".into()),
+            },
+        );
+        store.state.set_run_state_in_progress();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id,
+                code: "provider_error".into(),
+                message: "upstream 500".into(),
+            },
+        )));
+
+        // A genuine (non-interrupt) error is unchanged: the full Session-Summary
+        // card stands, the run reads error, and the error detail is surfaced.
+        let messages = &store.state.sessions[0].messages;
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.contains("Session Summary")),
+            "a non-interrupt error must keep the verbose Session Summary card"
         );
         assert_eq!(store.state.run_state.label(), "error");
         assert_eq!(
             store.state.run_state.detail(),
-            Some("interrupted: turn interrupted by client")
+            Some("provider_error: upstream 500")
+        );
+        assert_eq!(
+            store.state.status,
+            "Turn error provider_error: upstream 500"
+        );
+    }
+
+    #[test]
+    fn interrupt_restores_submitted_prompt_into_empty_composer() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .record_submitted_user_prompt(session_id, turn_id, "fix the flaky test".into());
+        assert!(store.state.composer.is_empty());
+
+        store.interrupt_command().expect("active turn interrupts");
+
+        assert_eq!(
+            store.state.composer, "fix the flaky test",
+            "the interrupted prompt is restored so it can be edited and resent"
+        );
+    }
+
+    #[test]
+    fn interrupt_does_not_clobber_a_nonempty_composer() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .record_submitted_user_prompt(session_id, turn_id, "fix the flaky test".into());
+        store.state.set_composer_text("a different idea I'm typing");
+
+        store.interrupt_command().expect("active turn interrupts");
+
+        assert_eq!(
+            store.state.composer, "a different idea I'm typing",
+            "text the user has already typed must never be clobbered by a restore"
         );
     }
 
