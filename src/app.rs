@@ -4706,75 +4706,6 @@ fn meaningful_output_lines(output: &str) -> Vec<&str> {
         .collect()
 }
 
-fn tool_action_label(item: &ActivityItem, running: bool) -> String {
-    if is_shell_family_tool(&item.title) {
-        return shell_action_label(
-            tool_invocation_text(item).as_deref().unwrap_or_default(),
-            running,
-        );
-    }
-
-    match (item.title.as_str(), running) {
-        ("read_file", true) => t!("app.tool.reading"),
-        ("read_file", false) => t!("app.tool.read"),
-        ("write_file", true) => t!("app.tool.writing"),
-        ("write_file", false) => t!("app.tool.wrote"),
-        ("edit_file" | "diff_edit", true) => t!("app.tool.editing"),
-        ("edit_file" | "diff_edit", false) => t!("app.tool.edited"),
-        ("list_dir", true) => t!("app.tool.listing"),
-        ("list_dir", false) => t!("app.tool.listed"),
-        ("grep" | "glob" | "web_search" | "deep_search", true) => t!("app.tool.searching"),
-        ("grep" | "glob" | "web_search" | "deep_search", false) => t!("app.tool.searched"),
-        ("web_fetch", true) => t!("app.tool.fetching"),
-        ("web_fetch", false) => t!("app.tool.fetched"),
-        ("browser", true) => t!("app.tool.browsing"),
-        ("browser", false) => t!("app.tool.browsed"),
-        ("spawn", true) => t!("app.tool.spawning"),
-        ("spawn", false) => t!("app.tool.spawned"),
-        ("send_file", true) => t!("app.tool.sending"),
-        ("send_file", false) => t!("app.tool.sent"),
-        ("manage_skills" | "admin_manage_skills", true) => t!("app.tool.managing"),
-        ("manage_skills" | "admin_manage_skills", false) => t!("app.tool.managed"),
-        (_, true) => t!("app.tool.using"),
-        (_, false) => t!("app.tool.used"),
-    }
-    .into_owned()
-}
-
-fn shell_action_label(command: &str, running: bool) -> String {
-    let command = command.trim_start();
-    let lower = command.to_ascii_lowercase();
-    let label = if lower.starts_with("sleep ") || lower.contains("; sleep ") {
-        ("app.tool.waiting", "app.tool.waited")
-    } else if lower.contains("cargo test")
-        || lower.contains("npm test")
-        || lower.contains("npm run test")
-        || lower.contains("pytest")
-        || lower.contains("go test")
-    {
-        ("app.tool.testing", "app.tool.tested")
-    } else if lower.contains("cargo build")
-        || lower.contains("npm run build")
-        || lower.contains("pnpm build")
-        || lower.contains("go build")
-    {
-        ("app.tool.building", "app.tool.built")
-    } else if lower.contains("npm install")
-        || lower.contains("pnpm install")
-        || lower.contains("cargo install")
-    {
-        ("app.tool.installing", "app.tool.installed")
-    } else {
-        ("app.tool.running", "app.tool.ran")
-    };
-
-    if running {
-        t!(label.0).into_owned()
-    } else {
-        t!(label.1).into_owned()
-    }
-}
-
 fn format_duration_ms(duration_ms: u64) -> String {
     if duration_ms < 1_000 {
         return format!("{duration_ms}ms");
@@ -5683,6 +5614,105 @@ fn push_agent_task_group(
     }
 }
 
+/// Claude-Code-style display name for a tool (`bash` → `Bash`, `read_file` →
+/// `Read`, …). Unknown tools get their first letter capitalized.
+fn tool_display_name(title: &str) -> String {
+    match title {
+        "shell" | "exec" | "exec_command" | "bash" => "Bash".into(),
+        "read_file" => "Read".into(),
+        "write_file" => "Write".into(),
+        "edit_file" | "diff_edit" => "Edit".into(),
+        "list_dir" => "List".into(),
+        "grep" | "grep_tool" => "Grep".into(),
+        "glob" | "glob_tool" => "Glob".into(),
+        "web_search" | "deep_search" => "Search".into(),
+        "web_fetch" => "Fetch".into(),
+        "spawn" => "Spawn".into(),
+        "browser" => "Browser".into(),
+        "message" => "Message".into(),
+        "send_file" => "Send".into(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        }
+    }
+}
+
+/// The `⏺` card bullet, colored by status: green when the tool succeeded, red
+/// when it failed, and the animated spinner while it is still running.
+fn tool_card_bullet(item: &ActivityItem, palette: Palette) -> (String, Style) {
+    if is_running_activity(item) {
+        (spinner_frame().to_string(), palette.selected())
+    } else if activity_is_failed(item) {
+        // Failures keep a distinct glyph (not just red) so they stay legible
+        // without color; success drops the checkmark for the calmer `⏺`.
+        ("✗".to_string(), Style::default().fg(palette.danger))
+    } else {
+        ("⏺".to_string(), Style::default().fg(palette.success))
+    }
+}
+
+/// Claude-Code-style tool-card header: `⏺ Bash(cmd)`. The invocation (shell
+/// command, spawn task, file path, …) renders in parens with raw JSON and the
+/// call-id stripped; multi-line commands indent to align under `(`.
+fn push_tool_card_header(lines: &mut Vec<Line<'static>>, palette: Palette, item: &ActivityItem) {
+    let (bullet, bullet_style) = tool_card_bullet(item, palette);
+    let name = tool_display_name(&item.title);
+    let duration = item
+        .duration_ms
+        .map(|ms| format!("  {}", format_duration_ms(ms)))
+        .unwrap_or_default();
+
+    let Some(invocation) = tool_invocation_text(item).filter(|text| !text.trim().is_empty()) else {
+        // No arguments to show: `⏺ Bash`.
+        let mut spans = vec![
+            Span::styled(bullet, bullet_style),
+            Span::styled(" ", palette.muted()),
+            Span::styled(name, palette.muted()),
+        ];
+        if !duration.is_empty() {
+            spans.push(Span::styled(duration, palette.muted()));
+        }
+        lines.push(Line::from(spans));
+        return;
+    };
+
+    // Continuation lines align under the first char after `(`.
+    let cont_indent = " ".repeat(bullet.chars().count() + 1 + name.chars().count() + 1);
+    let cmd_lines: Vec<&str> = invocation.lines().collect();
+    let max_lines = 10usize;
+    let shown = cmd_lines.len().min(max_lines).max(1);
+    let clipped = cmd_lines.len() > shown;
+
+    for idx in 0..shown {
+        let raw = cmd_lines.get(idx).copied().unwrap_or_default();
+        let last = idx + 1 == shown;
+        let mut text = truncate_terminal_line(raw, 100);
+        if last {
+            if clipped {
+                text.push('…');
+            }
+            text.push(')');
+        }
+        let mut spans = Vec::new();
+        if idx == 0 {
+            spans.push(Span::styled(bullet.clone(), bullet_style));
+            spans.push(Span::styled(" ", palette.muted()));
+            spans.push(Span::styled(format!("{name}("), palette.muted()));
+        } else {
+            spans.push(Span::styled(cont_indent.clone(), palette.muted()));
+        }
+        spans.push(Span::styled(text, palette.muted()));
+        if last && !duration.is_empty() {
+            spans.push(Span::styled(duration.clone(), palette.muted()));
+        }
+        lines.push(Line::from(spans));
+    }
+}
+
 fn push_agent_task_child(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -5690,6 +5720,14 @@ fn push_agent_task_child(
     first: bool,
     expanded: bool,
 ) {
+    // Tool calls render as Claude-Code-style `⏺ Tool(arg)` cards; other
+    // activity rows (file mutations, progress) keep the `⎿ ✓ …` tree form.
+    if item.kind == ActivityKind::Tool {
+        push_tool_card_header(lines, palette, item);
+        push_compact_tool_preview(lines, palette, item, expanded);
+        return;
+    }
+
     let (icon, icon_style) = activity_status_icon(item, palette);
     let prefix = if first { "  ⎿  " } else { "     " };
     let mut spans = vec![
@@ -5699,17 +5737,15 @@ fn push_agent_task_child(
     ];
     spans.extend(compact_activity_spans(item, palette));
     lines.push(Line::from(spans));
-
-    if item.kind == ActivityKind::Tool {
-        push_compact_tool_preview(lines, palette, item, expanded);
-    }
 }
 
 fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'static>> {
     if let Some(mutation) = FileMutationActivity::from_item(item) {
         // Activity rows render uniformly muted, no bold: the runtime log must
         // never outweigh the reply prose or the user's own words.
-        let mut spans = vec![
+        // "preview ready" was dropped: the TUI exposes no action to open the
+        // preview here, so the label was a dead affordance.
+        return vec![
             Span::styled(
                 file_mutation_action_label(&mutation.operation),
                 palette.muted(),
@@ -5718,38 +5754,10 @@ fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'st
             Span::styled(compact_file_path(&mutation.path), palette.muted()),
             Span::styled(format!("  {}", mutation.operation), palette.muted()),
         ];
-        if mutation.preview_ready {
-            spans.push(Span::styled(
-                format!("  {}", t!("app.activity.preview_ready")),
-                palette.selected(),
-            ));
-        }
-        return spans;
     }
 
-    if item.kind == ActivityKind::Tool {
-        let running = is_running_activity(item);
-        let mut spans = vec![
-            Span::styled(tool_action_label(item, running), palette.muted()),
-            Span::styled(" ", palette.muted()),
-            Span::styled(item.title.clone(), palette.muted()),
-        ];
-        if let Some(invocation) = tool_invocation_text(item) {
-            let prompt = if is_shell_family_tool(&item.title) {
-                "$ "
-            } else {
-                ""
-            };
-            spans.push(Span::styled(": ", palette.muted()));
-            spans.push(Span::styled(
-                format!("{prompt}{}", truncate_terminal_line(&invocation, 96)),
-                palette.muted(),
-            ));
-        }
-        push_compact_metadata_spans(&mut spans, palette, item);
-        return spans;
-    }
-
+    // Tool activities render as Claude-Code cards via `push_tool_card_header`;
+    // this path only handles non-tool rows (progress, generic).
     let mut spans = vec![
         Span::styled(item.title.clone(), palette.muted()),
         Span::styled(format!("  {}", item.status), palette.muted()),
@@ -5773,12 +5781,6 @@ fn push_compact_metadata_spans(
     if let Some(duration_ms) = item.duration_ms {
         spans.push(Span::styled(
             format!("  {}", format_duration_ms(duration_ms)),
-            palette.muted(),
-        ));
-    }
-    if let Some(tool_call_id) = item.tool_call_id.as_deref() {
-        spans.push(Span::styled(
-            format!("  call {tool_call_id}"),
             palette.muted(),
         ));
     }
@@ -5812,7 +5814,7 @@ fn push_compact_tool_preview(
     let shown = total.min(line_limit);
     for line in preview_lines.iter().take(shown) {
         lines.push(Line::from(vec![
-            Span::styled("     │ ", palette.border()),
+            Span::styled("  ⎿ ", palette.border()),
             Span::styled(truncate_terminal_line(line, 110), palette.text()),
         ]));
     }
@@ -5823,7 +5825,7 @@ fn push_compact_tool_preview(
             t!("app.hint.ctrl_o_expand").into_owned()
         };
         lines.push(Line::from(vec![
-            Span::styled("     │ ", palette.border()),
+            Span::styled("  ⎿ ", palette.border()),
             Span::styled(
                 t!(
                     "app.activity.more_lines_hidden",
@@ -5836,7 +5838,7 @@ fn push_compact_tool_preview(
         ]));
     } else if expanded && total > COLLAPSED_TOOL_PREVIEW_LINES {
         lines.push(Line::from(vec![
-            Span::styled("     │ ", palette.border()),
+            Span::styled("  ⎿ ", palette.border()),
             Span::styled(
                 t!("app.activity.expanded_hint").into_owned(),
                 palette.muted(),
@@ -11287,14 +11289,13 @@ mod tests {
         let text = rendered_text(&app);
 
         assert!(!text.contains("Activity"));
-        assert!(text.contains("Tested"));
-        assert!(text.contains("$ cargo test"));
+        assert!(text.contains("⏺ Bash(cargo test"));
         assert!(text.contains("running 6 tests"));
         assert!(text.contains("1 more line(s) hidden (Ctrl+O expand)"));
         assert!(text.contains("1.2s"));
         assert!(!text.contains("Progress"));
         assert!(!text.contains("Work  sticky"));
-        assert!(text.contains("call call-1"));
+        assert!(!text.contains("call call-1"));
         assert!(text.contains("gpt-5-codex"));
         assert!(text.contains("state"));
         assert!(text.contains("running"));
@@ -11471,7 +11472,7 @@ mod tests {
         let text = rendered_text(&app);
         let first_prompt = text.find("what is the status").expect("first prompt");
         let latest_prompt = text.find("are you working").expect("latest prompt");
-        let command = text.find("$ cargo test").expect("activity command");
+        let command = text.find("Bash(cargo test").expect("activity command");
 
         assert!(first_prompt < latest_prompt);
         assert!(latest_prompt < command);
@@ -11517,7 +11518,7 @@ mod tests {
         let text = rendered_text(&app);
         let prompt = text.find("build the site").expect("user prompt");
         let work_log = text.find("Agent task completed").expect("agent task");
-        let command = text.find("$ cargo build").expect("tool command");
+        let command = text.find("Bash(cargo build").expect("tool command");
         let answer = text
             .find("The site is built and ready.")
             .expect("assistant answer");
@@ -12534,9 +12535,9 @@ mod tests {
         app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
 
-        assert!(text.contains("Waited"));
+        assert!(text.contains("⏺ Bash(sleep 20"));
         assert!(text.contains("20s"));
-        assert!(text.contains("Wrote"));
+        assert!(text.contains("⏺ Write(src/lib.rs"));
         assert!(text.contains("18ms"));
         assert!(!text.contains("Command  ▸ shell"));
         assert!(!text.contains("Tool  ▸ write_file"));
@@ -12574,16 +12575,69 @@ mod tests {
         app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
 
-        // Clean command behind a shell prompt, with the verb keyed off it.
+        // Claude-Code-style card: `⏺ Bash(cmd)`, clean command, no JSON.
         assert!(
-            text.contains("$ find . -name '*.ts' -newer server"),
-            "want clean shell command, got:\n{text}"
+            text.contains("⏺ Bash(find . -name '*.ts' -newer server)"),
+            "want Claude-Code-style bash card, got:\n{text}"
         );
-        assert!(text.contains("Ran"), "want shell action verb, got:\n{text}");
+        assert!(
+            !text.contains("call bash-1"),
+            "must not show the call id, got:\n{text}"
+        );
         // No raw JSON arguments leaking through.
         assert!(
             !text.contains("{\"cmd\""),
             "must not show raw JSON args, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn render_spawn_and_multiline_tool_cards_claude_code_style() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("spawn + multiline")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // spawn's task (projected into `detail`) renders as `⏺ Spawn(task)`.
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "spawn", "complete")
+                .with_tool_call("spawn-1")
+                .with_detail("Restart the Vite dev server")
+                .with_success(true)
+                .with_duration_ms(2500),
+        );
+        // A multi-line command keeps both lines (indented under `(`).
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+                .with_tool_call("bash-2")
+                .with_detail("cd /srv\nnpm run dev")
+                .with_success(true),
+        );
+
+        app.expanded_tool_outputs = true;
+        let text = rendered_text(&app);
+
+        assert!(
+            text.contains("⏺ Spawn(Restart the Vite dev server)"),
+            "spawn must show its task, got:\n{text}"
+        );
+        assert!(text.contains("⏺ Bash(cd /srv"), "got:\n{text}");
+        assert!(
+            text.contains("npm run dev)"),
+            "multi-line command must keep its second line, got:\n{text}"
+        );
+        assert!(
+            !text.contains("spawn-1") && !text.contains("bash-2"),
+            "must not show call ids, got:\n{text}"
         );
     }
 
@@ -12617,7 +12671,7 @@ mod tests {
 
         assert!(text.contains("Changed"));
         assert!(text.contains(".../blue-origin/src/pages/index.astro"));
-        assert!(text.contains("preview ready"));
+        assert!(!text.contains("preview ready"));
         assert!(!text.contains("File mutation: modify /tmp/work"));
     }
 
@@ -12895,9 +12949,8 @@ mod tests {
         app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
 
-        assert!(text.contains("failed"));
         assert!(text.contains("✗"));
-        assert!(text.contains("✓"));
+        assert!(text.contains("⏺"));
         assert!(text.contains("70s"));
         assert!(text.contains("6 passed"));
     }
@@ -14378,7 +14431,7 @@ mod tests {
         let update = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
         let inserted = lines_text(&update.lines_to_insert);
         assert!(
-            inserted.contains("Agent task completed") && inserted.contains("$ cargo test"),
+            inserted.contains("Agent task completed") && inserted.contains("Bash(cargo test"),
             "completed activity should be inserted into scrollback mid-turn: {inserted:?}"
         );
         assert!(
@@ -14793,7 +14846,7 @@ mod tests {
         let first = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
         let first_text = lines_text(&first.lines_to_insert);
         assert!(first_text.contains("already flushed line"));
-        assert!(first_text.contains("$ cargo test"));
+        assert!(first_text.contains("Bash(cargo test"));
 
         app.sessions[0].live_reply = None;
         app.sessions[0].messages.push(Message::assistant(
@@ -14820,7 +14873,7 @@ mod tests {
             "committed assistant should flush the unflushed suffix: {second_text:?}"
         );
         assert!(
-            !second_text.contains("$ cargo test"),
+            !second_text.contains("Bash(cargo test"),
             "committed activity log must not duplicate the live-flushed action: {second_text:?}"
         );
         assert!(
@@ -15017,7 +15070,7 @@ mod tests {
             "missing activity log: {text:?}"
         );
         assert!(
-            text.contains("$ cargo build"),
+            text.contains("Bash(cargo build"),
             "missing tool detail: {text:?}"
         );
     }

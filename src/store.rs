@@ -9833,7 +9833,7 @@ fn tool_invocation_detail(tool_name: &str, arguments: &Value) -> Option<String> 
         value
             .get(key)
             .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.trim().is_empty())
     }
 
     let detail = match tool_name {
@@ -9897,6 +9897,11 @@ fn tool_invocation_detail(tool_name: &str, arguments: &Value) -> Option<String> 
         "glob" | "glob_tool" => str_field(arguments, "pattern")
             .or_else(|| str_field(arguments, "glob"))
             .unwrap_or("*")
+            .to_string(),
+        // spawn carries the delegated task text (not mode/limits) — show that,
+        // never the raw `{"mode":…,"task":…}` JSON.
+        "spawn" => str_field(arguments, "task")
+            .or_else(|| str_field(arguments, "prompt"))?
             .to_string(),
         _ => serde_json::to_string(arguments).ok()?,
     };
@@ -21053,6 +21058,15 @@ mod tests {
         assert_eq!(
             tool_invocation_detail("exec_command", &serde_json::json!({"cmd": "make"})).as_deref(),
             Some("make")
+        );
+        // spawn shows its task text, never the `{"mode":…,"task":…}` blob.
+        assert_eq!(
+            tool_invocation_detail(
+                "spawn",
+                &serde_json::json!({"mode": "sync", "task": "Do X"})
+            )
+            .as_deref(),
+            Some("Do X")
         );
         // A shell-family tool with no usable command yields no detail (like
         // the original `shell` arm); the renderer then falls back to JSON.
