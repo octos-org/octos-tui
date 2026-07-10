@@ -1233,6 +1233,7 @@ impl Store {
                 None
             }
             LocalAction::SetThinkingLevel(level) => self.dispatch_set_thinking_level(level),
+            LocalAction::ToggleReasoningDisplay => self.dispatch_toggle_reasoning_display(),
             LocalAction::CopyLastReply => {
                 self.copy_last_reply();
                 None
@@ -1777,6 +1778,25 @@ impl Store {
         // session_reasoning_effort at menu-build time (menu_app_snapshot), so
         // without a refresh it stays on the previous level until the next rebuild.
         self.refresh_active_menu();
+        None
+    }
+
+    fn dispatch_toggle_reasoning_display(&mut self) -> Option<AppUiCommand> {
+        let Some(session_id) = self.active_session().map(|s| s.id.clone()) else {
+            self.state.status = t!("thinking.no_session").to_string();
+            return None;
+        };
+        let now_on = if self.state.session_reasoning_display.remove(&session_id) {
+            false
+        } else {
+            self.state.session_reasoning_display.insert(session_id);
+            true
+        };
+        self.state.status = if now_on {
+            t!("thinking.display_on").to_string()
+        } else {
+            t!("thinking.display_off").to_string()
+        };
         None
     }
 
@@ -3865,6 +3885,8 @@ impl Store {
                     .get(&session.id)
                     .copied()
             }),
+            reasoning_display: selected_session
+                .is_some_and(|session| self.state.reasoning_display_enabled(&session.id)),
             permission_profile: selected_session
                 .and_then(|session| self.state.permission_profile_for(&session.id)),
             runtime_status,
@@ -5346,6 +5368,7 @@ impl Store {
                 // Local-only: the server doesn't know the per-session /thinking
                 // level, so preserve it across snapshot replays (reconnect/refresh).
                 let session_reasoning_effort = self.state.session_reasoning_effort.clone();
+                let session_reasoning_display = self.state.session_reasoning_display.clone();
                 // Local-only: the active /theme palette is a client setting the
                 // server never echoes, so preserve it across snapshot replays
                 // (otherwise a launch --theme or a runtime /theme reverts to Codex).
@@ -5430,6 +5453,7 @@ impl Store {
                 state.mcp_config_catalog = mcp_config_catalog;
                 state.tool_config_catalog = tool_config_catalog;
                 state.session_reasoning_effort = session_reasoning_effort;
+                state.session_reasoning_display = session_reasoning_display;
                 state.theme = theme;
                 state.config_path = config_path;
                 state.pinned_scroll = pinned_scroll;
@@ -10073,6 +10097,25 @@ mod tests {
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
         }
+    }
+
+    #[test]
+    fn thinking_display_toggle_flips_per_session_and_reports() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        assert!(!store.state.reasoning_display_enabled(&session_id));
+
+        store.dispatch_local_action(LocalAction::ToggleReasoningDisplay, None);
+        assert!(
+            store.state.reasoning_display_enabled(&session_id),
+            "first toggle turns display on for the active session"
+        );
+
+        store.dispatch_local_action(LocalAction::ToggleReasoningDisplay, None);
+        assert!(
+            !store.state.reasoning_display_enabled(&session_id),
+            "second toggle turns it back off"
+        );
     }
 
     fn store_with_empty_session() -> Store {

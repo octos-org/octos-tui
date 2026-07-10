@@ -359,7 +359,7 @@ fn onboarding_language_row() -> MenuItem {
 fn thinking_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     use octos_core::ui_protocol::ReasoningEffortLevel as L;
     let current = ctx.app.reasoning_effort;
-    let items = [
+    let mut items = [
         (
             "default",
             t!("menu.thinking.item.default.label"),
@@ -410,7 +410,27 @@ fn thinking_menu(ctx: &MenuContext<'_>) -> MenuSpec {
         }
         item
     })
-    .collect();
+    .collect::<Vec<_>>();
+
+    // Display toggle — orthogonal to the effort levels above: whether the
+    // committed reasoning renders as a transcript block for this session.
+    let display_on = ctx.app.reasoning_display;
+    items.push(
+        MenuItem::new(
+            "reasoning_display",
+            if display_on {
+                t!("menu.thinking.item.display.label_on")
+            } else {
+                t!("menu.thinking.item.display.label_off")
+            },
+            MenuAction::Local(LocalAction::ToggleReasoningDisplay),
+        )
+        .with_description(t!("menu.thinking.item.display.desc"))
+        .with_state(MenuItemState {
+            current: display_on,
+            ..MenuItemState::default()
+        }),
+    );
 
     MenuSpec {
         id: MenuId::from(crate::menu::registry::MENU_THINKING),

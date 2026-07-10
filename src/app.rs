@@ -534,9 +534,15 @@ pub fn finalized_history_lines_range(
             &message.content,
             wrap_width,
         );
-        // Codex-style: the verbose committed `reasoning_content` is intentionally
-        // NOT rendered into scrollback. The data is kept on the message for a
-        // future /thinking reveal; we just don't push it as a block here.
+        // Committed reasoning renders here only when the session opted in via
+        // the `/thinking` display toggle (off = codex-style quiet default).
+        push_reasoning_block(
+            &mut lines,
+            palette,
+            message.reasoning_content.as_deref(),
+            app.reasoning_display_enabled(&session.id),
+            app.expanded_tool_outputs,
+        );
         if let Some(tool_call_id) = message.tool_call_id.as_deref() {
             lines.push(Line::from(vec![
                 Span::styled("         tool_call ", palette.muted()),
@@ -635,9 +641,15 @@ pub fn finalized_history_lines_range_dedup_live(
                 wrap_width,
             );
         }
-        // Codex-style: the verbose committed `reasoning_content` is intentionally
-        // NOT rendered into scrollback. The data is kept on the message for a
-        // future /thinking reveal; we just don't push it as a block here.
+        // Committed reasoning renders here only when the session opted in via
+        // the `/thinking` display toggle (off = codex-style quiet default).
+        push_reasoning_block(
+            &mut lines,
+            palette,
+            message.reasoning_content.as_deref(),
+            app.reasoning_display_enabled(&session.id),
+            app.expanded_tool_outputs,
+        );
         if let Some(tool_call_id) = message.tool_call_id.as_deref() {
             lines.push(Line::from(vec![
                 Span::styled("         tool_call ", palette.muted()),
@@ -1208,10 +1220,12 @@ fn committed_content_hash(
     for message in &session.messages {
         message.role.as_str().hash(&mut hasher);
         message.content.hash(&mut hasher);
-        // reasoning_content is intentionally NOT hashed: codex-style display no
-        // longer renders it in committed scrollback, so a change to it (e.g. a
-        // late commit_live_reply attaching it) must not flip this hash and force
-        // a full re-flush of unchanged visible history (would duplicate scrollback).
+        // reasoning_content is NOT hashed: the /thinking display toggle applies
+        // to turns committed AFTER it flips (a terminal cannot retroactively
+        // redraw scrolled-off history — re-flushing would duplicate it). Past
+        // turns stay as flushed; the Tab inspector always shows full reasoning
+        // regardless of the toggle. So a reasoning change must not force a
+        // full re-flush of unchanged visible history.
         message.tool_call_id.hash(&mut hasher);
     }
     for (render_index, log) in anchored_activity_logs {
@@ -3388,6 +3402,50 @@ fn push_thinking_indicator(lines: &mut Vec<Line<'static>>, palette: Palette) {
         vec![Span::styled(format!("· {THINKING_INDICATOR_TEXT}"), style)],
         Some(bg),
     ));
+}
+
+/// Push the committed `reasoning_content` as a capped "· reasoning" block,
+/// gated on the active session's `/thinking` display toggle. Off by default
+/// (codex-style quiet). Capped to the first `REASONING_BLOCK_CAP` lines unless
+/// `expanded` (Ctrl+O), with a "+N more" affordance — the same convention as
+/// tool output. A no-op when display is off or there is no reasoning.
+const REASONING_BLOCK_CAP: usize = 6;
+
+fn push_reasoning_block(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    reasoning: Option<&str>,
+    display_on: bool,
+    expanded: bool,
+) {
+    if !display_on {
+        return;
+    }
+    let Some(reasoning) = reasoning.filter(|text| !text.trim().is_empty()) else {
+        return;
+    };
+    let all: Vec<&str> = reasoning.lines().filter(|l| !l.trim().is_empty()).collect();
+    let shown = if expanded {
+        all.len()
+    } else {
+        all.len().min(REASONING_BLOCK_CAP)
+    };
+    lines.push(Line::from(Span::styled(
+        "· reasoning".to_string(),
+        palette.muted(),
+    )));
+    for line in all.iter().take(shown) {
+        lines.push(Line::from(Span::styled(
+            format!("· {line}"),
+            palette.muted(),
+        )));
+    }
+    if all.len() > shown {
+        lines.push(Line::from(Span::styled(
+            format!("·   … +{} more line(s) (Ctrl+O expand)", all.len() - shown),
+            palette.muted(),
+        )));
+    }
 }
 
 fn push_message_block(
@@ -8334,6 +8392,103 @@ mod tests {
         assert!(
             footer.contains("/srv/octos-workspace"),
             "composer bottom border should show the cwd next to the model; got {footer:?}"
+        );
+    }
+
+    fn app_with_reasoning_message(reasoning: &str) -> (AppState, SessionKey) {
+        let session_id = SessionKey("local:rsn".into());
+        let mut assistant = Message::assistant("the answer is 4");
+        assistant.reasoning_content = Some(reasoning.to_string());
+        let app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "t".into(),
+                profile_id: None,
+                messages: vec![Message::user("q"), assistant],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        (app, session_id)
+    }
+
+    fn history_text(app: &AppState) -> String {
+        finalized_history_lines(app, Palette::for_theme(ThemeName::Codex), 200)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn reasoning_block_hidden_by_default_shown_when_toggled_on() {
+        let (mut app, session_id) = app_with_reasoning_message("step one\nstep two");
+        // OFF (default): the reasoning text must not appear in scrollback.
+        assert!(
+            !history_text(&app).contains("reasoning"),
+            "reasoning block must be hidden by default"
+        );
+        // ON: the block renders.
+        app.session_reasoning_display.insert(session_id);
+        let text = history_text(&app);
+        assert!(
+            text.contains("· reasoning"),
+            "toggle on renders the block: {text}"
+        );
+        assert!(text.contains("step one") && text.contains("step two"));
+    }
+
+    #[test]
+    fn reasoning_block_caps_lines_until_expanded() {
+        let long: String = (1..=12)
+            .map(|n| format!("thought line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (mut app, session_id) = app_with_reasoning_message(&long);
+        app.session_reasoning_display.insert(session_id);
+
+        let capped = history_text(&app);
+        assert!(
+            capped.contains("thought line 6"),
+            "cap shows the first 6 lines"
+        );
+        assert!(
+            !capped.contains("thought line 7"),
+            "beyond the cap is hidden until expanded"
+        );
+        assert!(capped.contains("more line(s) (Ctrl+O expand)"));
+
+        app.expanded_tool_outputs = true;
+        let expanded = history_text(&app);
+        assert!(
+            expanded.contains("thought line 12"),
+            "Ctrl+O expand shows the full reasoning"
+        );
+    }
+
+    #[test]
+    fn toggling_reasoning_display_does_not_reflush_committed_scrollback() {
+        // A terminal can't retroactively redraw scrolled-off history, so the
+        // toggle must NOT flip the committed fingerprint — otherwise the
+        // scrollback tracker's discontinuity branch would re-flush the whole
+        // history and duplicate it below the stale copy. The toggle applies to
+        // turns committed afterwards; past turns use the Tab inspector.
+        let (mut app, session_id) = app_with_reasoning_message("some reasoning");
+        let off = committed_messages_fingerprint(&app);
+        app.session_reasoning_display.insert(session_id);
+        let on = committed_messages_fingerprint(&app);
+        assert_eq!(
+            off.content_hash, on.content_hash,
+            "the display toggle must not force a committed-history re-flush"
         );
     }
 
