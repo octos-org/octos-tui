@@ -5799,6 +5799,32 @@ fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'st
 
     // Tool activities render as Claude-Code cards via `push_tool_card_header`;
     // this path only handles non-tool rows (progress, generic).
+
+    // A context-compaction notice is an infrequent, notable event — render it
+    // prominently (accent + ✦) so it stands out from the muted activity stream
+    // instead of scrolling by unseen in a busy multi-agent session.
+    let compacted_title = t!("status.activity_context_compacted");
+    if item.kind == ActivityKind::Progress && item.title.as_str() == compacted_title.as_ref() {
+        let mut spans = vec![
+            Span::styled("✦ ", Style::default().fg(palette.accent)),
+            Span::styled(
+                item.title.clone(),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {}", item.status), palette.muted()),
+        ];
+        if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
+            spans.push(Span::styled("  ", palette.muted()));
+            spans.push(Span::styled(
+                truncate_terminal_line(detail, 96),
+                palette.muted(),
+            ));
+        }
+        return spans;
+    }
+
     let mut spans = vec![
         Span::styled(item.title.clone(), palette.muted()),
         Span::styled(format!("  {}", item.status), palette.muted()),
@@ -12692,6 +12718,39 @@ mod tests {
             !text.contains("spawn-1") && !text.contains("bash-2"),
             "must not show call ids, got:\n{text}"
         );
+    }
+
+    #[test]
+    fn compaction_notice_renders_prominently_with_marker() {
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id,
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("go")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // The persistent "context compacted" notice must stand out from the
+        // muted activity stream so it isn't lost in a busy session.
+        app.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            t!("status.activity_context_compacted").into_owned(),
+            "120k → 40k tokens",
+        ));
+        app.expanded_tool_outputs = true;
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("✦ context compacted"),
+            "compaction notice must render with a prominent marker, got:\n{text}"
+        );
+        assert!(text.contains("120k → 40k tokens"), "got:\n{text}");
     }
 
     #[test]
