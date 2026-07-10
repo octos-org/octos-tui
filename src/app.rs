@@ -3343,13 +3343,12 @@ fn push_user_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, con
 /// surface background) so it reads as a dimmed continuation of that lane.
 const THINKING_INDICATOR_TEXT: &str = "thinking…";
 
-/// A horizontal ASCII octopus that "swims" during the thinking phase: a compact
-/// square head `[··]` flanked by the tilted-line glyphs `彡`/`ミ` (one arm bundle
-/// per side). The arms wave by swapping direction each step — `彡 ⇔ ミ` on the
-/// left and `ミ ⇔ 彡` on the right — a paddle stroke.
+/// A horizontal ASCII octopus that "swims" during the thinking phase: a `⇔`
+/// body flanked by the tilted-line glyphs `彡`/`ミ` (one arm per side). The arms
+/// wave by swapping direction each step — `彡⇔ミ ⇔ ミ⇔彡` — a paddle stroke.
 ///
-///   `彡[··]ミ`   `ミ[··]彡`
-const OCTOPUS_SWIM_FRAMES: [&str; 2] = ["彡[··]ミ", "ミ[··]彡"];
+///   `彡⇔ミ`   `ミ⇔彡`
+const OCTOPUS_SWIM_FRAMES: [&str; 2] = ["彡⇔ミ", "ミ⇔彡"];
 
 /// Current swimming-octopus frame. Rides the same process clock as
 /// [`spinner_frame`]; flaps roughly every 280ms so the arms wave at a calm,
@@ -8536,17 +8535,16 @@ mod tests {
 
     #[test]
     fn swimming_octopus_frames_have_boxed_eyes_four_arms_and_flip_direction() {
-        // Each frame: a compact square head [··] with one tilted-line arm glyph
-        // per side (彡/ミ). No fourth/top arm.
+        // Each frame: a `⇔` body with one tilted-line arm glyph per side (彡/ミ).
         for frame in OCTOPUS_SWIM_FRAMES {
-            assert!(frame.contains("[··]"), "compact square head: {frame}");
-            let (left, right) = frame.split_once("[··]").expect("head splits arms");
+            assert!(frame.contains("⇔"), "⇔ body: {frame}");
+            let (left, right) = frame.split_once("⇔").expect("body splits arms");
             assert_eq!(left.chars().count(), 1, "one arm glyph left: {frame}");
             assert_eq!(right.chars().count(), 1, "one arm glyph right: {frame}");
         }
-        // The arms swap direction each step: 彡[··]ミ ⇔ ミ[··]彡 — the wave.
-        assert_eq!(OCTOPUS_SWIM_FRAMES[0], "彡[··]ミ");
-        assert_eq!(OCTOPUS_SWIM_FRAMES[1], "ミ[··]彡");
+        // The arms swap direction each step: 彡⇔ミ ⇔ ミ⇔彡 — the wave.
+        assert_eq!(OCTOPUS_SWIM_FRAMES[0], "彡⇔ミ");
+        assert_eq!(OCTOPUS_SWIM_FRAMES[1], "ミ⇔彡");
         assert!(OCTOPUS_SWIM_FRAMES.contains(&octopus_swim_frame()));
     }
 
