@@ -3433,6 +3433,10 @@ pub struct AppState {
     pub turn_started_at: std::collections::HashMap<(SessionKey, TurnId), std::time::Instant>,
     /// Latest `/btw` aside per session (see [`BtwAside`]).
     pub btw_asides: std::collections::HashMap<SessionKey, BtwAside>,
+    /// Session that initiated the in-flight `profile/llm/select`, so its
+    /// result lands on the REQUESTING session even if the user switches away
+    /// before the response (or an older server echoes a synthetic key).
+    pub pending_model_select_session: Option<SessionKey>,
     pub expanded_tool_outputs: bool,
     pub menu_stack: MenuStack,
     pub active_menu: Option<MenuBuildResult>,
@@ -5218,6 +5222,7 @@ impl AppState {
             turn_activity_summaries: Vec::new(),
             turn_started_at: std::collections::HashMap::new(),
             btw_asides: std::collections::HashMap::new(),
+            pending_model_select_session: None,
             expanded_tool_outputs: false,
             menu_stack: MenuStack::new(),
             active_menu: None,

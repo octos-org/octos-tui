@@ -3796,7 +3796,18 @@ impl Store {
                 // dispatch outcome to its backend command here.
                 self.dispatch_local_action(action, None).into_command()
             }
-            MenuAction::SendAppUi(command) => Some(*command),
+            MenuAction::SendAppUi(command) => {
+                // Remember which session asked for a model switch: the async
+                // result must land on the INITIATING session, not whichever
+                // session is active when the response arrives.
+                if let AppUiCommand::ProfileLlmSelect(params) = command.as_ref() {
+                    self.state.pending_model_select_session = params
+                        .session_id
+                        .clone()
+                        .or_else(|| self.active_session().map(|session| session.id.clone()));
+                }
+                Some(*command)
+            }
             MenuAction::SubmitPrompt(prompt) => {
                 self.start_prompt_turn(prompt, t!("status.queued_menu_prompt").into_owned())
             }
@@ -5922,9 +5933,11 @@ impl Store {
     fn apply_model_select_event(&mut self, event: ModelSelectClientEvent) {
         let result = event.result;
         // Older servers echo a SYNTHETIC session key when the request carried
-        // none — fall back to the ACTIVE session so the switch still reflects
-        // in the footer/catalog instead of updating a phantom entry.
-        let session_id = if self
+        // none — route such results to the session that INITIATED the select
+        // (stashed at dispatch), never to whichever session happens to be
+        // active when the async response lands (the user may have switched).
+        let pending = self.state.pending_model_select_session.take();
+        let echoed_is_known = self
             .state
             .session_runtime_statuses
             .iter()
@@ -5934,12 +5947,20 @@ impl Store {
                 .session_model_catalogs
                 .iter()
                 .any(|catalog| catalog.session_id == result.session_id)
-        {
+            || self
+                .state
+                .sessions
+                .iter()
+                .any(|session| session.id == result.session_id);
+        let session_id = if echoed_is_known {
             result.session_id.clone()
         } else {
-            self.active_session()
-                .map(|session| session.id.clone())
-                .unwrap_or_else(|| result.session_id.clone())
+            match pending {
+                Some(pending) => pending,
+                // No initiating session on record and an unknown echo: leave
+                // the caches alone rather than guessing a target.
+                None => return,
+            }
         };
         if let Some(status) = self
             .state
@@ -17057,12 +17078,23 @@ mod tests {
         assert_eq!(store.state.run_state.label(), "done");
     }
 
-    /// Selecting a model must reflect in the ACTIVE session even when the
-    /// server echoes a synthetic session key (requests without session_id).
+    /// Selecting a model must reflect in the initiating session even when the
+    /// server echoes a synthetic session key — and an unsolicited synthetic
+    /// echo (no pending select) is ignored outright.
     #[test]
-    fn model_select_result_falls_back_to_the_active_session() {
+    fn model_select_result_falls_back_to_the_initiating_session() {
         let mut store = store_with_empty_session();
         let session_id = store.state.sessions[0].id.clone();
+        // Stash the initiating session the way the /model menu dispatch does.
+        let _ = store.dispatch_menu_action(crate::menu::MenuAction::send_appui(
+            AppUiCommand::ProfileLlmSelect(crate::model::ProfileLlmSelectParams {
+                profile_id: Some("dev".into()),
+                session_id: None,
+                family_id: "deepseek".into(),
+                model_id: "deepseek-chat".into(),
+                route_id: "official".into(),
+            }),
+        ));
         store
             .state
             .set_model_catalog(crate::model::SessionModelCatalog {
@@ -17129,7 +17161,120 @@ mod tests {
         assert_eq!(
             selected,
             vec!["deepseek-chat"],
-            "the switch must land on the ACTIVE session's catalog"
+            "the switch must land on the initiating session's catalog"
+        );
+
+        // An unsolicited synthetic echo (nothing pending) changes nothing.
+        store.apply_client_event(ClientEvent::ModelSelect(
+            crate::client_event::ModelSelectClientEvent {
+                result: crate::model::ModelSelectResult {
+                    session_id: SessionKey("dev:local:tui#coding".into()),
+                    selected: crate::model::ModelStatus {
+                        model: "deepseek-v4-pro".into(),
+                        provider: "deepseek".into(),
+                        title: None,
+                        family: None,
+                        route: None,
+                        selected: true,
+                        available: Some(true),
+                        queue_mode: None,
+                        qoe_policy: None,
+                    },
+                    applied: true,
+                    runtime_policy_stamp: None,
+                },
+                message: "Model selected".into(),
+            },
+        ));
+        let catalog = store
+            .state
+            .model_catalog_for(&session_id)
+            .expect("catalog still present");
+        assert!(
+            catalog
+                .models
+                .iter()
+                .any(|model| model.model == "deepseek-chat" && model.selected),
+            "an unsolicited echo must not overwrite the selection"
+        );
+    }
+
+    /// A select initiated in session A must land on A even if the user
+    /// switches to session B before the async result (with a synthetic echo)
+    /// arrives — resolving "active session" at response time targeted B.
+    #[test]
+    fn model_select_result_binds_to_the_initiating_session() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        store
+            .state
+            .set_model_catalog(crate::model::SessionModelCatalog {
+                session_id: a.clone(),
+                models: vec![crate::model::ModelStatus {
+                    model: "deepseek-v4-pro".into(),
+                    provider: "deepseek".into(),
+                    title: None,
+                    family: None,
+                    route: None,
+                    selected: true,
+                    available: Some(true),
+                    queue_mode: None,
+                    qoe_policy: None,
+                }],
+            });
+        // Session A initiates the select (stashes the pending session)…
+        let command = store.dispatch_menu_action(crate::menu::MenuAction::send_appui(
+            AppUiCommand::ProfileLlmSelect(crate::model::ProfileLlmSelectParams {
+                profile_id: Some("dev".into()),
+                session_id: None,
+                family_id: "deepseek".into(),
+                model_id: "deepseek-chat".into(),
+                route_id: "official".into(),
+            }),
+        ));
+        assert!(command.is_some());
+        // …then the user switches to B before the response lands.
+        store.state.switch_selected_session(1);
+
+        store.apply_client_event(ClientEvent::ModelSelect(
+            crate::client_event::ModelSelectClientEvent {
+                result: crate::model::ModelSelectResult {
+                    session_id: SessionKey("dev:local:tui#coding".into()),
+                    selected: crate::model::ModelStatus {
+                        model: "deepseek-chat".into(),
+                        provider: "deepseek".into(),
+                        title: None,
+                        family: None,
+                        route: None,
+                        selected: true,
+                        available: Some(true),
+                        queue_mode: None,
+                        qoe_policy: None,
+                    },
+                    applied: true,
+                    runtime_policy_stamp: None,
+                },
+                message: "Model selected".into(),
+            },
+        ));
+
+        let catalog = store
+            .state
+            .model_catalog_for(&a)
+            .expect("initiating session catalog");
+        assert!(
+            catalog
+                .models
+                .iter()
+                .any(|model| model.model == "deepseek-chat" && model.selected),
+            "the switch lands on the INITIATING session A"
+        );
+        assert!(
+            store
+                .state
+                .model_catalog_for(&SessionKey("local:b".into()))
+                .is_none(),
+            "the bystander session B stays untouched"
         );
     }
 
