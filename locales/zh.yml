@@ -95,6 +95,9 @@ app:
     esc_interrupt: "Esc 中断"
     stop_to_close: "/stop 关闭"
     tool_output_expanded: "工具输出已展开"
+  turn_summary:
+    ran_for: "耗时 %{duration}"
+    tasks_still_running: "%{count} 个后台任务仍在运行"
   status:
     state_label: "状态"
     idle: "空闲"

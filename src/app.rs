@@ -5176,55 +5176,61 @@ fn push_turn_activity_log_section(
     app: &AppState,
     collapse_settled: bool,
 ) {
-    if log.items.is_empty() {
+    let summary = app.turn_summary_for(&log.turn_id);
+    // A tool-less turn carries only a summary (no activity items); still render
+    // its report. Nothing at all to show only when both are absent.
+    if log.items.is_empty() && summary.is_none() {
         return;
     }
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
-    let shown_limit = if app.expanded_tool_outputs { 12 } else { 3 };
-    // Full uncapped set (header counts + footer tally both derive from this via
-    // `task_group_counts`, so they cannot diverge).
-    let full = log.items.iter().collect::<Vec<_>>();
-    let shown = full
-        .iter()
-        .rev()
-        .take(shown_limit)
-        .rev()
-        .copied()
-        .collect::<Vec<_>>();
-    push_agent_task_group(
-        lines,
-        palette,
-        Some(&log.turn_id),
-        &full,
-        &shown,
-        &running_subagent_titles_for_chip(app, Some(&log.turn_id)),
-        active_session_pending_continuations(app),
-        is_active_group(app, Some(&log.turn_id)),
-        app.expanded_tool_outputs,
-        collapse_settled,
-    );
-    if full.len() > shown.len() {
-        let hidden = full.len() - shown.len();
-        let (_, completed, active, _) = task_group_counts(&full);
-        lines.push(Line::from(vec![
-            Span::styled("     ", palette.muted()),
-            Span::styled(
-                t!(
-                    "app.activity.more_completed_active",
-                    hidden = hidden,
-                    completed = completed,
-                    active = active
-                )
-                .into_owned(),
-                palette.muted(),
-            ),
-        ]));
+    if !log.items.is_empty() {
+        let shown_limit = if app.expanded_tool_outputs { 12 } else { 3 };
+        // Full uncapped set (header counts + footer tally both derive from this
+        // via `task_group_counts`, so they cannot diverge).
+        let full = log.items.iter().collect::<Vec<_>>();
+        let shown = full
+            .iter()
+            .rev()
+            .take(shown_limit)
+            .rev()
+            .copied()
+            .collect::<Vec<_>>();
+        push_agent_task_group(
+            lines,
+            palette,
+            Some(&log.turn_id),
+            &full,
+            &shown,
+            &running_subagent_titles_for_chip(app, Some(&log.turn_id)),
+            active_session_pending_continuations(app),
+            is_active_group(app, Some(&log.turn_id)),
+            app.expanded_tool_outputs,
+            collapse_settled,
+        );
+        if full.len() > shown.len() {
+            let hidden = full.len() - shown.len();
+            let (_, completed, active, _) = task_group_counts(&full);
+            lines.push(Line::from(vec![
+                Span::styled("     ", palette.muted()),
+                Span::styled(
+                    t!(
+                        "app.activity.more_completed_active",
+                        hidden = hidden,
+                        completed = completed,
+                        active = active
+                    )
+                    .into_owned(),
+                    palette.muted(),
+                ),
+            ]));
+        }
+        if app.diff_preview.active && app.diff_preview.turn_id.as_ref() == Some(&log.turn_id) {
+            push_inline_diff_preview(lines, palette, &app.diff_preview, app.expanded_tool_outputs);
+        }
     }
-    if app.diff_preview.active && app.diff_preview.turn_id.as_ref() == Some(&log.turn_id) {
-        push_inline_diff_preview(lines, palette, &app.diff_preview, app.expanded_tool_outputs);
-    }
+    push_turn_summary_line(lines, palette, app, &log.turn_id);
 }
 
 fn push_turn_activity_log_section_unflushed(
@@ -5246,6 +5252,52 @@ fn push_turn_activity_log_section_unflushed(
         .map(|(_, item)| item)
         .collect::<Vec<_>>();
     push_finalized_activity_items_section(lines, palette, app, Some(&log.turn_id), &items);
+    // The settling flush routes a still-covered log through this path, so emit
+    // the committed turn summary here too (a no-op until the turn completes).
+    push_turn_summary_line(lines, palette, app, &log.turn_id);
+}
+
+/// Emit the committed per-turn status report line for `turn_id`, if one was
+/// captured. Shared by the flushed and unflushed (still-covered) activity-log
+/// section renderers so an orchestrated turn — whose log is still covered by the
+/// live tail at the settling flush — still gets its report in scrollback. Keeps
+/// one blank separator so the line reads as the turn's footer.
+fn push_turn_summary_line(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    app: &AppState,
+    turn_id: &octos_core::ui_protocol::TurnId,
+) {
+    let Some(summary) = app.turn_summary_for(turn_id) else {
+        return;
+    };
+    if !lines.is_empty() && !line_is_blank(lines.last()) {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        turn_summary_text(summary),
+        palette.muted(),
+    )));
+}
+
+/// The committed per-turn status report line, e.g.
+/// `✻ Ran for 5m 19s · 2 background task(s) still running`. The `✻` glyph and
+/// duration mirror the live working indicator; the trailing clause is dropped
+/// when nothing was left running.
+fn turn_summary_text(summary: &crate::model::TurnActivitySummary) -> String {
+    let ran_for = t!(
+        "app.turn_summary.ran_for",
+        duration = format_elapsed_secs(summary.elapsed_secs)
+    );
+    if summary.background_tasks > 0 {
+        let still_running = t!(
+            "app.turn_summary.tasks_still_running",
+            count = summary.background_tasks
+        );
+        format!("✻ {ran_for} · {still_running}")
+    } else {
+        format!("✻ {ran_for}")
+    }
 }
 
 fn push_finalized_activity_items_section(
@@ -6847,6 +6899,40 @@ fn render_harness_status_row(
     }
 }
 
+/// The current model id for the active session, drawn on the composer's bottom
+/// border. Prefers the runtime status's reported model, then its runtime policy
+/// stamp, then the model catalog's selected entry — so the footer reflects the
+/// current model whether it arrived via `session/status/read`, a model
+/// selection, or just the `/model` catalog. `None` until any of those is known
+/// (the footer then shows only the cwd).
+fn composer_footer_model(app: &AppState) -> Option<String> {
+    let session_id = &app.active_session()?.id;
+    let from_status = app.runtime_status_for(session_id).and_then(|status| {
+        status
+            .model
+            .as_ref()
+            .map(|model| model.model.clone())
+            .or_else(|| {
+                status
+                    .runtime_policy_stamp
+                    .as_ref()
+                    .and_then(|stamp| stamp.model.clone())
+            })
+    });
+    from_status
+        .or_else(|| {
+            app.model_catalog_for(session_id).and_then(|catalog| {
+                catalog
+                    .models
+                    .iter()
+                    .find(|model| model.selected)
+                    .map(|model| model.model.clone())
+            })
+        })
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+}
+
 fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
     let mut lines = Vec::new();
     let composer = app.composer_presentation();
@@ -6970,13 +7056,52 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
     } else {
         t!("app.pane.composer").to_string()
     };
-    let block = titled_block(
+    let mut block = titled_block(
         title,
         palette,
         app.focus == FocusPane::Composer,
         Some(t!("app.hint.composer_send").into_owned()),
     )
     .border_style(palette.border());
+
+    // Surface the working directory (bottom-left) and current model
+    // (bottom-right) right on the composer's bottom border. Both stay visible
+    // at the input without consuming a content row — the bottom border already
+    // exists. The cwd prefers the active session's server-confirmed workspace
+    // root (populated by `session/status/read`), so after a session switch the
+    // footer shows THAT session's workspace; the client-side `workspace.root`
+    // is the fallback until a runtime status arrives.
+    let cwd = app
+        .active_session()
+        .and_then(|session| app.runtime_status_for(&session.id))
+        .and_then(|status| {
+            status
+                .workspace_root
+                .as_deref()
+                .or(status.cwd.as_deref())
+                .filter(|root| !root.trim().is_empty())
+        })
+        .unwrap_or(app.workspace.root.as_str());
+    let cwd_title = format!(" {} ", short_path(cwd));
+    block = block
+        .title_bottom(Line::from(Span::styled(cwd_title.clone(), palette.muted())).left_aligned());
+    if let Some(model) = composer_footer_model(app) {
+        let model_title = format!(" {} ", truncate_terminal_line(&model, 28));
+        // Both bottom titles share one border row and ratatui paints
+        // overlapping titles over each other — on a composer too narrow for
+        // both, drop the model rather than colliding with the cwd.
+        let inner_width = area.width.saturating_sub(2) as usize;
+        if cwd_title.width() + model_title.width() <= inner_width {
+            block = block.title_bottom(
+                Line::from(Span::styled(
+                    model_title,
+                    Style::default().fg(palette.accent),
+                ))
+                .right_aligned(),
+            );
+        }
+    }
+
     Paragraph::new(Text::from(lines))
         .style(Style::default().fg(palette.text).bg(palette.surface))
         .block(block)
@@ -7223,7 +7348,6 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
         .active_session()
         .and_then(|session| session.profile_id.as_deref())
         .unwrap_or("default");
-    let cwd = app.workspace.root.as_str();
     let policy = if app.readonly {
         t!("app.status.sends_disabled").to_string()
     } else {
@@ -7291,8 +7415,8 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
             format!("{mode} {turn}"),
             palette.muted().bg(palette.surface_alt),
         ),
-        Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
-        Span::styled(short_path(cwd), palette.muted().bg(palette.surface_alt)),
+        // The cwd deliberately lives on the composer's bottom border, not here —
+        // repeating it one line below the composer read as clutter.
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
         Span::styled(key_hint, palette.selected().bg(palette.surface_alt)),
     ]))
@@ -7389,10 +7513,43 @@ fn short_id(id: &str) -> String {
     }
 }
 
+/// Resolve the current user's home directory from `HOME`, falling back to
+/// `USERPROFILE` (Windows normally sets only the latter), if set and non-empty.
+fn home_dir_str() -> Option<String> {
+    ["HOME", "USERPROFILE"].into_iter().find_map(|var| {
+        std::env::var_os(var)
+            .filter(|home| !home.is_empty())
+            .and_then(|home| home.into_string().ok())
+    })
+}
+
+/// Collapse a leading home-directory prefix to `~` the way a shell does
+/// (`/Users/me/proj` → `~/proj`, `/Users/me` → `~`). A no-op when `home` is
+/// absent/empty or is not a path-boundary prefix of `path` (so `/Users/mentor`
+/// is never mangled by a `/Users/me` home). Both `/` and `\` count as the
+/// boundary so native Windows paths collapse too. Pure over `home` so it is
+/// testable without touching the process environment.
+fn collapse_home_prefix(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home
+        .map(|home| home.trim_end_matches(['/', '\\']))
+        .filter(|home| !home.is_empty())
+    else {
+        return path.to_string();
+    };
+    if path == home {
+        return "~".to_string();
+    }
+    match path.strip_prefix(home) {
+        Some(rest) if rest.starts_with('/') || rest.starts_with('\\') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
 fn short_path(path: &str) -> String {
     const MAX_PATH_LEN: usize = 28;
+    let path = collapse_home_prefix(path, home_dir_str().as_deref());
     if path.chars().count() <= MAX_PATH_LEN {
-        return path.to_string();
+        return path;
     }
     let suffix = path
         .chars()
@@ -7956,7 +8113,8 @@ mod tests {
         cli::ThemeName,
         model::{
             ApprovalModalState, DiffPreview, DiffPreviewFile, DiffPreviewGetResult,
-            DiffPreviewHunk, DiffPreviewLine, SessionView, TurnPromptAnchor,
+            DiffPreviewHunk, DiffPreviewLine, ModelStatus, SessionModelCatalog,
+            SessionRuntimeStatus, SessionView, TurnActivitySummary, TurnPromptAnchor,
         },
         store::Store,
         viewport::ScrollbackTracker,
@@ -8036,6 +8194,466 @@ mod tests {
             .find(|row| row.contains(needle))
             .map(String::as_str)
             .unwrap_or_else(|| panic!("row containing {needle:?}"))
+    }
+
+    /// Test-only [`SessionRuntimeStatus`] carrying just the fields the composer
+    /// footer reads (model + workspace root); everything else stays empty.
+    fn runtime_status_with_model_cwd(
+        session_id: SessionKey,
+        model: &str,
+        cwd: &str,
+    ) -> SessionRuntimeStatus {
+        SessionRuntimeStatus {
+            session_id,
+            runtime_mode: None,
+            profile_id: None,
+            cwd: Some(cwd.into()),
+            workspace_root: Some(cwd.into()),
+            active_turn_id: None,
+            runtime_policy_stamp: None,
+            model: Some(ModelStatus {
+                model: model.into(),
+                provider: "test".into(),
+                title: None,
+                family: None,
+                route: None,
+                selected: true,
+                available: Some(true),
+                queue_mode: None,
+                qoe_policy: None,
+            }),
+            permission_profile: None,
+            approval_policy: None,
+            sandbox_mode: None,
+            sandbox: None,
+            filesystem_scope: None,
+            network: None,
+            tool_policy_id: None,
+            mcp_servers: Vec::new(),
+            memory_scope: None,
+            health: None,
+            mcp_summary: None,
+            tool_summary: None,
+            usage: None,
+            cursor: None,
+        }
+    }
+
+    #[test]
+    fn render_composer_shows_current_model_and_cwd_on_bottom_border() {
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // A non-home absolute path renders verbatim regardless of the test
+        // runner's HOME (home-dir collapsing is covered separately).
+        app.workspace.root = "/srv/octos-workspace".into();
+        app.set_runtime_status(runtime_status_with_model_cwd(
+            session_id,
+            "claude-fable-5",
+            "/srv/octos-workspace",
+        ));
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let buffer = rendered_buffer(&app, palette);
+        let rows = rendered_rows(&buffer);
+
+        // The current model is surfaced ONLY on the composer footer (the status
+        // bar never shows it), so the row carrying it is the composer's bottom
+        // border — and that same border row must also carry the cwd.
+        let footer = row_containing(&rows, "claude-fable-5");
+        assert!(
+            footer.contains("/srv/octos-workspace"),
+            "composer bottom border should show the cwd next to the model; got {footer:?}"
+        );
+    }
+
+    #[test]
+    fn render_composer_collapses_home_dir_in_cwd_footer() {
+        // Build the cwd from the runner's actual HOME so the assertion is
+        // deterministic across machines and exercises the real render path.
+        let Some(home) = std::env::var_os("HOME")
+            .and_then(|home| home.into_string().ok())
+            .map(|home| home.trim_end_matches('/').to_string())
+            .filter(|home| !home.is_empty())
+        else {
+            return; // no HOME → collapsing is a documented no-op, nothing to assert
+        };
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let cwd = format!("{home}/proj/octos");
+        app.workspace.root = cwd.clone();
+        app.set_runtime_status(runtime_status_with_model_cwd(session_id, "kimi-k2", &cwd));
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let buffer = rendered_buffer(&app, palette);
+        let rows = rendered_rows(&buffer);
+        let footer = row_containing(&rows, "kimi-k2");
+
+        assert!(
+            footer.contains("~/proj/octos"),
+            "composer cwd should collapse the home dir to ~; got {footer:?}"
+        );
+        assert!(
+            !footer.contains(&home),
+            "raw home dir must not leak once collapsed to ~; got {footer:?}"
+        );
+    }
+
+    #[test]
+    fn render_composer_shows_selected_catalog_model_without_runtime_status() {
+        // When no session/status/read has landed yet (no runtime status), the
+        // footer still shows the model the `/model` catalog marks selected.
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.workspace.root = "/srv/octos-workspace".into();
+        app.set_model_catalog(SessionModelCatalog {
+            session_id,
+            models: vec![
+                ModelStatus {
+                    model: "deepseek-v4-pro".into(),
+                    provider: "deepseek".into(),
+                    title: None,
+                    family: None,
+                    route: None,
+                    selected: true,
+                    available: Some(true),
+                    queue_mode: None,
+                    qoe_policy: None,
+                },
+                ModelStatus {
+                    model: "gpt-5".into(),
+                    provider: "openai".into(),
+                    title: None,
+                    family: None,
+                    route: None,
+                    selected: false,
+                    available: Some(true),
+                    queue_mode: None,
+                    qoe_policy: None,
+                },
+            ],
+        });
+        assert!(
+            app.runtime_status_for(&SessionKey("local:test".into()))
+                .is_none()
+        );
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let rows = rendered_rows(&rendered_buffer(&app, palette));
+        let footer = row_containing(&rows, "/srv/octos-workspace");
+        assert!(
+            footer.contains("deepseek-v4-pro"),
+            "footer should fall back to the catalog's selected model; got {footer:?}"
+        );
+        assert!(
+            !footer.contains("gpt-5"),
+            "only the selected catalog model belongs on the footer; got {footer:?}"
+        );
+    }
+
+    #[test]
+    fn status_bar_does_not_duplicate_the_composer_footer_cwd() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.workspace.root = "/srv/octos-workspace".into();
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let rows = rendered_rows(&rendered_buffer(&app, palette));
+
+        // The status bar (below the composer) must NOT repeat the cwd — it now
+        // lives on the composer's bottom border, and repeating it one line below
+        // read as clutter.
+        let status_row = row_containing(&rows, "approval gated");
+        assert!(
+            !status_row.contains("/srv/octos-workspace"),
+            "status bar should not duplicate the cwd now on the composer border; got {status_row:?}"
+        );
+        // ...but the cwd is still shown once (on the composer border).
+        assert!(
+            rows.iter().any(|row| row.contains("/srv/octos-workspace")),
+            "cwd should still appear once, on the composer border"
+        );
+    }
+
+    #[test]
+    fn unflushed_activity_section_still_emits_turn_summary() {
+        // Regression: an orchestrated turn's activity log is still covered by the
+        // live tail at the settling flush, so it routes through the UNFLUSHED
+        // section renderer with its items already flushed (empty here). The
+        // committed status report must still land in scrollback.
+        let session_id = SessionKey("local:test".into());
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("do it"), Message::assistant("done")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.attach_turn_summary(&session_id, &turn_id, 75, 1);
+        let log = crate::model::TurnActivityLog {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            request: Some("do it".into()),
+            anchor_index: None,
+            items: vec![],
+        };
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let mut lines = Vec::new();
+        let coverage = LiveTurnFinalization::new(&session_id, &turn_id);
+        push_turn_activity_log_section_unflushed(&mut lines, palette, &log, &app, &coverage);
+
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(
+            text.contains("✻ Ran for 1m 15s · 1 background task(s) still running"),
+            "unflushed section must still emit the turn summary; got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn turn_summary_text_formats_duration_and_running_tasks() {
+        let with_tasks = TurnActivitySummary {
+            session_id: SessionKey("local:test".into()),
+            turn_id: TurnId::new(),
+            elapsed_secs: 319,
+            background_tasks: 2,
+        };
+        assert_eq!(
+            turn_summary_text(&with_tasks),
+            "✻ Ran for 5m 19s · 2 background task(s) still running"
+        );
+
+        let no_tasks = TurnActivitySummary {
+            session_id: SessionKey("local:test".into()),
+            turn_id: TurnId::new(),
+            elapsed_secs: 8,
+            background_tasks: 0,
+        };
+        assert_eq!(turn_summary_text(&no_tasks), "✻ Ran for 8s");
+    }
+
+    #[test]
+    fn transcript_renders_turn_summary_line_after_completed_turn() {
+        let session_id = SessionKey("local:test".into());
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("do the thing"), Message::assistant("done")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // A completed turn with one background task still running. No activity
+        // log items — attach_turn_summary must synthesize a log so the report
+        // still renders after the assistant reply.
+        app.attach_turn_summary(&session_id, &turn_id, 75, 1);
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let rows = rendered_rows(&rendered_buffer(&app, palette));
+        let text = rows.join("\n");
+        assert!(
+            text.contains("✻ Ran for 1m 15s · 1 background task(s) still running"),
+            "transcript should carry the committed turn status report; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn collapse_home_prefix_replaces_home_with_tilde() {
+        assert_eq!(
+            collapse_home_prefix("/Users/me/proj/octos", Some("/Users/me")),
+            "~/proj/octos"
+        );
+        // Exact home collapses to a bare ~.
+        assert_eq!(collapse_home_prefix("/Users/me", Some("/Users/me")), "~");
+        // A trailing slash on HOME is tolerated.
+        assert_eq!(
+            collapse_home_prefix("/Users/me/x", Some("/Users/me/")),
+            "~/x"
+        );
+    }
+
+    #[test]
+    fn collapse_home_prefix_only_matches_on_path_boundary() {
+        // `/Users/mentor` shares a textual prefix with `/Users/me` but is NOT a
+        // subdirectory — it must be left untouched.
+        assert_eq!(
+            collapse_home_prefix("/Users/mentor/x", Some("/Users/me")),
+            "/Users/mentor/x"
+        );
+        // Absent/empty HOME is a no-op.
+        assert_eq!(collapse_home_prefix("/Users/me/x", None), "/Users/me/x");
+        assert_eq!(collapse_home_prefix("/Users/me/x", Some("")), "/Users/me/x");
+    }
+
+    #[test]
+    fn collapse_home_prefix_handles_windows_separators() {
+        // Native Windows paths use `\` as the boundary (USERPROFILE homes).
+        assert_eq!(
+            collapse_home_prefix(r"C:\Users\me\proj", Some(r"C:\Users\me")),
+            r"~\proj"
+        );
+        assert_eq!(
+            collapse_home_prefix(r"C:\Users\me", Some(r"C:\Users\me")),
+            "~"
+        );
+        // Trailing backslash on the home is tolerated; boundary still enforced.
+        assert_eq!(
+            collapse_home_prefix(r"C:\Users\me\x", Some(r"C:\Users\me\")),
+            r"~\x"
+        );
+        assert_eq!(
+            collapse_home_prefix(r"C:\Users\mentor\x", Some(r"C:\Users\me")),
+            r"C:\Users\mentor\x"
+        );
+    }
+
+    #[test]
+    fn composer_footer_prefers_session_workspace_root_over_global() {
+        // A canonicalized/global `workspace.root` must not shadow the ACTIVE
+        // session's server-confirmed workspace (from session/status/read) —
+        // switching between sessions with different workspaces shows each
+        // session's own root.
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.workspace.root = "/srv/global-root".into();
+        app.set_runtime_status(runtime_status_with_model_cwd(
+            session_id,
+            "kimi-k2",
+            "/srv/session-root",
+        ));
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let rows = rendered_rows(&rendered_buffer(&app, palette));
+        let footer = row_containing(&rows, "kimi-k2");
+        assert!(
+            footer.contains("/srv/session-root"),
+            "footer should show the session's server-confirmed workspace root; got {footer:?}"
+        );
+        assert!(
+            !footer.contains("/srv/global-root"),
+            "the global workspace root must not shadow the session's; got {footer:?}"
+        );
+    }
+
+    #[test]
+    fn composer_footer_drops_model_when_too_narrow_for_both_titles() {
+        // Ratatui paints overlapping border titles over each other; when the
+        // composer cannot fit cwd + model side by side the model is dropped —
+        // never a collision.
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.workspace.root = "/srv/quite/long/workspace/path/here".into();
+        app.set_runtime_status(runtime_status_with_model_cwd(
+            session_id,
+            "moonshotai-kimi-k2-instruct",
+            "/srv/quite/long/workspace/path/here",
+        ));
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let narrow = rendered_rows(&rendered_buffer_with_size(&app, palette, 40, 30));
+        assert!(
+            !narrow.iter().any(|row| row.contains("kimi")),
+            "model must be dropped when both footer titles cannot fit; got {narrow:?}"
+        );
+        let wide = rendered_rows(&rendered_buffer_with_size(&app, palette, 120, 30));
+        assert!(
+            wide.iter().any(|row| row.contains("kimi")),
+            "model renders again once the composer is wide enough"
+        );
     }
 
     fn row_index_containing(rows: &[String], needle: &str) -> usize {

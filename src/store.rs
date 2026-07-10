@@ -5324,6 +5324,10 @@ impl Store {
                 let completed_turns = self.state.completed_turns.clone();
                 let finalized_by_switch = self.state.finalized_by_switch.clone();
                 let live_reasoning = self.state.live_reasoning.clone();
+                // Per-turn wall clocks are local-only too: a snapshot landing
+                // mid-turn must not un-time the live turn (its completion would
+                // lose the committed status report's duration).
+                let turn_started_at = self.state.turn_started_at.clone();
                 let session_usage = self.state.session_usage.clone();
                 let session_context_window = self.state.session_context_window.clone();
                 // Local-only, and since the re-stage fix the gate holds the
@@ -5377,6 +5381,7 @@ impl Store {
                 state.completed_turns = completed_turns;
                 state.finalized_by_switch = finalized_by_switch;
                 state.live_reasoning = live_reasoning;
+                state.turn_started_at = turn_started_at;
                 state.session_usage = session_usage;
                 state.session_context_window = session_context_window;
                 state.staged_submit_in_flight = staged_submit_in_flight;
@@ -5675,6 +5680,14 @@ impl Store {
 
     fn apply_capabilities_event(&mut self, event: CapabilitiesClientEvent) -> Option<AppUiCommand> {
         self.state.set_capabilities(event.result.capabilities);
+        // `session/opened` can validly land BEFORE this capabilities response
+        // (restored and server-initiated opens race the handshake), and the
+        // open-time status probe is capability-gated. Now that the method set
+        // is known, probe the active session if it still lacks a status —
+        // otherwise the composer footer's model stays blank until the user
+        // opens a status/model menu. (Sessions-pane switches probe the rest
+        // lazily — `switch_selected_session` runs the same probe.)
+        self.state.probe_active_session_status_if_missing();
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
             "capabilities",
@@ -6653,6 +6666,19 @@ impl Store {
                 for command in hydration {
                     self.state.enqueue_autonomy_hydration(command);
                 }
+                // The composer footer shows the current model, which lives on
+                // the per-session runtime status. That status is only ever
+                // created by a `session/status/read`, so probe for it on open
+                // (when advertised) — otherwise the model never appears until
+                // the user happens to open a status/model menu. Cheap,
+                // idempotent, gated on the capability so older servers that do
+                // not advertise it are left untouched, and DEDUPED — the switch
+                // bundle above usually queued this probe already.
+                if self.state.capabilities.as_ref().is_some_and(|caps| {
+                    caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ)
+                }) {
+                    self.state.enqueue_session_status_probe(session_id.clone());
+                }
                 // M22-D: if the user staged a permission profile in
                 // onboarding, apply it now that we have a session id.
                 // Server authority is preserved — the follow-up RPC
@@ -6694,6 +6720,11 @@ impl Store {
                 self.commit_pending_live_reply_for_turn_switch(&event.session_id, &event.turn_id);
                 self.state
                     .record_turn_prompt_anchor_from_latest_user(&event.session_id, &event.turn_id);
+                // Per-turn wall clock for the committed status report — the
+                // global run-state clock resets on session switches, so the
+                // report times the turn itself, not the current visit to it.
+                self.state
+                    .note_turn_started(&event.session_id, &event.turn_id);
                 let targets_active = self.event_targets_active_session(&event.session_id);
                 if let Some(session) = self.find_session_mut(&event.session_id) {
                     // Out-of-order lifecycle (nit 1): a MessageDelta may have
@@ -7903,6 +7934,11 @@ impl Store {
         // finalized-by-switch early return so it always records.
         self.state
             .mark_turn_completed(&event.session_id, &event.turn_id);
+        // Consume the per-turn clock unconditionally (even on the early return
+        // below) so a finished turn never leaves a stale start behind.
+        let per_turn_elapsed = self
+            .state
+            .take_turn_elapsed_secs(&event.session_id, &event.turn_id);
         // Do NOT clear live_reply_segment_boundaries on completion: after the turn
         // settles the committed-path render (finalized_history_lines_range_dedup_live)
         // still needs them to split a concatenated live-reply commit into discrete
@@ -8008,6 +8044,26 @@ impl Store {
             self.state.session_retry.remove(&event.session_id);
             self.state
                 .capture_completed_turn_activity(&event.session_id, &event.turn_id);
+            // Committed status report: prefer the per-turn clock (immune to the
+            // selection switches that reset the global run-state clock, and
+            // present for background sessions). The run-state clock only
+            // backstops turns whose `TurnStarted` this client never saw, and
+            // only when it actually timed THIS turn (`targets_active`) — read
+            // BEFORE `set_run_state_success` clears it.
+            let elapsed = per_turn_elapsed.or_else(|| {
+                targets_active
+                    .then(|| self.state.run_state_elapsed_secs())
+                    .flatten()
+            });
+            if let Some(elapsed_secs) = elapsed {
+                let background_tasks = self.state.running_background_task_count(&event.session_id);
+                self.state.attach_turn_summary(
+                    &event.session_id,
+                    &event.turn_id,
+                    elapsed_secs,
+                    background_tasks,
+                );
+            }
             if targets_active {
                 self.state.set_run_state_success();
             }
@@ -8031,6 +8087,9 @@ impl Store {
         // stale/duplicate error for an earlier turn cannot drop a newer staged
         // submit's gate.
         self.release_staged_gate_for_turn(&event.session_id, &event.turn_id);
+        // An errored turn gets no status report; just drop its per-turn clock.
+        self.state
+            .take_turn_elapsed_secs(&event.session_id, &event.turn_id);
         // Idempotence vs a turn-switch (see `commit_live_reply`): the
         // finalized-by-switch marker suppresses only a false COMPLETION
         // fallback — it must NEVER hide a real ERROR. A turn finalized at a
@@ -16324,6 +16383,361 @@ mod tests {
         assert_eq!(store.state.sessions[0].messages.len(), 1);
         assert!(store.state.sessions[0].live_reply.is_none());
         assert_eq!(store.state.run_state.label(), "done");
+    }
+
+    #[test]
+    fn completed_turn_records_a_status_summary_with_running_task_count() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "done");
+        let session_id = store.state.sessions[0].id.clone();
+        // Two background tasks still running when the turn completes.
+        store.state.sessions[0].tasks = vec![
+            TaskView {
+                id: octos_core::TaskId::new(),
+                title: "shell a".into(),
+                state: TaskRuntimeState::Running,
+                runtime_detail: None,
+                output_tail: String::new(),
+                turn_id: None,
+            },
+            TaskView {
+                id: octos_core::TaskId::new(),
+                title: "shell b".into(),
+                state: TaskRuntimeState::Running,
+                runtime_detail: None,
+                output_tail: String::new(),
+                turn_id: None,
+            },
+        ];
+        store.state.set_run_state_in_progress();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let summary = store
+            .state
+            .turn_summary_for(&turn_id)
+            .expect("a completed turn records a status summary");
+        assert_eq!(summary.session_id, session_id);
+        assert_eq!(
+            summary.background_tasks, 2,
+            "summary snapshots the still-running background task count"
+        );
+    }
+
+    /// The composer footer shows the current model, which lives on the
+    /// per-session runtime status — and that status is only ever created by a
+    /// `session/status/read`. So opening a session must queue one (when the
+    /// server advertises it), otherwise the model never appears until the user
+    /// happens to open a status/model menu.
+    #[test]
+    fn session_open_enqueues_session_status_read_when_supported() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::SessionOpened;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_SESSION_STATUS_READ]);
+        let session_id = SessionKey("dev:local:soak#main".into());
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": session_id.clone(),
+            "active_profile_id": "dev",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        let mut saw_status_read = false;
+        while let Some(command) = store.state.dequeue_autonomy_hydration() {
+            if let AppUiCommand::ReadSessionStatus(params) = command {
+                if params.session_id == session_id {
+                    saw_status_read = true;
+                }
+            }
+        }
+        assert!(
+            saw_status_read,
+            "session open should enqueue session/status/read so the composer footer can show the current model"
+        );
+    }
+
+    /// A server that does not advertise `session/status/read` must not be
+    /// probed on session open — old backends stay untouched.
+    #[test]
+    fn session_open_skips_status_read_when_capability_absent() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::SessionOpened;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": SessionKey("dev:local:soak#main".into()),
+            "active_profile_id": "dev",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        let mut commands = Vec::new();
+        while let Some(command) = store.state.dequeue_autonomy_hydration() {
+            commands.push(command);
+        }
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, AppUiCommand::ReadSessionStatus(_))),
+            "no session/status/read should be queued when the capability is unadvertised; got {commands:?}"
+        );
+    }
+
+    /// `session/opened` can land BEFORE the capabilities response, in which
+    /// case the open-time probe is skipped (the gate is still unknown). Once
+    /// capabilities arrive, already-open sessions without a runtime status must
+    /// be probed — otherwise the composer footer's model stays blank forever.
+    #[test]
+    fn capabilities_arriving_after_session_open_requeue_status_read() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        assert!(
+            store.state.capabilities.is_none(),
+            "test premise: open-before-caps"
+        );
+
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[crate::model::APPUI_METHOD_SESSION_STATUS_READ],
+                    &[],
+                ),
+            },
+            message: "Octos UI capabilities refreshed".into(),
+        }));
+
+        let mut saw_status_read = false;
+        while let Some(command) = store.state.dequeue_autonomy_hydration() {
+            if let AppUiCommand::ReadSessionStatus(params) = command {
+                if params.session_id == session_id {
+                    saw_status_read = true;
+                }
+            }
+        }
+        assert!(
+            saw_status_read,
+            "capabilities arriving after session open must requeue session/status/read"
+        );
+    }
+
+    /// The late-capabilities probe covers ONLY the active session — one queue
+    /// entry. Bulk-probing every open session could overflow the 16-entry
+    /// autonomy-hydration queue and evict unrelated pending commands; inactive
+    /// sessions probe lazily when they become active.
+    #[test]
+    fn capabilities_probe_targets_only_the_active_session() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[crate::model::APPUI_METHOD_SESSION_STATUS_READ],
+                    &[],
+                ),
+            },
+            message: "Octos UI capabilities refreshed".into(),
+        }));
+
+        let mut status_reads = Vec::new();
+        while let Some(command) = store.state.dequeue_autonomy_hydration() {
+            if let AppUiCommand::ReadSessionStatus(params) = command {
+                status_reads.push(params.session_id);
+            }
+        }
+        assert_eq!(
+            status_reads,
+            vec![SessionKey("local:a".into())],
+            "exactly one probe, for the active session"
+        );
+    }
+
+    /// Sessions-pane navigation (every path funnels through the shared
+    /// `switch_selected_session` bundle) probes the incoming session's status
+    /// when it is missing — a session that raced the capabilities response gets
+    /// its footer model on first visit, not only via the /resume flow.
+    #[test]
+    fn direct_session_switch_probes_missing_status() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_SESSION_STATUS_READ,
+        ]));
+
+        store.state.switch_selected_session(1);
+
+        let mut status_reads = Vec::new();
+        while let Some(command) = store.state.dequeue_autonomy_hydration() {
+            if let AppUiCommand::ReadSessionStatus(params) = command {
+                status_reads.push(params.session_id);
+            }
+        }
+        assert_eq!(
+            status_reads,
+            vec![SessionKey("local:b".into())],
+            "switching to an unprobed session queues exactly its status read"
+        );
+
+        // Without the capability the switch probes nothing.
+        let mut ungated = store_with_two_sessions("local:a", "local:b");
+        ungated.state.switch_selected_session(1);
+        assert!(
+            ungated.state.dequeue_autonomy_hydration().is_none(),
+            "no capability advertised → no probe on switch"
+        );
+    }
+
+    /// A fresh `session/opened` both switches to the session (bundle probe)
+    /// and probes explicitly; rapid switches re-probe before a response lands.
+    /// Duplicates eat slots of the 16-capped hydration queue and can evict
+    /// unrelated pending commands — probes must dedupe against the queue.
+    #[test]
+    fn status_probes_deduplicate_against_the_pending_queue() {
+        use octos_core::ui_protocol::SessionOpened;
+
+        // Session open: the switch-bundle probe and the open-time probe must
+        // collapse to ONE queued read.
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_SESSION_STATUS_READ]);
+        let session_id = SessionKey("dev:local:opened#main".into());
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": session_id.clone(),
+            "active_profile_id": "dev",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        let mut reads = Vec::new();
+        while let Some(command) = store.state.dequeue_autonomy_hydration() {
+            if let AppUiCommand::ReadSessionStatus(params) = command {
+                reads.push(params.session_id);
+            }
+        }
+        assert_eq!(
+            reads,
+            vec![session_id],
+            "open + switch must queue exactly one status read"
+        );
+
+        // Switch burst: bouncing between two unprobed sessions queues one read
+        // per session, not one per switch.
+        let mut burst = store_with_two_sessions("local:a", "local:b");
+        burst.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_SESSION_STATUS_READ,
+        ]));
+        for index in [1, 0, 1, 0, 1] {
+            burst.state.switch_selected_session(index);
+        }
+        let mut burst_reads = Vec::new();
+        while let Some(command) = burst.state.dequeue_autonomy_hydration() {
+            if let AppUiCommand::ReadSessionStatus(params) = command {
+                burst_reads.push(params.session_id);
+            }
+        }
+        assert_eq!(
+            burst_reads,
+            vec![SessionKey("local:b".into()), SessionKey("local:a".into())],
+            "a switch burst queues one probe per session, not per switch"
+        );
+    }
+
+    /// A snapshot replay landing mid-turn must not un-time the live turn — the
+    /// per-turn clock is local-only state, carried over like `live_reasoning`.
+    #[test]
+    fn per_turn_clock_survives_snapshot_replay() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        let turn_id = TurnId::new();
+        store.state.note_turn_started(&a, &turn_id);
+
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![SessionView {
+                id: a.clone(),
+                title: "local:a".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            selected_session: 0,
+            status: "replayed".into(),
+            target: None,
+            readonly: false,
+        }));
+
+        assert!(
+            store
+                .state
+                .turn_started_at
+                .contains_key(&(a.clone(), turn_id.clone())),
+            "the per-turn clock must survive a snapshot replay"
+        );
+        assert!(
+            store.state.take_turn_elapsed_secs(&a, &turn_id).is_some(),
+            "the surviving clock still yields an elapsed duration"
+        );
+    }
+
+    /// The committed status report must time the TURN, not the current visit to
+    /// it: a turn on a non-selected session (the global run-state clock never
+    /// timed it) still records a report from its own `TurnStarted` clock.
+    #[test]
+    fn turn_summary_times_background_session_turn() {
+        let mut store = store_with_empty_session();
+        let background = SessionView {
+            id: SessionKey("local:background".into()),
+            title: "background".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        store.state.sessions.push(background);
+        let background_id = store.state.sessions[1].id.clone();
+        let turn_id = TurnId::new();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: background_id.clone(),
+                turn_id: turn_id.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        // Selection stays on the foreground session; the background turn's
+        // completion must still record a report (previously: none at all).
+        assert_eq!(store.state.selected_session, 0);
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: background_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let summary = store
+            .state
+            .turn_summary_for(&turn_id)
+            .expect("background-session turn completion records a status report");
+        assert_eq!(summary.session_id, background_id);
+        assert!(
+            store.state.turn_started_at.is_empty(),
+            "the per-turn clock entry drains at the terminal event"
+        );
     }
 
     #[test]
