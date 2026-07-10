@@ -3399,6 +3399,17 @@ pub struct AppState {
     pub diff_preview: DiffPreviewPaneState,
     pub activity: Vec<ActivityItem>,
     pub turn_activity_logs: Vec<TurnActivityLog>,
+    /// Hydrate-replayed tool envelopes already applied, keyed by
+    /// `(session, thread_id, seq)` — `seq` is the envelope's identity within
+    /// its thread (#1515). Hydrate re-runs on every reconnect; without this
+    /// ledger each re-run would duplicate the per-action rows.
+    pub applied_hydrate_tool_envelopes: std::collections::HashSet<(String, String, u64)>,
+    pub turn_activity_summaries: Vec<TurnActivitySummary>,
+    /// Wall-clock starts of in-flight turns, keyed by (session, turn). The
+    /// committed per-turn status report reads its duration here — the global
+    /// `run_state_started_at` clock resets whenever the selection changes, so
+    /// it cannot time a turn the user switched away from and back.
+    pub turn_started_at: std::collections::HashMap<(SessionKey, TurnId), std::time::Instant>,
     pub expanded_tool_outputs: bool,
     pub menu_stack: MenuStack,
     pub active_menu: Option<MenuBuildResult>,
@@ -3586,6 +3597,19 @@ pub struct TurnActivityLog {
     pub request: Option<String>,
     pub anchor_index: Option<usize>,
     pub items: Vec<ActivityItem>,
+}
+
+/// A committed per-turn status report (`✻ Ran for 5m 19s · 2 background tasks
+/// still running`) rendered at the tail of a finalized turn in the transcript.
+/// Captured at `TurnCompleted` (a snapshot — the running-task count reflects the
+/// moment the turn ended). Stored parallel to [`TurnActivityLog`] and looked up
+/// by `turn_id` so tool-less turns (no activity log items) still get a summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnActivitySummary {
+    pub session_id: SessionKey,
+    pub turn_id: TurnId,
+    pub elapsed_secs: u64,
+    pub background_tasks: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5148,6 +5172,9 @@ impl AppState {
             diff_preview: DiffPreviewPaneState::default(),
             activity: Vec::new(),
             turn_activity_logs: Vec::new(),
+            applied_hydrate_tool_envelopes: std::collections::HashSet::new(),
+            turn_activity_summaries: Vec::new(),
+            turn_started_at: std::collections::HashMap::new(),
             expanded_tool_outputs: false,
             menu_stack: MenuStack::new(),
             active_menu: None,
@@ -5290,14 +5317,32 @@ impl AppState {
         }
     }
 
-    /// Replace the loop list for a session.
+    /// Replace the loop list for a session, dropping tombstones.
+    ///
+    /// Mirrors [`Self::upsert_session_loop`], which strips
+    /// `status == "deleted"` records "so reconnect doesn't surface
+    /// tombstones". This path — the `loop/list` response and
+    /// reconnect rehydration — must apply the SAME filter. Otherwise a
+    /// backend that echoes deleted loops in `loop/list` leaves dimmed
+    /// zombie chips in the sticky autonomy indicator that `/loop delete`
+    /// can no longer clear (the `#1576` delete-can't-clear-the-chip
+    /// lineage): the active/paused counts already exclude them, so the
+    /// row reads "0 running" yet still shows chips.
+    ///
+    /// Returns the number of loops actually retained (after dropping
+    /// tombstones) so callers can report a count that matches what the
+    /// indicator now shows, rather than the raw response length.
     pub fn set_session_loops(
         &mut self,
         session_id: &SessionKey,
         loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
-    ) {
+    ) -> usize {
         let entry = self.session_autonomy_mut(session_id);
-        entry.loops = loops;
+        entry.loops = loops
+            .into_iter()
+            .filter(|loop_state| loop_state.status != "deleted")
+            .collect();
+        entry.loops.len()
     }
 
     /// Upsert one loop record by `loop_id`. Removes the loop when its
@@ -6048,6 +6093,156 @@ impl AppState {
         true
     }
 
+    /// The committed status report for a completed turn, if one was captured.
+    pub fn turn_summary_for(&self, turn_id: &TurnId) -> Option<&TurnActivitySummary> {
+        self.turn_activity_summaries
+            .iter()
+            .find(|summary| &summary.turn_id == turn_id)
+    }
+
+    /// Stamp the wall-clock start of a turn. Idempotent — a replayed
+    /// `TurnStarted` for a turn already being timed keeps the original start.
+    /// Bounded: turns drain their entry at every terminal event, so growth
+    /// only comes from turns that never terminate; evict the oldest past 64.
+    pub fn note_turn_started(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        const MAX_TRACKED_TURN_STARTS: usize = 64;
+        if self.turn_started_at.len() >= MAX_TRACKED_TURN_STARTS
+            && !self
+                .turn_started_at
+                .contains_key(&(session_id.clone(), turn_id.clone()))
+            && let Some(oldest) = self
+                .turn_started_at
+                .iter()
+                .min_by_key(|(_, started)| **started)
+                .map(|(key, _)| key.clone())
+        {
+            self.turn_started_at.remove(&oldest);
+        }
+        self.turn_started_at
+            .entry((session_id.clone(), turn_id.clone()))
+            .or_insert_with(std::time::Instant::now);
+    }
+
+    /// Take the elapsed seconds of a turn's per-turn clock, removing the entry
+    /// (terminal events consume it exactly once). `None` when this client never
+    /// saw the turn's `TurnStarted` (e.g. attached mid-turn).
+    pub fn take_turn_elapsed_secs(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> Option<u64> {
+        self.turn_started_at
+            .remove(&(session_id.clone(), turn_id.clone()))
+            .map(|started| started.elapsed().as_secs())
+    }
+
+    /// Count of the session's still-running background work (pending/running
+    /// tasks and sub-agents) — the `N still running` half of a turn summary.
+    pub fn running_background_task_count(&self, session_id: &SessionKey) -> usize {
+        self.sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .map(|session| {
+                session
+                    .tasks
+                    .iter()
+                    .filter(|task| matches!(task_state_label(task.state), "pending" | "running"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Record the committed per-turn status report captured at `TurnCompleted`.
+    /// Upserts by `turn_id`, and ensures a [`TurnActivityLog`] exists to anchor
+    /// the summary line in the transcript — for a tool-less turn (no activity
+    /// items) a summary-only log is synthesized so the report still renders
+    /// after the assistant reply. Bounded to the same window as the logs.
+    pub fn attach_turn_summary(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+        elapsed_secs: u64,
+        background_tasks: usize,
+    ) {
+        let summary = TurnActivitySummary {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            elapsed_secs,
+            background_tasks,
+        };
+        if let Some(existing) = self
+            .turn_activity_summaries
+            .iter_mut()
+            .find(|existing| &existing.turn_id == turn_id)
+        {
+            *existing = summary;
+        } else {
+            self.turn_activity_summaries.push(summary);
+        }
+
+        // A tool-less turn has no activity log to hang the summary on; synthesize
+        // an empty-items log anchored like `capture_completed_turn_activity`
+        // anchors real ones (optimistic user message, then prompt anchor, then
+        // the session's latest user message) so the report still renders after
+        // the assistant reply.
+        if !self
+            .turn_activity_logs
+            .iter()
+            .any(|log| &log.session_id == session_id && &log.turn_id == turn_id)
+        {
+            let optimistic =
+                self.optimistic_user_messages.iter().rev().find(|message| {
+                    &message.session_id == session_id && &message.turn_id == turn_id
+                });
+            let prompt_anchor = self
+                .turn_prompt_anchors
+                .iter()
+                .rev()
+                .find(|anchor| &anchor.session_id == session_id && &anchor.turn_id == turn_id);
+            let request = optimistic
+                .map(|message| message.content.clone())
+                .or_else(|| prompt_anchor.map(|anchor| anchor.content.clone()))
+                .or_else(|| {
+                    self.sessions
+                        .iter()
+                        .find(|session| &session.id == session_id)
+                        .and_then(|session| {
+                            session
+                                .messages
+                                .iter()
+                                .rev()
+                                .find(|message| message.role == octos_core::MessageRole::User)
+                                .map(|message| message.content.clone())
+                        })
+                });
+            let anchor_index = optimistic.map(|message| message.anchor_index).or_else(|| {
+                prompt_anchor.and_then(|anchor| resolve_turn_prompt_anchor(&self.sessions, anchor))
+            });
+            self.turn_activity_logs.push(TurnActivityLog {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                request,
+                anchor_index,
+                items: Vec::new(),
+            });
+            const MAX_TURN_ACTIVITY_LOGS: usize = 32;
+            if self.turn_activity_logs.len() > MAX_TURN_ACTIVITY_LOGS {
+                let excess = self.turn_activity_logs.len() - MAX_TURN_ACTIVITY_LOGS;
+                self.turn_activity_logs.drain(0..excess);
+            }
+        }
+
+        // Keep summaries bounded to the surviving logs so the two lists cannot
+        // drift (a summary whose log was trimmed away can never render).
+        let live_turns: std::collections::HashSet<TurnId> = self
+            .turn_activity_logs
+            .iter()
+            .map(|log| log.turn_id.clone())
+            .collect();
+        self.turn_activity_summaries
+            .retain(|summary| live_turns.contains(&summary.turn_id));
+    }
+
     /// Detail marker stamped on activity items created by the M9-γ
     /// projection-envelope `ToolStart` path. The envelope wire shape carries NO
     /// turn identity (it is keyed on `thread_id`/`seq`), so envelope tool items
@@ -6152,6 +6347,51 @@ impl AppState {
         self.load_composer_draft_for_selected_session();
         self.load_pending_messages_for_selected_session();
         self.refresh_run_state_from_selection();
+        // A session that raced the capabilities response missed its open-time
+        // status probe; probe it the moment it becomes active so the composer
+        // footer's model/cwd reflect it (no-op once a status is cached).
+        self.probe_active_session_status_if_missing();
+    }
+
+    /// Enqueue a `session/status/read` for the ACTIVE session when the server
+    /// advertises it and no runtime status is cached yet. One entry at a time —
+    /// bulk-probing every open session could overflow the capped
+    /// autonomy-hydration queue and evict unrelated pending commands. Sessions
+    /// probe on open in the normal flow; this covers the ones that raced the
+    /// capabilities response, lazily, whenever they become (or already are)
+    /// active — the composer footer only ever reads the active session anyway.
+    pub fn probe_active_session_status_if_missing(&mut self) {
+        if self
+            .capabilities
+            .as_ref()
+            .is_some_and(|caps| caps.supports_method(APPUI_METHOD_SESSION_STATUS_READ))
+            && let Some(session_id) = self
+                .active_session()
+                .map(|session| session.id.clone())
+                .filter(|session_id| self.runtime_status_for(session_id).is_none())
+        {
+            self.enqueue_session_status_probe(session_id);
+        }
+    }
+
+    /// Enqueue a `session/status/read`, deduplicating against one already
+    /// queued for the same session: a fresh `session/opened` both switches to
+    /// the session (bundle probe) and probes explicitly, and rapid session
+    /// switches re-probe before the first response lands — without the dedupe
+    /// each duplicate eats a slot of the capped hydration queue and can evict
+    /// unrelated pending commands.
+    pub fn enqueue_session_status_probe(&mut self, session_id: SessionKey) {
+        let already_queued = self.pending_autonomy_hydration.iter().any(|command| {
+            matches!(
+                command,
+                AppUiCommand::ReadSessionStatus(params) if params.session_id == session_id
+            )
+        });
+        if !already_queued {
+            self.enqueue_autonomy_hydration(AppUiCommand::ReadSessionStatus(
+                SessionStatusReadParams { session_id },
+            ));
+        }
     }
 
     /// Stash the ACTIVE session's staged-prompt queue under its key on the way

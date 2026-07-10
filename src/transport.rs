@@ -3394,14 +3394,13 @@ fn capabilities_event(result: ConfigCapabilitiesListResult) -> ClientEvent {
 }
 
 fn session_status_event(result: SessionStatusReadResult) -> ClientEvent {
-    let label = result
-        .runtime_policy_stamp
-        .as_ref()
-        .and_then(|stamp| stamp.model.as_deref())
-        .or_else(|| result.model.as_ref().map(|model| model.model.as_str()))
-        .unwrap_or("runtime");
+    // The active model is shown persistently on the composer's bottom
+    // border (bottom-right) since #257; repeating it in this transient
+    // status line duplicated the model one row away. Keep the message
+    // model-free — `result` still carries the model data that refreshes
+    // the composer footer.
     ClientEvent::SessionStatus(SessionStatusClientEvent {
-        message: format!("Runtime status refreshed: {label}"),
+        message: "Runtime status refreshed".to_string(),
         result,
     })
 }
@@ -4680,6 +4679,7 @@ impl AppUiBackend for MockAppUiBackend {
                             pending_approvals: None,
                             pending_questions: None,
                             replayed_envelopes: None,
+                            replayed_tool_envelopes: None,
                         },
                     }));
                 Ok(())
