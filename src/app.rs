@@ -554,7 +554,7 @@ pub fn finalized_history_lines_range(
             .iter()
             .filter(|(anchor_idx, _)| *anchor_idx == idx)
         {
-            push_turn_activity_log_section(&mut lines, palette, log, app, false);
+            push_turn_activity_log_section(&mut lines, palette, log, app, false, wrap_width);
         }
     }
     // Scrollback content must render on the terminal's NATIVE background, not the
@@ -665,9 +665,11 @@ pub fn finalized_history_lines_range_dedup_live(
                 .iter()
                 .find(|coverage| coverage.matches_turn(&log.session_id, &log.turn_id))
             {
-                push_turn_activity_log_section_unflushed(&mut lines, palette, log, app, coverage);
+                push_turn_activity_log_section_unflushed(
+                    &mut lines, palette, log, app, coverage, wrap_width,
+                );
             } else {
-                push_turn_activity_log_section(&mut lines, palette, log, app, false);
+                push_turn_activity_log_section(&mut lines, palette, log, app, false, wrap_width);
             }
         }
     }
@@ -911,6 +913,7 @@ pub fn finalized_live_turn_lines_between(
             app,
             Some(turn_id),
             &new_activity,
+            wrap_width,
         );
     }
 
@@ -1038,7 +1041,7 @@ fn push_live_reply_segment_separator(
 pub fn finalized_late_activity_lines_for_coverages(
     app: &AppState,
     palette: Palette,
-    _wrap_width: usize,
+    wrap_width: usize,
     live_coverages: &[LiveTurnFinalization],
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -1054,7 +1057,9 @@ pub fn finalized_late_activity_lines_for_coverages(
             .iter()
             .find(|coverage| coverage.matches_turn(&log.session_id, &log.turn_id))
         {
-            push_turn_activity_log_section_unflushed(&mut lines, palette, log, app, coverage);
+            push_turn_activity_log_section_unflushed(
+                &mut lines, palette, log, app, coverage, wrap_width,
+            );
         }
     }
     strip_lines_background(&mut lines);
@@ -2892,7 +2897,7 @@ fn transcript_render_model(app: &AppState, palette: Palette, area: Rect) -> Tran
                 .iter()
                 .filter(|(anchor_idx, _)| *anchor_idx == idx)
             {
-                push_turn_activity_log_section(&mut lines, palette, log, app, true);
+                push_turn_activity_log_section(&mut lines, palette, log, app, true, wrap_width);
             }
 
             if turn_flow_visible && Some(idx) == latest_user_index {
@@ -3284,7 +3289,7 @@ fn push_turn_flow(
         }
     }
 
-    push_activity_section_with_finalization(lines, palette, app, live_finalization);
+    push_activity_section_with_finalization(lines, palette, app, live_finalization, width);
 
     if live_turn_diff_preview_visible(app) {
         push_inline_diff_preview(lines, palette, &app.diff_preview, app.expanded_tool_outputs);
@@ -4378,6 +4383,35 @@ fn truncate_terminal_line(text: &str, max_chars: usize) -> String {
     preview
 }
 
+/// Truncate `text` to at most `max_cols` terminal *display* columns
+/// (unicode-width aware), appending a `…` when it overflows. Unlike
+/// [`truncate_terminal_line`] this counts double-width CJK/emoji glyphs as 2
+/// columns, so a row built from the result can never exceed its column budget
+/// and wrap. Never splits a char and never byte-slices, so it cannot panic on
+/// a multibyte boundary. The returned string's display width is `<= max_cols`.
+fn truncate_to_display_width(text: &str, max_cols: usize) -> String {
+    if text.width() <= max_cols {
+        return text.to_string();
+    }
+    if max_cols == 0 {
+        return String::new();
+    }
+    // Reserve one column for the ellipsis marker.
+    let budget = max_cols - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_w > budget {
+            break;
+        }
+        out.push(ch);
+        used += ch_w;
+    }
+    out.push('…');
+    out
+}
+
 fn line_is_blank(line: Option<&Line<'static>>) -> bool {
     line.map(|line| line.spans.iter().all(|span| span.content.trim().is_empty()))
         .unwrap_or(false)
@@ -4724,13 +4758,72 @@ fn compact_file_path(path: &str) -> String {
     format!(".../{}", components[components.len() - keep..].join("/"))
 }
 
+/// Longest raw-JSON fallback (display columns) `tool_invocation_text` will emit
+/// when it has no better human rendering — a hard cap so a pathological args
+/// blob can never be handed to the row builder unbounded. The per-row width
+/// budget truncates further; this only bounds the worst case.
+const RAW_ARG_FALLBACK_COLS: usize = 512;
+
+/// A human-readable one-line invocation for a tool activity, preferring a real
+/// command string over the raw serialized arguments (which used to leak into
+/// the card as `{"cmd":…}`). Order: an explicit `detail`, then a shell-like
+/// tool's command string, then a compact `key=value` of the first meaningful
+/// object field, then a bounded raw-JSON fallback.
 fn tool_invocation_text(item: &ActivityItem) -> Option<String> {
     if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
         return Some(detail.to_string());
     }
-    item.arguments
-        .as_ref()
-        .and_then(|arguments| serde_json::to_string(arguments).ok())
+    let arguments = item.arguments.as_ref()?;
+    // Shell-like tools carry their command under `command`/`cmd`; surface that
+    // (untruncated — callers like `shell_action_label` match on the full text,
+    // and the row builder applies the display-width budget) instead of the JSON
+    // envelope.
+    if is_shell_like_tool(&item.title) {
+        if let Some(command) = arguments
+            .get("command")
+            .or_else(|| arguments.get("cmd"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+        {
+            return Some(command.to_string());
+        }
+    }
+    // Other tools with an object payload: show a compact `key=value` of the
+    // first meaningful string/number field rather than the whole JSON blob.
+    if let Some(map) = arguments.as_object() {
+        if let Some(rendered) = first_meaningful_arg(map) {
+            return Some(rendered);
+        }
+    }
+    // Last resort: bounded raw JSON (never an unbounded dump).
+    serde_json::to_string(arguments)
+        .ok()
+        .map(|json| truncate_to_display_width(&json, RAW_ARG_FALLBACK_COLS))
+}
+
+/// Case-insensitive check for the shell family whose invocation is a command
+/// string (`shell`/`bash`/`sh`). Kept in one place so the command-extraction in
+/// [`tool_invocation_text`] and the `$ ` prompt in the row builder agree.
+fn is_shell_like_tool(title: &str) -> bool {
+    matches!(title.to_ascii_lowercase().as_str(), "shell" | "bash" | "sh")
+}
+
+/// Render the first meaningful field of an args object as a compact
+/// `key=value`, bounded so a huge value can't blow up the row. Returns `None`
+/// when no scalar (string/number/bool) field is present.
+fn first_meaningful_arg(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    for (key, value) in map {
+        let rendered = match value {
+            serde_json::Value::String(s) if !s.trim().is_empty() => s.trim().to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            _ => continue,
+        };
+        let value = truncate_to_display_width(&rendered, RAW_ARG_FALLBACK_COLS);
+        return Some(format!("{key}={value}"));
+    }
+    None
 }
 
 fn meaningful_output_lines(output: &str) -> Vec<&str> {
@@ -5177,6 +5270,7 @@ fn push_activity_section_with_finalization(
     palette: Palette,
     app: &AppState,
     live_finalization: Option<&LiveTurnFinalization>,
+    wrap_width: usize,
 ) {
     let mut flow_activity = flow_activity_items(app);
     if let Some(finalization) = active_live_finalization(app, live_finalization) {
@@ -5233,6 +5327,7 @@ fn push_activity_section_with_finalization(
                     is_active_group(app, last_turn),
                     app.expanded_tool_outputs,
                     true,
+                    wrap_width,
                 );
                 group.clear();
             }
@@ -5252,6 +5347,7 @@ fn push_activity_section_with_finalization(
             is_active_group(app, last_turn),
             app.expanded_tool_outputs,
             true,
+            wrap_width,
         );
     }
     if flow_activity.len() > recent.len() {
@@ -5350,6 +5446,7 @@ fn push_turn_activity_log_section(
     log: &TurnActivityLog,
     app: &AppState,
     collapse_settled: bool,
+    wrap_width: usize,
 ) {
     let summary = app.turn_summary_for(&log.turn_id);
     // A tool-less turn carries only a summary (no activity items); still render
@@ -5383,6 +5480,7 @@ fn push_turn_activity_log_section(
             is_active_group(app, Some(&log.turn_id)),
             app.expanded_tool_outputs,
             collapse_settled,
+            wrap_width,
         );
         if full.len() > shown.len() {
             let hidden = full.len() - shown.len();
@@ -5414,6 +5512,7 @@ fn push_turn_activity_log_section_unflushed(
     log: &TurnActivityLog,
     app: &AppState,
     coverage: &LiveTurnFinalization,
+    wrap_width: usize,
 ) {
     let items = log
         .items
@@ -5426,7 +5525,14 @@ fn push_turn_activity_log_section_unflushed(
         })
         .map(|(_, item)| item)
         .collect::<Vec<_>>();
-    push_finalized_activity_items_section(lines, palette, app, Some(&log.turn_id), &items);
+    push_finalized_activity_items_section(
+        lines,
+        palette,
+        app,
+        Some(&log.turn_id),
+        &items,
+        wrap_width,
+    );
     // The settling flush routes a still-covered log through this path, so emit
     // the committed turn summary here too (a no-op until the turn completes).
     push_turn_summary_line(lines, palette, app, &log.turn_id);
@@ -5481,6 +5587,7 @@ fn push_finalized_activity_items_section(
     app: &AppState,
     turn_id: Option<&octos_core::ui_protocol::TurnId>,
     items: &[&ActivityItem],
+    wrap_width: usize,
 ) {
     if items.is_empty() {
         return;
@@ -5500,6 +5607,7 @@ fn push_finalized_activity_items_section(
         app.expanded_tool_outputs,
         // Scrollback flush path: the archive never collapses.
         false,
+        wrap_width,
     );
 }
 
@@ -5638,6 +5746,7 @@ fn push_agent_task_group(
     is_active_group: bool,
     expanded: bool,
     collapse_settled: bool,
+    wrap_width: usize,
 ) {
     let active_subagents = subagent_titles.len();
     if items.is_empty() && subagent_titles.is_empty() {
@@ -5699,7 +5808,7 @@ fn push_agent_task_group(
     }
 
     for (idx, item) in items.iter().enumerate() {
-        push_agent_task_child(lines, palette, item, idx == 0, expanded);
+        push_agent_task_child(lines, palette, item, idx == 0, expanded, wrap_width);
     }
 
     // List this turn's running sub-agents (from session.tasks, attributed by
@@ -5709,12 +5818,18 @@ fn push_agent_task_group(
     for (idx, title) in subagent_titles.iter().enumerate() {
         let first = items.is_empty() && idx == 0;
         let prefix = if first { "  ⎿  " } else { "     " };
-        lines.push(Line::from(vec![
-            Span::styled(prefix, palette.border()),
-            Span::styled("◻ ", palette.selected()),
-            Span::styled(title.clone(), palette.muted()),
-            Span::styled(format!("  {}", t!("app.activity.running")), palette.muted()),
-        ]));
+        // Clip to `wrap_width` like every other child row so a long sub-agent
+        // title cannot overflow and wrap to column 0.
+        let spans = clip_line_spans(
+            vec![
+                Span::styled(prefix, palette.border()),
+                Span::styled("◻ ", palette.selected()),
+                Span::styled(title.clone(), palette.muted()),
+                Span::styled(format!("  {}", t!("app.activity.running")), palette.muted()),
+            ],
+            wrap_width,
+        );
+        lines.push(Line::from(spans));
     }
 }
 
@@ -5724,23 +5839,40 @@ fn push_agent_task_child(
     item: &ActivityItem,
     first: bool,
     expanded: bool,
+    wrap_width: usize,
 ) {
     let (icon, icon_style) = activity_status_icon(item, palette);
     let prefix = if first { "  ⎿  " } else { "     " };
+    // Display width consumed by the fixed lead-in (prefix + icon + one space);
+    // the content spans get the remaining budget so the whole row fits within
+    // `wrap_width` and ratatui never wraps it to column 0 (the indent-not-honored
+    // bug). Measured with unicode-width so CJK/emoji prefixes stay exact.
+    let lead_width = prefix.width() + icon.width() + 1;
+    let content_budget = wrap_width.saturating_sub(lead_width);
     let mut spans = vec![
         Span::styled(prefix, palette.border()),
         Span::styled(icon, icon_style),
         Span::styled(" ", palette.muted()),
     ];
-    spans.extend(compact_activity_spans(item, palette));
+    spans.extend(compact_activity_spans(item, palette, content_budget));
+    // Backstop: hard-clip the assembled row to `wrap_width` display columns so
+    // no child line can EVER exceed the transcript width (and wrap to column 0),
+    // even if a branch left an unbudgeted variable part (e.g. a long
+    // recovery-suggestion status). A budgeted row already fits, so this is a
+    // no-op there; it only bites pathological cases.
+    let spans = clip_line_spans(spans, wrap_width);
     lines.push(Line::from(spans));
 
     if item.kind == ActivityKind::Tool {
-        push_compact_tool_preview(lines, palette, item, expanded);
+        push_compact_tool_preview(lines, palette, item, expanded, wrap_width);
     }
 }
 
-fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'static>> {
+fn compact_activity_spans(
+    item: &ActivityItem,
+    palette: Palette,
+    content_budget: usize,
+) -> Vec<Span<'static>> {
     if let Some(mutation) = FileMutationActivity::from_item(item) {
         // Activity rows render uniformly muted, no bold: the runtime log must
         // never outweigh the reply prose or the user's own words.
@@ -5769,15 +5901,29 @@ fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'st
             Span::styled(" ", palette.muted()),
             Span::styled(item.title.clone(), palette.muted()),
         ];
+        // Compute the trailing metadata (duration) up front so its width can be
+        // reserved — the invocation is truncated to fit BEFORE it, keeping the
+        // duration visible instead of getting clipped off the end.
+        let mut meta = Vec::new();
+        push_compact_metadata_spans(&mut meta, palette, item);
         if let Some(invocation) = tool_invocation_text(item) {
-            let prompt = if item.title == "shell" { "$ " } else { "" };
+            let prompt = if is_shell_like_tool(&item.title) {
+                "$ "
+            } else {
+                ""
+            };
             spans.push(Span::styled(": ", palette.muted()));
+            let invocation_budget = remaining_content_budget(content_budget, &spans, &meta)
+                .saturating_sub(prompt.width());
             spans.push(Span::styled(
-                format!("{prompt}{}", truncate_terminal_line(&invocation, 96)),
+                format!(
+                    "{prompt}{}",
+                    truncate_to_display_width(&invocation, invocation_budget)
+                ),
                 palette.muted(),
             ));
         }
-        push_compact_metadata_spans(&mut spans, palette, item);
+        spans.extend(meta);
         return spans;
     }
 
@@ -5785,15 +5931,35 @@ fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'st
         Span::styled(item.title.clone(), palette.muted()),
         Span::styled(format!("  {}", item.status), palette.muted()),
     ];
+    let mut meta = Vec::new();
+    push_compact_metadata_spans(&mut meta, palette, item);
     if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
         spans.push(Span::styled("  ", palette.muted()));
+        let detail_budget = remaining_content_budget(content_budget, &spans, &meta);
         spans.push(Span::styled(
-            truncate_terminal_line(detail, 96),
+            truncate_to_display_width(detail, detail_budget),
             palette.muted(),
         ));
     }
-    push_compact_metadata_spans(&mut spans, palette, item);
+    spans.extend(meta);
     spans
+}
+
+/// Display columns still available for a row's variable part, given the total
+/// `content_budget`, the fixed leading spans already built, and the trailing
+/// metadata spans reserved after it. Saturating so an over-tight budget yields
+/// 0 (the variable part vanishes) rather than underflowing.
+fn remaining_content_budget(
+    content_budget: usize,
+    leading: &[Span<'static>],
+    trailing: &[Span<'static>],
+) -> usize {
+    let used: usize = leading
+        .iter()
+        .chain(trailing.iter())
+        .map(|span| span.content.as_ref().width())
+        .sum();
+    content_budget.saturating_sub(used)
 }
 
 fn push_compact_metadata_spans(
@@ -5807,12 +5973,9 @@ fn push_compact_metadata_spans(
             palette.muted(),
         ));
     }
-    if let Some(tool_call_id) = item.tool_call_id.as_deref() {
-        spans.push(Span::styled(
-            format!("  call {tool_call_id}"),
-            palette.muted(),
-        ));
-    }
+    // No `call <tool_call_id>` span: #267 established "no call-id" for CC-style
+    // activity cards. The `tool_call_id` FIELD is retained (used for keying /
+    // reconciliation); only the noisy display suffix is dropped.
 }
 
 fn push_compact_tool_preview(
@@ -5820,7 +5983,12 @@ fn push_compact_tool_preview(
     palette: Palette,
     item: &ActivityItem,
     expanded: bool,
+    wrap_width: usize,
 ) {
+    // The preview prefix `     │ ` is 7 display columns; budget the content so a
+    // preview line fits within `wrap_width` and never wraps to column 0.
+    const PREVIEW_PREFIX_COLS: usize = 7;
+    let preview_budget = wrap_width.saturating_sub(PREVIEW_PREFIX_COLS);
     let Some(output_preview) = item
         .output_preview
         .as_deref()
@@ -5844,7 +6012,10 @@ fn push_compact_tool_preview(
     for line in preview_lines.iter().take(shown) {
         lines.push(Line::from(vec![
             Span::styled("     │ ", palette.border()),
-            Span::styled(truncate_terminal_line(line, 110), palette.text()),
+            Span::styled(
+                truncate_to_display_width(line, preview_budget),
+                palette.text(),
+            ),
         ]));
     }
     if total > shown {
@@ -5853,26 +6024,32 @@ fn push_compact_tool_preview(
         } else {
             t!("app.hint.ctrl_o_expand").into_owned()
         };
-        lines.push(Line::from(vec![
-            Span::styled("     │ ", palette.border()),
-            Span::styled(
-                t!(
-                    "app.activity.more_lines_hidden",
-                    count = total - shown,
-                    action = action
-                )
-                .into_owned(),
-                palette.muted(),
-            ),
-        ]));
+        lines.push(Line::from(clip_line_spans(
+            vec![
+                Span::styled("     │ ", palette.border()),
+                Span::styled(
+                    t!(
+                        "app.activity.more_lines_hidden",
+                        count = total - shown,
+                        action = action
+                    )
+                    .into_owned(),
+                    palette.muted(),
+                ),
+            ],
+            wrap_width,
+        )));
     } else if expanded && total > COLLAPSED_TOOL_PREVIEW_LINES {
-        lines.push(Line::from(vec![
-            Span::styled("     │ ", palette.border()),
-            Span::styled(
-                t!("app.activity.expanded_hint").into_owned(),
-                palette.muted(),
-            ),
-        ]));
+        lines.push(Line::from(clip_line_spans(
+            vec![
+                Span::styled("     │ ", palette.border()),
+                Span::styled(
+                    t!("app.activity.expanded_hint").into_owned(),
+                    palette.muted(),
+                ),
+            ],
+            wrap_width,
+        )));
     }
 }
 
@@ -8970,7 +9147,7 @@ mod tests {
         let palette = Palette::for_theme(ThemeName::Codex);
         let mut lines = Vec::new();
         let coverage = LiveTurnFinalization::new(&session_id, &turn_id);
-        push_turn_activity_log_section_unflushed(&mut lines, palette, &log, &app, &coverage);
+        push_turn_activity_log_section_unflushed(&mut lines, palette, &log, &app, &coverage, 80);
 
         let text = lines
             .iter()
@@ -11565,12 +11742,145 @@ mod tests {
         assert!(text.contains("1.2s"));
         assert!(!text.contains("Progress"));
         assert!(!text.contains("Work  sticky"));
-        assert!(text.contains("call call-1"));
+        // #267 no-call-id: the activity card must NOT display the `call <id>`
+        // suffix (the tool_call_id field is retained, only the display is gone).
+        assert!(!text.contains("call call-1"));
         assert!(text.contains("gpt-5-codex"));
         assert!(text.contains("state"));
         assert!(text.contains("running"));
         assert!(text.contains("approval"));
         assert!(text.contains("1 msgs/0 tasks"));
+    }
+
+    /// Regression (indent-not-honored): the agent-task child row used to be one
+    /// long ratatui `Line` that overflowed the terminal width and wrapped back
+    /// to column 0 (the transcript renders with `Wrap { trim: false }`, which
+    /// has no hanging indent). Every rendered child line — the invocation row
+    /// AND its output-preview lines — must now fit within `wrap_width` at ANY
+    /// terminal width, measured with unicode-width so a long CJK command
+    /// (double-width glyphs) still fits and never panics at a multibyte cut.
+    #[test]
+    fn agent_task_child_row_never_exceeds_wrap_width() {
+        let long_ascii = format!("echo {}", "abcdefgh ".repeat(40));
+        let long_cjk = format!("echo {}", "数据处理与网络请求".repeat(20));
+        let items = [
+            ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+                .with_arguments(serde_json::json!({ "cmd": long_ascii }))
+                .with_tool_call("call_01_ABCDEFGHIJKLMNOP")
+                .with_output_preview("=== 1. teams ===\nsome very long output line that keeps going and going and going and going and going")
+                .with_success(true)
+                .with_duration_ms(21),
+            ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+                .with_arguments(serde_json::json!({ "cmd": long_cjk }))
+                .with_tool_call("call_02_ZYXWVUTSRQPONMLK")
+                .with_success(true)
+                .with_duration_ms(21),
+        ];
+        for wrap_width in [20usize, 32, 48, 60, 80, 120] {
+            for item in &items {
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                push_agent_task_child(
+                    &mut lines,
+                    Palette::for_theme(ThemeName::Slate),
+                    item,
+                    true,
+                    false,
+                    wrap_width,
+                );
+                assert!(
+                    !lines.is_empty(),
+                    "child row should render at least one line"
+                );
+                for line in &lines {
+                    let w: usize = line
+                        .spans
+                        .iter()
+                        .map(|span| span.content.as_ref().width())
+                        .sum();
+                    assert!(
+                        w <= wrap_width,
+                        "child line width {w} exceeds wrap_width {wrap_width}: {:?}",
+                        lines_text(&lines)
+                    );
+                }
+            }
+        }
+    }
+
+    /// The bash row must surface the actual command (`$ echo …`), never the raw
+    /// serialized arguments (`{"cmd":…}`), and must not append the `call <id>`
+    /// noise (#267 established "no call-id" for CC-style activity cards; this
+    /// agent-task-group child path predated that work and still leaked both).
+    #[test]
+    fn agent_task_bash_row_shows_command_not_raw_json_or_call_id() {
+        let item = ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+            .with_arguments(serde_json::json!({
+                "cmd": "echo \"=== 1. teams ===\" && curl -sX POST http://localhost:4000/"
+            }))
+            .with_tool_call("call_01_UVIa9EBA331xAfxbPFPM4446")
+            .with_success(false)
+            .with_duration_ms(21);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        push_agent_task_child(
+            &mut lines,
+            Palette::for_theme(ThemeName::Slate),
+            &item,
+            true,
+            false,
+            120,
+        );
+        let text = lines_text(&lines);
+        assert!(
+            text.contains("$ echo"),
+            "bash row must show the command: {text:?}"
+        );
+        assert!(
+            !text.contains("{\"cmd\""),
+            "bash row must not show raw JSON args: {text:?}"
+        );
+        assert!(
+            !text.contains("call call_"),
+            "bash row must not show call-id noise: {text:?}"
+        );
+        assert!(
+            !text.contains("call_01_UVIa9EBA331xAfxbPFPM4446"),
+            "the call-id must not be displayed: {text:?}"
+        );
+    }
+
+    /// The recovery-suggestion row (a non-Tool `Warning` activity) also predated
+    /// the no-call-id convention — it must not append `call <id>` either (the
+    /// exact fragment that wrapped to column 0 in the reported bug).
+    #[test]
+    fn agent_task_recovery_row_drops_call_id() {
+        let item = ActivityItem::new(
+            ActivityKind::Warning,
+            "Recovery suggestion",
+            "permission blocked; ask for the exact permission/escalation",
+        )
+        .with_tool_call("call_01_UVIa9EBA331xAfxbPFPM4446");
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        push_agent_task_child(
+            &mut lines,
+            Palette::for_theme(ThemeName::Slate),
+            &item,
+            false,
+            false,
+            120,
+        );
+        let text = lines_text(&lines);
+        assert!(
+            text.contains("Recovery suggestion"),
+            "recovery row should render: {text:?}"
+        );
+        assert!(
+            !text.contains("call call_"),
+            "recovery row must not show call-id noise: {text:?}"
+        );
+        assert!(
+            !text.contains("call_01_"),
+            "recovery row call-id must not be displayed: {text:?}"
+        );
     }
 
     /// An armed loop fires real model turns on an interval — the status bar
