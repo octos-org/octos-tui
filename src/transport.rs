@@ -4679,6 +4679,7 @@ impl AppUiBackend for MockAppUiBackend {
                             pending_approvals: None,
                             pending_questions: None,
                             replayed_envelopes: None,
+                            replayed_tool_envelopes: None,
                         },
                     }));
                 Ok(())

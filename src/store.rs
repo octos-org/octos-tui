@@ -6031,6 +6031,68 @@ impl Store {
                 });
         }
 
+        // #1515 replay lane: the server ships the session's persisted
+        // tool_start/progress/end projection envelopes on hydrate (stdio
+        // negotiates `event.spawn_complete.v1` by default). Re-apply them so
+        // archived turn groups regain their per-action rows after a client
+        // restart, instead of rendering a bare "N action(s)" header with no
+        // children. Idempotent via `applied_hydrate_tool_envelopes`.
+        if let Some(envelopes) = result.replayed_tool_envelopes.as_deref() {
+            // Envelopes from the legacy-notification emitter use the TURN id
+            // as their thread id, and hydrated turns may carry no thread_id at
+            // all — index by BOTH so replay rows resolve their turn either way.
+            let thread_turns: std::collections::HashMap<
+                String,
+                &octos_core::ui_protocol::HydratedTurn,
+            > = result
+                .turns
+                .iter()
+                .flatten()
+                .flat_map(|turn| {
+                    turn.thread_id
+                        .clone()
+                        .map(|thread| (thread, turn))
+                        .into_iter()
+                        .chain(std::iter::once((turn.turn_id.0.to_string(), turn)))
+                })
+                .collect();
+            // tool_call_ids whose ToolStart THIS pass created — Progress/End
+            // envelopes only ever mutate rows this replay owns (or upgrade a
+            // still-running row), never a richer live-streamed terminal row.
+            let mut created: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for envelope in envelopes {
+                self.apply_replayed_tool_envelope(
+                    &session_id,
+                    envelope,
+                    &thread_turns,
+                    &mut created,
+                );
+            }
+            // Archive replayed rows of already-terminal turns so they render
+            // as completed turn groups (children under the summary chip)
+            // rather than lingering in the live activity strip. Never capture
+            // the currently-streaming turn.
+            let live_turn = self
+                .state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .and_then(|session| session.live_reply.as_ref())
+                .map(|live_reply| live_reply.turn_id.clone());
+            for turn in result.turns.iter().flatten() {
+                let is_terminal = matches!(
+                    turn.state,
+                    TurnLifecycleState::Completed
+                        | TurnLifecycleState::Errored
+                        | TurnLifecycleState::Interrupted
+                );
+                if is_terminal && live_turn.as_ref() != Some(&turn.turn_id) {
+                    self.state
+                        .capture_completed_turn_activity(&session_id, &turn.turn_id);
+                }
+            }
+        }
+
         if let Some(turns) = result.turns.as_ref() {
             // GAP 1: orphan activity-chip self-heal on the rehydrate path. A
             // client rehydrating a session whose turn is already TERMINAL
@@ -6122,6 +6184,140 @@ impl Store {
         };
         self.state.status = t!("status.session_hydrated", summary = summary).into_owned();
         drain
+    }
+
+    /// Apply one hydrate-replayed tool envelope (#1515) quietly: transcript
+    /// activity effects only — no run-state flips, no status-bar writes (the
+    /// replayed turn is history, not live work).
+    fn apply_replayed_tool_envelope(
+        &mut self,
+        session_id: &SessionKey,
+        envelope: &octos_core::ui_protocol::Envelope,
+        thread_turns: &std::collections::HashMap<String, &octos_core::ui_protocol::HydratedTurn>,
+        created: &mut std::collections::HashSet<String>,
+    ) {
+        let key = (
+            session_id.0.clone(),
+            envelope.thread_id.clone(),
+            envelope.seq,
+        );
+        if !self.state.applied_hydrate_tool_envelopes.insert(key) {
+            return;
+        }
+        let turn_id = thread_turns
+            .get(envelope.thread_id.as_str())
+            .map(|turn| turn.turn_id.clone());
+        match &envelope.payload {
+            Payload::ToolStart {
+                tool_call_id,
+                name,
+                arguments_preview,
+            } => {
+                // A live-streamed row (or a prior replay already archived into
+                // the turn log) covers this call — never double-render it.
+                let in_live = self
+                    .state
+                    .activity
+                    .iter()
+                    .any(|item| item.tool_call_id.as_deref() == Some(tool_call_id.as_str()));
+                let in_archive = turn_id.as_ref().is_some_and(|turn| {
+                    self.state.turn_activity_logs.iter().any(|log| {
+                        &log.turn_id == turn
+                            && log.items.iter().any(|item| {
+                                item.tool_call_id.as_deref() == Some(tool_call_id.as_str())
+                            })
+                    })
+                });
+                if in_live || in_archive {
+                    return;
+                }
+                created.insert(tool_call_id.clone());
+                let mut item = ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
+                    .with_tool_call(tool_call_id.clone());
+                item = match turn_id {
+                    Some(turn) => {
+                        // Turn-scoped rows reconcile by turn_id, so `detail`
+                        // is free for the invocation echo (`command: …`).
+                        let mut item = item.with_turn(turn);
+                        if let Some(preview) = arguments_preview.clone() {
+                            item = item.with_detail(preview);
+                        }
+                        item
+                    }
+                    None => {
+                        // Thread marker stays load-bearing for the envelope
+                        // heal; the args preview rides in `arguments` instead.
+                        let mut item = item.with_session(session_id.clone()).with_detail(
+                            AppState::envelope_tool_detail_for_thread(&envelope.thread_id),
+                        );
+                        if let Some(preview) = arguments_preview.clone() {
+                            item = item.with_arguments(serde_json::Value::String(preview));
+                        }
+                        item
+                    }
+                };
+                self.state.push_activity(item);
+            }
+            Payload::ToolProgress {
+                tool_call_id,
+                message,
+            } => {
+                if !created.contains(tool_call_id) {
+                    return;
+                }
+                // Archived rows keep the invocation echo in `detail`; the
+                // latest progress line rides as the interim result excerpt
+                // (ToolEnd's real excerpt replaces it when present).
+                self.state.update_tool_activity(
+                    tool_call_id,
+                    "running",
+                    None,
+                    Some(message.clone()),
+                    None,
+                    None,
+                );
+            }
+            Payload::ToolEnd {
+                tool_call_id,
+                status,
+                error,
+                reason,
+                output_preview,
+                duration_ms,
+            } => {
+                // Apply when this replay created the row, or upgrade a row
+                // that is still "running" (its Start was applied by an earlier
+                // hydrate whose ledger already holds the Start seq). Never
+                // touch a terminal row — a live-streamed completion may carry
+                // richer output than the envelope.
+                let upgradeable = created.contains(tool_call_id)
+                    || self.state.activity.iter().any(|item| {
+                        item.tool_call_id.as_deref() == Some(tool_call_id.as_str())
+                            && item.status == "running"
+                    });
+                if !upgradeable {
+                    return;
+                }
+                let (label, success) = match status {
+                    EnvelopeToolEndStatus::Complete => ("complete", Some(true)),
+                    EnvelopeToolEndStatus::Error => ("failed", Some(false)),
+                    EnvelopeToolEndStatus::Skipped => ("skipped", None),
+                    EnvelopeToolEndStatus::Aborted => ("aborted", Some(false)),
+                };
+                // Same layout as the live arm: keep the invocation echo in
+                // `detail`; the failure text is the result excerpt.
+                let failure_text = error.clone().or_else(|| reason.clone());
+                self.state.update_tool_activity(
+                    tool_call_id,
+                    label,
+                    None,
+                    output_preview.clone().or(failure_text),
+                    success,
+                    *duration_ms,
+                );
+            }
+            _ => {}
+        }
     }
 
     fn apply_review_start_result(&mut self, result: ReviewStartResult) {
@@ -6594,6 +6790,9 @@ impl Store {
             UiNotification::VisualGenerating(_)
             | UiNotification::VisualSucceeded(_)
             | UiNotification::VisualFailed(_) => None,
+            // Streamed voice audio (#1504) — the TUI has no audio surface;
+            // ignore gracefully so newer servers don't wedge the client.
+            UiNotification::VoiceAudioChunk(_) => None,
             UiNotification::SessionOpened(event) => {
                 let session_id = event.session_id.clone();
                 // Restore the server-persisted per-session reasoning effort so
@@ -7452,13 +7651,23 @@ impl Store {
                 self.upsert_envelope_assistant_reasoning(&session_id, &thread_id, text);
                 None
             }
-            Payload::ToolStart { tool_call_id, name } => {
-                self.state.push_activity(
-                    ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
-                        .with_tool_call(tool_call_id.clone())
-                        .with_session(session_id.clone())
-                        .with_detail(AppState::envelope_tool_detail_for_thread(&thread_id)),
-                );
+            Payload::ToolStart {
+                tool_call_id,
+                name,
+                arguments_preview,
+            } => {
+                let mut item = ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
+                    .with_tool_call(tool_call_id.clone())
+                    .with_session(session_id.clone())
+                    // The thread marker is load-bearing: the envelope-thread
+                    // heal matches items by this exact detail string, so the
+                    // args preview rides in `arguments` (the renderer's
+                    // `tool_invocation_text` fallback) instead.
+                    .with_detail(AppState::envelope_tool_detail_for_thread(&thread_id));
+                if let Some(preview) = arguments_preview {
+                    item = item.with_arguments(serde_json::Value::String(preview));
+                }
+                self.state.push_activity(item);
                 if self.event_targets_active_session(&session_id) {
                     self.state.set_run_state_in_progress();
                 }
@@ -7489,6 +7698,8 @@ impl Store {
                 status,
                 error,
                 reason,
+                output_preview,
+                duration_ms,
             } => {
                 let (label, success) = match status {
                     EnvelopeToolEndStatus::Complete => ("complete", Some(true)),
@@ -7496,14 +7707,17 @@ impl Store {
                     EnvelopeToolEndStatus::Skipped => ("skipped", None),
                     EnvelopeToolEndStatus::Aborted => ("aborted", Some(false)),
                 };
-                let detail = error.or(reason);
+                // `detail` stays untouched: it carries the load-bearing
+                // thread marker (envelope-heal key) or the invocation echo.
+                // Error / reason text belongs in the result excerpt.
+                let failure_text = error.or(reason);
                 self.state.update_tool_activity(
                     &tool_call_id,
                     label,
-                    detail.clone(),
-                    detail,
-                    success,
                     None,
+                    output_preview.or(failure_text),
+                    success,
+                    duration_ms,
                 );
                 self.state.status = format!("Tool {label}: {tool_call_id}");
                 None
@@ -11719,6 +11933,7 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
+                replayed_tool_envelopes: None,
             },
         }));
 
@@ -11778,6 +11993,7 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
+                replayed_tool_envelopes: None,
             },
         }));
 
@@ -11845,6 +12061,7 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
+                replayed_tool_envelopes: None,
             },
         }));
 
@@ -18660,6 +18877,7 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-leaked".into(),
                 name: "run_pipeline".into(),
+                arguments_preview: None,
             },
         )));
         // Terminal barrier for the thread — no ToolEnd ever came for call-leaked.
@@ -18703,6 +18921,7 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-done".into(),
                 name: "run_pipeline".into(),
+                arguments_preview: None,
             },
         )));
         store.apply_event(AppUiEvent::Protocol(envelope_notification(
@@ -18713,6 +18932,8 @@ mod tests {
                 status: EnvelopeToolEndStatus::Complete,
                 error: None,
                 reason: None,
+                output_preview: None,
+                duration_ms: None,
             },
         )));
         store.apply_event(AppUiEvent::Protocol(envelope_notification(
@@ -18757,6 +18978,7 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-a".into(),
                 name: "run_pipeline".into(),
+                arguments_preview: None,
             },
         )));
         store.apply_event(AppUiEvent::Protocol(envelope_notification(
@@ -18765,6 +18987,7 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-b".into(),
                 name: "run_pipeline".into(),
+                arguments_preview: None,
             },
         )));
 
@@ -19055,6 +19278,7 @@ mod tests {
                 Payload::ToolStart {
                     tool_call_id: "call-topic".into(),
                     name: "run_pipeline".into(),
+                    arguments_preview: None,
                 },
             ),
         );
@@ -23106,6 +23330,7 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
+            replayed_tool_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -23228,6 +23453,7 @@ mod tests {
                 content: "background result".into(),
                 media: vec!["out.md".into()],
             }]),
+            replayed_tool_envelopes: None,
         };
 
         store.apply_client_event(ClientEvent::SessionHydrate(result));
@@ -23293,6 +23519,7 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
+            replayed_tool_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -23310,6 +23537,193 @@ mod tests {
         assert!(
             !crate::model::activity_status_is_running(&leaked.status),
             "the reconciled item must no longer read as running"
+        );
+    }
+
+    #[test]
+    fn hydrate_replays_tool_envelopes_into_archived_turn_group() {
+        use crate::client_event::ClientEvent;
+        // #1515 replay lane: a client restarting mid-project hydrates a
+        // session whose past turn ran tools. The replayed envelopes must
+        // materialize per-action rows (name + terminal status + error detail)
+        // and land in the turn's archived activity log — the group chip must
+        // not read "1 action(s) · 1 failed" with no children.
+        let turn_id = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Production shape: legacy-notification envelopes use the TURN id
+        // as their thread id, and the hydrated turn carries thread_id: None —
+        // the replay must resolve the turn through the turn-id key.
+        let envelope = |seq: u64, payload: Payload| Envelope {
+            thread_id: turn_id.0.to_string(),
+            seq,
+            client_message_id: None,
+            payload,
+        };
+        let result = SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 9,
+            },
+            context: None,
+            context_state: None,
+            messages: None,
+            threads: None,
+            turns: Some(vec![HydratedTurn {
+                turn_id: turn_id.clone(),
+                state: TurnLifecycleState::Errored,
+                started_at: None,
+                completed_at: None,
+                thread_id: None,
+            }]),
+            pending_approvals: None,
+            pending_questions: None,
+            replayed_envelopes: None,
+            replayed_tool_envelopes: Some(vec![
+                envelope(
+                    4,
+                    Payload::ToolStart {
+                        tool_call_id: "tc-replay-1".into(),
+                        name: "shell".into(),
+                        arguments_preview: Some("command: \"cargo test\"".into()),
+                    },
+                ),
+                envelope(
+                    5,
+                    Payload::ToolProgress {
+                        tool_call_id: "tc-replay-1".into(),
+                        message: "running cargo test".into(),
+                    },
+                ),
+                envelope(
+                    6,
+                    Payload::ToolEnd {
+                        tool_call_id: "tc-replay-1".into(),
+                        status: EnvelopeToolEndStatus::Error,
+                        error: Some("exit status 101".into()),
+                        reason: None,
+                        output_preview: Some("error[E0308]: mismatched types".into()),
+                        duration_ms: Some(2500),
+                    },
+                ),
+            ]),
+        };
+        store.apply_client_event(ClientEvent::SessionHydrate(result));
+
+        // The terminal turn's replayed rows are archived into the turn log.
+        let log = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_id)
+            .expect("replayed tool rows must be captured into the turn log");
+        let row = log
+            .items
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("tc-replay-1"))
+            .expect("the replayed action row exists");
+        assert_eq!(row.title, "shell");
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.success, Some(false));
+        // Full fidelity: the invocation echo, the result excerpt, and the
+        // duration all survive the replay (Claude-Code-style tool card).
+        assert_eq!(
+            row.detail.as_deref(),
+            Some("command: \"cargo test\""),
+            "turn-scoped replay rows carry the argument echo as detail"
+        );
+        assert_eq!(
+            row.output_preview.as_deref(),
+            Some("error[E0308]: mismatched types"),
+            "the result excerpt must land on the row"
+        );
+        assert_eq!(row.duration_ms, Some(2500));
+        // Quiet replay: history must not flip the live run state.
+        assert!(
+            store.state.active_turn().is_none(),
+            "replaying history must not resurrect an active turn"
+        );
+    }
+
+    #[test]
+    fn hydrate_tool_envelope_replay_is_idempotent_across_rehydrates() {
+        use crate::client_event::ClientEvent;
+        // Hydrate re-runs on every reconnect; the (session, thread, seq)
+        // ledger must make the replay apply-once.
+        let turn_id = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let make_result = || SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 9,
+            },
+            context: None,
+            context_state: None,
+            messages: None,
+            threads: None,
+            turns: Some(vec![HydratedTurn {
+                turn_id: turn_id.clone(),
+                state: TurnLifecycleState::Completed,
+                started_at: None,
+                completed_at: None,
+                thread_id: Some("thread-replay-2".into()),
+            }]),
+            pending_approvals: None,
+            pending_questions: None,
+            replayed_envelopes: None,
+            replayed_tool_envelopes: Some(vec![
+                Envelope {
+                    thread_id: "thread-replay-2".into(),
+                    seq: 1,
+                    client_message_id: None,
+                    payload: Payload::ToolStart {
+                        tool_call_id: "tc-idem".into(),
+                        name: "read_file".into(),
+                        arguments_preview: None,
+                    },
+                },
+                Envelope {
+                    thread_id: "thread-replay-2".into(),
+                    seq: 2,
+                    client_message_id: None,
+                    payload: Payload::ToolEnd {
+                        tool_call_id: "tc-idem".into(),
+                        status: EnvelopeToolEndStatus::Complete,
+                        error: None,
+                        reason: None,
+                        output_preview: None,
+                        duration_ms: None,
+                    },
+                },
+            ]),
+        };
+
+        store.apply_client_event(ClientEvent::SessionHydrate(make_result()));
+        store.apply_client_event(ClientEvent::SessionHydrate(make_result()));
+
+        let log = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_id)
+            .expect("turn log captured");
+        let rows = log
+            .items
+            .iter()
+            .filter(|item| item.tool_call_id.as_deref() == Some("tc-idem"))
+            .count();
+        assert_eq!(rows, 1, "re-hydrating must not duplicate replayed rows");
+        assert!(
+            !store
+                .state
+                .activity
+                .iter()
+                .any(|item| item.tool_call_id.as_deref() == Some("tc-idem")),
+            "captured rows must leave the live activity strip"
         );
     }
 
@@ -23349,6 +23763,7 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
+            replayed_tool_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -23400,6 +23815,7 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
+                replayed_tool_envelopes: None,
             };
             store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -23471,6 +23887,7 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
+                replayed_tool_envelopes: None,
             };
             store.apply_client_event(ClientEvent::SessionHydrate(result));
 
