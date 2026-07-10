@@ -3401,6 +3401,11 @@ pub struct AppState {
     pub diff_preview: DiffPreviewPaneState,
     pub activity: Vec<ActivityItem>,
     pub turn_activity_logs: Vec<TurnActivityLog>,
+    /// Hydrate-replayed tool envelopes already applied, keyed by
+    /// `(session, thread_id, seq)` — `seq` is the envelope's identity within
+    /// its thread (#1515). Hydrate re-runs on every reconnect; without this
+    /// ledger each re-run would duplicate the per-action rows.
+    pub applied_hydrate_tool_envelopes: std::collections::HashSet<(String, String, u64)>,
     pub turn_activity_summaries: Vec<TurnActivitySummary>,
     /// Wall-clock starts of in-flight turns, keyed by (session, turn). The
     /// committed per-turn status report reads its duration here — the global
@@ -5189,6 +5194,7 @@ impl AppState {
             diff_preview: DiffPreviewPaneState::default(),
             activity: Vec::new(),
             turn_activity_logs: Vec::new(),
+            applied_hydrate_tool_envelopes: std::collections::HashSet::new(),
             turn_activity_summaries: Vec::new(),
             turn_started_at: std::collections::HashMap::new(),
             btw_asides: std::collections::HashMap::new(),
@@ -5334,14 +5340,32 @@ impl AppState {
         }
     }
 
-    /// Replace the loop list for a session.
+    /// Replace the loop list for a session, dropping tombstones.
+    ///
+    /// Mirrors [`Self::upsert_session_loop`], which strips
+    /// `status == "deleted"` records "so reconnect doesn't surface
+    /// tombstones". This path — the `loop/list` response and
+    /// reconnect rehydration — must apply the SAME filter. Otherwise a
+    /// backend that echoes deleted loops in `loop/list` leaves dimmed
+    /// zombie chips in the sticky autonomy indicator that `/loop delete`
+    /// can no longer clear (the `#1576` delete-can't-clear-the-chip
+    /// lineage): the active/paused counts already exclude them, so the
+    /// row reads "0 running" yet still shows chips.
+    ///
+    /// Returns the number of loops actually retained (after dropping
+    /// tombstones) so callers can report a count that matches what the
+    /// indicator now shows, rather than the raw response length.
     pub fn set_session_loops(
         &mut self,
         session_id: &SessionKey,
         loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
-    ) {
+    ) -> usize {
         let entry = self.session_autonomy_mut(session_id);
-        entry.loops = loops;
+        entry.loops = loops
+            .into_iter()
+            .filter(|loop_state| loop_state.status != "deleted")
+            .collect();
+        entry.loops.len()
     }
 
     /// Upsert one loop record by `loop_id`. Removes the loop when its
