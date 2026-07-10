@@ -12755,6 +12755,82 @@ mod tests {
     }
 
     #[test]
+    fn compaction_completed_event_renders_prominent_notice_end_to_end() {
+        use octos_core::app_ui::AppUiEvent;
+        use octos_core::ui_protocol::{
+            ContextCompactionCompletedEvent, UiContextCompactionRecord, UiContextState,
+            UiNotification,
+        };
+        let session_id = SessionKey("local:test".into());
+        // Compaction is reported DURING a turn — give the session a live reply
+        // so the notice is turn-stamped (else it is suppressed mid-turn).
+        let turn_id = TurnId::new();
+        let mut store = Store {
+            state: AppState::new(
+                vec![SessionView {
+                    id: session_id.clone(),
+                    title: "test".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::user("do heavy work")],
+                    tasks: vec![],
+                    live_reply: Some(crate::model::LiveReply {
+                        turn_id,
+                        text: String::new(),
+                    }),
+                }],
+                0,
+                "ready".into(),
+                None,
+                false,
+            ),
+        };
+
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
+                session_id: session_id.clone(),
+                context_state: UiContextState {
+                    session_id: session_id.clone(),
+                    thread_id: None,
+                    generation: 4,
+                    transcript_hash: "abc123".into(),
+                    item_count: 42,
+                    token_estimate: 40_000,
+                    recovery_state: "healthy".into(),
+                    last_checkpoint_id: None,
+                    last_compaction_id: Some("comp-001".into()),
+                },
+                compaction: UiContextCompactionRecord {
+                    compaction_id: "comp-001".into(),
+                    checkpoint_id: "chk-001".into(),
+                    status: "applied".into(),
+                    policy_id: "default".into(),
+                    trigger: "token_budget".into(),
+                    input_generation: 3,
+                    output_generation: Some(4),
+                    input_transcript_hash: "input-h".into(),
+                    replacement_transcript_hash: Some("abc123".into()),
+                    installed_transcript_hash: Some("abc123".into()),
+                    input_item_count: 130,
+                    retained_count: 42,
+                    dropped_count: 88,
+                    summary_item_id: Some("sum-1".into()),
+                    token_estimate_before: 120_000,
+                    token_estimate_after: Some(40_000),
+                    error: None,
+                },
+            }),
+        ));
+
+        store.state.expanded_tool_outputs = true;
+        let text = rendered_text(&store.state);
+        // Full path: Completed event → persistent notice → prominent ✦ render.
+        assert!(
+            text.contains("✦ context compacted"),
+            "a real compaction Completed event must render the prominent notice, got:\n{text}"
+        );
+    }
+
+    #[test]
     fn render_file_mutation_progress_as_separate_activity_block() {
         let mut app = AppState::new(
             vec![SessionView {
