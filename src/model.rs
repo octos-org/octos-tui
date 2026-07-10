@@ -988,13 +988,15 @@ pub struct SessionStatusReadResult {
 /// an `invalid_result` app error and the composer footer degrades to the
 /// `<server authenticated profile>` placeholder.
 ///
-/// Semantics: `null`, a missing key, or an object whose `model` or
-/// `provider` member is null/absent all MEAN "no model resolved" and decode
-/// to `None` (the footer renders its regular no-model state). Everything
-/// else decodes as a normal [`ModelStatus`]; an object whose members are
-/// present but wrongly typed is a real protocol error and still fails —
-/// this tolerance only maps the no-model shapes, it must not mask malformed
-/// results.
+/// Semantics: `null`, a missing key, or an otherwise well-formed object
+/// whose `model` or `provider` member is null/absent all MEAN "no model
+/// resolved" and decode to `None` (the footer renders its regular no-model
+/// state). Everything else decodes as a normal [`ModelStatus`]; any
+/// wrongly-typed member is a real protocol error and still fails — the
+/// object is first validated through [`ModelStatusShapeProbe`], so a null
+/// `model`/`provider` never becomes a bypass that masks a malformed
+/// sibling. Unknown extra members keep being ignored, exactly like a plain
+/// [`ModelStatus`] decode.
 fn deserialize_status_model<'de, D>(deserializer: D) -> Result<Option<ModelStatus>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1002,15 +1004,52 @@ where
     let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
         return Ok(None);
     };
-    if let Some(object) = value.as_object() {
-        let unresolved = |key: &str| object.get(key).is_none_or(serde_json::Value::is_null);
-        if unresolved("model") || unresolved("provider") {
+    if value.is_object() {
+        let probe = ModelStatusShapeProbe::deserialize(&value).map_err(serde::de::Error::custom)?;
+        if probe.model.is_none() || probe.provider.is_none() {
             return Ok(None);
         }
     }
     ModelStatus::deserialize(value)
         .map(Some)
         .map_err(serde::de::Error::custom)
+}
+
+/// [`ModelStatus`] with `model`/`provider` relaxed to `Option` — used ONLY
+/// by [`deserialize_status_model`] to validate a candidate object before the
+/// no-model mapping. Every member a [`ModelStatus`] would type-check is
+/// type-checked here too (null/absent `model`/`provider` being the one
+/// permitted extra), so the skew tolerance cannot swallow a wrongly-typed
+/// sibling like `{"model": null, "provider": 42}`. The `Some` path then
+/// decodes the original value as a plain [`ModelStatus`], so any future
+/// `ModelStatus` field is picked up there without touching this probe.
+#[derive(Deserialize)]
+struct ModelStatusShapeProbe {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    title: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    family: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    route: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    selected: bool,
+    #[serde(default)]
+    #[allow(dead_code)]
+    available: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    queue_mode: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    qoe_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

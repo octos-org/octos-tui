@@ -6639,6 +6639,43 @@ mod tests {
         assert_eq!(error.code, "invalid_result");
     }
 
+    /// A null `model` member must not become a validation bypass: siblings
+    /// that ARE present still have to be well-typed, otherwise the
+    /// no-model mapping would mask a genuinely malformed result.
+    #[test]
+    fn session_status_null_model_member_with_malformed_sibling_still_errors() {
+        let event = decode_status_read_frame(server_status_read_result(Some(json!({
+            "model": null,
+            "provider": 42,
+            "selected": true
+        }))));
+
+        let ClientEvent::App(event) = event else {
+            panic!("expected app error event, got {event:?}");
+        };
+        let AppUiEvent::Error(error) = *event else {
+            panic!("expected invalid_result error, got {event:?}");
+        };
+        assert_eq!(error.code, "invalid_result");
+    }
+
+    #[test]
+    fn session_status_no_model_shape_with_malformed_selected_still_errors() {
+        let event = decode_status_read_frame(server_status_read_result(Some(json!({
+            "model": null,
+            "provider": null,
+            "selected": "yes"
+        }))));
+
+        let ClientEvent::App(event) = event else {
+            panic!("expected app error event, got {event:?}");
+        };
+        let AppUiEvent::Error(error) = *event else {
+            panic!("expected invalid_result error, got {event:?}");
+        };
+        assert_eq!(error.code, "invalid_result");
+    }
+
     #[test]
     fn protocol_readonly_policy_allows_read_style_and_blocks_mutations() {
         let session_id = SessionKey("local:test".into());
