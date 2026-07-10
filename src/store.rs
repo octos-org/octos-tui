@@ -3400,14 +3400,18 @@ impl Store {
         if len == 0 {
             return true;
         }
-        let mut next = (frame.selected_index + 1) % len;
+        let mut candidate = (frame.selected_index + 1) % len;
+        let mut found = None;
         for _ in 0..len {
-            if active_menu_index_selectable(self.state.active_menu.as_ref(), next) {
+            if active_menu_index_selectable(self.state.active_menu.as_ref(), candidate) {
+                found = Some(candidate);
                 break;
             }
-            next = (next + 1) % len;
+            candidate = (candidate + 1) % len;
         }
-        if let Some(frame) = self.state.menu_stack.active_mut() {
+        // Only move focus if a selectable row exists; an all-non-selectable
+        // menu leaves the cursor put rather than landing on a divider.
+        if let (Some(next), Some(frame)) = (found, self.state.menu_stack.active_mut()) {
             frame.selected_index = next;
         }
         self.refresh_active_menu();
@@ -3422,18 +3426,24 @@ impl Store {
         if len == 0 {
             return true;
         }
-        let mut prev = if frame.selected_index == 0 {
+        let mut candidate = if frame.selected_index == 0 {
             len - 1
         } else {
             frame.selected_index - 1
         };
+        let mut found = None;
         for _ in 0..len {
-            if active_menu_index_selectable(self.state.active_menu.as_ref(), prev) {
+            if active_menu_index_selectable(self.state.active_menu.as_ref(), candidate) {
+                found = Some(candidate);
                 break;
             }
-            prev = if prev == 0 { len - 1 } else { prev - 1 };
+            candidate = if candidate == 0 {
+                len - 1
+            } else {
+                candidate - 1
+            };
         }
-        if let Some(frame) = self.state.menu_stack.active_mut() {
+        if let (Some(prev), Some(frame)) = (found, self.state.menu_stack.active_mut()) {
             frame.selected_index = prev;
         }
         self.refresh_active_menu();
@@ -10165,6 +10175,36 @@ mod tests {
             row_checked(&store),
             Some(true),
             "the open menu row's checkbox must flip on immediately"
+        );
+    }
+
+    #[test]
+    fn menu_nav_holds_focus_when_no_selectable_rows() {
+        // Edge case (codex P1): an all-non-selectable menu must not move the
+        // cursor onto a non-selectable row — focus stays put.
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_THINKING));
+        // Force every row non-selectable in the built menu.
+        if let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_mut() {
+            for item in &mut spec.items {
+                item.state.non_selectable = true;
+            }
+        }
+        if let Some(frame) = store.state.menu_stack.active_mut() {
+            frame.selected_index = 2;
+        }
+        // refresh_active_menu would rebuild (restoring selectable rows), so call
+        // the nav directly against the mutated menu and assert no move happened
+        // before the rebuild — index stays at 2.
+        let before = store.state.menu_stack.active().map(|f| f.selected_index);
+        store.select_next_menu_item();
+        // After select_next the menu is rebuilt to the real (selectable) spec,
+        // but the index must not have been parked on a non-selectable row by
+        // the mutated pass; with all rows unselectable it holds at `before`.
+        assert_eq!(
+            store.state.menu_stack.active().map(|f| f.selected_index),
+            before,
+            "focus must not move when no selectable row exists"
         );
     }
 
