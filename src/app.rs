@@ -1198,11 +1198,7 @@ pub fn committed_messages_fingerprint(app: &AppState) -> CommittedFingerprint {
         // *replaces* history (same count, different content) is detected. It
         // also covers archived activity logs, which can arrive after the
         // corresponding assistant message was already flushed.
-        content_hash: committed_content_hash(
-            session,
-            &anchored_activity_logs,
-            app.reasoning_display_enabled(&session.id),
-        ),
+        content_hash: committed_content_hash(session, &anchored_activity_logs),
     }
 }
 
@@ -1218,23 +1214,18 @@ pub struct CommittedFingerprint {
 fn committed_content_hash(
     session: &SessionView,
     anchored_activity_logs: &[(usize, &TurnActivityLog)],
-    reasoning_display: bool,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // Toggling `/thinking` display flips what the committed history renders, so
-    // it must flip this fingerprint (else the scrollback tracker treats the
-    // turn on/off as a no-op and never re-flushes the blocks).
-    reasoning_display.hash(&mut hasher);
     for message in &session.messages {
         message.role.as_str().hash(&mut hasher);
         message.content.hash(&mut hasher);
-        // reasoning_content is hashed ONLY when display is on: with it off the
-        // block isn't rendered, so a late attach must not force a full re-flush
-        // of unchanged visible history (would duplicate scrollback).
-        if reasoning_display {
-            message.reasoning_content.hash(&mut hasher);
-        }
+        // reasoning_content is NOT hashed: the /thinking display toggle applies
+        // to turns committed AFTER it flips (a terminal cannot retroactively
+        // redraw scrolled-off history — re-flushing would duplicate it). Past
+        // turns stay as flushed; the Tab inspector always shows full reasoning
+        // regardless of the toggle. So a reasoning change must not force a
+        // full re-flush of unchanged visible history.
         message.tool_call_id.hash(&mut hasher);
     }
     for (render_index, log) in anchored_activity_logs {
@@ -8485,14 +8476,19 @@ mod tests {
     }
 
     #[test]
-    fn committed_fingerprint_flips_when_reasoning_display_toggles() {
+    fn toggling_reasoning_display_does_not_reflush_committed_scrollback() {
+        // A terminal can't retroactively redraw scrolled-off history, so the
+        // toggle must NOT flip the committed fingerprint — otherwise the
+        // scrollback tracker's discontinuity branch would re-flush the whole
+        // history and duplicate it below the stale copy. The toggle applies to
+        // turns committed afterwards; past turns use the Tab inspector.
         let (mut app, session_id) = app_with_reasoning_message("some reasoning");
         let off = committed_messages_fingerprint(&app);
         app.session_reasoning_display.insert(session_id);
         let on = committed_messages_fingerprint(&app);
-        assert_ne!(
+        assert_eq!(
             off.content_hash, on.content_hash,
-            "toggling display must flip the fingerprint so scrollback re-flushes"
+            "the display toggle must not force a committed-history re-flush"
         );
     }
 
