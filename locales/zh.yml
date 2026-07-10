@@ -859,8 +859,9 @@ menu:
         label: 中
       display:
         desc: 在本会话的对话记录中显示模型的推理内容（Ctrl+O 展开）。
-        label_off: 推理显示：关
-        label_on: 推理显示：开
+        label: 推理显示
+    divider:
+      display: "── 推理显示 ──"
     subtitle: 思考模型的推理强度（本次会话）。
     title: 思考强度
   title:

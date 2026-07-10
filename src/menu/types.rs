@@ -468,6 +468,10 @@ pub struct MenuItemState {
     pub loading: bool,
     pub destructive: bool,
     pub required_valid: Option<bool>,
+    /// A non-interactive display row (e.g. a section divider): rendered but
+    /// skipped by menu navigation and inert on Enter. Defaults to `false`
+    /// (every existing item stays selectable).
+    pub non_selectable: bool,
 }
 
 impl MenuItemState {

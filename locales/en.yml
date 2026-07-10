@@ -1261,8 +1261,9 @@ menu:
         label: Medium
       display:
         desc: "Show the model's reasoning as a transcript block for this session (Ctrl+O to expand)."
-        label_off: "Reasoning display: off"
-        label_on: "Reasoning display: on"
+        label: Reasoning display
+    divider:
+      display: "── Reasoning display ──"
     subtitle: Reasoning effort for thinking models (this session).
     title: Thinking effort
   title:
