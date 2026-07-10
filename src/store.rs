@@ -6201,12 +6201,23 @@ impl Store {
             envelope.thread_id.clone(),
             envelope.seq,
         );
-        if !self.state.applied_hydrate_tool_envelopes.insert(key) {
+        if !self
+            .state
+            .applied_hydrate_tool_envelopes
+            .insert(key.clone())
+        {
             return;
         }
-        let turn_id = thread_turns
-            .get(envelope.thread_id.as_str())
-            .map(|turn| turn.turn_id.clone());
+        let hydrated_turn = thread_turns.get(envelope.thread_id.as_str());
+        let turn_id = hydrated_turn.map(|turn| turn.turn_id.clone());
+        let turn_is_terminal = hydrated_turn.is_some_and(|turn| {
+            matches!(
+                turn.state,
+                TurnLifecycleState::Completed
+                    | TurnLifecycleState::Errored
+                    | TurnLifecycleState::Interrupted
+            )
+        });
         match &envelope.payload {
             Payload::ToolStart {
                 tool_call_id,
@@ -6219,19 +6230,34 @@ impl Store {
                 // no turn identity): ADOPT it onto the hydrated turn first,
                 // or the capture pass below can't archive it and a terminal
                 // row strands in the live strip while the turn group omits it.
-                if let Some(turn) = turn_id.as_ref() {
-                    if let Some(item) = self.state.activity.iter_mut().find(|item| {
-                        item.tool_call_id.as_deref() == Some(tool_call_id.as_str())
-                            && item.turn_id.is_none()
-                    }) {
-                        item.turn_id = Some(turn.clone());
-                        item.session_id = None;
-                        // Turn-scoped now: the thread marker is no longer the
-                        // heal key, so the slot is free for the invocation echo.
-                        if let Some(preview) = arguments_preview.clone() {
-                            item.detail = Some(preview);
+                // Adoption is only safe once the turn is TERMINAL (capture
+                // follows immediately, and turn-scoped reconcile covers it).
+                // Adopting onto a still-active turn would pull the row out of
+                // the thread-marker heal's reach with no ToolEnd guaranteed.
+                if turn_is_terminal {
+                    if let Some(turn) = turn_id.as_ref() {
+                        if let Some(item) = self.state.activity.iter_mut().find(|item| {
+                            item.tool_call_id.as_deref() == Some(tool_call_id.as_str())
+                                && item.turn_id.is_none()
+                        }) {
+                            item.turn_id = Some(turn.clone());
+                            item.session_id = None;
+                            // Turn-scoped now: the thread marker is no longer
+                            // the heal key, so the slot is free for the echo.
+                            if let Some(preview) = arguments_preview.clone() {
+                                item.detail = Some(preview);
+                            }
                         }
                     }
+                } else if self.state.activity.iter().any(|item| {
+                    item.tool_call_id.as_deref() == Some(tool_call_id.as_str())
+                        && item.turn_id.is_none()
+                }) {
+                    // Live row on a still-active turn: the live path stays in
+                    // charge. Un-consume the seq so a LATER (terminal) hydrate
+                    // can adopt + archive this row instead of stranding it.
+                    self.state.applied_hydrate_tool_envelopes.remove(&key);
+                    return;
                 }
                 let in_live = self
                     .state
@@ -23684,6 +23710,52 @@ mod tests {
                 .with_tool_call("tc-adopt")
                 .with_session(session_id.clone())
                 .with_detail(AppState::envelope_tool_detail_for_thread(&thread)),
+        );
+
+        // While the turn is still ACTIVE, replay must leave the live row in
+        // charge (turnless, marker intact) and NOT consume the seq — the
+        // heal contract stays with the thread marker until the turn ends.
+        let active_result = SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 5,
+            },
+            context: None,
+            context_state: None,
+            messages: None,
+            threads: None,
+            turns: Some(vec![HydratedTurn {
+                turn_id: turn_id.clone(),
+                state: TurnLifecycleState::Active,
+                started_at: None,
+                completed_at: None,
+                thread_id: None,
+            }]),
+            pending_approvals: None,
+            pending_questions: None,
+            replayed_envelopes: None,
+            replayed_tool_envelopes: Some(vec![Envelope {
+                thread_id: thread.clone(),
+                seq: 1,
+                client_message_id: None,
+                payload: Payload::ToolStart {
+                    tool_call_id: "tc-adopt".into(),
+                    name: "shell".into(),
+                    arguments_preview: Some("command: \"ls\"".into()),
+                },
+            }]),
+        };
+        store.apply_client_event(ClientEvent::SessionHydrate(active_result));
+        let live_row = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("tc-adopt"))
+            .expect("live row still present while the turn is active");
+        assert!(
+            live_row.turn_id.is_none(),
+            "no adoption while the turn is active — the marker heal owns it"
         );
 
         let result = SessionHydrateResult {
