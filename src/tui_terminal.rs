@@ -266,16 +266,32 @@ where
                 // On a real terminal shrink the old y can be below the new
                 // screen; scrolling that stale region corrupts the resized
                 // screen, so shrink reflow just clears and repaints.
-                scroll_region_up(
-                    &mut self.backend,
-                    old_area.top(),
-                    old_bottom_with_new_height,
-                )?;
-                self.visible_history_bottom = self
-                    .visible_history_bottom
-                    .saturating_sub(old_bottom_with_new_height);
-                self.visible_history_rows =
-                    self.visible_history_rows.min(self.visible_history_bottom);
+                //
+                // Scroll only the DEFICIT past the blank band between the
+                // history bottom and the viewport top (mirrors
+                // `insert_history_lines`' occupied-bottom logic). A previous
+                // viewport shrink (e.g. a menu closing) leaves such a band;
+                // consuming it first keeps repeated menu open/close cycles
+                // from scrolling another menu-height of transcript into
+                // scrollback each time and accumulating an unbounded blank
+                // gap above the viewport. `visible_history_rows == 0` means
+                // untracked shell content — treat the region as fully
+                // occupied so first-launch output still scrolls up intact
+                // (#232 #1).
+                let occupied_bottom = if self.visible_history_rows == 0 {
+                    old_area.top()
+                } else {
+                    self.visible_history_bottom.min(old_area.top())
+                };
+                let blank_gap = old_area.top().saturating_sub(occupied_bottom);
+                let scroll_by = old_bottom_with_new_height.saturating_sub(blank_gap);
+                if scroll_by > 0 {
+                    scroll_region_up(&mut self.backend, old_area.top(), scroll_by)?;
+                    self.visible_history_bottom =
+                        self.visible_history_bottom.saturating_sub(scroll_by);
+                    self.visible_history_rows =
+                        self.visible_history_rows.min(self.visible_history_bottom);
+                }
             }
 
             // A terminal shrink can leave `old_area.y` outside the new visible
@@ -813,16 +829,63 @@ mod tests {
     }
 
     #[test]
-    fn viewport_growth_scrolls_visible_history_extent_up() {
+    fn viewport_growth_consumes_blank_gap_before_scrolling() {
         let mut terminal = Terminal::new(RecordingBackend::new(10, 10)).expect("terminal");
         terminal.set_viewport_area(Rect::new(0, 8, 10, 2));
+        // History ends at row 6 with a 2-row blank band below it (rows 6-7),
+        // e.g. left behind by a previous viewport shrink.
         terminal.set_visible_history_extent(5, 6);
         terminal.last_known_screen_size = Size::new(10, 10);
 
         terminal.resize_viewport_to(4).expect("resize viewport");
 
         assert_eq!(terminal.viewport_area, Rect::new(0, 6, 10, 4));
-        assert_eq!(terminal.visible_history_bottom(), 4);
-        assert_eq!(terminal.visible_history_rows(), 4);
+        // Growth is covered entirely by the blank band: no history scrolls
+        // into scrollback and the extent stays put.
+        assert_eq!(terminal.visible_history_bottom(), 6);
+        assert_eq!(terminal.visible_history_rows(), 5);
+        assert!(
+            !terminal.backend().buf.windows(2).any(|w| *w == *b"\x1bD"),
+            "growth over a blank gap must not scroll history"
+        );
+    }
+
+    #[test]
+    fn menu_open_close_cycles_do_not_accumulate_blank_gap() {
+        // Regression: viewport grow scrolled history into scrollback on EVERY
+        // menu open, ignoring the blank band the previous close left behind —
+        // so each open/close cycle leaked another menu-height of blank rows
+        // between the transcript and the bottom chrome.
+        let mut terminal = Terminal::new(RecordingBackend::new(10, 50)).expect("terminal");
+        // Bottom-pinned 8-row viewport (top = 42) with the transcript flushed
+        // flush against it (history fills the whole region above).
+        terminal.set_viewport_area(Rect::new(0, 42, 10, 8));
+        terminal.set_visible_history_extent(42, 42);
+        terminal.last_known_screen_size = Size::new(10, 50);
+
+        for cycle in 1..=3 {
+            terminal.resize_viewport_to(20).expect("menu open"); // +12 rows
+            terminal.resize_viewport_to(8).expect("menu close"); // -12 rows
+            let gap = terminal
+                .viewport_area
+                .top()
+                .saturating_sub(terminal.visible_history_bottom());
+            assert!(
+                gap <= 12,
+                "cycle {cycle}: blank gap must stay bounded at one menu height, got {gap}"
+            );
+        }
+        // Only the FIRST open may scroll history (12 × Index); later opens
+        // must consume the blank band the close left behind.
+        let esc_d = terminal
+            .backend()
+            .buf
+            .windows(2)
+            .filter(|w| *w == *b"\x1bD")
+            .count();
+        assert_eq!(
+            esc_d, 12,
+            "only the first grow may scroll history into scrollback"
+        );
     }
 }
