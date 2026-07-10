@@ -5595,7 +5595,7 @@ fn push_agent_task_group(
     }
 
     for (idx, item) in items.iter().enumerate() {
-        push_agent_task_child(lines, palette, item, idx == 0, expanded);
+        push_agent_task_child(lines, palette, item, idx == 0, expanded, !collapse_settled);
     }
 
     // List this turn's running sub-agents (from session.tasks, attributed by
@@ -5719,12 +5719,13 @@ fn push_agent_task_child(
     item: &ActivityItem,
     first: bool,
     expanded: bool,
+    in_scrollback: bool,
 ) {
     // Tool calls render as Claude-Code-style `⏺ Tool(arg)` cards; other
     // activity rows (file mutations, progress) keep the `⎿ ✓ …` tree form.
     if item.kind == ActivityKind::Tool {
         push_tool_card_header(lines, palette, item);
-        push_compact_tool_preview(lines, palette, item, expanded);
+        push_compact_tool_preview(lines, palette, item, expanded, in_scrollback);
         return;
     }
 
@@ -5791,6 +5792,7 @@ fn push_compact_tool_preview(
     palette: Palette,
     item: &ActivityItem,
     expanded: bool,
+    in_scrollback: bool,
 ) {
     let Some(output_preview) = item
         .output_preview
@@ -5806,7 +5808,12 @@ fn push_compact_tool_preview(
         meaningful
     };
     let total = preview_lines.len();
-    let line_limit = if expanded {
+    // Frozen scrollback can't be repainted, so the Ctrl+O affordance is dead
+    // there: render the full output and drop the hint. Only the live viewport
+    // (which the toggle genuinely repaints) collapses to a preview.
+    let line_limit = if in_scrollback {
+        total
+    } else if expanded {
         EXPANDED_TOOL_PREVIEW_LINES
     } else {
         COLLAPSED_TOOL_PREVIEW_LINES
@@ -5817,6 +5824,10 @@ fn push_compact_tool_preview(
             Span::styled("  ⎿ ", palette.border()),
             Span::styled(truncate_terminal_line(line, 110), palette.text()),
         ]));
+    }
+    if in_scrollback {
+        // Full output already shown; no un-actionable "(Ctrl+O expand)" hint.
+        return;
     }
     if total > shown {
         let action = if expanded {
@@ -15113,6 +15124,55 @@ mod tests {
         assert!(
             text.contains("Bash(cargo build"),
             "missing tool detail: {text:?}"
+        );
+    }
+
+    #[test]
+    fn scrollback_renders_full_tool_output_without_ctrl_o_hint() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = chat_app(vec![
+            Message::user("run tests"),
+            Message::assistant("Done."),
+        ]);
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_id.clone(),
+            request: Some("run tests".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+                    .with_turn(turn_id)
+                    .with_detail("cargo test")
+                    .with_output_preview("line1\nline2\nline3\nline4\nline5")
+                    .with_success(true),
+            ],
+        });
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let lines = finalized_history_lines_range(&app, palette, 80, 1);
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Frozen scrollback shows the FULL output (the toggle can't repaint it)…
+        for n in 1..=5 {
+            assert!(
+                text.contains(&format!("line{n}")),
+                "missing line{n}:\n{text}"
+            );
+        }
+        // …and never the un-actionable Ctrl+O hint.
+        assert!(
+            !text.contains("Ctrl+O"),
+            "scrollback must not show a dead Ctrl+O hint:\n{text}"
+        );
+        assert!(
+            !text.contains("hidden"),
+            "scrollback must not hide output:\n{text}"
         );
     }
 
