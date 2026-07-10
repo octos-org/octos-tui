@@ -6671,17 +6671,13 @@ impl Store {
                 // created by a `session/status/read`, so probe for it on open
                 // (when advertised) — otherwise the model never appears until
                 // the user happens to open a status/model menu. Cheap,
-                // idempotent, and gated on the capability so older servers that
-                // do not advertise it are left untouched.
+                // idempotent, gated on the capability so older servers that do
+                // not advertise it are left untouched, and DEDUPED — the switch
+                // bundle above usually queued this probe already.
                 if self.state.capabilities.as_ref().is_some_and(|caps| {
                     caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ)
                 }) {
-                    self.state
-                        .enqueue_autonomy_hydration(AppUiCommand::ReadSessionStatus(
-                            crate::model::SessionStatusReadParams {
-                                session_id: session_id.clone(),
-                            },
-                        ));
+                    self.state.enqueue_session_status_probe(session_id.clone());
                 }
                 // M22-D: if the user staged a permission profile in
                 // onboarding, apply it now that we have a session id.
@@ -16598,6 +16594,60 @@ mod tests {
         assert!(
             ungated.state.dequeue_autonomy_hydration().is_none(),
             "no capability advertised → no probe on switch"
+        );
+    }
+
+    /// A fresh `session/opened` both switches to the session (bundle probe)
+    /// and probes explicitly; rapid switches re-probe before a response lands.
+    /// Duplicates eat slots of the 16-capped hydration queue and can evict
+    /// unrelated pending commands — probes must dedupe against the queue.
+    #[test]
+    fn status_probes_deduplicate_against_the_pending_queue() {
+        use octos_core::ui_protocol::SessionOpened;
+
+        // Session open: the switch-bundle probe and the open-time probe must
+        // collapse to ONE queued read.
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_SESSION_STATUS_READ]);
+        let session_id = SessionKey("dev:local:opened#main".into());
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": session_id.clone(),
+            "active_profile_id": "dev",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        let mut reads = Vec::new();
+        while let Some(command) = store.state.dequeue_autonomy_hydration() {
+            if let AppUiCommand::ReadSessionStatus(params) = command {
+                reads.push(params.session_id);
+            }
+        }
+        assert_eq!(
+            reads,
+            vec![session_id],
+            "open + switch must queue exactly one status read"
+        );
+
+        // Switch burst: bouncing between two unprobed sessions queues one read
+        // per session, not one per switch.
+        let mut burst = store_with_two_sessions("local:a", "local:b");
+        burst.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_SESSION_STATUS_READ,
+        ]));
+        for index in [1, 0, 1, 0, 1] {
+            burst.state.switch_selected_session(index);
+        }
+        let mut burst_reads = Vec::new();
+        while let Some(command) = burst.state.dequeue_autonomy_hydration() {
+            if let AppUiCommand::ReadSessionStatus(params) = command {
+                burst_reads.push(params.session_id);
+            }
+        }
+        assert_eq!(
+            burst_reads,
+            vec![SessionKey("local:b".into()), SessionKey("local:a".into())],
+            "a switch burst queues one probe per session, not per switch"
         );
     }
 

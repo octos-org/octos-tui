@@ -6346,6 +6346,24 @@ impl AppState {
                 .map(|session| session.id.clone())
                 .filter(|session_id| self.runtime_status_for(session_id).is_none())
         {
+            self.enqueue_session_status_probe(session_id);
+        }
+    }
+
+    /// Enqueue a `session/status/read`, deduplicating against one already
+    /// queued for the same session: a fresh `session/opened` both switches to
+    /// the session (bundle probe) and probes explicitly, and rapid session
+    /// switches re-probe before the first response lands — without the dedupe
+    /// each duplicate eats a slot of the capped hydration queue and can evict
+    /// unrelated pending commands.
+    pub fn enqueue_session_status_probe(&mut self, session_id: SessionKey) {
+        let already_queued = self.pending_autonomy_hydration.iter().any(|command| {
+            matches!(
+                command,
+                AppUiCommand::ReadSessionStatus(params) if params.session_id == session_id
+            )
+        });
+        if !already_queued {
             self.enqueue_autonomy_hydration(AppUiCommand::ReadSessionStatus(
                 SessionStatusReadParams { session_id },
             ));
