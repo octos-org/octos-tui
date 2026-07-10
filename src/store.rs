@@ -5478,7 +5478,13 @@ impl Store {
                 // main turn.
                 let is_btw_error = error.message.starts_with("session/btw ")
                     || (error.code == "too_many_pending_requests"
-                        && error.message.ends_with("enqueue session/btw request"));
+                        && error.message.ends_with("enqueue session/btw request"))
+                    || (error.code == "invalid_result"
+                        && error
+                            .message
+                            .starts_with("failed to decode UI protocol result for session/btw"))
+                    || (error.code == "frame_too_large"
+                        && error.message.starts_with("encoded session/btw request"));
                 if is_btw_error && self.state.fail_btw_answering(&error.message) > 0 {
                     self.state.status = t!("status.btw_failed").into_owned();
                     return None;
@@ -16642,6 +16648,35 @@ mod tests {
                 .map(|aside| &aside.state),
             Some(crate::model::BtwAsideState::Failed(_))
         ));
+
+        // The two remaining method-tagged shapes settle the aside too: a
+        // malformed success result and the outbound frame-size rejection.
+        for (code, message) in [
+            (
+                "invalid_result",
+                "failed to decode UI protocol result for session/btw: missing answer",
+            ),
+            (
+                "frame_too_large",
+                "encoded session/btw request r3 is 9999999 bytes; max is 1048576",
+            ),
+        ] {
+            store.state.set_btw_answering(&session_id, "again?".into());
+            store.apply_event(AppUiEvent::Error(octos_core::app_ui::AppUiError {
+                code: code.into(),
+                message: message.into(),
+            }));
+            assert!(
+                matches!(
+                    store
+                        .state
+                        .btw_aside_for(&session_id)
+                        .map(|aside| &aside.state),
+                    Some(crate::model::BtwAsideState::Failed(_))
+                ),
+                "{code} must settle the aside"
+            );
+        }
     }
 
     #[test]
