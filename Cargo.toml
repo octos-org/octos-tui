@@ -18,7 +18,7 @@ path = "src/main.rs"
 # add a gitignored `.cargo/config.toml` (see `.cargo/config.toml.example`) that
 # patches it to a sibling path — no need to edit this file.
 [dependencies]
-octos-core = { git = "https://github.com/octos-org/octos", rev = "67cfb1f5" }
+octos-core = { git = "https://github.com/octos-org/octos", rev = "0af189316afd23f19aae5a3d24372033c18dcda9" }
 clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
 color-eyre = "0.6"

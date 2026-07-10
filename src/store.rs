@@ -5,10 +5,10 @@ use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
     ApprovalRespondParams, DiffPreviewGetParams, EnvelopeNotification, EnvelopeToolEndStatus,
     HydratedMessage, InputItem, MessageDeltaEvent, MessagePersistedEvent, Payload,
-    ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult, SessionOpenParams,
-    TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState,
-    TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent, TurnId,
-    TurnInterruptParams, TurnLifecycleState, TurnSpawnCompleteEvent, TurnStartParams,
+    ReasoningDeltaEvent, ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult,
+    SessionOpenParams, TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams,
+    TaskRuntimeState, TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent,
+    TurnId, TurnInterruptParams, TurnLifecycleState, TurnSpawnCompleteEvent, TurnStartParams,
     TurnStateGetParams, UiContextState, UiNotification, UiProgressEvent,
     UserQuestionRequestedEvent,
 };
@@ -32,9 +32,9 @@ use crate::{
     model::{
         ActivityItem, ActivityKind, AppState, AppUiCommand, ApprovalModalAction,
         ApprovalModalState, AuthSendCodeParams, AuthVerifyParams, DiffHunkContext,
-        DiffPreviewGetResult, FocusPane, LiveReply, LlmRouteConfig, LlmSelectionConfig,
-        McpConfigDeleteParams, McpConfigListParams, McpConfigSetEnabledParams, McpConfigTestParams,
-        McpConfigUpsertParams, OnboardingAction, OnboardingProviderPending,
+        DiffPreviewGetResult, FocusPane, LiveReasoning, LiveReply, LlmRouteConfig,
+        LlmSelectionConfig, McpConfigDeleteParams, McpConfigListParams, McpConfigSetEnabledParams,
+        McpConfigTestParams, McpConfigUpsertParams, OnboardingAction, OnboardingProviderPending,
         OnboardingProviderSaveTarget, ProfileLlmCatalogParams, ProfileLlmListParams,
         ProfileLlmListResult, ProfileLocalCreateParams, ProfileSkillsInstallParams,
         ProfileSkillsListParams, ProfileSkillsRegistrySearchParams, ProfileSkillsRemoveParams,
@@ -171,6 +171,20 @@ fn finalize_live_reply_text(
     } else {
         text
     }
+}
+
+fn non_empty_reasoning(text: String) -> Option<String> {
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn assistant_message_with_reasoning(text: String, reasoning: Option<String>) -> Message {
+    let mut message = Message::assistant(text);
+    message.reasoning_content = reasoning.and_then(non_empty_reasoning);
+    message
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4635,6 +4649,10 @@ impl Store {
                 // Local-only: the server doesn't know the per-session /thinking
                 // level, so preserve it across snapshot replays (reconnect/refresh).
                 let session_reasoning_effort = self.state.session_reasoning_effort.clone();
+                // Local-only live stream buffer: snapshots carry committed
+                // history and `live_reply`, but not reasoning deltas accumulated
+                // in this client before the replay.
+                let live_reasoning = self.state.live_reasoning.clone();
                 // Local-only: the active /theme palette is a client setting the
                 // server never echoes, so preserve it across snapshot replays
                 // (otherwise a launch --theme or a runtime /theme reverts to Codex).
@@ -4678,6 +4696,7 @@ impl Store {
                 state.mcp_config_catalog = mcp_config_catalog;
                 state.tool_config_catalog = tool_config_catalog;
                 state.session_reasoning_effort = session_reasoning_effort;
+                state.live_reasoning = live_reasoning;
                 state.theme = theme;
                 state.config_path = config_path;
                 state.pinned_scroll = pinned_scroll;
@@ -5084,6 +5103,68 @@ impl Store {
                 });
         }
 
+        // #1515 replay lane: the server ships the session's persisted
+        // tool_start/progress/end projection envelopes on hydrate (stdio
+        // negotiates `event.spawn_complete.v1` by default). Re-apply them so
+        // archived turn groups regain their per-action rows after a client
+        // restart, instead of rendering a bare "N action(s)" header with no
+        // children. Idempotent via `applied_hydrate_tool_envelopes`.
+        if let Some(envelopes) = result.replayed_tool_envelopes.as_deref() {
+            // Envelopes from the legacy-notification emitter use the TURN id
+            // as their thread id, and hydrated turns may carry no thread_id at
+            // all — index by BOTH so replay rows resolve their turn either way.
+            let thread_turns: std::collections::HashMap<
+                String,
+                &octos_core::ui_protocol::HydratedTurn,
+            > = result
+                .turns
+                .iter()
+                .flatten()
+                .flat_map(|turn| {
+                    turn.thread_id
+                        .clone()
+                        .map(|thread| (thread, turn))
+                        .into_iter()
+                        .chain(std::iter::once((turn.turn_id.0.to_string(), turn)))
+                })
+                .collect();
+            // tool_call_ids whose ToolStart THIS pass created — Progress/End
+            // envelopes only ever mutate rows this replay owns (or upgrade a
+            // still-running row), never a richer live-streamed terminal row.
+            let mut created: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for envelope in envelopes {
+                self.apply_replayed_tool_envelope(
+                    &session_id,
+                    envelope,
+                    &thread_turns,
+                    &mut created,
+                );
+            }
+            // Archive replayed rows of already-terminal turns so they render
+            // as completed turn groups (children under the summary chip)
+            // rather than lingering in the live activity strip. Never capture
+            // the currently-streaming turn.
+            let live_turn = self
+                .state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .and_then(|session| session.live_reply.as_ref())
+                .map(|live_reply| live_reply.turn_id.clone());
+            for turn in result.turns.iter().flatten() {
+                let is_terminal = matches!(
+                    turn.state,
+                    TurnLifecycleState::Completed
+                        | TurnLifecycleState::Errored
+                        | TurnLifecycleState::Interrupted
+                );
+                if is_terminal && live_turn.as_ref() != Some(&turn.turn_id) {
+                    self.state
+                        .capture_completed_turn_activity(&session_id, &turn.turn_id);
+                }
+            }
+        }
+
         if let Some(turns) = result.turns.as_ref() {
             // GAP 1: orphan activity-chip self-heal on the rehydrate path. A
             // client rehydrating a session whose turn is already TERMINAL
@@ -5164,6 +5245,140 @@ impl Store {
             sections.join(", ")
         };
         self.state.status = t!("status.session_hydrated", summary = summary).into_owned();
+    }
+
+    /// Apply one hydrate-replayed tool envelope (#1515) quietly: transcript
+    /// activity effects only — no run-state flips, no status-bar writes (the
+    /// replayed turn is history, not live work).
+    fn apply_replayed_tool_envelope(
+        &mut self,
+        session_id: &SessionKey,
+        envelope: &octos_core::ui_protocol::Envelope,
+        thread_turns: &std::collections::HashMap<String, &octos_core::ui_protocol::HydratedTurn>,
+        created: &mut std::collections::HashSet<String>,
+    ) {
+        let key = (
+            session_id.0.clone(),
+            envelope.thread_id.clone(),
+            envelope.seq,
+        );
+        if !self.state.applied_hydrate_tool_envelopes.insert(key) {
+            return;
+        }
+        let turn_id = thread_turns
+            .get(envelope.thread_id.as_str())
+            .map(|turn| turn.turn_id.clone());
+        match &envelope.payload {
+            Payload::ToolStart {
+                tool_call_id,
+                name,
+                arguments_preview,
+            } => {
+                // A live-streamed row (or a prior replay already archived into
+                // the turn log) covers this call — never double-render it.
+                let in_live = self
+                    .state
+                    .activity
+                    .iter()
+                    .any(|item| item.tool_call_id.as_deref() == Some(tool_call_id.as_str()));
+                let in_archive = turn_id.as_ref().is_some_and(|turn| {
+                    self.state.turn_activity_logs.iter().any(|log| {
+                        &log.turn_id == turn
+                            && log.items.iter().any(|item| {
+                                item.tool_call_id.as_deref() == Some(tool_call_id.as_str())
+                            })
+                    })
+                });
+                if in_live || in_archive {
+                    return;
+                }
+                created.insert(tool_call_id.clone());
+                let mut item = ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
+                    .with_tool_call(tool_call_id.clone());
+                item = match turn_id {
+                    Some(turn) => {
+                        // Turn-scoped rows reconcile by turn_id, so `detail`
+                        // is free for the invocation echo (`command: …`).
+                        let mut item = item.with_turn(turn);
+                        if let Some(preview) = arguments_preview.clone() {
+                            item = item.with_detail(preview);
+                        }
+                        item
+                    }
+                    None => {
+                        // Thread marker stays load-bearing for the envelope
+                        // heal; the args preview rides in `arguments` instead.
+                        let mut item = item.with_session(session_id.clone()).with_detail(
+                            AppState::envelope_tool_detail_for_thread(&envelope.thread_id),
+                        );
+                        if let Some(preview) = arguments_preview.clone() {
+                            item = item.with_arguments(serde_json::Value::String(preview));
+                        }
+                        item
+                    }
+                };
+                self.state.push_activity(item);
+            }
+            Payload::ToolProgress {
+                tool_call_id,
+                message,
+            } => {
+                if !created.contains(tool_call_id) {
+                    return;
+                }
+                // Archived rows keep the invocation echo in `detail`; the
+                // latest progress line rides as the interim result excerpt
+                // (ToolEnd's real excerpt replaces it when present).
+                self.state.update_tool_activity(
+                    tool_call_id,
+                    "running",
+                    None,
+                    Some(message.clone()),
+                    None,
+                    None,
+                );
+            }
+            Payload::ToolEnd {
+                tool_call_id,
+                status,
+                error,
+                reason,
+                output_preview,
+                duration_ms,
+            } => {
+                // Apply when this replay created the row, or upgrade a row
+                // that is still "running" (its Start was applied by an earlier
+                // hydrate whose ledger already holds the Start seq). Never
+                // touch a terminal row — a live-streamed completion may carry
+                // richer output than the envelope.
+                let upgradeable = created.contains(tool_call_id)
+                    || self.state.activity.iter().any(|item| {
+                        item.tool_call_id.as_deref() == Some(tool_call_id.as_str())
+                            && item.status == "running"
+                    });
+                if !upgradeable {
+                    return;
+                }
+                let (label, success) = match status {
+                    EnvelopeToolEndStatus::Complete => ("complete", Some(true)),
+                    EnvelopeToolEndStatus::Error => ("failed", Some(false)),
+                    EnvelopeToolEndStatus::Skipped => ("skipped", None),
+                    EnvelopeToolEndStatus::Aborted => ("aborted", Some(false)),
+                };
+                // Same layout as the live arm: keep the invocation echo in
+                // `detail`; the failure text is the result excerpt.
+                let failure_text = error.clone().or_else(|| reason.clone());
+                self.state.update_tool_activity(
+                    tool_call_id,
+                    label,
+                    None,
+                    output_preview.clone().or(failure_text),
+                    success,
+                    *duration_ms,
+                );
+            }
+            _ => {}
+        }
     }
 
     fn apply_review_start_result(&mut self, result: ReviewStartResult) {
@@ -5633,6 +5848,14 @@ impl Store {
             UiNotification::VisualGenerating(_)
             | UiNotification::VisualSucceeded(_)
             | UiNotification::VisualFailed(_) => None,
+            // Voice-session lifecycle + streamed audio (#1504) — the TUI has
+            // no audio surface; ignore gracefully so newer servers that emit
+            // these don't wedge the client.
+            UiNotification::VoiceExit(_) | UiNotification::VoiceAudioChunk(_) => None,
+            // Compaction-started banner (UPCR-2026-026; tui main renders a
+            // live block for it since #253). This branch predates that UX —
+            // ignore gracefully until it rebases onto main.
+            UiNotification::ContextCompactionStarted(_) => None,
             UiNotification::SessionOpened(event) => {
                 let session_id = event.session_id.clone();
                 // Restore the server-persisted per-session reasoning effort so
@@ -5698,6 +5921,23 @@ impl Store {
                 for command in hydration {
                     self.state.enqueue_autonomy_hydration(command);
                 }
+                // The composer footer shows the current model, which lives on
+                // the per-session runtime status. That status is only ever
+                // created by a `session/status/read`, so probe for it on open
+                // (when advertised) — otherwise the model never appears until
+                // the user happens to open a status/model menu. Cheap,
+                // idempotent, and gated on the capability so older servers that
+                // do not advertise it are left untouched.
+                if self.state.capabilities.as_ref().is_some_and(|caps| {
+                    caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ)
+                }) {
+                    self.state
+                        .enqueue_autonomy_hydration(AppUiCommand::ReadSessionStatus(
+                            crate::model::SessionStatusReadParams {
+                                session_id: session_id.clone(),
+                            },
+                        ));
+                }
                 // M22-D: if the user staged a permission profile in
                 // onboarding, apply it now that we have a session id.
                 // Server authority is preserved — the follow-up RPC
@@ -5732,7 +5972,8 @@ impl Store {
                 // (No-op when the bound buffer is for the SAME turn — that case
                 // is the lazy-bind/replay race handled just below.)
                 self.commit_pending_live_reply_for_turn_switch(&event.session_id, &event.turn_id);
-                if let Some(session) = self.find_session_mut(&event.session_id) {
+                let session_bound = if let Some(session) = self.find_session_mut(&event.session_id)
+                {
                     // Out-of-order lifecycle (nit 1): a MessageDelta may have
                     // already lazy-bound THIS turn before its TurnStarted was
                     // delivered/replayed. Replacing the buffer unconditionally
@@ -5746,12 +5987,18 @@ impl Store {
                         .is_some_and(|live_reply| live_reply.turn_id == event.turn_id);
                     if !same_turn_already_bound {
                         session.live_reply = Some(LiveReply {
-                            turn_id: event.turn_id,
+                            turn_id: event.turn_id.clone(),
                             text: String::new(),
                         });
                     }
                     self.state.status = format!("Turn started in {}", session.title);
                     self.state.set_run_state_in_progress();
+                    true
+                } else {
+                    false
+                };
+                if session_bound {
+                    self.ensure_live_reasoning_bound(&event.session_id, &event.turn_id);
                 }
                 None
             }
@@ -5778,11 +6025,7 @@ impl Store {
                 // the first frame the client sees for the turn is a delta. When
                 // switching to a new turn_id, commit/close the prior turn's
                 // live_reply first so its answer is preserved.
-                let needs_bind = self
-                    .find_session(&session_id)
-                    .and_then(|session| session.live_reply.as_ref())
-                    .map(|live_reply| live_reply.turn_id != turn_id)
-                    .unwrap_or(true);
+                let needs_bind = self.live_turn_needs_bind(&session_id, &turn_id);
                 if needs_bind {
                     self.commit_pending_live_reply_for_turn_switch(&session_id, &turn_id);
                 }
@@ -5811,6 +6054,7 @@ impl Store {
                 }
                 None
             }
+            UiNotification::ReasoningDelta(event) => self.apply_reasoning_delta(event),
             UiNotification::ToolStarted(event) => {
                 let mut item =
                     ActivityItem::new(ActivityKind::Tool, event.tool_name.clone(), "running")
@@ -6308,18 +6552,32 @@ impl Store {
                 // visible in the transcript — leave the status line stable.
                 None
             }
+            Payload::ReasoningDelta { text } => {
+                self.upsert_envelope_assistant_reasoning(&session_id, &thread_id, text);
+                None
+            }
             Payload::AssistantPersisted { text, .. } => {
                 self.upsert_envelope_assistant_message(&session_id, &thread_id, text, true);
                 // Same as AssistantDelta: internal projection, not status-bar news.
                 None
             }
-            Payload::ToolStart { tool_call_id, name } => {
-                self.state.push_activity(
-                    ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
-                        .with_tool_call(tool_call_id.clone())
-                        .with_session(session_id.clone())
-                        .with_detail(AppState::envelope_tool_detail_for_thread(&thread_id)),
-                );
+            Payload::ToolStart {
+                tool_call_id,
+                name,
+                arguments_preview,
+            } => {
+                let mut item = ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
+                    .with_tool_call(tool_call_id.clone())
+                    .with_session(session_id.clone())
+                    // The thread marker is load-bearing: the envelope-thread
+                    // heal matches items by this exact detail string, so the
+                    // args preview rides in `arguments` (the renderer's
+                    // `tool_invocation_text` fallback) instead.
+                    .with_detail(AppState::envelope_tool_detail_for_thread(&thread_id));
+                if let Some(preview) = arguments_preview {
+                    item = item.with_arguments(serde_json::Value::String(preview));
+                }
+                self.state.push_activity(item);
                 self.state.set_run_state_in_progress();
                 self.state.status =
                     t!("status.tool_started", name = name, id = tool_call_id).into_owned();
@@ -6346,6 +6604,8 @@ impl Store {
                 status,
                 error,
                 reason,
+                output_preview,
+                duration_ms,
             } => {
                 let (label, success) = match status {
                     EnvelopeToolEndStatus::Complete => ("complete", Some(true)),
@@ -6353,14 +6613,17 @@ impl Store {
                     EnvelopeToolEndStatus::Skipped => ("skipped", None),
                     EnvelopeToolEndStatus::Aborted => ("aborted", Some(false)),
                 };
-                let detail = error.or(reason);
+                // `detail` stays untouched: it carries the load-bearing
+                // thread marker (heal key) or the invocation echo. Error /
+                // reason text belongs in the result excerpt.
+                let failure_text = error.or(reason);
                 self.state.update_tool_activity(
                     &tool_call_id,
                     label,
-                    detail.clone(),
-                    detail,
-                    success,
                     None,
+                    output_preview.or(failure_text),
+                    success,
+                    duration_ms,
                 );
                 self.state.status = format!("Tool {label}: {tool_call_id}");
                 None
@@ -6419,6 +6682,40 @@ impl Store {
                 text,
                 ThreadId::new(thread_id.to_owned()),
             ));
+        }
+        if follow_tail {
+            self.state.scroll_transcript_to_latest();
+        } else {
+            self.state.preserve_transcript_position_after_append(1);
+        }
+    }
+
+    fn upsert_envelope_assistant_reasoning(
+        &mut self,
+        session_id: &SessionKey,
+        thread_id: &str,
+        text: String,
+    ) {
+        let Some(text) = non_empty_reasoning(text) else {
+            return;
+        };
+        let follow_tail = self.state.transcript_scroll == 0;
+        let Some(session) = self.find_session_mut(session_id) else {
+            return;
+        };
+        if let Some(message) = session.messages.iter_mut().rev().find(|message| {
+            message.role == MessageRole::Assistant
+                && message.thread_id.as_deref() == Some(thread_id)
+        }) {
+            message
+                .reasoning_content
+                .get_or_insert_with(String::new)
+                .push_str(&text);
+        } else {
+            let mut message =
+                Message::assistant_with_thread(String::new(), ThreadId::new(thread_id.to_owned()));
+            message.reasoning_content = Some(text);
+            session.messages.push(message);
         }
         if follow_tail {
             self.state.scroll_transcript_to_latest();
@@ -6678,6 +6975,114 @@ impl Store {
         self.state.status = format!("Task output @{}", cursor.offset);
     }
 
+    fn ensure_live_reasoning_bound(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        let same_turn_already_bound = self
+            .state
+            .live_reasoning
+            .get(session_id)
+            .is_some_and(|live_reasoning| &live_reasoning.turn_id == turn_id);
+        if !same_turn_already_bound {
+            self.state.live_reasoning.insert(
+                session_id.clone(),
+                LiveReasoning {
+                    turn_id: turn_id.clone(),
+                    text: String::new(),
+                },
+            );
+        }
+    }
+
+    fn take_live_reasoning_for_turn(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> Option<String> {
+        let should_take = self
+            .state
+            .live_reasoning
+            .get(session_id)
+            .is_some_and(|live_reasoning| &live_reasoning.turn_id == turn_id);
+        if should_take {
+            self.state
+                .live_reasoning
+                .remove(session_id)
+                .and_then(|live_reasoning| non_empty_reasoning(live_reasoning.text))
+        } else {
+            None
+        }
+    }
+
+    fn live_turn_needs_bind(&self, session_id: &SessionKey, turn_id: &TurnId) -> bool {
+        let reply_needs_bind = self
+            .find_session(session_id)
+            .and_then(|session| session.live_reply.as_ref())
+            .map(|live_reply| &live_reply.turn_id != turn_id)
+            .unwrap_or(true);
+        let reasoning_needs_bind = self
+            .state
+            .live_reasoning
+            .get(session_id)
+            .map(|live_reasoning| &live_reasoning.turn_id != turn_id)
+            .unwrap_or(true);
+        reply_needs_bind || reasoning_needs_bind
+    }
+
+    fn apply_reasoning_delta(&mut self, event: ReasoningDeltaEvent) -> Option<AppUiCommand> {
+        let ReasoningDeltaEvent {
+            session_id,
+            turn_id,
+            text,
+            ..
+        } = event;
+
+        if self.state.is_turn_completed(&session_id, &turn_id) {
+            return None;
+        }
+
+        let follow_tail = self.state.transcript_scroll == 0;
+        let needs_bind = self.live_turn_needs_bind(&session_id, &turn_id);
+        if needs_bind {
+            self.commit_pending_live_reply_for_turn_switch(&session_id, &turn_id);
+        }
+
+        let session_bound = if let Some(session) = self.find_session_mut(&session_id) {
+            let live_reply = session.live_reply.get_or_insert_with(|| LiveReply {
+                turn_id: turn_id.clone(),
+                text: String::new(),
+            });
+            live_reply.turn_id == turn_id
+        } else {
+            false
+        };
+
+        let mut reset_scroll = false;
+        if session_bound {
+            let live_reasoning = self
+                .state
+                .live_reasoning
+                .entry(session_id.clone())
+                .or_insert_with(|| LiveReasoning {
+                    turn_id: turn_id.clone(),
+                    text: String::new(),
+                });
+            if live_reasoning.turn_id == turn_id {
+                live_reasoning.text.push_str(&text);
+                reset_scroll = true;
+            }
+        }
+
+        if needs_bind && reset_scroll {
+            self.state.set_run_state_in_progress();
+        }
+        if reset_scroll && follow_tail {
+            self.state.scroll_transcript_to_latest();
+        } else if reset_scroll {
+            self.state
+                .preserve_transcript_position_after_append(text.lines().count().saturating_sub(1));
+        }
+        None
+    }
+
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
         // Idempotence vs a turn-switch: if this turn was ALREADY finalized
         // (committed or dropped) by `commit_pending_live_reply_for_turn_switch`,
@@ -6702,6 +7107,7 @@ impl Store {
             .state
             .take_turn_finalized_by_switch(&event.session_id, &event.turn_id)
         {
+            self.take_live_reasoning_for_turn(&event.session_id, &event.turn_id);
             return None;
         }
         let seq = event.cursor.map(|cursor| cursor.seq).unwrap_or(0);
@@ -6710,6 +7116,7 @@ impl Store {
         let fallback_summary = self.turn_completion_fallback_message(&event.turn_id);
         let partial_fallback_summary =
             self.turn_partial_completion_fallback_message(&event.turn_id);
+        let mut reasoning = self.take_live_reasoning_for_turn(&event.session_id, &event.turn_id);
         let (status, reset_scroll, completed_current_turn) = {
             let session = self.find_session_mut(&event.session_id)?;
             let title = session.title.clone();
@@ -6721,7 +7128,9 @@ impl Store {
                         &fallback_summary,
                         &partial_fallback_summary,
                     );
-                    session.messages.push(Message::assistant(text));
+                    session
+                        .messages
+                        .push(assistant_message_with_reasoning(text, reasoning.take()));
                     (
                         t!("status.turn_completed", title = title, seq = seq).into_owned(),
                         true,
@@ -6738,7 +7147,10 @@ impl Store {
                 }
                 None => (
                     {
-                        session.messages.push(Message::assistant(fallback_summary));
+                        session.messages.push(assistant_message_with_reasoning(
+                            fallback_summary,
+                            reasoning.take(),
+                        ));
                         t!("status.turn_completed", title = title, seq = seq).into_owned()
                     },
                     true,
@@ -6767,6 +7179,18 @@ impl Store {
             self.state.session_retry.remove(&event.session_id);
             self.state
                 .capture_completed_turn_activity(&event.session_id, &event.turn_id);
+            // Snapshot the turn's elapsed time BEFORE `set_run_state_success`
+            // clears `run_state_started_at`, and the still-running background
+            // task count, into a committed status report for the scrollback.
+            if let Some(elapsed_secs) = self.state.run_state_elapsed_secs() {
+                let background_tasks = self.state.running_background_task_count(&event.session_id);
+                self.state.attach_turn_summary(
+                    &event.session_id,
+                    &event.turn_id,
+                    elapsed_secs,
+                    background_tasks,
+                );
+            }
             self.state.set_run_state_success();
         }
         self.submit_next_pending_if_idle()
@@ -6799,6 +7223,7 @@ impl Store {
         let follow_tail = self.state.transcript_scroll == 0;
         let fallback_summary =
             self.turn_error_fallback_message(&event.turn_id, &event.code, &event.message);
+        let mut reasoning = self.take_live_reasoning_for_turn(&event.session_id, &event.turn_id);
         let session = self.find_session_mut(&event.session_id)?;
         let title = session.title.clone();
         // `failed_current_turn`: this error terminates the LIVE turn — it owns
@@ -6815,7 +7240,9 @@ impl Store {
                 } else {
                     format!("{fallback_summary}\n- Partial response: {partial}")
                 };
-                session.messages.push(Message::assistant(text));
+                session
+                    .messages
+                    .push(assistant_message_with_reasoning(text, reasoning.take()));
                 (
                     format!("Turn error {}: {}", event.code, event.message),
                     true,
@@ -6829,7 +7256,10 @@ impl Store {
                 // A's (partial) text was already committed at switch time, so
                 // the card is the bare error summary (no partial-response tail
                 // here; that tail belongs to the live-turn arm above).
-                session.messages.push(Message::assistant(fallback_summary));
+                session.messages.push(assistant_message_with_reasoning(
+                    fallback_summary,
+                    reasoning.take(),
+                ));
                 session.live_reply = Some(live_reply);
                 (
                     format!("Turn error {}: {}", event.code, event.message),
@@ -6846,7 +7276,10 @@ impl Store {
                 )
             }
             None => {
-                session.messages.push(Message::assistant(fallback_summary));
+                session.messages.push(assistant_message_with_reasoning(
+                    fallback_summary,
+                    reasoning.take(),
+                ));
                 (
                     format!("Turn error {}: {}", event.code, event.message),
                     true,
@@ -6923,8 +7356,8 @@ impl Store {
     /// message — the prior turn's accumulated answer is neither lost nor merged
     /// into the next turn. A prior turn that streamed NO text is dropped
     /// silently (its eventual `TurnCompleted`, if any, is handled by the
-    /// fallback path); we only persist a prior turn that actually produced a
-    /// visible answer.
+    /// fallback path); we only persist a prior turn that actually produced
+    /// visible answer or reasoning output.
     ///
     /// Activity vs. assistant-message decision (DO-NOT-SHIP #2): the assistant
     /// MESSAGE and the tool ACTIVITY are two independent artifacts. A
@@ -6944,13 +7377,20 @@ impl Store {
         session_id: &octos_core::SessionKey,
         new_turn: &TurnId,
     ) {
-        let prior_turn = match self.find_session(session_id).and_then(|session| {
+        let prior_reply_turn = self.find_session(session_id).and_then(|session| {
             session
                 .live_reply
                 .as_ref()
                 .filter(|live_reply| &live_reply.turn_id != new_turn)
                 .map(|live_reply| live_reply.turn_id.clone())
-        }) {
+        });
+        let prior_reasoning_turn = self
+            .state
+            .live_reasoning
+            .get(session_id)
+            .filter(|live_reasoning| &live_reasoning.turn_id != new_turn)
+            .map(|live_reasoning| live_reasoning.turn_id.clone());
+        let prior_turn = match prior_reply_turn.or(prior_reasoning_turn) {
             Some(turn_id) => turn_id,
             None => return,
         };
@@ -6965,23 +7405,37 @@ impl Store {
         let fallback_summary = self.turn_completion_fallback_message(&prior_turn);
         let partial_fallback_summary = self.turn_partial_completion_fallback_message(&prior_turn);
         let follow_tail = self.state.transcript_scroll == 0;
+        let mut reasoning = self.take_live_reasoning_for_turn(session_id, &prior_turn);
         let mut committed = false;
         if let Some(session) = self.find_session_mut(session_id) {
-            // Drop a prior turn that streamed NO visible text: its eventual
+            // Drop a prior turn that streamed NO visible output: its eventual
             // terminal event (if it arrives) handles the empty/fallback case;
-            // only persist a prior turn that produced a real answer.
-            if let Some(live_reply) = session
-                .live_reply
-                .take()
-                .filter(|live_reply| !live_reply.text.trim().is_empty())
-            {
-                let text = finalize_live_reply_text(
-                    live_reply.text,
-                    complete_live_plan,
-                    &fallback_summary,
-                    &partial_fallback_summary,
-                );
-                session.messages.push(Message::assistant(text));
+            // persist a prior turn that produced an answer or reasoning text.
+            let prior_live_reply = match session.live_reply.take() {
+                Some(live_reply) if live_reply.turn_id == prior_turn => Some(live_reply),
+                other => {
+                    session.live_reply = other;
+                    None
+                }
+            };
+            if let Some(live_reply) = prior_live_reply {
+                if !live_reply.text.trim().is_empty() || reasoning.is_some() {
+                    let text = finalize_live_reply_text(
+                        live_reply.text,
+                        complete_live_plan,
+                        &fallback_summary,
+                        &partial_fallback_summary,
+                    );
+                    session
+                        .messages
+                        .push(assistant_message_with_reasoning(text, reasoning.take()));
+                    committed = true;
+                }
+            } else if reasoning.is_some() {
+                session.messages.push(assistant_message_with_reasoning(
+                    fallback_summary,
+                    reasoning.take(),
+                ));
                 committed = true;
             }
         }
@@ -10927,6 +11381,68 @@ mod tests {
         );
     }
 
+    /// The composer footer shows the current model, which lives on the
+    /// per-session runtime status — and that status is only ever created by a
+    /// `session/status/read`. So opening a session must queue one (when the
+    /// server advertises it), otherwise the model never appears until the user
+    /// happens to open a status/model menu.
+    #[test]
+    fn session_open_enqueues_session_status_read_when_supported() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::SessionOpened;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_SESSION_STATUS_READ]);
+        let session_id = SessionKey("dev:local:soak#main".into());
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": session_id.clone(),
+            "active_profile_id": "dev",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        let mut saw_status_read = false;
+        while let Some(command) = store.state.dequeue_autonomy_hydration() {
+            if let AppUiCommand::ReadSessionStatus(params) = command {
+                if params.session_id == session_id {
+                    saw_status_read = true;
+                }
+            }
+        }
+        assert!(
+            saw_status_read,
+            "session open should enqueue session/status/read so the composer footer can show the current model"
+        );
+    }
+
+    /// A server that does not advertise `session/status/read` must not be
+    /// probed on session open — old backends stay untouched.
+    #[test]
+    fn session_open_skips_status_read_when_capability_absent() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::SessionOpened;
+
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": SessionKey("dev:local:soak#main".into()),
+            "active_profile_id": "dev",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        let mut commands = Vec::new();
+        while let Some(command) = store.state.dequeue_autonomy_hydration() {
+            commands.push(command);
+        }
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, AppUiCommand::ReadSessionStatus(_))),
+            "no session/status/read should be queued when the capability is unadvertised; got {commands:?}"
+        );
+    }
+
     /// A session opening while a NON-onboarding menu (or no menu) is active
     /// must not be force-closed — only the wizard tears itself down.
     #[test]
@@ -12270,6 +12786,107 @@ mod tests {
         assert_eq!(store.state.sessions[0].messages.len(), 1);
         assert!(store.state.sessions[0].live_reply.is_none());
         assert_eq!(store.state.run_state.label(), "done");
+    }
+
+    #[test]
+    fn completed_turn_records_a_status_summary_with_running_task_count() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "done");
+        let session_id = store.state.sessions[0].id.clone();
+        // Two background tasks still running when the turn completes.
+        store.state.sessions[0].tasks = vec![
+            TaskView {
+                id: octos_core::TaskId::new(),
+                title: "shell a".into(),
+                state: TaskRuntimeState::Running,
+                runtime_detail: None,
+                output_tail: String::new(),
+                turn_id: None,
+            },
+            TaskView {
+                id: octos_core::TaskId::new(),
+                title: "shell b".into(),
+                state: TaskRuntimeState::Running,
+                runtime_detail: None,
+                output_tail: String::new(),
+                turn_id: None,
+            },
+        ];
+        store.state.set_run_state_in_progress();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let summary = store
+            .state
+            .turn_summary_for(&turn_id)
+            .expect("a completed turn records a status summary");
+        assert_eq!(summary.session_id, session_id);
+        assert_eq!(
+            summary.background_tasks, 2,
+            "summary snapshots the still-running background task count"
+        );
+    }
+
+    #[test]
+    fn reasoning_delta_accumulates_and_commits_with_live_reply() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "final answer");
+        let session_id = store.state.sessions[0].id.clone();
+
+        for chunk in ["thinking ", "through it"] {
+            store.apply_event(AppUiEvent::Protocol(UiNotification::ReasoningDelta(
+                ReasoningDeltaEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_id.clone(),
+                    text: chunk.into(),
+                },
+            )));
+        }
+
+        let live_reasoning = store
+            .state
+            .live_reasoning
+            .get(&session_id)
+            .expect("reasoning delta binds a live reasoning buffer");
+        assert_eq!(live_reasoning.turn_id, turn_id);
+        assert_eq!(live_reasoning.text, "thinking through it");
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let message = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("assistant message committed");
+        assert_eq!(message.content, "final answer");
+        assert_eq!(
+            message.reasoning_content.as_deref(),
+            Some("thinking through it")
+        );
+        assert!(
+            !store.state.live_reasoning.contains_key(&session_id),
+            "reasoning buffer clears after finalize"
+        );
     }
 
     #[test]
@@ -13664,6 +14281,7 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-leaked".into(),
                 name: "run_pipeline".into(),
+                arguments_preview: None,
             },
         )));
         // Terminal barrier for the thread — no ToolEnd ever came for call-leaked.
@@ -13707,6 +14325,7 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-done".into(),
                 name: "run_pipeline".into(),
+                arguments_preview: None,
             },
         )));
         store.apply_event(AppUiEvent::Protocol(envelope_notification(
@@ -13717,6 +14336,8 @@ mod tests {
                 status: EnvelopeToolEndStatus::Complete,
                 error: None,
                 reason: None,
+                output_preview: None,
+                duration_ms: None,
             },
         )));
         store.apply_event(AppUiEvent::Protocol(envelope_notification(
@@ -13761,6 +14382,7 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-a".into(),
                 name: "run_pipeline".into(),
+                arguments_preview: None,
             },
         )));
         store.apply_event(AppUiEvent::Protocol(envelope_notification(
@@ -13769,6 +14391,7 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-b".into(),
                 name: "run_pipeline".into(),
+                arguments_preview: None,
             },
         )));
 
@@ -14059,6 +14682,7 @@ mod tests {
                 Payload::ToolStart {
                     tool_call_id: "call-topic".into(),
                     name: "run_pipeline".into(),
+                    arguments_preview: None,
                 },
             ),
         );
@@ -17901,6 +18525,7 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
+            replayed_tool_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -18023,6 +18648,7 @@ mod tests {
                 content: "background result".into(),
                 media: vec!["out.md".into()],
             }]),
+            replayed_tool_envelopes: None,
         };
 
         store.apply_client_event(ClientEvent::SessionHydrate(result));
@@ -18088,6 +18714,7 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
+            replayed_tool_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -18105,6 +18732,193 @@ mod tests {
         assert!(
             !crate::model::activity_status_is_running(&leaked.status),
             "the reconciled item must no longer read as running"
+        );
+    }
+
+    #[test]
+    fn hydrate_replays_tool_envelopes_into_archived_turn_group() {
+        use crate::client_event::ClientEvent;
+        // #1515 replay lane: a client restarting mid-project hydrates a
+        // session whose past turn ran tools. The replayed envelopes must
+        // materialize per-action rows (name + terminal status + error detail)
+        // and land in the turn's archived activity log — the group chip must
+        // not read "1 action(s) · 1 failed" with no children.
+        let turn_id = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Production shape: legacy-notification envelopes use the TURN id
+        // as their thread id, and the hydrated turn carries thread_id: None —
+        // the replay must resolve the turn through the turn-id key.
+        let envelope = |seq: u64, payload: Payload| Envelope {
+            thread_id: turn_id.0.to_string(),
+            seq,
+            client_message_id: None,
+            payload,
+        };
+        let result = SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 9,
+            },
+            context: None,
+            context_state: None,
+            messages: None,
+            threads: None,
+            turns: Some(vec![HydratedTurn {
+                turn_id: turn_id.clone(),
+                state: TurnLifecycleState::Errored,
+                started_at: None,
+                completed_at: None,
+                thread_id: None,
+            }]),
+            pending_approvals: None,
+            pending_questions: None,
+            replayed_envelopes: None,
+            replayed_tool_envelopes: Some(vec![
+                envelope(
+                    4,
+                    Payload::ToolStart {
+                        tool_call_id: "tc-replay-1".into(),
+                        name: "shell".into(),
+                        arguments_preview: Some("command: \"cargo test\"".into()),
+                    },
+                ),
+                envelope(
+                    5,
+                    Payload::ToolProgress {
+                        tool_call_id: "tc-replay-1".into(),
+                        message: "running cargo test".into(),
+                    },
+                ),
+                envelope(
+                    6,
+                    Payload::ToolEnd {
+                        tool_call_id: "tc-replay-1".into(),
+                        status: EnvelopeToolEndStatus::Error,
+                        error: Some("exit status 101".into()),
+                        reason: None,
+                        output_preview: Some("error[E0308]: mismatched types".into()),
+                        duration_ms: Some(2500),
+                    },
+                ),
+            ]),
+        };
+        store.apply_client_event(ClientEvent::SessionHydrate(result));
+
+        // The terminal turn's replayed rows are archived into the turn log.
+        let log = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_id)
+            .expect("replayed tool rows must be captured into the turn log");
+        let row = log
+            .items
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("tc-replay-1"))
+            .expect("the replayed action row exists");
+        assert_eq!(row.title, "shell");
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.success, Some(false));
+        // Full fidelity: the invocation echo, the result excerpt, and the
+        // duration all survive the replay (Claude-Code-style tool card).
+        assert_eq!(
+            row.detail.as_deref(),
+            Some("command: \"cargo test\""),
+            "turn-scoped replay rows carry the argument echo as detail"
+        );
+        assert_eq!(
+            row.output_preview.as_deref(),
+            Some("error[E0308]: mismatched types"),
+            "the result excerpt must land on the row"
+        );
+        assert_eq!(row.duration_ms, Some(2500));
+        // Quiet replay: history must not flip the live run state.
+        assert!(
+            store.state.active_turn().is_none(),
+            "replaying history must not resurrect an active turn"
+        );
+    }
+
+    #[test]
+    fn hydrate_tool_envelope_replay_is_idempotent_across_rehydrates() {
+        use crate::client_event::ClientEvent;
+        // Hydrate re-runs on every reconnect; the (session, thread, seq)
+        // ledger must make the replay apply-once.
+        let turn_id = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let make_result = || SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 9,
+            },
+            context: None,
+            context_state: None,
+            messages: None,
+            threads: None,
+            turns: Some(vec![HydratedTurn {
+                turn_id: turn_id.clone(),
+                state: TurnLifecycleState::Completed,
+                started_at: None,
+                completed_at: None,
+                thread_id: Some("thread-replay-2".into()),
+            }]),
+            pending_approvals: None,
+            pending_questions: None,
+            replayed_envelopes: None,
+            replayed_tool_envelopes: Some(vec![
+                Envelope {
+                    thread_id: "thread-replay-2".into(),
+                    seq: 1,
+                    client_message_id: None,
+                    payload: Payload::ToolStart {
+                        tool_call_id: "tc-idem".into(),
+                        name: "read_file".into(),
+                        arguments_preview: None,
+                    },
+                },
+                Envelope {
+                    thread_id: "thread-replay-2".into(),
+                    seq: 2,
+                    client_message_id: None,
+                    payload: Payload::ToolEnd {
+                        tool_call_id: "tc-idem".into(),
+                        status: EnvelopeToolEndStatus::Complete,
+                        error: None,
+                        reason: None,
+                        output_preview: None,
+                        duration_ms: None,
+                    },
+                },
+            ]),
+        };
+
+        store.apply_client_event(ClientEvent::SessionHydrate(make_result()));
+        store.apply_client_event(ClientEvent::SessionHydrate(make_result()));
+
+        let log = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_id)
+            .expect("turn log captured");
+        let rows = log
+            .items
+            .iter()
+            .filter(|item| item.tool_call_id.as_deref() == Some("tc-idem"))
+            .count();
+        assert_eq!(rows, 1, "re-hydrating must not duplicate replayed rows");
+        assert!(
+            !store
+                .state
+                .activity
+                .iter()
+                .any(|item| item.tool_call_id.as_deref() == Some("tc-idem")),
+            "captured rows must leave the live activity strip"
         );
     }
 
@@ -18144,6 +18958,7 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
+            replayed_tool_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -18195,6 +19010,7 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
+                replayed_tool_envelopes: None,
             };
             store.apply_client_event(ClientEvent::SessionHydrate(result));
 

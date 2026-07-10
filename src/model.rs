@@ -27,6 +27,12 @@ pub type LiveReply = AppUiLiveReply;
 pub type SessionView = AppUiSession;
 pub type TaskView = AppUiTask;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveReasoning {
+    pub turn_id: TurnId,
+    pub text: String,
+}
+
 pub const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str = "config/capabilities/list";
 pub const APPUI_METHOD_SESSION_STATUS_READ: &str = "session/status/read";
 pub const APPUI_METHOD_MODEL_LIST: &str = "profile/llm/list";
@@ -3169,6 +3175,9 @@ pub struct AppState {
     /// honest context-fill gauge; falls back to a fixed default until the first
     /// cost update arrives.
     pub session_context_window: std::collections::HashMap<SessionKey, u64>,
+    /// In-flight assistant reasoning/thinking text, keyed by session and bound
+    /// to a turn id just like `SessionView::live_reply`.
+    pub live_reasoning: std::collections::HashMap<SessionKey, LiveReasoning>,
     /// Turn ids that reached a terminal state (completed/errored), per session.
     /// A late `MessageDelta` for one of these — e.g. background spawn_only tokens
     /// re-streamed under the dead foreground turn id — must be dropped, not
@@ -3262,6 +3271,12 @@ pub struct AppState {
     pub diff_preview: DiffPreviewPaneState,
     pub activity: Vec<ActivityItem>,
     pub turn_activity_logs: Vec<TurnActivityLog>,
+    /// Hydrate-replayed tool envelopes already applied, keyed by
+    /// `(session, thread_id, seq)` — `seq` is the envelope's identity within
+    /// its thread (#1515). Hydrate re-runs on every reconnect; without this
+    /// ledger each re-run would duplicate the per-action rows.
+    pub applied_hydrate_tool_envelopes: std::collections::HashSet<(String, String, u64)>,
+    pub turn_activity_summaries: Vec<TurnActivitySummary>,
     pub expanded_tool_outputs: bool,
     pub menu_stack: MenuStack,
     pub active_menu: Option<MenuBuildResult>,
@@ -3370,6 +3385,19 @@ pub struct TurnActivityLog {
     pub request: Option<String>,
     pub anchor_index: Option<usize>,
     pub items: Vec<ActivityItem>,
+}
+
+/// A committed per-turn status report (`✻ Ran for 5m 19s · 2 background tasks
+/// still running`) rendered at the tail of a finalized turn in the transcript.
+/// Captured at `TurnCompleted` (a snapshot — the running-task count reflects the
+/// moment the turn ended). Stored parallel to [`TurnActivityLog`] and looked up
+/// by `turn_id` so tool-less turns (no activity log items) still get a summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnActivitySummary {
+    pub session_id: SessionKey,
+    pub turn_id: TurnId,
+    pub elapsed_secs: u64,
+    pub background_tasks: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4825,6 +4853,7 @@ impl AppState {
             orchestration: std::collections::HashMap::new(),
             session_usage: std::collections::HashMap::new(),
             session_context_window: std::collections::HashMap::new(),
+            live_reasoning: std::collections::HashMap::new(),
             completed_turns: std::collections::HashMap::new(),
             session_retry: std::collections::HashMap::new(),
             session_reasoning_effort: std::collections::HashMap::new(),
@@ -4866,6 +4895,8 @@ impl AppState {
             diff_preview: DiffPreviewPaneState::default(),
             activity: Vec::new(),
             turn_activity_logs: Vec::new(),
+            applied_hydrate_tool_envelopes: std::collections::HashSet::new(),
+            turn_activity_summaries: Vec::new(),
             expanded_tool_outputs: false,
             menu_stack: MenuStack::new(),
             active_menu: None,
@@ -5538,6 +5569,92 @@ impl AppState {
         self.activity
             .retain(|item| item.turn_id.as_ref() != Some(turn_id));
         true
+    }
+
+    /// The committed status report for a completed turn, if one was captured.
+    pub fn turn_summary_for(&self, turn_id: &TurnId) -> Option<&TurnActivitySummary> {
+        self.turn_activity_summaries
+            .iter()
+            .find(|summary| &summary.turn_id == turn_id)
+    }
+
+    /// Count of the session's still-running background work (pending/running
+    /// tasks and sub-agents) — the `N still running` half of a turn summary.
+    pub fn running_background_task_count(&self, session_id: &SessionKey) -> usize {
+        self.sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .map(|session| {
+                session
+                    .tasks
+                    .iter()
+                    .filter(|task| matches!(task_state_label(task.state), "pending" | "running"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Record the committed per-turn status report captured at `TurnCompleted`.
+    /// Upserts by `turn_id`, and ensures a [`TurnActivityLog`] exists to anchor
+    /// the summary line in the transcript — for a tool-less turn (no activity
+    /// items) a summary-only log is synthesized so the report still renders
+    /// after the assistant reply. Bounded to the same window as the logs.
+    pub fn attach_turn_summary(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+        elapsed_secs: u64,
+        background_tasks: usize,
+    ) {
+        let summary = TurnActivitySummary {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            elapsed_secs,
+            background_tasks,
+        };
+        if let Some(existing) = self
+            .turn_activity_summaries
+            .iter_mut()
+            .find(|existing| &existing.turn_id == turn_id)
+        {
+            *existing = summary;
+        } else {
+            self.turn_activity_summaries.push(summary);
+        }
+
+        // A tool-less turn has no activity log to hang the summary on; synthesize
+        // an empty-items log anchored to the turn's user message so the report
+        // still renders after the assistant reply (the render/hash paths treat a
+        // log with a summary as renderable even when its item list is empty).
+        if !self
+            .turn_activity_logs
+            .iter()
+            .any(|log| &log.session_id == session_id && &log.turn_id == turn_id)
+        {
+            let request = latest_user_content_for_session(&self.sessions, session_id);
+            self.turn_activity_logs.push(TurnActivityLog {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                request,
+                anchor_index: None,
+                items: Vec::new(),
+            });
+            const MAX_TURN_ACTIVITY_LOGS: usize = 32;
+            if self.turn_activity_logs.len() > MAX_TURN_ACTIVITY_LOGS {
+                let excess = self.turn_activity_logs.len() - MAX_TURN_ACTIVITY_LOGS;
+                self.turn_activity_logs.drain(0..excess);
+            }
+        }
+
+        // Keep summaries bounded to the surviving logs so the two lists cannot
+        // drift (a summary whose log was trimmed away can never render).
+        let live_turns: std::collections::HashSet<TurnId> = self
+            .turn_activity_logs
+            .iter()
+            .map(|log| log.turn_id.clone())
+            .collect();
+        self.turn_activity_summaries
+            .retain(|summary| live_turns.contains(&summary.turn_id));
     }
 
     /// Detail marker stamped on activity items created by the M9-γ
