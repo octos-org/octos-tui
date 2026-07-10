@@ -7535,7 +7535,9 @@ impl Store {
                 self.upsert_envelope_assistant_reasoning(&session_id, &thread_id, text);
                 None
             }
-            Payload::ToolStart { tool_call_id, name } => {
+            Payload::ToolStart {
+                tool_call_id, name, ..
+            } => {
                 self.state.push_activity(
                     ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
                         .with_tool_call(tool_call_id.clone())
@@ -7572,6 +7574,7 @@ impl Store {
                 status,
                 error,
                 reason,
+                ..
             } => {
                 let (label, success) = match status {
                     EnvelopeToolEndStatus::Complete => ("complete", Some(true)),
@@ -19021,6 +19024,8 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-leaked".into(),
                 name: "run_pipeline".into(),
+
+                arguments_preview: None,
             },
         )));
         // Terminal barrier for the thread — no ToolEnd ever came for call-leaked.
@@ -19064,6 +19069,8 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-done".into(),
                 name: "run_pipeline".into(),
+
+                arguments_preview: None,
             },
         )));
         store.apply_event(AppUiEvent::Protocol(envelope_notification(
@@ -19074,6 +19081,9 @@ mod tests {
                 status: EnvelopeToolEndStatus::Complete,
                 error: None,
                 reason: None,
+
+                output_preview: None,
+                duration_ms: None,
             },
         )));
         store.apply_event(AppUiEvent::Protocol(envelope_notification(
@@ -19118,6 +19128,8 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-a".into(),
                 name: "run_pipeline".into(),
+
+                arguments_preview: None,
             },
         )));
         store.apply_event(AppUiEvent::Protocol(envelope_notification(
@@ -19126,6 +19138,8 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-b".into(),
                 name: "run_pipeline".into(),
+
+                arguments_preview: None,
             },
         )));
 
@@ -19416,6 +19430,8 @@ mod tests {
                 Payload::ToolStart {
                     tool_call_id: "call-topic".into(),
                     name: "run_pipeline".into(),
+
+                    arguments_preview: None,
                 },
             ),
         );
