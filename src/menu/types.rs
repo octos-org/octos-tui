@@ -352,6 +352,10 @@ pub enum LocalAction {
         num_turns: u32,
         prefill: String,
     },
+    /// `/btw <question>` — ask a quick aside answered out-of-band while the
+    /// current turn keeps working (no tools, ephemeral). The question is taken
+    /// from the command's inline args.
+    Btw,
     Custom(&'static str),
 }
 

@@ -625,6 +625,7 @@ pub enum AppUiCommand {
     StartReview(ReviewStartParams),
     ListConfigCapabilities(ConfigCapabilitiesListParams),
     ReadSessionStatus(SessionStatusReadParams),
+    SessionBtw(octos_core::ui_protocol::SessionBtwParams),
     ListModels(ModelListParams),
     SelectModel(ModelSelectParams),
     ListPermissionProfiles(PermissionProfileListParams),
@@ -713,6 +714,7 @@ impl AppUiCommand {
             Self::StartReview(_) => APPUI_METHOD_REVIEW_START,
             Self::ListConfigCapabilities(_) => APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
             Self::ReadSessionStatus(_) => APPUI_METHOD_SESSION_STATUS_READ,
+            Self::SessionBtw(_) => octos_core::ui_protocol::methods::SESSION_BTW,
             Self::ListModels(_) | Self::ProfileLlmList(_) => APPUI_METHOD_MODEL_LIST,
             Self::SelectModel(_) | Self::ProfileLlmSelect(_) => APPUI_METHOD_MODEL_SELECT,
             Self::ListPermissionProfiles(_) => {
@@ -3410,6 +3412,8 @@ pub struct AppState {
     /// `run_state_started_at` clock resets whenever the selection changes, so
     /// it cannot time a turn the user switched away from and back.
     pub turn_started_at: std::collections::HashMap<(SessionKey, TurnId), std::time::Instant>,
+    /// Latest `/btw` aside per session (see [`BtwAside`]).
+    pub btw_asides: std::collections::HashMap<SessionKey, BtwAside>,
     pub expanded_tool_outputs: bool,
     pub menu_stack: MenuStack,
     pub active_menu: Option<MenuBuildResult>,
@@ -3610,6 +3614,24 @@ pub struct TurnActivitySummary {
     pub turn_id: TurnId,
     pub elapsed_secs: u64,
     pub background_tasks: usize,
+}
+
+/// A `/btw` aside: a quick question asked WHILE the session's live turn keeps
+/// running, answered out-of-band by the server with no tools. Ephemeral — it
+/// never joins the transcript; the card renders in the live pane and the next
+/// prompt submit dismisses a settled one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BtwAside {
+    pub session_id: SessionKey,
+    pub question: String,
+    pub state: BtwAsideState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BtwAsideState {
+    Answering,
+    Answered(String),
+    Failed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5175,6 +5197,7 @@ impl AppState {
             applied_hydrate_tool_envelopes: std::collections::HashSet::new(),
             turn_activity_summaries: Vec::new(),
             turn_started_at: std::collections::HashMap::new(),
+            btw_asides: std::collections::HashMap::new(),
             expanded_tool_outputs: false,
             menu_stack: MenuStack::new(),
             active_menu: None,
@@ -6134,6 +6157,64 @@ impl AppState {
         self.turn_started_at
             .remove(&(session_id.clone(), turn_id.clone()))
             .map(|started| started.elapsed().as_secs())
+    }
+
+    /// The `/btw` aside for a session, if any (latest per session).
+    pub fn btw_aside_for(&self, session_id: &SessionKey) -> Option<&BtwAside> {
+        self.btw_asides.get(session_id)
+    }
+
+    /// Stage a new `/btw` aside as answering (replaces any prior aside).
+    pub fn set_btw_answering(&mut self, session_id: &SessionKey, question: String) {
+        self.btw_asides.insert(
+            session_id.clone(),
+            BtwAside {
+                session_id: session_id.clone(),
+                question,
+                state: BtwAsideState::Answering,
+            },
+        );
+    }
+
+    /// Resolve the ANSWERING aside for `session_id` with the server's answer.
+    /// A stale result (nothing answering — e.g. the aside was replaced) is
+    /// dropped rather than resurrecting a dismissed card.
+    pub fn resolve_btw_answer(&mut self, session_id: &SessionKey, answer: String) -> bool {
+        match self.btw_asides.get_mut(session_id) {
+            Some(aside) if aside.state == BtwAsideState::Answering => {
+                aside.state = BtwAsideState::Answered(answer);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Fail every ANSWERING aside. RPC errors surface generically as
+    /// `"{method} request {id} failed: …"` with no session attribution, so all
+    /// in-flight asides fail together (concurrent asides across sessions are
+    /// rare; the card invites a retry).
+    pub fn fail_btw_answering(&mut self, message: &str) -> usize {
+        let mut failed = 0;
+        for aside in self.btw_asides.values_mut() {
+            if aside.state == BtwAsideState::Answering {
+                aside.state = BtwAsideState::Failed(message.to_owned());
+                failed += 1;
+            }
+        }
+        failed
+    }
+
+    /// Drop a SETTLED (answered/failed) aside — the exchange is ephemeral and
+    /// the next prompt submit dismisses it. An answering aside stays; its
+    /// result may still land.
+    pub fn clear_settled_btw_aside(&mut self, session_id: &SessionKey) {
+        if self
+            .btw_asides
+            .get(session_id)
+            .is_some_and(|aside| !matches!(aside.state, BtwAsideState::Answering))
+        {
+            self.btw_asides.remove(session_id);
+        }
     }
 
     /// Count of the session's still-running background work (pending/running

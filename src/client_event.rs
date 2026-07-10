@@ -53,6 +53,7 @@ pub enum ClientEvent {
     ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchClientEvent),
     ProfileSkillsMutation(ProfileSkillsMutationClientEvent),
     SessionStatus(SessionStatusClientEvent),
+    SessionBtw(SessionBtwClientEvent),
     ToolStatus(ToolStatusClientEvent),
     ToolConfigList(ToolConfigListClientEvent),
     ToolConfigMutation(ToolConfigMutationClientEvent),
@@ -201,6 +202,13 @@ pub struct ProfileSkillsMutationClientEvent {
 pub struct SessionStatusClientEvent {
     pub result: SessionStatusReadResult,
     pub message: String,
+}
+
+/// Result of a `session/btw` aside — the out-of-band answer to a quick
+/// question asked while the session's turn keeps running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBtwClientEvent {
+    pub result: octos_core::ui_protocol::SessionBtwResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

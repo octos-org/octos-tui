@@ -164,6 +164,9 @@ pub const APPUI_SKILLS_MENU_METHODS_ANY: &[&str] = &[
 /// unsupported `session/hydrate` RPC, so the command hides unless both land.
 pub const APPUI_RESUME_MENU_METHODS_ALL: &[&str] =
     &[methods::SESSION_LIST, methods::SESSION_HYDRATE];
+/// `/btw` is gated on the server advertising `session/btw` — the out-of-band
+/// aside answer; older servers hide the command instead of erroring on send.
+pub const APPUI_BTW_METHODS_ALL: &[&str] = &[methods::SESSION_BTW];
 /// `/rewind` is gated on the server advertising `session/rollback`; without it
 /// there is no way to drop the later turns, so the command hides.
 pub const APPUI_REWIND_MENU_METHODS_ANY: &[&str] =
@@ -598,6 +601,15 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             availability: CommandAvailability::app_ui_read(&[APPUI_METHOD_SESSION_STATUS_READ]),
             inline_args: InlineArgMode::None,
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_COST)),
+        },
+        CommandSpec {
+            name: "btw",
+            aliases: &["aside"],
+            description: "Ask a quick aside question while the current turn keeps working.",
+            category: CommandCategory::Session,
+            availability: CommandAvailability::app_ui_read(APPUI_BTW_METHODS_ALL),
+            inline_args: InlineArgMode::Required,
+            entry: CommandEntry::LocalAction(LocalAction::Btw),
         },
         CommandSpec {
             name: "resume",

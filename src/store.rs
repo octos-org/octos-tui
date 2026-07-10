@@ -437,6 +437,11 @@ impl Store {
         if should_record_in_history(&prompt) {
             self.state.composer_history.record(&prompt);
         }
+        if let Some(session_id) = self.active_session().map(|session| session.id.clone()) {
+            // A settled `/btw` aside is ephemeral — the next prompt dismisses
+            // it (an answering one stays; its result may still land).
+            self.state.clear_settled_btw_aside(&session_id);
+        }
         if self.state.active_turn().is_some() {
             self.state.pending_messages.push(prompt);
             self.state.status = t!("status.message_staged").into_owned();
@@ -1208,6 +1213,7 @@ impl Store {
             LocalAction::SetLanguage => self.dispatch_set_language(inline_args.unwrap_or_default()),
             LocalAction::SetLanguageCode(lang) => self.dispatch_set_language_code(lang),
             LocalAction::SetThinking => self.dispatch_set_thinking(inline_args.unwrap_or_default()),
+            LocalAction::Btw => self.dispatch_btw(inline_args.unwrap_or_default()),
             LocalAction::SetScrollMode => {
                 self.dispatch_set_scrollmode(inline_args.unwrap_or_default());
                 // Executing from the slash popup must close it: the toggle's
@@ -1681,6 +1687,40 @@ impl Store {
         } else {
             t!("scrollmode.set_native").into_owned()
         };
+    }
+
+    /// `/btw <question>` — ask a quick aside while the current turn keeps
+    /// working. Slash commands bypass mid-turn staging, so this fires
+    /// immediately; the server answers out-of-band with NO tools and the
+    /// exchange stays ephemeral (it never joins the session history).
+    fn dispatch_btw(&mut self, args: &str) -> Option<AppUiCommand> {
+        let question = args.trim().to_owned();
+        let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
+            self.state.status = t!("status.no_session_send_prompt").into_owned();
+            return None;
+        };
+        if question.is_empty() {
+            self.state.status = t!("status.btw_usage").into_owned();
+            return None;
+        }
+        if self
+            .state
+            .btw_aside_for(&session_id)
+            .is_some_and(|aside| aside.state == crate::model::BtwAsideState::Answering)
+        {
+            self.state.status = t!("status.btw_busy").into_owned();
+            return None;
+        }
+        self.state.set_btw_answering(&session_id, question.clone());
+        self.state.status = t!("status.btw_answering").into_owned();
+        self.state.scroll_transcript_to_latest();
+        Some(AppUiCommand::SessionBtw(
+            octos_core::ui_protocol::SessionBtwParams {
+                session_id,
+                topic: None,
+                question,
+            },
+        ))
     }
 
     fn dispatch_set_thinking(&mut self, inline_args: &str) -> Option<AppUiCommand> {
@@ -4855,6 +4895,23 @@ impl Store {
                 self.refresh_active_menu_if_open();
                 None
             }
+            ClientEvent::SessionBtw(event) => {
+                // Resolve the answering aside; a stale answer (aside replaced
+                // or dismissed meanwhile) is dropped, not resurrected. Only an
+                // ACTIVE-session answer may touch the shared status/scroll — a
+                // background session's aside resolving must not yank the view
+                // the user is currently reading.
+                let session_id = event.result.session_id.clone();
+                if self
+                    .state
+                    .resolve_btw_answer(&session_id, event.result.answer)
+                    && self.event_targets_active_session(&session_id)
+                {
+                    self.state.status = t!("status.btw_answered").into_owned();
+                    self.state.scroll_transcript_to_latest();
+                }
+                None
+            }
             ClientEvent::ToolStatus(event) => {
                 self.apply_tool_status_event(event);
                 self.refresh_active_menu_if_open();
@@ -5409,6 +5466,33 @@ impl Store {
                 None
             }
             AppUiEvent::Error(error) => {
+                // `/btw` failure/cancellation. Match ONLY the two shapes the
+                // transport actually produces for an aside — the response
+                // error/cancel ("{method} request {id} …" formats the method
+                // FIRST) and the pre-send pending-cap rejection (its fixed
+                // trailer names the method) — never a bare substring: an
+                // unrelated error merely echoing "session/btw" (e.g. inside a
+                // session key) must fall through to the normal error handling
+                // below, not be swallowed by this early return. Errors carry
+                // no session attribution; with concurrent asides across
+                // sessions all answering cards fail together (rare; each card
+                // invites a retry). CRUCIALLY: an aside failure is NOT a
+                // turn/transport failure — return before the generic path
+                // below flips the run state to error for a perfectly healthy
+                // main turn.
+                let is_btw_error = error.message.starts_with("session/btw ")
+                    || (error.code == "too_many_pending_requests"
+                        && error.message.ends_with("enqueue session/btw request"))
+                    || (error.code == "invalid_result"
+                        && error
+                            .message
+                            .starts_with("failed to decode UI protocol result for session/btw"))
+                    || (error.code == "frame_too_large"
+                        && error.message.starts_with("encoded session/btw request"));
+                if is_btw_error && self.state.fail_btw_answering(&error.message) > 0 {
+                    self.state.status = t!("status.btw_failed").into_owned();
+                    return None;
+                }
                 // A staged-drain SubmitPrompt can die at the TRANSPORT layer —
                 // no turn/started or terminal will ever arrive for it, so the
                 // FIFO in-flight gate would wedge the session's remaining
@@ -11958,6 +12042,7 @@ mod tests {
         store.apply_client_event(ClientEvent::SessionRollback(SessionRollbackResult {
             dropped_turns: 1,
             thread: SessionHydrateResult {
+                replayed_tool_envelopes: None,
                 session_id: SessionKey("local:a".into()),
                 cursor: octos_core::ui_protocol::UiCursor {
                     stream: "local:a".into(),
@@ -11983,7 +12068,6 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
-                replayed_tool_envelopes: None,
             },
         }));
 
@@ -12019,6 +12103,7 @@ mod tests {
         store.apply_client_event(ClientEvent::SessionRollback(SessionRollbackResult {
             dropped_turns: 1,
             thread: SessionHydrateResult {
+                replayed_tool_envelopes: None,
                 session_id: session_id.clone(),
                 cursor: octos_core::ui_protocol::UiCursor {
                     stream: session_id.0.clone(),
@@ -12044,7 +12129,6 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
-                replayed_tool_envelopes: None,
             },
         }));
 
@@ -12088,6 +12172,7 @@ mod tests {
         store.apply_client_event(ClientEvent::SessionRollback(SessionRollbackResult {
             dropped_turns: 2,
             thread: SessionHydrateResult {
+                replayed_tool_envelopes: None,
                 session_id: session_id.clone(),
                 cursor: octos_core::ui_protocol::UiCursor {
                     stream: session_id.0.clone(),
@@ -12113,7 +12198,6 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
-                replayed_tool_envelopes: None,
             },
         }));
 
@@ -16656,6 +16740,281 @@ mod tests {
         assert_eq!(store.state.sessions[0].messages.len(), 1);
         assert!(store.state.sessions[0].live_reply.is_none());
         assert_eq!(store.state.run_state.label(), "done");
+    }
+
+    #[test]
+    fn btw_dispatches_mid_turn_without_staging() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming…");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.target = Some("ws://example.test/ui-protocol".into());
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            octos_core::ui_protocol::methods::SESSION_BTW,
+        ]));
+
+        store.state.composer = "/btw what are you working on?".into();
+        let command = store.compose_command().expect("btw emits session/btw");
+        let AppUiCommand::SessionBtw(params) = command else {
+            panic!("expected SessionBtw, got {command:?}");
+        };
+        assert_eq!(params.session_id, session_id);
+        assert_eq!(params.question, "what are you working on?");
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "/btw must fire immediately, never stage behind the live turn"
+        );
+        assert!(matches!(
+            store.state.btw_aside_for(&session_id),
+            Some(crate::model::BtwAside {
+                state: crate::model::BtwAsideState::Answering,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn btw_rejects_empty_question_and_busy_aside() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming…");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.target = Some("ws://example.test/ui-protocol".into());
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            octos_core::ui_protocol::methods::SESSION_BTW,
+        ]));
+
+        store.state.composer = "/btw   ".into();
+        assert!(store.compose_command().is_none(), "empty question rejected");
+        assert!(store.state.btw_aside_for(&session_id).is_none());
+
+        store.state.set_btw_answering(&session_id, "first?".into());
+        store.state.composer = "/btw second?".into();
+        assert!(
+            store.compose_command().is_none(),
+            "a second aside while the first is answering is rejected"
+        );
+        assert_eq!(
+            store
+                .state
+                .btw_aside_for(&session_id)
+                .map(|aside| aside.question.clone()),
+            Some("first?".into()),
+            "the answering aside is not replaced"
+        );
+    }
+
+    #[test]
+    fn btw_command_hidden_without_capability() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming…");
+        let session_id = store.state.sessions[0].id.clone();
+        // No capabilities at all → the registry hides /btw as unavailable.
+        store.state.composer = "/btw hello?".into();
+        assert!(store.compose_command().is_none());
+        assert!(
+            store.state.btw_aside_for(&session_id).is_none(),
+            "an unavailable command must not stage an aside"
+        );
+    }
+
+    #[test]
+    fn btw_answer_resolves_the_answering_aside() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming…");
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .set_btw_answering(&session_id, "what are you doing?".into());
+
+        store.apply_client_event(ClientEvent::SessionBtw(
+            crate::client_event::SessionBtwClientEvent {
+                result: octos_core::ui_protocol::SessionBtwResult {
+                    session_id: session_id.clone(),
+                    answer: "Refactoring the parser.".into(),
+                    model: Some("kimi-k2.5".into()),
+                },
+            },
+        ));
+
+        assert!(matches!(
+            store.state.btw_aside_for(&session_id).map(|aside| &aside.state),
+            Some(crate::model::BtwAsideState::Answered(answer)) if answer == "Refactoring the parser."
+        ));
+    }
+
+    #[test]
+    fn btw_error_fails_the_answering_aside() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming…");
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .set_btw_answering(&session_id, "still there?".into());
+
+        store.apply_event(AppUiEvent::Error(octos_core::app_ui::AppUiError {
+            code: "request_cancelled".into(),
+            message: "session/btw request r7 cancelled: transport closed".into(),
+        }));
+
+        assert!(matches!(
+            store
+                .state
+                .btw_aside_for(&session_id)
+                .map(|aside| &aside.state),
+            Some(crate::model::BtwAsideState::Failed(_))
+        ));
+        // An aside failure is NOT a turn failure: the live turn's run state
+        // must stay untouched (previously the generic error path flipped it
+        // to error for a perfectly healthy main turn).
+        assert!(
+            store.state.run_state.is_active(),
+            "aside failure must not fail the live turn's run state; got {:?}",
+            store.state.run_state.label()
+        );
+    }
+
+    #[test]
+    fn unrelated_error_echoing_btw_text_does_not_fail_the_aside() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming…");
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .set_btw_answering(&session_id, "still there?".into());
+
+        // An unrelated failure whose text merely CONTAINS "session/btw"
+        // (e.g. an echoed session key) must not be swallowed by the aside
+        // branch — it takes the normal error path and the aside keeps
+        // answering.
+        store.apply_event(AppUiEvent::Error(octos_core::app_ui::AppUiError {
+            code: "unknown_session".into(),
+            message: "turn/start request r9 failed: unknown session dev:x#session/btw".into(),
+        }));
+        assert!(
+            matches!(
+                store
+                    .state
+                    .btw_aside_for(&session_id)
+                    .map(|aside| &aside.state),
+                Some(crate::model::BtwAsideState::Answering)
+            ),
+            "a non-aside error must not settle the aside"
+        );
+
+        // The pre-send pending-cap rejection IS an aside error (fixed trailer
+        // names the method) and settles the card.
+        store.apply_event(AppUiEvent::Error(octos_core::app_ui::AppUiError {
+            code: "too_many_pending_requests".into(),
+            message:
+                "UI protocol has 16 pending request(s); refusing to enqueue session/btw request"
+                    .into(),
+        }));
+        assert!(matches!(
+            store
+                .state
+                .btw_aside_for(&session_id)
+                .map(|aside| &aside.state),
+            Some(crate::model::BtwAsideState::Failed(_))
+        ));
+
+        // The two remaining method-tagged shapes settle the aside too: a
+        // malformed success result and the outbound frame-size rejection.
+        for (code, message) in [
+            (
+                "invalid_result",
+                "failed to decode UI protocol result for session/btw: missing answer",
+            ),
+            (
+                "frame_too_large",
+                "encoded session/btw request r3 is 9999999 bytes; max is 1048576",
+            ),
+        ] {
+            store.state.set_btw_answering(&session_id, "again?".into());
+            store.apply_event(AppUiEvent::Error(octos_core::app_ui::AppUiError {
+                code: code.into(),
+                message: message.into(),
+            }));
+            assert!(
+                matches!(
+                    store
+                        .state
+                        .btw_aside_for(&session_id)
+                        .map(|aside| &aside.state),
+                    Some(crate::model::BtwAsideState::Failed(_))
+                ),
+                "{code} must settle the aside"
+            );
+        }
+    }
+
+    #[test]
+    fn background_session_btw_answer_does_not_touch_the_active_view() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming…");
+        let background = SessionView {
+            id: SessionKey("local:background".into()),
+            title: "background".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        store.state.sessions.push(background);
+        let background_id = store.state.sessions[1].id.clone();
+        store
+            .state
+            .set_btw_answering(&background_id, "still on it?".into());
+        store.state.status = "reading session A".into();
+
+        store.apply_client_event(ClientEvent::SessionBtw(
+            crate::client_event::SessionBtwClientEvent {
+                result: octos_core::ui_protocol::SessionBtwResult {
+                    session_id: background_id.clone(),
+                    answer: "yes".into(),
+                    model: None,
+                },
+            },
+        ));
+
+        assert!(
+            matches!(
+                store
+                    .state
+                    .btw_aside_for(&background_id)
+                    .map(|aside| &aside.state),
+                Some(crate::model::BtwAsideState::Answered(answer)) if answer == "yes"
+            ),
+            "the background aside still resolves"
+        );
+        assert_eq!(
+            store.state.status, "reading session A",
+            "a background aside answer must not overwrite the active view's status"
+        );
+    }
+
+    #[test]
+    fn next_prompt_submit_dismisses_settled_aside_only() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming…");
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Settled (answered) aside → the next prompt dismisses it.
+        store.state.set_btw_answering(&session_id, "q1?".into());
+        assert!(store.state.resolve_btw_answer(&session_id, "a1".into()));
+        store.state.composer = "next actual prompt".into();
+        let _ = store.compose_command();
+        assert!(
+            store.state.btw_aside_for(&session_id).is_none(),
+            "a settled aside is ephemeral — dismissed on the next submit"
+        );
+
+        // Answering aside → stays (its result may still land).
+        store.state.set_btw_answering(&session_id, "q2?".into());
+        store.state.composer = "another prompt".into();
+        let _ = store.compose_command();
+        assert!(
+            store.state.btw_aside_for(&session_id).is_some(),
+            "an answering aside survives a prompt submit"
+        );
     }
 
     #[test]
@@ -23359,6 +23718,7 @@ mod tests {
         let session_id = store.state.sessions[0].id.clone();
 
         let result = SessionHydrateResult {
+            replayed_tool_envelopes: None,
             session_id: session_id.clone(),
             cursor: octos_core::ui_protocol::UiCursor {
                 stream: session_id.0.clone(),
@@ -23384,7 +23744,6 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
-            replayed_tool_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -23416,6 +23775,7 @@ mod tests {
             "Allow write_file",
         );
         let result = SessionHydrateResult {
+            replayed_tool_envelopes: None,
             session_id: session_id.clone(),
             cursor: UiCursor {
                 stream: "session".into(),
@@ -23510,7 +23870,6 @@ mod tests {
                 content: "background result".into(),
                 media: vec!["out.md".into()],
             }]),
-            replayed_tool_envelopes: None,
         };
 
         store.apply_client_event(ClientEvent::SessionHydrate(result));
@@ -23557,6 +23916,7 @@ mod tests {
         );
 
         let result = SessionHydrateResult {
+            replayed_tool_envelopes: None,
             session_id: session_id.clone(),
             cursor: octos_core::ui_protocol::UiCursor {
                 stream: session_id.0.clone(),
@@ -23576,7 +23936,6 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
-            replayed_tool_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -24011,6 +24370,7 @@ mod tests {
         );
 
         let result = SessionHydrateResult {
+            replayed_tool_envelopes: None,
             session_id: session_id.clone(),
             cursor: octos_core::ui_protocol::UiCursor {
                 stream: session_id.0.clone(),
@@ -24030,7 +24390,6 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
-            replayed_tool_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -24063,6 +24422,7 @@ mod tests {
             );
 
             let result = SessionHydrateResult {
+                replayed_tool_envelopes: None,
                 session_id: session_id.clone(),
                 cursor: octos_core::ui_protocol::UiCursor {
                     stream: session_id.0.clone(),
@@ -24082,7 +24442,6 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
-                replayed_tool_envelopes: None,
             };
             store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -24135,6 +24494,7 @@ mod tests {
                 .push("queued behind dead turn".into());
 
             let result = SessionHydrateResult {
+                replayed_tool_envelopes: None,
                 session_id: session_id.clone(),
                 cursor: octos_core::ui_protocol::UiCursor {
                     stream: session_id.0.clone(),
@@ -24154,7 +24514,6 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
-                replayed_tool_envelopes: None,
             };
             store.apply_client_event(ClientEvent::SessionHydrate(result));
 

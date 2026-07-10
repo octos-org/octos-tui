@@ -95,6 +95,9 @@ app:
     esc_interrupt: "Esc 中断"
     stop_to_close: "/stop 关闭"
     tool_output_expanded: "工具输出已展开"
+  btw:
+    answering: "回答中…"
+    failed: "旁路提问失败:%{error}"
   turn_summary:
     ran_for: "耗时 %{duration}"
     tasks_still_running: "%{count} 个后台任务仍在运行"
@@ -905,6 +908,11 @@ status:
   list_more: "，+%{count} 项更多"
   no_session_send_prompt: "没有打开的编码会话。发送提示前请运行 /onboard open-session。"
   message_staged: "消息已暂存；将在当前回合结束后提交。按 Esc 可中断/发送。"
+  btw_usage: "用法:/btw <问题> — 在当前回合继续运行时快速旁路提问"
+  btw_answering: "btw:回答中…"
+  btw_answered: "btw:已回答"
+  btw_busy: "btw:上一个旁路提问仍在回答中"
+  btw_failed: "btw:旁路提问失败"
   staged_submit_requeued: "提交在传输层失败；暂存消息已重新入队，稍后自动重试。"
   queued_turn_start: "已排队 回合/启动"
   command_unavailable: "命令不可用"
