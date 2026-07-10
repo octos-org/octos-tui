@@ -173,11 +173,19 @@ pub fn live_ui_height_with_finalization(
 
     // Never let the live UI eat the whole screen: leave at least a few rows of
     // scrollback visible above it (so the user always sees prior output and can
-    // start a selection there). Always at least the chrome.
+    // start a selection there). Always at least the chrome — but HARD-capped
+    // at height-2 (#232 #3, codex fold 4): a FULL-SCREEN viewport has no
+    // DECSTBM scroll region above it (DECSTBM needs top < bottom; xterm
+    // ignores a 0-1-row `CSI 1;1r`), so the inline history flush has nowhere
+    // to scroll — flushed lines are printed inside the viewport and silently
+    // repainted over. Paired with the `area.top() <= 1` fallback in
+    // `insert_history_lines`; both were dropped together and reinstated
+    // together.
+    let max_live = height.saturating_sub(2).max(1);
     let cap = height
         .saturating_sub(LIVE_VIEWPORT_MIN_SCROLLBACK)
-        .max(chrome.min(height));
-    total.clamp(chrome.min(height).max(1), cap.max(1))
+        .max(chrome.min(max_live));
+    total.clamp(chrome.min(max_live).max(1), cap.max(1))
 }
 
 /// Minimum rows of scrollback to keep visible above the inline viewport.

@@ -62,10 +62,22 @@ fn reset_scroll_region<W: Write>(w: &mut W) -> io::Result<()> {
 /// otherwise). Updates `terminal.viewport_area` so the next draw paints in the
 /// viewport's new position. Cursor-position-neutral: restores the cursor to
 /// where it was on entry.
-pub fn insert_history_lines<B>(terminal: &mut Terminal<B>, lines: Vec<Line>) -> io::Result<()>
+pub fn insert_history_lines<B>(terminal: &mut Terminal<B>, mut lines: Vec<Line>) -> io::Result<()>
 where
     B: Backend + Write,
 {
+    // SANITIZE FIRST, wrap after: span content is later Printed verbatim into
+    // the terminal mid-DECSTBM-dance (`write_spans` does no escaping), so raw
+    // control bytes in untrusted transcript content would execute there — a
+    // stray `CSI r` / `CSI 2J` corrupts the screen, an OSC retitles the
+    // window. Tabs additionally count width 0 in `wrap_line` but advance up to
+    // 8 columns on a real terminal, breaking the one-Line-one-row invariant
+    // the row math below depends on. This is the single chokepoint: every
+    // scrollback write goes through this function.
+    for line in &mut lines {
+        sanitize_line_in_place(line);
+    }
+
     let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
     let mut area = terminal.viewport_area;
     let last_cursor_pos = terminal.last_known_cursor_pos;
@@ -78,7 +90,7 @@ where
     for line in &lines {
         wrapped.extend(wrap_line(line, wrap_width));
     }
-    let wrapped_rows = wrapped.len() as u16;
+    let wrapped_rows = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
     if wrapped_rows == 0 {
         return Ok(());
     }
@@ -103,13 +115,69 @@ where
         should_update_area = true;
     }
 
+    // A viewport with fewer than TWO rows above it cannot use the DECSTBM
+    // path: `CSI 1;0r` is invalid (xterm reads the 0 param as "default",
+    // i.e. the whole screen) and `CSI 1;1r` is equally rejected (DECSTBM
+    // requires top < bottom), so the region never narrows and the scroll ops
+    // would hit the live viewport — flushed lines were printed inside it and
+    // silently repainted over on tiny panes (#232 #3, codex fold 4). Stream
+    // the lines through the bottom row of an explicit full-screen region
+    // instead: each `\r\n` at the bottom margin scrolls one row out through
+    // the top into scrollback, and the trailing feeds push every printed
+    // line (plus any preserved rows above the viewport) the rest of the way
+    // out — the next draw repaints the viewport regardless, so rows left on
+    // screen would be lost, not saved. The VIEWPORT rows are cleared first so
+    // the displaced chrome (composer/status) streams out as blanks, never as
+    // copyable text in scrollback; rows ABOVE the viewport are genuine
+    // history/shell content and stream out intact.
+    if area.top() <= 1 {
+        let bottom = screen_size.height.max(1);
+        for row in area.top()..bottom {
+            queue!(writer, MoveTo(0, row), Clear(ClearType::UntilNewLine))?;
+        }
+        set_scroll_region(writer, 1, bottom)?;
+        queue!(writer, MoveTo(0, bottom.saturating_sub(1)))?;
+        for line in &wrapped {
+            write_history_line(writer, line)?;
+            queue!(writer, Print("\r\n"))?;
+        }
+        for _ in 0..bottom.saturating_sub(1) {
+            queue!(writer, Print("\r\n"))?;
+        }
+        reset_scroll_region(writer)?;
+        queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
+        // The grow step above may have slid the viewport down (a top-0 area
+        // with spare rows below lands here at top 1) — apply the pending move
+        // before returning or the stored viewport stays on the old row while
+        // the screen shifted, and the next draw repaints the wrong rows
+        // (codex fold 5).
+        if should_update_area {
+            terminal.set_viewport_area(area);
+        }
+        terminal.set_visible_history_extent(0, 0);
+        // The scroll shifted the on-screen viewport content; force the next
+        // draw to repaint it fully instead of diffing against a stale buffer.
+        terminal.invalidate_viewport();
+        Backend::flush(terminal.backend_mut())?;
+        return Ok(());
+    }
+
     // Limit scrolling to the rows above the viewport. The terminal may have
     // spare blank capacity between the already-inserted history and the live
     // viewport (for example after the live tail shrinks). Append into that gap
-    // first; only scroll rows that are known to be visible history. Using a
-    // leading CRLF to create space preserves the gap once per call, which makes
-    // streamed chunks render with extra blank rows compared with one combined
-    // insert.
+    // first; scroll only the DEFICIT — the rows the new content overflows past
+    // the viewport top when appended directly below the existing history:
+    //
+    // * On the FIRST flush (`visible_history_rows == 0`) the extent is empty
+    //   at `area.top()`, so the deficit equals the full insert and the region
+    //   scrolls before printing — whatever the shell had above the viewport
+    //   shifts up (into scrollback as needed) instead of being overwritten
+    //   (#232 #1).
+    // * On later flushes the deficit consumes blank filler above the history
+    //   first, one flush at a time, so the transcript stays flush against the
+    //   viewport instead of being relocated to the region top with the blank
+    //   band bulk-dumped into scrollback (#232 #2, the old
+    //   `history_top + to_scroll` relocation).
     set_scroll_region(writer, 1, area.top())?;
     let history_bottom = if visible_history_rows == 0 {
         area.top()
@@ -121,26 +189,26 @@ where
     let overflowing_rows = history_bottom
         .saturating_add(wrapped_rows)
         .saturating_sub(area.top());
-    let history_rows_to_scroll = overflowing_rows.min(history_rows);
-    let index_count = if history_rows_to_scroll > 0 {
-        history_top.saturating_add(history_rows_to_scroll)
-    } else {
-        0
-    };
+    // Scrollable budget = the rows at or above `history_bottom` (the blank
+    // band plus the history itself). Never scroll the gap BELOW the history
+    // (rows between it and the viewport): those are consumed by the print
+    // itself, and scrolling them would interleave stale blank rows between
+    // the old and new content in scrollback.
+    let index_count = overflowing_rows.min(history_bottom);
     if index_count > 0 {
         queue!(writer, MoveTo(0, area.top().saturating_sub(1)))?;
         for _ in 0..index_count {
             queue!(writer, Print("\x1bD"))?; // Index (ESC D): scroll region up.
         }
     }
-    let remaining_history_rows = history_rows.saturating_sub(history_rows_to_scroll);
-    let base_bottom = if index_count > 0 {
-        remaining_history_rows
-    } else {
-        history_bottom
-    };
-    let new_bottom = base_bottom.saturating_add(wrapped_rows).min(area.top());
-    let new_visible_history_rows = remaining_history_rows
+    // Everything in the region shifted up by `index_count`; history rows that
+    // passed the region top (beyond the blank band above them) left the screen.
+    let shifted_history_bottom = history_bottom.saturating_sub(index_count);
+    let shifted_history_rows = history_rows.saturating_sub(index_count.saturating_sub(history_top));
+    let new_bottom = shifted_history_bottom
+        .saturating_add(wrapped_rows)
+        .min(area.top());
+    let new_visible_history_rows = shifted_history_rows
         .saturating_add(wrapped_rows)
         .min(area.top());
     let cursor_top = new_bottom.saturating_sub(wrapped_rows.min(new_bottom));
@@ -167,6 +235,36 @@ where
     // history to insert, so an idle TUI still emits nothing.
     Backend::flush(terminal.backend_mut())?;
     Ok(())
+}
+
+/// Replace each span's content with a terminal-safe version: tabs expand to 4
+/// spaces (fixed expansion — scrollback lines are wrapped by column, so
+/// tabstop-relative expansion has no anchor here) and every other control
+/// char — C0 (including `\r`, `\n`, ESC), DEL, and C1 (U+0080–U+009F, the
+/// 8-bit CSI/OSC forms) — is removed. Removing the introducer defuses the
+/// whole escape sequence (its params become inert printable text). Styling
+/// and span boundaries are preserved. Clean spans are left unallocated.
+fn sanitize_line_in_place(line: &mut Line<'_>) {
+    for span in &mut line.spans {
+        let content = span.content.as_ref();
+        if content.chars().any(char::is_control) {
+            span.content = std::borrow::Cow::Owned(sanitize_span_content(content));
+        }
+    }
+}
+
+/// `char::is_control` matches Unicode `Cc` — exactly C0 (U+0000–U+001F), DEL
+/// (U+007F) and C1 (U+0080–U+009F).
+fn sanitize_span_content(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    for ch in content.chars() {
+        if ch == '\t' {
+            out.push_str("    ");
+        } else if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Word-wrap a [`Line`] to `width` display columns, preserving per-span style.
@@ -600,7 +698,11 @@ mod tests {
                     if parsed.len() >= 2 {
                         let top = parsed[0].max(1).saturating_sub(1);
                         let bottom = parsed[1].max(1).min(self.size.height).saturating_sub(1);
-                        if top <= bottom {
+                        // DECSTBM requires top < bottom (xterm IGNORES a
+                        // degenerate one-row region like `CSI 1;1r`) — mirror
+                        // that so the harness cannot mask real-terminal
+                        // failures (codex fold 4).
+                        if top < bottom {
                             self.margin_top = top;
                             self.margin_bottom = bottom;
                         }
@@ -770,7 +872,11 @@ mod tests {
         height: u16,
         final_viewport: Rect,
     ) -> Terminal<ScreenBackend> {
-        let seed_top = final_viewport.y.saturating_sub(1).max(1);
+        // Seed with a top ≥ 2 so the seeding itself stays on the normal
+        // DECSTBM path — a top ≤ 1 seed would route through the full-screen
+        // streaming fallback (codex fold 4) and pollute the combos that then
+        // assert exact normal-path row layouts.
+        let seed_top = final_viewport.y.saturating_sub(1).max(2);
         let seed_viewport = Rect::new(0, seed_top, width, height - seed_top);
         let mut term = screen_term(width, height, seed_viewport);
         insert_history_lines(&mut term, vec![text_line("old")]).expect("seed old history");
@@ -883,6 +989,31 @@ mod tests {
                     .backend()
                     .screen_rows_above(combined.viewport_area.top());
 
+                if viewport_top < 2 {
+                    // Degenerate region (`area.top() <= 1`, codex fold 4):
+                    // these route through the full-screen STREAMING fallback,
+                    // which trades blank-noise for guaranteed scrollback
+                    // delivery — exact row equivalence doesn't hold. The seed
+                    // row sits INSIDE the final one-row-above viewport here
+                    // (the helper moved the viewport up over it), i.e. it is
+                    // live-area territory the next draw repaints regardless —
+                    // only the flushed inserts are recoverable content.
+                    let readable = |rows: &[String]| -> Vec<String> {
+                        rows.iter().filter(|row| !row.is_empty()).cloned().collect()
+                    };
+                    assert_eq!(
+                        readable(&split_rows),
+                        vec!["first", "second"],
+                        "streaming-path split inserts must deliver the flushed content in order: height={height} viewport_top={viewport_top}"
+                    );
+                    assert_eq!(
+                        readable(&split_rows),
+                        readable(&combined_rows),
+                        "streaming-path chunked and combined inserts must deliver the same content: height={height} viewport_top={viewport_top}"
+                    );
+                    continue;
+                }
+
                 assert_eq!(
                     split_rows,
                     vec!["old", "first", "", "second", ""],
@@ -915,6 +1046,300 @@ mod tests {
             split_rows,
             vec!["first", "", "second", ""],
             "redrawing a leading-blank live tail between inserts must not add a second blank"
+        );
+    }
+
+    #[test]
+    fn insert_history_strips_raw_escapes_and_controls_from_span_content() {
+        // Fix #5: span content is Printed verbatim into the terminal mid-
+        // DECSTBM dance; raw ESC/CSI/OSC or C1 bytes in untrusted transcript
+        // content (tool output, `cat` of a binary, model-echoed escapes) would
+        // corrupt the screen / retitle the window. Every control char must be
+        // removed at the chokepoint (the introducer gone, the sequence is
+        // inert text).
+        let mut t = term(40, 8);
+        let line = Line::from(vec![Span::raw(
+            "a\u{1b}[31mred\u{1b}]0;evil\u{7}b\rc\u{9b}2Jd\u{7f}e",
+        )]);
+        insert_history_lines(&mut t, vec![line]).expect("insert history");
+
+        let out = t.backend().output();
+        assert!(!out.contains("\x1b[31m"), "raw CSI color leaked: {out:?}");
+        assert!(!out.contains("\x1b[2J"), "raw CSI clear leaked: {out:?}");
+        assert!(!out.contains("\x1b]"), "raw OSC leaked: {out:?}");
+        assert!(!out.contains('\u{9b}'), "raw C1 CSI leaked: {out:?}");
+        assert!(!out.contains('\u{7}'), "raw BEL leaked: {out:?}");
+        assert!(!out.contains('\u{7f}'), "raw DEL leaked: {out:?}");
+        // The printable payload survives with the introducers/controls gone
+        // (defused sequence params render as inert text).
+        assert!(
+            out.contains("a[31mred]0;evilbc2Jde"),
+            "sanitized payload missing: {out:?}"
+        );
+    }
+
+    #[test]
+    fn insert_history_expands_tabs_so_wrapping_matches_terminal_columns() {
+        // Fix #5 (tab drift): `wrap_line` counted '\t' as width 0 while a real
+        // terminal advances up to 8 columns, breaking the one-Line-one-row
+        // invariant the DECSTBM row math depends on (#220 zone). Tabs expand to
+        // 4 spaces BEFORE wrapping, so "aaaa\tbbbb" (12 expanded columns) must
+        // occupy two physical rows at width 8 — not one.
+        let width = 8;
+        let height = 8;
+        let viewport = Rect::new(0, 4, width, 2);
+        let mut t = screen_term(width, height, viewport);
+
+        insert_history_lines(&mut t, vec![text_line("aaaa\tbbbb")]).expect("insert history");
+
+        let rows = t.backend().screen_rows_above(t.viewport_area.top());
+        assert_eq!(
+            rows,
+            vec!["aaaa", "bbbb"],
+            "tab-expanded content must wrap into two physical rows"
+        );
+
+        // No wrap needed: the tab still renders as spaces (single row).
+        let mut t = screen_term(12, height, Rect::new(0, 4, 12, 2));
+        insert_history_lines(&mut t, vec![text_line("a\tb")]).expect("insert history");
+        let rows = t.backend().screen_rows_above(t.viewport_area.top());
+        assert_eq!(rows, vec!["a    b"]);
+    }
+
+    #[test]
+    fn insert_history_row_count_saturates_instead_of_wrapping_at_u16_max() {
+        // Fix #6: `wrapped.len() as u16` wrapped modulo 65536, so 65_537
+        // one-row lines truncated to 1 and the viewport slid by a single row
+        // even with 2 spare rows below it. Saturating keeps the full (clamped)
+        // row count in play.
+        let mut t = Terminal::new(RecordingBackend::new(10, 8)).expect("terminal");
+        t.set_viewport_area(Rect::new(0, 5, 10, 1)); // 2 spare rows below
+
+        let lines: Vec<Line> = (0..=usize::from(u16::MAX))
+            .map(|_| Line::from("x"))
+            .collect();
+        insert_history_lines(&mut t, lines).expect("insert history");
+
+        assert_eq!(
+            t.viewport_area.y, 7,
+            "viewport must slide by the full spare gap (2 rows), not by len % 65536"
+        );
+    }
+
+    /// Codex fold 5: a viewport at row 0 with spare rows below first GROWS
+    /// down (area.y bumps, `should_update_area` set) and can then land in the
+    /// degenerate-region streaming fallback (`area.top() <= 1`) — which used
+    /// to return WITHOUT applying the pending `set_viewport_area`, leaving
+    /// the stored viewport at the old row while the screen had shifted (the
+    /// next draw repainted the wrong rows).
+    #[test]
+    fn fallback_after_grow_applies_the_pending_viewport_move() {
+        let mut t = Terminal::new(RecordingBackend::new(10, 6)).expect("terminal");
+        t.set_viewport_area(Rect::new(0, 0, 10, 1)); // top row, 5 spare below
+
+        insert_history_lines(&mut t, vec![text_line("x")]).expect("insert history");
+
+        assert_eq!(
+            t.viewport_area.y, 1,
+            "the grow step's viewport move must be applied even when the streaming fallback returns early"
+        );
+    }
+
+    /// Write `text` directly into the emulated screen row (bypassing the
+    /// escape-sequence path) — simulates content that was on the terminal
+    /// BEFORE the TUI started tracking it (prior shell output at launch).
+    fn seed_screen_row(term: &mut Terminal<ScreenBackend>, row: u16, text: &str) {
+        let backend = term.backend_mut();
+        let cells = &mut backend.rows[usize::from(row)];
+        for (idx, ch) in text.chars().enumerate() {
+            if idx >= cells.len() {
+                break;
+            }
+            cells[idx] = ch;
+        }
+    }
+
+    /// P2 (tri-repo #246 ⊃ #232 #1): the FIRST flush of a session
+    /// (`visible_history_rows == 0`) treated the whole region above the
+    /// viewport as a printable gap and wrote upward from `area.top()` with no
+    /// scroll — clobbering whatever the user's shell had there. The first
+    /// flush must scroll the pre-existing rows up (into scrollback if needed)
+    /// and print into the freed rows.
+    #[test]
+    fn first_flush_preserves_preexisting_shell_rows() {
+        let width = 24;
+        let height = 8;
+        // Viewport occupies the bottom 3 rows; rows 0..5 belong to the shell.
+        let mut term = screen_term(width, height, Rect::new(0, 5, width, 3));
+        seed_screen_row(&mut term, 3, "shell-one");
+        seed_screen_row(&mut term, 4, "shell-two");
+
+        insert_history_lines(&mut term, vec![text_line("tui-1"), text_line("tui-2")])
+            .expect("first flush");
+
+        let rows = term.backend().screen_rows_above(term.viewport_area.top());
+        assert_eq!(
+            rows,
+            vec!["shell-one", "shell-two", "tui-1", "tui-2"],
+            "the first flush must scroll prior shell output up, not overwrite it"
+        );
+    }
+
+    /// P2 (tri-repo #246 ⊃ #232 #2): when a flush overflowed the space above
+    /// the viewport, `index_count = history_top + to_scroll` relocated the
+    /// retained history to the region TOP — bulk-dumping the blank band into
+    /// scrollback and detaching the transcript from the viewport (content at
+    /// the screen top, blank rows between it and the live area). The scroll
+    /// must instead cover exactly the deficit: history stays flush against
+    /// the viewport and nothing readable is pushed out while blank capacity
+    /// remains above.
+    #[test]
+    fn overflow_flush_keeps_history_flush_against_the_viewport() {
+        let width = 24;
+        let height = 10;
+        // Viewport on the bottom 4 rows; region above is rows 0..6.
+        let mut term = screen_term(width, height, Rect::new(0, 6, width, 4));
+
+        insert_history_lines(&mut term, vec![text_line("one"), text_line("two")])
+            .expect("first flush");
+        insert_history_lines(
+            &mut term,
+            vec![
+                text_line("three"),
+                text_line("four"),
+                text_line("five"),
+                text_line("six"),
+                text_line("seven"),
+            ],
+        )
+        .expect("overflow flush");
+
+        // All seven rows are readable in order (scrollback + screen)...
+        let rows = term.backend().screen_rows_above(term.viewport_area.top());
+        assert_eq!(
+            rows,
+            vec!["one", "two", "three", "four", "five", "six", "seven"],
+            "the transcript stays contiguous across an overflow flush"
+        );
+        // ...the newest row sits FLUSH against the viewport (no detach)...
+        let screen_last = term.backend().rows[usize::from(term.viewport_area.top()) - 1]
+            .iter()
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        assert_eq!(
+            screen_last, "seven",
+            "the newest history row must sit directly above the viewport"
+        );
+        // ...and nothing readable entered scrollback beyond the true deficit
+        // (7 content rows - 6 region rows = 1): "one" scrolls out, "two"
+        // stays on screen.
+        let readable_in_scrollback: Vec<&String> = term
+            .backend()
+            .scrollback
+            .iter()
+            .filter(|row| !row.is_empty())
+            .collect();
+        assert_eq!(
+            readable_in_scrollback,
+            vec!["one"],
+            "only the true overflow leaves the screen; the old code relocated everything"
+        );
+    }
+
+    /// P2 (tri-repo #246 ⊃ #232 #3): with the viewport covering the whole
+    /// screen (`area.top() == 0`, tiny pane), the old code emitted the
+    /// INVALID `CSI 1;0r` (xterm reads param 0 as "default" = full screen)
+    /// and printed the lines inside the viewport, where the next draw
+    /// repainted over them — content silently lost. The lines must instead be
+    /// streamed through the bottom of a full-screen scroll region so they
+    /// land in scrollback.
+    #[test]
+    fn full_screen_viewport_streams_lines_into_scrollback() {
+        let width = 24;
+        let height = 4;
+        let mut term = screen_term(width, height, Rect::new(0, 0, width, height));
+
+        insert_history_lines(&mut term, vec![text_line("alpha"), text_line("beta")])
+            .expect("full-screen flush");
+
+        assert!(
+            !String::from_utf8_lossy(&term.backend().buf).contains("\x1b[1;0r"),
+            "must not emit the invalid CSI 1;0r scroll region"
+        );
+        let readable: Vec<&String> = term
+            .backend()
+            .scrollback
+            .iter()
+            .filter(|row| !row.is_empty())
+            .collect();
+        assert_eq!(
+            readable,
+            vec!["alpha", "beta"],
+            "flushed lines must reach scrollback, not be repainted over inside the viewport"
+        );
+    }
+
+    /// Codex fold 4: DECSTBM requires top < bottom — xterm IGNORES
+    /// `CSI 1;1r`, so with the viewport at row 1 the "normal" path scrolled
+    /// the WHOLE screen (region never narrowed) and clobbered/leaked the live
+    /// viewport. A one-row-above viewport must use the streaming fallback,
+    /// never emit the degenerate region.
+    #[test]
+    fn one_row_above_viewport_streams_instead_of_degenerate_region() {
+        let width = 24;
+        let height = 6;
+        let mut term = screen_term(width, height, Rect::new(0, 1, width, height - 1));
+        seed_screen_row(&mut term, 0, "shell-top");
+
+        insert_history_lines(&mut term, vec![text_line("h-one"), text_line("h-two")])
+            .expect("one-row flush");
+
+        assert!(
+            !String::from_utf8_lossy(&term.backend().buf).contains("\x1b[1;1r"),
+            "must not emit the xterm-invalid CSI 1;1r one-row region"
+        );
+        let readable: Vec<&String> = term
+            .backend()
+            .scrollback
+            .iter()
+            .filter(|row| !row.is_empty())
+            .collect();
+        assert_eq!(
+            readable,
+            vec!["shell-top", "h-one", "h-two"],
+            "the pre-existing shell row and both flushed lines must reach scrollback"
+        );
+    }
+
+    /// Codex fold 4: the full-screen streaming fallback scrolled the OLD
+    /// viewport rows (composer/status chrome) into scrollback ahead of the
+    /// history lines. The region is cleared first so the displaced rows
+    /// stream out as blanks, never as copyable chrome text.
+    #[test]
+    fn full_screen_streaming_does_not_leak_viewport_chrome_into_scrollback() {
+        let width = 24;
+        let height = 4;
+        let mut term = screen_term(width, height, Rect::new(0, 0, width, height));
+        for row in 0..height {
+            seed_screen_row(&mut term, row, "CHROME-ROW");
+        }
+
+        insert_history_lines(&mut term, vec![text_line("alpha")]).expect("full-screen flush");
+
+        assert!(
+            !term
+                .backend()
+                .scrollback
+                .iter()
+                .any(|row| row.contains("CHROME-ROW")),
+            "old viewport chrome must not leak into scrollback: {:?}",
+            term.backend().scrollback
+        );
+        assert!(
+            term.backend().scrollback.iter().any(|row| row == "alpha"),
+            "the flushed line still reaches scrollback: {:?}",
+            term.backend().scrollback
         );
     }
 
