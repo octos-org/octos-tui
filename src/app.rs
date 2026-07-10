@@ -6765,6 +6765,11 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
             .iter()
             .filter(|l| autonomy_loop_is_active(l))
             .count();
+        // Chips render every non-deleted loop (active + paused). Count paused
+        // too so the header reconciles with the chips — a `--solo` boot parks
+        // active loops to `paused`, which otherwise reads as "0 running" beside
+        // several visible chips.
+        let paused = state.loops.iter().filter(|l| l.status == "paused").count();
         spans.push(Span::styled(
             "↻ ",
             Style::default()
@@ -6772,8 +6777,12 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
                 .add_modifier(Modifier::BOLD)
                 .bg(palette.surface),
         ));
+        let mut loops_label = t!("app.autonomy.loops_running", count = running).to_string();
+        if paused > 0 {
+            loops_label.push_str(&t!("app.autonomy.loops_paused_suffix", count = paused));
+        }
         spans.push(Span::styled(
-            t!("app.autonomy.loops_running", count = running).to_string(),
+            loops_label,
             palette.title().bg(palette.surface),
         ));
         spans.push(Span::styled("   ", palette.text().bg(palette.surface)));
@@ -13806,9 +13815,41 @@ mod tests {
         let text = rendered_text(&app);
         assert!(text.contains("Goal:"));
         assert!(text.contains("finish OAuth refactor"));
-        assert!(text.contains("Loops: 2 running"));
+        assert!(text.contains("Loops: 2 active"));
         assert!(text.contains("5m deploy-check"));
         assert!(text.contains("self-paced PR-watch"));
+    }
+
+    #[test]
+    fn autonomy_indicator_counts_paused_loops_alongside_active() {
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // A `--solo` boot parks active loops to `paused`: the header must read
+        // "0 active · 2 paused", not "0 running" beside two visible chips.
+        let mut l1 = sample_loop("l1", "deploy-check", "fixed_interval", Some(300));
+        l1.status = "paused".into();
+        let mut l2 = sample_loop("l2", "PR-watch", "self_paced", None);
+        l2.status = "paused".into();
+        app.set_session_loops(&session_id, vec![l1, l2]);
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Loops: 0 active · 2 paused"),
+            "paused loops must reconcile with the chips, got:\n{text}"
+        );
     }
 
     #[test]
