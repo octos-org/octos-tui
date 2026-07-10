@@ -12068,7 +12068,6 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
-                replayed_tool_envelopes: None,
             },
         }));
 
@@ -12130,7 +12129,6 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
-                replayed_tool_envelopes: None,
             },
         }));
 
@@ -12200,7 +12198,6 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
-                replayed_tool_envelopes: None,
             },
         }));
 
@@ -23747,7 +23744,6 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
-            replayed_tool_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -23874,7 +23870,6 @@ mod tests {
                 content: "background result".into(),
                 media: vec!["out.md".into()],
             }]),
-            replayed_tool_envelopes: None,
         };
 
         store.apply_client_event(ClientEvent::SessionHydrate(result));
@@ -23941,7 +23936,6 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
-            replayed_tool_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -24396,7 +24390,6 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
-            replayed_tool_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -24449,7 +24442,6 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
-                replayed_tool_envelopes: None,
             };
             store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -24522,7 +24514,6 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
-                replayed_tool_envelopes: None,
             };
             store.apply_client_event(ClientEvent::SessionHydrate(result));
 
