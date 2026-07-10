@@ -9623,7 +9623,12 @@ fn hydrated_row_to_message(row: HydratedMessage) -> Message {
         media: row.media,
         tool_calls: None,
         tool_call_id: None,
-        reasoning_content: None,
+        // Persisted thinking text — mapping it here is what makes the
+        // "· reasoning" block survive a client restart (the server surfaces
+        // it on negotiated hydrates; older servers simply omit the field).
+        reasoning_content: row
+            .reasoning_content
+            .map(|reasoning| crate::sanitize::strip_terminal_controls(&reasoning).into_owned()),
         client_message_id: row.client_message_id,
         thread_id: row.thread_id,
         timestamp: row.persisted_at,
@@ -11971,6 +11976,7 @@ mod tests {
                     message_id: None,
                     source: None,
                     media: Vec::new(),
+                    reasoning_content: None,
                 }]),
                 threads: None,
                 turns: None,
@@ -12031,6 +12037,7 @@ mod tests {
                     message_id: None,
                     source: None,
                     media: Vec::new(),
+                    reasoning_content: None,
                 }]),
                 threads: None,
                 turns: None,
@@ -12099,6 +12106,7 @@ mod tests {
                     message_id: None,
                     source: None,
                     media: Vec::new(),
+                    reasoning_content: None,
                 }]),
                 threads: None,
                 turns: None,
@@ -23320,6 +23328,7 @@ mod tests {
             message_id: None,
             source: None,
             media: Vec::new(),
+            reasoning_content: None,
         };
         assert!(hydrated_row_is_displayable(&row(
             "user",
@@ -23368,6 +23377,7 @@ mod tests {
                 message_id: None,
                 source: None,
                 media: Vec::new(),
+                reasoning_content: None,
             }]),
             threads: None,
             turns: None,
@@ -23435,6 +23445,7 @@ mod tests {
                     message_id: Some("msg-user".into()),
                     source: Some("user".into()),
                     media: Vec::new(),
+                    reasoning_content: None,
                 },
                 HydratedMessage {
                     seq: 2,
@@ -23447,6 +23458,7 @@ mod tests {
                     message_id: Some("companion".into()),
                     source: Some("background".into()),
                     media: vec!["companion.md".into()],
+                    reasoning_content: None,
                 },
                 HydratedMessage {
                     seq: 3,
@@ -23459,6 +23471,7 @@ mod tests {
                     message_id: Some("spawn-ack".into()),
                     source: Some("background".into()),
                     media: Vec::new(),
+                    reasoning_content: None,
                 },
             ]),
             threads: Some(vec![ThreadGraphEntry {
@@ -23582,6 +23595,78 @@ mod tests {
             !crate::model::activity_status_is_running(&leaked.status),
             "the reconciled item must no longer read as running"
         );
+    }
+
+    #[test]
+    fn hydrated_rows_carry_reasoning_content_into_the_transcript() {
+        use crate::client_event::ClientEvent;
+        // The server persists per-message reasoning and (negotiated) hydrate
+        // now surfaces it; mapping it onto Message.reasoning_content is what
+        // makes the "· reasoning" block survive a client restart.
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let result = SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 2,
+            },
+            context: None,
+            context_state: None,
+            messages: Some(vec![
+                HydratedMessage {
+                    seq: 0,
+                    role: "user".into(),
+                    content: "which is larger, 9.11 or 9.9?".into(),
+                    turn_id: None,
+                    thread_id: None,
+                    client_message_id: None,
+                    persisted_at: chrono::Utc::now(),
+                    message_id: None,
+                    source: None,
+                    media: vec![],
+                    reasoning_content: None,
+                },
+                HydratedMessage {
+                    seq: 1,
+                    role: "assistant".into(),
+                    content: "9.9 is larger.".into(),
+                    turn_id: None,
+                    thread_id: None,
+                    client_message_id: None,
+                    persisted_at: chrono::Utc::now(),
+                    message_id: None,
+                    source: None,
+                    media: vec![],
+                    reasoning_content: Some("compare 0.9 vs 0.11".into()),
+                },
+            ]),
+            threads: None,
+            turns: None,
+            pending_approvals: None,
+            pending_questions: None,
+            replayed_envelopes: None,
+            replayed_tool_envelopes: None,
+        };
+        store.apply_client_event(ClientEvent::SessionHydrate(result));
+
+        let session = &store.state.sessions[0];
+        let assistant = session
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("assistant row hydrated");
+        assert_eq!(
+            assistant.reasoning_content.as_deref(),
+            Some("compare 0.9 vs 0.11"),
+            "hydrated reasoning must land on the message so the block renders"
+        );
+        let user = session
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::User)
+            .expect("user row hydrated");
+        assert_eq!(user.reasoning_content, None);
     }
 
     #[test]

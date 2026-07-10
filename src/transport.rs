@@ -4670,6 +4670,7 @@ impl AppUiBackend for MockAppUiBackend {
                                 thread_id: None,
                                 client_message_id: None,
                                 persisted_at: Utc::now(),
+                                reasoning_content: None,
                                 message_id: None,
                                 source: None,
                                 media: Vec::new(),
