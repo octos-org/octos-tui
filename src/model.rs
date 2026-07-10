@@ -6323,6 +6323,33 @@ impl AppState {
         self.load_composer_draft_for_selected_session();
         self.load_pending_messages_for_selected_session();
         self.refresh_run_state_from_selection();
+        // A session that raced the capabilities response missed its open-time
+        // status probe; probe it the moment it becomes active so the composer
+        // footer's model/cwd reflect it (no-op once a status is cached).
+        self.probe_active_session_status_if_missing();
+    }
+
+    /// Enqueue a `session/status/read` for the ACTIVE session when the server
+    /// advertises it and no runtime status is cached yet. One entry at a time —
+    /// bulk-probing every open session could overflow the capped
+    /// autonomy-hydration queue and evict unrelated pending commands. Sessions
+    /// probe on open in the normal flow; this covers the ones that raced the
+    /// capabilities response, lazily, whenever they become (or already are)
+    /// active — the composer footer only ever reads the active session anyway.
+    pub fn probe_active_session_status_if_missing(&mut self) {
+        if self
+            .capabilities
+            .as_ref()
+            .is_some_and(|caps| caps.supports_method(APPUI_METHOD_SESSION_STATUS_READ))
+            && let Some(session_id) = self
+                .active_session()
+                .map(|session| session.id.clone())
+                .filter(|session_id| self.runtime_status_for(session_id).is_none())
+        {
+            self.enqueue_autonomy_hydration(AppUiCommand::ReadSessionStatus(
+                SessionStatusReadParams { session_id },
+            ));
+        }
     }
 
     /// Stash the ACTIVE session's staged-prompt queue under its key on the way

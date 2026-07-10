@@ -1423,9 +1423,6 @@ impl Store {
             self.state
                 .switch_selected_session(self.state.sessions.len().saturating_sub(1));
         }
-        // A session opened before the capabilities response never got its
-        // open-time status probe — probe it lazily now that it is active.
-        self.probe_active_session_status_if_missing();
         // The incoming session may be idle with staged messages waiting (they
         // were left queued when a terminal fired while another session was
         // active) — drain them now that it is active again.
@@ -5681,29 +5678,6 @@ impl Store {
         .into_owned();
     }
 
-    /// Enqueue a `session/status/read` for the ACTIVE session when the server
-    /// advertises it and no runtime status is cached yet. One entry at a time —
-    /// bulk-probing every open session could overflow the capped
-    /// autonomy-hydration queue and evict unrelated pending commands. Sessions
-    /// probe on open in the normal flow; this covers the ones that raced the
-    /// capabilities response, lazily, whenever they become (or already are)
-    /// active — the composer footer only ever reads the active session anyway.
-    fn probe_active_session_status_if_missing(&mut self) {
-        if self.state.capabilities.as_ref().is_some_and(|caps| {
-            caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ)
-        }) && let Some(session_id) = self
-            .state
-            .active_session()
-            .map(|session| session.id.clone())
-            .filter(|session_id| self.state.runtime_status_for(session_id).is_none())
-        {
-            self.state
-                .enqueue_autonomy_hydration(AppUiCommand::ReadSessionStatus(
-                    crate::model::SessionStatusReadParams { session_id },
-                ));
-        }
-    }
-
     fn apply_capabilities_event(&mut self, event: CapabilitiesClientEvent) -> Option<AppUiCommand> {
         self.state.set_capabilities(event.result.capabilities);
         // `session/opened` can validly land BEFORE this capabilities response
@@ -5711,8 +5685,9 @@ impl Store {
         // open-time status probe is capability-gated. Now that the method set
         // is known, probe the active session if it still lacks a status —
         // otherwise the composer footer's model stays blank until the user
-        // opens a status/model menu.
-        self.probe_active_session_status_if_missing();
+        // opens a status/model menu. (Sessions-pane switches probe the rest
+        // lazily — `switch_selected_session` runs the same probe.)
+        self.state.probe_active_session_status_if_missing();
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
             "capabilities",
@@ -16589,6 +16564,40 @@ mod tests {
             status_reads,
             vec![SessionKey("local:a".into())],
             "exactly one probe, for the active session"
+        );
+    }
+
+    /// Sessions-pane navigation (every path funnels through the shared
+    /// `switch_selected_session` bundle) probes the incoming session's status
+    /// when it is missing — a session that raced the capabilities response gets
+    /// its footer model on first visit, not only via the /resume flow.
+    #[test]
+    fn direct_session_switch_probes_missing_status() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_SESSION_STATUS_READ,
+        ]));
+
+        store.state.switch_selected_session(1);
+
+        let mut status_reads = Vec::new();
+        while let Some(command) = store.state.dequeue_autonomy_hydration() {
+            if let AppUiCommand::ReadSessionStatus(params) = command {
+                status_reads.push(params.session_id);
+            }
+        }
+        assert_eq!(
+            status_reads,
+            vec![SessionKey("local:b".into())],
+            "switching to an unprobed session queues exactly its status read"
+        );
+
+        // Without the capability the switch probes nothing.
+        let mut ungated = store_with_two_sessions("local:a", "local:b");
+        ungated.state.switch_selected_session(1);
+        assert!(
+            ungated.state.dequeue_autonomy_hydration().is_none(),
+            "no capability advertised → no probe on switch"
         );
     }
 
