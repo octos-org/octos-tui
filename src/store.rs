@@ -3400,7 +3400,20 @@ impl Store {
         if len == 0 {
             return true;
         }
-        frame.selected_index = (frame.selected_index + 1) % len;
+        let mut candidate = (frame.selected_index + 1) % len;
+        let mut found = None;
+        for _ in 0..len {
+            if active_menu_index_selectable(self.state.active_menu.as_ref(), candidate) {
+                found = Some(candidate);
+                break;
+            }
+            candidate = (candidate + 1) % len;
+        }
+        // Only move focus if a selectable row exists; an all-non-selectable
+        // menu leaves the cursor put rather than landing on a divider.
+        if let (Some(next), Some(frame)) = (found, self.state.menu_stack.active_mut()) {
+            frame.selected_index = next;
+        }
         self.refresh_active_menu();
         true
     }
@@ -3413,11 +3426,26 @@ impl Store {
         if len == 0 {
             return true;
         }
-        frame.selected_index = if frame.selected_index == 0 {
+        let mut candidate = if frame.selected_index == 0 {
             len - 1
         } else {
             frame.selected_index - 1
         };
+        let mut found = None;
+        for _ in 0..len {
+            if active_menu_index_selectable(self.state.active_menu.as_ref(), candidate) {
+                found = Some(candidate);
+                break;
+            }
+            candidate = if candidate == 0 {
+                len - 1
+            } else {
+                candidate - 1
+            };
+        }
+        if let (Some(prev), Some(frame)) = (found, self.state.menu_stack.active_mut()) {
+            frame.selected_index = prev;
+        }
         self.refresh_active_menu();
         true
     }
@@ -3712,6 +3740,9 @@ impl Store {
             .active()
             .map(|frame| frame.selected_index)
             .unwrap_or(0);
+        if !active_menu_index_selectable(self.state.active_menu.as_ref(), selected_index) {
+            return None;
+        }
         let action = self
             .state
             .active_menu
@@ -9586,6 +9617,20 @@ fn menu_item_matches_search_tokens(item: &crate::menu::MenuItem, tokens: &[Strin
     tokens.iter().all(|token| haystack.contains(token))
 }
 
+/// Whether the menu item at `index` accepts navigation focus. Non-selectable
+/// rows (dividers/headers) are rendered but skipped by Up/Down and inert on
+/// Enter.
+fn active_menu_index_selectable(menu: Option<&MenuBuildResult>, index: usize) -> bool {
+    match menu {
+        Some(MenuBuildResult::Ready(spec)) => spec
+            .items
+            .get(index)
+            .map(|item| !item.state.non_selectable)
+            .unwrap_or(true),
+        _ => true,
+    }
+}
+
 fn active_menu_selected_action(
     menu: &MenuBuildResult,
     selected_index: usize,
@@ -10105,36 +10150,101 @@ mod tests {
     }
 
     #[test]
-    fn thinking_display_toggle_rebuilds_menu_label_in_place() {
-        // Regression: toggling the /thinking display row must flip its label
+    fn thinking_display_toggle_rebuilds_menu_checkbox_in_place() {
+        // Regression: toggling the /thinking display row must flip its checkbox
         // on Enter, not only when the cursor later moves (which triggers an
         // incidental rebuild). The handler must refresh the open menu.
         let mut store = store_with_empty_session();
         store.open_menu(MenuId::from(crate::menu::registry::MENU_THINKING));
 
-        let row_label = |store: &Store| -> String {
+        let row_checked = |store: &Store| -> Option<bool> {
             match store.state.active_menu.as_ref() {
                 Some(MenuBuildResult::Ready(spec)) => spec
                     .items
                     .iter()
                     .find(|item| item.id == "reasoning_display")
-                    .map(|item| item.label.clone())
+                    .map(|item| item.state.checked)
                     .expect("display row present"),
                 other => panic!("thinking menu not ready: {other:?}"),
             }
         };
-        let before = row_label(&store);
+        // Rendered as a checkbox: `checked` must flip on Enter, in place.
+        assert_eq!(row_checked(&store), Some(false), "starts unchecked");
+        store.dispatch_local_action(LocalAction::ToggleReasoningDisplay, None);
+        assert_eq!(
+            row_checked(&store),
+            Some(true),
+            "the open menu row's checkbox must flip on immediately"
+        );
+    }
+
+    #[test]
+    fn menu_nav_holds_focus_when_no_selectable_rows() {
+        // Edge case (codex P1): an all-non-selectable menu must not move the
+        // cursor onto a non-selectable row — focus stays put.
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_THINKING));
+        // Force every row non-selectable in the built menu.
+        if let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_mut() {
+            for item in &mut spec.items {
+                item.state.non_selectable = true;
+            }
+        }
+        if let Some(frame) = store.state.menu_stack.active_mut() {
+            frame.selected_index = 2;
+        }
+        // refresh_active_menu would rebuild (restoring selectable rows), so call
+        // the nav directly against the mutated menu and assert no move happened
+        // before the rebuild — index stays at 2.
+        let before = store.state.menu_stack.active().map(|f| f.selected_index);
+        store.select_next_menu_item();
+        // After select_next the menu is rebuilt to the real (selectable) spec,
+        // but the index must not have been parked on a non-selectable row by
+        // the mutated pass; with all rows unselectable it holds at `before`.
+        assert_eq!(
+            store.state.menu_stack.active().map(|f| f.selected_index),
+            before,
+            "focus must not move when no selectable row exists"
+        );
+    }
+
+    #[test]
+    fn thinking_menu_divider_is_non_selectable_and_skipped() {
+        // The divider between effort levels and the display toggle must not
+        // take navigation focus, and Enter on it must be inert.
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_THINKING));
+        let items = match store.state.active_menu.as_ref() {
+            Some(MenuBuildResult::Ready(spec)) => spec.items.clone(),
+            other => panic!("thinking menu not ready: {other:?}"),
+        };
+        let divider_idx = items
+            .iter()
+            .position(|item| item.state.non_selectable)
+            .expect("a non-selectable divider row exists");
+        // The divider sits between the 5 effort levels and the display toggle.
+        assert_eq!(divider_idx, 5, "divider follows the five effort levels");
         assert!(
-            before.to_lowercase().contains("off"),
-            "starts off: {before}"
+            items
+                .get(divider_idx + 1)
+                .is_some_and(|i| i.id == "reasoning_display"),
+            "the display toggle follows the divider"
         );
 
-        store.dispatch_local_action(LocalAction::ToggleReasoningDisplay, None);
-        let after = row_label(&store);
-        assert!(
-            after.to_lowercase().contains("on") && !after.eq_ignore_ascii_case(&before),
-            "the open menu row must flip to on immediately: {after}"
-        );
+        // Cursor at the last effort level (idx 4); Down must skip the divider
+        // and land on the toggle (idx 6), never on the divider (idx 5).
+        if let Some(frame) = store.state.menu_stack.active_mut() {
+            frame.selected_index = 4;
+        }
+        store.refresh_active_menu();
+        store.select_next_menu_item();
+        let landed = store
+            .state
+            .menu_stack
+            .active()
+            .map(|f| f.selected_index)
+            .unwrap();
+        assert_eq!(landed, 6, "Down from the last level skips the divider");
     }
 
     #[test]

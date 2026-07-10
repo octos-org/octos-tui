@@ -412,22 +412,30 @@ fn thinking_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     })
     .collect::<Vec<_>>();
 
-    // Display toggle — orthogonal to the effort levels above: whether the
-    // committed reasoning renders as a transcript block for this session.
+    // A non-interactive divider separates the radio effort levels above from
+    // the display toggle below — different axes (how hard vs whether shown).
+    items.push(
+        MenuItem::new("", t!("menu.thinking.divider.display"), MenuAction::Noop).with_state(
+            MenuItemState {
+                non_selectable: true,
+                ..MenuItemState::default()
+            },
+        ),
+    );
+    // Display toggle — orthogonal to the effort levels: whether the committed
+    // reasoning renders as a transcript block for this session. Rendered as a
+    // checkbox (`[x]`/`[ ]`), NOT the radio `*`, so it reads as a toggle rather
+    // than a 6th level.
     let display_on = ctx.app.reasoning_display;
     items.push(
         MenuItem::new(
             "reasoning_display",
-            if display_on {
-                t!("menu.thinking.item.display.label_on")
-            } else {
-                t!("menu.thinking.item.display.label_off")
-            },
+            t!("menu.thinking.item.display.label"),
             MenuAction::Local(LocalAction::ToggleReasoningDisplay),
         )
         .with_description(t!("menu.thinking.item.display.desc"))
         .with_state(MenuItemState {
-            current: display_on,
+            checked: Some(display_on),
             ..MenuItemState::default()
         }),
     );
