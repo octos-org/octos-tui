@@ -8537,6 +8537,11 @@ impl Store {
         // A turn error cancels any pending AskUserQuestion picker for this turn
         // (design §4.2: the turn-interrupt/error path is Phase-1's cancellation).
         self.clear_question_for_turn(&event.session_id, &event.turn_id);
+        // Mirror `commit_live_reply`: a plan/todo checklist is per-turn state, so
+        // an errored/interrupted turn must drop its panel too (turn-matched, and
+        // before the duplicate-terminal return so a replayed error clears it).
+        self.state
+            .clear_session_plan_for_turn(&event.session_id, &event.turn_id);
         // Idempotence vs a DUPLICATE terminal (mirror `commit_live_reply`): the
         // turn already terminated through a terminal handler (completed OR
         // errored), so a late/replayed error for it must not push a second
