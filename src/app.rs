@@ -4662,18 +4662,25 @@ fn compact_file_path(path: &str) -> String {
 /// octos exposes several shell-family tools that all run a command string:
 /// `shell`/`exec`/`exec_command` (field `command`) and the codex-compatible
 /// `bash` (field `cmd`, falling back to `command`). They should all render as
-/// a real `$ command` line, not the raw JSON arguments blob.
-fn is_shell_family_tool(title: &str) -> bool {
+/// a real `$ command` line, not the raw JSON arguments blob. Kept in sync with
+/// the projection-side extraction in [`crate::store::tool_invocation_detail`].
+pub(crate) fn is_shell_family_tool(title: &str) -> bool {
     matches!(title, "shell" | "exec" | "exec_command" | "bash")
 }
 
 /// Pull the command string out of a shell-family tool's arguments so the card
-/// shows `$ find …` instead of `{"cmd":"find …"}`.
+/// shows `$ find …` instead of `{"cmd":"find …"}`. Empty fields are skipped so
+/// `{"cmd":"","command":"cargo test"}` still falls back to the real command.
 fn shell_command_arg(item: &ActivityItem) -> Option<String> {
     let arguments = item.arguments.as_ref()?;
     ["cmd", "command"]
         .into_iter()
-        .find_map(|key| arguments.get(key).and_then(|value| value.as_str()))
+        .find_map(|key| {
+            arguments
+                .get(key)
+                .and_then(|value| value.as_str())
+                .filter(|command| !command.is_empty())
+        })
         .map(str::to_owned)
 }
 

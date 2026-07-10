@@ -9837,7 +9837,13 @@ fn tool_invocation_detail(tool_name: &str, arguments: &Value) -> Option<String> 
     }
 
     let detail = match tool_name {
-        "shell" => str_field(arguments, "command")?.to_string(),
+        // Shell-family tools all run a command string: shell/exec/exec_command
+        // carry it in `command`, the codex-style `bash` tool in `cmd` (falling
+        // back to `command`). `str_field` skips empty fields, so
+        // `{"cmd":"","command":…}` still falls back to the real command.
+        name if crate::app::is_shell_family_tool(name) => str_field(arguments, "cmd")
+            .or_else(|| str_field(arguments, "command"))?
+            .to_string(),
         "read_file" => {
             let path = str_field(arguments, "path")?;
             let start = arguments.get("start_line").and_then(Value::as_u64);
@@ -20993,6 +20999,67 @@ mod tests {
         assert_eq!(activity.duration_ms, Some(1250));
         assert_eq!(activity.tool_call_id.as_deref(), Some("call-1"));
         assert_eq!(store.state.run_state.label(), "running");
+    }
+
+    /// Regression: the codex-style `bash` tool (and `exec`/`exec_command`) must
+    /// project a clean command `detail`, not the raw JSON arguments. This
+    /// exercises the real ToolStarted → projection path — a renderer-only test
+    /// misses that `tool_invocation_detail` pre-fills `detail` here, so the
+    /// renderer never reaches its own `cmd`/`command` extraction.
+    #[test]
+    fn bash_tool_projects_command_detail_not_json_args() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let turn_id = TurnId::new();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
+            ToolStartedEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                tool_call_id: "bash-1".into(),
+                tool_name: "bash".into(),
+                arguments: Some(serde_json::json!({"cmd": "pwd"})),
+            },
+        )));
+
+        assert_eq!(store.state.activity.len(), 1);
+        let activity = &store.state.activity[0];
+        assert_eq!(activity.title, "bash");
+        assert_eq!(
+            activity.detail.as_deref(),
+            Some("pwd"),
+            "bash must project the command, not raw JSON args"
+        );
+    }
+
+    /// Shell-family detail extraction: an empty `cmd` falls back to `command`
+    /// (codex P2), and `exec`/`exec_command` are covered alongside `bash`.
+    #[test]
+    fn shell_family_detail_extracts_command_across_aliases() {
+        assert_eq!(
+            tool_invocation_detail(
+                "bash",
+                &serde_json::json!({"cmd": "", "command": "cargo test"})
+            )
+            .as_deref(),
+            Some("cargo test"),
+            "empty cmd must fall back to command"
+        );
+        assert_eq!(
+            tool_invocation_detail("exec", &serde_json::json!({"command": "ls -la"})).as_deref(),
+            Some("ls -la")
+        );
+        assert_eq!(
+            tool_invocation_detail("exec_command", &serde_json::json!({"cmd": "make"})).as_deref(),
+            Some("make")
+        );
+        // A shell-family tool with no usable command yields no detail (like
+        // the original `shell` arm); the renderer then falls back to JSON.
+        assert_eq!(
+            tool_invocation_detail("bash", &serde_json::json!({"timeout_ms": 5000})),
+            None
+        );
     }
 
     #[test]
