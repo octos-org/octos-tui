@@ -1822,7 +1822,10 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
 
 fn onboarding_family_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let Some(catalog) = ctx.app.profile_llm_catalog else {
-        return MenuBuildResult::Unavailable(MenuStatusSpec {
+        // Opening this menu auto-sends `profile/llm/catalog` (see
+        // `auto_fetch_for_menu`); render Loading until the result refreshes
+        // the menu rather than dead-ending on "load the catalog first".
+        return MenuBuildResult::Loading(MenuStatusSpec {
             id: MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY),
             title: t!("menu.onboard.family.title").into_owned(),
             message: t!("menu.onboard.unavailable_catalog_msg").into_owned(),
@@ -1897,7 +1900,9 @@ fn onboarding_model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         });
     }
     let Some(catalog) = ctx.app.profile_llm_catalog else {
-        return MenuBuildResult::Unavailable(MenuStatusSpec {
+        // Same auto-fetch contract as the family step: the open dispatched
+        // `profile/llm/catalog`, so this is a loading state, not a dead end.
+        return MenuBuildResult::Loading(MenuStatusSpec {
             id: MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL),
             title: t!("menu.onboard.model.title").into_owned(),
             message: t!("menu.onboard.unavailable_catalog_msg").into_owned(),
@@ -3006,6 +3011,7 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 let action = if can_select {
                     MenuAction::send_appui(AppUiCommand::ProfileLlmSelect(ProfileLlmSelectParams {
                         profile_id: profile_id.clone(),
+                        session_id: ctx.app.selected_session_id.cloned(),
                         family_id: model
                             .family
                             .clone()

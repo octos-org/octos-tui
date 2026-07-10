@@ -2756,6 +2756,11 @@ pub struct ProfileLlmDeleteParams {
 pub struct ProfileLlmSelectParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
+    /// The ACTIVE session, so the server's result echoes a session id the
+    /// client actually tracks — without it the server synthesizes a
+    /// `profile:local:tui#coding` key and the select result updates nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<octos_core::SessionKey>,
     pub family_id: String,
     pub model_id: String,
     pub route_id: String,

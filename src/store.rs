@@ -3751,20 +3751,36 @@ impl Store {
         self.dispatch_menu_action(action)
     }
 
+    /// Catalog-backed menus load their data on OPEN: the onboarding
+    /// family/model steps previously dead-ended on "load the provider catalog
+    /// first" unless the user had pressed the manual load row — the reason
+    /// "/onboard only offers the saved provider" reads as a hard limit.
+    fn auto_fetch_for_menu(&mut self, id: &crate::menu::MenuId) -> Option<AppUiCommand> {
+        let is_catalog_menu = *id
+            == crate::menu::MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY)
+            || *id == crate::menu::MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL);
+        (is_catalog_menu
+            && self.state.profile_llm_catalog.is_none()
+            && self.profile_llm_catalog_supported())
+        .then(|| AppUiCommand::ProfileLlmCatalog(ProfileLlmCatalogParams::default()))
+    }
+
     fn dispatch_menu_action(&mut self, action: MenuAction) -> Option<AppUiCommand> {
         match action {
             MenuAction::OpenMenu(id) => {
+                let fetch = self.auto_fetch_for_menu(&id);
                 self.open_menu(id);
-                None
+                fetch
             }
             MenuAction::ReplaceMenu(id) => {
+                let fetch = self.auto_fetch_for_menu(&id);
                 self.state.menu_stack.replace(id);
                 self.refresh_active_menu();
                 if let Some(frame) = self.state.menu_stack.active() {
                     self.state.status =
                         t!("status.menu_label", id = frame.id.to_string()).into_owned();
                 }
-                None
+                fetch
             }
             MenuAction::Close => {
                 self.close_menu();
@@ -5905,11 +5921,31 @@ impl Store {
 
     fn apply_model_select_event(&mut self, event: ModelSelectClientEvent) {
         let result = event.result;
+        // Older servers echo a SYNTHETIC session key when the request carried
+        // none — fall back to the ACTIVE session so the switch still reflects
+        // in the footer/catalog instead of updating a phantom entry.
+        let session_id = if self
+            .state
+            .session_runtime_statuses
+            .iter()
+            .any(|status| status.session_id == result.session_id)
+            || self
+                .state
+                .session_model_catalogs
+                .iter()
+                .any(|catalog| catalog.session_id == result.session_id)
+        {
+            result.session_id.clone()
+        } else {
+            self.active_session()
+                .map(|session| session.id.clone())
+                .unwrap_or_else(|| result.session_id.clone())
+        };
         if let Some(status) = self
             .state
             .session_runtime_statuses
             .iter_mut()
-            .find(|status| status.session_id == result.session_id)
+            .find(|status| status.session_id == session_id)
         {
             status.model = Some(result.selected.clone());
             if let Some(stamp) = result.runtime_policy_stamp.clone() {
@@ -5920,7 +5956,7 @@ impl Store {
             .state
             .session_model_catalogs
             .iter_mut()
-            .find(|catalog| catalog.session_id == result.session_id)
+            .find(|catalog| catalog.session_id == session_id)
         {
             for model in &mut catalog.models {
                 model.selected = model.model == result.selected.model
@@ -17019,6 +17055,99 @@ mod tests {
         assert_eq!(store.state.sessions[0].messages.len(), 1);
         assert!(store.state.sessions[0].live_reply.is_none());
         assert_eq!(store.state.run_state.label(), "done");
+    }
+
+    /// Selecting a model must reflect in the ACTIVE session even when the
+    /// server echoes a synthetic session key (requests without session_id).
+    #[test]
+    fn model_select_result_falls_back_to_the_active_session() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .set_model_catalog(crate::model::SessionModelCatalog {
+                session_id: session_id.clone(),
+                models: vec![
+                    crate::model::ModelStatus {
+                        model: "deepseek-v4-pro".into(),
+                        provider: "deepseek".into(),
+                        title: None,
+                        family: None,
+                        route: None,
+                        selected: true,
+                        available: Some(true),
+                        queue_mode: None,
+                        qoe_policy: None,
+                    },
+                    crate::model::ModelStatus {
+                        model: "deepseek-chat".into(),
+                        provider: "deepseek".into(),
+                        title: None,
+                        family: None,
+                        route: None,
+                        selected: false,
+                        available: Some(true),
+                        queue_mode: None,
+                        qoe_policy: None,
+                    },
+                ],
+            });
+
+        store.apply_client_event(ClientEvent::ModelSelect(
+            crate::client_event::ModelSelectClientEvent {
+                result: crate::model::ModelSelectResult {
+                    // Synthetic key from an older/parameterless server.
+                    session_id: SessionKey("dev:local:tui#coding".into()),
+                    selected: crate::model::ModelStatus {
+                        model: "deepseek-chat".into(),
+                        provider: "deepseek".into(),
+                        title: None,
+                        family: None,
+                        route: None,
+                        selected: true,
+                        available: Some(true),
+                        queue_mode: None,
+                        qoe_policy: None,
+                    },
+                    applied: true,
+                    runtime_policy_stamp: None,
+                },
+                message: "Model selected".into(),
+            },
+        ));
+
+        let catalog = store
+            .state
+            .model_catalog_for(&session_id)
+            .expect("active session catalog");
+        let selected: Vec<_> = catalog
+            .models
+            .iter()
+            .filter(|model| model.selected)
+            .map(|model| model.model.as_str())
+            .collect();
+        assert_eq!(
+            selected,
+            vec!["deepseek-chat"],
+            "the switch must land on the ACTIVE session's catalog"
+        );
+    }
+
+    /// Opening the onboarding family step auto-loads the provider catalog —
+    /// previously it dead-ended on "load the catalog first" and the wizard
+    /// read as deepseek-only.
+    #[test]
+    fn opening_family_menu_auto_fetches_the_catalog() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG]);
+        assert!(store.state.profile_llm_catalog.is_none());
+        let command = store.dispatch_menu_action(crate::menu::MenuAction::OpenMenu(
+            crate::menu::MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY),
+        ));
+        assert!(
+            matches!(command, Some(AppUiCommand::ProfileLlmCatalog(_))),
+            "family-menu open must fetch the catalog; got {command:?}"
+        );
     }
 
     #[test]
