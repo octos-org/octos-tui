@@ -5074,8 +5074,12 @@ impl Store {
                     t!("status.loop_created", id = loop_id, mode = mode).into_owned();
             }
             AutonomyResult::LoopList(result) => {
-                let count = result.loops.len();
-                self.state
+                // Count the RETAINED loops (tombstones dropped by
+                // `set_session_loops`), not the raw response length —
+                // otherwise the acknowledgment can claim "N loop(s)"
+                // while the indicator shows fewer (codex P2).
+                let count = self
+                    .state
                     .set_session_loops(&result.session_id, result.loops);
                 self.state.status = t!("status.loop_list_refreshed", count = count).into_owned();
             }
