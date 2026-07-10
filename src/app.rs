@@ -3343,6 +3343,24 @@ fn push_user_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, con
 /// surface background) so it reads as a dimmed continuation of that lane.
 const THINKING_INDICATOR_TEXT: &str = "thinking…";
 
+/// A horizontal ASCII octopus that "swims" during the thinking phase: a `[⇔]`
+/// head flanked by the tilted-line glyphs `彡`/`ミ` (one arm per side). The arms
+/// wave by swapping direction each step — `彡[⇔]ミ ⇔ ミ[⇔]彡` — a paddle stroke.
+///
+///   `彡[⇔]ミ`   `ミ[⇔]彡`
+const OCTOPUS_SWIM_FRAMES: [&str; 2] = ["彡[⇔]ミ", "ミ[⇔]彡"];
+
+/// Current swimming-octopus frame. Rides the same process clock as
+/// [`spinner_frame`]; flaps roughly every 280ms so the arms wave at a calm,
+/// legible pace rather than strobing.
+fn octopus_swim_frame() -> &'static str {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    OCTOPUS_SWIM_FRAMES[(elapsed / 280) as usize % OCTOPUS_SWIM_FRAMES.len()]
+}
+
 /// `▰▰▰▰▱▱▱▱` fixed-width fraction bar for the compaction/context UX.
 pub(crate) fn progress_bar(frac: f64, width: usize) -> String {
     let filled = ((frac.clamp(0.0, 1.0)) * width as f64).round() as usize;
@@ -3399,7 +3417,10 @@ fn push_thinking_indicator(lines: &mut Vec<Line<'static>>, palette: Palette) {
     let bg = chat_message_bg(palette, "reasoning");
     let style = palette.muted().add_modifier(Modifier::DIM).bg(bg);
     lines.push(chat_line(
-        vec![Span::styled(format!("· {THINKING_INDICATOR_TEXT}"), style)],
+        vec![Span::styled(
+            format!("{} {THINKING_INDICATOR_TEXT}", octopus_swim_frame()),
+            style,
+        )],
         Some(bg),
     ));
 }
@@ -8510,6 +8531,21 @@ mod tests {
         // Settled states keep their static, non-animated markers.
         assert_eq!(run_state_marker(&SessionRunState::Success), "✓");
         assert_eq!(run_state_marker(&SessionRunState::Idle), "·");
+    }
+
+    #[test]
+    fn swimming_octopus_frames_have_boxed_eyes_four_arms_and_flip_direction() {
+        // Each frame: a `[⇔]` head with one tilted-line arm glyph per side (彡/ミ).
+        for frame in OCTOPUS_SWIM_FRAMES {
+            assert!(frame.contains("[⇔]"), "[⇔] head: {frame}");
+            let (left, right) = frame.split_once("[⇔]").expect("head splits arms");
+            assert_eq!(left.chars().count(), 1, "one arm glyph left: {frame}");
+            assert_eq!(right.chars().count(), 1, "one arm glyph right: {frame}");
+        }
+        // The arms swap direction each step: 彡[⇔]ミ ⇔ ミ[⇔]彡 — the wave.
+        assert_eq!(OCTOPUS_SWIM_FRAMES[0], "彡[⇔]ミ");
+        assert_eq!(OCTOPUS_SWIM_FRAMES[1], "ミ[⇔]彡");
+        assert!(OCTOPUS_SWIM_FRAMES.contains(&octopus_swim_frame()));
     }
 
     #[test]
@@ -15211,8 +15247,10 @@ mod tests {
             "live render should show the terse `thinking` indicator; got: {rendered:?}"
         );
         assert!(
-            rendered.contains("· "),
-            "terse indicator should reuse the reasoning `· ` prefix; got: {rendered:?}"
+            OCTOPUS_SWIM_FRAMES
+                .iter()
+                .any(|frame| rendered.contains(frame)),
+            "terse indicator should show the swimming octopus; got: {rendered:?}"
         );
         assert!(
             !rendered.contains(VERBOSE),
