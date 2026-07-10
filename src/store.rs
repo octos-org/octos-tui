@@ -5462,19 +5462,24 @@ impl Store {
                 None
             }
             AppUiEvent::Error(error) => {
-                // `/btw` failure/cancellation: RPC errors surface generically
-                // ("{method} request {id} failed|cancelled: …", and some
-                // send-layer rejections embed the method later), so match by
-                // substring and mark answering asides failed so the card never
-                // wedges on "Answering…". Errors carry no session attribution;
-                // with concurrent asides across sessions all answering cards
-                // fail together (rare; each card invites a retry). CRUCIALLY:
-                // an aside failure is NOT a turn/transport failure — return
-                // before the generic path below flips the run state to error
-                // for a perfectly healthy main turn.
-                if error.message.contains("session/btw")
-                    && self.state.fail_btw_answering(&error.message) > 0
-                {
+                // `/btw` failure/cancellation. Match ONLY the two shapes the
+                // transport actually produces for an aside — the response
+                // error/cancel ("{method} request {id} …" formats the method
+                // FIRST) and the pre-send pending-cap rejection (its fixed
+                // trailer names the method) — never a bare substring: an
+                // unrelated error merely echoing "session/btw" (e.g. inside a
+                // session key) must fall through to the normal error handling
+                // below, not be swallowed by this early return. Errors carry
+                // no session attribution; with concurrent asides across
+                // sessions all answering cards fail together (rare; each card
+                // invites a retry). CRUCIALLY: an aside failure is NOT a
+                // turn/transport failure — return before the generic path
+                // below flips the run state to error for a perfectly healthy
+                // main turn.
+                let is_btw_error = error.message.starts_with("session/btw ")
+                    || (error.code == "too_many_pending_requests"
+                        && error.message.ends_with("enqueue session/btw request"));
+                if is_btw_error && self.state.fail_btw_answering(&error.message) > 0 {
                     self.state.status = t!("status.btw_failed").into_owned();
                     return None;
                 }
@@ -16592,6 +16597,51 @@ mod tests {
             "aside failure must not fail the live turn's run state; got {:?}",
             store.state.run_state.label()
         );
+    }
+
+    #[test]
+    fn unrelated_error_echoing_btw_text_does_not_fail_the_aside() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming…");
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .set_btw_answering(&session_id, "still there?".into());
+
+        // An unrelated failure whose text merely CONTAINS "session/btw"
+        // (e.g. an echoed session key) must not be swallowed by the aside
+        // branch — it takes the normal error path and the aside keeps
+        // answering.
+        store.apply_event(AppUiEvent::Error(octos_core::app_ui::AppUiError {
+            code: "unknown_session".into(),
+            message: "turn/start request r9 failed: unknown session dev:x#session/btw".into(),
+        }));
+        assert!(
+            matches!(
+                store
+                    .state
+                    .btw_aside_for(&session_id)
+                    .map(|aside| &aside.state),
+                Some(crate::model::BtwAsideState::Answering)
+            ),
+            "a non-aside error must not settle the aside"
+        );
+
+        // The pre-send pending-cap rejection IS an aside error (fixed trailer
+        // names the method) and settles the card.
+        store.apply_event(AppUiEvent::Error(octos_core::app_ui::AppUiError {
+            code: "too_many_pending_requests".into(),
+            message:
+                "UI protocol has 16 pending request(s); refusing to enqueue session/btw request"
+                    .into(),
+        }));
+        assert!(matches!(
+            store
+                .state
+                .btw_aside_for(&session_id)
+                .map(|aside| &aside.state),
+            Some(crate::model::BtwAsideState::Failed(_))
+        ));
     }
 
     #[test]

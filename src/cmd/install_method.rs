@@ -64,7 +64,9 @@ impl InstallMethod {
     pub fn upgrade_command(&self) -> Option<&'static str> {
         match self {
             InstallMethod::CargoDistInstaller => None,
-            InstallMethod::Homebrew => Some("brew update && brew upgrade octos-org/octos-tui/octos-tui"),
+            InstallMethod::Homebrew => {
+                Some("brew update && brew upgrade octos-org/octos-tui/octos-tui")
+            }
             InstallMethod::Npm => Some("npm update -g @octos-org/octos-tui"),
             InstallMethod::CargoRegistry => Some("cargo install octos-tui --force"),
             InstallMethod::CargoGit => {
