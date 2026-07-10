@@ -5650,8 +5650,11 @@ fn tool_card_bullet(item: &ActivityItem, palette: Palette) -> (String, Style) {
         // Failures keep a distinct glyph (not just red) so they stay legible
         // without color; success drops the checkmark for the calmer `⏺`.
         ("✗".to_string(), Style::default().fg(palette.danger))
-    } else {
+    } else if activity_is_completed(item) {
         ("⏺".to_string(), Style::default().fg(palette.success))
+    } else {
+        // interrupted / skipped / pending — neutral, never a false green success.
+        ("⏺".to_string(), palette.muted())
     }
 }
 
