@@ -3356,12 +3356,39 @@ pub(crate) fn progress_bar(frac: f64, width: usize) -> String {
 /// ```
 /// The percentage is honest: pre-compaction tokens over the session's
 /// context window (threshold as the fallback denominator).
+/// How long the settled "context compacted" block dwells after completion.
+/// The server pass is synchronous — started/completed land in one drain batch
+/// and draws only follow the batch — so without this dwell the block would
+/// paint zero frames, ever.
+const LIVE_COMPACTION_SETTLED_DISPLAY_SECS: u64 = 4;
+
 fn push_live_compaction_block(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
     comp: &crate::model::LiveCompaction,
     context_window: Option<u64>,
 ) {
+    if let Some(completed_at) = comp.completed_at {
+        // Settled: dwell for a short window, then render nothing (the entry
+        // itself is bounded by turn-terminal sweeps / the next Started).
+        if completed_at.elapsed().as_secs() >= LIVE_COMPACTION_SETTLED_DISPLAY_SECS {
+            return;
+        }
+        let after = comp
+            .token_estimate_after
+            .unwrap_or(comp.token_estimate_before);
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "✶ {} ({} → {} tokens)",
+                t!("status.activity_context_compacted"),
+                humanize_token_count(comp.token_estimate_before),
+                humanize_token_count(after),
+            ),
+            Style::default().fg(palette.accent),
+        )]));
+        lines.push(Line::from(""));
+        return;
+    }
     let elapsed = comp.started_at.elapsed().as_secs();
     let denominator = context_window
         .filter(|w| *w > 0)

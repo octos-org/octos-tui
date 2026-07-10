@@ -7116,6 +7116,20 @@ impl Store {
                 // report times the turn itself, not the current visit to it.
                 self.state
                     .note_turn_started(&event.session_id, &event.turn_id);
+                // Adopt turnless sticky notices (context-compaction rows
+                // reported before this turn started, e.g. via the
+                // connection-independent drain) into this turn: a turnless
+                // row is hidden by the turn-flow filter while any turn is
+                // active and is never archived at turn end — adopting it
+                // makes it render in the flow and archive with the turn.
+                for item in self.state.activity.iter_mut() {
+                    if item.sticky
+                        && item.turn_id.is_none()
+                        && item.session_id.as_ref() == Some(&event.session_id)
+                    {
+                        item.turn_id = Some(event.turn_id.clone());
+                    }
+                }
                 let targets_active = self.event_targets_active_session(&event.session_id);
                 if let Some(session) = self.find_session_mut(&event.session_id) {
                     // Out-of-order lifecycle (nit 1): a MessageDelta may have
@@ -7580,9 +7594,12 @@ impl Store {
             }
             UiNotification::ContextCompactionStarted(event) => {
                 // UPCR-2026-026: in-progress compaction state. The serve
-                // pass is synchronous today, so completed may arrive in the
-                // same batch — the block then only flashes; the durable
-                // notice below still records the outcome.
+                // pass is synchronous today, so completed arrives in the
+                // SAME drain batch and draws only follow the batch — the
+                // completed handler therefore settles the block in place
+                // (rather than removing it) and the renderer dwells on the
+                // settled state for a short window; the durable notice
+                // still records the outcome permanently.
                 let turn_id = self
                     .find_session_mut(&event.session_id)
                     .and_then(|session| {
@@ -7592,6 +7609,8 @@ impl Store {
                     event.session_id.clone(),
                     crate::model::LiveCompaction {
                         started_at: std::time::Instant::now(),
+                        completed_at: None,
+                        token_estimate_after: None,
                         token_estimate_before: event.context_state.token_estimate as u64,
                         threshold_tokens: event.threshold_tokens as u64,
                         trigger: event.trigger.clone(),
@@ -7603,7 +7622,19 @@ impl Store {
             }
             UiNotification::ContextCompactionCompleted(event) => {
                 let session_id = event.session_id.clone();
-                let live_compaction = self.state.live_compaction.remove(&session_id);
+                // Settle the live block IN PLACE instead of removing it:
+                // started+completed land in one drain batch (synchronous
+                // server pass) and draws only follow the batch, so removal
+                // here meant the "Compacting…" block painted ZERO frames.
+                // The renderer dwells on the settled state for a short
+                // window; turn-terminal sweeps and the next Started insert
+                // still bound the entry's lifetime.
+                let live_compaction = self.state.live_compaction.get(&session_id).cloned();
+                if let Some(live) = self.state.live_compaction.get_mut(&session_id) {
+                    live.completed_at = Some(std::time::Instant::now());
+                    live.token_estimate_after =
+                        event.compaction.token_estimate_after.map(|v| v as u64);
+                }
                 let state = crate::model::ContextLifecycleState {
                     session_id: event.context_state.session_id.clone(),
                     thread_id: event.context_state.thread_id.clone(),
@@ -7657,6 +7688,10 @@ impl Store {
                     let turn_id = self.find_session_mut(&session_id).and_then(|session| {
                         session.live_reply.as_ref().map(|live| live.turn_id.clone())
                     });
+                    // Sticky: survives the activity cap's oldest-first
+                    // eviction (a busy turn's tool flood otherwise dropped
+                    // the notice before it could be archived) and, when
+                    // turnless, is adopted by the session's next TurnStarted.
                     let mut notice = ActivityItem::new(
                         ActivityKind::Progress,
                         t!("status.activity_context_compacted").into_owned(),
@@ -7665,7 +7700,8 @@ impl Store {
                             humanize_token_count(before),
                             humanize_token_count(after)
                         ),
-                    );
+                    )
+                    .with_sticky();
                     // Mockup-style honest fullness bar: after-size over the
                     // session's REAL context window when known; else the
                     // started event's threshold (labeled as such); else no
@@ -7716,6 +7752,14 @@ impl Store {
                     notice.success = Some(true);
                     if let Some(turn_id) = turn_id {
                         notice = notice.with_turn(turn_id);
+                    } else {
+                        // No live turn (e.g. connection-independent drain, or
+                        // an emitter that reports before TurnStarted): stamp
+                        // the session so the next TurnStarted for THIS
+                        // session can adopt the notice into its turn — a
+                        // turnless row is hidden by the turn-flow filter for
+                        // the whole turn and never archived.
+                        notice = notice.with_session(session_id.clone());
                     }
                     self.state.push_activity(notice);
                 }
@@ -21779,6 +21823,8 @@ mod tests {
             session_id.clone(),
             crate::model::LiveCompaction {
                 started_at: std::time::Instant::now(),
+                completed_at: None,
+                token_estimate_after: None,
                 token_estimate_before: 1_000,
                 threshold_tokens: 800,
                 trigger: "preflight".into(),
@@ -21993,6 +22039,243 @@ mod tests {
             notice.turn_id.as_ref(),
             Some(&turn_id),
             "compaction notice must be stamped with the session's live turn"
+        );
+    }
+
+    /// A compaction reported with NO live turn (connection-independent drain,
+    /// or an emitter that reports before TurnStarted) lands turnless — the
+    /// turn-flow filter then hides it for the whole next turn and it is never
+    /// archived. The session's next TurnStarted must ADOPT it into the turn.
+    #[test]
+    fn turnless_compaction_notice_is_adopted_and_archived_with_next_turn() {
+        use octos_core::ui_protocol::{
+            ContextCompactionCompletedEvent, UiContextCompactionRecord, UiContextState,
+        };
+
+        let session_id = SessionKey("local:test".into());
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "test".into(),
+            profile_id: None,
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None, // no live turn at compaction time
+        };
+        let mut store = Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        };
+
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
+                session_id: session_id.clone(),
+                context_state: UiContextState {
+                    session_id: session_id.clone(),
+                    thread_id: None,
+                    generation: 4,
+                    transcript_hash: "abc123".into(),
+                    item_count: 42,
+                    token_estimate: 9_100,
+                    recovery_state: "healthy".into(),
+                    last_checkpoint_id: None,
+                    last_compaction_id: Some("comp-001".into()),
+                },
+                compaction: UiContextCompactionRecord {
+                    compaction_id: "comp-001".into(),
+                    checkpoint_id: "chk-001".into(),
+                    status: "applied".into(),
+                    policy_id: "default".into(),
+                    trigger: "agent_loop:turn_start".into(),
+                    input_generation: 3,
+                    output_generation: Some(4),
+                    input_transcript_hash: "input-h".into(),
+                    replacement_transcript_hash: Some("abc123".into()),
+                    installed_transcript_hash: Some("abc123".into()),
+                    input_item_count: 130,
+                    retained_count: 42,
+                    dropped_count: 88,
+                    summary_item_id: Some("sum-1".into()),
+                    token_estimate_before: 31_200,
+                    token_estimate_after: Some(9_100),
+                    error: None,
+                },
+            }),
+        ));
+
+        let notice = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.sticky)
+            .expect("turnless compaction notice must be pushed");
+        assert!(notice.turn_id.is_none());
+        assert_eq!(
+            notice.session_id.as_ref(),
+            Some(&session_id),
+            "turnless notice must be session-stamped for adoption"
+        );
+
+        // The next TurnStarted for this session adopts the notice…
+        let turn_id = TurnId::new();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        let notice = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.sticky)
+            .expect("notice still present");
+        assert_eq!(
+            notice.turn_id.as_ref(),
+            Some(&turn_id),
+            "TurnStarted must adopt the turnless notice into the new turn"
+        );
+
+        // …so the turn's terminal archives it with the turn.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            store
+                .state
+                .turn_activity_logs
+                .iter()
+                .any(|log| log.turn_id == turn_id && log.items.iter().any(|item| item.sticky)),
+            "adopted notice must be archived into the turn's activity log"
+        );
+    }
+
+    /// Started+Completed arrive in one drain batch (synchronous server pass)
+    /// and draws only follow the batch — removing the live block on Completed
+    /// meant it painted ZERO frames. Completed must settle it in place.
+    #[test]
+    fn compaction_completed_settles_live_block_in_place() {
+        use octos_core::ui_protocol::{
+            ContextCompactionCompletedEvent, ContextCompactionStartedEvent,
+            UiContextCompactionRecord, UiContextState,
+        };
+
+        let session_id = SessionKey("local:test".into());
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "test".into(),
+            profile_id: None,
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        };
+        let context_state = UiContextState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 4,
+            transcript_hash: "abc123".into(),
+            item_count: 42,
+            token_estimate: 91_000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        };
+
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionStarted(ContextCompactionStartedEvent {
+                session_id: session_id.clone(),
+                context_state: context_state.clone(),
+                trigger: "preflight".into(),
+                threshold_tokens: 96_000,
+            }),
+        ));
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
+                session_id: session_id.clone(),
+                context_state,
+                compaction: UiContextCompactionRecord {
+                    compaction_id: "comp-001".into(),
+                    checkpoint_id: "chk-001".into(),
+                    status: "applied".into(),
+                    policy_id: "default".into(),
+                    trigger: "preflight".into(),
+                    input_generation: 3,
+                    output_generation: Some(4),
+                    input_transcript_hash: "input-h".into(),
+                    replacement_transcript_hash: Some("abc123".into()),
+                    installed_transcript_hash: Some("abc123".into()),
+                    input_item_count: 130,
+                    retained_count: 42,
+                    dropped_count: 88,
+                    summary_item_id: Some("sum-1".into()),
+                    token_estimate_before: 91_000,
+                    token_estimate_after: Some(31_000),
+                    error: None,
+                },
+            }),
+        ));
+
+        let live = store
+            .state
+            .live_compaction
+            .get(&session_id)
+            .expect("completed must settle the live block in place, not remove it");
+        assert!(live.completed_at.is_some(), "must be marked settled");
+        assert_eq!(live.token_estimate_after, Some(31_000));
+    }
+
+    /// The activity cap's blind oldest-first eviction dropped compaction
+    /// notices mid-turn (they predate the turn's tool flood), erasing them
+    /// before `capture_completed_turn_activity` could archive them. Sticky
+    /// rows must survive the cap.
+    #[test]
+    fn sticky_activity_survives_cap_eviction() {
+        let session_id = SessionKey("local:test".into());
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "test".into(),
+            profile_id: None,
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut state = AppState::new(vec![session], 0, "ready".into(), None, false);
+
+        state.push_activity(
+            ActivityItem::new(
+                ActivityKind::Progress,
+                "context compacted",
+                "31k → 9k tokens",
+            )
+            .with_sticky(),
+        );
+        for idx in 0..100 {
+            state.push_activity(ActivityItem::new(
+                ActivityKind::Tool,
+                "bash",
+                format!("tool {idx}"),
+            ));
+        }
+
+        assert_eq!(
+            state.activity.len(),
+            80,
+            "the cap must still bound the list"
+        );
+        assert!(
+            state.activity.iter().any(|item| item.sticky),
+            "the sticky notice must survive the tool flood"
         );
     }
 
