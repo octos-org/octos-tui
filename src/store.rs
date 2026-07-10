@@ -7497,6 +7497,24 @@ impl Store {
                 ));
                 None
             }
+            UiNotification::PlanUpdated(event) => {
+                let count = event.plan.items.len();
+                let done = event
+                    .plan
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        item.status == octos_core::ui_protocol::PlanItemStatus::Completed
+                    })
+                    .count();
+                self.state.set_session_plan(
+                    &event.session_id,
+                    Some(event.plan.clone()),
+                    event.turn_id.clone(),
+                );
+                self.state.status = format!("Plan updated: {done}/{count} done");
+                None
+            }
             UiNotification::SessionGoalUpdated(event) => {
                 let objective = event.goal.objective.clone();
                 let status_label = event.goal.status.clone();
@@ -8321,6 +8339,13 @@ impl Store {
         // terminal for an already-finalized turn still dismisses the picker
         // instead of leaving it wedged (nit).
         self.clear_question_for_turn(&event.session_id, &event.turn_id);
+        // The plan/todo checklist is per-turn working state — drop it once its
+        // authoring turn completes so a finished checklist doesn't stay sticky
+        // (and keep it turn-matched so a stale/replayed terminal for a different
+        // turn can't clear a newer plan). Runs before the duplicate-terminal
+        // early return so a session-open `turn/completed` replay clears it too.
+        self.state
+            .clear_session_plan_for_turn(&event.session_id, &event.turn_id);
         // Idempotence vs a DUPLICATE terminal (e.g. a replayed turn/completed
         // after reconnect): the turn already went through a terminal handler,
         // so its card/fallback and run-state transition already happened.
@@ -8512,6 +8537,11 @@ impl Store {
         // A turn error cancels any pending AskUserQuestion picker for this turn
         // (design §4.2: the turn-interrupt/error path is Phase-1's cancellation).
         self.clear_question_for_turn(&event.session_id, &event.turn_id);
+        // Mirror `commit_live_reply`: a plan/todo checklist is per-turn state, so
+        // an errored/interrupted turn must drop its panel too (turn-matched, and
+        // before the duplicate-terminal return so a replayed error clears it).
+        self.state
+            .clear_session_plan_for_turn(&event.session_id, &event.turn_id);
         // Idempotence vs a DUPLICATE terminal (mirror `commit_live_reply`): the
         // turn already terminated through a terminal handler (completed OR
         // errored), so a late/replayed error for it must not push a second
