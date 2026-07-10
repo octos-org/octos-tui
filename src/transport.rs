@@ -55,8 +55,8 @@ use crate::{
         PermissionProfileClientEvent, ProfileLlmCatalogClientEvent, ProfileLlmListClientEvent,
         ProfileLlmMutationClientEvent, ProfileLocalCreateClientEvent, ProfileSkillsListClientEvent,
         ProfileSkillsMutationClientEvent, ProfileSkillsRegistrySearchClientEvent,
-        SessionStatusClientEvent, ToolConfigListClientEvent, ToolConfigMutationClientEvent,
-        ToolStatusClientEvent,
+        SessionBtwClientEvent, SessionStatusClientEvent, ToolConfigListClientEvent,
+        ToolConfigMutationClientEvent, ToolStatusClientEvent,
     },
     model::{
         AppUiAuthToken, AppUiCommand, AuthLogoutResult, AuthMeResult, AuthSendCodeResult,
@@ -1674,6 +1674,7 @@ impl ProtocolAppUiBackend {
             AppUiCommand::ListConfigCapabilities(_)
                 | AppUiCommand::OpenSession(_)
                 | AppUiCommand::ReadSessionStatus(_)
+                | AppUiCommand::SessionBtw(_)
                 | AppUiCommand::ListModels(_)
                 | AppUiCommand::ListApprovalScopes(_)
                 | AppUiCommand::ListPermissionProfiles(_)
@@ -2492,6 +2493,7 @@ fn rpc_request_from_command(
         AppUiCommand::OpenSession(params) => serde_json::to_value(params),
         AppUiCommand::ListConfigCapabilities(params) => serde_json::to_value(params),
         AppUiCommand::ReadSessionStatus(params) => serde_json::to_value(params),
+        AppUiCommand::SessionBtw(params) => serde_json::to_value(params),
         AppUiCommand::SubmitPrompt(params) => serde_json::to_value(params),
         AppUiCommand::InterruptTurn(params) => serde_json::to_value(params),
         AppUiCommand::ListModels(params) => serde_json::to_value(params),
@@ -2786,6 +2788,23 @@ fn success_response_to_app_event(
                         format!(
                             "failed to decode UI protocol result for {}: {err}",
                             crate::model::APPUI_METHOD_SESSION_STATUS_READ
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        octos_core::ui_protocol::methods::SESSION_BTW => {
+            match serde_json::from_value::<octos_core::ui_protocol::SessionBtwResult>(result) {
+                Ok(result) => Ok(Some(ClientEvent::SessionBtw(SessionBtwClientEvent {
+                    result,
+                }))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            octos_core::ui_protocol::methods::SESSION_BTW
                         ),
                     )
                     .into(),
@@ -4211,6 +4230,19 @@ impl AppUiBackend for MockAppUiBackend {
                     )));
                 Ok(())
             }
+            AppUiCommand::SessionBtw(params) => {
+                self.queue
+                    .push_back(ClientEvent::SessionBtw(SessionBtwClientEvent {
+                        result: octos_core::ui_protocol::SessionBtwResult {
+                            session_id: params.session_id,
+                            answer: "Mock aside answer — the prototype backend has no LLM, \
+                                     but the /btw card, busy gate, and dismissal all work."
+                                .into(),
+                            model: Some("mock".into()),
+                        },
+                    }));
+                Ok(())
+            }
             AppUiCommand::InterruptTurn(_) => {
                 self.enqueue_protocol(UiNotification::Warning(WarningEvent {
                     session_id: SessionKey("local:prototype#interrupt".into()),
@@ -4663,6 +4695,7 @@ impl AppUiBackend for MockAppUiBackend {
                             },
                             context: None,
                             context_state: None,
+                            replayed_tool_envelopes: None,
                             messages: Some(vec![HydratedMessage {
                                 seq: 1,
                                 role: "user".into(),

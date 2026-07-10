@@ -3220,6 +3220,13 @@ fn push_turn_flow(
         push_inline_user_question_card(lines, palette, picker, width);
     }
 
+    // `/btw` aside card: the question echo + its state (`✽ Answering…` → the
+    // answer block) rides the live pane like the approval/question cards — the
+    // exchange is ephemeral and never joins the committed transcript.
+    if let Some(aside) = app.btw_asides.get(&session.id) {
+        push_btw_aside_card(lines, palette, aside, width);
+    }
+
     // Live reasoning for the active turn: codex-style, we DON'T render the
     // verbose "thinking" text. The deltas still accumulate in `live_reasoning`
     // (so a future /thinking toggle can reveal them and commit_live_reply can
@@ -3402,6 +3409,7 @@ fn push_message_block(
     let indent = match role {
         "tool" => "$ ",
         "reasoning" => "· ",
+        "btw" => "· ",
         _ => "",
     };
     let prose_marker = match role {
@@ -3728,6 +3736,7 @@ fn chat_message_bg(palette: Palette, role: &str) -> Color {
         "user" => palette.diff_context_bg,
         "assistant" => palette.surface,
         "reasoning" => palette.surface,
+        "btw" => palette.surface,
         "tool" => palette.surface,
         _ => palette.surface,
     }
@@ -4756,6 +4765,44 @@ fn approval_action_labels(_approval: &ApprovalModalState) -> [String; 3] {
 /// [`push_inline_approval_card`]. Shows the mandatory `title`/`body` fallback,
 /// the active structured question (1–4), each option as a radio/checkbox row,
 /// and the always-present free-text "Other" row.
+/// The `/btw` aside card: question echo, then `✽ Answering…` while the
+/// out-of-band answer is in flight, then the answer as a dim `·` block (or a
+/// failure line). Live-pane only — the aside is ephemeral by design.
+fn push_btw_aside_card(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    aside: &crate::model::BtwAside,
+    width: usize,
+) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  ", palette.muted()),
+        Span::styled(format!("/btw {}", aside.question), palette.selected()),
+    ]));
+    match &aside.state {
+        crate::model::BtwAsideState::Answering => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("    ", palette.muted()),
+                Span::styled(format!("✽ {}", t!("app.btw.answering")), palette.muted()),
+            ]));
+        }
+        crate::model::BtwAsideState::Answered(answer) => {
+            push_message_block(lines, palette, "btw", answer, width);
+        }
+        crate::model::BtwAsideState::Failed(message) => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("    ", palette.muted()),
+                Span::styled(
+                    format!("✽ {}", t!("app.btw.failed", error = message.clone())),
+                    palette.muted(),
+                ),
+            ]));
+        }
+    }
+}
+
 fn push_inline_user_question_card(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -8522,6 +8569,53 @@ mod tests {
         assert!(
             text.contains("✻ Ran for 1m 15s · 1 background task(s) still running"),
             "transcript should carry the committed turn status report; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn btw_aside_card_renders_answering_then_answer() {
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("do the thing"), Message::assistant("on it")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.set_btw_answering(&session_id, "what are you working on?".into());
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let rows = rendered_rows(&rendered_buffer(&app, palette));
+        let text = rows.join("\n");
+        assert!(
+            text.contains("/btw what are you working on?"),
+            "aside question echo missing:\n{text}"
+        );
+        assert!(
+            text.contains("✽ Answering…"),
+            "answering indicator missing:\n{text}"
+        );
+
+        assert!(
+            app.resolve_btw_answer(&session_id, "Refactoring the parser.".into()),
+            "answer resolves the answering aside"
+        );
+        let rows = rendered_rows(&rendered_buffer(&app, palette));
+        let text = rows.join("\n");
+        assert!(
+            text.contains("Refactoring the parser."),
+            "answer block missing:\n{text}"
+        );
+        assert!(
+            !text.contains("✽ Answering…"),
+            "answering indicator must clear once answered:\n{text}"
         );
     }
 

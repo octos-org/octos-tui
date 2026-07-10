@@ -104,6 +104,9 @@ app:
     esc_interrupt: "Esc interrupt"
     stop_to_close: "/stop to close"
     tool_output_expanded: "tool output expanded"
+  btw:
+    answering: "Answering…"
+    failed: "Aside failed: %{error}"
   turn_summary:
     ran_for: "Ran for %{duration}"
     tasks_still_running: "%{count} background task(s) still running"
@@ -448,6 +451,11 @@ status:
   list_more: ", +%{count} more"
   no_session_send_prompt: "No coding session open. Run /onboard open-session before sending a prompt."
   message_staged: "Message staged; it will submit after the active turn. Press Esc to interrupt/send."
+  btw_usage: "Usage: /btw <question> — ask a quick aside while the turn keeps working"
+  btw_answering: "btw: answering…"
+  btw_answered: "btw: answered"
+  btw_busy: "btw: still answering the previous aside"
+  btw_failed: "btw: aside failed"
   staged_submit_requeued: "Submit failed at the transport; the staged message was re-queued and will retry."
   queued_turn_start: "Queued turn/start"
   command_unavailable: "command is unavailable"
