@@ -301,6 +301,9 @@ pub fn render_viewport_with_finalization(
             render_live_tail_with_finalization(app, palette, root[0], live_finalization),
             root[0],
         );
+        // `/btw` aside floats over the top of the live tail so it reads as a
+        // distinct top pane instead of mingling with the streaming reply.
+        render_btw_overlay(frame, app, palette, root[0]);
     }
     if let Some(menu) = active_menu.as_ref() {
         menu_render::render_menu_surface(frame, root[1], menu, palette);
@@ -1268,6 +1271,8 @@ fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palet
         if app.transcript_pager_active {
             render_pager_scrollbar(frame, metrics, areas.transcript, palette);
         }
+        // `/btw` aside floats over the top of the transcript as a distinct pane.
+        render_btw_overlay(frame, app, palette, areas.transcript);
     }
     if let Some(menu) = active_menu.as_ref() {
         menu_render::render_menu_surface(frame, areas.menu, menu, palette);
@@ -3206,11 +3211,8 @@ fn should_show_turn_flow(app: &AppState, session: &SessionView) -> bool {
             .user_question
             .as_ref()
             .is_some_and(|picker| picker.visible)
-        // A `/btw` aside is the same class of live-only card: it must keep
-        // rendering after the session settles (the answer often lands right
-        // as — or after — the main turn completes) until the next prompt
-        // submit dismisses it.
-        || app.btw_asides.contains_key(&session.id)
+        // NB: a `/btw` aside no longer forces the turn flow — it renders as a
+        // floating top overlay (`render_btw_overlay`) so it doesn't mingle.
         || should_pin_recent_user_context(app, session)
 }
 
@@ -3239,12 +3241,9 @@ fn push_turn_flow(
         push_inline_user_question_card(lines, palette, picker, width);
     }
 
-    // `/btw` aside card: the question echo + its state (`✽ Answering…` → the
-    // answer block) rides the live pane like the approval/question cards — the
-    // exchange is ephemeral and never joins the committed transcript.
-    if let Some(aside) = app.btw_asides.get(&session.id) {
-        push_btw_aside_card(lines, palette, aside, width);
-    }
+    // `/btw` aside renders as a floating overlay pinned to the TOP of the live
+    // viewport (see `render_btw_overlay`), not inline here — otherwise it
+    // mingles with the streaming reply/activity below it.
 
     // Live reasoning for the active turn: codex-style, we DON'T render the
     // verbose "thinking" text. The deltas still accumulate in `live_reasoning`
@@ -4825,6 +4824,44 @@ fn push_btw_aside_card(
             ]));
         }
     }
+}
+
+/// Render the `/btw` aside as a floating overlay pinned to the TOP of the live
+/// viewport. It draws over the top rows of the live tail each frame (never
+/// flushed to scrollback) and vanishes on the next prompt submit — so the aside
+/// reads as a distinct top pane instead of mingling with the streaming reply.
+fn render_btw_overlay(
+    frame: &mut impl FrameLike,
+    app: &AppState,
+    palette: Palette,
+    tail_area: Rect,
+) {
+    if tail_area.width == 0 || tail_area.height == 0 {
+        return;
+    }
+    let Some(session) = app.active_session() else {
+        return;
+    };
+    let Some(aside) = app.btw_asides.get(&session.id) else {
+        return;
+    };
+    let mut lines = Vec::new();
+    push_btw_aside_card(&mut lines, palette, aside, tail_area.width as usize);
+    if lines.is_empty() {
+        return;
+    }
+    let height = (lines.len() as u16).min(tail_area.height);
+    let overlay = Rect {
+        x: tail_area.x,
+        y: tail_area.y,
+        width: tail_area.width,
+        height,
+    };
+    frame.render_widget(Clear, overlay);
+    frame.render_widget(
+        Paragraph::new(lines).style(palette.text().bg(palette.surface)),
+        overlay,
+    );
 }
 
 fn push_inline_user_question_card(
@@ -8818,20 +8855,13 @@ mod tests {
             false,
         );
         app.set_btw_answering(&session_id, "still with me?".into());
-        let session = app.active_session().expect("session");
-        assert!(
-            should_show_turn_flow(&app, session),
-            "an aside must keep the turn-flow (and its card) rendering on a settled session"
-        );
-        let lines =
-            live_tail_lines_with_finalization(&app, Palette::for_theme(ThemeName::Codex), 80, None);
-        let text = lines
-            .iter()
-            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
-            .collect::<String>();
+        // The aside now renders as a floating overlay, no longer gated on the
+        // turn flow — so it stays visible even after the session settles.
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let text = rendered_rows(&rendered_buffer(&app, palette)).join("\n");
         assert!(
             text.contains("/btw still with me?"),
-            "live tail must carry the aside card when idle; got {text:?}"
+            "settled session must still render the aside overlay; got:\n{text}"
         );
     }
 
