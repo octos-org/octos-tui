@@ -7507,8 +7507,11 @@ impl Store {
                         item.status == octos_core::ui_protocol::PlanItemStatus::Completed
                     })
                     .count();
-                self.state
-                    .set_session_plan(&event.session_id, Some(event.plan.clone()));
+                self.state.set_session_plan(
+                    &event.session_id,
+                    Some(event.plan.clone()),
+                    event.turn_id.clone(),
+                );
                 self.state.status = format!("Plan updated: {done}/{count} done");
                 None
             }
@@ -8336,6 +8339,13 @@ impl Store {
         // terminal for an already-finalized turn still dismisses the picker
         // instead of leaving it wedged (nit).
         self.clear_question_for_turn(&event.session_id, &event.turn_id);
+        // The plan/todo checklist is per-turn working state — drop it once its
+        // authoring turn completes so a finished checklist doesn't stay sticky
+        // (and keep it turn-matched so a stale/replayed terminal for a different
+        // turn can't clear a newer plan). Runs before the duplicate-terminal
+        // early return so a session-open `turn/completed` replay clears it too.
+        self.state
+            .clear_session_plan_for_turn(&event.session_id, &event.turn_id);
         // Idempotence vs a DUPLICATE terminal (e.g. a replayed turn/completed
         // after reconnect): the turn already went through a terminal handler,
         // so its card/fallback and run-state transition already happened.

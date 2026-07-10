@@ -13747,6 +13747,7 @@ mod tests {
                     },
                 ],
             }),
+            None,
         );
 
         // header + 3 item rows, no goal/loops.
@@ -13768,6 +13769,35 @@ mod tests {
     }
 
     #[test]
+    fn plan_cleared_only_when_its_authoring_turn_completes() {
+        use octos_core::ui_protocol::{PlanItemStatus, UiPlanItem, UiPlanRecord};
+        let mut app = autonomy_app_state();
+        let session_id = SessionKey("local:test".into());
+        let turn = TurnId::new();
+        let other_turn = TurnId::new();
+        let plan = Some(UiPlanRecord {
+            title: Some("plan".into()),
+            updated_at_ms: 0,
+            items: vec![UiPlanItem {
+                id: "1".into(),
+                title: "do it".into(),
+                status: PlanItemStatus::InProgress,
+                priority: None,
+            }],
+        });
+        app.set_session_plan(&session_id, plan, Some(turn.clone()));
+        assert_eq!(autonomy_indicator_height(&app), 2);
+
+        // A completion for a DIFFERENT turn must not clear the panel.
+        app.clear_session_plan_for_turn(&session_id, &other_turn);
+        assert_eq!(autonomy_indicator_height(&app), 2);
+
+        // The authoring turn's completion clears it.
+        app.clear_session_plan_for_turn(&session_id, &turn);
+        assert_eq!(autonomy_indicator_height(&app), 0);
+    }
+
+    #[test]
     fn plan_indicator_truncates_long_checklist() {
         use octos_core::ui_protocol::{PlanItemStatus, UiPlanItem, UiPlanRecord};
         let mut app = autonomy_app_state();
@@ -13786,6 +13816,7 @@ mod tests {
                 updated_at_ms: 0,
                 items,
             }),
+            None,
         );
         // header + 8 shown + 1 overflow line.
         assert_eq!(autonomy_indicator_height(&app), 10);

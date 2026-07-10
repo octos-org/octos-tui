@@ -524,6 +524,9 @@ pub struct SessionAutonomyState {
     /// Latest model-authored plan/todo checklist (`plan/updated`). `None` until
     /// the agent calls `update_plan` this session.
     pub plan: Option<octos_core::ui_protocol::UiPlanRecord>,
+    /// Turn that authored the current `plan`, when known. The plan is per-turn
+    /// working state, so it is cleared when this turn completes.
+    pub plan_turn_id: Option<TurnId>,
 }
 
 impl SessionAutonomyState {
@@ -537,6 +540,7 @@ impl SessionAutonomyState {
             goal_transition_actor: None,
             loops: Vec::new(),
             plan: None,
+            plan_turn_id: None,
         }
     }
 }
@@ -5429,12 +5433,33 @@ impl AppState {
 
     /// Replace the cached plan/todo checklist for a session. The `update_plan`
     /// tool sends the full ordered list each call, so this is a wholesale swap.
+    /// `turn_id` is the authoring turn (when known) so the panel can be cleared
+    /// on that turn's completion.
     pub fn set_session_plan(
         &mut self,
         session_id: &SessionKey,
         plan: Option<octos_core::ui_protocol::UiPlanRecord>,
+        turn_id: Option<TurnId>,
     ) {
-        self.session_autonomy_mut(session_id).plan = plan;
+        let entry = self.session_autonomy_mut(session_id);
+        entry.plan = plan;
+        entry.plan_turn_id = turn_id;
+    }
+
+    /// Clear a session's plan panel once the turn that authored it completes.
+    /// A plan with no known authoring turn (`plan_turn_id == None`) is left in
+    /// place — there is no terminal event to key its removal on.
+    pub fn clear_session_plan_for_turn(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        if let Some(entry) = self
+            .session_autonomy
+            .iter_mut()
+            .find(|s| &s.session_id == session_id)
+        {
+            if entry.plan_turn_id.as_ref() == Some(turn_id) {
+                entry.plan = None;
+                entry.plan_turn_id = None;
+            }
+        }
     }
 
     /// Replace the cached output tail for an agent. The backend is
