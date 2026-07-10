@@ -3796,28 +3796,7 @@ impl Store {
                 // dispatch outcome to its backend command here.
                 self.dispatch_local_action(action, None).into_command()
             }
-            MenuAction::SendAppUi(command) => {
-                // Remember which session asked for a model switch: results
-                // (and select-attributed errors) pop this FIFO in reply
-                // order, landing each on its INITIATING session — never on
-                // whichever session is active when the response arrives.
-                if let AppUiCommand::ProfileLlmSelect(params) = command.as_ref() {
-                    if let Some(session_id) = params
-                        .session_id
-                        .clone()
-                        .or_else(|| self.active_session().map(|session| session.id.clone()))
-                    {
-                        const MAX_PENDING_SELECTS: usize = 8;
-                        if self.state.pending_model_select_sessions.len() >= MAX_PENDING_SELECTS {
-                            self.state.pending_model_select_sessions.pop_front();
-                        }
-                        self.state
-                            .pending_model_select_sessions
-                            .push_back(session_id);
-                    }
-                }
-                Some(*command)
-            }
+            MenuAction::SendAppUi(command) => Some(*command),
             MenuAction::SubmitPrompt(prompt) => {
                 self.start_prompt_turn(prompt, t!("status.queued_menu_prompt").into_owned())
             }
@@ -5590,22 +5569,6 @@ impl Store {
                 // turn/transport failure — return before the generic path
                 // below flips the run state to error for a perfectly healthy
                 // main turn.
-                // A failed/cancelled/rejected `profile/llm/select` consumes
-                // its FIFO slot too — otherwise a later select's reply would
-                // correlate against the dead request's session.
-                let is_select_error = error.message.starts_with("profile/llm/select ")
-                    || error
-                        .message
-                        .ends_with("enqueue profile/llm/select request")
-                    || error
-                        .message
-                        .starts_with("encoded profile/llm/select request")
-                    || error
-                        .message
-                        .starts_with("failed to decode UI protocol result for profile/llm/select");
-                if is_select_error {
-                    self.state.pending_model_select_sessions.pop_front();
-                }
                 let is_btw_error = error.message.starts_with("session/btw ")
                     || (error.code == "too_many_pending_requests"
                         && error.message.ends_with("enqueue session/btw request"))
@@ -5958,12 +5921,13 @@ impl Store {
 
     fn apply_model_select_event(&mut self, event: ModelSelectClientEvent) {
         let result = event.result;
-        // Replies arrive in request order: the FIFO front IS the initiating
-        // session. The echoed key is deliberately not trusted for targeting —
-        // legacy servers echo a synthetic `profile:local:tui#coding` that can
-        // collide with a genuinely loaded session. An unsolicited result
-        // (nothing pending) is ignored rather than guessed at.
-        let Some(session_id) = self.state.pending_model_select_sessions.pop_front() else {
+        // The transport correlates each select response with its request by
+        // JSON-RPC id and hands us the INITIATING session — immune to reply
+        // reordering, queue drift, and pre-send rejections. The echoed result
+        // key is deliberately never used for targeting (legacy servers echo a
+        // synthetic `profile:local:tui#coding` that can collide with a real
+        // session); an event without attribution is ignored, not guessed at.
+        let Some(session_id) = event.initiating_session else {
             return;
         };
         if let Some(status) = self
@@ -17082,27 +17046,17 @@ mod tests {
         assert_eq!(store.state.run_state.label(), "done");
     }
 
-    /// Selecting a model must reflect in the initiating session even when the
-    /// server echoes a synthetic session key — and an unsolicited synthetic
-    /// echo (no pending select) is ignored outright.
+    /// A select result carries its initiating session (correlated by request
+    /// id in the transport) and lands exactly there — even if the user
+    /// switched sessions meanwhile; an unattributed result is ignored.
     #[test]
-    fn model_select_result_falls_back_to_the_initiating_session() {
-        let mut store = store_with_empty_session();
-        let session_id = store.state.sessions[0].id.clone();
-        // Stash the initiating session the way the /model menu dispatch does.
-        let _ = store.dispatch_menu_action(crate::menu::MenuAction::send_appui(
-            AppUiCommand::ProfileLlmSelect(crate::model::ProfileLlmSelectParams {
-                profile_id: Some("dev".into()),
-                session_id: None,
-                family_id: "deepseek".into(),
-                model_id: "deepseek-chat".into(),
-                route_id: "official".into(),
-            }),
-        ));
+    fn model_select_result_lands_on_the_initiating_session() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
         store
             .state
             .set_model_catalog(crate::model::SessionModelCatalog {
-                session_id: session_id.clone(),
+                session_id: a.clone(),
                 models: vec![
                     crate::model::ModelStatus {
                         model: "deepseek-v4-pro".into(),
@@ -17128,124 +17082,16 @@ mod tests {
                     },
                 ],
             });
-
-        store.apply_client_event(ClientEvent::ModelSelect(
-            crate::client_event::ModelSelectClientEvent {
-                result: crate::model::ModelSelectResult {
-                    // Synthetic key from an older/parameterless server.
-                    session_id: SessionKey("dev:local:tui#coding".into()),
-                    selected: crate::model::ModelStatus {
-                        model: "deepseek-chat".into(),
-                        provider: "deepseek".into(),
-                        title: None,
-                        family: None,
-                        route: None,
-                        selected: true,
-                        available: Some(true),
-                        queue_mode: None,
-                        qoe_policy: None,
-                    },
-                    applied: true,
-                    runtime_policy_stamp: None,
-                },
-                message: "Model selected".into(),
-            },
-        ));
-
-        let catalog = store
-            .state
-            .model_catalog_for(&session_id)
-            .expect("active session catalog");
-        let selected: Vec<_> = catalog
-            .models
-            .iter()
-            .filter(|model| model.selected)
-            .map(|model| model.model.as_str())
-            .collect();
-        assert_eq!(
-            selected,
-            vec!["deepseek-chat"],
-            "the switch must land on the initiating session's catalog"
-        );
-
-        // An unsolicited synthetic echo (nothing pending) changes nothing.
-        store.apply_client_event(ClientEvent::ModelSelect(
-            crate::client_event::ModelSelectClientEvent {
-                result: crate::model::ModelSelectResult {
-                    session_id: SessionKey("dev:local:tui#coding".into()),
-                    selected: crate::model::ModelStatus {
-                        model: "deepseek-v4-pro".into(),
-                        provider: "deepseek".into(),
-                        title: None,
-                        family: None,
-                        route: None,
-                        selected: true,
-                        available: Some(true),
-                        queue_mode: None,
-                        qoe_policy: None,
-                    },
-                    applied: true,
-                    runtime_policy_stamp: None,
-                },
-                message: "Model selected".into(),
-            },
-        ));
-        let catalog = store
-            .state
-            .model_catalog_for(&session_id)
-            .expect("catalog still present");
-        assert!(
-            catalog
-                .models
-                .iter()
-                .any(|model| model.model == "deepseek-chat" && model.selected),
-            "an unsolicited echo must not overwrite the selection"
-        );
-    }
-
-    /// A select initiated in session A must land on A even if the user
-    /// switches to session B before the async result (with a synthetic echo)
-    /// arrives — resolving "active session" at response time targeted B.
-    #[test]
-    fn model_select_result_binds_to_the_initiating_session() {
-        let mut store = store_with_two_sessions("local:a", "local:b");
-        let a = SessionKey("local:a".into());
-        store
-            .state
-            .set_model_catalog(crate::model::SessionModelCatalog {
-                session_id: a.clone(),
-                models: vec![crate::model::ModelStatus {
-                    model: "deepseek-v4-pro".into(),
-                    provider: "deepseek".into(),
-                    title: None,
-                    family: None,
-                    route: None,
-                    selected: true,
-                    available: Some(true),
-                    queue_mode: None,
-                    qoe_policy: None,
-                }],
-            });
-        // Session A initiates the select (stashes the pending session)…
-        let command = store.dispatch_menu_action(crate::menu::MenuAction::send_appui(
-            AppUiCommand::ProfileLlmSelect(crate::model::ProfileLlmSelectParams {
-                profile_id: Some("dev".into()),
-                session_id: None,
-                family_id: "deepseek".into(),
-                model_id: "deepseek-chat".into(),
-                route_id: "official".into(),
-            }),
-        ));
-        assert!(command.is_some());
-        // …then the user switches to B before the response lands.
+        // The user switches to B before A's reply lands.
         store.state.switch_selected_session(1);
 
-        store.apply_client_event(ClientEvent::ModelSelect(
+        let event = |model: &str, initiating: Option<SessionKey>| {
             crate::client_event::ModelSelectClientEvent {
                 result: crate::model::ModelSelectResult {
+                    // Legacy synthetic echo — never used for targeting.
                     session_id: SessionKey("dev:local:tui#coding".into()),
                     selected: crate::model::ModelStatus {
-                        model: "deepseek-chat".into(),
+                        model: model.into(),
                         provider: "deepseek".into(),
                         title: None,
                         family: None,
@@ -17259,15 +17105,19 @@ mod tests {
                     runtime_policy_stamp: None,
                 },
                 message: "Model selected".into(),
-            },
-        ));
+                initiating_session: initiating,
+            }
+        };
 
-        let catalog = store
-            .state
-            .model_catalog_for(&a)
-            .expect("initiating session catalog");
+        store.apply_client_event(ClientEvent::ModelSelect(event(
+            "deepseek-chat",
+            Some(a.clone()),
+        )));
         assert!(
-            catalog
+            store
+                .state
+                .model_catalog_for(&a)
+                .expect("catalog")
                 .models
                 .iter()
                 .any(|model| model.model == "deepseek-chat" && model.selected),
@@ -17278,15 +17128,28 @@ mod tests {
                 .state
                 .model_catalog_for(&SessionKey("local:b".into()))
                 .is_none(),
-            "the bystander session B stays untouched"
+            "the active bystander session B stays untouched"
+        );
+
+        // Unattributed result: ignored, selection unchanged.
+        store.apply_client_event(ClientEvent::ModelSelect(event("deepseek-v4-pro", None)));
+        assert!(
+            store
+                .state
+                .model_catalog_for(&a)
+                .expect("catalog")
+                .models
+                .iter()
+                .any(|model| model.model == "deepseek-chat" && model.selected),
+            "an unattributed echo must not overwrite the selection"
         );
     }
 
-    /// Overlapping selects on a legacy server (synthetic echoes) correlate by
-    /// reply ORDER: select in A, switch to B, select in B — the first reply
-    /// lands on A, the second on B.
+    /// Overlapping selects correlate by REQUEST attribution, not arrival
+    /// order: even when B's reply arrives before A's, each lands on its own
+    /// initiating session.
     #[test]
-    fn overlapping_model_selects_correlate_in_reply_order() {
+    fn out_of_order_select_replies_land_on_their_initiating_sessions() {
         let mut store = store_with_two_sessions("local:a", "local:b");
         let a = SessionKey("local:a".into());
         let b = SessionKey("local:b".into());
@@ -17308,44 +17171,30 @@ mod tests {
                     }],
                 });
         }
-        let select = |session: &SessionKey, model: &str| {
-            crate::menu::MenuAction::send_appui(AppUiCommand::ProfileLlmSelect(
-                crate::model::ProfileLlmSelectParams {
-                    profile_id: Some("dev".into()),
-                    session_id: Some(session.clone()),
-                    family_id: "deepseek".into(),
-                    model_id: model.into(),
-                    route_id: "official".into(),
+        let reply =
+            |model: &str, initiating: &SessionKey| crate::client_event::ModelSelectClientEvent {
+                result: crate::model::ModelSelectResult {
+                    session_id: SessionKey("dev:local:tui#coding".into()),
+                    selected: crate::model::ModelStatus {
+                        model: model.into(),
+                        provider: "deepseek".into(),
+                        title: None,
+                        family: None,
+                        route: None,
+                        selected: true,
+                        available: Some(true),
+                        queue_mode: None,
+                        qoe_policy: None,
+                    },
+                    applied: true,
+                    runtime_policy_stamp: None,
                 },
-            ))
-        };
-        let _ = store.dispatch_menu_action(select(&a, "deepseek-chat"));
-        store.state.switch_selected_session(1);
-        let _ = store.dispatch_menu_action(select(&b, "deepseek-reasoner"));
-
-        let synthetic_reply = |model: &str| crate::client_event::ModelSelectClientEvent {
-            result: crate::model::ModelSelectResult {
-                session_id: SessionKey("dev:local:tui#coding".into()),
-                selected: crate::model::ModelStatus {
-                    model: model.into(),
-                    provider: "deepseek".into(),
-                    title: None,
-                    family: None,
-                    route: None,
-                    selected: true,
-                    available: Some(true),
-                    queue_mode: None,
-                    qoe_policy: None,
-                },
-                applied: true,
-                runtime_policy_stamp: None,
-            },
-            message: "Model selected".into(),
-        };
-        store.apply_client_event(ClientEvent::ModelSelect(synthetic_reply("deepseek-chat")));
-        store.apply_client_event(ClientEvent::ModelSelect(synthetic_reply(
-            "deepseek-reasoner",
-        )));
+                message: "Model selected".into(),
+                initiating_session: Some(initiating.clone()),
+            };
+        // B's reply arrives FIRST even though A asked first.
+        store.apply_client_event(ClientEvent::ModelSelect(reply("deepseek-reasoner", &b)));
+        store.apply_client_event(ClientEvent::ModelSelect(reply("deepseek-chat", &a)));
 
         let selected_of = |store: &Store, session: &SessionKey| {
             store.state.model_catalog_for(session).and_then(|catalog| {
@@ -17356,15 +17205,10 @@ mod tests {
                     .map(|model| model.model.clone())
             })
         };
-        assert_eq!(
-            selected_of(&store, &a).as_deref(),
-            Some("deepseek-chat"),
-            "first reply correlates to the FIRST initiating session"
-        );
+        assert_eq!(selected_of(&store, &a).as_deref(), Some("deepseek-chat"));
         assert_eq!(
             selected_of(&store, &b).as_deref(),
-            Some("deepseek-reasoner"),
-            "second reply correlates to the SECOND initiating session"
+            Some("deepseek-reasoner")
         );
     }
 

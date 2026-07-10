@@ -3433,14 +3433,6 @@ pub struct AppState {
     pub turn_started_at: std::collections::HashMap<(SessionKey, TurnId), std::time::Instant>,
     /// Latest `/btw` aside per session (see [`BtwAside`]).
     pub btw_asides: std::collections::HashMap<SessionKey, BtwAside>,
-    /// FIFO of sessions that initiated in-flight `profile/llm/select`
-    /// requests. Replies come back in request order on the single ordered
-    /// connection, so popping the front correlates each result (or
-    /// select-attributed error) with its initiating session EXACTLY — the
-    /// echoed key is never trusted for targeting (legacy servers echo a
-    /// synthetic `profile:local:tui#coding` that can collide with a real
-    /// session). Bounded; an overflowing burst drops the oldest.
-    pub pending_model_select_sessions: std::collections::VecDeque<SessionKey>,
     pub expanded_tool_outputs: bool,
     pub menu_stack: MenuStack,
     pub active_menu: Option<MenuBuildResult>,
@@ -5226,7 +5218,6 @@ impl AppState {
             turn_activity_summaries: Vec::new(),
             turn_started_at: std::collections::HashMap::new(),
             btw_asides: std::collections::HashMap::new(),
-            pending_model_select_sessions: std::collections::VecDeque::new(),
             expanded_tool_outputs: false,
             menu_stack: MenuStack::new(),
             active_menu: None,
