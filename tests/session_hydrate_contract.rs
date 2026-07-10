@@ -84,6 +84,7 @@ fn session_hydrate_result_replaces_durable_messages() {
             message_id: Some("msg-1".into()),
             source: Some("assistant".into()),
             media: Vec::new(),
+            reasoning_content: None,
         }]),
         threads: None,
         turns: None,
