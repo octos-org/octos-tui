@@ -3272,6 +3272,12 @@ pub struct AppState {
     /// Preserved across `Snapshot` replays (see `apply_event`).
     pub session_reasoning_effort:
         std::collections::HashMap<SessionKey, octos_core::ui_protocol::ReasoningEffortLevel>,
+    /// Per-session opt-in to render the committed `reasoning_content` as a
+    /// capped "· reasoning" block in the transcript. Absent/false = the
+    /// codex-style quiet default (spinner + inspector only). Toggled from the
+    /// `/thinking` menu; parallels `session_reasoning_effort` in lifetime and
+    /// Snapshot preservation.
+    pub session_reasoning_display: std::collections::HashSet<SessionKey>,
     /// Per-session set of turn ids that were already finalized (committed OR
     /// dropped) by `commit_pending_live_reply_for_turn_switch` at a turn-switch
     /// boundary. A prior turn's OWN late `TurnCompleted`/`TurnError` may still
@@ -5149,6 +5155,7 @@ impl AppState {
             completed_turns: std::collections::HashMap::new(),
             session_retry: std::collections::HashMap::new(),
             session_reasoning_effort: std::collections::HashMap::new(),
+            session_reasoning_display: std::collections::HashSet::new(),
             finalized_by_switch: std::collections::HashMap::new(),
             selected_session,
             selected_task: 0,
@@ -5728,6 +5735,11 @@ impl AppState {
                 .min(self.git.selectable_len().saturating_sub(1));
             self.git.scroll = self.git.scroll.min(self.git.selected);
         }
+    }
+
+    /// Whether the given session opted into rendering reasoning blocks.
+    pub fn reasoning_display_enabled(&self, session_id: &SessionKey) -> bool {
+        self.session_reasoning_display.contains(session_id)
     }
 
     pub fn active_session(&self) -> Option<&SessionView> {

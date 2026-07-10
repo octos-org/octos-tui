@@ -857,6 +857,10 @@ menu:
       medium:
         desc: 均衡推理。
         label: 中
+      display:
+        desc: 在本会话的对话记录中显示模型的推理内容（Ctrl+O 展开）。
+        label_off: 推理显示：关
+        label_on: 推理显示：开
     subtitle: 思考模型的推理强度（本次会话）。
     title: 思考强度
   title:
@@ -1242,3 +1246,5 @@ thinking:
   set: 推理强度已设为 %{level}。
   unknown: 未知强度 '%{value}'。可选：low、medium、high、max、default。
   usage: 推理强度：%{current}。用法：/thinking <low|medium|high|max|default>。
+  display_on: 本会话已在对话记录中显示推理内容。
+  display_off: 已隐藏推理内容（仅保留动画与检查器）。

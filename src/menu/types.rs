@@ -310,6 +310,9 @@ pub enum LocalAction {
     /// Set the per-session reasoning effort to a specific level from the
     /// `/thinking` selection menu. `None` clears the override (server default).
     SetThinkingLevel(Option<octos_core::ui_protocol::ReasoningEffortLevel>),
+    /// Toggle whether committed reasoning renders as a transcript block
+    /// for the active session (`/thinking` display row).
+    ToggleReasoningDisplay,
     /// Persist the runtime UI settings (theme/lang/scroll-mode/vim-mode) back to
     /// the launch config file (`/saveconfig`).
     SaveConfig,
@@ -640,6 +643,9 @@ pub struct MenuAppSnapshot<'a> {
     /// Active session's reasoning effort, for marking the current `/thinking`
     /// menu item. `None` = server default (no per-session override).
     pub reasoning_effort: Option<octos_core::ui_protocol::ReasoningEffortLevel>,
+    /// Whether the active session renders reasoning as a transcript block,
+    /// for the `/thinking` display toggle row's on/off state.
+    pub reasoning_display: bool,
     pub permission_profile: Option<octos_core::ui_protocol::PermissionProfileSelection>,
     pub runtime_status: Option<&'a SessionRuntimeStatus>,
     pub model_catalog: Option<&'a SessionModelCatalog>,

@@ -419,6 +419,8 @@ thinking:
   cleared: "Reasoning effort cleared — using the server default."
   unknown: "Unknown effort '%{value}'. Available: low, medium, high, max, default."
   no_session: "No active session — open or select a session first."
+  display_on: Reasoning now shows in the transcript for this session.
+  display_off: Reasoning hidden from the transcript (spinner + inspector only).
 
 status:
   opening_diff_preview: "Opening diff preview: %{operation} %{path}"
@@ -1257,6 +1259,10 @@ menu:
       medium:
         desc: Balanced reasoning.
         label: Medium
+      display:
+        desc: "Show the model's reasoning as a transcript block for this session (Ctrl+O to expand)."
+        label_off: "Reasoning display: off"
+        label_on: "Reasoning display: on"
     subtitle: Reasoning effort for thinking models (this session).
     title: Thinking effort
   title:
