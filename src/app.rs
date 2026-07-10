@@ -4659,9 +4659,32 @@ fn compact_file_path(path: &str) -> String {
     format!(".../{}", components[components.len() - keep..].join("/"))
 }
 
+/// octos exposes several shell-family tools that all run a command string:
+/// `shell`/`exec`/`exec_command` (field `command`) and the codex-compatible
+/// `bash` (field `cmd`, falling back to `command`). They should all render as
+/// a real `$ command` line, not the raw JSON arguments blob.
+fn is_shell_family_tool(title: &str) -> bool {
+    matches!(title, "shell" | "exec" | "exec_command" | "bash")
+}
+
+/// Pull the command string out of a shell-family tool's arguments so the card
+/// shows `$ find …` instead of `{"cmd":"find …"}`.
+fn shell_command_arg(item: &ActivityItem) -> Option<String> {
+    let arguments = item.arguments.as_ref()?;
+    ["cmd", "command"]
+        .into_iter()
+        .find_map(|key| arguments.get(key).and_then(|value| value.as_str()))
+        .map(str::to_owned)
+}
+
 fn tool_invocation_text(item: &ActivityItem) -> Option<String> {
     if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
         return Some(detail.to_string());
+    }
+    if is_shell_family_tool(&item.title) {
+        if let Some(command) = shell_command_arg(item) {
+            return Some(command);
+        }
     }
     item.arguments
         .as_ref()
@@ -4677,7 +4700,7 @@ fn meaningful_output_lines(output: &str) -> Vec<&str> {
 }
 
 fn tool_action_label(item: &ActivityItem, running: bool) -> String {
-    if item.title == "shell" {
+    if is_shell_family_tool(&item.title) {
         return shell_action_label(
             tool_invocation_text(item).as_deref().unwrap_or_default(),
             running,
@@ -5705,7 +5728,11 @@ fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'st
             Span::styled(item.title.clone(), palette.muted()),
         ];
         if let Some(invocation) = tool_invocation_text(item) {
-            let prompt = if item.title == "shell" { "$ " } else { "" };
+            let prompt = if is_shell_family_tool(&item.title) {
+                "$ "
+            } else {
+                ""
+            };
             spans.push(Span::styled(": ", palette.muted()));
             spans.push(Span::styled(
                 format!("{prompt}{}", truncate_terminal_line(&invocation, 96)),
@@ -12506,6 +12533,51 @@ mod tests {
         assert!(text.contains("18ms"));
         assert!(!text.contains("Command  ▸ shell"));
         assert!(!text.contains("Tool  ▸ write_file"));
+    }
+
+    #[test]
+    fn render_activity_shows_bash_command_not_raw_json_args() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run a bash command")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // The codex-style `bash` tool carries its command in `arguments.cmd`
+        // (no `detail`), unlike `shell`/`exec` which set `detail`. It must
+        // still render as a real `$ command` line, not the raw JSON blob.
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+                .with_tool_call("bash-1")
+                .with_arguments(serde_json::json!({
+                    "cmd": "find . -name '*.ts' -newer server"
+                }))
+                .with_success(true)
+                .with_duration_ms(8),
+        );
+
+        app.expanded_tool_outputs = true;
+        let text = rendered_text(&app);
+
+        // Clean command behind a shell prompt, with the verb keyed off it.
+        assert!(
+            text.contains("$ find . -name '*.ts' -newer server"),
+            "want clean shell command, got:\n{text}"
+        );
+        assert!(text.contains("Ran"), "want shell action verb, got:\n{text}");
+        // No raw JSON arguments leaking through.
+        assert!(
+            !text.contains("{\"cmd\""),
+            "must not show raw JSON args, got:\n{text}"
+        );
     }
 
     #[test]
