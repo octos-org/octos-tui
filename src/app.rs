@@ -7612,7 +7612,12 @@ fn run_state_style(state: &SessionRunState, palette: Palette) -> Style {
 
 fn run_state_marker(state: &SessionRunState) -> &'static str {
     match state {
-        SessionRunState::InProgress => "•",
+        // Pin the swimming octopus to the always-visible status bar: on a big
+        // turn the transcript's "Orchestrating" chip scrolls above the fold, so
+        // this is the reliable "still working" signal that never scrolls away.
+        // Time-based like the transcript spinner; the status bar redraws every
+        // frame so it animates smoothly.
+        SessionRunState::InProgress => spinner_frame(),
         SessionRunState::Blocked { .. } => "!",
         SessionRunState::Success => "✓",
         SessionRunState::Error { .. } => "x",
@@ -8490,6 +8495,21 @@ mod tests {
             off.content_hash, on.content_hash,
             "the display toggle must not force a committed-history re-flush"
         );
+    }
+
+    #[test]
+    fn in_progress_status_marker_is_the_octopus_spinner() {
+        // The pinned "still working" signal: the in-progress status marker is
+        // one of the octopus spinner frames (not a static bullet), so it stays
+        // visible in the status bar even when the transcript chip scrolls off.
+        let marker = run_state_marker(&SessionRunState::InProgress);
+        assert!(
+            SPINNER_FRAMES.contains(&marker),
+            "in-progress marker must be an octopus spinner frame, got {marker:?}"
+        );
+        // Settled states keep their static, non-animated markers.
+        assert_eq!(run_state_marker(&SessionRunState::Success), "✓");
+        assert_eq!(run_state_marker(&SessionRunState::Idle), "·");
     }
 
     #[test]
@@ -9960,7 +9980,14 @@ mod tests {
             .sum::<usize>();
 
         assert!(text.contains("Working on it."));
-        assert!(text.contains("state • Working"));
+        // The in-progress status marker is the animated octopus spinner now
+        // (pinned so it survives a transcript that scrolls the chip off).
+        assert!(
+            SPINNER_FRAMES
+                .iter()
+                .any(|frame| text.contains(&format!("state {frame} Working"))),
+            "status bar shows an octopus-spinner + Working:\n{text}"
+        );
         assert!(!text.contains("Progress"));
         assert!(!text.contains("Work  sticky"));
         assert_eq!(
