@@ -3192,6 +3192,11 @@ fn should_show_turn_flow(app: &AppState, session: &SessionView) -> bool {
             .user_question
             .as_ref()
             .is_some_and(|picker| picker.visible)
+        // A `/btw` aside is the same class of live-only card: it must keep
+        // rendering after the session settles (the answer often lands right
+        // as — or after — the main turn completes) until the next prompt
+        // submit dismisses it.
+        || app.btw_asides.contains_key(&session.id)
         || should_pin_recent_user_context(app, session)
 }
 
@@ -8569,6 +8574,44 @@ mod tests {
         assert!(
             text.contains("✻ Ran for 1m 15s · 1 background task(s) still running"),
             "transcript should carry the committed turn status report; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn settled_session_keeps_rendering_btw_aside() {
+        // Regression (live soak): the live tail gates on should_show_turn_flow,
+        // which went false once the session settled — the aside card vanished
+        // the moment the main turn completed, often before the answer landed.
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("go"), Message::assistant("done")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.set_btw_answering(&session_id, "still with me?".into());
+        let session = app.active_session().expect("session");
+        assert!(
+            should_show_turn_flow(&app, session),
+            "an aside must keep the turn-flow (and its card) rendering on a settled session"
+        );
+        let lines =
+            live_tail_lines_with_finalization(&app, Palette::for_theme(ThemeName::Codex), 80, None);
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(
+            text.contains("/btw still with me?"),
+            "live tail must carry the aside card when idle; got {text:?}"
         );
     }
 

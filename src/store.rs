@@ -4897,10 +4897,15 @@ impl Store {
             }
             ClientEvent::SessionBtw(event) => {
                 // Resolve the answering aside; a stale answer (aside replaced
-                // or dismissed meanwhile) is dropped, not resurrected.
+                // or dismissed meanwhile) is dropped, not resurrected. Only an
+                // ACTIVE-session answer may touch the shared status/scroll — a
+                // background session's aside resolving must not yank the view
+                // the user is currently reading.
+                let session_id = event.result.session_id.clone();
                 if self
                     .state
-                    .resolve_btw_answer(&event.result.session_id, event.result.answer)
+                    .resolve_btw_answer(&session_id, event.result.answer)
+                    && self.event_targets_active_session(&session_id)
                 {
                     self.state.status = t!("status.btw_answered").into_owned();
                     self.state.scroll_transcript_to_latest();
@@ -5458,13 +5463,20 @@ impl Store {
             }
             AppUiEvent::Error(error) => {
                 // `/btw` failure/cancellation: RPC errors surface generically
-                // as "{method} request {id} failed|cancelled: …" with the
-                // method leading — mark answering asides failed so the card
-                // never wedges on "Answering…".
-                if error.message.starts_with("session/btw ")
+                // ("{method} request {id} failed|cancelled: …", and some
+                // send-layer rejections embed the method later), so match by
+                // substring and mark answering asides failed so the card never
+                // wedges on "Answering…". Errors carry no session attribution;
+                // with concurrent asides across sessions all answering cards
+                // fail together (rare; each card invites a retry). CRUCIALLY:
+                // an aside failure is NOT a turn/transport failure — return
+                // before the generic path below flips the run state to error
+                // for a perfectly healthy main turn.
+                if error.message.contains("session/btw")
                     && self.state.fail_btw_answering(&error.message) > 0
                 {
                     self.state.status = t!("status.btw_failed").into_owned();
+                    return None;
                 }
                 // A staged-drain SubmitPrompt can die at the TRANSPORT layer —
                 // no turn/started or terminal will ever arrive for it, so the
@@ -16572,6 +16584,59 @@ mod tests {
                 .map(|aside| &aside.state),
             Some(crate::model::BtwAsideState::Failed(_))
         ));
+        // An aside failure is NOT a turn failure: the live turn's run state
+        // must stay untouched (previously the generic error path flipped it
+        // to error for a perfectly healthy main turn).
+        assert!(
+            store.state.run_state.is_active(),
+            "aside failure must not fail the live turn's run state; got {:?}",
+            store.state.run_state.label()
+        );
+    }
+
+    #[test]
+    fn background_session_btw_answer_does_not_touch_the_active_view() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming…");
+        let background = SessionView {
+            id: SessionKey("local:background".into()),
+            title: "background".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        store.state.sessions.push(background);
+        let background_id = store.state.sessions[1].id.clone();
+        store
+            .state
+            .set_btw_answering(&background_id, "still on it?".into());
+        store.state.status = "reading session A".into();
+
+        store.apply_client_event(ClientEvent::SessionBtw(
+            crate::client_event::SessionBtwClientEvent {
+                result: octos_core::ui_protocol::SessionBtwResult {
+                    session_id: background_id.clone(),
+                    answer: "yes".into(),
+                    model: None,
+                },
+            },
+        ));
+
+        assert!(
+            matches!(
+                store
+                    .state
+                    .btw_aside_for(&background_id)
+                    .map(|aside| &aside.state),
+                Some(crate::model::BtwAsideState::Answered(answer)) if answer == "yes"
+            ),
+            "the background aside still resolves"
+        );
+        assert_eq!(
+            store.state.status, "reading session A",
+            "a background aside answer must not overwrite the active view's status"
+        );
     }
 
     #[test]
