@@ -7083,23 +7083,29 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
         })
         .unwrap_or(app.workspace.root.as_str());
     let cwd_title = format!(" {} ", short_path(cwd));
-    block = block
-        .title_bottom(Line::from(Span::styled(cwd_title.clone(), palette.muted())).left_aligned());
     if let Some(model) = composer_footer_model(app) {
         let model_title = format!(" {} ", truncate_terminal_line(&model, 28));
         // Both bottom titles share one border row and ratatui paints
-        // overlapping titles over each other — on a composer too narrow for
-        // both, drop the model rather than colliding with the cwd.
+        // overlapping titles over each other. The model is the footer's
+        // SOLE persistent display now that the status line no longer echoes
+        // it (the de-dup), so when the border is too narrow for both, keep
+        // the model and drop the cwd rather than hiding the model entirely
+        // (which would leave the active model visible nowhere).
         let inner_width = area.width.saturating_sub(2) as usize;
         if cwd_title.width() + model_title.width() <= inner_width {
-            block = block.title_bottom(
-                Line::from(Span::styled(
-                    model_title,
-                    Style::default().fg(palette.accent),
-                ))
-                .right_aligned(),
-            );
+            block = block
+                .title_bottom(Line::from(Span::styled(cwd_title, palette.muted())).left_aligned());
         }
+        block = block.title_bottom(
+            Line::from(Span::styled(
+                model_title,
+                Style::default().fg(palette.accent),
+            ))
+            .right_aligned(),
+        );
+    } else {
+        block =
+            block.title_bottom(Line::from(Span::styled(cwd_title, palette.muted())).left_aligned());
     }
 
     Paragraph::new(Text::from(lines))
@@ -8617,10 +8623,12 @@ mod tests {
     }
 
     #[test]
-    fn composer_footer_drops_model_when_too_narrow_for_both_titles() {
+    fn composer_footer_keeps_model_and_drops_cwd_when_too_narrow_for_both_titles() {
         // Ratatui paints overlapping border titles over each other; when the
-        // composer cannot fit cwd + model side by side the model is dropped —
-        // never a collision.
+        // composer cannot fit cwd + model side by side, the cwd is dropped and
+        // the MODEL is kept — never a collision. The model is the footer's sole
+        // persistent home now that the status line no longer echoes it, so it
+        // must never be the title that vanishes.
         let session_id = SessionKey("local:test".into());
         let mut app = AppState::new(
             vec![SessionView {
@@ -8646,13 +8654,21 @@ mod tests {
         let palette = Palette::for_theme(ThemeName::Codex);
         let narrow = rendered_rows(&rendered_buffer_with_size(&app, palette, 40, 30));
         assert!(
-            !narrow.iter().any(|row| row.contains("kimi")),
-            "model must be dropped when both footer titles cannot fit; got {narrow:?}"
+            narrow.iter().any(|row| row.contains("kimi")),
+            "model must be kept when both footer titles cannot fit; got {narrow:?}"
+        );
+        assert!(
+            !narrow.iter().any(|row| row.contains("workspace/path")),
+            "cwd must be dropped when both footer titles cannot fit; got {narrow:?}"
         );
         let wide = rendered_rows(&rendered_buffer_with_size(&app, palette, 120, 30));
         assert!(
             wide.iter().any(|row| row.contains("kimi")),
-            "model renders again once the composer is wide enough"
+            "model still renders when the composer is wide enough"
+        );
+        assert!(
+            wide.iter().any(|row| row.contains("workspace/path")),
+            "cwd renders alongside the model once the composer is wide enough"
         );
     }
 
@@ -11016,6 +11032,88 @@ mod tests {
             !text.contains("loop(s)"),
             "chip must vanish with no loops: {text}"
         );
+    }
+
+    /// A deleted loop is a tombstone — `/loop delete` removed it, so it
+    /// must not linger as a dimmed zombie chip in the sticky autonomy
+    /// indicator. Deleted records can still arrive via the `loop/list`
+    /// rehydration path, so `set_session_loops` must strip them exactly
+    /// like `upsert_session_loop` does. Without the filter the row reads
+    /// "0 running" (the active/paused counts exclude tombstones) yet
+    /// still renders chips — the `#1576` delete-can't-clear-it symptom.
+    #[test]
+    fn deleted_loops_do_not_surface_as_zombie_chips() {
+        fn loop_record(status: &str) -> octos_core::ui_protocol::UiLoopRecord {
+            serde_json::from_value(serde_json::json!({
+                "loop_id": "loop-1",
+                "session_id": "local:loops",
+                "prompt": "keep poking",
+                "mode": "interval",
+                "interval_seconds": 60,
+                "status": status,
+                "expires_at_ms": 0,
+                "created_at_ms": 0,
+                "updated_at_ms": 0,
+            }))
+            .expect("loop record")
+        }
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:loops".into()),
+                title: "loops".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let session_id = SessionKey("local:loops".into());
+
+        // Positive control: an active loop DOES surface as a chip, so the
+        // negative assertions below are meaningful.
+        let retained = app.set_session_loops(&session_id, vec![loop_record("active")]);
+        assert_eq!(retained, 1);
+        assert!(
+            rendered_text(&app).contains("keep poking"),
+            "active loop chip should render"
+        );
+
+        // Regression: a deleted (tombstoned) loop must be dropped, not
+        // stored and dimmed. The returned count must reflect the retained
+        // loops so the refresh acknowledgment can't claim more than the
+        // indicator shows (codex P2).
+        let retained = app.set_session_loops(&session_id, vec![loop_record("deleted")]);
+        assert_eq!(retained, 0, "deleted-only batch retains nothing");
+        assert_eq!(
+            app.session_autonomy_for(&session_id)
+                .map(|state| state.loops.len()),
+            Some(0),
+            "deleted loop must be filtered out of the mirror"
+        );
+        assert_eq!(app.session_loop_counts(&session_id), (0, 0));
+        let text = rendered_text(&app);
+        assert!(
+            !text.contains("keep poking"),
+            "deleted loop must not render a chip: {text}"
+        );
+
+        // Mixed batch: only the non-deleted survivor is kept and counted.
+        let retained = app.set_session_loops(
+            &session_id,
+            vec![loop_record("active"), loop_record("deleted")],
+        );
+        assert_eq!(retained, 1, "mixed batch retains only the non-deleted loop");
+        assert_eq!(
+            app.session_autonomy_for(&session_id)
+                .map(|state| state.loops.len()),
+            Some(1),
+            "mixed batch must keep only the non-deleted loop"
+        );
+        assert_eq!(app.session_loop_counts(&session_id), (1, 0));
     }
 
     #[test]
