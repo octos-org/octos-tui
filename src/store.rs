@@ -6215,6 +6215,24 @@ impl Store {
             } => {
                 // A live-streamed row (or a prior replay already archived into
                 // the turn log) covers this call — never double-render it.
+                // But a LIVE envelope row is turnless (the envelope path has
+                // no turn identity): ADOPT it onto the hydrated turn first,
+                // or the capture pass below can't archive it and a terminal
+                // row strands in the live strip while the turn group omits it.
+                if let Some(turn) = turn_id.as_ref() {
+                    if let Some(item) = self.state.activity.iter_mut().find(|item| {
+                        item.tool_call_id.as_deref() == Some(tool_call_id.as_str())
+                            && item.turn_id.is_none()
+                    }) {
+                        item.turn_id = Some(turn.clone());
+                        item.session_id = None;
+                        // Turn-scoped now: the thread marker is no longer the
+                        // heal key, so the slot is free for the invocation echo.
+                        if let Some(preview) = arguments_preview.clone() {
+                            item.detail = Some(preview);
+                        }
+                    }
+                }
                 let in_live = self
                     .state
                     .activity
@@ -23644,6 +23662,98 @@ mod tests {
         assert!(
             store.state.active_turn().is_none(),
             "replaying history must not resurrect an active turn"
+        );
+    }
+
+    #[test]
+    fn hydrate_replay_adopts_live_turnless_envelope_row_into_turn_group() {
+        use crate::client_event::ClientEvent;
+        // A tool that streamed LIVE via the envelope path leaves a turnless
+        // row (thread-marker detail). When the same call replays on hydrate,
+        // the row must be ADOPTED onto the hydrated turn — otherwise the
+        // capture pass can't archive it and a terminal row strands in the
+        // live strip while the turn group omits it.
+        let turn_id = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let thread = turn_id.0.to_string();
+
+        // Live envelope path created the turnless row.
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "running")
+                .with_tool_call("tc-adopt")
+                .with_session(session_id.clone())
+                .with_detail(AppState::envelope_tool_detail_for_thread(&thread)),
+        );
+
+        let result = SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 9,
+            },
+            context: None,
+            context_state: None,
+            messages: None,
+            threads: None,
+            turns: Some(vec![HydratedTurn {
+                turn_id: turn_id.clone(),
+                state: TurnLifecycleState::Completed,
+                started_at: None,
+                completed_at: None,
+                thread_id: None,
+            }]),
+            pending_approvals: None,
+            pending_questions: None,
+            replayed_envelopes: None,
+            replayed_tool_envelopes: Some(vec![
+                Envelope {
+                    thread_id: thread.clone(),
+                    seq: 1,
+                    client_message_id: None,
+                    payload: Payload::ToolStart {
+                        tool_call_id: "tc-adopt".into(),
+                        name: "shell".into(),
+                        arguments_preview: Some("command: \"ls\"".into()),
+                    },
+                },
+                Envelope {
+                    thread_id: thread,
+                    seq: 2,
+                    client_message_id: None,
+                    payload: Payload::ToolEnd {
+                        tool_call_id: "tc-adopt".into(),
+                        status: EnvelopeToolEndStatus::Complete,
+                        error: None,
+                        reason: None,
+                        output_preview: Some("ok".into()),
+                        duration_ms: Some(7),
+                    },
+                },
+            ]),
+        };
+        store.apply_client_event(ClientEvent::SessionHydrate(result));
+
+        let log = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_id)
+            .expect("adopted live row must be archived into the turn log");
+        let row = log
+            .items
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("tc-adopt"))
+            .expect("row present in the archive");
+        assert_eq!(row.detail.as_deref(), Some("command: \"ls\""));
+        assert_eq!(row.output_preview.as_deref(), Some("ok"));
+        assert!(
+            !store
+                .state
+                .activity
+                .iter()
+                .any(|item| item.tool_call_id.as_deref() == Some("tc-adopt")),
+            "no stranded duplicate may remain in the live strip"
         );
     }
 
