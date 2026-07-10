@@ -938,7 +938,11 @@ pub struct SessionStatusReadResult {
     pub active_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_status_model",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub model: Option<ModelStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_profile: Option<String>,
@@ -970,6 +974,43 @@ pub struct SessionStatusReadResult {
     pub cursor: Option<SessionCursorStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<UiProtocolCapabilities>,
+}
+
+/// Skew-tolerant decoder for [`SessionStatusReadResult::model`].
+///
+/// octos servers up to protocol 1.1.0 answer `session/status/read` with
+/// `"model": {"model": null, "provider": null, "selected": true}` when the
+/// runtime policy has no resolved model (fresh data dir, onboarding before a
+/// provider is saved). [`ModelStatus::model`]/[`ModelStatus::provider`] are
+/// deliberately non-optional — the model list/select paths genuinely require
+/// them — so decoding that shape directly fails with "invalid type: null"
+/// and takes the ENTIRE status result down with it: the transport surfaces
+/// an `invalid_result` app error and the composer footer degrades to the
+/// `<server authenticated profile>` placeholder.
+///
+/// Semantics: `null`, a missing key, or an object whose `model` or
+/// `provider` member is null/absent all MEAN "no model resolved" and decode
+/// to `None` (the footer renders its regular no-model state). Everything
+/// else decodes as a normal [`ModelStatus`]; an object whose members are
+/// present but wrongly typed is a real protocol error and still fails —
+/// this tolerance only maps the no-model shapes, it must not mask malformed
+/// results.
+fn deserialize_status_model<'de, D>(deserializer: D) -> Result<Option<ModelStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if let Some(object) = value.as_object() {
+        let unresolved = |key: &str| object.get(key).is_none_or(serde_json::Value::is_null);
+        if unresolved("model") || unresolved("provider") {
+            return Ok(None);
+        }
+    }
+    ModelStatus::deserialize(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

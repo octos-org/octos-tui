@@ -6476,6 +6476,169 @@ mod tests {
         assert_eq!(event.result.skills[0].status.as_deref(), Some("installed"));
     }
 
+    /// Realistic `session/status/read` result body as emitted by an octos
+    /// server (protocol 1.1.0) for a fresh data dir where onboarding has not
+    /// saved a provider yet — captured verbatim from `octos serve --stdio`
+    /// (capabilities trimmed to a representative subset). `model_member`
+    /// controls the `model` key: `Some(value)` inserts it, `None` omits it.
+    fn server_status_read_result(model_member: Option<Value>) -> Value {
+        let mut result = json!({
+            "session_id": "local:tui#coding",
+            "profile_id": "ada",
+            "runtime_policy_stamp": {
+                "runtime_mode": "solo",
+                "profile_id": "ada",
+                "workspace_root": null,
+                "approval_policy": "on-request",
+                "sandbox_mode": "workspace-write",
+                "permission_profile": "workspace_write",
+                "filesystem_scope": "workspace",
+                "network": "blocked",
+                "model": null,
+                "provider": null,
+                "tool_policy_id": "profile",
+                "mcp_servers": [],
+                "memory_scope": "profile-session",
+                "qoe_policy": "profile",
+                "queue_mode": "adaptive",
+                "tool_contract_id": "codex-compatible-coding-v1",
+                "tool_contract_version": "1",
+                "model_toolset": "coding",
+                "dynamic_tool_discovery": "enabled"
+            },
+            "context": null,
+            "context_state": null,
+            "permission_profile": "workspace_write",
+            "sandbox": "workspace-write",
+            "health": { "status": "ok" },
+            "mcp_summary": { "connected": 0, "connecting": 0, "failed": 0, "disabled": 0 },
+            "tool_summary": { "visible": 0, "enabled": 0, "denied": 0, "policy_id": "profile" },
+            "usage": {},
+            "cursor": { "healthy": true, "replay_supported": true },
+            "capabilities": {
+                "version": { "protocol": "octos-ui/v1alpha1", "schema_version": 1, "jsonrpc": "2.0" },
+                "capabilities_schema_version": 2,
+                "supported_methods": ["session/open", "session/status/read"],
+                "supported_notifications": ["turn/started"]
+            }
+        });
+        if let Some(model) = model_member {
+            result["model"] = model;
+        }
+        result
+    }
+
+    fn decode_status_read_frame(result: Value) -> ClientEvent {
+        let mut pending = HashMap::new();
+        pending.insert(
+            "status-1".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_SESSION_STATUS_READ.into(),
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "status-1",
+            "result": result,
+        })
+        .to_string();
+        rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event")
+    }
+
+    fn expect_session_status(event: ClientEvent) -> crate::model::SessionStatusReadResult {
+        let ClientEvent::SessionStatus(event) = event else {
+            panic!("expected session status event, got {event:?}");
+        };
+        event.result
+    }
+
+    /// The version-skew shape that used to fail the whole decode: a server
+    /// with no resolved model emits
+    /// `"model": {"model": null, "provider": null, "selected": true}`.
+    /// That null-member object MEANS "no model resolved" and must decode to
+    /// `model == None` — never take the entire SessionStatusReadResult down
+    /// with an `invalid_result` error that degrades the composer footer to
+    /// the `<server authenticated profile>` placeholder.
+    #[test]
+    fn session_status_null_member_model_object_decodes_as_no_model() {
+        let status = expect_session_status(decode_status_read_frame(server_status_read_result(
+            Some(json!({
+                "model": null,
+                "provider": null,
+                "selected": true
+            })),
+        )));
+
+        assert_eq!(status.model, None);
+        // The rest of the result must land — this is what keeps the footer
+        // on real data instead of the placeholder.
+        assert_eq!(status.profile_id.as_deref(), Some("ada"));
+        assert_eq!(status.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(
+            status
+                .runtime_policy_stamp
+                .as_ref()
+                .and_then(|stamp| stamp.profile_id.as_deref()),
+            Some("ada")
+        );
+    }
+
+    #[test]
+    fn session_status_resolved_model_object_still_decodes() {
+        let status = expect_session_status(decode_status_read_frame(server_status_read_result(
+            Some(json!({
+                "model": "deepseek-v4-pro",
+                "provider": "deepseek",
+                "selected": true
+            })),
+        )));
+
+        let model = status.model.expect("resolved model decodes to Some");
+        assert_eq!(model.model, "deepseek-v4-pro");
+        assert_eq!(model.provider, "deepseek");
+        assert!(model.selected);
+    }
+
+    #[test]
+    fn session_status_null_model_decodes_as_no_model() {
+        let status = expect_session_status(decode_status_read_frame(server_status_read_result(
+            Some(Value::Null),
+        )));
+        assert_eq!(status.model, None);
+        assert_eq!(status.profile_id.as_deref(), Some("ada"));
+    }
+
+    #[test]
+    fn session_status_missing_model_key_decodes_as_no_model() {
+        let status =
+            expect_session_status(decode_status_read_frame(server_status_read_result(None)));
+        assert_eq!(status.model, None);
+        assert_eq!(status.profile_id.as_deref(), Some("ada"));
+    }
+
+    /// Tolerance is ONLY for the no-model shapes. A model object whose
+    /// members are present but wrongly typed is a real protocol error and
+    /// must keep surfacing `invalid_result` — the deserializer must not
+    /// silently swallow it as `None`.
+    #[test]
+    fn session_status_malformed_model_object_still_reports_invalid_result() {
+        let event = decode_status_read_frame(server_status_read_result(Some(json!({
+            "model": 42,
+            "provider": "deepseek",
+            "selected": true
+        }))));
+
+        let ClientEvent::App(event) = event else {
+            panic!("expected app error event, got {event:?}");
+        };
+        let AppUiEvent::Error(error) = *event else {
+            panic!("expected invalid_result error, got {event:?}");
+        };
+        assert_eq!(error.code, "invalid_result");
+    }
+
     #[test]
     fn protocol_readonly_policy_allows_read_style_and_blocks_mutations() {
         let session_id = SessionKey("local:test".into());
