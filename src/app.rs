@@ -5822,6 +5822,7 @@ fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'st
                 palette.muted(),
             ));
         }
+        push_compact_metadata_spans(&mut spans, palette, item);
         return spans;
     }
 
