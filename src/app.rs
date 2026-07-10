@@ -3250,7 +3250,7 @@ fn push_turn_flow(
     // verbose "thinking" text. The deltas still accumulate in `live_reasoning`
     // (so a future /thinking toggle can reveal them and commit_live_reply can
     // hand them to the message's reasoning_content); we only surface a single
-    // dimmed `· thinking…` indicator, and ONLY while the model is still
+    // dimmed swimming-octopus indicator, and ONLY while the model is still
     // reasoning — once the answer has started streaming (`live_reply.text` has
     // non-empty content for the active turn) we drop the indicator too.
     if let Some((session_id, turn_id)) = app.active_turn()
@@ -3263,7 +3263,7 @@ fn push_turn_flow(
             .as_ref()
             .is_none_or(|live_reply| live_reply.text.trim().is_empty())
     {
-        push_thinking_indicator(lines, palette);
+        push_thinking_indicator(lines, palette, width);
     }
 
     if let Some(live_reply) = &session.live_reply {
@@ -3338,27 +3338,59 @@ fn push_user_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, con
     }
 }
 
-/// The terse codex-style "thinking" indicator shown in place of the verbose
-/// live reasoning text. Reuses the `reasoning` role styling (`· ` prefix +
-/// surface background) so it reads as a dimmed continuation of that lane.
-const THINKING_INDICATOR_TEXT: &str = "thinking…";
-
-/// A horizontal ASCII octopus that "swims" during the thinking phase: a `[⇔]`
-/// head flanked by the tilted-line glyphs `彡`/`ミ` (one arm per side). The arms
-/// wave by swapping direction each step — `彡[⇔]ミ ⇔ ミ[⇔]彡` — a paddle stroke.
+/// A horizontal ASCII octopus that "swims" across the thinking line: a `[⇔]`
+/// head flanked by the tilted-line glyphs `彡`/`ミ` (one arm per side). The two
+/// frames now encode travel *direction* rather than an in-place paddle — the
+/// octopus ping-pongs left↔right (see [`octopus_swim`]) and faces the way it
+/// moves: `彡[⇔]ミ` swimming right, `ミ[⇔]彡` swimming left.
 ///
 ///   `彡[⇔]ミ`   `ミ[⇔]彡`
 const OCTOPUS_SWIM_FRAMES: [&str; 2] = ["彡[⇔]ミ", "ミ[⇔]彡"];
 
-/// Current swimming-octopus frame. Rides the same process clock as
-/// [`spinner_frame`]; flaps roughly every 280ms so the arms wave at a calm,
-/// legible pace rather than strobing.
-fn octopus_swim_frame() -> &'static str {
-    use std::sync::OnceLock;
-    use std::time::Instant;
-    static START: OnceLock<Instant> = OnceLock::new();
-    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
-    OCTOPUS_SWIM_FRAMES[(elapsed / 280) as usize % OCTOPUS_SWIM_FRAMES.len()]
+/// Milliseconds the octopus spends per display column. ~150ms/col reads as a
+/// calm swim (a full left→right→left sweep is a couple of seconds on a typical
+/// terminal) rather than a strobe.
+const OCTOPUS_SWIM_STEP_MS: u128 = 150;
+
+/// Cap on the ping-pong travel so the sweep stays legible on very wide
+/// terminals — a full-width dash would read as teleporting, not swimming.
+const OCTOPUS_SWIM_MAX_OFFSET: usize = 28;
+
+/// Pure elapsed→(leading-space offset, frame) mapping for the swimming octopus.
+///
+/// The octopus travels horizontally as a triangle wave: the leading-space
+/// offset climbs `0 → MAX` (swimming right, `彡[⇔]ミ`), then falls `MAX → 0`
+/// (swimming left, `ミ[⇔]彡`), forever. `MAX` keeps the octopus plus a one-column
+/// right margin inside `wrap_width`, measured in display *columns* via
+/// `unicode-width` (the CJK arm glyphs are double-width), and is capped at
+/// [`OCTOPUS_SWIM_MAX_OFFSET`]. On a terminal too narrow to travel, `MAX` is 0
+/// and the octopus sits still (facing right) rather than panicking. All
+/// arithmetic is overflow-safe: `offset` is bounded by `MAX`, so the caller's
+/// `" ".repeat(offset)` can never run away.
+fn octopus_swim(elapsed_ms: u128, wrap_width: usize) -> (usize, &'static str) {
+    let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
+    let max = wrap_width
+        .saturating_sub(octopus_width + 1)
+        .min(OCTOPUS_SWIM_MAX_OFFSET);
+    if max == 0 {
+        return (0, OCTOPUS_SWIM_FRAMES[0]);
+    }
+    let cycle = 2 * max;
+    // Reduce modulo in u128 first so a huge uptime can never truncate badly.
+    let pos = ((elapsed_ms / OCTOPUS_SWIM_STEP_MS) % cycle as u128) as usize;
+    let (offset, moving_right) = if pos <= max {
+        (pos, true) // rising: swim right →
+    } else {
+        (cycle - pos, false) // falling: swim left ←
+    };
+    // Direction↔frame mapping — a single flippable line if the facing should
+    // ever be swapped.
+    let frame = if moving_right {
+        OCTOPUS_SWIM_FRAMES[0]
+    } else {
+        OCTOPUS_SWIM_FRAMES[1]
+    };
+    (offset, frame)
 }
 
 /// `▰▰▰▰▱▱▱▱` fixed-width fraction bar for the compaction/context UX.
@@ -3406,10 +3438,22 @@ fn push_live_compaction_block(
     lines.push(Line::from(""));
 }
 
-/// Push a single dimmed `· thinking…` line. Mirrors the `reasoning` role's
-/// prefix/background from [`push_message_block`] / [`chat_message_bg`] but
-/// renders one fixed line instead of the model's full reasoning prose.
-fn push_thinking_indicator(lines: &mut Vec<Line<'static>>, palette: Palette) {
+/// Push a single dimmed line carrying only the swimming octopus — no text. The
+/// octopus alone signals the thinking phase, traveling left↔right across the
+/// line (see [`octopus_swim`]). Mirrors the `reasoning` role's background from
+/// [`push_message_block`] / [`chat_message_bg`] so it reads as a dimmed
+/// continuation of that lane. `wrap_width` bounds the travel so the octopus
+/// never runs past the transcript's wrap edge.
+fn push_thinking_indicator(lines: &mut Vec<Line<'static>>, palette: Palette, wrap_width: usize) {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    // Same process-lifetime clock pattern as the spinner. The event loop
+    // redraws ~every 120ms during an active turn, so the elapsed-driven travel
+    // animates smoothly.
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    let (offset, frame) = octopus_swim(elapsed, wrap_width);
+
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
@@ -3418,7 +3462,7 @@ fn push_thinking_indicator(lines: &mut Vec<Line<'static>>, palette: Palette) {
     let style = palette.muted().add_modifier(Modifier::DIM).bg(bg);
     lines.push(chat_line(
         vec![Span::styled(
-            format!("{} {THINKING_INDICATOR_TEXT}", octopus_swim_frame()),
+            format!("{}{}", " ".repeat(offset), frame),
             style,
         )],
         Some(bg),
@@ -8653,10 +8697,97 @@ mod tests {
             assert_eq!(left.chars().count(), 1, "one arm glyph left: {frame}");
             assert_eq!(right.chars().count(), 1, "one arm glyph right: {frame}");
         }
-        // The arms swap direction each step: 彡[⇔]ミ ⇔ ミ[⇔]彡 — the wave.
+        // The two frames face opposite ways — now the travel *direction*:
+        // 彡[⇔]ミ swims right, ミ[⇔]彡 swims left.
         assert_eq!(OCTOPUS_SWIM_FRAMES[0], "彡[⇔]ミ");
         assert_eq!(OCTOPUS_SWIM_FRAMES[1], "ミ[⇔]彡");
-        assert!(OCTOPUS_SWIM_FRAMES.contains(&octopus_swim_frame()));
+    }
+
+    #[test]
+    fn octopus_swim_starts_at_origin_facing_right() {
+        // elapsed=0 → sitting at the left margin, swimming right.
+        let (offset, frame) = octopus_swim(0, 80);
+        assert_eq!(offset, 0, "starts flush-left");
+        assert_eq!(frame, "彡[⇔]ミ", "the first phase faces right");
+        assert_eq!(frame, OCTOPUS_SWIM_FRAMES[0]);
+    }
+
+    #[test]
+    fn octopus_swim_ping_pongs_a_clean_triangle_wave() {
+        // Sample one full period, one column-step at a time, and confirm the
+        // offset traces 0→MAX→0 (a triangle) while the frame faces the way it
+        // travels: right on the rise, left on the fall.
+        let wrap_width = 40usize;
+        let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
+        let max = wrap_width
+            .saturating_sub(octopus_width + 1)
+            .min(OCTOPUS_SWIM_MAX_OFFSET);
+        assert!(max > 0, "test needs a non-trivial sweep (got MAX={max})");
+
+        // The triangle we expect, built independently of the implementation:
+        // rise 0..=MAX, then fall MAX-1..=1 (the trough 0 opens the next period).
+        let mut expected = Vec::new();
+        expected.extend(0..=max); // rising, swimming right
+        expected.extend((1..max).rev()); // falling, swimming left
+        let cycle = expected.len();
+        assert_eq!(cycle, 2 * max, "one period spans 2·MAX column-steps");
+
+        for (step, &want_offset) in expected.iter().enumerate() {
+            let elapsed = (step as u128) * OCTOPUS_SWIM_STEP_MS;
+            let (offset, frame) = octopus_swim(elapsed, wrap_width);
+            assert_eq!(offset, want_offset, "offset at step {step}");
+            // Never overshoots the peak, never underflows below the margin.
+            assert!(
+                offset <= max,
+                "offset {offset} exceeded MAX {max} at {step}"
+            );
+            // Facing matches direction: rising (step<=max) → right, else left.
+            let want_frame = if step <= max {
+                OCTOPUS_SWIM_FRAMES[0]
+            } else {
+                OCTOPUS_SWIM_FRAMES[1]
+            };
+            assert_eq!(frame, want_frame, "facing at step {step}");
+        }
+
+        // The period repeats: step `cycle` lands back at the origin, facing right.
+        let (wrapped, frame) = octopus_swim((cycle as u128) * OCTOPUS_SWIM_STEP_MS, wrap_width);
+        assert_eq!(wrapped, 0, "period wraps back to the left margin");
+        assert_eq!(frame, OCTOPUS_SWIM_FRAMES[0]);
+    }
+
+    #[test]
+    fn octopus_swim_never_overflows_the_wrap_width() {
+        // The octopus (plus a one-column right margin) always stays inside the
+        // wrap boundary, across a long stretch of the animation, for a range of
+        // terminal widths — including the huge-terminal cap.
+        let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
+        for wrap_width in [octopus_width + 2, 20, 40, 80, 200, 1000] {
+            for step in 0..400u128 {
+                let (offset, _frame) = octopus_swim(step * OCTOPUS_SWIM_STEP_MS, wrap_width);
+                assert!(
+                    offset + octopus_width <= wrap_width,
+                    "octopus overflowed wrap_width={wrap_width}: offset={offset}",
+                );
+                assert!(
+                    offset <= OCTOPUS_SWIM_MAX_OFFSET,
+                    "offset {offset} exceeded the sweep cap at wrap_width={wrap_width}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn octopus_swim_tiny_terminal_sits_still_without_panicking() {
+        // A terminal too narrow to travel: MAX collapses to 0, so the octopus
+        // holds the left margin (facing right) instead of panicking or wrapping.
+        let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
+        for wrap_width in [0usize, 1, 2, octopus_width, octopus_width + 1] {
+            // A large elapsed value also exercises the u128→usize math safely.
+            let (offset, frame) = octopus_swim(9_999_999_999, wrap_width);
+            assert_eq!(offset, 0, "no travel at wrap_width={wrap_width}");
+            assert_eq!(frame, OCTOPUS_SWIM_FRAMES[0], "faces right when still");
+        }
     }
 
     #[test]
@@ -15438,10 +15569,10 @@ mod tests {
     }
 
     #[test]
-    fn live_reasoning_before_answer_renders_terse_thinking_not_verbose_text() {
+    fn live_reasoning_before_answer_renders_swimming_octopus_without_text() {
         // Codex-style live render: with non-empty live_reasoning and NO answer
-        // streamed yet, push_turn_flow surfaces a single dimmed `· thinking…`
-        // indicator and NEVER the verbose reasoning prose.
+        // streamed yet, push_turn_flow surfaces a single dimmed swimming-octopus
+        // indicator (no "thinking" label) and NEVER the verbose reasoning prose.
         const VERBOSE: &str =
             "Let me carefully reason step by step about the user's request in great detail";
         // Empty live_reply.text => the answer has not started streaming yet.
@@ -15461,14 +15592,15 @@ mod tests {
         let rendered = lines_text(&lines);
 
         assert!(
-            rendered.contains(THINKING_INDICATOR_TEXT),
-            "live render should show the terse `thinking` indicator; got: {rendered:?}"
-        );
-        assert!(
             OCTOPUS_SWIM_FRAMES
                 .iter()
                 .any(|frame| rendered.contains(frame)),
-            "terse indicator should show the swimming octopus; got: {rendered:?}"
+            "the indicator should show the swimming octopus; got: {rendered:?}"
+        );
+        // The octopus alone signals the thinking phase — no "thinking" label.
+        assert!(
+            !rendered.to_lowercase().contains("thinking"),
+            "the indicator must carry no `thinking` text; got: {rendered:?}"
         );
         assert!(
             !rendered.contains(VERBOSE),
@@ -15498,8 +15630,10 @@ mod tests {
         let rendered = lines_text(&lines);
 
         assert!(
-            !rendered.contains(THINKING_INDICATOR_TEXT),
-            "thinking indicator must drop once the answer streams; got: {rendered:?}"
+            !OCTOPUS_SWIM_FRAMES
+                .iter()
+                .any(|frame| rendered.contains(frame)),
+            "the swimming-octopus indicator must drop once the answer streams; got: {rendered:?}"
         );
         assert!(
             !rendered.contains(VERBOSE),
