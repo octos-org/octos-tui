@@ -3796,7 +3796,18 @@ impl Store {
                 // dispatch outcome to its backend command here.
                 self.dispatch_local_action(action, None).into_command()
             }
-            MenuAction::SendAppUi(command) => Some(*command),
+            MenuAction::SendAppUi(mut command) => {
+                // A select without an explicit session targets the ACTIVE
+                // session: stamp it on the request itself so the transport's
+                // request-id correlation always carries attribution (the
+                // store drops unattributed results rather than guessing).
+                if let AppUiCommand::ProfileLlmSelect(params) = command.as_mut() {
+                    if params.session_id.is_none() {
+                        params.session_id = self.active_session().map(|session| session.id.clone());
+                    }
+                }
+                Some(*command)
+            }
             MenuAction::SubmitPrompt(prompt) => {
                 self.start_prompt_turn(prompt, t!("status.queued_menu_prompt").into_owned())
             }
@@ -17142,6 +17153,31 @@ mod tests {
                 .iter()
                 .any(|model| model.model == "deepseek-chat" && model.selected),
             "an unattributed echo must not overwrite the selection"
+        );
+    }
+
+    /// A select dispatched WITHOUT an explicit session is stamped with the
+    /// active session at dispatch — attribution is total, and still flows
+    /// through the transport's request-id correlation.
+    #[test]
+    fn dispatch_stamps_the_active_session_onto_unattributed_selects() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let command = store.dispatch_menu_action(crate::menu::MenuAction::send_appui(
+            AppUiCommand::ProfileLlmSelect(crate::model::ProfileLlmSelectParams {
+                profile_id: Some("dev".into()),
+                session_id: None,
+                family_id: "deepseek".into(),
+                model_id: "deepseek-chat".into(),
+                route_id: "official".into(),
+            }),
+        ));
+        let Some(AppUiCommand::ProfileLlmSelect(params)) = command else {
+            panic!("expected the select command back, got {command:?}");
+        };
+        assert_eq!(
+            params.session_id,
+            Some(SessionKey("local:a".into())),
+            "the active session is stamped at dispatch"
         );
     }
 
