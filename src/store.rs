@@ -7497,6 +7497,21 @@ impl Store {
                 ));
                 None
             }
+            UiNotification::PlanUpdated(event) => {
+                let count = event.plan.items.len();
+                let done = event
+                    .plan
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        item.status == octos_core::ui_protocol::PlanItemStatus::Completed
+                    })
+                    .count();
+                self.state
+                    .set_session_plan(&event.session_id, Some(event.plan.clone()));
+                self.state.status = format!("Plan updated: {done}/{count} done");
+                None
+            }
             UiNotification::SessionGoalUpdated(event) => {
                 let objective = event.goal.objective.clone();
                 let status_label = event.goal.status.clone();

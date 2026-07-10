@@ -521,6 +521,9 @@ pub struct SessionAutonomyState {
     pub goal: Option<octos_core::ui_protocol::UiGoalRecord>,
     pub goal_transition_actor: Option<String>,
     pub loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
+    /// Latest model-authored plan/todo checklist (`plan/updated`). `None` until
+    /// the agent calls `update_plan` this session.
+    pub plan: Option<octos_core::ui_protocol::UiPlanRecord>,
 }
 
 impl SessionAutonomyState {
@@ -533,6 +536,7 @@ impl SessionAutonomyState {
             goal: None,
             goal_transition_actor: None,
             loops: Vec::new(),
+            plan: None,
         }
     }
 }
@@ -5421,6 +5425,16 @@ impl AppState {
         let entry = self.session_autonomy_mut(session_id);
         entry.goal = goal;
         entry.goal_transition_actor = transition_actor;
+    }
+
+    /// Replace the cached plan/todo checklist for a session. The `update_plan`
+    /// tool sends the full ordered list each call, so this is a wholesale swap.
+    pub fn set_session_plan(
+        &mut self,
+        session_id: &SessionKey,
+        plan: Option<octos_core::ui_protocol::UiPlanRecord>,
+    ) {
+        self.session_autonomy_mut(session_id).plan = plan;
     }
 
     /// Replace the cached output tail for an agent. The backend is

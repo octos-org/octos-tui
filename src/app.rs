@@ -6623,6 +6623,21 @@ fn active_session_autonomy(app: &AppState) -> Option<&SessionAutonomyState> {
 
 /// Number of rows the sticky autonomy indicator needs: 0 when both goal
 /// and loops are absent, 1 when only one is present, 2 when both are.
+/// Max plan items rendered in the sticky panel before collapsing to a
+/// `… +N more` summary line, so a long checklist can't dominate the screen.
+const PLAN_PANEL_MAX_ITEMS: usize = 8;
+
+/// Rows the plan checklist adds to the sticky panel: a header line plus one
+/// row per shown item (capped), plus a `+N more` line when truncated.
+fn plan_panel_rows(plan: &octos_core::ui_protocol::UiPlanRecord) -> u16 {
+    if plan.items.is_empty() {
+        return 0;
+    }
+    let shown = plan.items.len().min(PLAN_PANEL_MAX_ITEMS);
+    let overflow = usize::from(plan.items.len() > PLAN_PANEL_MAX_ITEMS);
+    (1 + shown + overflow) as u16
+}
+
 fn autonomy_indicator_height(app: &AppState) -> u16 {
     match active_session_autonomy(app) {
         Some(state) => {
@@ -6632,6 +6647,9 @@ fn autonomy_indicator_height(app: &AppState) -> u16 {
             }
             if !state.loops.is_empty() {
                 rows += 1;
+            }
+            if let Some(plan) = state.plan.as_ref() {
+                rows += plan_panel_rows(plan);
             }
             rows
         }
@@ -6758,6 +6776,99 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
             spans.pop();
         }
         lines.push(Line::from(spans));
+    }
+    if let Some(plan) = state.plan.as_ref() {
+        lines.extend(plan_indicator_lines(plan, palette));
+    }
+    lines
+}
+
+/// Render the model-authored plan/todo checklist as a header line
+/// (`✶ <activity> (done/total)`) plus a `⎿`-anchored tree of items with a
+/// per-status glyph. Mirrors the sub-agent task-group tree visual.
+fn plan_indicator_lines(
+    plan: &octos_core::ui_protocol::UiPlanRecord,
+    palette: Palette,
+) -> Vec<Line<'static>> {
+    use octos_core::ui_protocol::PlanItemStatus;
+    if plan.items.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let total = plan.items.len();
+    let done = plan
+        .items
+        .iter()
+        .filter(|item| item.status == PlanItemStatus::Completed)
+        .count();
+    // Header: prefer the model's activity label, else the in-progress item,
+    // else a generic fallback.
+    let title = plan
+        .title
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| {
+            plan.items
+                .iter()
+                .find(|item| item.status == PlanItemStatus::InProgress)
+                .map(|item| item.title.clone())
+        })
+        .unwrap_or_else(|| "Plan".to_string());
+    lines.push(Line::from(vec![
+        Span::styled(
+            "✶ ",
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+                .bg(palette.surface),
+        ),
+        Span::styled(title, palette.title().bg(palette.surface)),
+        Span::styled(
+            format!("  ({done}/{total})"),
+            palette.muted().bg(palette.surface),
+        ),
+    ]));
+    for (idx, item) in plan.items.iter().take(PLAN_PANEL_MAX_ITEMS).enumerate() {
+        let (glyph, glyph_style) = match item.status {
+            PlanItemStatus::Completed => (
+                "✔",
+                Style::default().fg(palette.success).bg(palette.surface),
+            ),
+            PlanItemStatus::InProgress => (
+                "▸",
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(palette.surface),
+            ),
+            PlanItemStatus::Pending => ("◼", palette.muted().bg(palette.surface)),
+        };
+        // `⎿` anchors the first child; the rest align under the glyph.
+        let prefix = if idx == 0 { "  ⎿  " } else { "     " };
+        let mut spans = vec![
+            Span::styled(prefix, palette.muted().bg(palette.surface)),
+            Span::styled(format!("{glyph} "), glyph_style),
+        ];
+        if let Some(priority) = item.priority.as_ref().filter(|p| !p.trim().is_empty()) {
+            spans.push(Span::styled(
+                format!("{priority} "),
+                palette.muted().bg(palette.surface),
+            ));
+        }
+        let item_style = if item.status == PlanItemStatus::Completed {
+            palette.muted().bg(palette.surface)
+        } else {
+            palette.text().bg(palette.surface)
+        };
+        spans.push(Span::styled(item.title.clone(), item_style));
+        lines.push(Line::from(spans));
+    }
+    if plan.items.len() > PLAN_PANEL_MAX_ITEMS {
+        let more = plan.items.len() - PLAN_PANEL_MAX_ITEMS;
+        lines.push(Line::from(Span::styled(
+            format!("     … +{more} more"),
+            palette.muted().bg(palette.surface),
+        )));
     }
     lines
 }
@@ -13603,6 +13714,82 @@ mod tests {
             !text.contains("Loops:"),
             "idle render must not surface a loop label",
         );
+    }
+
+    #[test]
+    fn plan_indicator_renders_checklist_tree_with_glyphs() {
+        use octos_core::ui_protocol::{PlanItemStatus, UiPlanItem, UiPlanRecord};
+        let mut app = autonomy_app_state();
+        let session_id = SessionKey("local:test".into());
+        app.set_session_plan(
+            &session_id,
+            Some(UiPlanRecord {
+                title: Some("Building memory panel".into()),
+                updated_at_ms: 0,
+                items: vec![
+                    UiPlanItem {
+                        id: "1".into(),
+                        title: "PWA manifest".into(),
+                        status: PlanItemStatus::Completed,
+                        priority: None,
+                    },
+                    UiPlanItem {
+                        id: "2".into(),
+                        title: "memory panel".into(),
+                        status: PlanItemStatus::InProgress,
+                        priority: Some("P3".into()),
+                    },
+                    UiPlanItem {
+                        id: "3".into(),
+                        title: "cron toggle".into(),
+                        status: PlanItemStatus::Pending,
+                        priority: None,
+                    },
+                ],
+            }),
+        );
+
+        // header + 3 item rows, no goal/loops.
+        assert_eq!(autonomy_indicator_height(&app), 4);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        assert_eq!(lines.len(), 4);
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Building memory panel"),
+            "header activity title"
+        );
+        assert!(text.contains("(1/3)"), "done/total counter");
+        assert!(text.contains('⎿'), "tree anchor glyph");
+        assert!(text.contains('✔'), "completed glyph");
+        assert!(text.contains('◼'), "pending glyph");
+        assert!(text.contains("PWA manifest"));
+        assert!(text.contains("P3"), "priority chip on the in-progress item");
+    }
+
+    #[test]
+    fn plan_indicator_truncates_long_checklist() {
+        use octos_core::ui_protocol::{PlanItemStatus, UiPlanItem, UiPlanRecord};
+        let mut app = autonomy_app_state();
+        let items: Vec<_> = (0..12)
+            .map(|i| UiPlanItem {
+                id: i.to_string(),
+                title: format!("item {i}"),
+                status: PlanItemStatus::Pending,
+                priority: None,
+            })
+            .collect();
+        app.set_session_plan(
+            &SessionKey("local:test".into()),
+            Some(UiPlanRecord {
+                title: Some("big plan".into()),
+                updated_at_ms: 0,
+                items,
+            }),
+        );
+        // header + 8 shown + 1 overflow line.
+        assert_eq!(autonomy_indicator_height(&app), 10);
+        assert!(rendered_text(&app).contains("+4 more"));
     }
 
     #[test]
