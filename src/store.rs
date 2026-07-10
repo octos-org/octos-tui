@@ -1797,6 +1797,11 @@ impl Store {
         } else {
             t!("thinking.display_off").to_string()
         };
+        // Rebuild the open /thinking menu so the display row's label + marker
+        // flip on Enter — mirrors dispatch_set_thinking_level. Without this
+        // the row only updates on the next rebuild (e.g. when the cursor
+        // moves), which reads as a dead toggle.
+        self.refresh_active_menu();
         None
     }
 
@@ -10097,6 +10102,39 @@ mod tests {
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
         }
+    }
+
+    #[test]
+    fn thinking_display_toggle_rebuilds_menu_label_in_place() {
+        // Regression: toggling the /thinking display row must flip its label
+        // on Enter, not only when the cursor later moves (which triggers an
+        // incidental rebuild). The handler must refresh the open menu.
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_THINKING));
+
+        let row_label = |store: &Store| -> String {
+            match store.state.active_menu.as_ref() {
+                Some(MenuBuildResult::Ready(spec)) => spec
+                    .items
+                    .iter()
+                    .find(|item| item.id == "reasoning_display")
+                    .map(|item| item.label.clone())
+                    .expect("display row present"),
+                other => panic!("thinking menu not ready: {other:?}"),
+            }
+        };
+        let before = row_label(&store);
+        assert!(
+            before.to_lowercase().contains("off"),
+            "starts off: {before}"
+        );
+
+        store.dispatch_local_action(LocalAction::ToggleReasoningDisplay, None);
+        let after = row_label(&store);
+        assert!(
+            after.to_lowercase().contains("on") && !after.eq_ignore_ascii_case(&before),
+            "the open menu row must flip to on immediately: {after}"
+        );
     }
 
     #[test]
