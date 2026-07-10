@@ -4766,40 +4766,192 @@ const RAW_ARG_FALLBACK_COLS: usize = 512;
 
 /// A human-readable one-line invocation for a tool activity, preferring a real
 /// command string over the raw serialized arguments (which used to leak into
-/// the card as `{"cmd":…}`). Order: an explicit `detail`, then a shell-like
-/// tool's command string, then a compact `key=value` of the first meaningful
-/// object field, then a bounded raw-JSON fallback.
+/// the card as `{"cmd":…}`). Order: an explicit `detail` (run through the
+/// args-echo humanizer — the server path fills it with the protocol #1606
+/// `arguments_preview` JSON echo), then a shell-like tool's command string,
+/// then a compact `key=value` of the first meaningful object field, then a
+/// bounded raw-JSON fallback.
+///
+/// DISPLAY-ONLY: `ActivityItem.detail` itself is never rewritten — the
+/// envelope thread marker stored there is load-bearing for the turn-less
+/// reconcile ([`AppState::reconcile_envelope_thread_running_activity`]).
 fn tool_invocation_text(item: &ActivityItem) -> Option<String> {
     if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
-        return Some(detail.to_string());
+        return Some(humanize_args_echo(detail, &item.title));
     }
     let arguments = item.arguments.as_ref()?;
+    // The envelope lane parks the same serialized args echo in `arguments` as
+    // a JSON String (its `detail` carries the thread marker instead): treat
+    // the inner text exactly like a detail echo — re-serializing it would
+    // render `"{\"cmd\":…`.
+    if let Some(echo) = arguments.as_str() {
+        let echo = echo.trim();
+        if !echo.is_empty() {
+            return Some(humanize_args_echo(echo, &item.title));
+        }
+    }
     // Shell-like tools carry their command under `command`/`cmd`; surface that
     // (untruncated — callers like `shell_action_label` match on the full text,
     // and the row builder applies the display-width budget) instead of the JSON
     // envelope.
     if is_shell_like_tool(&item.title) {
-        if let Some(command) = arguments
-            .get("command")
-            .or_else(|| arguments.get("cmd"))
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|command| !command.is_empty())
-        {
-            return Some(command.to_string());
+        if let Some(command) = shell_command_from_args(arguments) {
+            return Some(command);
         }
     }
     // Other tools with an object payload: show a compact `key=value` of the
     // first meaningful string/number field rather than the whole JSON blob.
     if let Some(map) = arguments.as_object() {
         if let Some(rendered) = first_meaningful_arg(map) {
-            return Some(rendered);
+            return Some(single_line_invocation(&rendered));
         }
     }
     // Last resort: bounded raw JSON (never an unbounded dump).
     serde_json::to_string(arguments)
         .ok()
         .map(|json| truncate_to_display_width(&json, RAW_ARG_FALLBACK_COLS))
+}
+
+/// The `command`/`cmd` string of a shell-like tool's args object, flattened to
+/// one line. `None` when the payload has no non-empty command string.
+fn shell_command_from_args(arguments: &serde_json::Value) -> Option<String> {
+    arguments
+        .get("command")
+        .or_else(|| arguments.get("cmd"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(single_line_invocation)
+}
+
+/// Humanize a serialized arguments echo for the one-line tool row. The server
+/// caps the echo (~700 bytes, protocol #1606), so a JSON object echo often
+/// arrives CUT mid-string — strict parsing gets the well-formed case, a
+/// lenient scan covers the truncated one, and a cleanup pass guarantees the
+/// floor: no raw `{"key":` prefix, no literal `\n`/`\t` escape leaking into
+/// the row. Non-JSON text (bang echoes, thread markers, progress prose)
+/// passes through with only the escape/one-line normalization.
+fn humanize_args_echo(echo: &str, title: &str) -> String {
+    let trimmed = echo.trim();
+    if trimmed.starts_with('{') {
+        // Complete echo: strict parse, then the same rendering the
+        // object-arguments path uses (command string / first `key=value`).
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            let value = serde_json::Value::Object(map);
+            if is_shell_like_tool(title) {
+                if let Some(command) = shell_command_from_args(&value) {
+                    return command;
+                }
+            }
+            if let Some(map) = value.as_object() {
+                if let Some(rendered) = first_meaningful_arg(map) {
+                    return single_line_invocation(&rendered);
+                }
+            }
+        } else if is_shell_like_tool(title) {
+            // Truncated echo (strict parse fails): scan for the command key
+            // and decode the string value up to the cut.
+            if let Some(command) = lenient_echo_command(trimmed) {
+                return command;
+            }
+        }
+        // Floor for anything else `{`-shaped (truncated non-shell echo, or an
+        // object with no scalar field): strip the JSON framing and decode the
+        // common escapes so the row never shows `{"key":` or a literal `\n`.
+        return single_line_invocation(&scrub_json_echo_fragment(trimmed));
+    }
+    // Not a JSON object echo. The producer's `key: value` preview format still
+    // JSON-encodes string values, so decode the common escapes; rows are
+    // one-line, so an escaped newline becomes a space. Plain text without
+    // backslashes passes through unchanged.
+    single_line_invocation(&decode_json_string_escapes(trimmed))
+}
+
+/// Lenient `command`/`cmd` extraction from a truncated JSON object echo that
+/// `serde_json` cannot parse (the ~700-byte cap cuts mid-string): find the
+/// key, then decode its string value up to the closing unescaped quote or the
+/// end of the input. Char-boundary safe (operates on `char`s, and the marker
+/// find can only land on ASCII boundaries).
+fn lenient_echo_command(echo: &str) -> Option<String> {
+    for key in ["\"command\"", "\"cmd\""] {
+        let Some(pos) = echo.find(key) else {
+            continue;
+        };
+        let rest = echo[pos + key.len()..].trim_start();
+        let Some(rest) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let Some(body) = rest.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let command = single_line_invocation(&decode_json_string_body(body, true));
+        if !command.is_empty() {
+            return Some(command);
+        }
+    }
+    None
+}
+
+/// Floor rendering for a truncated JSON echo with no better extraction: drop
+/// the leading `{`/`"` framing and decode the common escapes. The result is
+/// not pretty, but it never shows a raw `{"key":` prefix or a literal `\n`.
+fn scrub_json_echo_fragment(echo: &str) -> String {
+    let body = echo.strip_prefix('{').unwrap_or(echo).trim_start();
+    let body = body.strip_prefix('"').unwrap_or(body);
+    decode_json_string_escapes(body)
+}
+
+/// Decode the common JSON string escapes for one-line display: `\"`→`"`,
+/// `\\`→`\`, `\n`/`\t`/`\r`→space. Unknown escapes pass through verbatim and a
+/// dangling trailing backslash (left by the echo's byte cap) is dropped.
+fn decode_json_string_escapes(text: &str) -> String {
+    decode_json_string_body(text, false)
+}
+
+/// Shared escape decoder. With `stop_at_quote`, decoding ends at the first
+/// unescaped `"` (the value's closing quote in a JSON echo — trailing sibling
+/// keys are dropped); otherwise the whole input is decoded.
+fn decode_json_string_body(text: &str, stop_at_quote: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if stop_at_quote => break,
+            '\\' => match chars.next() {
+                Some('n' | 't' | 'r') => out.push(' '),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                // Dangling backslash at the truncation cut — drop it.
+                None => {}
+            },
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Rows are one-line: flatten real newlines/tabs in an invocation to spaces
+/// (the row is width-truncated by the builder; multi-line content belongs to
+/// the `│` output-preview lines, which are NOT run through this).
+fn single_line_invocation(text: &str) -> String {
+    if text.chars().any(|ch| matches!(ch, '\n' | '\r' | '\t')) {
+        text.chars()
+            .map(|ch| match ch {
+                '\n' | '\r' | '\t' => ' ',
+                other => other,
+            })
+            .collect::<String>()
+            .trim()
+            .to_string()
+    } else {
+        text.trim().to_string()
+    }
 }
 
 /// Case-insensitive check for the shell family whose invocation is a command
@@ -11846,6 +11998,214 @@ mod tests {
             !text.contains("call_01_UVIa9EBA331xAfxbPFPM4446"),
             "the call-id must not be displayed: {text:?}"
         );
+    }
+
+    fn agent_task_child_text(item: &ActivityItem, wrap_width: usize) -> String {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        push_agent_task_child(
+            &mut lines,
+            Palette::for_theme(ThemeName::Slate),
+            item,
+            true,
+            false,
+            wrap_width,
+        );
+        lines_text(&lines)
+    }
+
+    /// Live-capture regression (#273 follow-up): on the real server path the
+    /// invocation comes from `detail` — the protocol #1606 `arguments_preview`
+    /// echo, a JSON serialization of the tool args capped at ~700 bytes, so it
+    /// often arrives CUT mid-string (no closing quote/brace, unparseable by
+    /// strict serde). The shell row must still extract `$ <command>`; the raw
+    /// `{"cmd":…` framing must never render.
+    #[test]
+    fn agent_task_bash_row_extracts_command_from_truncated_detail_echo() {
+        let item = ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+            .with_detail(
+                r#"{"cmd":"grep -n '<img' /Users/yuechen/dev/2026-world-cup/client/src/pages/HomePage.tsx /Users/yuechen/dev/2026-world-cup/client/s"#,
+            )
+            .with_tool_call("call_01_ABCDEFGHIJKLMNOP")
+            .with_success(true)
+            .with_duration_ms(33);
+        let text = agent_task_child_text(&item, 120);
+        assert!(
+            text.contains("$ grep -n '<img'"),
+            "truncated echo must still yield the command: {text:?}"
+        );
+        assert!(
+            !text.contains("{\"cmd\""),
+            "raw JSON echo must never render: {text:?}"
+        );
+    }
+
+    /// A complete (untruncated) args echo in `detail` parses strictly and the
+    /// shell row shows the command alone — sibling keys like `timeout` are
+    /// noise the raw echo used to drag in.
+    #[test]
+    fn agent_task_bash_row_extracts_command_from_complete_detail_echo() {
+        let item = ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+            .with_detail(r#"{"cmd":"echo hi","timeout":5}"#)
+            .with_success(true)
+            .with_duration_ms(21);
+        let text = agent_task_child_text(&item, 120);
+        assert!(
+            text.contains("$ echo hi"),
+            "complete echo must yield the command: {text:?}"
+        );
+        assert!(
+            !text.contains("{\"cmd\"") && !text.contains("timeout"),
+            "echo framing and sibling keys must not render: {text:?}"
+        );
+    }
+
+    /// The envelope live lane parks the same args echo in `arguments` as a
+    /// JSON String (detail carries the load-bearing thread marker there, and
+    /// after archival the echo can surface via `arguments`). A string-typed
+    /// `arguments` must be treated exactly like a detail echo — never
+    /// re-serialized into `"{\"cmd\":…`.
+    #[test]
+    fn agent_task_bash_row_extracts_command_from_string_arguments_echo() {
+        let item = ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+            .with_arguments(serde_json::Value::String(
+                r#"{"cmd":"echo hi","timeout":5}"#.into(),
+            ))
+            .with_success(true)
+            .with_duration_ms(21);
+        let text = agent_task_child_text(&item, 120);
+        assert!(
+            text.contains("$ echo hi"),
+            "string-arguments echo must yield the command: {text:?}"
+        );
+        assert!(
+            !text.contains("cmd") && !text.contains("\\\""),
+            "echo framing must not render (raw or re-escaped): {text:?}"
+        );
+    }
+
+    /// Non-shell tools: a complete args echo in `detail` renders the compact
+    /// `key=value` form (same as the object-arguments path), and JSON string
+    /// escapes (`\n`) never leak into the one-line row as literal two-char
+    /// sequences.
+    #[test]
+    fn agent_task_edit_row_compacts_complete_detail_echo() {
+        let item = ActivityItem::new(ActivityKind::Tool, "edit_file", "complete")
+            .with_detail(r#"{"path":"/a/App.tsx","new_string":"<Route/>\n  <Route/>"}"#)
+            .with_success(true)
+            .with_duration_ms(21);
+        let text = agent_task_child_text(&item, 120);
+        // serde_json maps iterate alphabetically (no preserve_order), so the
+        // first meaningful field is `new_string`; its REAL newline (decoded by
+        // the strict parse) must flatten to spaces in the one-line row.
+        assert!(
+            text.contains("new_string=<Route/>   <Route/>"),
+            "complete echo must compact to key=value: {text:?}"
+        );
+        assert!(
+            !text.contains("{\"path\""),
+            "raw JSON echo must never render: {text:?}"
+        );
+        assert!(
+            !text.contains("\\n"),
+            "literal backslash-n must never render: {text:?}"
+        );
+    }
+
+    /// Non-shell tools with a TRUNCATED echo (strict parse fails): the cleanup
+    /// pass must strip the `{"` framing and decode the common escapes — the
+    /// bar is NO raw `{"key":` prefix and NO literal `\n` in the row.
+    #[test]
+    fn agent_task_edit_row_scrubs_truncated_detail_echo() {
+        let item = ActivityItem::new(ActivityKind::Tool, "edit_file", "complete")
+            .with_detail(r#"{"path":"/a/App.tsx","new_string":"<Route/>\n  <Ro"#)
+            .with_success(true)
+            .with_duration_ms(21);
+        let text = agent_task_child_text(&item, 120);
+        assert!(
+            !text.contains("{\"path\""),
+            "raw JSON echo prefix must never render: {text:?}"
+        );
+        assert!(
+            !text.contains("\\n"),
+            "literal backslash-n must never render: {text:?}"
+        );
+        assert!(
+            text.contains("/a/App.tsx"),
+            "the echo's content should survive the scrub: {text:?}"
+        );
+    }
+
+    /// The producer's `key: value` preview format (object args rendered as
+    /// `path: "...", new_string: "..."`) JSON-encodes string values, so `\n`
+    /// escapes leak as literal two-char sequences — the display pass must
+    /// decode them (rows are one-line; an escaped newline becomes a space).
+    #[test]
+    fn agent_task_row_unescapes_key_value_echo_escapes() {
+        let item = ActivityItem::new(ActivityKind::Tool, "edit_file", "complete")
+            .with_detail(r#"path: "/a/App.tsx", new_string: "<Route/>\n  <Route/>""#)
+            .with_success(true)
+            .with_duration_ms(21);
+        let text = agent_task_child_text(&item, 120);
+        assert!(
+            !text.contains("\\n"),
+            "literal backslash-n must never render: {text:?}"
+        );
+        assert!(
+            text.contains("path: \"/a/App.tsx\""),
+            "non-JSON detail otherwise renders as-is: {text:?}"
+        );
+    }
+
+    /// Plain (non-JSON) details are untouched: a bang command echo and the
+    /// load-bearing envelope thread marker render verbatim.
+    #[test]
+    fn agent_task_row_keeps_plain_detail_verbatim() {
+        let bang = ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+            .with_detail("! echo hi")
+            .with_success(true);
+        let text = agent_task_child_text(&bang, 120);
+        assert!(
+            text.contains("! echo hi"),
+            "plain detail must render unchanged: {text:?}"
+        );
+
+        let marker = ActivityItem::new(ActivityKind::Tool, "shell", "running")
+            .with_detail(AppState::envelope_tool_detail_for_thread("th-123"));
+        let text = agent_task_child_text(&marker, 120);
+        assert!(
+            text.contains("thread th-123"),
+            "thread marker must render unchanged: {text:?}"
+        );
+    }
+
+    /// The lenient extractor never panics on multibyte content, respects a
+    /// closing quote when one survived the cut, decodes escapes, and drops a
+    /// dangling backslash left by the byte cap.
+    #[test]
+    fn lenient_echo_extraction_handles_multibyte_escapes_and_cuts() {
+        let cases: &[(&str, &str)] = &[
+            // CJK content cut with the producer's ellipsis, no closing quote.
+            (
+                "{\"cmd\":\"echo 日本語のコマンド…",
+                "echo 日本語のコマンド…",
+            ),
+            // Closing quote survived the cut: trailing sibling junk dropped.
+            (r#"{"cmd":"echo hi","timeo"#, "echo hi"),
+            // Escaped quote/backslash decode; escaped newline becomes space.
+            (r#"{"cmd":"echo \"hi\" \\ a\nb"#, "echo \"hi\" \\ a b"),
+            // Dangling backslash at the cut is dropped.
+            (r#"{"cmd":"echo hi\"#, "echo hi"),
+            // `command` key works too.
+            (r#"{"command":"ls -la","cwd":"/tmp"}"#, "ls -la"),
+        ];
+        for (echo, expected) in cases {
+            let item = ActivityItem::new(ActivityKind::Tool, "bash", "complete").with_detail(*echo);
+            let text = tool_invocation_text(&item).expect("invocation");
+            assert_eq!(
+                &text, expected,
+                "echo {echo:?} must extract {expected:?}, got {text:?}"
+            );
+        }
     }
 
     /// The recovery-suggestion row (a non-Tool `Warning` activity) also predated
