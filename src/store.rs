@@ -4232,10 +4232,6 @@ impl Store {
         self.state
             .pending_interrupt_restores
             .retain(|pending| pending.session_id != session_id);
-        // Drop the prior turn's last persona word so a new turn doesn't flash
-        // it before its own first `status_word` arrives (the harness falls
-        // back to the phase in that ≤8s gap).
-        self.state.session_status_word.remove(&session_id);
         let turn_id = octos_core::ui_protocol::TurnId::new();
         self.state.record_submitted_user_prompt(
             session_id.clone(),
@@ -5740,6 +5736,9 @@ impl Store {
                 // lose the committed status report's duration).
                 let turn_started_at = self.state.turn_started_at.clone();
                 let session_usage = self.state.session_usage.clone();
+                // Persona status words survive a reconnect replay so the harness
+                // gradient word doesn't blink back to "Working" mid-turn (codex P2).
+                let session_status_word = self.state.session_status_word.clone();
                 let session_context_window = self.state.session_context_window.clone();
                 // Local-only, and since the re-stage fix the gate holds the
                 // ONLY copy of a drained staged prompt (codex fold): a replay
@@ -5797,6 +5796,7 @@ impl Store {
                 state.live_reasoning = live_reasoning;
                 state.turn_started_at = turn_started_at;
                 state.session_usage = session_usage;
+                state.session_status_word = session_status_word;
                 state.session_context_window = session_context_window;
                 state.staged_submit_in_flight = staged_submit_in_flight;
                 // Settle gates the snapshot already reflects BEFORE the
@@ -7252,23 +7252,27 @@ impl Store {
 
         // A whimsical persona status word (`progress/updated{kind:"status_word"}`,
         // rotated server-side ~every 8s) drives the harness gradient line above
-        // the composer — keep the latest per session. A word with an empty
-        // label clears it (falls back to the phase).
+        // the composer. Store it keyed with the event's turn so the render can
+        // ignore a word left over from a prior turn (a stale word never shows).
+        // A word with an empty label clears it (falls back to the phase). An
+        // event without a turn_id can't be attributed, so it is skipped.
         if event.metadata.kind == octos_core::ui_protocol::progress_kinds::STATUS_WORD {
-            match event
-                .metadata
-                .label
-                .as_deref()
-                .map(str::trim)
-                .filter(|word| !word.is_empty())
-            {
-                Some(word) => {
-                    self.state
-                        .session_status_word
-                        .insert(event.session_id.clone(), word.to_owned());
-                }
-                None => {
-                    self.state.session_status_word.remove(&event.session_id);
+            if let Some(turn_id) = event.turn_id.clone() {
+                match event
+                    .metadata
+                    .label
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|word| !word.is_empty())
+                {
+                    Some(word) => {
+                        self.state
+                            .session_status_word
+                            .insert(event.session_id.clone(), (turn_id, word.to_owned()));
+                    }
+                    None => {
+                        self.state.session_status_word.remove(&event.session_id);
+                    }
                 }
             }
         }
@@ -23399,11 +23403,12 @@ mod tests {
         let mut store = store_with_empty_session();
         let session_id = store.state.sessions[0].id.clone();
 
+        let turn = TurnId::new();
         let mut meta = UiProgressMetadata::new(progress_kinds::STATUS_WORD);
         meta.label = Some("Conjuring".into());
         store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
             session_id.clone(),
-            Some(TurnId::new()),
+            Some(turn.clone()),
             meta,
         )));
         assert_eq!(
@@ -23411,28 +23416,30 @@ mod tests {
                 .state
                 .session_status_word
                 .get(&session_id)
-                .map(String::as_str),
-            Some("Conjuring"),
-            "the persona word is stored for the session"
+                .map(|(t, w)| (t.clone(), w.as_str())),
+            Some((turn.clone(), "Conjuring")),
+            "the persona word is stored keyed with its turn"
         );
 
-        // Starting a new turn in this session clears it.
-        store.state.composer = "next prompt".into();
-        let _ = store.compose_command();
-        assert!(
-            !store.state.session_status_word.contains_key(&session_id),
-            "a new turn drops the prior persona word"
+        // A turn-less word can't be attributed -> it does not overwrite.
+        let mut orphan = UiProgressMetadata::new(progress_kinds::STATUS_WORD);
+        orphan.label = Some("Orphan".into());
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id.clone(),
+            None,
+            orphan,
+        )));
+        assert_eq!(
+            store
+                .state
+                .session_status_word
+                .get(&session_id)
+                .map(|(_, w)| w.as_str()),
+            Some("Conjuring"),
+            "a turn-less word does not overwrite the stored one"
         );
 
         // An empty-label status_word clears the word (falls back to phase).
-        let mut meta = UiProgressMetadata::new(progress_kinds::STATUS_WORD);
-        meta.label = Some("Simmering".into());
-        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
-            session_id.clone(),
-            Some(TurnId::new()),
-            meta,
-        )));
-        assert!(store.state.session_status_word.contains_key(&session_id));
         let mut empty = UiProgressMetadata::new(progress_kinds::STATUS_WORD);
         empty.label = Some("   ".into());
         store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(

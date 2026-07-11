@@ -7793,10 +7793,15 @@ fn harness_status_lines(
     // master re-entry) still shows, since that is information the operator
     // should see rather than a decorative word. The `…` reads as an ongoing
     // action.
+    // Only the ACTIVE turn's word shows — a word keyed to a settled/prior turn
+    // (or a server-started continuation before its own first rotation) is
+    // ignored, so a stale word never lingers (codex P2 on #294).
+    let active_turn_id = app.active_turn().map(|(_, turn_id)| turn_id);
     let persona_word = app
         .session_status_word
         .get(&session_id)
-        .map(|word| word.trim())
+        .filter(|(word_turn, _)| active_turn_id == Some(word_turn))
+        .map(|(_, word)| word.trim())
         .filter(|word| !word.is_empty())
         .map(|word| format!("{word}…"));
     let phase = match status.and_then(|s| s.phase.as_deref()) {
@@ -15877,7 +15882,12 @@ mod tests {
         use octos_core::ui_protocol::SessionOrchestrationEvent;
         let session_id = SessionKey("local:test".into());
         let mut app = autonomy_app_state();
-        // A plain working turn (no sub-agents) with a persona word set.
+        // Active turn (word keys to it) with a plain working phase.
+        let turn_id = octos_core::ui_protocol::TurnId::new();
+        app.sessions[0].live_reply = Some(crate::model::LiveReply {
+            turn_id: turn_id.clone(),
+            text: String::new(),
+        });
         app.orchestration.insert(
             session_id.clone(),
             SessionOrchestrationEvent {
@@ -15889,7 +15899,7 @@ mod tests {
             },
         );
         app.session_status_word
-            .insert(session_id.clone(), "Conjuring".into());
+            .insert(session_id.clone(), (turn_id.clone(), "Conjuring".into()));
 
         let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex), true)
             .iter()
