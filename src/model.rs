@@ -3626,6 +3626,11 @@ pub struct PendingInterruptRestore {
     pub session_id: SessionKey,
     pub turn_id: TurnId,
     pub prompt: String,
+    /// The turn's terminal already arrived but a menu was open at that
+    /// moment, so the composer fill was deferred once more (codex round-3
+    /// P2: consuming it there lost the prompt permanently). A settled entry
+    /// applies when the menu stack empties.
+    pub settled: bool,
 }
 
 /// M16-G2 per-session lifecycle ledger entry. The TUI keeps these in

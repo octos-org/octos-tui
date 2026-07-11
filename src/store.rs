@@ -3379,6 +3379,9 @@ impl Store {
             if let Some(frame) = self.state.menu_stack.active() {
                 self.state.status = t!("status.menu_label", id = frame.id.to_string()).into_owned();
             }
+            // The stack may just have emptied — apply a restore whose
+            // terminal was deferred by the open menu.
+            self.apply_settled_interrupt_restore_after_menu_close();
             return true;
         }
         false
@@ -3415,6 +3418,8 @@ impl Store {
         }
         self.state.menu_stack.close_all();
         self.state.active_menu = None;
+        // Apply a restore whose terminal was deferred by the open menu.
+        self.apply_settled_interrupt_restore_after_menu_close();
         true
     }
 
@@ -4345,6 +4350,7 @@ impl Store {
                     session_id: session_id.clone(),
                     turn_id: turn_id.clone(),
                     prompt,
+                    settled: false,
                 });
         }
 
@@ -4373,11 +4379,34 @@ impl Store {
         else {
             return;
         };
-        let pending = self.state.pending_interrupt_restores.remove(index);
         let pending_is_active = self
             .state
             .active_session()
-            .is_some_and(|session| session.id == pending.session_id);
+            .is_some_and(|session| session.id == *session_id);
+        // A menu is up in the pending's own session (e.g. the user is
+        // browsing the slash popup when the terminal lands): filling the
+        // composer under it would flip the popup's key routing into
+        // composer-edit mid-browse — but CONSUMING the entry here lost the
+        // prompt permanently (codex round-3 P2). Mark it settled and keep
+        // it; the menu-close path applies it.
+        if pending_is_active && self.state.menu_stack.is_active() {
+            self.state.pending_interrupt_restores[index].settled = true;
+            return;
+        }
+        let pending = self.state.pending_interrupt_restores.remove(index);
+        self.apply_interrupt_restore(pending, pending_is_active);
+    }
+
+    /// Apply a consumed pending restore: into the live composer (active
+    /// session, still-empty composer), or into the session's saved draft when
+    /// the user switched away. Staged messages waiting for the session's turn
+    /// slot win outright — their drain submits next and the prompt stays
+    /// reachable through composer history.
+    fn apply_interrupt_restore(
+        &mut self,
+        pending: crate::model::PendingInterruptRestore,
+        pending_is_active: bool,
+    ) {
         let staged_for_session = if pending_is_active {
             !self.state.pending_messages.is_empty()
         } else {
@@ -4390,7 +4419,7 @@ impl Store {
             return;
         }
         if pending_is_active {
-            if self.state.composer.is_empty() && !self.state.menu_stack.is_active() {
+            if self.state.composer.is_empty() {
                 // Same composer-set mechanism as the rewind prefill.
                 self.state.set_composer_text(pending.prompt);
                 self.state.focus = FocusPane::Composer;
@@ -4412,6 +4441,37 @@ impl Store {
                     text: pending.prompt,
                 });
         }
+    }
+
+    /// Menu-close hook for a restore whose terminal arrived WHILE a menu was
+    /// open (see `restore_interrupted_prompt_on_settle`): once the stack is
+    /// empty, apply the active session's settled entry. A non-empty composer
+    /// (e.g. a dispatch just completed a slash draft into it) leaves the
+    /// entry for a later close — never clobber, never lose.
+    fn apply_settled_interrupt_restore_after_menu_close(&mut self) {
+        if self.state.menu_stack.is_active() {
+            return;
+        }
+        let Some(active_id) = self
+            .state
+            .active_session()
+            .map(|session| session.id.clone())
+        else {
+            return;
+        };
+        let Some(index) = self
+            .state
+            .pending_interrupt_restores
+            .iter()
+            .position(|pending| pending.settled && pending.session_id == active_id)
+        else {
+            return;
+        };
+        if !self.state.composer.is_empty() {
+            return;
+        }
+        let pending = self.state.pending_interrupt_restores.remove(index);
+        self.apply_interrupt_restore(pending, true);
     }
 
     pub fn respond_approval_command(
@@ -9315,6 +9375,15 @@ impl Store {
         // fallback card or mishandling the dropped-empty case.
         self.state
             .mark_turn_finalized_by_switch(session_id, &prior_turn);
+        // A successor turn is becoming this session's live turn — through
+        // `TurnStarted` OR a delta-first lazy bind whose TurnStarted was never
+        // delivered (codex round-3 P1). Either way the prior turn's pending
+        // interrupt-restore is superseded: its late terminal must not fill
+        // the composer while the successor streams (that would re-block the
+        // `/` popup, the exact bug the deferral exists to prevent).
+        self.state
+            .pending_interrupt_restores
+            .retain(|pending| pending.session_id != *session_id || pending.turn_id == *new_turn);
         // The switch finalizes the prior turn WITHOUT a terminal — a
         // compaction block owned by that turn would otherwise strand (its
         // completed may also have been missed, and later terminals carry
@@ -22516,6 +22585,88 @@ mod tests {
             Some("prompt for a"),
             "the restored prompt becomes session A's draft (rewind-prefill convention)"
         );
+    }
+
+    #[test]
+    fn interrupt_restore_dropped_when_successor_lazy_binds_from_delta() {
+        // codex P1 (round 3): a successor turn can become live via a
+        // delta-first LAZY BIND (its TurnStarted was never delivered). The
+        // pending restore for the interrupted prior turn must be superseded
+        // there too — a late terminal for the old turn must not fill the
+        // composer while the successor streams.
+        let turn_a = TurnId::new();
+        let mut store = store_with_live_reply(turn_a.clone(), "streaming a");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_a.clone(),
+            "prompt for a".into(),
+        );
+        store.interrupt_command().expect("A's turn interrupts");
+
+        // Delta for a NEW turn B lazy-binds the successor (no TurnStarted).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                text: "successor stream".into(),
+            },
+        )));
+
+        // A's late terminal arrives while B streams.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_a,
+                code: "interrupted".into(),
+                message: "turn interrupted by client".into(),
+            },
+        )));
+        assert!(
+            store.state.composer.is_empty(),
+            "the superseded restore must not fill the composer under the lazy-bound successor"
+        );
+        assert!(store.state.pending_interrupt_restores.is_empty());
+    }
+
+    #[test]
+    fn interrupt_restore_retries_after_menu_closes() {
+        // codex P2 (round 3): a terminal landing while the slash popup is
+        // open must not throw the prompt away — the restore is deferred once
+        // more and applies when the menu closes.
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            "prompt behind the popup".into(),
+        );
+        store.interrupt_command().expect("active turn interrupts");
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                code: "interrupted".into(),
+                message: "turn interrupted by client".into(),
+            },
+        )));
+        assert!(
+            store.state.composer.is_empty(),
+            "no composer fill under the open menu"
+        );
+
+        store.close_menu();
+        assert_eq!(
+            store.state.composer, "prompt behind the popup",
+            "closing the menu applies the settled restore"
+        );
+        assert!(store.state.pending_interrupt_restores.is_empty());
     }
 
     #[test]
