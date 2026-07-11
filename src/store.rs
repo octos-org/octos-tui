@@ -5470,6 +5470,11 @@ impl Store {
                 let session_runtime_statuses = self.state.session_runtime_statuses.clone();
                 let profile_llm_catalog = self.state.profile_llm_catalog.clone();
                 let profile_llm_state = self.state.profile_llm_state.clone();
+                // One-shot re-flush request: a snapshot replay draining
+                // between an aside dismissal and the next draw must not eat
+                // it, or the vacated rows stay blank after reconnect when the
+                // committed history is unchanged (codex P2 on #288).
+                let transcript_reflush_requested = self.state.transcript_reflush_requested;
                 let profile_skills = self.state.profile_skills.clone();
                 let profile_skill_registry = self.state.profile_skill_registry.clone();
                 let session_model_catalogs = self.state.session_model_catalogs.clone();
@@ -5557,6 +5562,7 @@ impl Store {
                 state.session_runtime_statuses = session_runtime_statuses;
                 state.profile_llm_catalog = profile_llm_catalog;
                 state.profile_llm_state = profile_llm_state;
+                state.transcript_reflush_requested = transcript_reflush_requested;
                 state.profile_skills = profile_skills;
                 state.profile_skill_registry = profile_skill_registry;
                 state.session_model_catalogs = session_model_catalogs;
@@ -13345,6 +13351,33 @@ mod tests {
             store.state.run_state.is_active(),
             "a replacement submit in flight must keep the run state active, got {:?}",
             store.state.run_state
+        );
+    }
+
+    /// A snapshot replay draining between an aside dismissal and the next
+    /// draw must not eat the one-shot re-flush request (codex P2 on #288) —
+    /// with unchanged committed history the tracker would emit nothing and
+    /// the vacated rows would stay blank after reconnect.
+    #[test]
+    fn snapshot_replay_preserves_the_transcript_reflush_request() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming…");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.set_btw_answering(&session_id, "q?".into());
+        assert!(store.state.resolve_btw_answer(&session_id, "a".into()));
+        assert!(store.state.dismiss_btw_aside(&session_id));
+
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: store.state.sessions.clone(),
+            selected_session: 0,
+            status: "resynced".into(),
+            target: None,
+            readonly: false,
+        }));
+
+        assert!(
+            store.state.take_transcript_reflush_request(),
+            "the re-flush request must survive a snapshot replay"
         );
     }
 

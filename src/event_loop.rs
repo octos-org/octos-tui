@@ -284,11 +284,14 @@ where
     // A dismissed `/btw` aside shrinks the live region and strands a blank
     // band between the transcript tail and the composer — with the turn
     // settled, nothing ever refills it (user report: "huge blank space").
-    // The store requests a one-shot re-flush; marking the tracker stale here
-    // makes THIS frame re-insert the committed transcript over the vacated
-    // rows, exactly like the width-resize path above.
+    // The store requests a one-shot re-flush; staling the COMMITTED watermark
+    // here makes THIS frame re-insert the committed transcript over the
+    // vacated rows. Unlike the resize path above, the live watermarks are
+    // preserved: the main turn may still be streaming and its rows survive
+    // on screen (only the old viewport region is cleared on shrink), so a
+    // full reset would duplicate them in scrollback (codex P2).
     if store.state.take_transcript_reflush_request() {
-        scrollback.mark_flushed_stale();
+        scrollback.mark_committed_flush_stale();
     }
 
     // The scrollback flush must wrap to the SAME width `insert_history_lines`
