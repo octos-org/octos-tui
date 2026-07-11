@@ -6565,6 +6565,7 @@ mod tests {
             "status-1".into(),
             PendingRequest {
                 method: crate::model::APPUI_METHOD_SESSION_STATUS_READ.into(),
+                select_session: None,
             },
         );
         let frame = json!({
