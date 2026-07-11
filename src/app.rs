@@ -3570,6 +3570,12 @@ fn push_reasoning_block(
     }
 }
 
+/// Hanging indent for assistant message bodies: the `• ` marker (2 display
+/// columns) sits on the first visual line only, and every other physical line
+/// of the same message hangs under it by this prefix, so the body reads as one
+/// contiguous block (the Claude Code reference shape).
+const ASSISTANT_BODY_INDENT: &str = "  ";
+
 fn push_message_block(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -3592,6 +3598,7 @@ fn push_message_block(
 
     let bg = chat_message_bg(palette, role);
     let indent = match role {
+        "assistant" => ASSISTANT_BODY_INDENT,
         "tool" => "$ ",
         "reasoning" => "· ",
         "btw" => "· ",
@@ -3638,7 +3645,15 @@ fn push_live_reply_block(
 
     let bg = chat_message_bg(palette, "assistant");
     let marker = first.then_some("• ");
-    push_formatted_body_marked(lines, palette, content, "", marker, Some(bg), width);
+    push_formatted_body_marked(
+        lines,
+        palette,
+        content,
+        ASSISTANT_BODY_INDENT,
+        marker,
+        Some(bg),
+        width,
+    );
 }
 
 fn push_live_reply_block_seeded(
@@ -3667,7 +3682,7 @@ fn push_live_reply_block_seeded(
         lines,
         palette,
         content,
-        "",
+        ASSISTANT_BODY_INDENT,
         marker,
         Some(bg),
         width,
@@ -3980,6 +3995,11 @@ fn push_formatted_body_marked_seeded(
     let mut prose = Vec::new();
     let mut table = Vec::new();
     let mut checkbox_index = 1usize;
+    let body_start = lines.len();
+    // Hanging (all-whitespace) indents keep their blank separators truly blank
+    // — no trailing spaces in immutable scrollback; glyph gutters (`· `, `$ `)
+    // keep marking their blank rows.
+    let separator_indent = if indent.trim().is_empty() { "" } else { indent };
     let normalized = content.trim_matches(|ch: char| ch.is_whitespace() && ch != '\n');
 
     for raw_line in normalized.lines() {
@@ -3989,7 +4009,7 @@ fn push_formatted_body_marked_seeded(
             raw_line.trim()
         };
         if let Some(rest) = line.trim_start().strip_prefix("```") {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             if let Some((language, body)) = in_code.take() {
                 push_code_block_lines(lines, palette, indent, bg, &language, &body, true);
@@ -4028,12 +4048,15 @@ fn push_formatted_body_marked_seeded(
         }
 
         if line.is_empty() {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             checkbox_index = 1;
             if !last_blank && (previous_reply_has_output || !lines.is_empty()) {
                 lines.push(chat_line(
-                    vec![Span::styled(indent, style_bg(palette.border(), bg))],
+                    vec![Span::styled(
+                        separator_indent,
+                        style_bg(palette.border(), bg),
+                    )],
                     bg,
                 ));
                 last_blank = true;
@@ -4043,25 +4066,25 @@ fn push_formatted_body_marked_seeded(
         last_blank = false;
 
         if let Some(command) = shell_command_from_line(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             push_command_row(lines, palette, indent, command);
             continue;
         }
 
         if markdown_table_separator(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             continue;
         }
 
         if let Some(cells) = markdown_table_cells(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             table.push(cells.into_iter().map(str::to_owned).collect());
             continue;
         }
 
         if markdown_hr(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             let rule_width = width.saturating_sub(indent.chars().count()).clamp(1, 40);
             lines.push(chat_line(
@@ -4075,7 +4098,7 @@ fn push_formatted_body_marked_seeded(
         }
 
         if let Some(heading) = markdown_heading(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             let mut spans = vec![Span::styled(indent, style_bg(palette.border(), bg))];
             spans.extend(inline_markdown_spans(
@@ -4089,7 +4112,7 @@ fn push_formatted_body_marked_seeded(
         }
 
         if let Some((_checked, text)) = markdown_checkbox(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             let mut spans = vec![
                 Span::styled(indent, style_bg(palette.border(), bg)),
@@ -4110,7 +4133,7 @@ fn push_formatted_body_marked_seeded(
         }
 
         if let Some(text) = markdown_bullet(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             let mut spans = vec![
                 Span::styled(indent, style_bg(palette.border(), bg)),
@@ -4127,7 +4150,7 @@ fn push_formatted_body_marked_seeded(
         }
 
         if let Some((number, text)) = markdown_numbered(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             let mut spans = vec![
                 Span::styled(indent, style_bg(palette.border(), bg)),
@@ -4144,7 +4167,7 @@ fn push_formatted_body_marked_seeded(
         }
 
         if let Some(text) = markdown_blockquote(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             // Render as a quoted line with a left bar + muted italics, instead of
             // leaking the literal `>` marker into prose.
@@ -4172,8 +4195,109 @@ fn push_formatted_body_marked_seeded(
         // frame.
         push_code_block_lines(lines, palette, indent, bg, &language, &body, false);
     }
-    flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+    flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
     flush_markdown_table(lines, palette, &mut table, indent, bg, width);
+    finish_hanging_body(lines, body_start, palette, indent, prose_marker, bg, width);
+}
+
+/// Post-pass for hanging-indent bodies (assistant messages, whose `indent` is
+/// the all-whitespace [`ASSISTANT_BODY_INDENT`]): swap the first non-blank
+/// row's leading indent span for the `• ` prose marker, then pre-wrap any
+/// over-width row so its wrapped continuations keep the hang. Both downstream
+/// wrap paths (ratatui's `Wrap { trim: false }` in the live tail and
+/// `insert_history::wrap_line` for native scrollback) restart wrapped rows at
+/// column 0, so the body must never hand them an over-width line. Glyph-gutter
+/// bodies (`$ `, `· `, `› `) and unindented bodies are left exactly as before.
+fn finish_hanging_body(
+    lines: &mut Vec<Line<'static>>,
+    body_start: usize,
+    palette: Palette,
+    indent: &'static str,
+    prose_marker: Option<&'static str>,
+    bg: Option<Color>,
+    width: usize,
+) {
+    if indent.is_empty() || !indent.trim().is_empty() {
+        return;
+    }
+
+    // Sanitize BEFORE measuring — the same order `insert_history` uses. Tabs
+    // render as four columns once scrollback sanitizes them, so measuring the
+    // raw `\t` (0 columns here, 1 in `str::width`) under-counted the row: it
+    // passed the pre-wrap check, then insert-time wrapping split it back to a
+    // column-zero continuation, losing the hang (codex r2 P2). Stripping the
+    // other control chars here also keeps the pre-wrap cutter's budget honest
+    // (codex r2 P1) and renders deterministically in the live lane.
+    for line in lines[body_start..].iter_mut() {
+        crate::insert_history::sanitize_line_in_place(line);
+    }
+
+    if let Some(marker) = prose_marker
+        && let Some(first_line) = lines[body_start..]
+            .iter_mut()
+            .find(|line| !line_is_blank(Some(line)))
+    {
+        let marker_span = Span::styled(marker, style_bg(palette.selected(), bg));
+        match first_line.spans.first_mut() {
+            // Every body emitter leads with the indent span; the marker
+            // replaces it 1:1 (same display width), keeping the row width
+            // unchanged.
+            Some(lead) if lead.content.as_ref() == indent => *lead = marker_span,
+            _ => first_line.spans.insert(0, marker_span),
+        }
+    }
+
+    let line_width = |line: &Line<'static>| -> usize {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref().width())
+            .sum()
+    };
+    if lines[body_start..]
+        .iter()
+        .all(|line| line_width(line) <= width)
+    {
+        return;
+    }
+
+    let content_width = width.saturating_sub(indent.width()).max(1);
+    let body = lines.split_off(body_start);
+    for mut line in body {
+        if line_width(&line) <= width {
+            lines.push(line);
+            continue;
+        }
+        // Detach the leading indent/marker span, wrap the remainder to the
+        // hang-reduced width, then re-attach: row 0 keeps its own lead,
+        // continuation rows get the hang.
+        let lead = match line.spans.first() {
+            Some(span)
+                if span.content.as_ref() == indent
+                    || prose_marker.is_some_and(|marker| span.content.as_ref() == marker) =>
+            {
+                Some(line.spans.remove(0))
+            }
+            _ => None,
+        };
+        let hang_style = lead
+            .as_ref()
+            .map(|span| span.style)
+            .unwrap_or_else(|| style_bg(palette.border(), bg));
+        let style = line.style;
+        let rest = Line::from(std::mem::take(&mut line.spans)).style(style);
+        for (row_idx, row) in crate::insert_history::wrap_line(&rest, content_width)
+            .into_iter()
+            .enumerate()
+        {
+            let mut spans = Vec::with_capacity(row.spans.len() + 1);
+            match (&lead, row_idx) {
+                (Some(lead), 0) => spans.push(lead.clone()),
+                _ => spans.push(Span::styled(indent, hang_style)),
+            }
+            spans.extend(row.spans);
+            lines.push(Line::from(spans).style(style));
+        }
+    }
 }
 
 fn flush_prose_paragraph(
@@ -4181,7 +4305,6 @@ fn flush_prose_paragraph(
     palette: Palette,
     prose: &mut Vec<String>,
     indent: &'static str,
-    prose_marker: Option<&'static str>,
     bg: Option<Color>,
 ) {
     if prose.is_empty() {
@@ -4190,9 +4313,6 @@ fn flush_prose_paragraph(
 
     let paragraph = prose.join(" ");
     let mut spans = vec![Span::styled(indent, style_bg(palette.border(), bg))];
-    if let Some(marker) = prose_marker {
-        spans.push(Span::styled(marker, style_bg(palette.selected(), bg)));
-    }
     spans.extend(inline_markdown_spans(
         &paragraph,
         style_bg(palette.text(), bg),
@@ -11299,7 +11419,7 @@ mod tests {
     }
 
     #[test]
-    fn render_assistant_markdown_is_left_aligned_without_marker_leakage() {
+    fn render_assistant_markdown_hangs_body_without_marker_leakage() {
         let app = AppState::new(
             vec![SessionView {
                 id: SessionKey("local:test".into()),
@@ -11329,10 +11449,12 @@ mod tests {
                 .find("•")
                 .is_some_and(|idx| idx < prose.find("First paragraph").unwrap())
         );
-        assert_eq!(bullet.find("- "), Some(0));
+        // Body rows hang 2 columns under the marker — never a second `• `.
+        assert_eq!(bullet.find("- "), Some(2));
         // The table is now drawn as a real bordered grid, so its rows start with
-        // the box border rather than the raw cell text — still no marker leakage.
-        assert!(table.starts_with("│"));
+        // the box border (after the hang) rather than the raw cell text — still
+        // no marker leakage.
+        assert!(table.starts_with("  │"));
         assert!(table.contains("Page"));
         assert!(!text.contains("|---|---|"));
         assert!(!text.contains("**Either**"));
@@ -16535,11 +16657,11 @@ mod tests {
         ));
         let body = rendered
             .iter()
-            .position(|line| line == "Body one.")
+            .position(|line| line == "  Body one.")
             .expect("first segment body should render before the boundary");
         let heading = rendered
             .iter()
-            .position(|line| line == "Step 2")
+            .position(|line| line == "  Step 2")
             .expect("second segment heading should render as markdown");
 
         assert_eq!(
@@ -16609,8 +16731,8 @@ mod tests {
             .expect("first segment should render as assistant prose");
         let second = rendered
             .iter()
-            .position(|line| line == "Step 2: b." || line == "• Step 2: b.")
-            .expect("second segment should render as a discrete markdown block");
+            .position(|line| line == "  Step 2: b.")
+            .expect("second segment should render as a discrete hanging markdown block");
 
         assert_eq!(
             rendered.get(first + 1).map(String::as_str),
@@ -16625,6 +16747,419 @@ mod tests {
         assert!(
             !rendered.iter().any(|line| line.contains("a.Step 2")),
             "committed assistant segment boundary must prevent gluing: {rendered:#?}"
+        );
+    }
+
+    // ---- assistant body hanging indent ----
+    // The reference shape (Claude Code): the `• ` marker sits on the FIRST
+    // visual line of an assistant message, and EVERY other physical line of
+    // the same message — paragraphs, list items, headings, code rows, wrapped
+    // continuations — hangs two columns under it, so the body reads as one
+    // contiguous block. Blank separators stay truly blank.
+
+    /// The hanging indent must be exactly as wide as the `• ` marker, or the
+    /// continuation lines don't align under the first line's text.
+    #[test]
+    fn assistant_hanging_indent_matches_marker_display_width() {
+        assert_eq!(ASSISTANT_BODY_INDENT, "  ");
+        assert_eq!(ASSISTANT_BODY_INDENT.width(), "• ".width());
+    }
+
+    /// The user-reported shape: a committed multi-paragraph assistant message
+    /// used to drop every paragraph after the first back to column 0.
+    #[test]
+    fn committed_assistant_multi_paragraph_body_hangs_under_marker() {
+        let app = chat_app(vec![
+            Message::user("install android studio"),
+            Message::assistant(
+                "Homebrew is available. Let me install Android Studio via cask:\n\n\
+                 Homebrew has permission issues in this sandbox. Let me download directly:\n\n\
+                 The sandbox is blocking curl SSL and Homebrew. Let me try another way:",
+            ),
+        ]);
+        let rendered = line_texts(&finalized_history_lines_range(
+            &app,
+            Palette::for_theme(ThemeName::Slate),
+            100,
+            1,
+        ));
+        assert_eq!(
+            rendered,
+            vec![
+                "• Homebrew is available. Let me install Android Studio via cask:".to_string(),
+                "".into(),
+                "  Homebrew has permission issues in this sandbox. Let me download directly:"
+                    .into(),
+                "".into(),
+                "  The sandbox is blocking curl SSL and Homebrew. Let me try another way:".into(),
+            ],
+            "the whole body must hang under the marker"
+        );
+    }
+
+    /// A long single paragraph at a narrow wrap width: every wrapped
+    /// continuation row carries the 2-column hang, no row exceeds the wrap
+    /// width (unicode-width — CJK stays in budget), and no words are lost.
+    #[test]
+    fn assistant_wrapped_paragraph_rows_hang_and_fit_width() {
+        let body = "The sandbox is blocking curl SSL and Homebrew so the 安装过程 must fall \
+                    back to a manual download flow that keeps going for quite a while longer.";
+        for wrap_width in [24usize, 40, 61, 80] {
+            let mut lines = Vec::new();
+            push_message_block(
+                &mut lines,
+                Palette::for_theme(ThemeName::Slate),
+                "assistant",
+                body,
+                wrap_width,
+            );
+            let texts = line_texts(&lines);
+            assert!(
+                texts.len() > 1,
+                "wrap_width {wrap_width} must produce wrapped rows: {texts:#?}"
+            );
+            for (idx, (line, text)) in lines.iter().zip(&texts).enumerate() {
+                let w: usize = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref().width())
+                    .sum();
+                assert!(
+                    w <= wrap_width,
+                    "row {idx} width {w} exceeds wrap_width {wrap_width}: {text:?}"
+                );
+                if idx == 0 {
+                    assert!(
+                        text.starts_with("• "),
+                        "first row carries the marker: {text:?}"
+                    );
+                } else {
+                    assert!(
+                        text.starts_with("  ") && !text.starts_with("   "),
+                        "wrapped continuation rows hang at exactly 2 columns: {text:?}"
+                    );
+                }
+            }
+            let mut rejoined = texts
+                .iter()
+                .map(|text| text.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            rejoined = rejoined.trim_start_matches("• ").to_string();
+            assert_eq!(
+                rejoined.split_whitespace().collect::<Vec<_>>(),
+                body.split_whitespace().collect::<Vec<_>>(),
+                "wrapping must not drop or reorder words at wrap_width {wrap_width}"
+            );
+        }
+    }
+
+    /// The Claude-Code reference shape: a numbered-list body hangs its list
+    /// rows AND their wrapped continuations under the marker line.
+    #[test]
+    fn assistant_numbered_list_hangs_items_and_wrapped_continuations() {
+        let body = "Complete inventory, grouped by PR — the fixes:\n\n\
+                    1. session_cost was turn-scoped and needed to become cumulative across \
+                    the whole session lifetime\n\
+                    2. the summary row double-counted cache reads";
+        let wrap_width = 48usize;
+        let mut lines = Vec::new();
+        push_message_block(
+            &mut lines,
+            Palette::for_theme(ThemeName::Slate),
+            "assistant",
+            body,
+            wrap_width,
+        );
+        let texts = line_texts(&lines);
+        assert!(
+            texts[0].starts_with("• "),
+            "first row carries the marker: {texts:#?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.starts_with("  1. ")),
+            "list rows hang at 2 columns: {texts:#?}"
+        );
+        let item_row = texts
+            .iter()
+            .position(|text| text.starts_with("  1. "))
+            .expect("numbered item row");
+        assert!(
+            texts[item_row + 1].starts_with("  ") && !texts[item_row + 1].trim().is_empty(),
+            "the wrapped continuation of a long list item hangs too: {texts:#?}"
+        );
+        for (idx, (line, text)) in lines.iter().zip(&texts).enumerate() {
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref().width())
+                .sum();
+            assert!(
+                w <= wrap_width,
+                "row {idx} width {w} exceeds wrap_width {wrap_width}: {text:?}"
+            );
+            if text.trim().is_empty() {
+                assert_eq!(text, "", "blank separators stay truly blank: {texts:#?}");
+            } else if idx > 0 {
+                assert!(
+                    text.starts_with("  "),
+                    "every non-blank body row hangs: {text:?}"
+                );
+            }
+        }
+    }
+
+    /// A heading-first assistant message: the marker sits on the heading (the
+    /// first visual line, CC-style) and the rest of the body hangs.
+    #[test]
+    fn assistant_heading_first_body_carries_marker_on_heading() {
+        let mut lines = Vec::new();
+        push_message_block(
+            &mut lines,
+            Palette::for_theme(ThemeName::Slate),
+            "assistant",
+            "### Step 2\n\nNow I'll add a style block.",
+            80,
+        );
+        assert_eq!(
+            line_texts(&lines),
+            vec!["• Step 2", "", "  Now I'll add a style block."],
+            "the marker goes on the first visual line even when it is a heading"
+        );
+    }
+
+    /// Fenced code inside an assistant body: the frame rows and code rows all
+    /// hang under the marker line.
+    #[test]
+    fn assistant_code_block_rows_hang_under_marker() {
+        let mut lines = Vec::new();
+        push_message_block(
+            &mut lines,
+            Palette::for_theme(ThemeName::Slate),
+            "assistant",
+            "Run this:\n\n```rust\nfn main() {}\n```",
+            80,
+        );
+        let texts = line_texts(&lines);
+        assert_eq!(texts[0], "• Run this:");
+        assert!(
+            texts.iter().any(|text| text.starts_with("  ┌─ rust")),
+            "fence header hangs: {texts:#?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.starts_with("  │ fn main()")),
+            "code rows hang: {texts:#?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.starts_with("  └─")),
+            "fence footer hangs: {texts:#?}"
+        );
+    }
+
+    /// Live streaming lane: the hang applies mid-stream. The first batch
+    /// carries the marker; continuation batches hang every line and never
+    /// re-issue the bullet.
+    #[test]
+    fn live_reply_batches_hang_under_marker_mid_stream() {
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let mut first_batch = Vec::new();
+        push_live_reply_block(
+            &mut first_batch,
+            palette,
+            "Para one settled.\n\nPara two settled.",
+            80,
+            true,
+        );
+        assert_eq!(
+            line_texts(&first_batch),
+            vec!["• Para one settled.", "", "  Para two settled."],
+            "first batch: marker on line 1, later paragraphs hang"
+        );
+
+        let mut continuation = Vec::new();
+        push_live_reply_block(
+            &mut continuation,
+            palette,
+            "Para three keeps going.",
+            80,
+            false,
+        );
+        assert_eq!(
+            line_texts(&continuation),
+            vec!["  Para three keeps going."],
+            "continuation batches hang without re-issuing the bullet"
+        );
+    }
+
+    /// Scrollback-flush lane (immutable — must be right the first time): the
+    /// delta between two flush watermarks renders continuation chunks with the
+    /// hang, and a wrapped-at-flush-time long paragraph hangs its rows.
+    #[test]
+    fn scrollback_flush_delta_hangs_continuation_lines() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let text = "first block done.\n\nsecond block, which is long enough that a narrow \
+                    terminal must wrap it across several physical rows to fit.\n\n";
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("go")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: text.into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+
+        let wrap_width = 40usize;
+        let mut mid = LiveTurnFinalization::new(&session_id, &turn_id);
+        mid.reply_flushed_text = "first block done.\n\n".to_string();
+        let next = next_live_turn_finalization(&app, Some(&mid)).expect("watermark");
+        assert_eq!(next.reply_flushed_text, text, "fully settled text flushes");
+
+        let second_batch = finalized_live_turn_lines_between(
+            &app,
+            Palette::for_theme(ThemeName::Slate),
+            wrap_width,
+            &mid,
+            &next,
+        );
+        let texts = line_texts(&second_batch);
+        assert!(
+            texts.iter().filter(|text| !text.trim().is_empty()).count() > 1,
+            "the long continuation paragraph must wrap: {texts:#?}"
+        );
+        for (line, text) in second_batch.iter().zip(&texts) {
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref().width())
+                .sum();
+            assert!(
+                w <= wrap_width,
+                "flushed row width {w} exceeds wrap_width {wrap_width}: {text:?}"
+            );
+            if !text.trim().is_empty() {
+                assert!(
+                    text.starts_with("  ") && !text.starts_with("• "),
+                    "flushed continuation rows hang, no re-issued bullet: {text:?}"
+                );
+            }
+        }
+    }
+
+    /// Regression guard: the other roles keep their own prefix systems — no
+    /// 2-space hang leaks into user prompts or tool bodies.
+    #[test]
+    fn non_assistant_roles_keep_their_prefixes_unchanged() {
+        let palette = Palette::for_theme(ThemeName::Slate);
+
+        let mut user_lines = Vec::new();
+        push_message_block(&mut user_lines, palette, "user", "line one\nline two", 80);
+        assert_eq!(
+            line_texts(&user_lines),
+            vec!["▌ line one", "▌ line two"],
+            "user prompts keep the gutter, gain no hang"
+        );
+
+        let mut tool_lines = Vec::new();
+        push_message_block(
+            &mut tool_lines,
+            palette,
+            "tool",
+            "para one.\n\npara two.",
+            80,
+        );
+        assert_eq!(
+            line_texts(&tool_lines),
+            vec!["$ para one.", "$ ", "$ para two."],
+            "tool bodies keep their `$ ` gutter on every row, gain no hang"
+        );
+
+        let mut pending_lines = Vec::new();
+        push_formatted_body(
+            &mut pending_lines,
+            palette,
+            "queued question",
+            "› ",
+            None,
+            80,
+        );
+        assert_eq!(
+            line_texts(&pending_lines),
+            vec!["› queued question"],
+            "pending-message rows keep their `› ` prefix"
+        );
+    }
+
+    /// codex-review (r2 P2): tabs render as FOUR columns once
+    /// `insert_history` sanitizes scrollback, but the body used to be
+    /// measured with the raw `\t` (0–1 columns), so a tab-bearing code row
+    /// passed the pre-wrap check and was then re-wrapped to a column-zero
+    /// continuation at insert time — losing the hang. Assistant bodies must
+    /// sanitize (expand tabs, strip controls) BEFORE measuring, mirroring
+    /// insert_history's sanitize-first-wrap-after order, so rendered rows
+    /// carry no raw controls and stay within the wrap width post-expansion.
+    #[test]
+    fn assistant_body_expands_tabs_before_prewrap_measurement() {
+        let wrap_width = 16usize;
+        let mut lines = Vec::new();
+        push_message_block(
+            &mut lines,
+            Palette::for_theme(ThemeName::Slate),
+            "assistant",
+            "```\nab\tcdefgh\n```\n\nprose\twith tab",
+            wrap_width,
+        );
+        let texts = line_texts(&lines);
+        for (idx, (line, text)) in lines.iter().zip(&texts).enumerate() {
+            assert!(
+                !text.contains('\t') && !text.chars().any(char::is_control),
+                "row {idx} must carry no raw control characters: {text:?}"
+            );
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref().width())
+                .sum();
+            assert!(
+                w <= wrap_width,
+                "row {idx} width {w} exceeds wrap_width {wrap_width} after tab expansion: {texts:#?}"
+            );
+        }
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.starts_with("  ") && text.contains("cdefgh")),
+            "the tab-bearing code row still hangs: {texts:#?}"
+        );
+    }
+
+    /// Empty and whitespace-only assistant bodies stay inert (no marker-only
+    /// line, no panic).
+    #[test]
+    fn assistant_empty_and_whitespace_bodies_stay_inert() {
+        let palette = Palette::for_theme(ThemeName::Slate);
+
+        let mut empty_lines = Vec::new();
+        push_message_block(&mut empty_lines, palette, "assistant", "", 80);
+        assert_eq!(line_texts(&empty_lines), vec!["<empty>"]);
+
+        let mut blank_lines = Vec::new();
+        push_message_block(&mut blank_lines, palette, "assistant", "   ", 80);
+        assert!(
+            !line_texts(&blank_lines)
+                .iter()
+                .any(|text| text.contains('•')),
+            "a whitespace-only body must not render a dangling marker"
         );
     }
 
@@ -16836,19 +17371,19 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                "1",
+                "  1",
                 "",
-                "I'll create demo.html with an HTML5 skeleton.",
+                "  I'll create demo.html with an HTML5 skeleton.",
                 "",
-                "Step 2",
+                "• Step 2",
                 "",
-                "• Now I'll add a style block.",
+                "  Now I'll add a style block.",
                 "",
-                "Step 3",
+                "• Step 3",
                 "",
-                "• Finally, I'll add an <h1>.",
+                "  Finally, I'll add an <h1>.",
             ],
-            "later assistant messages must render as fresh markdown blocks, not live-reply continuations"
+            "later assistant messages must render as fresh markdown blocks (own marker, hanging body), not live-reply continuations"
         );
     }
 

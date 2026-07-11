@@ -104,14 +104,23 @@ fn horizontal_rule_renders_divider() {
 fn long_url_is_not_truncated() {
     let long = format!("https://example.com/{}", "segment/".repeat(12));
     let lines = render(&format!("[doc]({long})"));
+    // An over-width assistant row is pre-wrapped with the 2-column hanging
+    // indent (marker row + `  ` continuation rows); reconstruct the logical
+    // text by stripping the per-row prefixes. Wrapping is allowed — losing
+    // characters (`truncate_terminal_line`-style " ..." ellipsis) is not.
     let joined: String = lines
         .iter()
-        .flat_map(|l| l.spans.iter())
-        .map(|s| s.content.to_string())
+        .map(|l| {
+            let row: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            row.strip_prefix("• ")
+                .or_else(|| row.strip_prefix("  "))
+                .unwrap_or(&row)
+                .to_string()
+        })
         .collect();
     assert!(
         joined.contains(&long),
-        "the full url must survive (no truncation) for terminal auto-linkification"
+        "the full url must survive (no truncation, wrapped rows reconstruct): {joined:?}"
     );
     assert!(!joined.contains(" ..."), "no truncation ellipsis");
 }
