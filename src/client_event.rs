@@ -53,6 +53,7 @@ pub enum ClientEvent {
     ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchClientEvent),
     ProfileSkillsMutation(ProfileSkillsMutationClientEvent),
     SessionStatus(SessionStatusClientEvent),
+    SessionBtw(SessionBtwClientEvent),
     ToolStatus(ToolStatusClientEvent),
     ToolConfigList(ToolConfigListClientEvent),
     ToolConfigMutation(ToolConfigMutationClientEvent),
@@ -67,6 +68,13 @@ pub enum ClientEvent {
     /// never blocks on a running command. The store folds this back into
     /// the matching "running" activity chip via its `local_id`.
     LocalShellResult(LocalShellResultEvent),
+    /// The stdio transport relaunched its `serve --stdio` child after a
+    /// disconnect. A freshly spawned child has no in-flight turns by
+    /// construction, so any turn the client still shows as live belongs to
+    /// the dead process and its terminal event will never arrive — the store
+    /// must fail those latched turns and drain the staged prompt queue, or
+    /// every subsequent prompt wedges behind the phantom turn forever.
+    BackendRelaunched,
 }
 
 impl From<AppUiEvent> for ClientEvent {
@@ -91,6 +99,10 @@ pub struct ModelListClientEvent {
 pub struct ModelSelectClientEvent {
     pub result: ModelSelectResult,
     pub message: String,
+    /// The session that initiated the select (correlated by JSON-RPC request
+    /// id in the transport). `None` only for unsolicited/legacy shapes —
+    /// which the store ignores rather than guessing a target.
+    pub initiating_session: Option<octos_core::SessionKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +206,13 @@ pub struct ProfileSkillsMutationClientEvent {
 pub struct SessionStatusClientEvent {
     pub result: SessionStatusReadResult,
     pub message: String,
+}
+
+/// Result of a `session/btw` aside — the out-of-band answer to a quick
+/// question asked while the session's turn keeps running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBtwClientEvent {
+    pub result: octos_core::ui_protocol::SessionBtwResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

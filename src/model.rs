@@ -521,6 +521,12 @@ pub struct SessionAutonomyState {
     pub goal: Option<octos_core::ui_protocol::UiGoalRecord>,
     pub goal_transition_actor: Option<String>,
     pub loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
+    /// Latest model-authored plan/todo checklist (`plan/updated`). `None` until
+    /// the agent calls `update_plan` this session.
+    pub plan: Option<octos_core::ui_protocol::UiPlanRecord>,
+    /// Turn that authored the current `plan`, when known. The plan is per-turn
+    /// working state, so it is cleared when this turn completes.
+    pub plan_turn_id: Option<TurnId>,
 }
 
 impl SessionAutonomyState {
@@ -533,6 +539,8 @@ impl SessionAutonomyState {
             goal: None,
             goal_transition_actor: None,
             loops: Vec::new(),
+            plan: None,
+            plan_turn_id: None,
         }
     }
 }
@@ -625,6 +633,7 @@ pub enum AppUiCommand {
     StartReview(ReviewStartParams),
     ListConfigCapabilities(ConfigCapabilitiesListParams),
     ReadSessionStatus(SessionStatusReadParams),
+    SessionBtw(octos_core::ui_protocol::SessionBtwParams),
     ListModels(ModelListParams),
     SelectModel(ModelSelectParams),
     ListPermissionProfiles(PermissionProfileListParams),
@@ -713,6 +722,7 @@ impl AppUiCommand {
             Self::StartReview(_) => APPUI_METHOD_REVIEW_START,
             Self::ListConfigCapabilities(_) => APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
             Self::ReadSessionStatus(_) => APPUI_METHOD_SESSION_STATUS_READ,
+            Self::SessionBtw(_) => octos_core::ui_protocol::methods::SESSION_BTW,
             Self::ListModels(_) | Self::ProfileLlmList(_) => APPUI_METHOD_MODEL_LIST,
             Self::SelectModel(_) | Self::ProfileLlmSelect(_) => APPUI_METHOD_MODEL_SELECT,
             Self::ListPermissionProfiles(_) => {
@@ -787,6 +797,11 @@ pub struct ResumeSessionRow {
     pub message_count: usize,
     #[serde(default)]
     pub updated_at: Option<String>,
+    /// First line of the session's most recent user prompt, used as the row's
+    /// codex-style preview. The server may or may not emit it (older builds
+    /// don't), so it defaults to `None` and the picker falls back to `title`.
+    #[serde(default)]
+    pub last_prompt: Option<String>,
 }
 
 /// One row in the `/rewind` turn picker, projected from the ACTIVE session's
@@ -802,6 +817,14 @@ pub struct RewindTurnRow {
     pub preview: String,
     pub num_turns: u32,
     pub prefill: String,
+    /// Codex-style checkpoint ordinal shown in the row (`#1` = newest). Equals
+    /// `num_turns` by construction; carried explicitly so the render layer and
+    /// `/rewind <n>` inline both speak in "checkpoint N" without re-deriving it.
+    pub checkpoint: u32,
+    /// RFC3339 timestamp of the user message this row rewinds to, for the row's
+    /// relative-time description. `Some` in practice (octos-core `Message`
+    /// always carries a `timestamp`); `None` only if a source ever omits it.
+    pub timestamp: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -915,7 +938,11 @@ pub struct SessionStatusReadResult {
     pub active_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_status_model",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub model: Option<ModelStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_profile: Option<String>,
@@ -947,6 +974,82 @@ pub struct SessionStatusReadResult {
     pub cursor: Option<SessionCursorStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<UiProtocolCapabilities>,
+}
+
+/// Skew-tolerant decoder for [`SessionStatusReadResult::model`].
+///
+/// octos servers up to protocol 1.1.0 answer `session/status/read` with
+/// `"model": {"model": null, "provider": null, "selected": true}` when the
+/// runtime policy has no resolved model (fresh data dir, onboarding before a
+/// provider is saved). [`ModelStatus::model`]/[`ModelStatus::provider`] are
+/// deliberately non-optional — the model list/select paths genuinely require
+/// them — so decoding that shape directly fails with "invalid type: null"
+/// and takes the ENTIRE status result down with it: the transport surfaces
+/// an `invalid_result` app error and the composer footer degrades to the
+/// `<server authenticated profile>` placeholder.
+///
+/// Semantics: `null`, a missing key, or an otherwise well-formed object
+/// whose `model` or `provider` member is null/absent all MEAN "no model
+/// resolved" and decode to `None` (the footer renders its regular no-model
+/// state). Everything else decodes as a normal [`ModelStatus`]; any
+/// wrongly-typed member is a real protocol error and still fails — the
+/// object is first validated through [`ModelStatusShapeProbe`], so a null
+/// `model`/`provider` never becomes a bypass that masks a malformed
+/// sibling. Unknown extra members keep being ignored, exactly like a plain
+/// [`ModelStatus`] decode.
+fn deserialize_status_model<'de, D>(deserializer: D) -> Result<Option<ModelStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if value.is_object() {
+        let probe = ModelStatusShapeProbe::deserialize(&value).map_err(serde::de::Error::custom)?;
+        if probe.model.is_none() || probe.provider.is_none() {
+            return Ok(None);
+        }
+    }
+    ModelStatus::deserialize(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
+/// [`ModelStatus`] with `model`/`provider` relaxed to `Option` — used ONLY
+/// by [`deserialize_status_model`] to validate a candidate object before the
+/// no-model mapping. Every member a [`ModelStatus`] would type-check is
+/// type-checked here too (null/absent `model`/`provider` being the one
+/// permitted extra), so the skew tolerance cannot swallow a wrongly-typed
+/// sibling like `{"model": null, "provider": 42}`. The `Some` path then
+/// decodes the original value as a plain [`ModelStatus`], so any future
+/// `ModelStatus` field is picked up there without touching this probe.
+#[derive(Deserialize)]
+struct ModelStatusShapeProbe {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    title: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    family: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    route: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    selected: bool,
+    #[serde(default)]
+    #[allow(dead_code)]
+    available: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    queue_mode: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    qoe_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1286,6 +1389,28 @@ pub struct ContextLifecycleState {
     pub last_checkpoint_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_compaction_id: Option<String>,
+}
+
+/// In-flight context compaction (UPCR-2026-026).
+#[derive(Debug, Clone)]
+pub struct LiveCompaction {
+    pub started_at: std::time::Instant,
+    /// Set when the matching `ContextCompactionCompleted` lands. The server
+    /// pass is synchronous, so started/completed arrive in one drain batch
+    /// and draws only follow the batch — without a settled dwell the block
+    /// would paint zero frames. The renderer keeps showing a settled state
+    /// for a short window after this timestamp.
+    pub completed_at: Option<std::time::Instant>,
+    /// Post-compaction estimate from the completed event (for the settled
+    /// `before → after` line).
+    pub token_estimate_after: Option<u64>,
+    pub token_estimate_before: u64,
+    pub threshold_tokens: u64,
+    pub trigger: String,
+    /// The turn that was live when compaction started — terminal-driven
+    /// cleanup only clears a block owned by THAT turn (a stale/duplicate
+    /// terminal must not clear a newer turn's block).
+    pub turn_id: Option<TurnId>,
 }
 
 /// M16-G2 last-compaction record summary (truncated). The full record
@@ -2720,6 +2845,11 @@ pub struct ProfileLlmDeleteParams {
 pub struct ProfileLlmSelectParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
+    /// The ACTIVE session, so the server's result echoes a session id the
+    /// client actually tracks — without it the server synthesizes a
+    /// `profile:local:tui#coding` key and the select result updates nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<octos_core::SessionKey>,
     pub family_id: String,
     pub model_id: String,
     pub route_id: String,
@@ -3244,6 +3374,12 @@ pub struct AppState {
     /// Preserved across `Snapshot` replays (see `apply_event`).
     pub session_reasoning_effort:
         std::collections::HashMap<SessionKey, octos_core::ui_protocol::ReasoningEffortLevel>,
+    /// Per-session opt-in to render the committed `reasoning_content` as a
+    /// capped "· reasoning" block in the transcript. Absent/false = the
+    /// codex-style quiet default (spinner + inspector only). Toggled from the
+    /// `/thinking` menu; parallels `session_reasoning_effort` in lifetime and
+    /// Snapshot preservation.
+    pub session_reasoning_display: std::collections::HashSet<SessionKey>,
     /// Per-session set of turn ids that were already finalized (committed OR
     /// dropped) by `commit_pending_live_reply_for_turn_switch` at a turn-switch
     /// boundary. A prior turn's OWN late `TurnCompleted`/`TurnError` may still
@@ -3325,9 +3461,18 @@ pub struct AppState {
     /// events (no request/session ids on the wire errors), so instead of an
     /// ever-growing error-code taxonomy, a gate older than
     /// [`crate::store::STAGED_SUBMIT_GATE_TTL`] is treated as stale and
-    /// ignored — any missed death self-heals in seconds. Deliberately NOT
-    /// snapshot-preserved: a replay clears it outright.
-    pub staged_submit_in_flight: std::collections::HashMap<SessionKey, std::time::Instant>,
+    /// ignored — any missed death self-heals in seconds (and, since the gate
+    /// carries the prompt, the stale-gate path RE-STAGES it rather than
+    /// dropping it). Snapshot-PRESERVED (codex fold): the gate may hold the
+    /// only copy of a drained prompt, so a reconnect replay carries the map
+    /// over like the staged queues; a gate whose turn died with the old
+    /// connection self-heals via the TTL re-stage.
+    ///
+    /// The gate also carries the in-flight PROMPT (P2 tri-repo #246): a
+    /// staged submit that dies at the transport layer is re-staged from the
+    /// gate instead of vanishing — the drain had already pulled it off the
+    /// queue, so the gate is the only place its text survives.
+    pub staged_submit_in_flight: std::collections::HashMap<SessionKey, StagedSubmitGate>,
     pub optimistic_user_messages: Vec<OptimisticUserMessage>,
     pub turn_prompt_anchors: Vec<TurnPromptAnchor>,
     /// Byte offsets in `live_reply.text` where one persisted assistant content
@@ -3340,6 +3485,11 @@ pub struct AppState {
     /// message's `reasoning_content`, which the transcript renders as a separate
     /// `· reasoning` block above the answer.
     pub live_reasoning: std::collections::HashMap<(SessionKey, TurnId), String>,
+    /// In-flight context compaction per session (UPCR-2026-026): set on
+    /// `context/compaction_started`, cleared on completed / turn end.
+    /// Renders the "Compacting conversation…" block with an honest
+    /// fullness bar.
+    pub live_compaction: std::collections::HashMap<SessionKey, LiveCompaction>,
     pub status: String,
     pub target: Option<String>,
     pub readonly: bool,
@@ -3359,6 +3509,19 @@ pub struct AppState {
     pub diff_preview: DiffPreviewPaneState,
     pub activity: Vec<ActivityItem>,
     pub turn_activity_logs: Vec<TurnActivityLog>,
+    /// Hydrate-replayed tool envelopes already applied, keyed by
+    /// `(session, thread_id, seq)` — `seq` is the envelope's identity within
+    /// its thread (#1515). Hydrate re-runs on every reconnect; without this
+    /// ledger each re-run would duplicate the per-action rows.
+    pub applied_hydrate_tool_envelopes: std::collections::HashSet<(String, String, u64)>,
+    pub turn_activity_summaries: Vec<TurnActivitySummary>,
+    /// Wall-clock starts of in-flight turns, keyed by (session, turn). The
+    /// committed per-turn status report reads its duration here — the global
+    /// `run_state_started_at` clock resets whenever the selection changes, so
+    /// it cannot time a turn the user switched away from and back.
+    pub turn_started_at: std::collections::HashMap<(SessionKey, TurnId), std::time::Instant>,
+    /// Latest `/btw` aside per session (see [`BtwAside`]).
+    pub btw_asides: std::collections::HashMap<SessionKey, BtwAside>,
     pub expanded_tool_outputs: bool,
     pub menu_stack: MenuStack,
     pub active_menu: Option<MenuBuildResult>,
@@ -3497,6 +3660,48 @@ pub struct TurnPromptAnchor {
     pub prior_matching_user_count: usize,
 }
 
+/// FIFO gate for a staged-drain submit that is between enqueue and its
+/// `turn/started` (see [`AppState::staged_submit_in_flight`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedSubmitGate {
+    /// When the submit was enqueued — drives the
+    /// [`crate::store::STAGED_SUBMIT_GATE_TTL`] staleness backstop.
+    pub submitted_at: Instant,
+    /// The prompt (and its optimistic turn) still in flight. `Some` until the
+    /// submit settles; consumed to RE-STAGE the prompt when the submit dies at
+    /// the transport layer. `None` marks a backoff-only gate left behind by
+    /// such a re-stage: it keeps the drain closed for the TTL so a dead
+    /// transport is retried on the TTL cadence instead of every UI tick, and
+    /// a repeat wire error cannot re-stage the same prompt twice.
+    pub in_flight: Option<StagedSubmitInFlight>,
+}
+
+impl StagedSubmitGate {
+    /// A live gate for a just-enqueued staged submit.
+    pub fn in_flight(turn_id: TurnId, prompt: String) -> Self {
+        Self {
+            submitted_at: Instant::now(),
+            in_flight: Some(StagedSubmitInFlight { turn_id, prompt }),
+        }
+    }
+
+    /// A backoff-only gate left behind after a transport-death re-stage.
+    pub fn backoff() -> Self {
+        Self {
+            submitted_at: Instant::now(),
+            in_flight: None,
+        }
+    }
+}
+
+/// The prompt a [`StagedSubmitGate`] is protecting, with the optimistic turn
+/// id its transcript row / prompt anchor were recorded under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedSubmitInFlight {
+    pub turn_id: TurnId,
+    pub prompt: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnActivityLog {
     pub session_id: SessionKey,
@@ -3504,6 +3709,41 @@ pub struct TurnActivityLog {
     pub request: Option<String>,
     pub anchor_index: Option<usize>,
     pub items: Vec<ActivityItem>,
+}
+
+/// A committed per-turn status report (`✻ Ran for 5m 19s · 2 background tasks
+/// still running`) rendered at the tail of a finalized turn in the transcript.
+/// Captured at `TurnCompleted` (a snapshot — the running-task count reflects the
+/// moment the turn ended). Stored parallel to [`TurnActivityLog`] and looked up
+/// by `turn_id` so tool-less turns (no activity log items) still get a summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnActivitySummary {
+    pub session_id: SessionKey,
+    pub turn_id: TurnId,
+    pub elapsed_secs: u64,
+    pub background_tasks: usize,
+}
+
+/// A `/btw` aside: a quick question asked WHILE the session's live turn keeps
+/// running, answered out-of-band by the server with no tools. Ephemeral — it
+/// never joins the transcript; the card renders in the live pane and the next
+/// prompt submit dismisses a settled one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BtwAside {
+    pub session_id: SessionKey,
+    pub question: String,
+    pub state: BtwAsideState,
+    /// Physical-row scroll offset for the overlay when the answer is taller than
+    /// the pane (which is capped at half the viewport). The render path clamps
+    /// this against the true max each frame, mirroring `transcript_scroll`.
+    pub scroll: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BtwAsideState {
+    Answering,
+    Answered(String),
+    Failed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3620,15 +3860,25 @@ pub struct ActivityItem {
     pub duration_ms: Option<u64>,
     pub turn_id: Option<TurnId>,
     pub tool_call_id: Option<String>,
-    /// Owning session for items created on a session-scoped path. Only set by
-    /// the projection-envelope `ToolStart` emit (`apply_envelope`), which is the
-    /// one path whose items carry NO turn identity and so cannot be reconciled
-    /// by `turn_id`. The envelope `TurnCompleted` self-heal
-    /// ([`AppState::reconcile_envelope_thread_running_activity`]) filters on
-    /// this so a thread_id shared across sessions cannot over-suppress a sibling
-    /// session's genuinely-active chip. Left `None` for all turn-scoped items
-    /// (which reconcile via `turn_id`).
+    /// Owning session for items created on a session-scoped path. Set by the
+    /// projection-envelope `ToolStart` emit (`apply_envelope`) — the one path
+    /// whose items carry NO turn identity and so cannot be reconciled by
+    /// `turn_id` (the envelope `TurnCompleted` self-heal,
+    /// [`AppState::reconcile_envelope_thread_running_activity`], filters on it
+    /// so a thread_id shared across sessions cannot over-suppress a sibling
+    /// session's genuinely-active chip) — and by the session-scoped protocol
+    /// arms (`ToolStarted`, progress events), where
+    /// [`AppState::push_activity`] / [`AppState::update_tool_activity`] use it
+    /// to keep a background session's activity from drifting the ACTIVE
+    /// transcript's scroll (P2 tri-repo #246). `None` = unattributed (treated
+    /// as active-view content).
     pub session_id: Option<SessionKey>,
+    /// Sticky rows are infrequent, notable notices (context compaction) that
+    /// (a) survive the activity cap's oldest-first eviction so a busy turn's
+    /// tool flood cannot silently drop them before they are archived, and
+    /// (b) when turnless, are adopted by the session's next `TurnStarted` so
+    /// they render in the turn flow and archive with the turn.
+    pub sticky: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3651,7 +3901,13 @@ impl ActivityItem {
             turn_id: None,
             tool_call_id: None,
             session_id: None,
+            sticky: false,
         }
+    }
+
+    pub fn with_sticky(mut self) -> Self {
+        self.sticky = true;
+        self
     }
 
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
@@ -5017,6 +5273,7 @@ impl AppState {
             completed_turns: std::collections::HashMap::new(),
             session_retry: std::collections::HashMap::new(),
             session_reasoning_effort: std::collections::HashMap::new(),
+            session_reasoning_display: std::collections::HashSet::new(),
             finalized_by_switch: std::collections::HashMap::new(),
             selected_session,
             selected_task: 0,
@@ -5043,6 +5300,7 @@ impl AppState {
             turn_prompt_anchors: Vec::new(),
             live_reply_segment_boundaries: std::collections::HashMap::new(),
             live_reasoning: std::collections::HashMap::new(),
+            live_compaction: std::collections::HashMap::new(),
             status,
             target,
             readonly,
@@ -5061,6 +5319,10 @@ impl AppState {
             diff_preview: DiffPreviewPaneState::default(),
             activity: Vec::new(),
             turn_activity_logs: Vec::new(),
+            applied_hydrate_tool_envelopes: std::collections::HashSet::new(),
+            turn_activity_summaries: Vec::new(),
+            turn_started_at: std::collections::HashMap::new(),
+            btw_asides: std::collections::HashMap::new(),
             expanded_tool_outputs: false,
             menu_stack: MenuStack::new(),
             active_menu: None,
@@ -5155,6 +5417,23 @@ impl AppState {
             .expect("just pushed autonomy entry")
     }
 
+    /// Loop counts `(active, paused)` for `session_id`'s autonomy mirror.
+    /// Drives the status-bar loop chip: an ACTIVE loop fires real model
+    /// turns on an interval, which the operator must be able to see at a
+    /// glance (a forgotten loop otherwise burns tokens invisibly).
+    pub fn session_loop_counts(&self, session_id: &SessionKey) -> (usize, usize) {
+        let Some(entry) = self
+            .session_autonomy
+            .iter()
+            .find(|entry| &entry.session_id == session_id)
+        else {
+            return (0, 0);
+        };
+        let active = entry.loops.iter().filter(|l| l.status == "active").count();
+        let paused = entry.loops.iter().filter(|l| l.status == "paused").count();
+        (active, paused)
+    }
+
     /// Replace the entire agent list for a session. Used by the
     /// `agent/list` response and after reconnect-hydration.
     pub fn set_session_agents(
@@ -5186,14 +5465,32 @@ impl AppState {
         }
     }
 
-    /// Replace the loop list for a session.
+    /// Replace the loop list for a session, dropping tombstones.
+    ///
+    /// Mirrors [`Self::upsert_session_loop`], which strips
+    /// `status == "deleted"` records "so reconnect doesn't surface
+    /// tombstones". This path — the `loop/list` response and
+    /// reconnect rehydration — must apply the SAME filter. Otherwise a
+    /// backend that echoes deleted loops in `loop/list` leaves dimmed
+    /// zombie chips in the sticky autonomy indicator that `/loop delete`
+    /// can no longer clear (the `#1576` delete-can't-clear-the-chip
+    /// lineage): the active/paused counts already exclude them, so the
+    /// row reads "0 running" yet still shows chips.
+    ///
+    /// Returns the number of loops actually retained (after dropping
+    /// tombstones) so callers can report a count that matches what the
+    /// indicator now shows, rather than the raw response length.
     pub fn set_session_loops(
         &mut self,
         session_id: &SessionKey,
         loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
-    ) {
+    ) -> usize {
         let entry = self.session_autonomy_mut(session_id);
-        entry.loops = loops;
+        entry.loops = loops
+            .into_iter()
+            .filter(|loop_state| loop_state.status != "deleted")
+            .collect();
+        entry.loops.len()
     }
 
     /// Upsert one loop record by `loop_id`. Removes the loop when its
@@ -5242,6 +5539,37 @@ impl AppState {
         let entry = self.session_autonomy_mut(session_id);
         entry.goal = goal;
         entry.goal_transition_actor = transition_actor;
+    }
+
+    /// Replace the cached plan/todo checklist for a session. The `update_plan`
+    /// tool sends the full ordered list each call, so this is a wholesale swap.
+    /// `turn_id` is the authoring turn (when known) so the panel can be cleared
+    /// on that turn's completion.
+    pub fn set_session_plan(
+        &mut self,
+        session_id: &SessionKey,
+        plan: Option<octos_core::ui_protocol::UiPlanRecord>,
+        turn_id: Option<TurnId>,
+    ) {
+        let entry = self.session_autonomy_mut(session_id);
+        entry.plan = plan;
+        entry.plan_turn_id = turn_id;
+    }
+
+    /// Clear a session's plan panel once the turn that authored it completes.
+    /// A plan with no known authoring turn (`plan_turn_id == None`) is left in
+    /// place — there is no terminal event to key its removal on.
+    pub fn clear_session_plan_for_turn(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        if let Some(entry) = self
+            .session_autonomy
+            .iter_mut()
+            .find(|s| &s.session_id == session_id)
+        {
+            if entry.plan_turn_id.as_ref() == Some(turn_id) {
+                entry.plan = None;
+                entry.plan_turn_id = None;
+            }
+        }
     }
 
     /// Replace the cached output tail for an agent. The backend is
@@ -5558,6 +5886,11 @@ impl AppState {
         }
     }
 
+    /// Whether the given session opted into rendering reasoning blocks.
+    pub fn reasoning_display_enabled(&self, session_id: &SessionKey) -> bool {
+        self.session_reasoning_display.contains(session_id)
+    }
+
     pub fn active_session(&self) -> Option<&SessionView> {
         self.sessions.get(self.selected_session)
     }
@@ -5674,6 +6007,160 @@ impl AppState {
             retained.push(optimistic);
         }
         self.optimistic_user_messages = retained;
+    }
+
+    /// The user prompt that started `turn_id` in `session_id`. Used to restore
+    /// the prompt into the composer when a turn is interrupted (Esc/Ctrl+C) so
+    /// it can be edited and resent. Mirrors the turn-activity log's request
+    /// resolution (the same three fallbacks it anchors a report on): the
+    /// optimistic echo first, then the persisted turn-prompt anchor (which
+    /// survives the turn — it is only reaped by an explicit withdraw or the
+    /// per-session cap), then the session's latest user message.
+    pub fn submitted_prompt_for_turn(
+        &self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> Option<String> {
+        self.optimistic_user_messages
+            .iter()
+            .rev()
+            .find(|message| &message.session_id == session_id && &message.turn_id == turn_id)
+            .map(|message| message.content.clone())
+            .or_else(|| {
+                self.turn_prompt_anchors
+                    .iter()
+                    .rev()
+                    .find(|anchor| &anchor.session_id == session_id && &anchor.turn_id == turn_id)
+                    .map(|anchor| anchor.content.clone())
+            })
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .find(|session| &session.id == session_id)
+                    .and_then(|session| {
+                        session
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == octos_core::MessageRole::User)
+                            .map(|message| message.content.clone())
+                    })
+            })
+    }
+
+    /// Settle staged-submit gates that a freshly-replayed snapshot already
+    /// REFLECTS (codex fold): if the replayed session contains the in-flight
+    /// prompt as a user message beyond the pre-submit baseline, the submit
+    /// reached the server before the replay — no later TurnStarted/terminal
+    /// will arrive on this connection to clear the gate, and letting it
+    /// TTL-expire would re-stage and submit a DUPLICATE turn. Gates with no
+    /// echo stay armed (a genuinely dead submit self-heals via the TTL
+    /// re-stage).
+    ///
+    /// MUST run BEFORE [`Self::restore_optimistic_user_messages`]: the
+    /// restore re-inserts un-echoed optimistic rows, which would inflate the
+    /// match count and settle (lose) a gate whose submit never landed.
+    pub fn settle_staged_gates_reflected_by_snapshot(&mut self) {
+        let mut settled: Vec<SessionKey> = Vec::new();
+        for (session_id, gate) in &self.staged_submit_in_flight {
+            let Some(in_flight) = gate.in_flight.as_ref() else {
+                continue;
+            };
+            let Some(session) = self
+                .sessions
+                .iter()
+                .find(|session| &session.id == session_id)
+            else {
+                continue;
+            };
+            // Baseline = matching rows that existed BEFORE this submit, from
+            // the surviving optimistic tracking entry or (codex fold 4) the
+            // turn-prompt anchor recorded for the same turn — the two caches
+            // evict independently. With NO baseline at all the gate stays
+            // ARMED: assuming 0 would make any OLDER identical user message
+            // look like a snapshot echo and settle away the only copy of the
+            // prompt (data loss); an armed gate at worst re-stages via the
+            // TTL and duplicates a turn the server already ran — recoverable,
+            // and only reachable when both caches evicted the entry.
+            let baseline = self
+                .optimistic_user_messages
+                .iter()
+                .find(|optimistic| {
+                    &optimistic.session_id == session_id && optimistic.turn_id == in_flight.turn_id
+                })
+                .map(|optimistic| optimistic.prior_matching_user_count)
+                .or_else(|| {
+                    self.turn_prompt_anchors
+                        .iter()
+                        .find(|anchor| {
+                            &anchor.session_id == session_id && anchor.turn_id == in_flight.turn_id
+                        })
+                        .map(|anchor| anchor.prior_matching_user_count)
+                });
+            let Some(baseline) = baseline else {
+                continue;
+            };
+            if matching_user_message_count(session, &in_flight.prompt) > baseline {
+                settled.push(session_id.clone());
+            }
+        }
+        for session_id in settled {
+            self.staged_submit_in_flight.remove(&session_id);
+        }
+    }
+
+    /// Withdraw the optimistic user prompt recorded for `turn_id`: its submit
+    /// died at the transport layer, so the turn will never start and the
+    /// prompt is being RE-STAGED (P2 tri-repo #246). Removes the optimistic
+    /// tracking entry, the turn-prompt anchor, and the transcript row the
+    /// tracking inserted — otherwise the re-submit records the same content a
+    /// second time and the transcript shows a duplicate user row.
+    pub fn withdraw_optimistic_user_prompt(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        let Some(position) = self.optimistic_user_messages.iter().position(|optimistic| {
+            &optimistic.session_id == session_id && &optimistic.turn_id == turn_id
+        }) else {
+            return;
+        };
+        let optimistic = self.optimistic_user_messages.remove(position);
+        self.turn_prompt_anchors
+            .retain(|anchor| !(&anchor.session_id == session_id && &anchor.turn_id == turn_id));
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| &session.id == session_id)
+        else {
+            return;
+        };
+        // Only remove a row that is genuinely OUR optimistic insert (count
+        // above the pre-insert baseline). The send died at the transport, so
+        // no server echo can account for the extra match; take the LAST one —
+        // the optimistic row is the most recent insert of this content.
+        if matching_user_message_count(session, &optimistic.content)
+            > optimistic.prior_matching_user_count
+            && let Some(row) = session.messages.iter().rposition(|message| {
+                message.role.as_str() == "user" && message.content == optimistic.content
+            })
+        {
+            session.messages.remove(row);
+        }
+    }
+
+    /// Put a transport-dead staged submit's prompt back at the FRONT of its
+    /// session's staged queue so FIFO order survives the retry (P2 tri-repo
+    /// #246). The active session's queue lives in `pending_messages`; other
+    /// sessions' queues are stashed per-session.
+    pub fn restage_staged_prompt_front(&mut self, session_id: &SessionKey, prompt: String) {
+        let is_active = self
+            .active_session()
+            .is_some_and(|session| &session.id == session_id);
+        if is_active {
+            self.pending_messages.insert(0, prompt);
+        } else {
+            self.pending_messages_by_session
+                .entry(session_id.clone())
+                .or_default()
+                .insert(0, prompt);
+        }
     }
 
     pub fn record_turn_prompt_anchor_from_latest_user(
@@ -5829,6 +6316,244 @@ impl AppState {
         true
     }
 
+    /// The committed status report for a completed turn, if one was captured.
+    pub fn turn_summary_for(&self, turn_id: &TurnId) -> Option<&TurnActivitySummary> {
+        self.turn_activity_summaries
+            .iter()
+            .find(|summary| &summary.turn_id == turn_id)
+    }
+
+    /// Stamp the wall-clock start of a turn. Idempotent — a replayed
+    /// `TurnStarted` for a turn already being timed keeps the original start.
+    /// Bounded: turns drain their entry at every terminal event, so growth
+    /// only comes from turns that never terminate; evict the oldest past 64.
+    pub fn note_turn_started(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        const MAX_TRACKED_TURN_STARTS: usize = 64;
+        if self.turn_started_at.len() >= MAX_TRACKED_TURN_STARTS
+            && !self
+                .turn_started_at
+                .contains_key(&(session_id.clone(), turn_id.clone()))
+            && let Some(oldest) = self
+                .turn_started_at
+                .iter()
+                .min_by_key(|(_, started)| **started)
+                .map(|(key, _)| key.clone())
+        {
+            self.turn_started_at.remove(&oldest);
+        }
+        self.turn_started_at
+            .entry((session_id.clone(), turn_id.clone()))
+            .or_insert_with(std::time::Instant::now);
+    }
+
+    /// Take the elapsed seconds of a turn's per-turn clock, removing the entry
+    /// (terminal events consume it exactly once). `None` when this client never
+    /// saw the turn's `TurnStarted` (e.g. attached mid-turn).
+    pub fn take_turn_elapsed_secs(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> Option<u64> {
+        self.turn_started_at
+            .remove(&(session_id.clone(), turn_id.clone()))
+            .map(|started| started.elapsed().as_secs())
+    }
+
+    /// The `/btw` aside for a session, if any (latest per session).
+    pub fn btw_aside_for(&self, session_id: &SessionKey) -> Option<&BtwAside> {
+        self.btw_asides.get(session_id)
+    }
+
+    /// Stage a new `/btw` aside as answering (replaces any prior aside).
+    pub fn set_btw_answering(&mut self, session_id: &SessionKey, question: String) {
+        self.btw_asides.insert(
+            session_id.clone(),
+            BtwAside {
+                session_id: session_id.clone(),
+                question,
+                state: BtwAsideState::Answering,
+                scroll: 0,
+            },
+        );
+    }
+
+    /// Scroll the active session's `/btw` overlay by `delta` physical rows
+    /// (positive = reveal lower content). Saturating; the render path clamps to
+    /// the true content max. Returns `true` when an aside was present to scroll,
+    /// so the key handler knows the event was consumed.
+    pub fn nudge_btw_scroll(&mut self, session_id: &SessionKey, delta: i32) -> bool {
+        match self.btw_asides.get_mut(session_id) {
+            Some(aside) => {
+                aside.scroll = if delta >= 0 {
+                    aside.scroll.saturating_add(delta as u16)
+                } else {
+                    aside.scroll.saturating_sub((-delta) as u16)
+                };
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Resolve the ANSWERING aside for `session_id` with the server's answer.
+    /// A stale result (nothing answering — e.g. the aside was replaced) is
+    /// dropped rather than resurrecting a dismissed card.
+    pub fn resolve_btw_answer(&mut self, session_id: &SessionKey, answer: String) -> bool {
+        match self.btw_asides.get_mut(session_id) {
+            Some(aside) if aside.state == BtwAsideState::Answering => {
+                aside.state = BtwAsideState::Answered(answer);
+                // Fresh answer starts at the top.
+                aside.scroll = 0;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Fail every ANSWERING aside. RPC errors surface generically as
+    /// `"{method} request {id} failed: …"` with no session attribution, so all
+    /// in-flight asides fail together (concurrent asides across sessions are
+    /// rare; the card invites a retry).
+    pub fn fail_btw_answering(&mut self, message: &str) -> usize {
+        let mut failed = 0;
+        for aside in self.btw_asides.values_mut() {
+            if aside.state == BtwAsideState::Answering {
+                aside.state = BtwAsideState::Failed(message.to_owned());
+                failed += 1;
+            }
+        }
+        failed
+    }
+
+    /// Drop a SETTLED (answered/failed) aside — the exchange is ephemeral and
+    /// the next prompt submit dismisses it. An answering aside stays; its
+    /// result may still land.
+    pub fn clear_settled_btw_aside(&mut self, session_id: &SessionKey) {
+        if self
+            .btw_asides
+            .get(session_id)
+            .is_some_and(|aside| !matches!(aside.state, BtwAsideState::Answering))
+        {
+            self.btw_asides.remove(session_id);
+        }
+    }
+
+    /// Codex-style dialog dismissal: unconditionally close the session's
+    /// `/btw` aside pane (Enter on an empty composer). Unlike
+    /// [`Self::clear_settled_btw_aside`] this also closes a still-answering
+    /// aside — the user chose to leave; a late answer for a dismissed aside
+    /// is dropped by `set_btw_answered`'s state guard.
+    pub fn dismiss_btw_aside(&mut self, session_id: &SessionKey) -> bool {
+        self.btw_asides.remove(session_id).is_some()
+    }
+
+    /// Count of the session's still-running background work (pending/running
+    /// tasks and sub-agents) — the `N still running` half of a turn summary.
+    pub fn running_background_task_count(&self, session_id: &SessionKey) -> usize {
+        self.sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .map(|session| {
+                session
+                    .tasks
+                    .iter()
+                    .filter(|task| matches!(task_state_label(task.state), "pending" | "running"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Record the committed per-turn status report captured at `TurnCompleted`.
+    /// Upserts by `turn_id`, and ensures a [`TurnActivityLog`] exists to anchor
+    /// the summary line in the transcript — for a tool-less turn (no activity
+    /// items) a summary-only log is synthesized so the report still renders
+    /// after the assistant reply. Bounded to the same window as the logs.
+    pub fn attach_turn_summary(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+        elapsed_secs: u64,
+        background_tasks: usize,
+    ) {
+        let summary = TurnActivitySummary {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            elapsed_secs,
+            background_tasks,
+        };
+        if let Some(existing) = self
+            .turn_activity_summaries
+            .iter_mut()
+            .find(|existing| &existing.turn_id == turn_id)
+        {
+            *existing = summary;
+        } else {
+            self.turn_activity_summaries.push(summary);
+        }
+
+        // A tool-less turn has no activity log to hang the summary on; synthesize
+        // an empty-items log anchored like `capture_completed_turn_activity`
+        // anchors real ones (optimistic user message, then prompt anchor, then
+        // the session's latest user message) so the report still renders after
+        // the assistant reply.
+        if !self
+            .turn_activity_logs
+            .iter()
+            .any(|log| &log.session_id == session_id && &log.turn_id == turn_id)
+        {
+            let optimistic =
+                self.optimistic_user_messages.iter().rev().find(|message| {
+                    &message.session_id == session_id && &message.turn_id == turn_id
+                });
+            let prompt_anchor = self
+                .turn_prompt_anchors
+                .iter()
+                .rev()
+                .find(|anchor| &anchor.session_id == session_id && &anchor.turn_id == turn_id);
+            let request = optimistic
+                .map(|message| message.content.clone())
+                .or_else(|| prompt_anchor.map(|anchor| anchor.content.clone()))
+                .or_else(|| {
+                    self.sessions
+                        .iter()
+                        .find(|session| &session.id == session_id)
+                        .and_then(|session| {
+                            session
+                                .messages
+                                .iter()
+                                .rev()
+                                .find(|message| message.role == octos_core::MessageRole::User)
+                                .map(|message| message.content.clone())
+                        })
+                });
+            let anchor_index = optimistic.map(|message| message.anchor_index).or_else(|| {
+                prompt_anchor.and_then(|anchor| resolve_turn_prompt_anchor(&self.sessions, anchor))
+            });
+            self.turn_activity_logs.push(TurnActivityLog {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                request,
+                anchor_index,
+                items: Vec::new(),
+            });
+            const MAX_TURN_ACTIVITY_LOGS: usize = 32;
+            if self.turn_activity_logs.len() > MAX_TURN_ACTIVITY_LOGS {
+                let excess = self.turn_activity_logs.len() - MAX_TURN_ACTIVITY_LOGS;
+                self.turn_activity_logs.drain(0..excess);
+            }
+        }
+
+        // Keep summaries bounded to the surviving logs so the two lists cannot
+        // drift (a summary whose log was trimmed away can never render).
+        let live_turns: std::collections::HashSet<TurnId> = self
+            .turn_activity_logs
+            .iter()
+            .map(|log| log.turn_id.clone())
+            .collect();
+        self.turn_activity_summaries
+            .retain(|summary| live_turns.contains(&summary.turn_id));
+    }
+
     /// Detail marker stamped on activity items created by the M9-γ
     /// projection-envelope `ToolStart` path. The envelope wire shape carries NO
     /// turn identity (it is keyed on `thread_id`/`seq`), so envelope tool items
@@ -5933,6 +6658,51 @@ impl AppState {
         self.load_composer_draft_for_selected_session();
         self.load_pending_messages_for_selected_session();
         self.refresh_run_state_from_selection();
+        // A session that raced the capabilities response missed its open-time
+        // status probe; probe it the moment it becomes active so the composer
+        // footer's model/cwd reflect it (no-op once a status is cached).
+        self.probe_active_session_status_if_missing();
+    }
+
+    /// Enqueue a `session/status/read` for the ACTIVE session when the server
+    /// advertises it and no runtime status is cached yet. One entry at a time —
+    /// bulk-probing every open session could overflow the capped
+    /// autonomy-hydration queue and evict unrelated pending commands. Sessions
+    /// probe on open in the normal flow; this covers the ones that raced the
+    /// capabilities response, lazily, whenever they become (or already are)
+    /// active — the composer footer only ever reads the active session anyway.
+    pub fn probe_active_session_status_if_missing(&mut self) {
+        if self
+            .capabilities
+            .as_ref()
+            .is_some_and(|caps| caps.supports_method(APPUI_METHOD_SESSION_STATUS_READ))
+            && let Some(session_id) = self
+                .active_session()
+                .map(|session| session.id.clone())
+                .filter(|session_id| self.runtime_status_for(session_id).is_none())
+        {
+            self.enqueue_session_status_probe(session_id);
+        }
+    }
+
+    /// Enqueue a `session/status/read`, deduplicating against one already
+    /// queued for the same session: a fresh `session/opened` both switches to
+    /// the session (bundle probe) and probes explicitly, and rapid session
+    /// switches re-probe before the first response lands — without the dedupe
+    /// each duplicate eats a slot of the capped hydration queue and can evict
+    /// unrelated pending commands.
+    pub fn enqueue_session_status_probe(&mut self, session_id: SessionKey) {
+        let already_queued = self.pending_autonomy_hydration.iter().any(|command| {
+            matches!(
+                command,
+                AppUiCommand::ReadSessionStatus(params) if params.session_id == session_id
+            )
+        });
+        if !already_queued {
+            self.enqueue_autonomy_hydration(AppUiCommand::ReadSessionStatus(
+                SessionStatusReadParams { session_id },
+            ));
+        }
     }
 
     /// Stash the ACTIVE session's staged-prompt queue under its key on the way
@@ -6087,14 +6857,74 @@ impl AppState {
             .map(|entry| entry.cursor)
     }
 
+    /// Whether an activity row with this attribution can render in the
+    /// CURRENT view — the gate for scroll preservation on activity writes
+    /// (P2 tri-repo #246 fold). Mirrors the flow's filter shape
+    /// (`flow_activity_items` filters by the active turn):
+    ///
+    /// * unattributed (`session_id == None`) → assume visible (old behavior);
+    /// * the active session's own rows → visible;
+    /// * a background row tied to a TURN → renders only under its own turn's
+    ///   flow, never the active one → invisible here;
+    /// * a background TURNLESS row → renders in the active flow exactly when
+    ///   no turn is active (codex fold: skipping these lost the read
+    ///   position for rows that were on screen). May over-preserve for the
+    ///   few turnless rows `is_subagent_progress` folds away — the safe
+    ///   direction.
+    fn activity_renders_in_active_view(
+        &self,
+        session_id: Option<&SessionKey>,
+        turn_id: Option<&TurnId>,
+    ) -> bool {
+        let Some(session_id) = session_id else {
+            return true;
+        };
+        if self
+            .active_session()
+            .is_some_and(|session| &session.id == session_id)
+        {
+            return true;
+        }
+        match turn_id {
+            Some(_) => false,
+            None => self.active_turn().is_none(),
+        }
+    }
+
     pub fn push_activity(&mut self, item: ActivityItem) {
         const MAX_ACTIVITY_ITEMS: usize = 80;
+        // Preserving the scroll for a row that renders nowhere in the current
+        // view would drift the active transcript's read position; skipping it
+        // for a row that IS visible loses the position instead — gate on the
+        // render-accurate predicate (P2 tri-repo #246 fold).
+        let renders_in_active_view =
+            self.activity_renders_in_active_view(item.session_id.as_ref(), item.turn_id.as_ref());
         let estimated_rows = estimated_activity_rows(&item);
         self.activity.push(item);
-        self.preserve_transcript_position_after_append(estimated_rows);
+        if renders_in_active_view {
+            self.preserve_transcript_position_after_append(estimated_rows);
+        }
         if self.activity.len() > MAX_ACTIVITY_ITEMS {
-            let excess = self.activity.len() - MAX_ACTIVITY_ITEMS;
-            self.activity.drain(0..excess);
+            let mut excess = self.activity.len() - MAX_ACTIVITY_ITEMS;
+            // Evict oldest NON-sticky rows first: sticky notices (context
+            // compaction) are infrequent and notable, and blind oldest-first
+            // eviction dropped them mid-turn — pushed before the turn's tool
+            // flood, they were always the first to go, vanishing before
+            // `capture_completed_turn_activity` could archive them.
+            let mut idx = 0;
+            while excess > 0 && idx < self.activity.len() {
+                if self.activity[idx].sticky {
+                    idx += 1;
+                } else {
+                    self.activity.remove(idx);
+                    excess -= 1;
+                }
+            }
+            // Degenerate case (everything left is sticky): still bound the
+            // list — the cap is a hard memory/render guarantee.
+            if excess > 0 {
+                self.activity.drain(0..excess);
+            }
         }
     }
 
@@ -6114,7 +6944,13 @@ impl AppState {
         duration_ms: Option<u64>,
     ) {
         let status = status.into();
-        let mut updated = false;
+        // Tool output previews carry raw ANSI/control bytes from dev servers
+        // and CLIs; sanitize at this shared chokepoint (agent tools AND the
+        // `!` local shell both land here) so the transcript never renders
+        // escape sequences.
+        let output_preview = output_preview
+            .map(|preview| crate::sanitize::strip_terminal_controls(&preview).into_owned());
+        let mut updated: Option<(Option<SessionKey>, Option<TurnId>)> = None;
         if let Some(item) = self
             .activity
             .iter_mut()
@@ -6134,9 +6970,14 @@ impl AppState {
             if duration_ms.is_some() {
                 item.duration_ms = duration_ms;
             }
-            updated = true;
+            updated = Some((item.session_id.clone(), item.turn_id.clone()));
         }
-        if updated {
+        // Mirror `push_activity`: only an update to a row that can render in
+        // the current view may adjust the read position (P2 tri-repo #246
+        // fold).
+        if let Some((item_session, item_turn)) = updated
+            && self.activity_renders_in_active_view(item_session.as_ref(), item_turn.as_ref())
+        {
             self.preserve_transcript_position_after_append(1);
         }
     }

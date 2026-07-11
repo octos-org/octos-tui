@@ -88,7 +88,8 @@ app:
     more_hunks_hidden: "+%{count} more hunk(s) hidden (Ctrl+O expand)"
   autonomy:
     goal_prefix: "Goal: "
-    loops_running: "Loops: %{count} running"
+    loops_running: "Loops: %{count} active"
+    loops_paused_suffix: " · %{count} paused"
     goal_meta: " (%{status} · %{used}/%{budget} tokens)"
   statusbar:
     agents: "%{count} agents"
@@ -97,15 +98,27 @@ app:
     retrying_attempt: "retrying (attempt %{attempt})"
     retrying: "retrying"
     msgs_tasks: "%{msgs} msgs/%{tasks} tasks"
+    loops_active: "⟳ %{count} active loop(s) — /loop pause to stop"
+    loops_paused: "%{count} paused loop(s) — /loop resume to re-arm"
     background_tasks: "%{count} background task(s)"
     ps_to_view: "/ps to view"
     esc_interrupt: "Esc interrupt"
     stop_to_close: "/stop to close"
     tool_output_expanded: "tool output expanded"
+  btw:
+    answering: "Answering…"
+    failed: "Aside failed: %{error}"
+    pane_title: "Aside — /btw"
+    close_hint: "Enter to close"
+    closed: "aside closed"
+  turn_summary:
+    ran_for: "Ran for %{duration}"
+    tasks_still_running: "%{count} background task(s) still running"
   status:
     state_label: "state"
     idle: "Idle"
     working: "Working"
+    waiting: "Waiting"
     blocked: "Blocked"
     done: "Done"
     error: "Error"
@@ -411,6 +424,8 @@ thinking:
   cleared: "Reasoning effort cleared — using the server default."
   unknown: "Unknown effort '%{value}'. Available: low, medium, high, max, default."
   no_session: "No active session — open or select a session first."
+  display_on: Reasoning now shows in the transcript for this session.
+  display_off: Reasoning hidden from the transcript (spinner + inspector only).
 
 status:
   opening_diff_preview: "Opening diff preview: %{operation} %{path}"
@@ -419,6 +434,7 @@ status:
   tool_started: "Tool started: %{name} (%{id})"
   question_asked: "Question asked: %{title}"
   turn_completed: "Turn completed in %{title} at seq %{seq}"
+  backend_relaunched_turn_lost: "Backend process restarted — the in-flight turn was lost; staged prompts go to the new backend."
   turn_completed_stale: "Ignored completed stale turn in %{title}"
   # Read-only mode feedback
   readonly_turn_disabled: "Read-only mode: turn/start disabled"
@@ -442,6 +458,12 @@ status:
   list_more: ", +%{count} more"
   no_session_send_prompt: "No coding session open. Run /onboard open-session before sending a prompt."
   message_staged: "Message staged; it will submit after the active turn. Press Esc to interrupt/send."
+  btw_usage: "Usage: /btw <question> — ask a quick aside while the turn keeps working"
+  btw_answering: "btw: answering…"
+  btw_answered: "btw: answered"
+  btw_busy: "btw: still answering the previous aside"
+  btw_failed: "btw: aside failed"
+  staged_submit_requeued: "Submit failed at the transport; the staged message was re-queued and will retry."
   queued_turn_start: "Queued turn/start"
   command_unavailable: "command is unavailable"
   no_session_runtime: "No coding session open. Run /onboard open-session before runtime commands."
@@ -722,6 +744,7 @@ status:
   activity_agent_list: "agent list"
   no_agents: "No active agents"
   activity_session_goal: "session goal"
+  compacting_context: "Compacting conversation…"
   activity_context_compacted: "context compacted"
   # Local-command activity titles (slash-name kept literal)
   local_stop: "local /stop"
@@ -764,6 +787,10 @@ status:
   summary_none_observed: "none observed"
   summary_not_reported: "not reported"
   summary_none_recorded: "none recorded"
+  # Shown (status line + terse transcript note) when the user interrupts their
+  # own turn (Esc/Ctrl+C). Deliberately terse: a user stop is not a failure, so
+  # it does not get the verbose Session-Summary card that genuine errors do.
+  turn_interrupted: "Turn interrupted"
 
 # --- menu chrome + command descriptions (full i18n pass) ---
 command:
@@ -1246,6 +1273,11 @@ menu:
       medium:
         desc: Balanced reasoning.
         label: Medium
+      display:
+        desc: "Show the model's reasoning as a transcript block for this session (Ctrl+O to expand)."
+        label: Reasoning display
+    divider:
+      display: "── Reasoning display ──"
     subtitle: Reasoning effort for thinking models (this session).
     title: Thinking effort
   title:

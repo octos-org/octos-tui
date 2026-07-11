@@ -26,7 +26,7 @@ use crate::{
     app,
     cli::Cli,
     client_event::ClientEvent,
-    insert_history::insert_history_lines,
+    insert_history::insert_history_lines_with_size,
     model::{AppState, AppUiCommand, ApprovalModalAction, FocusPane},
     store::Store,
     theme::Palette,
@@ -77,6 +77,7 @@ pub fn run(cli: Cli) -> Result<()> {
         mode: RenderMode::Inline,
         saved_inline_viewport: None,
         saved_visible_history_extent: None,
+        saved_inline_screen_size: None,
         mouse_captured: false,
     };
 
@@ -200,6 +201,15 @@ pub fn run(cli: Cli) -> Result<()> {
             dirty = true;
         }
 
+        // Tick-driven staged-drain backstop: a prompt re-staged after a
+        // transport-death (and any staged prompt whose wake site was missed)
+        // flows once its gate TTL clears, without needing a turn event or a
+        // session switch. The enqueued submit is sent by
+        // `drain_backend_events` below via the follow-up queue.
+        if store.drain_staged_backstop() {
+            dirty = true;
+        }
+
         if drain_backend_events(backend.as_mut(), &mut store)? {
             dirty = true;
         }
@@ -257,6 +267,20 @@ where
     let size = terminal.size()?;
     let width = size.width;
 
+    // This frame will take the FULL viewport reset inside
+    // `resize_viewport_to` (width change either direction, or terminal-
+    // height shrink — mirror of its exact condition): the reset clears the
+    // whole visible screen, erasing the transcript rows already flushed
+    // there. Forget the flushed watermark BEFORE the sync below, so this
+    // same frame re-inserts the committed history freshly wrapped at the
+    // new width — otherwise the chat visually vanishes, leaving a bare
+    // composer (the old-width copy survives only in real scrollback).
+    if size.width != terminal.last_known_screen_size.width
+        || size.height < terminal.last_known_screen_size.height
+    {
+        scrollback.mark_flushed_stale();
+    }
+
     // The scrollback flush must wrap to the SAME width `insert_history_lines`
     // uses (the full viewport width), so the line accounting stays consistent.
     let wrap_width = usize::from(width).max(1);
@@ -284,7 +308,7 @@ where
                 &store.state,
                 palette,
                 height,
-                size.height,
+                size,
                 update.lines_to_insert,
                 live_tail_finalization,
             )
@@ -295,7 +319,7 @@ where
             &store.state,
             palette,
             height,
-            size.height,
+            size,
             update.lines_to_insert,
             live_tail_finalization,
         )
@@ -307,16 +331,19 @@ fn draw_inline_frame<B>(
     state: &crate::model::AppState,
     palette: Palette,
     height: u16,
-    terminal_height: u16,
+    size: ratatui::layout::Size,
     lines_to_insert: Vec<ratatui::text::Line<'static>>,
     live_tail_finalization: Option<app::LiveTurnFinalization>,
 ) -> Result<()>
 where
     B: Backend + io::Write,
 {
-    terminal.resize_viewport_to(height)?;
+    // `size` is the SAME snapshot the caller used for the scrollback
+    // stale-mark — one sample drives both the reset decision and the
+    // re-flush, so they can never disagree about a mid-frame resize.
+    terminal.resize_viewport_to_size(height, size)?;
     if !lines_to_insert.is_empty() {
-        insert_history_lines(terminal, lines_to_insert)?;
+        insert_history_lines_with_size(terminal, lines_to_insert, size)?;
         terminal.invalidate_viewport();
     }
     terminal.draw(|frame| {
@@ -324,7 +351,7 @@ where
             frame,
             state,
             palette,
-            terminal_height,
+            size.height,
             live_tail_finalization.as_ref(),
         );
     })?;
@@ -1013,6 +1040,12 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::Up => {
             move_up(store);
         }
+        KeyCode::PageDown if btw_aside_open(&store.state) => {
+            scroll_open_btw_aside(store, 8);
+        }
+        KeyCode::PageUp if btw_aside_open(&store.state) => {
+            scroll_open_btw_aside(store, -8);
+        }
         KeyCode::PageDown => match store.state.focus {
             FocusPane::Workspace => store.state.workspace.scroll_down(8),
             FocusPane::Git => store.state.git.scroll_down(8),
@@ -1359,7 +1392,44 @@ fn handle_composer_vim_key(store: &mut Store, key: &KeyEvent) -> Option<KeyActio
     Some(KeyAction::Continue)
 }
 
+/// Whether the active session has a `/btw` overlay on screen (so PageUp/PageDown
+/// scroll it instead of the transcript). The overlay is non-modal — it floats
+/// over the live tail — so it takes the paging keys only while present.
+fn btw_aside_open(state: &crate::model::AppState) -> bool {
+    state
+        .active_session()
+        .is_some_and(|session| state.btw_aside_for(&session.id).is_some())
+}
+
+/// Scroll the active session's `/btw` overlay by `delta` rows (render clamps to
+/// the true content max).
+fn scroll_open_btw_aside(store: &mut Store, delta: i32) {
+    if let Some(session_id) = store
+        .state
+        .active_session()
+        .map(|session| session.id.clone())
+    {
+        store.state.nudge_btw_scroll(&session_id, delta);
+    }
+}
+
 fn handle_composer_enter(store: &mut Store) -> KeyAction {
+    // Codex-style dialog dismissal: Enter on an EMPTY composer closes the
+    // `/btw` aside pane and returns to the live session (submitting a real
+    // prompt already dismisses it via `clear_settled_btw_aside`). Codex's
+    // bottom-pane views close on plain Enter; the aside is non-modal, so the
+    // empty-composer guard keeps Enter-to-send untouched.
+    if store.state.composer.is_empty() {
+        let dismissed = store
+            .state
+            .active_session()
+            .map(|session| session.id.clone())
+            .is_some_and(|session_id| store.state.dismiss_btw_aside(&session_id));
+        if dismissed {
+            store.state.status = t!("app.btw.closed").into_owned();
+            return KeyAction::Continue;
+        }
+    }
     let command = store.compose_command();
     if store.state.exit_requested {
         KeyAction::Quit
@@ -1468,6 +1538,12 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         }
         KeyCode::Enter => {
             if slash_help_query_active(store) && slash_help_enter_executes(store) {
+                // Executing the slash draft: the popup's job is done — CLOSE
+                // it before submitting. Leaving it open buried the command's
+                // result surface (e.g. the /btw aside pane) under a stale
+                // "No options available" box, which read as the command not
+                // running at all (live-terminal bug).
+                store.close_menu();
                 return handle_composer_enter(store);
             }
             let command = store.accept_active_menu_item();
@@ -1532,12 +1608,13 @@ fn slash_help_enter_executes(store: &Store) -> bool {
         return true;
     }
     let registry = crate::menu::CommandRegistry::with_core_commands();
-    if matches!(
-        registry.resolve(draft),
-        crate::menu::CommandResolution::Found { .. }
-    ) {
-        // Exact command (or alias) name: run it directly.
-        return true;
+    if let crate::menu::CommandResolution::Found { command, .. } = registry.resolve(draft) {
+        // Resolvable name with NO arguments typed yet: dispatch directly
+        // unless the command REQUIRES arguments — bare dispatch of those is
+        // only a usage error, so they route to the accept path and complete
+        // as "/name " for argument typing (codex completes there too, via
+        // Tab; Enter doubles as our completion key for required-arg drafts).
+        return command.inline_args != crate::menu::types::InlineArgMode::Required;
     }
     // Partial name: execute only if the popup has nothing left to offer.
     store
@@ -1568,12 +1645,17 @@ fn slash_help_menu_active(store: &Store) -> bool {
 
 fn sync_slash_help_search_query(store: &mut Store) {
     if let Some(frame) = store.state.menu_stack.active_mut() {
-        frame.search_query = store
+        // Filter by the COMMAND TOKEN only (codex command_popup behavior):
+        // once the user types arguments ("/btw what are you…"), matching the
+        // whole draft against the registry yields "No options available" for
+        // a perfectly valid command. The first token keeps the command
+        // matched + highlighted while arguments are typed.
+        let draft = store
             .state
             .composer
             .strip_prefix('/')
-            .unwrap_or(store.state.composer.as_str())
-            .to_string();
+            .unwrap_or(store.state.composer.as_str());
+        frame.search_query = draft.split_whitespace().next().unwrap_or("").to_string();
         frame.selected_index = 0;
     }
     store.refresh_active_menu();
@@ -1886,6 +1968,10 @@ fn toggle_transcript_pager(store: &mut Store) {
 }
 
 fn scroll_current_surface_down(store: &mut Store, lines: usize) {
+    if btw_aside_open(&store.state) {
+        scroll_open_btw_aside(store, lines as i32);
+        return;
+    }
     if store.state.task_output.active {
         store.state.task_output.scroll_down(lines);
         return;
@@ -1924,6 +2010,10 @@ fn scroll_current_surface_down(store: &mut Store, lines: usize) {
 }
 
 fn scroll_current_surface_up(store: &mut Store, lines: usize) {
+    if btw_aside_open(&store.state) {
+        scroll_open_btw_aside(store, -(lines as i32));
+        return;
+    }
     if store.state.task_output.active {
         store.state.task_output.scroll_up(lines);
         return;
@@ -1981,6 +2071,14 @@ struct TerminalGuard {
     mode: RenderMode,
     saved_inline_viewport: Option<ratatui::layout::Rect>,
     saved_visible_history_extent: Option<(u16, u16)>,
+    /// Screen size the INLINE layout was last laid out for, saved on entering
+    /// the alt screen. The overlay draw path consumes resizes by updating
+    /// `last_known_screen_size` itself, so without restoring this on leave a
+    /// resize that happened while the overlay was up would be invisible to
+    /// the inline flow — `resize_viewport_to` would take the incremental path
+    /// against a stale viewport while the emulator had already rewrapped the
+    /// hidden normal screen (reflow ghosts).
+    saved_inline_screen_size: Option<ratatui::layout::Size>,
     /// Mouse capture is on ONLY while the transcript pager is up (so the wheel
     /// scrolls the pager). It must never be on in the inline chat flow, where
     /// it would defeat native terminal selection/copy.
@@ -2021,6 +2119,10 @@ impl TerminalGuard {
             terminal.visible_history_rows(),
             terminal.visible_history_bottom(),
         ));
+        // Save BEFORE the overwrite below: this is the size the inline layout
+        // was laid out for, restored by `leave_alt_screen` so the next inline
+        // draw can detect any resize that happened while the overlay was up.
+        self.saved_inline_screen_size = Some(terminal.last_known_screen_size);
         execute!(terminal.backend_mut(), EnterAlternateScreen)?;
         let size = terminal.size()?;
         terminal.set_viewport_area(ratatui::layout::Rect::new(0, 0, size.width, size.height));
@@ -2049,6 +2151,16 @@ impl TerminalGuard {
         terminal.set_viewport_area(self.saved_inline_viewport.take().unwrap_or(fallback));
         if let Some((rows, bottom)) = saved_visible_history_extent {
             terminal.set_visible_history_extent(rows, bottom);
+        }
+        // Restore the inline-era screen size so `resize_viewport_to` compares
+        // the real size against what the inline layout last saw, not against
+        // whatever the overlay draw path recorded while consuming a resize on
+        // the alt screen. A size that changed anywhere across the overlay
+        // round-trip then takes the full-reset path (the emulator rewrapped
+        // the hidden normal screen); an unchanged size stays a cheap
+        // invalidate-only repaint exactly as before.
+        if let Some(size) = self.saved_inline_screen_size.take() {
+            terminal.last_known_screen_size = size;
         }
         terminal.invalidate_viewport();
         self.mode = RenderMode::Inline;
@@ -2574,6 +2686,7 @@ mod tests {
             mode: RenderMode::Inline,
             saved_inline_viewport: None,
             saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
             mouse_captured: false,
         };
         let mut scrollback = ScrollbackTracker::new();
@@ -2630,6 +2743,7 @@ mod tests {
             mode: RenderMode::Inline,
             saved_inline_viewport: None,
             saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
             mouse_captured: false,
         };
         let mut scrollback = ScrollbackTracker::new();
@@ -2660,6 +2774,7 @@ mod tests {
             mode: RenderMode::Inline,
             saved_inline_viewport: None,
             saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
             mouse_captured: false,
         };
 
@@ -2683,15 +2798,77 @@ mod tests {
             .resize_viewport_to(4)
             .expect("resize restored inline viewport");
         assert_eq!(terminal.viewport_area, Rect::new(0, 16, 60, 4));
-        assert_eq!(terminal.backend().cursor, Position { x: 0, y: 16 });
+        // The screen was resized (80x24 -> 60x20) while the overlay was up,
+        // so the restore takes the width-change full-reset path: whole-screen
+        // clear from the origin and a dropped visible-history extent (the
+        // emulator rewrapped the inline screen behind the alt screen).
+        assert_eq!(terminal.backend().cursor, Position { x: 0, y: 0 });
         assert_eq!(
             terminal.backend().clears,
-            vec![ClearType::All, ClearType::AfterCursor]
+            vec![ClearType::All, ClearType::All]
         );
+        assert_eq!(terminal.visible_history_rows(), 0);
+        assert_eq!(terminal.visible_history_bottom(), 0);
 
         let written = String::from_utf8_lossy(&terminal.backend().buf);
         assert!(written.contains("\u{1b}[?1049h"));
         assert!(written.contains("\u{1b}[?1049l"));
+    }
+
+    #[test]
+    fn overlay_resize_consumed_by_alt_screen_still_full_resets_inline() {
+        // codex finding on the resize-ghost fix: a resize handled WHILE the
+        // overlay was up updates `last_known_screen_size` on the alt screen
+        // (the `draw()` overlay path), so the inline restore no longer sees a
+        // size delta — yet the emulator rewrapped the hidden NORMAL screen.
+        // `leave_alt_screen` must restore the screen size the INLINE layout
+        // was last laid out for, so the next inline draw still takes the
+        // width-change full-reset path.
+        let mut terminal =
+            InlineTerminal::new(RecordingBackend::new(80, 24)).expect("recording terminal");
+        terminal.set_viewport_area(Rect::new(0, 20, 80, 4));
+        terminal.set_visible_history_extent(3, 20);
+        terminal.last_known_screen_size = Size::new(80, 24);
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+            saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
+            mouse_captured: false,
+        };
+
+        guard
+            .enter_alt_screen(&mut terminal)
+            .expect("enter alt screen");
+        // Simulate the overlay draw's resize handling (event_loop::draw):
+        // the screen narrows while the overlay is up and the overlay path
+        // consumes the delta by updating last_known_screen_size itself.
+        terminal.backend_mut().size = Size::new(60, 24);
+        terminal.set_viewport_area(Rect::new(0, 0, 60, 24));
+        terminal
+            .clear_visible_screen()
+            .expect("overlay resize clear");
+        terminal.invalidate_viewport();
+        terminal.last_known_screen_size = Size::new(60, 24);
+
+        guard
+            .leave_alt_screen(&mut terminal)
+            .expect("leave alt screen");
+        terminal
+            .resize_viewport_to(4)
+            .expect("resize restored inline viewport");
+
+        // Width changed 80 -> 60 relative to the inline layout: full reset.
+        assert_eq!(terminal.viewport_area, Rect::new(0, 20, 60, 4));
+        assert_eq!(
+            terminal.backend().clears.last(),
+            Some(&ClearType::All),
+            "inline restore after an overlay-consumed resize must full-clear; clears: {:?}",
+            terminal.backend().clears
+        );
+        assert_eq!(terminal.backend().cursor, Position { x: 0, y: 0 });
+        assert_eq!(terminal.visible_history_rows(), 0);
+        assert_eq!(terminal.visible_history_bottom(), 0);
     }
 
     #[test]
@@ -3002,7 +3179,10 @@ mod tests {
         // instead of ESC[ / ESC]. The whole sequence must drop, not just the
         // introducer (else the params/text like "31m…" leak into the composer).
         let mut store = store_with_sessions(1);
-        handle_terminal_event(&mut store, Event::Paste("\u{9b}31mred\u{9d}0;t\u{7}END".into()));
+        handle_terminal_event(
+            &mut store,
+            Event::Paste("\u{9b}31mred\u{9d}0;t\u{7}END".into()),
+        );
         assert_eq!(store.state.composer, "redEND");
     }
 
@@ -3506,6 +3686,125 @@ mod tests {
         ));
         assert!(!store.state.expanded_tool_outputs);
         assert_eq!(store.state.status, "Collapsed tool output + diff");
+    }
+
+    /// Codex-style dialog dismissal: Enter on an EMPTY composer closes the
+    /// `/btw` aside pane; Enter with text still submits (and dismisses via the
+    /// submit path). Mirrors codex's bottom-pane "Enter to close" convention.
+    #[test]
+    fn empty_composer_enter_dismisses_btw_aside() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.set_btw_answering(&session_id, "quick q".into());
+        assert!(store.state.btw_asides.contains_key(&session_id));
+
+        assert!(matches!(
+            handle_key(&mut store, modified_key(KeyCode::Enter, KeyModifiers::NONE)),
+            KeyAction::Continue
+        ));
+        assert!(
+            !store.state.btw_asides.contains_key(&session_id),
+            "empty-composer Enter must close the aside pane"
+        );
+
+        // Without an aside, empty Enter stays a no-op (no send, no crash).
+        assert!(matches!(
+            handle_key(&mut store, modified_key(KeyCode::Enter, KeyModifiers::NONE)),
+            KeyAction::Continue
+        ));
+    }
+
+    /// Codex Enter semantics: Enter on a highlighted ARGUMENT-LESS command
+    /// dispatches it immediately — one Enter from partial name to the
+    /// command's page (here `/them` → the theme menu), never the old
+    /// complete-into-composer + second-Enter round trip. Argful commands
+    /// complete with a trailing space instead (args must be typed anyway;
+    /// the next Enter executes the draft directly).
+    #[test]
+    fn slash_popup_enter_dispatches_selection_like_codex() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        for ch in "/them".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        handle_key(&mut store, key(KeyCode::Enter));
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_THEME),
+            "one Enter on a partial argless command must open its page"
+        );
+        assert!(
+            store.state.composer.is_empty(),
+            "dispatch must not leave the completed name in the composer"
+        );
+
+        // Optional-arg command: bare dispatch is valid (opens its page) —
+        // one Enter must go straight there too, composer cleared.
+        store.close_menu();
+        store.state.set_composer_text("");
+        for ch in "/lang".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        handle_key(&mut store, key(KeyCode::Enter));
+        assert!(
+            store.state.composer.is_empty(),
+            "optional-arg command dispatches bare, composer cleared"
+        );
+        assert_ne!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_HELP),
+            "dispatch must leave the help popup (command page or closed)"
+        );
+    }
+
+    /// Live-terminal bug: typing `/btw <args>` filtered the registry with the
+    /// WHOLE draft (args included) — "No options available" — and Enter
+    /// executed the draft but left the stale popup open, burying the aside
+    /// pane. The popup must (a) keep filtering by the command token only and
+    /// (b) close when Enter executes the draft.
+    #[test]
+    fn slash_draft_with_args_keeps_match_and_enter_closes_menu() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+
+        for ch in "/btw what are you doing".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        assert_eq!(store.state.composer, "/btw what are you doing");
+        // (a) the filter uses the command token, so /btw stays matched.
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.search_query.as_str()),
+            Some("btw"),
+            "popup must filter by the command token, not the whole draft"
+        );
+
+        // (b) Enter executes the draft AND closes the popup.
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+        assert!(
+            store.state.menu_stack.active().is_none(),
+            "executing the slash draft must close the popup"
+        );
+        assert!(
+            !matches!(action, KeyAction::Quit),
+            "draft execution must not quit"
+        );
+        assert!(
+            store.state.composer.is_empty(),
+            "submitting the draft must clear the composer"
+        );
     }
 
     #[test]

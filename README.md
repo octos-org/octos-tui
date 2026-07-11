@@ -2,6 +2,13 @@
 
 <div align="center">
 <pre>
+             .---.
+            / o o \
+            \  ~  /
+        .-._/`---'\_.-.
+       ( ( (  ) (  ) ) )
+        `-´ (_) (_) `-´
+
  ██████╗  ██████╗████████╗ ██████╗ ███████╗
 ██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔════╝
 ██║   ██║██║        ██║   ██║   ██║███████╗
@@ -12,10 +19,52 @@
 <em>Welcome to Octos — Your Coding Buddy</em>
 </div>
 
-`octos-tui` is a standalone terminal UI client for the Octos UI Protocol.
-It is a chat-first coding client that you point at an `octos serve` backend; the
-server owns the agent, providers, and tools, and the TUI renders the
-conversation, command/tool cards, diffs, and approvals.
+`octos-tui` is the terminal app for [Octos](https://github.com/octos-org/octos)
+— an AI coding assistant in your terminal, in the spirit of Claude Code and
+Codex. The Octos server runs the agent, the models, and the tools; `octos-tui`
+is the fast, keyboard-driven way to talk to it: chat, diffs, tool approvals,
+background tasks — all without leaving the shell.
+
+## Start here
+
+Two pieces: the Octos **server** (the brain) and this **TUI** (the terminal
+client). One command installs both:
+
+```bash
+npm install -g @octos-org/octos @octos-org/octos-tui
+# or with Homebrew (each repo is its own tap):
+#   brew tap octos-org/octos     https://github.com/octos-org/octos
+#   brew tap octos-org/octos-tui https://github.com/octos-org/octos-tui
+#   brew install octos-org/octos/octos octos-org/octos-tui/octos-tui
+```
+
+Then start the TUI with its own private local server:
+
+```bash
+octos-tui --mode protocol \
+  --stdio-command "octos serve --stdio --solo --data-dir ~/.octos-tui-data"
+```
+
+You'll land on the **"Welcome to Octos"** screen. In the next five minutes:
+create your local profile (three fields — the email is local metadata only),
+pick an AI provider, paste its API key, and open your first coding chat.
+The [Quickstart](#quickstart-solo-onboarding) below walks every screen.
+
+> **Heads-up:** plain `octos-tui` with no flags opens a **mock demo** with
+> canned replies — nice for a look around, but not connected to anything.
+> Use the command above for the real thing.
+
+### If something looks wrong
+
+| Symptom | Fix |
+|---|---|
+| `command not found: octos` | The server isn't installed — `npm install -g @octos-org/octos` (or the [server install guide](https://github.com/octos-org/octos#start-here)). |
+| Replies are instant and feel canned | You're in mock mode (no flags). Start with the `--stdio-command ...` command above. |
+| "Test provider" fails during onboarding | Re-check the API key and the provider choice; you can redo it anytime with `/onboard` or `/setup`. |
+
+More in the full [Troubleshooting](#troubleshooting) table below.
+
+---
 
 On a fresh first launch the main window shows the **OCTOS** block-letter
 wordmark with the tagline *"Welcome to Octos — Your Coding Buddy"* above a
@@ -43,13 +92,23 @@ arm64), and Windows (x86-64), distributed via:
 # npm
 npm install -g @octos-org/octos-tui
 
-# Homebrew
-brew install octos-org/tap/octos-tui
+# Homebrew (this repo is its own tap)
+brew tap octos-org/octos-tui https://github.com/octos-org/octos-tui
+brew install octos-org/octos-tui/octos-tui
 
 # shell installer (macOS / Linux)
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/octos-org/octos-tui/releases/latest/download/octos-tui-installer.sh | sh
+
+# PowerShell installer (Windows)
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/octos-org/octos-tui/releases/latest/download/octos-tui-installer.ps1 | iex"
 ```
+
+Once installed, `octos-tui update` checks for a newer release — and for
+shell/PowerShell-installer installs it self-updates in place; npm/brew/cargo
+installs are owned by their package manager, so it prints the matching
+upgrade command instead. `octos-tui doctor` diagnoses the local environment
+and connection prerequisites.
 
 ### From source with Cargo (needs Rust 1.85+)
 
@@ -71,9 +130,14 @@ cargo install octos-tui
 A copy-pasteable, first-time walkthrough. By the end you have a local profile,
 an LLM provider, and a live coding session — no dashboard, no email OTP.
 
-### 1. Get the source and build
+### 1. Install the binaries
 
-`octos-tui` is a single binary. `octos-core` (the shared protocol crate) is
+Install the TUI and the server as shown in [Start here](#start-here) — the
+npm and brew routes install **both** pieces. (The shell/PowerShell installers
+in [Install](#install) ship the TUI **only**; pair them with a server install
+from the [octos repo](https://github.com/octos-org/octos#start-here).)
+
+Building from source works too — `octos-core` (the shared protocol crate) is
 pulled automatically as a git dependency, so a plain clone builds with **no
 sibling checkout** required (needs Rust 1.85+):
 
@@ -81,7 +145,7 @@ sibling checkout** required (needs Rust 1.85+):
 git clone https://github.com/octos-org/octos-tui.git
 cd octos-tui
 cargo build --release
-# produces ./target/release/octos-tui
+# produces ./target/release/octos-tui — substitute it for `octos-tui` below
 ```
 
 > **Developing against a local `octos`?** To build against an uncommitted
@@ -97,7 +161,7 @@ empty** data directory and pass **no** `--profile-id`. The TUI launches the
 server as a child process over stdio, so you only run one command:
 
 ```bash
-./target/release/octos-tui \
+octos-tui \
   --mode protocol \
   --stdio-command "octos serve --stdio --solo --data-dir ./octos-data"
 ```
@@ -263,8 +327,16 @@ Set the palette at launch with `--theme <name>`, or switch live with `/theme`
 ### In-session keys and slash commands
 
 ```text
-[ / ]   select previous / next inline diff hunk
-c       stage the selected hunk as next-turn context
+Tab        switch to the inspector pane (Esc returns to chat)
+PgUp/PgDn  scroll the transcript (PgUp also opens the pager)
+y / s / n  approve once / approve for session / deny a pending tool approval
+Alt+A      re-show the pending approval prompt
+[ / ]      select previous / next inline diff hunk
+c          stage the selected hunk as next-turn context
+Ctrl+U     clear the composer
+Ctrl+C     interrupt the active turn
+Esc        with no active turn: cancel the first running background task
+q          quit
 ```
 
 ```text
@@ -280,7 +352,35 @@ c       stage the selected hunk as next-turn context
 /vimmode    toggle Vim modal editing in the composer (Normal/Insert)
 /saveconfig persist the active theme / language / scroll-mode / vim-mode to the config file
 /onboard    set onboarding fields inline (name, username, email, key, ...)
+/copy       copy the last assistant reply to the clipboard (works over SSH)
+/status     snapshot-backed session, runtime, and connection status
+/cost       server-reported token and cost usage
+/title      configure terminal-title items
+/keymap     inspect and edit TUI key bindings
+/login      sign in with email OTP, or inspect current auth state
+/exit       quit the TUI
 ```
+
+Sessions and autonomy (shown when the server advertises the capability):
+
+```text
+/resume     switch to a prior session and reload its transcript (alias: /sessions)
+/rewind     go back to an earlier checkpoint in this session to edit & resend (alias: /backtrack)
+/loop       create, list, pause, resume, fire-now, or delete backend loops
+/goal       view, set, pause, resume, or clear the persisted session goal
+```
+
+`/resume` lists sessions newest-first; `/rewind` shows codex-style checkpoint
+rows (`#n  message preview`) and rolls the session back to the one you pick, so
+you can edit and resend from there. When a session has loops, the status bar
+shows a loop chip (active/paused), and the context gauge reflects the **real
+per-model context window** reported by the server, not a fixed default.
+
+`/activity` (search sessions/tasks/activity) and `/statusline` (status-bar
+items) are always available. Further capability-gated commands
+(`/provider`, `/permissions`, `/mcp`, `/tools`, `/skills`, `/task`,
+`/threads`, `/turn`, `/agents`, `/review`) appear in the `/` popup only when
+the connected server supports them — `/help` always lists what is live.
 
 `/model`, `/theme`, `/lang`, and `/thinking` open a selection menu when run with
 no argument (or apply inline with an arg). In every selection menu the **active
@@ -298,10 +398,13 @@ the model.
 ### Composer editing
 
 The composer is multi-line: **Enter** sends, **Shift+Enter** (or **Ctrl+J** as a
-portable fallback) inserts a newline, and the box grows as you add lines. Arrow
-**Up/Down** move the cursor between lines (and fall back to scrolling the
-transcript at the first/last line). Emacs-style keys also work (Ctrl+A/E,
-Alt+B/F, Ctrl+W, Ctrl+K, …).
+portable fallback) inserts a newline, and the box grows as you add lines.
+
+Arrow **Up** from an **empty** composer recalls your command history —
+newest first, persisted across sessions, shell-style; once browsing, **Down**
+steps back toward newer entries. With text present the arrows move the cursor
+between lines (and fall back to scrolling the transcript at the first/last
+line). Emacs-style keys also work (Ctrl+A/E, Alt+B/F, Ctrl+W, Ctrl+K, …).
 
 **Vim mode** is opt-in — `--vim-mode`, config `"vim-mode": true`, or `/vimmode`
 at runtime; the composer title then shows `NORMAL` / `INSERT`. It implements a
@@ -327,7 +430,8 @@ stays pinned to the bottom; **Esc** (or Ctrl+T again) closes it.
 `--scroll-mode pinned` (or `/scrollmode pinned`) opts into app-side wheel
 handling: the wheel always scrolls the transcript and the composer never moves,
 at the cost of native mouse selection (use Shift+drag). Settled tool-activity
-groups collapse to a one-line summary; **Ctrl+O** expands them.
+groups collapse to a one-line summary; **Ctrl+O** expands them — the same
+toggle also expands the diff preview's selected hunk in full.
 
 ### Markdown rendering
 
@@ -336,6 +440,10 @@ checkboxes, blockquotes, tables, fenced code blocks with **syntax highlighting**
 (theme-matched, following `/theme`), inline bold/italic/code, `~~strikethrough~~`,
 `---` rules, and `[links](url)`. Link urls render in full so the terminal can
 make them cmd/ctrl+clickable in the native scroll flow.
+
+While a thinking model reasons, the transcript shows a terse codex-style
+`· thinking…` indicator instead of the verbose reasoning stream; the reply
+replaces it when the answer starts. Control the effort with `/thinking`.
 
 ### Languages (i18n)
 

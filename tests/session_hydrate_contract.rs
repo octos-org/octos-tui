@@ -73,6 +73,7 @@ fn session_hydrate_result_replaces_durable_messages() {
         },
         context: None,
         context_state: None,
+        replayed_tool_envelopes: None,
         messages: Some(vec![HydratedMessage {
             seq: 1,
             role: "assistant".into(),
@@ -84,6 +85,7 @@ fn session_hydrate_result_replaces_durable_messages() {
             message_id: Some("msg-1".into()),
             source: Some("assistant".into()),
             media: Vec::new(),
+            reasoning_content: None,
         }]),
         threads: None,
         turns: None,
