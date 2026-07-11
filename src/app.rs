@@ -5956,6 +5956,18 @@ fn push_turn_activity_log_section_unflushed(
         })
         .map(|(_, item)| item)
         .collect::<Vec<_>>();
+    // Separate this covered log from whatever precedes it — the flushed
+    // variant already does, but a BURST of still-covered sub-agent logs (an
+    // active parent turn) routes HERE, where the missing separator packed the
+    // "Agent task …" cards into an unreadable wall (user report: "add a space
+    // between each agent complete status"). Guarded so it never doubles a
+    // caller's blank, and only when this section will render something.
+    if (!items.is_empty() || app.turn_summary_for(&log.turn_id).is_some())
+        && !lines.is_empty()
+        && !line_is_blank(lines.last())
+    {
+        lines.push(Line::from(""));
+    }
     push_finalized_activity_items_section(
         lines,
         palette,
@@ -6182,14 +6194,6 @@ fn push_agent_task_group(
     let active_subagents = subagent_titles.len();
     if items.is_empty() && subagent_titles.is_empty() {
         return;
-    }
-    // Separate consecutive groups with a blank line so a burst of sub-agent
-    // "Agent task …" cards doesn't pack into an unreadable wall (user report:
-    // "too busy"). Guarded against doubling, so a caller that already emitted
-    // a leading blank (e.g. `push_turn_activity_log_section`) doesn't stack a
-    // second one.
-    if !lines.is_empty() && !line_is_blank(lines.last()) {
-        lines.push(Line::from(""));
     }
     // Header counts tally the FULL turn set, not the display-capped `items`.
     let (total, completed, active, failed) = task_group_counts(full_items);
@@ -15863,58 +15867,50 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_agent_task_groups_are_blank_separated() {
-        // A burst of sub-agent turns must not pack into a wall — each
-        // `push_agent_task_group` gets a guarded leading blank (user report:
-        // "add a space between each agent complete status").
+    fn consecutive_covered_agent_task_logs_are_blank_separated() {
+        // The real burst path: a still-covered sub-agent log routes through
+        // push_turn_activity_log_section_unflushed (an active parent turn).
+        // Two such logs in a row must be blank-separated, not packed into a
+        // wall (user report: "add a space between each agent complete status").
         let palette = Palette::for_theme(ThemeName::Codex);
+        let app = autonomy_app_state();
+        let session_id = app.sessions[0].id.clone();
+
+        let mk_log = |tag: &str| {
+            let turn = octos_core::ui_protocol::TurnId::new();
+            crate::model::TurnActivityLog {
+                session_id: session_id.clone(),
+                turn_id: turn.clone(),
+                request: None,
+                anchor_index: None,
+                items: vec![
+                    ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                        .with_tool_call(tag)
+                        .with_detail(format!("echo {tag}"))
+                        .with_success(true)
+                        .with_turn(turn),
+                ],
+            }
+        };
+        let log_a = mk_log("a");
+        let log_b = mk_log("b");
+        // A coverage that flushes nothing, so both logs render their items.
+        let coverage = LiveTurnFinalization {
+            session_id: session_id.0.clone(),
+            turn_id: log_a.turn_id.0.to_string(),
+            reply_flushed_text: String::new(),
+            activity_flushed_items: 0,
+            activity_flushed_keys: Vec::new(),
+        };
+
         let mut lines = Vec::new();
+        push_turn_activity_log_section_unflushed(&mut lines, palette, &log_a, &app, &coverage, 120);
+        let boundary = lines.len();
+        push_turn_activity_log_section_unflushed(&mut lines, palette, &log_b, &app, &coverage, 120);
 
-        let turn_a = octos_core::ui_protocol::TurnId::new();
-        let turn_b = octos_core::ui_protocol::TurnId::new();
-        let item_a = ActivityItem::new(ActivityKind::Tool, "shell", "complete")
-            .with_tool_call("a")
-            .with_detail("echo a")
-            .with_success(true)
-            .with_turn(turn_a.clone());
-        let item_b = ActivityItem::new(ActivityKind::Tool, "shell", "complete")
-            .with_tool_call("b")
-            .with_detail("echo b")
-            .with_success(true)
-            .with_turn(turn_b.clone());
-
-        push_agent_task_group(
-            &mut lines,
-            palette,
-            Some(&turn_a),
-            &[&item_a],
-            &[&item_a],
-            &[],
-            0,
-            false,
-            true,
-            false,
-            120,
-        );
-        let after_first = lines.len();
-        push_agent_task_group(
-            &mut lines,
-            palette,
-            Some(&turn_b),
-            &[&item_b],
-            &[&item_b],
-            &[],
-            0,
-            false,
-            true,
-            false,
-            120,
-        );
-
-        // The second group opens with a blank line (the separator).
         assert!(
-            line_is_blank(lines.get(after_first)),
-            "a blank line must separate consecutive groups; got: {:?}",
+            line_is_blank(lines.get(boundary)),
+            "consecutive covered logs must be blank-separated; got: {:?}",
             lines_text(&lines)
         );
     }
