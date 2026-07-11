@@ -4097,7 +4097,7 @@ fn mutating_action_missing_reason(ctx: &MenuContext<'_>, method: &'static str) -
 
 fn permission_menu_missing_reason(ctx: &MenuContext<'_>) -> String {
     if ctx.availability.capabilities.is_none() {
-        "Octos UI capabilities are not available".into()
+        t!("menu.availability.ui_unavailable").into_owned()
     } else if let Some((method, reason)) =
         APPUI_PERMISSION_MENU_METHODS_ANY.iter().find_map(|method| {
             ctx.availability
@@ -4105,7 +4105,12 @@ fn permission_menu_missing_reason(ctx: &MenuContext<'_>) -> String {
                 .map(|reason| (*method, reason))
         })
     {
-        format!("Octos UI method `{method}` is unsupported: {reason}")
+        t!(
+            "menu.availability.method_unsupported",
+            method = method,
+            reason = reason
+        )
+        .into_owned()
     } else {
         format!(
             "Octos UI permission methods are not advertised: {}",
@@ -4512,9 +4517,14 @@ fn permission_method_row(ctx: &MenuContext<'_>, method: &'static str) -> MenuPre
 
 fn method_missing_reason(ctx: &MenuContext<'_>, method: &str) -> String {
     if let Some(reason) = ctx.availability.unsupported_method_reason(method) {
-        format!("Octos UI method `{method}` is unsupported: {reason}")
+        t!(
+            "menu.availability.method_unsupported",
+            method = method,
+            reason = reason
+        )
+        .into_owned()
     } else if ctx.availability.capabilities.is_none() {
-        "Octos UI capabilities are not available".into()
+        t!("menu.availability.ui_unavailable").into_owned()
     } else {
         format!("Octos UI method `{method}` is not advertised by this backend.")
     }

@@ -797,6 +797,8 @@ command:
   agents:
     desc: Inspect or interrupt backend-owned subagents.
   aliases_label: 'Aliases:'
+  copy:
+    desc: Copy the last assistant reply to your clipboard (works over SSH).
   cost:
     desc: Show server-reported token and cost usage.
   exit:
@@ -856,6 +858,23 @@ command:
   turn:
     desc: Inspect backend turn lifecycle state.
 menu:
+  availability:
+    approval_has_focus: approval modal has keyboard focus
+    blocked_read_only: blocked in read-only mode
+    feature_flag_disabled: "feature flag `%{flag}` is disabled"
+    feature_unavailable: "Octos UI feature `%{feature}` is not available"
+    method_unavailable: "Octos UI method `%{method}` is not available"
+    method_unsupported: "Octos UI method `%{method}` is unsupported: %{reason}"
+    requires_active_turn: requires an active turn or background task
+    requires_approval_modal: requires a visible approval modal
+    requires_disconnected: requires disconnected mode
+    requires_idle_turn: requires the current turn to be idle
+    requires_mock_mode: requires mock mode
+    requires_one_of: "requires one of %{methods}"
+    requires_open_session: requires an open session
+    requires_protocol_mode: requires protocol mode
+    requires_ui_server: requires a connected Octos UI server
+    ui_unavailable: Octos UI capabilities are not available
   component:
     footer: Space toggle | Enter save | Esc close
     preview_title: Preview
@@ -883,16 +902,23 @@ menu:
     title: Cost
     unavailable_no_session: Usage totals require an open Octos UI session.
     unavailable_title: Cost unavailable
+  empty: No options available
+  filter:
+    placeholder: Filter options
   footer:
     enter_apply_esc_close: Enter apply | Esc close
     enter_run_esc_close: Enter run | Esc close
     esc_back: Esc back
     esc_close: Esc close
+    multi: "Up/Down move | Enter confirm | Esc cancel"
+    select: "Enter accept | Esc cancel | Up/Down move"
   help:
     footer: Enter open/run | Esc close
     search: Filter commands
     subtitle: Commands are resolved by the shared registry.
     title: Slash Commands
+  item:
+    default_suffix: " default"
   keymap:
     item:
       composer_delete_word:
@@ -1168,6 +1194,8 @@ menu:
     title: Provider
     unavailable_title: Providers unavailable
   runtime_preview_title: Runtime
+  search:
+    label: "Search "
   skills:
     item:
       cache_empty:
@@ -1303,3 +1331,4 @@ menu:
     subtitle: Server-owned search, web, browser, and MCP tool settings.
     title: Tool Settings
     unavailable_title: Tool settings unavailable
+  unavailable: Menu unavailable
