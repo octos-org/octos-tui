@@ -118,6 +118,7 @@ app:
     state_label: "state"
     idle: "Idle"
     working: "Working"
+    waiting: "Waiting"
     blocked: "Blocked"
     done: "Done"
     error: "Error"

@@ -8270,20 +8270,34 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
     let work = status_bar_work_text(app);
     let key_hint = hint_bar_text(hint_bar_model(app));
 
+    // A turn parked on an operator decision is not "Working": the model is
+    // stopped until the human answers. Show a distinct Waiting state (with a
+    // steady `?` instead of the spinner) whenever an approval or an
+    // AskUserQuestion is pending — visible OR collapsed, the turn is parked
+    // either way — and fall back to the plain run_state display otherwise.
+    let waiting_on_operator = matches!(app.run_state, SessionRunState::InProgress)
+        && (app.approval.is_some() || app.user_question.is_some());
+    let (state_marker, state_label, state_style) = if waiting_on_operator {
+        (
+            "?".to_string(),
+            t!("app.status.waiting").to_string(),
+            palette.selected().add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            run_state_marker(&app.run_state).to_string(),
+            run_state_status_label(&app.run_state),
+            run_state_style(&app.run_state, palette),
+        )
+    };
     Paragraph::new(Line::from(vec![
         Span::styled(
             format!(" {} ", t!("app.status.state_label")),
             palette.title().bg(palette.surface_alt),
         ),
-        Span::styled(
-            run_state_marker(&app.run_state).to_string(),
-            run_state_style(&app.run_state, palette).bg(palette.surface_alt),
-        ),
+        Span::styled(state_marker, state_style.bg(palette.surface_alt)),
         Span::styled(" ", palette.muted().bg(palette.surface_alt)),
-        Span::styled(
-            run_state_status_label(&app.run_state).to_string(),
-            run_state_style(&app.run_state, palette).bg(palette.surface_alt),
-        ),
+        Span::styled(state_label, state_style.bg(palette.surface_alt)),
         Span::styled(format!(" {work}"), palette.muted().bg(palette.surface_alt)),
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
         Span::styled(policy.to_string(), palette.text().bg(palette.surface_alt)),
@@ -9542,6 +9556,81 @@ mod tests {
         assert!(
             !footer.contains("gpt-5"),
             "only the selected catalog model belongs on the footer; got {footer:?}"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_waiting_while_an_approval_or_question_is_pending() {
+        // A turn parked on an approval (or AskUserQuestion) is not "Working" —
+        // the agent is waiting on the OPERATOR. The state segment must say so,
+        // and flip back to Working once the decision is resolved.
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.run_state = SessionRunState::InProgress;
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let rows = rendered_rows(&rendered_buffer(&app, palette));
+        let status_row = row_containing(&rows, "approval gated");
+        assert!(
+            status_row.contains("Working"),
+            "in-progress without a pending decision stays Working: {status_row:?}"
+        );
+
+        app.approval = Some(ApprovalModalState {
+            session_id: session_id.clone(),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            title: "Run command".into(),
+            body: "approve?".into(),
+            approval_kind: None,
+            risk: None,
+            typed_details: None,
+            render_hints: None,
+            visible: true,
+        });
+        let rows = rendered_rows(&rendered_buffer(&app, palette));
+        let status_row = row_containing(&rows, "approval gated");
+        assert!(
+            status_row.contains("Waiting"),
+            "pending approval must read Waiting: {status_row:?}"
+        );
+        assert!(
+            !status_row.contains("Working"),
+            "Waiting replaces Working: {status_row:?}"
+        );
+
+        // Even a hidden (collapsed) approval modal is still a parked turn.
+        if let Some(approval) = app.approval.as_mut() {
+            approval.visible = false;
+        }
+        let rows = rendered_rows(&rendered_buffer(&app, palette));
+        let status_row = row_containing(&rows, "approval gated");
+        assert!(
+            status_row.contains("Waiting"),
+            "collapsed-but-pending approval still Waiting: {status_row:?}"
+        );
+
+        // Resolved -> back to Working.
+        app.approval = None;
+        let rows = rendered_rows(&rendered_buffer(&app, palette));
+        let status_row = row_containing(&rows, "approval gated");
+        assert!(
+            status_row.contains("Working"),
+            "resolved decision returns to Working: {status_row:?}"
         );
     }
 
