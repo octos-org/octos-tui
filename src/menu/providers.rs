@@ -186,19 +186,26 @@ fn help_menu(ctx: &MenuContext<'_>) -> MenuSpec {
         .enumerate()
         .map(|(idx, visible)| {
             let command = visible.command;
-            // EVERY command completes into the composer on Enter (codex's flow:
-            // pick from the popup, the full `/name` lands in the box, Enter
-            // again runs it). This is uniform across all commands — argful or
-            // not — so behavior is consistent and new commands need no special
-            // wiring. Argful commands get a trailing space (type the arg next);
-            // argument-less ones complete to the exact name so the next Enter
-            // resolves and executes directly.
-            let completed = if command.inline_args == crate::menu::types::InlineArgMode::None {
-                format!("/{}", command.name)
+            // Codex Enter semantics (checked against codex-rs
+            // bottom_pane/chat_composer/slash_input.rs): Enter on a highlighted
+            // command DISPATCHES it immediately — an argument-less command goes
+            // straight to its page/menu/action in one Enter, never the old
+            // complete-then-Enter-again round trip. Argful commands complete
+            // into the composer WITH a trailing space instead (the user has to
+            // type arguments anyway, and the next Enter executes the draft
+            // directly via `slash_help_enter_executes`) — codex spends Tab on
+            // that affordance; Tab is the inspector toggle here.
+            let action = if command.inline_args == crate::menu::types::InlineArgMode::Required {
+                // Bare dispatch would only be a usage error — complete with a
+                // trailing space so the user types the required argument;
+                // the next Enter executes the draft directly.
+                MenuAction::Local(LocalAction::EditComposer(format!("/{} ", command.name)))
             } else {
-                format!("/{} ", command.name)
+                // None AND Optional: bare dispatch is valid and useful
+                // (optional-arg commands open their interactive page, e.g.
+                // /lang → language picker) — one Enter, straight there.
+                MenuAction::Local(LocalAction::RunSlashCommand(format!("/{}", command.name)))
             };
-            let action = MenuAction::Local(LocalAction::EditComposer(completed));
             let mut description = command_description(command.description, command.aliases);
             if command.name == "scrollmode" {
                 // Surface the CURRENT mode so the user knows what a toggle
@@ -359,7 +366,7 @@ fn onboarding_language_row() -> MenuItem {
 fn thinking_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     use octos_core::ui_protocol::ReasoningEffortLevel as L;
     let current = ctx.app.reasoning_effort;
-    let items = [
+    let mut items = [
         (
             "default",
             t!("menu.thinking.item.default.label"),
@@ -410,7 +417,35 @@ fn thinking_menu(ctx: &MenuContext<'_>) -> MenuSpec {
         }
         item
     })
-    .collect();
+    .collect::<Vec<_>>();
+
+    // A non-interactive divider separates the radio effort levels above from
+    // the display toggle below — different axes (how hard vs whether shown).
+    items.push(
+        MenuItem::new("", t!("menu.thinking.divider.display"), MenuAction::Noop).with_state(
+            MenuItemState {
+                non_selectable: true,
+                ..MenuItemState::default()
+            },
+        ),
+    );
+    // Display toggle — orthogonal to the effort levels: whether the committed
+    // reasoning renders as a transcript block for this session. Rendered as a
+    // checkbox (`[x]`/`[ ]`), NOT the radio `*`, so it reads as a toggle rather
+    // than a 6th level.
+    let display_on = ctx.app.reasoning_display;
+    items.push(
+        MenuItem::new(
+            "reasoning_display",
+            t!("menu.thinking.item.display.label"),
+            MenuAction::Local(LocalAction::ToggleReasoningDisplay),
+        )
+        .with_description(t!("menu.thinking.item.display.desc"))
+        .with_state(MenuItemState {
+            checked: Some(display_on),
+            ..MenuItemState::default()
+        }),
+    );
 
     MenuSpec {
         id: MenuId::from(crate::menu::registry::MENU_THINKING),
@@ -1794,12 +1829,25 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
 
 fn onboarding_family_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let Some(catalog) = ctx.app.profile_llm_catalog else {
-        return MenuBuildResult::Unavailable(MenuStatusSpec {
+        // Opening this menu auto-sends `profile/llm/catalog` (see
+        // `auto_fetch_for_menu`); render Loading until the result refreshes
+        // the menu rather than dead-ending on "load the catalog first". When
+        // the server never advertised the catalog method, no fetch is in
+        // flight — stay Unavailable instead of loading forever.
+        let spec = MenuStatusSpec {
             id: MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY),
             title: t!("menu.onboard.family.title").into_owned(),
             message: t!("menu.onboard.unavailable_catalog_msg").into_owned(),
             footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
-        });
+        };
+        return if ctx
+            .availability
+            .supports_method(APPUI_METHOD_PROFILE_LLM_CATALOG)
+        {
+            MenuBuildResult::Loading(spec)
+        } else {
+            MenuBuildResult::Unavailable(spec)
+        };
     };
     let default_state;
     let state = if let Some(state) = ctx.app.onboarding {
@@ -1869,12 +1917,23 @@ fn onboarding_model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         });
     }
     let Some(catalog) = ctx.app.profile_llm_catalog else {
-        return MenuBuildResult::Unavailable(MenuStatusSpec {
+        // Same auto-fetch contract as the family step: Loading only while a
+        // fetch can actually be in flight; Unavailable on servers that never
+        // advertised the catalog method.
+        let spec = MenuStatusSpec {
             id: MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL),
             title: t!("menu.onboard.model.title").into_owned(),
             message: t!("menu.onboard.unavailable_catalog_msg").into_owned(),
             footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
-        });
+        };
+        return if ctx
+            .availability
+            .supports_method(APPUI_METHOD_PROFILE_LLM_CATALOG)
+        {
+            MenuBuildResult::Loading(spec)
+        } else {
+            MenuBuildResult::Unavailable(spec)
+        };
     };
     let Some(models) = catalog
         .families
@@ -2978,6 +3037,7 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 let action = if can_select {
                     MenuAction::send_appui(AppUiCommand::ProfileLlmSelect(ProfileLlmSelectParams {
                         profile_id: profile_id.clone(),
+                        session_id: ctx.app.selected_session_id.cloned(),
                         family_id: model
                             .family
                             .clone()

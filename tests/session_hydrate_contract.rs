@@ -73,6 +73,7 @@ fn session_hydrate_result_replaces_durable_messages() {
         },
         context: None,
         context_state: None,
+        replayed_tool_envelopes: None,
         messages: Some(vec![HydratedMessage {
             seq: 1,
             role: "assistant".into(),
@@ -84,13 +85,13 @@ fn session_hydrate_result_replaces_durable_messages() {
             message_id: Some("msg-1".into()),
             source: Some("assistant".into()),
             media: Vec::new(),
+            reasoning_content: None,
         }]),
         threads: None,
         turns: None,
         pending_approvals: None,
         pending_questions: None,
         replayed_envelopes: None,
-        replayed_tool_envelopes: None,
     };
 
     store.apply_client_event(ClientEvent::SessionHydrate(result));

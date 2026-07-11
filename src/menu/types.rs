@@ -291,6 +291,12 @@ pub enum LocalAction {
     SaveKeymap,
     RefreshMenu(MenuId),
     EditComposer(String),
+    /// Codex Enter semantics for the slash popup: dispatch the highlighted
+    /// command IMMEDIATELY (one Enter goes straight to the command's
+    /// page/menu/action) instead of completing its name into the composer
+    /// and requiring a second Enter. The string is the full slash draft to
+    /// run (e.g. "/theme").
+    RunSlashCommand(String),
     Onboarding(OnboardingAction),
     Skills,
     McpConfig,
@@ -310,6 +316,9 @@ pub enum LocalAction {
     /// Set the per-session reasoning effort to a specific level from the
     /// `/thinking` selection menu. `None` clears the override (server default).
     SetThinkingLevel(Option<octos_core::ui_protocol::ReasoningEffortLevel>),
+    /// Toggle whether committed reasoning renders as a transcript block
+    /// for the active session (`/thinking` display row).
+    ToggleReasoningDisplay,
     /// Persist the runtime UI settings (theme/lang/scroll-mode/vim-mode) back to
     /// the launch config file (`/saveconfig`).
     SaveConfig,
@@ -352,6 +361,10 @@ pub enum LocalAction {
         num_turns: u32,
         prefill: String,
     },
+    /// `/btw <question>` — ask a quick aside answered out-of-band while the
+    /// current turn keeps working (no tools, ephemeral). The question is taken
+    /// from the command's inline args.
+    Btw,
     Custom(&'static str),
 }
 
@@ -461,6 +474,10 @@ pub struct MenuItemState {
     pub loading: bool,
     pub destructive: bool,
     pub required_valid: Option<bool>,
+    /// A non-interactive display row (e.g. a section divider): rendered but
+    /// skipped by menu navigation and inert on Enter. Defaults to `false`
+    /// (every existing item stays selectable).
+    pub non_selectable: bool,
 }
 
 impl MenuItemState {
@@ -636,6 +653,9 @@ pub struct MenuAppSnapshot<'a> {
     /// Active session's reasoning effort, for marking the current `/thinking`
     /// menu item. `None` = server default (no per-session override).
     pub reasoning_effort: Option<octos_core::ui_protocol::ReasoningEffortLevel>,
+    /// Whether the active session renders reasoning as a transcript block,
+    /// for the `/thinking` display toggle row's on/off state.
+    pub reasoning_display: bool,
     pub permission_profile: Option<octos_core::ui_protocol::PermissionProfileSelection>,
     pub runtime_status: Option<&'a SessionRuntimeStatus>,
     pub model_catalog: Option<&'a SessionModelCatalog>,

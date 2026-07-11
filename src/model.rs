@@ -521,6 +521,12 @@ pub struct SessionAutonomyState {
     pub goal: Option<octos_core::ui_protocol::UiGoalRecord>,
     pub goal_transition_actor: Option<String>,
     pub loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
+    /// Latest model-authored plan/todo checklist (`plan/updated`). `None` until
+    /// the agent calls `update_plan` this session.
+    pub plan: Option<octos_core::ui_protocol::UiPlanRecord>,
+    /// Turn that authored the current `plan`, when known. The plan is per-turn
+    /// working state, so it is cleared when this turn completes.
+    pub plan_turn_id: Option<TurnId>,
 }
 
 impl SessionAutonomyState {
@@ -533,6 +539,8 @@ impl SessionAutonomyState {
             goal: None,
             goal_transition_actor: None,
             loops: Vec::new(),
+            plan: None,
+            plan_turn_id: None,
         }
     }
 }
@@ -625,6 +633,7 @@ pub enum AppUiCommand {
     StartReview(ReviewStartParams),
     ListConfigCapabilities(ConfigCapabilitiesListParams),
     ReadSessionStatus(SessionStatusReadParams),
+    SessionBtw(octos_core::ui_protocol::SessionBtwParams),
     ListModels(ModelListParams),
     SelectModel(ModelSelectParams),
     ListPermissionProfiles(PermissionProfileListParams),
@@ -713,6 +722,7 @@ impl AppUiCommand {
             Self::StartReview(_) => APPUI_METHOD_REVIEW_START,
             Self::ListConfigCapabilities(_) => APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
             Self::ReadSessionStatus(_) => APPUI_METHOD_SESSION_STATUS_READ,
+            Self::SessionBtw(_) => octos_core::ui_protocol::methods::SESSION_BTW,
             Self::ListModels(_) | Self::ProfileLlmList(_) => APPUI_METHOD_MODEL_LIST,
             Self::SelectModel(_) | Self::ProfileLlmSelect(_) => APPUI_METHOD_MODEL_SELECT,
             Self::ListPermissionProfiles(_) => {
@@ -928,7 +938,11 @@ pub struct SessionStatusReadResult {
     pub active_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_status_model",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub model: Option<ModelStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_profile: Option<String>,
@@ -960,6 +974,82 @@ pub struct SessionStatusReadResult {
     pub cursor: Option<SessionCursorStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<UiProtocolCapabilities>,
+}
+
+/// Skew-tolerant decoder for [`SessionStatusReadResult::model`].
+///
+/// octos servers up to protocol 1.1.0 answer `session/status/read` with
+/// `"model": {"model": null, "provider": null, "selected": true}` when the
+/// runtime policy has no resolved model (fresh data dir, onboarding before a
+/// provider is saved). [`ModelStatus::model`]/[`ModelStatus::provider`] are
+/// deliberately non-optional — the model list/select paths genuinely require
+/// them — so decoding that shape directly fails with "invalid type: null"
+/// and takes the ENTIRE status result down with it: the transport surfaces
+/// an `invalid_result` app error and the composer footer degrades to the
+/// `<server authenticated profile>` placeholder.
+///
+/// Semantics: `null`, a missing key, or an otherwise well-formed object
+/// whose `model` or `provider` member is null/absent all MEAN "no model
+/// resolved" and decode to `None` (the footer renders its regular no-model
+/// state). Everything else decodes as a normal [`ModelStatus`]; any
+/// wrongly-typed member is a real protocol error and still fails — the
+/// object is first validated through [`ModelStatusShapeProbe`], so a null
+/// `model`/`provider` never becomes a bypass that masks a malformed
+/// sibling. Unknown extra members keep being ignored, exactly like a plain
+/// [`ModelStatus`] decode.
+fn deserialize_status_model<'de, D>(deserializer: D) -> Result<Option<ModelStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if value.is_object() {
+        let probe = ModelStatusShapeProbe::deserialize(&value).map_err(serde::de::Error::custom)?;
+        if probe.model.is_none() || probe.provider.is_none() {
+            return Ok(None);
+        }
+    }
+    ModelStatus::deserialize(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
+/// [`ModelStatus`] with `model`/`provider` relaxed to `Option` — used ONLY
+/// by [`deserialize_status_model`] to validate a candidate object before the
+/// no-model mapping. Every member a [`ModelStatus`] would type-check is
+/// type-checked here too (null/absent `model`/`provider` being the one
+/// permitted extra), so the skew tolerance cannot swallow a wrongly-typed
+/// sibling like `{"model": null, "provider": 42}`. The `Some` path then
+/// decodes the original value as a plain [`ModelStatus`], so any future
+/// `ModelStatus` field is picked up there without touching this probe.
+#[derive(Deserialize)]
+struct ModelStatusShapeProbe {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    title: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    family: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    route: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    selected: bool,
+    #[serde(default)]
+    #[allow(dead_code)]
+    available: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    queue_mode: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    qoe_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1305,6 +1395,15 @@ pub struct ContextLifecycleState {
 #[derive(Debug, Clone)]
 pub struct LiveCompaction {
     pub started_at: std::time::Instant,
+    /// Set when the matching `ContextCompactionCompleted` lands. The server
+    /// pass is synchronous, so started/completed arrive in one drain batch
+    /// and draws only follow the batch — without a settled dwell the block
+    /// would paint zero frames. The renderer keeps showing a settled state
+    /// for a short window after this timestamp.
+    pub completed_at: Option<std::time::Instant>,
+    /// Post-compaction estimate from the completed event (for the settled
+    /// `before → after` line).
+    pub token_estimate_after: Option<u64>,
     pub token_estimate_before: u64,
     pub threshold_tokens: u64,
     pub trigger: String,
@@ -2746,6 +2845,11 @@ pub struct ProfileLlmDeleteParams {
 pub struct ProfileLlmSelectParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
+    /// The ACTIVE session, so the server's result echoes a session id the
+    /// client actually tracks — without it the server synthesizes a
+    /// `profile:local:tui#coding` key and the select result updates nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<octos_core::SessionKey>,
     pub family_id: String,
     pub model_id: String,
     pub route_id: String,
@@ -3270,6 +3374,12 @@ pub struct AppState {
     /// Preserved across `Snapshot` replays (see `apply_event`).
     pub session_reasoning_effort:
         std::collections::HashMap<SessionKey, octos_core::ui_protocol::ReasoningEffortLevel>,
+    /// Per-session opt-in to render the committed `reasoning_content` as a
+    /// capped "· reasoning" block in the transcript. Absent/false = the
+    /// codex-style quiet default (spinner + inspector only). Toggled from the
+    /// `/thinking` menu; parallels `session_reasoning_effort` in lifetime and
+    /// Snapshot preservation.
+    pub session_reasoning_display: std::collections::HashSet<SessionKey>,
     /// Per-session set of turn ids that were already finalized (committed OR
     /// dropped) by `commit_pending_live_reply_for_turn_switch` at a turn-switch
     /// boundary. A prior turn's OWN late `TurnCompleted`/`TurnError` may still
@@ -3410,6 +3520,8 @@ pub struct AppState {
     /// `run_state_started_at` clock resets whenever the selection changes, so
     /// it cannot time a turn the user switched away from and back.
     pub turn_started_at: std::collections::HashMap<(SessionKey, TurnId), std::time::Instant>,
+    /// Latest `/btw` aside per session (see [`BtwAside`]).
+    pub btw_asides: std::collections::HashMap<SessionKey, BtwAside>,
     pub expanded_tool_outputs: bool,
     pub menu_stack: MenuStack,
     pub active_menu: Option<MenuBuildResult>,
@@ -3612,6 +3724,28 @@ pub struct TurnActivitySummary {
     pub background_tasks: usize,
 }
 
+/// A `/btw` aside: a quick question asked WHILE the session's live turn keeps
+/// running, answered out-of-band by the server with no tools. Ephemeral — it
+/// never joins the transcript; the card renders in the live pane and the next
+/// prompt submit dismisses a settled one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BtwAside {
+    pub session_id: SessionKey,
+    pub question: String,
+    pub state: BtwAsideState,
+    /// Physical-row scroll offset for the overlay when the answer is taller than
+    /// the pane (which is capped at half the viewport). The render path clamps
+    /// this against the true max each frame, mirroring `transcript_scroll`.
+    pub scroll: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BtwAsideState {
+    Answering,
+    Answered(String),
+    Failed(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPermissionProfile {
     pub session_id: SessionKey,
@@ -3739,6 +3873,12 @@ pub struct ActivityItem {
     /// transcript's scroll (P2 tri-repo #246). `None` = unattributed (treated
     /// as active-view content).
     pub session_id: Option<SessionKey>,
+    /// Sticky rows are infrequent, notable notices (context compaction) that
+    /// (a) survive the activity cap's oldest-first eviction so a busy turn's
+    /// tool flood cannot silently drop them before they are archived, and
+    /// (b) when turnless, are adopted by the session's next `TurnStarted` so
+    /// they render in the turn flow and archive with the turn.
+    pub sticky: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3761,7 +3901,13 @@ impl ActivityItem {
             turn_id: None,
             tool_call_id: None,
             session_id: None,
+            sticky: false,
         }
+    }
+
+    pub fn with_sticky(mut self) -> Self {
+        self.sticky = true;
+        self
     }
 
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
@@ -5127,6 +5273,7 @@ impl AppState {
             completed_turns: std::collections::HashMap::new(),
             session_retry: std::collections::HashMap::new(),
             session_reasoning_effort: std::collections::HashMap::new(),
+            session_reasoning_display: std::collections::HashSet::new(),
             finalized_by_switch: std::collections::HashMap::new(),
             selected_session,
             selected_task: 0,
@@ -5175,6 +5322,7 @@ impl AppState {
             applied_hydrate_tool_envelopes: std::collections::HashSet::new(),
             turn_activity_summaries: Vec::new(),
             turn_started_at: std::collections::HashMap::new(),
+            btw_asides: std::collections::HashMap::new(),
             expanded_tool_outputs: false,
             menu_stack: MenuStack::new(),
             active_menu: None,
@@ -5391,6 +5539,37 @@ impl AppState {
         let entry = self.session_autonomy_mut(session_id);
         entry.goal = goal;
         entry.goal_transition_actor = transition_actor;
+    }
+
+    /// Replace the cached plan/todo checklist for a session. The `update_plan`
+    /// tool sends the full ordered list each call, so this is a wholesale swap.
+    /// `turn_id` is the authoring turn (when known) so the panel can be cleared
+    /// on that turn's completion.
+    pub fn set_session_plan(
+        &mut self,
+        session_id: &SessionKey,
+        plan: Option<octos_core::ui_protocol::UiPlanRecord>,
+        turn_id: Option<TurnId>,
+    ) {
+        let entry = self.session_autonomy_mut(session_id);
+        entry.plan = plan;
+        entry.plan_turn_id = turn_id;
+    }
+
+    /// Clear a session's plan panel once the turn that authored it completes.
+    /// A plan with no known authoring turn (`plan_turn_id == None`) is left in
+    /// place — there is no terminal event to key its removal on.
+    pub fn clear_session_plan_for_turn(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        if let Some(entry) = self
+            .session_autonomy
+            .iter_mut()
+            .find(|s| &s.session_id == session_id)
+        {
+            if entry.plan_turn_id.as_ref() == Some(turn_id) {
+                entry.plan = None;
+                entry.plan_turn_id = None;
+            }
+        }
     }
 
     /// Replace the cached output tail for an agent. The backend is
@@ -5707,6 +5886,11 @@ impl AppState {
         }
     }
 
+    /// Whether the given session opted into rendering reasoning blocks.
+    pub fn reasoning_display_enabled(&self, session_id: &SessionKey) -> bool {
+        self.session_reasoning_display.contains(session_id)
+    }
+
     pub fn active_session(&self) -> Option<&SessionView> {
         self.sessions.get(self.selected_session)
     }
@@ -5823,6 +6007,45 @@ impl AppState {
             retained.push(optimistic);
         }
         self.optimistic_user_messages = retained;
+    }
+
+    /// The user prompt that started `turn_id` in `session_id`. Used to restore
+    /// the prompt into the composer when a turn is interrupted (Esc/Ctrl+C) so
+    /// it can be edited and resent. Mirrors the turn-activity log's request
+    /// resolution (the same three fallbacks it anchors a report on): the
+    /// optimistic echo first, then the persisted turn-prompt anchor (which
+    /// survives the turn — it is only reaped by an explicit withdraw or the
+    /// per-session cap), then the session's latest user message.
+    pub fn submitted_prompt_for_turn(
+        &self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> Option<String> {
+        self.optimistic_user_messages
+            .iter()
+            .rev()
+            .find(|message| &message.session_id == session_id && &message.turn_id == turn_id)
+            .map(|message| message.content.clone())
+            .or_else(|| {
+                self.turn_prompt_anchors
+                    .iter()
+                    .rev()
+                    .find(|anchor| &anchor.session_id == session_id && &anchor.turn_id == turn_id)
+                    .map(|anchor| anchor.content.clone())
+            })
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .find(|session| &session.id == session_id)
+                    .and_then(|session| {
+                        session
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == octos_core::MessageRole::User)
+                            .map(|message| message.content.clone())
+                    })
+            })
     }
 
     /// Settle staged-submit gates that a freshly-replayed snapshot already
@@ -6134,6 +6357,94 @@ impl AppState {
         self.turn_started_at
             .remove(&(session_id.clone(), turn_id.clone()))
             .map(|started| started.elapsed().as_secs())
+    }
+
+    /// The `/btw` aside for a session, if any (latest per session).
+    pub fn btw_aside_for(&self, session_id: &SessionKey) -> Option<&BtwAside> {
+        self.btw_asides.get(session_id)
+    }
+
+    /// Stage a new `/btw` aside as answering (replaces any prior aside).
+    pub fn set_btw_answering(&mut self, session_id: &SessionKey, question: String) {
+        self.btw_asides.insert(
+            session_id.clone(),
+            BtwAside {
+                session_id: session_id.clone(),
+                question,
+                state: BtwAsideState::Answering,
+                scroll: 0,
+            },
+        );
+    }
+
+    /// Scroll the active session's `/btw` overlay by `delta` physical rows
+    /// (positive = reveal lower content). Saturating; the render path clamps to
+    /// the true content max. Returns `true` when an aside was present to scroll,
+    /// so the key handler knows the event was consumed.
+    pub fn nudge_btw_scroll(&mut self, session_id: &SessionKey, delta: i32) -> bool {
+        match self.btw_asides.get_mut(session_id) {
+            Some(aside) => {
+                aside.scroll = if delta >= 0 {
+                    aside.scroll.saturating_add(delta as u16)
+                } else {
+                    aside.scroll.saturating_sub((-delta) as u16)
+                };
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Resolve the ANSWERING aside for `session_id` with the server's answer.
+    /// A stale result (nothing answering — e.g. the aside was replaced) is
+    /// dropped rather than resurrecting a dismissed card.
+    pub fn resolve_btw_answer(&mut self, session_id: &SessionKey, answer: String) -> bool {
+        match self.btw_asides.get_mut(session_id) {
+            Some(aside) if aside.state == BtwAsideState::Answering => {
+                aside.state = BtwAsideState::Answered(answer);
+                // Fresh answer starts at the top.
+                aside.scroll = 0;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Fail every ANSWERING aside. RPC errors surface generically as
+    /// `"{method} request {id} failed: …"` with no session attribution, so all
+    /// in-flight asides fail together (concurrent asides across sessions are
+    /// rare; the card invites a retry).
+    pub fn fail_btw_answering(&mut self, message: &str) -> usize {
+        let mut failed = 0;
+        for aside in self.btw_asides.values_mut() {
+            if aside.state == BtwAsideState::Answering {
+                aside.state = BtwAsideState::Failed(message.to_owned());
+                failed += 1;
+            }
+        }
+        failed
+    }
+
+    /// Drop a SETTLED (answered/failed) aside — the exchange is ephemeral and
+    /// the next prompt submit dismisses it. An answering aside stays; its
+    /// result may still land.
+    pub fn clear_settled_btw_aside(&mut self, session_id: &SessionKey) {
+        if self
+            .btw_asides
+            .get(session_id)
+            .is_some_and(|aside| !matches!(aside.state, BtwAsideState::Answering))
+        {
+            self.btw_asides.remove(session_id);
+        }
+    }
+
+    /// Codex-style dialog dismissal: unconditionally close the session's
+    /// `/btw` aside pane (Enter on an empty composer). Unlike
+    /// [`Self::clear_settled_btw_aside`] this also closes a still-answering
+    /// aside — the user chose to leave; a late answer for a dismissed aside
+    /// is dropped by `set_btw_answered`'s state guard.
+    pub fn dismiss_btw_aside(&mut self, session_id: &SessionKey) -> bool {
+        self.btw_asides.remove(session_id).is_some()
     }
 
     /// Count of the session's still-running background work (pending/running
@@ -6594,8 +6905,26 @@ impl AppState {
             self.preserve_transcript_position_after_append(estimated_rows);
         }
         if self.activity.len() > MAX_ACTIVITY_ITEMS {
-            let excess = self.activity.len() - MAX_ACTIVITY_ITEMS;
-            self.activity.drain(0..excess);
+            let mut excess = self.activity.len() - MAX_ACTIVITY_ITEMS;
+            // Evict oldest NON-sticky rows first: sticky notices (context
+            // compaction) are infrequent and notable, and blind oldest-first
+            // eviction dropped them mid-turn — pushed before the turn's tool
+            // flood, they were always the first to go, vanishing before
+            // `capture_completed_turn_activity` could archive them.
+            let mut idx = 0;
+            while excess > 0 && idx < self.activity.len() {
+                if self.activity[idx].sticky {
+                    idx += 1;
+                } else {
+                    self.activity.remove(idx);
+                    excess -= 1;
+                }
+            }
+            // Degenerate case (everything left is sticky): still bound the
+            // list — the cap is a hard memory/render guarantee.
+            if excess > 0 {
+                self.activity.drain(0..excess);
+            }
         }
     }
 

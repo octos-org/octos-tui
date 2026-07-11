@@ -53,6 +53,7 @@ pub enum ClientEvent {
     ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchClientEvent),
     ProfileSkillsMutation(ProfileSkillsMutationClientEvent),
     SessionStatus(SessionStatusClientEvent),
+    SessionBtw(SessionBtwClientEvent),
     ToolStatus(ToolStatusClientEvent),
     ToolConfigList(ToolConfigListClientEvent),
     ToolConfigMutation(ToolConfigMutationClientEvent),
@@ -98,6 +99,10 @@ pub struct ModelListClientEvent {
 pub struct ModelSelectClientEvent {
     pub result: ModelSelectResult,
     pub message: String,
+    /// The session that initiated the select (correlated by JSON-RPC request
+    /// id in the transport). `None` only for unsolicited/legacy shapes —
+    /// which the store ignores rather than guessing a target.
+    pub initiating_session: Option<octos_core::SessionKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +206,13 @@ pub struct ProfileSkillsMutationClientEvent {
 pub struct SessionStatusClientEvent {
     pub result: SessionStatusReadResult,
     pub message: String,
+}
+
+/// Result of a `session/btw` aside — the out-of-band answer to a quick
+/// question asked while the session's turn keeps running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBtwClientEvent {
+    pub result: octos_core::ui_protocol::SessionBtwResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

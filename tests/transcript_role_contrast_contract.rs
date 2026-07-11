@@ -166,7 +166,9 @@ fn activity_rows_are_muted_without_bold() {
     let frame = rendered(&store.state, 90, 24);
 
     let palette = Palette::for_theme(ThemeName::default());
-    let label_cell = cell_at_text(&frame, "shell").expect("tool label cell");
+    // Tool activity renders as a Claude-Code-style card (`⏺ Bash($ cmd)`);
+    // the muted-label contract now holds on the card's tool name.
+    let label_cell = cell_at_text(&frame, "Bash(").expect("tool label cell");
     assert_eq!(
         label_cell.fg, palette.muted,
         "activity tool labels render muted"

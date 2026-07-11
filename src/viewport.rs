@@ -64,6 +64,21 @@ impl ScrollbackTracker {
         Self::default()
     }
 
+    /// Forget everything already flushed, so the next [`Self::sync`] re-emits
+    /// the ENTIRE committed history (plus any already-streamed live-turn
+    /// content) as a fresh first flush.
+    ///
+    /// Used when the terminal takes the full viewport reset path on a resize
+    /// (width change either direction, or terminal-height shrink — see
+    /// `Terminal::resize_viewport_to`): that reset clears the whole visible
+    /// screen, erasing the transcript rows this tracker had flushed there.
+    /// Without a re-flush the chat visually vanishes — a bare composer on an
+    /// empty screen — with the pre-resize copy reachable only by scrolling
+    /// real scrollback, wrapped at the old width.
+    pub fn mark_flushed_stale(&mut self) {
+        *self = Self::new();
+    }
+
     /// Reconcile the tracker against the current app state and return the lines
     /// to push into scrollback. `wrap_width` is the inline-viewport width.
     pub fn sync(
@@ -312,6 +327,38 @@ mod tests {
     }
 
     #[test]
+    fn mark_flushed_stale_reflushes_the_whole_transcript() {
+        // The width-change full viewport reset clears the visible screen,
+        // erasing the transcript rows already flushed there. After
+        // mark_flushed_stale the next sync must re-emit the ENTIRE committed
+        // history (as a plain flush, not a reset — the screen was already
+        // cleared by the terminal), so the chat reappears freshly wrapped.
+        let mut tracker = ScrollbackTracker::new();
+        let app = state(vec![Message::user("hi"), Message::assistant("a1")]);
+        let first = tracker.sync(&app, palette(), 60);
+        assert!(!first.lines_to_insert.is_empty());
+
+        let settled = tracker.sync(&app, palette(), 60);
+        assert!(
+            settled.lines_to_insert.is_empty(),
+            "no growth -> nothing to flush"
+        );
+
+        tracker.mark_flushed_stale();
+        let reflushed = tracker.sync(&app, palette(), 50);
+        assert!(!reflushed.reset, "the terminal reset already cleared");
+        assert_eq!(
+            reflushed.lines_to_insert.len(),
+            app::finalized_history_lines(&app, palette(), 50).len(),
+            "must re-emit the full committed history at the new width"
+        );
+
+        // ...and the tracker keeps working incrementally afterwards.
+        let after = tracker.sync(&app, palette(), 50);
+        assert!(after.lines_to_insert.is_empty());
+    }
+
+    #[test]
     fn appending_a_message_flushes_only_the_new_one() {
         let mut tracker = ScrollbackTracker::new();
         let app1 = state(vec![Message::user("hi"), Message::assistant("a1")]);
@@ -386,7 +433,7 @@ mod tests {
             .join("");
         assert!(update.reset, "late activity log changes finalized history");
         assert!(
-            text.contains("Agent task completed") && text.contains("$ cargo test"),
+            text.contains("Agent task completed") && text.contains("Bash($ cargo test"),
             "reflush should include archived activity log: {text:?}"
         );
     }
