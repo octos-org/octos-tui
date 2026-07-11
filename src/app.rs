@@ -3283,6 +3283,48 @@ fn should_show_turn_flow(app: &AppState, session: &SessionView) -> bool {
         || should_pin_recent_user_context(app, session)
 }
 
+/// Whether the ACTIVE session's turn is in its "thinking" phase: the model
+/// has started reasoning (`live_reasoning` non-empty) and no answer has
+/// streamed yet (`live_reply.text` empty). This is EXACTLY the swimming-octopus
+/// condition, which the status-bar "Thinking" label tracks verbatim (the user
+/// asked for "Thinking when the octopus swimming"); it flips to "Working" the
+/// moment the answer begins streaming.
+fn active_turn_is_thinking(app: &AppState) -> bool {
+    let Some((session_id, turn_id)) = app.active_turn() else {
+        return false;
+    };
+    let reasoning_started = app
+        .live_reasoning
+        .get(&(session_id.clone(), turn_id.clone()))
+        .is_some_and(|reasoning| !reasoning.trim().is_empty());
+    let answer_not_started = app
+        .active_session()
+        .and_then(|session| session.live_reply.as_ref())
+        .is_none_or(|live_reply| live_reply.text.trim().is_empty());
+    // Not thinking while parked on an operator decision FOR THIS session: an
+    // approval-gated tool sets run_state Blocked and the status bar shows
+    // "Waiting", so the octopus must stop too (codex round 3). The
+    // approval/question slots are global, so scope them to the active session
+    // — a background session's pending decision must not suppress the octopus
+    // here (codex round 4). Durable state, not transient activity rows.
+    let decision_for_active = app
+        .approval
+        .as_ref()
+        .is_some_and(|approval| &approval.session_id == session_id)
+        || app
+            .user_question
+            .as_ref()
+            .is_some_and(|question| &question.session_id == session_id);
+    let awaiting_operator =
+        decision_for_active || matches!(app.run_state, SessionRunState::Blocked { .. });
+    // Deliberately NOT gated on tool activity: this predicate IS the swimming
+    // octopus, which the user asked the label to track ("Thinking when the
+    // octopus swimming"). The octopus swims from the first reasoning delta
+    // until the answer streams — including while tools run — so the label
+    // matches it exactly.
+    reasoning_started && answer_not_started && !awaiting_operator
+}
+
 fn push_turn_flow(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -3318,17 +3360,10 @@ fn push_turn_flow(
     // hand them to the message's reasoning_content); we only surface a single
     // dimmed swimming-octopus indicator, and ONLY while the model is still
     // reasoning — once the answer has started streaming (`live_reply.text` has
-    // non-empty content for the active turn) we drop the indicator too.
-    if let Some((session_id, turn_id)) = app.active_turn()
-        && app
-            .live_reasoning
-            .get(&(session_id.clone(), turn_id.clone()))
-            .is_some_and(|reasoning| !reasoning.trim().is_empty())
-        && session
-            .live_reply
-            .as_ref()
-            .is_none_or(|live_reply| live_reply.text.trim().is_empty())
-    {
+    // non-empty content for the active turn) we drop the indicator too. The
+    // status-bar "Thinking" label is gated on the SAME predicate
+    // (`active_turn_is_thinking`) so the octopus and the label never disagree.
+    if active_turn_is_thinking(app) {
         push_thinking_indicator(lines, palette, width);
     }
 
@@ -8692,6 +8727,19 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
             "?".to_string(),
             t!("app.status.waiting").to_string(),
             palette.selected().add_modifier(Modifier::BOLD),
+        )
+    } else if matches!(app.run_state, SessionRunState::InProgress) && active_turn_is_thinking(app) {
+        // Reasoning phase (octopus swimming): keep the animated spinner marker
+        // and the in-progress style, but label it "Thinking" — the turn is
+        // running, but it is not yet acting (no answer/tool output). Flips to
+        // "Working" the moment the answer or a tool call begins. Gated on
+        // InProgress so a late terminal (e.g. an Error for a switch-finalized
+        // turn while a successor is still live-and-blank) is never masked by
+        // the Thinking label (codex P2).
+        (
+            run_state_marker(&app.run_state).to_string(),
+            t!("app.status.thinking").to_string(),
+            run_state_style(&app.run_state, palette),
         )
     } else {
         (
@@ -18231,6 +18279,89 @@ mod tests {
         );
         app.set_run_state_in_progress();
         app
+    }
+
+    #[test]
+    fn status_shows_thinking_while_reasoning_then_working_once_answering() {
+        // User ask: the status must read "Thinking" while the octopus swims
+        // (reasoning started, no answer yet) and "Working" once the answer or
+        // a tool begins — the octopus and the label share one predicate.
+        // Reasoning phase: empty live_reply.text + non-empty live_reasoning.
+        let mut thinking = active_turn_app("");
+        let (sid, tid) = thinking
+            .active_turn()
+            .map(|(s, t)| (s.clone(), t.clone()))
+            .unwrap();
+        thinking
+            .live_reasoning
+            .insert((sid, tid), "reasoning about the request".to_string());
+        thinking.status = "ready".into(); // neutral status message
+        assert!(active_turn_is_thinking(&thinking), "predicate must be true");
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let rows = rendered_rows(&rendered_buffer(&thinking, palette));
+        let status = row_containing(&rows, " state ");
+        assert!(
+            status.contains("Thinking"),
+            "status bar must read Thinking: {status:?}"
+        );
+        assert!(
+            !status.contains("Working"),
+            "status bar not Working while thinking: {status:?}"
+        );
+
+        // Answer streaming: live_reply.text non-empty -> Working.
+        let mut answering = active_turn_app("here is the answer");
+        let (sid, tid) = answering
+            .active_turn()
+            .map(|(s, t)| (s.clone(), t.clone()))
+            .unwrap();
+        answering
+            .live_reasoning
+            .insert((sid, tid), "reasoning about the request".to_string());
+        answering.status = "ready".into();
+        assert!(!active_turn_is_thinking(&answering));
+        let rows = rendered_rows(&rendered_buffer(&answering, palette));
+        let status = row_containing(&rows, " state ");
+        assert!(
+            status.contains("Working"),
+            "status bar must read Working: {status:?}"
+        );
+        assert!(
+            !status.contains("Thinking"),
+            "status bar not Thinking while answering: {status:?}"
+        );
+
+        // In progress but NO reasoning yet (e.g. straight to tools) -> Working.
+        let mut no_reason = active_turn_app("");
+        no_reason.status = "ready".into();
+        assert!(!active_turn_is_thinking(&no_reason));
+        let rows = rendered_rows(&rendered_buffer(&no_reason, palette));
+        let status = row_containing(&rows, " state ");
+        assert!(
+            status.contains("Working"),
+            "no reasoning -> status bar Working: {status:?}"
+        );
+
+        // Reasoning present but run_state is Error -> the Error label is not
+        // masked by Thinking (codex P2).
+        let mut errored = active_turn_app("");
+        let (sid, tid) = errored
+            .active_turn()
+            .map(|(s, t)| (s.clone(), t.clone()))
+            .unwrap();
+        errored
+            .live_reasoning
+            .insert((sid, tid), "reasoning".to_string());
+        errored.status = "ready".into();
+        errored.run_state = SessionRunState::Error {
+            message: "boom".into(),
+        };
+        let rows = rendered_rows(&rendered_buffer(&errored, palette));
+        let status = row_containing(&rows, " state ");
+        assert!(
+            !status.contains("Thinking"),
+            "an Error state must not be masked by Thinking: {status:?}"
+        );
     }
 
     #[test]
