@@ -3356,33 +3356,45 @@ fn push_user_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, con
 ///   `彡[⇔]ミ` ⇄ `ミ[⇔]彡`
 const OCTOPUS_SWIM_FRAMES: [&str; 2] = ["彡[⇔]ミ", "ミ[⇔]彡"];
 
-/// Milliseconds the octopus spends per display column. ~150ms/col reads as a
-/// calm swim (and a ~3 strokes/sec paddle) rather than a strobe.
-const OCTOPUS_SWIM_STEP_MS: u128 = 150;
+/// One-way sweep duration: the octopus crosses edge-to-edge in this time
+/// REGARDLESS of terminal width. The previous fixed ms-per-column pace made
+/// the sweep ~21s one-way on a 146-column pane, so typical thinking phases
+/// ended with the octopus visibly stuck around mid-screen ("only went half
+/// of the page"). 4s matches the pace the capped sweep used to have.
+const OCTOPUS_SWEEP_ONE_WAY_MS: u128 = 4_000;
+
+/// Paddle-stroke cadence — the arms flip mirror-image at this interval,
+/// independent of travel position (~3 strokes/sec reads as swimming, not a
+/// strobe).
+const OCTOPUS_STROKE_MS: u128 = 150;
 
 /// Pure elapsed→(leading-space offset, frame) mapping for the swimming octopus.
 ///
 /// The octopus travels horizontally as a triangle wave: the leading-space
-/// offset climbs `0 → MAX` then falls `MAX → 0`, forever, sweeping the FULL
-/// `wrap_width` — `MAX` keeps the octopus plus a one-column right margin
-/// inside it, measured in display *columns* via `unicode-width` (the CJK arm
-/// glyphs are double-width). The paddle frame alternates every column step
-/// independent of travel direction. On a terminal too narrow to travel,
-/// `MAX` is 0 and the octopus paddles in place at the left margin rather
-/// than panicking. All arithmetic is overflow-safe: `offset` is bounded by
-/// `MAX`, so the caller's `" ".repeat(offset)` can never run away.
+/// offset climbs `0 → MAX` in [`OCTOPUS_SWEEP_ONE_WAY_MS`] then falls back,
+/// forever, sweeping the FULL `wrap_width` — `MAX` keeps the octopus plus a
+/// one-column right margin inside it, measured in display *columns* via
+/// `unicode-width` (the CJK arm glyphs are double-width). Position is
+/// time-proportional, so it reaches the far edge every sweep on any width.
+/// The paddle frame alternates every [`OCTOPUS_STROKE_MS`] independent of
+/// travel. On a terminal too narrow to travel, `MAX` is 0 and the octopus
+/// paddles in place at the left margin rather than panicking. All arithmetic
+/// is overflow-safe: `offset` is bounded by `MAX`, so the caller's
+/// `" ".repeat(offset)` can never run away.
 fn octopus_swim(elapsed_ms: u128, wrap_width: usize) -> (usize, &'static str) {
     let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
+    let frame = OCTOPUS_SWIM_FRAMES[((elapsed_ms / OCTOPUS_STROKE_MS) % 2) as usize];
     let max = wrap_width.saturating_sub(octopus_width + 1);
-    // Reduce in u128 first so a huge uptime can never truncate badly.
-    let steps = elapsed_ms / OCTOPUS_SWIM_STEP_MS;
-    let frame = OCTOPUS_SWIM_FRAMES[(steps % 2) as usize];
     if max == 0 {
         return (0, frame);
     }
-    let cycle = 2 * max;
-    let pos = (steps % cycle as u128) as usize;
-    let offset = if pos <= max { pos } else { cycle - pos };
+    // Triangle wave in TIME (u128 end-to-end so a huge uptime can't
+    // truncate): phase ∈ [0, 2·SWEEP), folded to one_way ∈ [0, SWEEP],
+    // then scaled onto [0, MAX].
+    let cycle_ms = 2 * OCTOPUS_SWEEP_ONE_WAY_MS;
+    let phase = elapsed_ms % cycle_ms;
+    let one_way = phase.min(cycle_ms - phase);
+    let offset = ((one_way * max as u128) / OCTOPUS_SWEEP_ONE_WAY_MS) as usize;
     (offset, frame)
 }
 
@@ -9275,10 +9287,30 @@ mod tests {
     }
 
     #[test]
-    fn octopus_swim_ping_pongs_the_full_width_while_paddling() {
-        // Sample one full period, one column-step at a time, and confirm the
-        // offset traces 0→MAX→0 (a triangle) spanning the FULL wrap width —
-        // no sweep cap — while the paddle frame alternates on every step.
+    fn octopus_swim_reaches_the_far_edge_in_one_sweep_on_any_width() {
+        // The sweep is time-proportional: at exactly OCTOPUS_SWEEP_ONE_WAY_MS
+        // the octopus touches the far edge — on ANY terminal width. (The old
+        // fixed ms-per-column pace took ~21s one-way on a 146-column pane, so
+        // real thinking phases ended with the octopus around mid-screen.)
+        let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
+        for wrap_width in [20usize, 40, 80, 146, 200, 1000] {
+            let max = wrap_width.saturating_sub(octopus_width + 1);
+            let (at_peak, _) = octopus_swim(OCTOPUS_SWEEP_ONE_WAY_MS, wrap_width);
+            assert_eq!(
+                at_peak, max,
+                "far edge reached after one sweep at wrap_width={wrap_width}"
+            );
+            // …and it comes all the way back by the end of the cycle.
+            let (back, _) = octopus_swim(2 * OCTOPUS_SWEEP_ONE_WAY_MS, wrap_width);
+            assert_eq!(back, 0, "returns to origin at wrap_width={wrap_width}");
+        }
+    }
+
+    #[test]
+    fn octopus_swim_traces_a_symmetric_triangle_while_paddling() {
+        // Sampled through one full cycle: offset rises monotonically to MAX,
+        // falls monotonically back, is mirror-symmetric around the peak, and
+        // the paddle stroke alternates every OCTOPUS_STROKE_MS throughout.
         let wrap_width = 120usize;
         let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
         let max = wrap_width.saturating_sub(octopus_width + 1);
@@ -9287,59 +9319,62 @@ mod tests {
             "the sweep must exceed the old 28-column cap (got MAX={max})"
         );
 
-        // The triangle we expect, built independently of the implementation:
-        // rise 0..=MAX, then fall MAX-1..=1 (the trough 0 opens the next period).
-        let mut expected = Vec::new();
-        expected.extend(0..=max); // rising →
-        expected.extend((1..max).rev()); // falling ←
-        let cycle = expected.len();
-        assert_eq!(cycle, 2 * max, "one period spans 2·MAX column-steps");
-
-        for (step, &want_offset) in expected.iter().enumerate() {
-            let elapsed = (step as u128) * OCTOPUS_SWIM_STEP_MS;
-            let (offset, frame) = octopus_swim(elapsed, wrap_width);
-            assert_eq!(offset, want_offset, "offset at step {step}");
-            // Never overshoots the peak, never underflows below the margin.
-            assert!(
-                offset <= max,
-                "offset {offset} exceeded MAX {max} at {step}"
-            );
-            // The arms flip mirror-image every column step, independent of
-            // travel direction.
+        let cycle_ms = 2 * OCTOPUS_SWEEP_ONE_WAY_MS;
+        let mut previous = None;
+        for t in (0..=cycle_ms).step_by(50) {
+            let (offset, frame) = octopus_swim(t, wrap_width);
+            assert!(offset <= max, "offset {offset} exceeded MAX {max} at {t}ms");
+            // Mirror symmetry: same distance from either end of the cycle.
+            let (mirrored, _) = octopus_swim(cycle_ms - t, wrap_width);
+            assert_eq!(offset, mirrored, "triangle asymmetric at {t}ms");
+            // Monotone rise then fall.
+            if let Some((prev_t, prev_offset)) = previous {
+                if t <= OCTOPUS_SWEEP_ONE_WAY_MS {
+                    assert!(
+                        offset >= prev_offset,
+                        "rising leg regressed between {prev_t}ms and {t}ms"
+                    );
+                } else if prev_t >= OCTOPUS_SWEEP_ONE_WAY_MS {
+                    assert!(
+                        offset <= prev_offset,
+                        "falling leg climbed between {prev_t}ms and {t}ms"
+                    );
+                }
+            }
+            // Stroke follows the global clock, independent of position.
             assert_eq!(
                 frame,
-                OCTOPUS_SWIM_FRAMES[step % 2],
-                "paddle stroke at step {step}"
+                OCTOPUS_SWIM_FRAMES[((t / OCTOPUS_STROKE_MS) % 2) as usize],
+                "paddle stroke at {t}ms"
             );
+            previous = Some((t, offset));
         }
-
-        // The period repeats: step `cycle` lands back at the origin.
-        let (wrapped, _frame) = octopus_swim((cycle as u128) * OCTOPUS_SWIM_STEP_MS, wrap_width);
-        assert_eq!(wrapped, 0, "period wraps back to the left margin");
     }
 
     #[test]
     fn octopus_swim_never_overflows_the_wrap_width() {
-        // The octopus (plus a one-column right margin) always stays inside the
-        // wrap boundary, across a long stretch of the animation, for a range
-        // of terminal widths — and on wide terminals it actually reaches the
-        // far edge (full-width travel, not a capped sweep).
+        // The octopus (plus a one-column right margin) always stays inside
+        // the wrap boundary across full cycles, for a range of widths — and
+        // reaches the far edge on every one of them (full-width travel).
         let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
         for wrap_width in [octopus_width + 2, 20, 40, 80, 200, 1000] {
             let max = wrap_width.saturating_sub(octopus_width + 1);
             let mut peak = 0usize;
-            // 2·1000 steps covers a full period even at wrap_width=1000.
-            for step in 0..2000u128 {
-                let (offset, _frame) = octopus_swim(step * OCTOPUS_SWIM_STEP_MS, wrap_width);
+            for t in (0..2 * OCTOPUS_SWEEP_ONE_WAY_MS).step_by(25) {
+                let (offset, _frame) = octopus_swim(t, wrap_width);
                 assert!(
                     offset + octopus_width <= wrap_width,
                     "octopus overflowed wrap_width={wrap_width}: offset={offset}",
                 );
                 peak = peak.max(offset);
             }
+            // step_by sampling always hits the exact SWEEP_MS peak instant
+            // because 25 divides it; assert it rather than assuming.
+            let (at_peak, _) = octopus_swim(OCTOPUS_SWEEP_ONE_WAY_MS, wrap_width);
             assert_eq!(
-                peak, max,
-                "sweep must reach the far edge at wrap_width={wrap_width}"
+                peak.max(at_peak),
+                max,
+                "far edge at wrap_width={wrap_width}"
             );
         }
     }
@@ -9351,17 +9386,17 @@ mod tests {
         // wrapping.
         let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
         for wrap_width in [0usize, 1, 2, octopus_width, octopus_width + 1] {
-            // A large elapsed value also exercises the u128→usize math safely.
-            let (offset, frame) = octopus_swim(9_999_999_999, wrap_width);
+            // A large elapsed value also exercises the u128 math safely.
+            let big = 9_999_999_999u128;
+            let (offset, frame) = octopus_swim(big, wrap_width);
             assert_eq!(offset, 0, "no travel at wrap_width={wrap_width}");
-            let steps = 9_999_999_999u128 / OCTOPUS_SWIM_STEP_MS;
             assert_eq!(
                 frame,
-                OCTOPUS_SWIM_FRAMES[(steps % 2) as usize],
+                OCTOPUS_SWIM_FRAMES[((big / OCTOPUS_STROKE_MS) % 2) as usize],
                 "keeps paddling in place"
             );
-            // Consecutive steps still alternate strokes while parked.
-            let (_, next) = octopus_swim((steps + 1) * OCTOPUS_SWIM_STEP_MS, wrap_width);
+            // The next stroke interval still alternates while parked.
+            let (_, next) = octopus_swim(big + OCTOPUS_STROKE_MS, wrap_width);
             assert_ne!(frame, next, "parked octopus must keep alternating strokes");
         }
     }
