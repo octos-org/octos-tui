@@ -612,19 +612,43 @@ pub fn finalized_history_lines_range_dedup_live(
             used_reply_coverages[coverage_idx] = true;
             let coverage = &live_coverages[coverage_idx];
             let suffix = &message.content[coverage.reply_flushed_text.len()..];
-            // Continuation of a reply whose prefix is already in scrollback
-            // (coverage is only matched when non-empty) — never re-issue the
-            // bullet, but do seed blank handling from the streamed prefix so a
-            // separator split across commit still renders like one document.
-            push_live_reply_block_seeded(
-                &mut lines,
-                palette,
-                suffix,
-                wrap_width,
-                false,
-                true,
-                live_reply_prefix_ends_blank(palette, &coverage.reply_flushed_text, wrap_width),
-            );
+            let prefix_ends_blank =
+                live_reply_prefix_ends_blank(palette, &coverage.reply_flushed_text, wrap_width);
+            // A trailing Session Summary in the suffix must render as a card
+            // here too — this live-flushed-prefix branch is the normal
+            // long-running-tool partial-completion case and otherwise emits
+            // flat markdown (codex P2 on #292). Split the prose suffix from the
+            // summary; render the prose seeded (no bullet), then the card.
+            if let Some(start) = session_summary_block_start(suffix) {
+                let body = suffix[..start].trim_end();
+                if !body.is_empty() {
+                    push_live_reply_block_seeded(
+                        &mut lines,
+                        palette,
+                        body,
+                        wrap_width,
+                        false,
+                        true,
+                        prefix_ends_blank,
+                    );
+                }
+                let bg = chat_message_bg(palette, "assistant");
+                push_session_summary_card(&mut lines, palette, &suffix[start..], bg, wrap_width);
+            } else {
+                // Continuation of a reply whose prefix is already in scrollback
+                // (coverage matched only when non-empty) — never re-issue the
+                // bullet, but seed blank handling from the streamed prefix so a
+                // separator split across commit still renders like one document.
+                push_live_reply_block_seeded(
+                    &mut lines,
+                    palette,
+                    suffix,
+                    wrap_width,
+                    false,
+                    true,
+                    prefix_ends_blank,
+                );
+            }
         } else if message.role.as_str() == "assistant" {
             let boundaries =
                 committed_reply_segment_boundaries_for_message(app, session, idx, &message.content);
