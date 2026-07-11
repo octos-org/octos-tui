@@ -13354,6 +13354,54 @@ mod tests {
         );
     }
 
+    /// codex P2 round 3: the reflush SCOPE is captured at dismissal time — a
+    /// `TurnCompleted` draining between the dismissal and the next draw must
+    /// not demote a mid-stream dismissal to the committed-only path (whose
+    /// live dedup re-inserts only the post-prefix suffix, leaving the band).
+    #[test]
+    fn reflush_scope_survives_a_turn_settling_before_the_draw() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streamed prefix…");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.set_btw_answering(&session_id, "q?".into());
+        assert!(store.state.resolve_btw_answer(&session_id, "a".into()));
+
+        // Dismiss WHILE the live reply is in flight…
+        assert!(store.state.dismiss_btw_aside(&session_id));
+        // …then the turn settles before the event loop reaches the draw.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            store.state.sessions[0].live_reply.is_none(),
+            "the turn settled"
+        );
+
+        assert_eq!(
+            store.state.take_transcript_reflush_request(),
+            Some(crate::model::TranscriptReflushScope::WithLive),
+            "the dismissal-time streaming scope must survive the settle"
+        );
+
+        // And a dismissal AFTER settle records the committed-only scope.
+        store.state.set_btw_answering(&session_id, "q2?".into());
+        assert!(store.state.resolve_btw_answer(&session_id, "a2".into()));
+        assert!(store.state.dismiss_btw_aside(&session_id));
+        assert_eq!(
+            store.state.take_transcript_reflush_request(),
+            Some(crate::model::TranscriptReflushScope::CommittedOnly),
+            "a settled dismissal keeps the dedup-preserving committed path"
+        );
+    }
+
     /// A snapshot replay draining between an aside dismissal and the next
     /// draw must not eat the one-shot re-flush request (codex P2 on #288) —
     /// with unchanged committed history the tracker would emit nothing and
@@ -13376,7 +13424,7 @@ mod tests {
         }));
 
         assert!(
-            store.state.take_transcript_reflush_request(),
+            store.state.take_transcript_reflush_request().is_some(),
             "the re-flush request must survive a snapshot replay"
         );
     }
@@ -17835,16 +17883,17 @@ mod tests {
         store.state.set_btw_answering(&session_id, "q1?".into());
         assert!(store.state.resolve_btw_answer(&session_id, "a1".into()));
         assert!(
-            !store.state.take_transcript_reflush_request(),
+            store.state.take_transcript_reflush_request().is_none(),
             "no request while the aside is up"
         );
         assert!(store.state.dismiss_btw_aside(&session_id));
-        assert!(
+        assert_eq!(
             store.state.take_transcript_reflush_request(),
-            "dismissal must request the re-flush"
+            Some(crate::model::TranscriptReflushScope::WithLive),
+            "mid-stream dismissal must request the coherent live block"
         );
         assert!(
-            !store.state.take_transcript_reflush_request(),
+            store.state.take_transcript_reflush_request().is_none(),
             "the request is one-shot"
         );
 
@@ -17858,7 +17907,7 @@ mod tests {
             "settled aside dismissed by the submit"
         );
         assert!(
-            store.state.take_transcript_reflush_request(),
+            store.state.take_transcript_reflush_request().is_some(),
             "prompt-submit dismissal must request the re-flush"
         );
 
@@ -17870,7 +17919,7 @@ mod tests {
             "answering aside survives"
         );
         assert!(
-            !store.state.take_transcript_reflush_request(),
+            store.state.take_transcript_reflush_request().is_none(),
             "no removal -> no re-flush request"
         );
     }

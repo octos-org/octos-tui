@@ -296,16 +296,12 @@ where
     //   re-emit the full coherent committed+live block instead
     //   (`mark_flushed_stale`; the pre-dismissal copy migrates up into
     //   scrollback, the same bounded duplication the resize path accepts).
-    if store.state.take_transcript_reflush_request() {
-        let live_streaming = store
-            .state
-            .active_session()
-            .is_some_and(|session| session.live_reply.is_some());
-        if live_streaming {
-            scrollback.mark_flushed_stale();
-        } else {
-            scrollback.mark_committed_flush_stale();
+    match store.state.take_transcript_reflush_request() {
+        Some(crate::model::TranscriptReflushScope::WithLive) => scrollback.mark_flushed_stale(),
+        Some(crate::model::TranscriptReflushScope::CommittedOnly) => {
+            scrollback.mark_committed_flush_stale()
         }
+        None => {}
     }
 
     // The scrollback flush must wrap to the SAME width `insert_history_lines`
