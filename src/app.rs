@@ -6183,6 +6183,14 @@ fn push_agent_task_group(
     if items.is_empty() && subagent_titles.is_empty() {
         return;
     }
+    // Separate consecutive groups with a blank line so a burst of sub-agent
+    // "Agent task …" cards doesn't pack into an unreadable wall (user report:
+    // "too busy"). Guarded against doubling, so a caller that already emitted
+    // a leading blank (e.g. `push_turn_activity_log_section`) doesn't stack a
+    // second one.
+    if !lines.is_empty() && !line_is_blank(lines.last()) {
+        lines.push(Line::from(""));
+    }
     // Header counts tally the FULL turn set, not the display-capped `items`.
     let (total, completed, active, failed) = task_group_counts(full_items);
     // `spawn` returns immediately, so the parent's tool-call rollup can be all
@@ -15852,6 +15860,63 @@ mod tests {
         // A tiny window clamps to a full gauge rather than overflowing.
         app.session_context_window.insert(session_id.clone(), 1_000);
         assert_eq!(harness_context_ratio(&app), Some(1.0));
+    }
+
+    #[test]
+    fn consecutive_agent_task_groups_are_blank_separated() {
+        // A burst of sub-agent turns must not pack into a wall — each
+        // `push_agent_task_group` gets a guarded leading blank (user report:
+        // "add a space between each agent complete status").
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let mut lines = Vec::new();
+
+        let turn_a = octos_core::ui_protocol::TurnId::new();
+        let turn_b = octos_core::ui_protocol::TurnId::new();
+        let item_a = ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+            .with_tool_call("a")
+            .with_detail("echo a")
+            .with_success(true)
+            .with_turn(turn_a.clone());
+        let item_b = ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+            .with_tool_call("b")
+            .with_detail("echo b")
+            .with_success(true)
+            .with_turn(turn_b.clone());
+
+        push_agent_task_group(
+            &mut lines,
+            palette,
+            Some(&turn_a),
+            &[&item_a],
+            &[&item_a],
+            &[],
+            0,
+            false,
+            true,
+            false,
+            120,
+        );
+        let after_first = lines.len();
+        push_agent_task_group(
+            &mut lines,
+            palette,
+            Some(&turn_b),
+            &[&item_b],
+            &[&item_b],
+            &[],
+            0,
+            false,
+            true,
+            false,
+            120,
+        );
+
+        // The second group opens with a blank line (the separator).
+        assert!(
+            line_is_blank(lines.get(after_first)),
+            "a blank line must separate consecutive groups; got: {:?}",
+            lines_text(&lines)
+        );
     }
 
     #[test]
