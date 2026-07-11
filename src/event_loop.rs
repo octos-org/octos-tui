@@ -1493,6 +1493,12 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         }
         KeyCode::Enter => {
             if slash_help_query_active(store) && slash_help_enter_executes(store) {
+                // Executing the slash draft: the popup's job is done — CLOSE
+                // it before submitting. Leaving it open buried the command's
+                // result surface (e.g. the /btw aside pane) under a stale
+                // "No options available" box, which read as the command not
+                // running at all (live-terminal bug).
+                store.close_menu();
                 return handle_composer_enter(store);
             }
             let command = store.accept_active_menu_item();
@@ -1593,12 +1599,17 @@ fn slash_help_menu_active(store: &Store) -> bool {
 
 fn sync_slash_help_search_query(store: &mut Store) {
     if let Some(frame) = store.state.menu_stack.active_mut() {
-        frame.search_query = store
+        // Filter by the COMMAND TOKEN only (codex command_popup behavior):
+        // once the user types arguments ("/btw what are you…"), matching the
+        // whole draft against the registry yields "No options available" for
+        // a perfectly valid command. The first token keeps the command
+        // matched + highlighted while arguments are typed.
+        let draft = store
             .state
             .composer
             .strip_prefix('/')
-            .unwrap_or(store.state.composer.as_str())
-            .to_string();
+            .unwrap_or(store.state.composer.as_str());
+        frame.search_query = draft.split_whitespace().next().unwrap_or("").to_string();
         frame.selected_index = 0;
     }
     store.refresh_active_menu();
@@ -3561,6 +3572,47 @@ mod tests {
             handle_key(&mut store, modified_key(KeyCode::Enter, KeyModifiers::NONE)),
             KeyAction::Continue
         ));
+    }
+
+    /// Live-terminal bug: typing `/btw <args>` filtered the registry with the
+    /// WHOLE draft (args included) — "No options available" — and Enter
+    /// executed the draft but left the stale popup open, burying the aside
+    /// pane. The popup must (a) keep filtering by the command token only and
+    /// (b) close when Enter executes the draft.
+    #[test]
+    fn slash_draft_with_args_keeps_match_and_enter_closes_menu() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+
+        for ch in "/btw what are you doing".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        assert_eq!(store.state.composer, "/btw what are you doing");
+        // (a) the filter uses the command token, so /btw stays matched.
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.search_query.as_str()),
+            Some("btw"),
+            "popup must filter by the command token, not the whole draft"
+        );
+
+        // (b) Enter executes the draft AND closes the popup.
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+        assert!(
+            store.state.menu_stack.active().is_none(),
+            "executing the slash draft must close the popup"
+        );
+        assert!(
+            !matches!(action, KeyAction::Quit),
+            "draft execution must not quit"
+        );
+        assert!(
+            store.state.composer.is_empty(),
+            "submitting the draft must clear the composer"
+        );
     }
 
     #[test]
