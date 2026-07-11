@@ -350,11 +350,14 @@ pub(crate) fn wrap_line(line: &Line, width: usize) -> Vec<Line<'static>> {
                         if cur_width == 0 {
                             // A single glyph wider than the whole width (a CJK
                             // cell at width 1): emit it anyway — mirrors the
-                            // pre-existing hard-split behavior.
+                            // pre-existing hard-split behavior — and flush its
+                            // row at once, or `cur_width > width` would
+                            // underflow `width - cur_width` on the next char
+                            // (codex-review finding).
                             let ch_len = rest.chars().next().map_or(0, char::len_utf8);
                             let (glyph, tail) = rest.split_at(ch_len);
                             cur.push(Span::styled(glyph.to_string(), piece.style));
-                            cur_width += glyph.width();
+                            out.push(finish_line(std::mem::take(&mut cur), line.style));
                             rest = tail;
                             continue;
                         }
@@ -1516,6 +1519,28 @@ mod tests {
                     && s.style.add_modifier.contains(Modifier::ITALIC)),
             "the styled middle piece keeps its own style: {out:#?}"
         );
+    }
+
+    /// codex-review regression: at a one-column width, a double-width glyph is
+    /// force-emitted (it can never fit), which used to leave
+    /// `cur_width > width` and underflow `width - cur_width` on the NEXT
+    /// character. The forced glyph must flush its row immediately.
+    #[test]
+    fn wrap_survives_double_width_glyph_at_one_column_width() {
+        let line = Line::from(vec![Span::from("中a中b")]);
+        let out = wrap_line(&line, 1);
+        let rejoined: String = out
+            .iter()
+            .flat_map(|l| &l.spans)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(rejoined, "中a中b", "no character may be lost");
+        for l in &out {
+            assert!(
+                l.width() <= 2,
+                "each row holds at most the one forced glyph: {out:?}"
+            );
+        }
     }
 
     /// A glued multi-span run longer than the width hard-splits piece-wise:
