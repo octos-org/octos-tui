@@ -3522,6 +3522,18 @@ pub struct AppState {
     pub turn_started_at: std::collections::HashMap<(SessionKey, TurnId), std::time::Instant>,
     /// Latest `/btw` aside per session (see [`BtwAside`]).
     pub btw_asides: std::collections::HashMap<SessionKey, BtwAside>,
+    /// One-shot request to re-flush the transcript into terminal scrollback
+    /// on the next draw. Set when a tall live-region pane (the `/btw` aside)
+    /// is dismissed: the viewport shrink strands a blank band between the
+    /// transcript tail and the composer that nothing refills once the turn
+    /// is settled. Consumed by the event loop, which marks the scrollback
+    /// tracker stale so the same frame re-inserts the transcript over the
+    /// vacated rows (the same machinery a width-resize uses). The scope is
+    /// captured AT DISMISSAL TIME — a `TurnCompleted` draining before the
+    /// next draw must not demote a mid-stream dismissal to the committed-
+    /// only path, whose live-dedup would re-insert only the post-prefix
+    /// suffix and leave the band (codex P2 round 3).
+    pub transcript_reflush_requested: Option<TranscriptReflushScope>,
     pub expanded_tool_outputs: bool,
     pub menu_stack: MenuStack,
     pub active_menu: Option<MenuBuildResult>,
@@ -3744,6 +3756,19 @@ pub enum BtwAsideState {
     Answering,
     Answered(String),
     Failed(String),
+}
+
+/// Scope of a pending one-shot transcript re-flush (see
+/// `AppState::transcript_reflush_requested`): whether the dismissal happened
+/// while the session's main turn was still streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptReflushScope {
+    /// Turn settled at dismissal — committed-only re-flush (live dedup
+    /// watermarks preserved).
+    CommittedOnly,
+    /// Main turn still streaming at dismissal — re-emit the coherent
+    /// committed+live block.
+    WithLive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5323,6 +5348,7 @@ impl AppState {
             turn_activity_summaries: Vec::new(),
             turn_started_at: std::collections::HashMap::new(),
             btw_asides: std::collections::HashMap::new(),
+            transcript_reflush_requested: None,
             expanded_tool_outputs: false,
             menu_stack: MenuStack::new(),
             active_menu: None,
@@ -6435,6 +6461,7 @@ impl AppState {
             .is_some_and(|aside| !matches!(aside.state, BtwAsideState::Answering))
         {
             self.btw_asides.remove(session_id);
+            self.request_transcript_reflush(session_id);
         }
     }
 
@@ -6444,7 +6471,41 @@ impl AppState {
     /// aside — the user chose to leave; a late answer for a dismissed aside
     /// is dropped by `set_btw_answered`'s state guard.
     pub fn dismiss_btw_aside(&mut self, session_id: &SessionKey) -> bool {
-        self.btw_asides.remove(session_id).is_some()
+        let removed = self.btw_asides.remove(session_id).is_some();
+        if removed {
+            self.request_transcript_reflush(session_id);
+        }
+        removed
+    }
+
+    /// Record the one-shot re-flush request, capturing the dismissal-time
+    /// streaming scope (see the field docs): a live reply in flight for the
+    /// session means the frame must re-emit the coherent committed+live
+    /// block, and that decision must survive the turn settling before the
+    /// next draw.
+    fn request_transcript_reflush(&mut self, session_id: &SessionKey) {
+        let live_streaming = self
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .is_some_and(|session| session.live_reply.is_some());
+        let scope = if live_streaming {
+            TranscriptReflushScope::WithLive
+        } else {
+            TranscriptReflushScope::CommittedOnly
+        };
+        // A WithLive request must not be demoted by a same-frame settled
+        // dismissal of another pane; keep the stronger scope.
+        self.transcript_reflush_requested = match self.transcript_reflush_requested {
+            Some(TranscriptReflushScope::WithLive) => Some(TranscriptReflushScope::WithLive),
+            _ => Some(scope),
+        };
+    }
+
+    /// One-shot take of the pending transcript re-flush request (see the
+    /// field docs) — returns a value at most once per request.
+    pub fn take_transcript_reflush_request(&mut self) -> Option<TranscriptReflushScope> {
+        self.transcript_reflush_requested.take()
     }
 
     /// Count of the session's still-running background work (pending/running

@@ -281,6 +281,29 @@ where
         scrollback.mark_flushed_stale();
     }
 
+    // A dismissed `/btw` aside shrinks the live region and strands a blank
+    // band between the transcript tail and the composer — with the turn
+    // settled, nothing ever refills it (user report: "huge blank space").
+    // The store requests a one-shot re-flush; staling the tracker here makes
+    // THIS frame re-insert the transcript over the vacated rows. Which
+    // watermark to stale depends on whether the main turn is still
+    // streaming (codex P2 ×2 on #288):
+    // - settled: committed-only (`mark_committed_flush_stale`) — the kept
+    //   `completed_live` watermarks dedupe content that already streamed;
+    // - still streaming: a committed-only re-flush can be SHORTER than the
+    //   vacated band (e.g. only the user prompt is committed) and later
+    //   live chunks would append under a duplicated committed block — so
+    //   re-emit the full coherent committed+live block instead
+    //   (`mark_flushed_stale`; the pre-dismissal copy migrates up into
+    //   scrollback, the same bounded duplication the resize path accepts).
+    match store.state.take_transcript_reflush_request() {
+        Some(crate::model::TranscriptReflushScope::WithLive) => scrollback.mark_flushed_stale(),
+        Some(crate::model::TranscriptReflushScope::CommittedOnly) => {
+            scrollback.mark_committed_flush_stale()
+        }
+        None => {}
+    }
+
     // The scrollback flush must wrap to the SAME width `insert_history_lines`
     // uses (the full viewport width), so the line accounting stays consistent.
     let wrap_width = usize::from(width).max(1);
