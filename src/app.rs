@@ -8275,10 +8275,27 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
     // A turn parked on an operator decision is not "Working": the model is
     // stopped until the human answers. Show a distinct Waiting state (with a
     // steady `?` instead of the spinner) whenever an approval or an
-    // AskUserQuestion is pending — visible OR collapsed, the turn is parked
-    // either way — and fall back to the plain run_state display otherwise.
-    let waiting_on_operator = matches!(app.run_state, SessionRunState::InProgress)
-        && (app.approval.is_some() || app.user_question.is_some());
+    // AskUserQuestion is pending FOR THE ACTIVE SESSION — visible or
+    // collapsed, the turn is parked either way. The arrival path parks
+    // run_state at Blocked (and some mid-turn paths keep InProgress), so
+    // both count (codex P1: the InProgress-only gate never fired on the
+    // real flow, and an unscoped modal check marked the active session
+    // waiting for another session's decision).
+    let active_session_id = app.active_session().map(|session| session.id.clone());
+    let pending_decision_for_active = active_session_id.as_ref().is_some_and(|session_id| {
+        app.approval
+            .as_ref()
+            .is_some_and(|approval| &approval.session_id == session_id)
+            || app
+                .user_question
+                .as_ref()
+                .is_some_and(|question| &question.session_id == session_id)
+    });
+    let waiting_on_operator = pending_decision_for_active
+        && matches!(
+            app.run_state,
+            SessionRunState::InProgress | SessionRunState::Blocked { .. }
+        );
     let (state_marker, state_label, state_style) = if waiting_on_operator {
         (
             "?".to_string(),
@@ -9591,6 +9608,11 @@ mod tests {
             "in-progress without a pending decision stays Working: {status_row:?}"
         );
 
+        // The REAL arrival path parks run_state at Blocked (codex P1: the
+        // InProgress-only gate never fired on the actual flow).
+        app.run_state = SessionRunState::Blocked {
+            message: "Run command".into(),
+        };
         app.approval = Some(ApprovalModalState {
             session_id: session_id.clone(),
             approval_id: ApprovalId::new(),
@@ -9626,8 +9648,22 @@ mod tests {
             "collapsed-but-pending approval still Waiting: {status_row:?}"
         );
 
-        // Resolved -> back to Working.
+        // Another session's decision must NOT mark this one waiting: with
+        // the modal re-keyed to a different session the label falls back to
+        // the plain run_state (Blocked here).
+        if let Some(approval) = app.approval.as_mut() {
+            approval.session_id = SessionKey("local:other".into());
+        }
+        let rows = rendered_rows(&rendered_buffer(&app, palette));
+        let status_row = row_containing(&rows, "approval gated");
+        assert!(
+            !status_row.contains("Waiting"),
+            "another session's decision must not read Waiting here: {status_row:?}"
+        );
+
+        // Resolved -> back to the plain run_state display.
         app.approval = None;
+        app.run_state = SessionRunState::InProgress;
         let rows = rendered_rows(&rendered_buffer(&app, palette));
         let status_row = row_containing(&rows, "approval gated");
         assert!(

@@ -9086,7 +9086,16 @@ impl Store {
         // A turn that died between submit and its first latched delta left
         // run_state in-progress with nothing above to fail it — settle the
         // chip so the status bar cannot read "Working" against a dead child.
-        if self.state.run_state.is_active() && self.state.active_turn().is_none() {
+        // ONLY when the reconcile produced no replacement work: a follow-up
+        // command (auto-retry / restaged resubmit from fail_live_reply) has
+        // already re-armed the run state for a prompt genuinely in flight,
+        // and settling here would clobber it (codex P2). The or_else drain
+        // below arms its own run state inside start_prompt_turn, so settling
+        // before it is safe — an idle chip is exactly what lets it drain.
+        if follow_up.is_none()
+            && self.state.run_state.is_active()
+            && self.state.active_turn().is_none()
+        {
             self.state.set_run_state_idle();
         }
         follow_up.or_else(|| self.submit_next_pending_if_idle())
@@ -13309,6 +13318,33 @@ mod tests {
         assert!(
             format!("{command:?}").contains("queued prompt"),
             "the drained command must carry the staged prompt, got {command:?}"
+        );
+    }
+
+    /// A replacement submit produced by the relaunch reconcile itself (auto
+    /// retry / restaged prompt) re-arms the run state for a prompt genuinely
+    /// in flight — the idle-settle must not clobber it (codex P2).
+    #[test]
+    fn backend_relaunch_keeps_run_state_active_for_replacement_submits() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let dead_turn = TurnId::new();
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: dead_turn,
+            text: "partial".into(),
+        });
+        store.state.set_run_state_in_progress();
+        store.state.pending_messages = vec!["replacement prompt".into()];
+
+        let command = store.apply_client_event(ClientEvent::BackendRelaunched);
+
+        assert!(
+            command.is_some(),
+            "the staged replacement must be resubmitted"
+        );
+        assert!(
+            store.state.run_state.is_active(),
+            "a replacement submit in flight must keep the run state active, got {:?}",
+            store.state.run_state
         );
     }
 
