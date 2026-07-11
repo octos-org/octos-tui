@@ -2692,11 +2692,17 @@ mod tests {
             .resize_viewport_to(4)
             .expect("resize restored inline viewport");
         assert_eq!(terminal.viewport_area, Rect::new(0, 16, 60, 4));
-        assert_eq!(terminal.backend().cursor, Position { x: 0, y: 16 });
+        // The screen was resized (80x24 -> 60x20) while the overlay was up,
+        // so the restore takes the width-change full-reset path: whole-screen
+        // clear from the origin and a dropped visible-history extent (the
+        // emulator rewrapped the inline screen behind the alt screen).
+        assert_eq!(terminal.backend().cursor, Position { x: 0, y: 0 });
         assert_eq!(
             terminal.backend().clears,
-            vec![ClearType::All, ClearType::AfterCursor]
+            vec![ClearType::All, ClearType::All]
         );
+        assert_eq!(terminal.visible_history_rows(), 0);
+        assert_eq!(terminal.visible_history_bottom(), 0);
 
         let written = String::from_utf8_lossy(&terminal.backend().buf);
         assert!(written.contains("\u{1b}[?1049h"));
