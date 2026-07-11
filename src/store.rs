@@ -4217,11 +4217,21 @@ impl Store {
         prompt: String,
         status: impl Into<String>,
     ) -> Option<AppUiCommand> {
-        // A new submit (typed, menu-driven, or the staged drain) supersedes a
-        // pending interrupt-restore: the user moved on, and restoring the old
-        // prompt under the new turn would re-block the `/` slash popup.
-        self.state.pending_interrupt_restore = None;
         let session_id = self.active_session()?.id.clone();
+        // A new submit (typed, menu-driven, or the staged drain) supersedes a
+        // pending interrupt-restore FOR THIS SESSION: the user moved on here,
+        // and restoring the old prompt under the new turn would re-block the
+        // `/` slash popup. Scoped to the submitting session (codex P2) — a
+        // submit in session B says nothing about session A's pending restore,
+        // which lands in A's saved draft when A's terminal arrives.
+        if self
+            .state
+            .pending_interrupt_restore
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == session_id)
+        {
+            self.state.pending_interrupt_restore = None;
+        }
         let turn_id = octos_core::ui_protocol::TurnId::new();
         self.state.record_submitted_user_prompt(
             session_id.clone(),
@@ -6286,6 +6296,11 @@ impl Store {
             // `reconcile_after_backend_relaunch`) — nothing to finalize here.
             _ => return None,
         }
+        // This IS the interrupted turn's settle when the backend restarted
+        // under it (no `turn/completed`/`turn/error` will ever arrive) — the
+        // deferred Esc/Ctrl+C prompt restore applies here too (codex P2), or
+        // the prompt is silently lost after Esc + reconnect.
+        self.restore_interrupted_prompt_on_settle(session_id, turn_id);
         self.state
             .live_reasoning
             .remove(&(session_id.clone(), turn_id.clone()));
@@ -22508,6 +22523,121 @@ mod tests {
             Some("prompt for a"),
             "the restored prompt becomes session A's draft (rewind-prefill convention)"
         );
+    }
+
+    #[test]
+    fn interrupt_restore_survives_submit_in_another_session() {
+        // codex P2: a submit in session B must not drop session A's pending
+        // interrupt-restore — the "user moved on" rationale is session-scoped.
+        let turn_id = TurnId::new();
+        let session_a = SessionView {
+            id: SessionKey("local:a".into()),
+            title: "a".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: Some(LiveReply {
+                turn_id: turn_id.clone(),
+                text: "streaming".into(),
+            }),
+        };
+        let session_b = SessionView {
+            id: SessionKey("local:b".into()),
+            title: "b".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: AppState::new(vec![session_a, session_b], 0, "ready".into(), None, false),
+        };
+        let session_a_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_a_id.clone(),
+            turn_id.clone(),
+            "prompt for a".into(),
+        );
+        store.interrupt_command().expect("active turn interrupts");
+
+        // Switch to B and submit a fresh prompt there. Session A's live turn
+        // does not gate B (`active_turn` is session-scoped), so this STARTS
+        // B's turn via `start_prompt_turn`.
+        store.state.switch_selected_session(1);
+        store.state.set_composer_text("prompt for b");
+        let command = store.compose_command();
+        assert!(command.is_some(), "B is idle — the submit starts B's turn");
+
+        // A's terminal lands: its prompt must still restore (as A's draft).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_a_id.clone(),
+                topic: None,
+                turn_id,
+                code: "interrupted".into(),
+                message: "turn interrupted by client".into(),
+            },
+        )));
+        let draft = store
+            .state
+            .composer_drafts
+            .iter()
+            .find(|draft| draft.session_id == session_a_id)
+            .map(|draft| draft.text.clone());
+        assert_eq!(
+            draft.as_deref(),
+            Some("prompt for a"),
+            "a submit in B must not discard A's pending interrupt-restore"
+        );
+    }
+
+    #[test]
+    fn interrupt_restore_applies_when_hydrate_finalizes_the_turn() {
+        use crate::client_event::ClientEvent;
+        // codex P2: a backend restart can settle the interrupted turn through
+        // the hydrate finalize path (`finalize_stale_hydrated_live_turn`) —
+        // no `turn/completed`/`turn/error` ever arrives. The deferred restore
+        // must apply there too, or the prompt is silently lost.
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            "prompt lost to the restart".into(),
+        );
+        store.interrupt_command().expect("active turn interrupts");
+        assert!(store.state.composer.is_empty());
+
+        let result = SessionHydrateResult {
+            replayed_tool_envelopes: None,
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 1,
+            },
+            context: None,
+            context_state: None,
+            messages: None,
+            threads: None,
+            turns: Some(vec![HydratedTurn {
+                turn_id,
+                state: TurnLifecycleState::Interrupted,
+                started_at: None,
+                completed_at: None,
+                thread_id: None,
+            }]),
+            pending_approvals: None,
+            pending_questions: None,
+            replayed_envelopes: None,
+        };
+        store.apply_client_event(ClientEvent::SessionHydrate(result));
+
+        assert_eq!(
+            store.state.composer, "prompt lost to the restart",
+            "the hydrate-finalized interrupted turn must still restore its prompt"
+        );
+        assert!(store.state.pending_interrupt_restore.is_none());
     }
 
     #[test]
