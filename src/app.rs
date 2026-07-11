@@ -6316,11 +6316,19 @@ fn tool_card_bullet(item: &ActivityItem, palette: Palette) -> (String, Style) {
     }
 }
 
-/// Claude-Code-style tool-card header: `⏺ Bash(cmd)`. The invocation (shell
-/// command, spawn task, file path, …) renders in parens with raw JSON and the
-/// call-id stripped; multi-line commands indent to align under `(`. Every
-/// emitted line is budgeted + clipped to `wrap_width` display columns so it
-/// can never overflow and wrap to column 0 (the indent-not-honored bug).
+/// Leading indent for a tool card rendered as an agent-task-group CHILD:
+/// the card is always emitted under a group header (`⣻ Orchestrating…`), so
+/// its bullet must nest instead of sitting flush at column 0 where it reads
+/// as a sibling of the header. Two columns puts the `⏺`/spinner bullet at the
+/// same tree level as the `⎿` connector of non-tool children.
+const TOOL_CARD_CHILD_INDENT: &str = "  ";
+
+/// Claude-Code-style tool-card header: `  ⏺ Bash(cmd)` (indented as a group
+/// child). The invocation (shell command, spawn task, file path, …) renders
+/// in parens with raw JSON and the call-id stripped; multi-line commands
+/// indent to align under `(`. Every emitted line is budgeted + clipped to
+/// `wrap_width` display columns so it can never overflow and wrap to column 0
+/// (the indent-not-honored bug).
 fn push_tool_card_header(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -6329,14 +6337,17 @@ fn push_tool_card_header(
 ) {
     let (bullet, bullet_style) = tool_card_bullet(item, palette);
     let name = tool_display_name(&item.title);
+    let indent = TOOL_CARD_CHILD_INDENT;
+    let indent_cols = indent.width();
     let duration = item
         .duration_ms
         .map(|ms| format!("  {}", format_duration_ms(ms)))
         .unwrap_or_default();
 
     let Some(invocation) = tool_invocation_text(item).filter(|text| !text.trim().is_empty()) else {
-        // No arguments to show: `⏺ Bash`.
+        // No arguments to show: `  ⏺ Bash`.
         let mut spans = vec![
+            Span::styled(indent, palette.muted()),
             Span::styled(bullet, bullet_style),
             Span::styled(" ", palette.muted()),
             Span::styled(name, palette.muted()),
@@ -6349,7 +6360,7 @@ fn push_tool_card_header(
     };
 
     // Shell-family invocations keep the `$ ` prompt inside the parens —
-    // `⏺ Bash($ cargo test)` — the command-row marker #276 established; the
+    // `  ⏺ Bash($ cargo test)` — the command-row marker #276 established; the
     // prompt is part of the budgeted text so the width math stays exact.
     let invocation = if is_shell_family_tool(&item.title) {
         format!("$ {invocation}")
@@ -6357,14 +6368,16 @@ fn push_tool_card_header(
         invocation
     };
 
-    // Continuation lines align under the first char after `(`.
-    let cont_indent = " ".repeat(bullet.chars().count() + 1 + name.chars().count() + 1);
+    // Continuation lines align under the first char after `(`, INCLUDING the
+    // leading child indent so multi-line commands stay under the card.
+    let cont_indent =
+        " ".repeat(indent_cols + bullet.chars().count() + 1 + name.chars().count() + 1);
     let cmd_lines: Vec<&str> = invocation.lines().collect();
     let max_lines = 10usize;
     let shown = cmd_lines.len().min(max_lines).max(1);
     let clipped = cmd_lines.len() > shown;
-    // Budget the command text so lead-in + text + `)` + duration fit within
-    // `wrap_width` (unicode-width, so CJK commands stay exact).
+    // Budget the command text so indent + lead-in + text + `)` + duration fit
+    // within `wrap_width` (unicode-width, so CJK commands stay exact).
     let lead_width = cont_indent.width();
     let text_budget = wrap_width
         .saturating_sub(lead_width)
@@ -6383,6 +6396,7 @@ fn push_tool_card_header(
         }
         let mut spans = Vec::new();
         if idx == 0 {
+            spans.push(Span::styled(indent, palette.muted()));
             spans.push(Span::styled(bullet.clone(), bullet_style));
             spans.push(Span::styled(" ", palette.muted()));
             spans.push(Span::styled(format!("{name}("), palette.muted()));
@@ -6551,9 +6565,11 @@ fn push_compact_tool_preview(
     wrap_width: usize,
     in_scrollback: bool,
 ) {
-    // The preview prefix `  ⎿ ` is 4 display columns; budget the content so a
+    // The preview prefix `    ⎿ ` is 6 display columns — the 2-col child
+    // indent of the tool card (`TOOL_CARD_CHILD_INDENT`) plus `  ⎿ ` — so the
+    // output nests under the indented `⏺` bullet. Budget the content so a
     // preview line fits within `wrap_width` and never wraps to column 0.
-    const PREVIEW_PREFIX_COLS: usize = 4;
+    const PREVIEW_PREFIX_COLS: usize = 6;
     let preview_budget = wrap_width.saturating_sub(PREVIEW_PREFIX_COLS);
     let Some(output_preview) = item
         .output_preview
@@ -6582,7 +6598,7 @@ fn push_compact_tool_preview(
     let shown = total.min(line_limit);
     for line in preview_lines.iter().take(shown) {
         lines.push(Line::from(vec![
-            Span::styled("  ⎿ ", palette.border()),
+            Span::styled("    ⎿ ", palette.border()),
             Span::styled(
                 truncate_to_display_width(line, preview_budget),
                 palette.text(),
@@ -6601,7 +6617,7 @@ fn push_compact_tool_preview(
         };
         lines.push(Line::from(clip_line_spans(
             vec![
-                Span::styled("  ⎿ ", palette.border()),
+                Span::styled("    ⎿ ", palette.border()),
                 Span::styled(
                     t!(
                         "app.activity.more_lines_hidden",
@@ -6617,7 +6633,7 @@ fn push_compact_tool_preview(
     } else if expanded && total > COLLAPSED_TOOL_PREVIEW_LINES {
         lines.push(Line::from(clip_line_spans(
             vec![
-                Span::styled("  ⎿ ", palette.border()),
+                Span::styled("    ⎿ ", palette.border()),
                 Span::styled(
                     t!("app.activity.expanded_hint").into_owned(),
                     palette.muted(),
@@ -14226,6 +14242,67 @@ mod tests {
         assert!(text.contains("let value ="));
         assert!(text.contains(" ..."));
         assert!(!text.contains("TAIL_UNIQUE_SHOULD_NOT_RENDER"));
+    }
+
+    #[test]
+    fn tool_card_children_are_indented_under_the_group_header() {
+        // A tool activity renders as a `⏺ Bash(...)` card, but it is always a
+        // CHILD of the agent-task group header (`⣻ Orchestrating…` / `• Agent
+        // task …`). Its bullet must be indented so it nests under the header
+        // instead of sitting flush at column 0 where it reads as a sibling
+        // (user report: "bash commands should be indented").
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("done")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_tool_call("wait-1")
+                .with_detail("curl -L https://example.com -o /tmp/x.dmg")
+                .with_success(true)
+                .with_output_preview("downloaded 120MB")
+                .with_duration_ms(3200),
+        );
+
+        // Expanded so the settled group shows its child rows (a live/running
+        // turn shows them too — same non-collapsed path the user hit).
+        app.expanded_tool_outputs = true;
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let rows = rendered_rows(&rendered_buffer(&app, palette));
+
+        let card_row = rows
+            .iter()
+            .find(|row| row.contains("Bash($ curl"))
+            .unwrap_or_else(|| panic!("no Bash card row; got:\n{}", rows.join("\n")));
+        assert!(
+            card_row.starts_with("  ⏺")
+                || card_row.starts_with("  ") && card_row.trim_start().starts_with('⏺'),
+            "the tool card bullet must be indented as a group child, got: {card_row:?}"
+        );
+        assert!(
+            !card_row.trim_end().starts_with("⏺"),
+            "the tool card must NOT be flush at column 0: {card_row:?}"
+        );
+
+        // The `⎿` output preview nests one step further under the indented card.
+        let preview_row = rows
+            .iter()
+            .find(|row| row.contains("downloaded 120MB"))
+            .expect("preview row");
+        assert!(
+            preview_row.starts_with("    ⎿"),
+            "the preview must nest under the indented card, got: {preview_row:?}"
+        );
     }
 
     #[test]
