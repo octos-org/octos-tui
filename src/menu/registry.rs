@@ -428,7 +428,7 @@ impl MenuRegistry {
             .unwrap_or_else(|| {
                 MenuBuildResult::Unavailable(MenuStatusSpec::new(
                     id.clone(),
-                    "Menu unavailable",
+                    t!("menu.unavailable"),
                     format!("No menu provider is registered for `{id}`."),
                 ))
             })
@@ -501,7 +501,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "copy",
             aliases: &["yank"],
-            description: "Copy the last assistant reply to your clipboard (works over SSH).",
+            description: "command.copy.desc",
             category: CommandCategory::Runtime,
             availability: CommandAvailability::always(),
             inline_args: InlineArgMode::None,

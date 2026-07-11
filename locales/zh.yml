@@ -80,7 +80,7 @@ app:
   autonomy:
     goal_prefix: "目标："
     loops_running: "循环：%{count} 个运行中"
-    goal_meta: " (%{status} · %{used}/%{budget} tokens)"
+    goal_meta: " (%{status} · %{used}/%{budget} Token)"
   statusbar:
     agents: "%{count} 个智能体"
     re_entering: "重新进入中"
@@ -374,6 +374,8 @@ command:
   agents:
     desc: 查看或中断后端智能体
   aliases_label: 别名：
+  copy:
+    desc: 将最近一条助手回复复制到剪贴板（支持 SSH 环境）。
   cost:
     desc: 显示服务器报告的 token 和费用用量
   exit:
@@ -437,6 +439,23 @@ lang:
   unknown: 未知语言 '%{value}'。可选：en、zh。
   usage: 当前语言：%{current}。用法：/lang <en|zh>。
 menu:
+  availability:
+    approval_has_focus: 审批弹窗正占用键盘焦点
+    blocked_read_only: 只读模式下已阻止
+    feature_flag_disabled: "功能开关 `%{flag}` 已禁用"
+    feature_unavailable: "Octos UI 能力 `%{feature}` 不可用"
+    method_unavailable: "Octos UI 方法 `%{method}` 不可用"
+    method_unsupported: "不支持 Octos UI 方法 `%{method}`：%{reason}"
+    requires_active_turn: 需要活动的回合或后台任务
+    requires_approval_modal: 需要可见的审批弹窗
+    requires_disconnected: 需要断开连接模式
+    requires_idle_turn: 需要当前回合处于空闲状态
+    requires_mock_mode: 需要 mock 模式
+    requires_one_of: "需要以下方法之一：%{methods}"
+    requires_open_session: 需要打开的会话
+    requires_protocol_mode: 需要 protocol 模式
+    requires_ui_server: 需要已连接的 Octos UI 服务器
+    ui_unavailable: Octos UI 能力不可用
   component:
     footer: 空格 切换 | 回车 保存 | Esc 关闭
     preview_title: 预览
@@ -464,16 +483,24 @@ menu:
     title: 费用
     unavailable_no_session: 用量统计需要一个打开的 Octos UI 会话。
     unavailable_title: 费用不可用
+  empty: 没有可用选项
+  filter:
+    placeholder: 筛选选项
   footer:
     enter_apply_esc_close: 回车 应用 | Esc 关闭
     enter_run_esc_close: 回车 执行 | Esc 关闭
     esc_back: Esc 返回
     esc_close: Esc 关闭
+    multi: "Space 切换 | Enter 确认 | Esc 取消 | 上/下 移动"
+    multi_reorder: "Space 切换 | Enter 确认 | Esc 取消 | Alt+上/Alt+下 重新排序"
+    select: "Enter 确认 | Esc 取消 | 上/下 移动"
   help:
     footer: 回车 打开/运行 | Esc 关闭
     search: 筛选命令
     subtitle: 命令由共享注册表解析。
     title: 斜杠命令
+  item:
+    default_suffix: " 默认"
   keymap:
     item:
       composer_delete_word:
@@ -749,6 +776,8 @@ menu:
     title: 供应商
     unavailable_title: 供应商不可用
   runtime_preview_title: 运行时
+  search:
+    label: "搜索 "
   skills:
     item:
       cache_empty:
@@ -879,6 +908,7 @@ menu:
     subtitle: 服务器端搜索、网页、浏览器和 MCP 工具设置。
     title: 工具设置
     unavailable_title: 工具设置不可用
+  unavailable: 菜单不可用
 status:
   opening_diff_preview: "正在打开差异预览：%{operation} %{path}"
   opening_inline_diff_preview: "正在打开内联差异预览：%{title}"
