@@ -7258,6 +7258,11 @@ impl Store {
         // event without a turn_id can't be attributed, so it is skipped.
         if event.metadata.kind == octos_core::ui_protocol::progress_kinds::STATUS_WORD {
             if let Some(turn_id) = event.turn_id.clone() {
+                let stored_turn = self
+                    .state
+                    .session_status_word
+                    .get(&event.session_id)
+                    .map(|(turn, _)| turn.clone());
                 match event
                     .metadata
                     .label
@@ -7265,14 +7270,26 @@ impl Store {
                     .map(str::trim)
                     .filter(|word| !word.is_empty())
                 {
-                    Some(word) => {
+                    // Only a same-or-newer turn may set the word (TurnId is
+                    // UUIDv7, time-ordered): a delayed/replayed event for an
+                    // OLDER turn must not clobber a newer turn's word, which
+                    // the render would then reject as non-active (codex P2).
+                    Some(word)
+                        if stored_turn
+                            .as_ref()
+                            .is_none_or(|stored| turn_id.0 >= stored.0) =>
+                    {
                         self.state
                             .session_status_word
                             .insert(event.session_id.clone(), (turn_id, word.to_owned()));
                     }
-                    None => {
+                    Some(_) => {}
+                    // Only the stored turn may clear its own word — an old
+                    // turn's blank must not wipe a newer turn's word.
+                    None if stored_turn.as_ref() == Some(&turn_id) => {
                         self.state.session_status_word.remove(&event.session_id);
                     }
+                    None => {}
                 }
             }
         }
@@ -23439,17 +23456,31 @@ mod tests {
             "a turn-less word does not overwrite the stored one"
         );
 
-        // An empty-label status_word clears the word (falls back to phase).
+        // A blank word for a DIFFERENT (older) turn must NOT clear the
+        // stored word (codex P2 anti-clobber).
+        let mut stale_blank = UiProgressMetadata::new(progress_kinds::STATUS_WORD);
+        stale_blank.label = Some("   ".into());
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id.clone(),
+            Some(TurnId::new()),
+            stale_blank,
+        )));
+        assert!(
+            store.state.session_status_word.contains_key(&session_id),
+            "a blank for a different turn must not clear the stored word"
+        );
+
+        // A blank for the SAME turn clears it (falls back to phase).
         let mut empty = UiProgressMetadata::new(progress_kinds::STATUS_WORD);
         empty.label = Some("   ".into());
         store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
             session_id.clone(),
-            Some(TurnId::new()),
+            Some(turn.clone()),
             empty,
         )));
         assert!(
             !store.state.session_status_word.contains_key(&session_id),
-            "a blank word clears the stored persona word"
+            "a blank for the stored turn clears the persona word"
         );
     }
 
