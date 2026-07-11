@@ -3522,6 +3522,14 @@ pub struct AppState {
     pub turn_started_at: std::collections::HashMap<(SessionKey, TurnId), std::time::Instant>,
     /// Latest `/btw` aside per session (see [`BtwAside`]).
     pub btw_asides: std::collections::HashMap<SessionKey, BtwAside>,
+    /// One-shot request to re-flush the committed transcript into terminal
+    /// scrollback on the next draw. Set when a tall live-region pane (the
+    /// `/btw` aside) is dismissed: the viewport shrink strands a blank band
+    /// between the transcript tail and the composer that nothing refills
+    /// once the turn is settled. Consumed by the event loop, which marks the
+    /// scrollback tracker stale so the same frame re-inserts the transcript
+    /// over the vacated rows (the same machinery a width-resize uses).
+    pub transcript_reflush_requested: bool,
     pub expanded_tool_outputs: bool,
     pub menu_stack: MenuStack,
     pub active_menu: Option<MenuBuildResult>,
@@ -5323,6 +5331,7 @@ impl AppState {
             turn_activity_summaries: Vec::new(),
             turn_started_at: std::collections::HashMap::new(),
             btw_asides: std::collections::HashMap::new(),
+            transcript_reflush_requested: false,
             expanded_tool_outputs: false,
             menu_stack: MenuStack::new(),
             active_menu: None,
@@ -6435,6 +6444,7 @@ impl AppState {
             .is_some_and(|aside| !matches!(aside.state, BtwAsideState::Answering))
         {
             self.btw_asides.remove(session_id);
+            self.transcript_reflush_requested = true;
         }
     }
 
@@ -6444,7 +6454,17 @@ impl AppState {
     /// aside — the user chose to leave; a late answer for a dismissed aside
     /// is dropped by `set_btw_answered`'s state guard.
     pub fn dismiss_btw_aside(&mut self, session_id: &SessionKey) -> bool {
-        self.btw_asides.remove(session_id).is_some()
+        let removed = self.btw_asides.remove(session_id).is_some();
+        if removed {
+            self.transcript_reflush_requested = true;
+        }
+        removed
+    }
+
+    /// One-shot take of the pending transcript re-flush request (see the
+    /// field docs) — returns true at most once per request.
+    pub fn take_transcript_reflush_request(&mut self) -> bool {
+        std::mem::take(&mut self.transcript_reflush_requested)
     }
 
     /// Count of the session's still-running background work (pending/running

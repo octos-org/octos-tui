@@ -17786,6 +17786,62 @@ mod tests {
         );
     }
 
+    /// Dismissing an aside (Enter on empty composer, or the next prompt
+    /// clearing a settled one) shrinks the live region by the aside's full
+    /// wrapped height — the vacated rows strand as a blank band above the
+    /// composer that nothing refills once the turn is settled (user report:
+    /// "huge blank space"). Both removal paths must request the one-shot
+    /// transcript re-flush the event loop turns into a scrollback re-insert.
+    #[test]
+    fn dismissing_a_btw_aside_requests_a_transcript_reflush() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming…");
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Explicit dismissal (Enter on the empty composer).
+        store.state.set_btw_answering(&session_id, "q1?".into());
+        assert!(store.state.resolve_btw_answer(&session_id, "a1".into()));
+        assert!(
+            !store.state.take_transcript_reflush_request(),
+            "no request while the aside is up"
+        );
+        assert!(store.state.dismiss_btw_aside(&session_id));
+        assert!(
+            store.state.take_transcript_reflush_request(),
+            "dismissal must request the re-flush"
+        );
+        assert!(
+            !store.state.take_transcript_reflush_request(),
+            "the request is one-shot"
+        );
+
+        // Prompt-submit dismissal of a settled aside requests it too.
+        store.state.set_btw_answering(&session_id, "q2?".into());
+        assert!(store.state.resolve_btw_answer(&session_id, "a2".into()));
+        store.state.composer = "next actual prompt".into();
+        let _ = store.compose_command();
+        assert!(
+            store.state.btw_aside_for(&session_id).is_none(),
+            "settled aside dismissed by the submit"
+        );
+        assert!(
+            store.state.take_transcript_reflush_request(),
+            "prompt-submit dismissal must request the re-flush"
+        );
+
+        // A no-op clear (aside still answering) must NOT request one.
+        store.state.set_btw_answering(&session_id, "q3?".into());
+        store.state.clear_settled_btw_aside(&session_id);
+        assert!(
+            store.state.btw_aside_for(&session_id).is_some(),
+            "answering aside survives"
+        );
+        assert!(
+            !store.state.take_transcript_reflush_request(),
+            "no removal -> no re-flush request"
+        );
+    }
+
     #[test]
     fn completed_turn_records_a_status_summary_with_running_task_count() {
         let turn_id = TurnId::new();

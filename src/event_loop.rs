@@ -281,6 +281,16 @@ where
         scrollback.mark_flushed_stale();
     }
 
+    // A dismissed `/btw` aside shrinks the live region and strands a blank
+    // band between the transcript tail and the composer — with the turn
+    // settled, nothing ever refills it (user report: "huge blank space").
+    // The store requests a one-shot re-flush; marking the tracker stale here
+    // makes THIS frame re-insert the committed transcript over the vacated
+    // rows, exactly like the width-resize path above.
+    if store.state.take_transcript_reflush_request() {
+        scrollback.mark_flushed_stale();
+    }
+
     // The scrollback flush must wrap to the SAME width `insert_history_lines`
     // uses (the full viewport width), so the line accounting stays consistent.
     let wrap_width = usize::from(width).max(1);
