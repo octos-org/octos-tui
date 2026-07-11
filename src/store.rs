@@ -1206,6 +1206,16 @@ impl Store {
                 self.state.status = t!("status.edit_field_prompt").into_owned();
                 None
             }
+            LocalAction::RunSlashCommand(draft) => {
+                // Codex Enter semantics: run the highlighted command NOW.
+                // Close the popup first so a command that opens its own menu
+                // (its "command page") lands on a clean stack, then execute
+                // the draft through the same path a composer submit takes.
+                self.close_menu();
+                self.state.set_composer_text(draft);
+                self.state.focus = FocusPane::Composer;
+                self.compose_command()
+            }
             LocalAction::Onboarding(action) => self.dispatch_onboarding_action(action, inline_args),
             LocalAction::Skills => self.dispatch_skills_inline(inline_args.unwrap_or_default()),
             LocalAction::McpConfig => self.dispatch_mcp_inline(inline_args.unwrap_or_default()),
@@ -3748,7 +3758,33 @@ impl Store {
             .active_menu
             .as_ref()
             .and_then(|menu| active_menu_selected_action(menu, selected_index))?;
-        self.dispatch_menu_action(action)
+        // Codex `dismiss_on_select` semantics: a LEAF selection closes the
+        // WHOLE menu stack — one pick = done, no Esc-chording back out of
+        // multi-level menus. Exempt are actions that manage the menu surface
+        // themselves:
+        //  * navigation — detected by the stack CHANGING under dispatch
+        //    (OpenMenu/ReplaceMenu/Close/..., or a local action that opens
+        //    its own page),
+        //  * RefreshMenu — the explicit stay-open mechanism for toggle rows,
+        //  * Onboarding actions + any selection while the wizard is in the
+        //    stack (the wizard owns its flow; its language step reuses the
+        //    same SetLanguageCode leaf and must return to the wizard),
+        //  * EditComposer — keeps the slash popup up for argument typing.
+        let path_before = self.state.menu_stack.path();
+        let keep_open = matches!(
+            &action,
+            MenuAction::Noop
+                | MenuAction::Local(LocalAction::RefreshMenu(_))
+                | MenuAction::Local(LocalAction::Onboarding(_))
+                | MenuAction::Local(LocalAction::EditComposer(_))
+        ) || path_before
+            .iter()
+            .any(|id| id.as_str().starts_with(crate::menu::registry::MENU_ONBOARD));
+        let command = self.dispatch_menu_action(action);
+        if !keep_open && self.state.menu_stack.path() == path_before {
+            self.close_all_menus();
+        }
+        command
     }
 
     /// Catalog-backed menus load their data on OPEN: the onboarding
@@ -16310,6 +16346,67 @@ mod tests {
         ));
     }
 
+    /// Codex `dismiss_on_select`: a leaf pick collapses the WHOLE menu stack
+    /// (no Esc-chording out of multi-level menus); wizard flows are exempt.
+    #[test]
+    fn menu_leaf_selection_closes_all_levels() {
+        let mut store = store_with_empty_session();
+        // Two levels deep: help → theme.
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_THEME));
+        assert_eq!(store.state.menu_stack.path().len(), 2);
+        // Select a concrete theme row (a SetTheme leaf).
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected theme menu");
+        };
+        let idx = spec
+            .items
+            .iter()
+            .position(|item| item.id == "slate")
+            .expect("slate theme row");
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("active frame")
+            .selected_index = idx;
+        assert!(store.accept_active_menu_item().is_none());
+        assert!(
+            store.state.menu_stack.path().is_empty(),
+            "leaf selection must close ALL menu levels"
+        );
+        assert_eq!(store.state.theme.as_str(), "slate");
+    }
+
+    /// The onboarding wizard owns its own flow: a leaf pick inside it (the
+    /// language step reuses the SetLanguageCode leaf) must NOT nuke the stack.
+    #[test]
+    fn onboarding_leaf_selection_keeps_wizard_open() {
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_LANGUAGE));
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected onboarding language menu");
+        };
+        // Pick the row for the CURRENT locale (en) so the global locale is
+        // unchanged for parallel tests.
+        let idx = spec
+            .items
+            .iter()
+            .position(|item| item.id.ends_with(".en"))
+            .expect("en language row");
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("active frame")
+            .selected_index = idx;
+        assert!(store.accept_active_menu_item().is_none());
+        assert!(
+            !store.state.menu_stack.path().is_empty(),
+            "wizard-scoped selection must keep the wizard flow open"
+        );
+    }
+
     #[test]
     fn searchable_menu_filters_items_and_dispatches_filtered_action() {
         let mut store = store_with_empty_session();
@@ -16332,13 +16429,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(labels, vec!["/keymap"]);
 
-        // Uniform completion: accepting the filtered item completes it into the
-        // composer (it does NOT open the menu yet) — consistent across all
-        // commands, argful or not.
+        // Codex Enter semantics: accepting the filtered item DISPATCHES it
+        // immediately — one Enter opens the command's page; the composer is
+        // left clean (no complete-then-Enter-again round trip).
         assert!(store.accept_active_menu_item().is_none());
-        assert_eq!(store.state.composer, "/keymap");
-        // The follow-up Enter resolves the now-complete command and opens it.
-        assert!(store.compose_command().is_none());
+        assert_eq!(store.state.composer, "");
         assert_eq!(
             store
                 .state
