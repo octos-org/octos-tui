@@ -6942,6 +6942,20 @@ fn task_group_counts(full_items: &[&ActivityItem]) -> (usize, usize, usize, usiz
     (total, completed, active, failed)
 }
 
+/// The single-variant diff-preview status the server always sends today
+/// (`DiffPreviewGetStatus::Ready`). It carries no information, so it is
+/// suppressed from the header; any other value is surfaced.
+fn is_default_diff_status(status: &str) -> bool {
+    status == "ready"
+}
+
+/// The single-variant diff-preview source the server always sends today
+/// (`DiffPreviewSource::PendingStore`) — an internal implementation detail.
+/// Suppressed from the header; any other value is surfaced.
+fn is_default_diff_source(source: &str) -> bool {
+    source == "pending_store"
+}
+
 fn push_inline_diff_preview(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -6966,7 +6980,7 @@ fn push_inline_diff_preview(
     ]));
 
     if let Some(preview) = &diff.preview {
-        lines.push(Line::from(vec![
+        let mut header = vec![
             Span::styled("    ", palette.muted()),
             Span::styled(
                 preview
@@ -6975,17 +6989,30 @@ fn push_inline_diff_preview(
                     .unwrap_or_else(|| t!("app.diff.inline_patch").to_string()),
                 palette.text().add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  ", palette.muted()),
-            Span::styled(
-                diff.status.as_deref().unwrap_or("unknown").to_string(),
-                palette.muted(),
-            ),
-            Span::styled("  ", palette.muted()),
-            Span::styled(
-                diff.source.as_deref().unwrap_or("unknown").to_string(),
-                palette.muted(),
-            ),
-        ]));
+        ];
+        // Only surface `status`/`source` when they carry information. Today both
+        // are single-variant protocol constants ("ready" / "pending_store")
+        // that are pure noise — and "pending_store" is an internal server
+        // implementation detail — so the defaults are suppressed and the row
+        // shows just the operation + path (e.g. "modify …"). An unrecognized
+        // future value is still shown so genuinely new states aren't swallowed.
+        if let Some(status) = diff
+            .status
+            .as_deref()
+            .filter(|status| !is_default_diff_status(status))
+        {
+            header.push(Span::styled("  ", palette.muted()));
+            header.push(Span::styled(status.to_string(), palette.muted()));
+        }
+        if let Some(source) = diff
+            .source
+            .as_deref()
+            .filter(|source| !is_default_diff_source(source))
+        {
+            header.push(Span::styled("  ", palette.muted()));
+            header.push(Span::styled(source.to_string(), palette.muted()));
+        }
+        lines.push(Line::from(header));
 
         if preview.files.is_empty() {
             lines.push(Line::from(vec![
@@ -15592,7 +15619,7 @@ mod tests {
     }
 
     #[test]
-    fn render_diff_preview_modal_includes_status_files_and_hunks() {
+    fn render_diff_preview_modal_omits_default_status_and_source_labels() {
         let app = app_with_diff(DiffPreviewGetResult {
             status: "ready".into(),
             source: "pending_store".into(),
@@ -15629,8 +15656,21 @@ mod tests {
 
         assert!(text.contains("Diff Preview"));
         assert!(text.contains("Roman numeral patch"));
-        assert!(text.contains("ready"));
-        assert!(text.contains("pending_store"));
+        // The default single-variant labels ("ready" / "pending_store") must
+        // not render in the header. Slice the header region (the title through
+        // the hint line that immediately follows it) so the word "ready" in the
+        // unrelated bottom status bar can't mask a regression.
+        let title = text.find("Roman numeral patch").expect("title in header");
+        let hint = text.find("select hunk").expect("hint after header");
+        let header_region = &text[title..hint];
+        assert!(
+            !header_region.contains("ready"),
+            "default status label must be suppressed: {header_region:?}"
+        );
+        assert!(
+            !header_region.contains("pending_store"),
+            "default source label must be suppressed: {header_region:?}"
+        );
         assert!(text.contains("modified"));
         assert!(text.contains("src/roman.rs"));
         assert!(text.contains("@@ -1 +1 @@"));
