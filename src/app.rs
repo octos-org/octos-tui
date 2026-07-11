@@ -213,19 +213,24 @@ fn live_tail_height_with_finalization(
         wrap_width,
         live_finalization,
     );
-    let rows = transcript_visual_rows(&lines, wrap_width) as u16;
+    let transcript_rows = transcript_visual_rows(&lines, wrap_width) as u16;
+    // The STREAMING transcript is always capped at half the viewport so a long
+    // in-flight turn can't dominate the screen — the rest stays in scrollback.
+    let half = (height / 2).max(3);
+    let capped_transcript = transcript_rows.min(half);
     // The `/btw` aside draws as a floating overlay OVER the tail's top rows
     // (`render_btw_overlay`) and adds no flow lines of its own — reserve its
-    // rows here or a settled/short tail starves the overlay's 3-row minimum
-    // and the pane becomes invisible while still answering (codex P1).
-    let rows = rows.max(btw_overlay_height_hint(app, width));
-    // Cap the tail so it can't dominate the viewport; the rest stays in
-    // scrollback. Scale with the terminal (at most half its height) rather than
-    // a fixed 18 — a tall terminal shouldn't strand the live tail at 18 while a
-    // short one over-reserves. The outer `live_ui_height` clamp still guarantees
-    // `LIVE_VIEWPORT_MIN_SCROLLBACK` rows of scrollback remain visible.
-    let max_tail = (height / 2).max(3);
-    rows.clamp(0, max_tail)
+    // rows here or a settled/short tail starves the overlay's 3-row minimum and
+    // the pane becomes invisible while still answering (codex P1). Unlike the
+    // transcript, a `/btw` aside is a focused reading surface the user
+    // explicitly opened, so ITS reservation may exceed the half mark to fit the
+    // whole answer rather than stranding its tail behind a scroll. Merging AFTER
+    // the transcript cap keeps a long stream half-capped even while an aside is
+    // open (only the aside's own height grows). The outer `live_ui_height` clamp
+    // still reserves `LIVE_VIEWPORT_MIN_SCROLLBACK` rows of scrollback, and the
+    // overlay scrolls whatever still doesn't fit on a small terminal.
+    let btw_hint = btw_overlay_height_hint(app, width);
+    capped_transcript.max(btw_hint).min(height)
 }
 
 pub(crate) fn live_tail_has_guarded_sections(
@@ -9957,6 +9962,31 @@ mod tests {
     }
 
     #[test]
+    fn btw_overlay_grows_to_fit_a_long_answer_on_a_tall_terminal() {
+        // Regression: the aside was capped at half the viewport, so a long
+        // answer stranded its last line behind a scroll even with screen space
+        // to spare (reported: "…gives you a proper" cut off). It must now grow
+        // to show the WHOLE answer and drop the scroll indicator.
+        let (app, _session_id) = app_with_long_btw_answer();
+        // Height 30 at width 100: the answer wraps to more than half of 30 (the
+        // old cap), so the old code stranded its tail behind a scroll — but it
+        // fits comfortably within the full viewport minus composer + scrollback.
+        let text = viewport_rows(&app, 100, 30).join("\n");
+        assert!(
+            text.contains("Likely next step"),
+            "the tail paragraph must render; got:\n{text}"
+        );
+        assert!(
+            text.contains("instead of the build doing it."),
+            "the FINAL sentence must be fully visible, not stranded; got:\n{text}"
+        );
+        assert!(
+            !text.contains("PgUp/PgDn"),
+            "a fitting answer must not show a scroll indicator when it fits; got:\n{text}"
+        );
+    }
+
+    #[test]
     fn btw_overlay_wraps_long_prose_instead_of_clipping() {
         let (app, _session_id) = app_with_long_btw_answer();
         // Tall terminal: the whole answer fits, so nothing is clipped and no
@@ -17477,6 +17507,27 @@ mod tests {
         assert!(
             tall > short,
             "the cap scales with terminal height: {tall} vs {short}"
+        );
+    }
+
+    #[test]
+    fn long_stream_stays_half_capped_even_with_a_btw_aside_open() {
+        // Regression (codex P2 on the aside-height fix): raising the tail cap for
+        // a `/btw` aside must lift ONLY the aside's own reservation — a long
+        // in-flight stream behind a short aside must still be half-capped so it
+        // can't grow the viewport and displace scrollback.
+        let huge = (1..=80)
+            .map(|i| format!("para {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut app = active_turn_app(&huge);
+        let session_id = app.active_session().expect("active session").id.clone();
+        // A short aside (just "Answering…"), far smaller than half the screen.
+        app.set_btw_answering(&session_id, "quick q".into());
+        let tail = live_tail_height_with_finalization(&app, 80, 50, None);
+        assert!(
+            tail <= 25,
+            "a long stream must stay half-capped despite an open aside: {tail}"
         );
     }
 
