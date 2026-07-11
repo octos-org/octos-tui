@@ -7077,7 +7077,7 @@ pub fn activity_status_is_running(status: &str) -> bool {
 /// once the durable terminal agent record lands.
 pub fn terminal_task_state_from_agent_status(status: &str) -> Option<TaskRuntimeState> {
     match status {
-        "completed" | "done" => Some(TaskRuntimeState::Completed),
+        "completed" => Some(TaskRuntimeState::Completed),
         "failed" => Some(TaskRuntimeState::Failed),
         "interrupted" | "cancelled" => Some(TaskRuntimeState::Cancelled),
         _ => None,

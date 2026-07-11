@@ -1188,6 +1188,7 @@ status:
   bang_usage: "用法：!<命令>"
   bang_no_output: "（无输出）"
   cannot_start_review_active_turn: "轮次进行中，无法启动审查。"
+  cannot_spawn_active_turn: "轮次进行中，无法派遣智能体。"
   server_clamped_onboarding_choice: "服务器收紧或拒绝了暂存的引导设置选择。"
   goal_clear_requested: "已请求清除目标"
   submitted_staged_message: "已提交暂存的消息"

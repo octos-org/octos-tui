@@ -197,11 +197,12 @@ fn session_open_does_not_hydrate_without_autonomy_feature() {
     assert_eq!(store.state.pending_autonomy_hydration.len(), 0);
 }
 
-/// `/agents spawn N <prompt>` dispatches a `SubmitPrompt` turn and
-/// simultaneously enqueues an `agent/list` refresh in the hydration queue.
+/// `/agents spawn N <prompt>` dispatches a `SubmitPrompt` turn.
 /// The TUI must never emit a hypothetical generic `agent/spawn` RPC.
+/// No pre-spawn `agent/list` is enqueued — agents announce themselves via
+/// `AgentUpdated` as they spin up, avoiding a stale empty-roster chip.
 #[test]
-fn agents_spawn_dispatches_turn_and_queues_list_refresh() {
+fn agents_spawn_dispatches_turn() {
     let mut store = store_with_autonomy_session();
     store.state.composer = "/agents spawn 2 do work".into();
 
@@ -215,7 +216,7 @@ fn agents_spawn_dispatches_turn_and_queues_list_refresh() {
     let queued: Vec<_> =
         std::iter::from_fn(|| store.state.dequeue_autonomy_hydration()).collect();
     assert!(
-        queued.iter().any(|c| matches!(c, AppUiCommand::ListAgents(_))),
-        "spawn must enqueue ListAgents in the hydration queue, got: {queued:?}"
+        queued.is_empty(),
+        "spawn must not pre-enqueue a ListAgents (avoids stale empty-roster chip), got: {queued:?}"
     );
 }

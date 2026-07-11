@@ -756,15 +756,14 @@ impl Store {
                 }))
             }
             AgentsCommand::Spawn { count, prompt } => {
+                if self.state.active_turn().is_some() {
+                    self.state.status =
+                        t!("status.cannot_spawn_active_turn").into_owned();
+                    return None;
+                }
                 if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_AGENT_LIST) {
                     return None;
                 }
-                self.state.enqueue_autonomy_hydration(AppUiCommand::ListAgents(
-                    crate::model::AgentListParams {
-                        session_id: session_id.clone(),
-                        parent_agent_id: None,
-                    },
-                ));
                 let text = t!(
                     "status.spawn_agents_turn",
                     count = count,
@@ -4772,32 +4771,25 @@ impl Store {
                         crate::model::terminal_task_state_from_agent_status(&a.status).is_none()
                     })
                     .count();
-                if result.agents.is_empty() {
-                    self.state.push_activity(ActivityItem::new(
-                        ActivityKind::Progress,
-                        t!("status.activity_agent_list").into_owned(),
-                        t!("status.no_agents").into_owned(),
-                    ));
-                } else {
-                    for agent in &result.agents {
-                        let title = agent
-                            .title
-                            .clone()
-                            .unwrap_or_else(|| agent.nickname.clone());
-                        let detail = agent
-                            .summary
-                            .clone()
-                            .or_else(|| agent.last_task.clone())
-                            .unwrap_or_else(|| agent.role.clone());
-                        self.state.push_activity(
-                            ActivityItem::new(
-                                ActivityKind::Progress,
-                                title,
-                                agent.status.clone(),
-                            )
-                            .with_detail(detail),
-                        );
-                    }
+                for agent in &result.agents {
+                    let title = agent
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| agent.nickname.clone());
+                    let detail = agent
+                        .summary
+                        .clone()
+                        .or_else(|| agent.last_task.clone())
+                        .unwrap_or_else(|| agent.role.clone());
+                    self.state.push_activity(
+                        ActivityItem::new(
+                            ActivityKind::Progress,
+                            title,
+                            agent.status.clone(),
+                        )
+                        .with_detail(detail)
+                        .with_session(result.session_id.clone()),
+                    );
                 }
                 self.state
                     .set_session_agents(&result.session_id, result.agents);
@@ -7036,6 +7028,29 @@ impl Store {
             // octos-core is ahead of this crate and added `VoiceExit`; handling
             // it here keeps the match exhaustive so the workspace compiles.)
             UiNotification::VoiceExit(_) => None,
+            UiNotification::ContextCompactionStarted(event) => {
+                let session_id = event.session_id.clone();
+                let state = crate::model::ContextLifecycleState {
+                    session_id: event.context_state.session_id.clone(),
+                    thread_id: event.context_state.thread_id.clone(),
+                    generation: event.context_state.generation,
+                    transcript_hash: event.context_state.transcript_hash.clone(),
+                    item_count: event.context_state.item_count,
+                    token_estimate: event.context_state.token_estimate,
+                    recovery_state: event.context_state.recovery_state.clone(),
+                    last_checkpoint_id: event.context_state.last_checkpoint_id.clone(),
+                    last_compaction_id: event.context_state.last_compaction_id.clone(),
+                };
+                self.state
+                    .context_lifecycle_mut(&session_id)
+                    .state = Some(state);
+                self.state.status = format!(
+                    "Compacting context ({} tokens, trigger: {})",
+                    humanize_token_count(event.context_state.token_estimate),
+                    event.trigger,
+                );
+                None
+            }
         }
     }
 
@@ -19192,15 +19207,23 @@ mod tests {
     }
 
     #[test]
-    fn spawn_enqueues_agent_list_refresh() {
+    fn spawn_rejected_with_active_turn() {
         let mut store = protocol_store_with_autonomy();
+        let turn_id = TurnId::new();
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id,
+            text: "streaming".into(),
+        });
         store.state.set_composer_text("/agents spawn 2 do work");
-        let _command = store.compose_command();
-        let queued: Vec<_> =
-            std::iter::from_fn(|| store.state.dequeue_autonomy_hydration()).collect();
+        let command = store.compose_command();
         assert!(
-            queued.iter().any(|c| matches!(c, AppUiCommand::ListAgents(_))),
-            "spawn must enqueue a ListAgents refresh, got: {queued:?}"
+            command.is_none(),
+            "spawn must be rejected while a turn is active"
+        );
+        assert!(
+            store.state.status.contains("active"),
+            "status must mention active turn, got: {:?}",
+            store.state.status
         );
     }
 
@@ -20574,7 +20597,7 @@ mod tests {
     }
 
     #[test]
-    fn autonomy_agent_list_empty_pushes_no_agents_chip() {
+    fn autonomy_agent_list_empty_produces_no_chip() {
         use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
         let mut store = protocol_store_with_autonomy();
         let session_id = SessionKey("local:test".into());
@@ -20584,9 +20607,11 @@ mod tests {
                 agents: vec![],
             }),
         }));
-        assert_eq!(store.state.activity.len(), 1);
-        assert_eq!(store.state.activity[0].title, "agent list");
-        assert_eq!(store.state.activity[0].status, "No active agents");
+        assert_eq!(
+            store.state.activity.len(),
+            0,
+            "empty agent list must not push a chip — status bar already shows 0"
+        );
         assert!(store.state.status.contains("0 agent"));
     }
 
@@ -20634,7 +20659,7 @@ mod tests {
             nickname: "cod".into(),
             title: None,    // falls back to nickname
             backend_kind: "native".into(),
-            status: "done".into(),
+            status: "completed".into(),
             last_task: None,
             summary: None,  // falls back to role
             output_tail: None,
@@ -20660,10 +20685,10 @@ mod tests {
             .session_autonomy_for(&session_id)
             .expect("mirror");
         assert_eq!(mirror.agents.len(), 2);
-        // "done" is terminal — only the 1 "running" reviewer is active.
+        // "completed" is terminal — only the 1 "running" reviewer is active.
         assert!(store.state.status.contains("1 agent"));
 
-        // One chip per agent.
+        // One chip per agent, each bound to the result session.
         assert_eq!(store.state.activity.len(), 2);
 
         // Reviewer chip uses explicit title and summary.
@@ -20671,12 +20696,14 @@ mod tests {
         assert_eq!(reviewer_chip.title, "Code Reviewer");
         assert_eq!(reviewer_chip.status, "running");
         assert_eq!(reviewer_chip.detail.as_deref(), Some("Reviewing PR #42"));
+        assert_eq!(reviewer_chip.session_id.as_ref(), Some(&session_id));
 
         // Coder chip falls back to nickname (title absent) and role (summary absent).
         let coder_chip = &store.state.activity[1];
         assert_eq!(coder_chip.title, "cod");
-        assert_eq!(coder_chip.status, "done");
+        assert_eq!(coder_chip.status, "completed");
         assert_eq!(coder_chip.detail.as_deref(), Some("coder"));
+        assert_eq!(coder_chip.session_id.as_ref(), Some(&session_id));
     }
 
     #[test]
@@ -20716,7 +20743,7 @@ mod tests {
                 session_id: session_id.clone(),
                 agents: vec![
                     make_agent("ag-1", "completed"),
-                    make_agent("ag-2", "done"),
+                    make_agent("ag-2", "interrupted"),
                     make_agent("ag-3", "failed"),
                 ],
             }),
