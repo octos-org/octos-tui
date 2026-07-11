@@ -4232,6 +4232,10 @@ impl Store {
         self.state
             .pending_interrupt_restores
             .retain(|pending| pending.session_id != session_id);
+        // Drop the prior turn's last persona word so a new turn doesn't flash
+        // it before its own first `status_word` arrives (the harness falls
+        // back to the phase in that ≤8s gap).
+        self.state.session_status_word.remove(&session_id);
         let turn_id = octos_core::ui_protocol::TurnId::new();
         self.state.record_submitted_user_prompt(
             session_id.clone(),
@@ -7244,6 +7248,29 @@ impl Store {
         }
         if event.turn_id.is_some() && self.event_targets_active_session(&event.session_id) {
             self.state.set_run_state_in_progress();
+        }
+
+        // A whimsical persona status word (`progress/updated{kind:"status_word"}`,
+        // rotated server-side ~every 8s) drives the harness gradient line above
+        // the composer — keep the latest per session. A word with an empty
+        // label clears it (falls back to the phase).
+        if event.metadata.kind == octos_core::ui_protocol::progress_kinds::STATUS_WORD {
+            match event
+                .metadata
+                .label
+                .as_deref()
+                .map(str::trim)
+                .filter(|word| !word.is_empty())
+            {
+                Some(word) => {
+                    self.state
+                        .session_status_word
+                        .insert(event.session_id.clone(), word.to_owned());
+                }
+                None => {
+                    self.state.session_status_word.remove(&event.session_id);
+                }
+            }
         }
 
         if let Some((operation, path, preview_id)) = diff_preview_request {
@@ -23362,6 +23389,61 @@ mod tests {
         )));
 
         assert_eq!(store.state.status, "Thinking");
+    }
+
+    #[test]
+    fn status_word_is_stored_per_session_and_cleared_on_new_turn() {
+        // The persona word (kind=status_word, in metadata.label) is kept per
+        // session for the harness gradient line, and a new turn drops the
+        // prior word so it can't flash before the fresh one arrives.
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        let mut meta = UiProgressMetadata::new(progress_kinds::STATUS_WORD);
+        meta.label = Some("Conjuring".into());
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id.clone(),
+            Some(TurnId::new()),
+            meta,
+        )));
+        assert_eq!(
+            store
+                .state
+                .session_status_word
+                .get(&session_id)
+                .map(String::as_str),
+            Some("Conjuring"),
+            "the persona word is stored for the session"
+        );
+
+        // Starting a new turn in this session clears it.
+        store.state.composer = "next prompt".into();
+        let _ = store.compose_command();
+        assert!(
+            !store.state.session_status_word.contains_key(&session_id),
+            "a new turn drops the prior persona word"
+        );
+
+        // An empty-label status_word clears the word (falls back to phase).
+        let mut meta = UiProgressMetadata::new(progress_kinds::STATUS_WORD);
+        meta.label = Some("Simmering".into());
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id.clone(),
+            Some(TurnId::new()),
+            meta,
+        )));
+        assert!(store.state.session_status_word.contains_key(&session_id));
+        let mut empty = UiProgressMetadata::new(progress_kinds::STATUS_WORD);
+        empty.label = Some("   ".into());
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id.clone(),
+            Some(TurnId::new()),
+            empty,
+        )));
+        assert!(
+            !store.state.session_status_word.contains_key(&session_id),
+            "a blank word clears the stored persona word"
+        );
     }
 
     #[test]

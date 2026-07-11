@@ -7785,12 +7785,30 @@ fn harness_status_lines(
     let session_id = session.id.clone();
     let status = app.orchestration.get(&session_id);
 
+    // The whimsical persona status word (server `progress/updated{kind:
+    // "status_word"}`, rotated ~every 8s — e.g. "Conjuring", "正在炼丹") wins
+    // over the flat "Working" phase so the gradient line reads `⣻ Conjuring…`
+    // like the web ThinkingIndicator. It replaces ONLY the generic working
+    // phase; a real "orchestrating" / "re-entering" phase (sub-agents running,
+    // master re-entry) still shows, since that is information the operator
+    // should see rather than a decorative word. The `…` reads as an ongoing
+    // action.
+    let persona_word = app
+        .session_status_word
+        .get(&session_id)
+        .map(|word| word.trim())
+        .filter(|word| !word.is_empty())
+        .map(|word| format!("{word}…"));
     let phase = match status.and_then(|s| s.phase.as_deref()) {
         Some("orchestrating") => t!("app.harness.orchestrating").to_string(),
         Some("re-entering") => t!("app.harness.re_entering").to_string(),
-        Some("working") => t!("app.harness.working").to_string(),
+        Some("working") => persona_word
+            .clone()
+            .unwrap_or_else(|| t!("app.harness.working").to_string()),
         Some(other) if !other.is_empty() => other.to_string(),
-        _ => t!("app.harness.working").to_string(),
+        _ => persona_word
+            .clone()
+            .unwrap_or_else(|| t!("app.harness.working").to_string()),
     };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -15852,6 +15870,66 @@ mod tests {
         // A tiny window clamps to a full gauge rather than overflowing.
         app.session_context_window.insert(session_id.clone(), 1_000);
         assert_eq!(harness_context_ratio(&app), Some(1.0));
+    }
+
+    #[test]
+    fn harness_line_shows_the_persona_word_over_the_working_phase() {
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+        // A plain working turn (no sub-agents) with a persona word set.
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 0,
+                pending_continuations: 0,
+                phase: Some("working".into()),
+            },
+        );
+        app.session_status_word
+            .insert(session_id.clone(), "Conjuring".into());
+
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex), true)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            text.contains("Conjuring…"),
+            "persona word shows with ellipsis: {text:?}"
+        );
+        assert!(
+            !text.contains("Working"),
+            "the flat Working phase is replaced: {text:?}"
+        );
+
+        // A REAL orchestrating phase (sub-agents) keeps its informative label,
+        // not the decorative word.
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 2,
+                pending_continuations: 0,
+                phase: Some("orchestrating".into()),
+            },
+        );
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex), true)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            text.contains("Orchestrating"),
+            "orchestrating phase kept: {text:?}"
+        );
+        assert!(
+            !text.contains("Conjuring"),
+            "word does not mask a real phase: {text:?}"
+        );
     }
 
     #[test]
