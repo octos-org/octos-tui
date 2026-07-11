@@ -218,13 +218,21 @@ fn live_tail_height_with_finalization(
     // (`render_btw_overlay`) and adds no flow lines of its own — reserve its
     // rows here or a settled/short tail starves the overlay's 3-row minimum
     // and the pane becomes invisible while still answering (codex P1).
-    let rows = rows.max(btw_overlay_height_hint(app, width));
-    // Cap the tail so it can't dominate the viewport; the rest stays in
-    // scrollback. Scale with the terminal (at most half its height) rather than
-    // a fixed 18 — a tall terminal shouldn't strand the live tail at 18 while a
-    // short one over-reserves. The outer `live_ui_height` clamp still guarantees
-    // `LIVE_VIEWPORT_MIN_SCROLLBACK` rows of scrollback remain visible.
-    let max_tail = (height / 2).max(3);
+    let btw_hint = btw_overlay_height_hint(app, width);
+    let rows = rows.max(btw_hint);
+    // Cap the tail so the STREAMING transcript can't dominate the viewport (the
+    // rest stays in scrollback): at most half the terminal height. A `/btw`
+    // aside is different — it's a focused reading surface the user explicitly
+    // opened, so let it use its full content height and fill most of the screen
+    // rather than stranding a fitting answer behind a scroll at the half mark.
+    // The outer `live_ui_height` clamp still reserves
+    // `LIVE_VIEWPORT_MIN_SCROLLBACK` rows of scrollback in BOTH cases, and the
+    // overlay scrolls whatever still doesn't fit on a small terminal.
+    let max_tail = if btw_hint > 0 {
+        height
+    } else {
+        (height / 2).max(3)
+    };
     rows.clamp(0, max_tail)
 }
 
@@ -9954,6 +9962,31 @@ mod tests {
         let answer = "I'm working on integrating Astro into your World Cup 2026 frontend to provide better component-based architecture. The idea is to use Astro as a meta-framework wrapping your existing React islands.\n\nWhat's been done so far:\n- Researched Astro's React integration docs\n- Set up an Astro project alongside your existing React app\n- Got Astro to build successfully\n\nCurrent blocker: The Astro SSR pages try to fetch data from your GraphQL server at localhost:4000 during build time, but this sandbox environment blocks outbound network so the build data step fails.\n\nLikely next step: Switching the Astro pages to use client-side fetching instead of SSR fetch, so the browser does the GraphQL call at runtime instead of the build doing it.";
         app.resolve_btw_answer(&session_id, answer.into());
         (app, session_id)
+    }
+
+    #[test]
+    fn btw_overlay_grows_to_fit_a_long_answer_on_a_tall_terminal() {
+        // Regression: the aside was capped at half the viewport, so a long
+        // answer stranded its last line behind a scroll even with screen space
+        // to spare (reported: "…gives you a proper" cut off). It must now grow
+        // to show the WHOLE answer and drop the scroll indicator.
+        let (app, _session_id) = app_with_long_btw_answer();
+        // Height 30 at width 100: the answer wraps to more than half of 30 (the
+        // old cap), so the old code stranded its tail behind a scroll — but it
+        // fits comfortably within the full viewport minus composer + scrollback.
+        let text = viewport_rows(&app, 100, 30).join("\n");
+        assert!(
+            text.contains("Likely next step"),
+            "the tail paragraph must render; got:\n{text}"
+        );
+        assert!(
+            text.contains("instead of the build doing it."),
+            "the FINAL sentence must be fully visible, not stranded; got:\n{text}"
+        );
+        assert!(
+            !text.contains("PgUp/PgDn"),
+            "a fitting answer must not show a scroll indicator when it fits; got:\n{text}"
+        );
     }
 
     #[test]
