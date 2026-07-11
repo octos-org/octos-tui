@@ -77,6 +77,7 @@ pub fn run(cli: Cli) -> Result<()> {
         mode: RenderMode::Inline,
         saved_inline_viewport: None,
         saved_visible_history_extent: None,
+        saved_inline_screen_size: None,
         mouse_captured: false,
     };
 
@@ -1990,6 +1991,14 @@ struct TerminalGuard {
     mode: RenderMode,
     saved_inline_viewport: Option<ratatui::layout::Rect>,
     saved_visible_history_extent: Option<(u16, u16)>,
+    /// Screen size the INLINE layout was last laid out for, saved on entering
+    /// the alt screen. The overlay draw path consumes resizes by updating
+    /// `last_known_screen_size` itself, so without restoring this on leave a
+    /// resize that happened while the overlay was up would be invisible to
+    /// the inline flow — `resize_viewport_to` would take the incremental path
+    /// against a stale viewport while the emulator had already rewrapped the
+    /// hidden normal screen (reflow ghosts).
+    saved_inline_screen_size: Option<ratatui::layout::Size>,
     /// Mouse capture is on ONLY while the transcript pager is up (so the wheel
     /// scrolls the pager). It must never be on in the inline chat flow, where
     /// it would defeat native terminal selection/copy.
@@ -2030,6 +2039,10 @@ impl TerminalGuard {
             terminal.visible_history_rows(),
             terminal.visible_history_bottom(),
         ));
+        // Save BEFORE the overwrite below: this is the size the inline layout
+        // was laid out for, restored by `leave_alt_screen` so the next inline
+        // draw can detect any resize that happened while the overlay was up.
+        self.saved_inline_screen_size = Some(terminal.last_known_screen_size);
         execute!(terminal.backend_mut(), EnterAlternateScreen)?;
         let size = terminal.size()?;
         terminal.set_viewport_area(ratatui::layout::Rect::new(0, 0, size.width, size.height));
@@ -2058,6 +2071,16 @@ impl TerminalGuard {
         terminal.set_viewport_area(self.saved_inline_viewport.take().unwrap_or(fallback));
         if let Some((rows, bottom)) = saved_visible_history_extent {
             terminal.set_visible_history_extent(rows, bottom);
+        }
+        // Restore the inline-era screen size so `resize_viewport_to` compares
+        // the real size against what the inline layout last saw, not against
+        // whatever the overlay draw path recorded while consuming a resize on
+        // the alt screen. A size that changed anywhere across the overlay
+        // round-trip then takes the full-reset path (the emulator rewrapped
+        // the hidden normal screen); an unchanged size stays a cheap
+        // invalidate-only repaint exactly as before.
+        if let Some(size) = self.saved_inline_screen_size.take() {
+            terminal.last_known_screen_size = size;
         }
         terminal.invalidate_viewport();
         self.mode = RenderMode::Inline;
@@ -2583,6 +2606,7 @@ mod tests {
             mode: RenderMode::Inline,
             saved_inline_viewport: None,
             saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
             mouse_captured: false,
         };
         let mut scrollback = ScrollbackTracker::new();
@@ -2639,6 +2663,7 @@ mod tests {
             mode: RenderMode::Inline,
             saved_inline_viewport: None,
             saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
             mouse_captured: false,
         };
         let mut scrollback = ScrollbackTracker::new();
@@ -2669,6 +2694,7 @@ mod tests {
             mode: RenderMode::Inline,
             saved_inline_viewport: None,
             saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
             mouse_captured: false,
         };
 
@@ -2707,6 +2733,62 @@ mod tests {
         let written = String::from_utf8_lossy(&terminal.backend().buf);
         assert!(written.contains("\u{1b}[?1049h"));
         assert!(written.contains("\u{1b}[?1049l"));
+    }
+
+    #[test]
+    fn overlay_resize_consumed_by_alt_screen_still_full_resets_inline() {
+        // codex finding on the resize-ghost fix: a resize handled WHILE the
+        // overlay was up updates `last_known_screen_size` on the alt screen
+        // (the `draw()` overlay path), so the inline restore no longer sees a
+        // size delta — yet the emulator rewrapped the hidden NORMAL screen.
+        // `leave_alt_screen` must restore the screen size the INLINE layout
+        // was last laid out for, so the next inline draw still takes the
+        // width-change full-reset path.
+        let mut terminal =
+            InlineTerminal::new(RecordingBackend::new(80, 24)).expect("recording terminal");
+        terminal.set_viewport_area(Rect::new(0, 20, 80, 4));
+        terminal.set_visible_history_extent(3, 20);
+        terminal.last_known_screen_size = Size::new(80, 24);
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+            saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
+            mouse_captured: false,
+        };
+
+        guard
+            .enter_alt_screen(&mut terminal)
+            .expect("enter alt screen");
+        // Simulate the overlay draw's resize handling (event_loop::draw):
+        // the screen narrows while the overlay is up and the overlay path
+        // consumes the delta by updating last_known_screen_size itself.
+        terminal.backend_mut().size = Size::new(60, 24);
+        terminal.set_viewport_area(Rect::new(0, 0, 60, 24));
+        terminal
+            .clear_visible_screen()
+            .expect("overlay resize clear");
+        terminal.invalidate_viewport();
+        terminal.last_known_screen_size = Size::new(60, 24);
+
+        guard
+            .leave_alt_screen(&mut terminal)
+            .expect("leave alt screen");
+        terminal
+            .resize_viewport_to(4)
+            .expect("resize restored inline viewport");
+
+        // Width changed 80 -> 60 relative to the inline layout: full reset.
+        assert_eq!(terminal.viewport_area, Rect::new(0, 20, 60, 4));
+        assert_eq!(
+            terminal.backend().clears.last(),
+            Some(&ClearType::All),
+            "inline restore after an overlay-consumed resize must full-clear; clears: {:?}",
+            terminal.backend().clears
+        );
+        assert_eq!(terminal.backend().cursor, Position { x: 0, y: 0 });
+        assert_eq!(terminal.visible_history_rows(), 0);
+        assert_eq!(terminal.visible_history_bottom(), 0);
     }
 
     #[test]
