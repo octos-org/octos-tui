@@ -267,6 +267,20 @@ where
     let size = terminal.size()?;
     let width = size.width;
 
+    // This frame will take the FULL viewport reset inside
+    // `resize_viewport_to` (width change either direction, or terminal-
+    // height shrink — mirror of its exact condition): the reset clears the
+    // whole visible screen, erasing the transcript rows already flushed
+    // there. Forget the flushed watermark BEFORE the sync below, so this
+    // same frame re-inserts the committed history freshly wrapped at the
+    // new width — otherwise the chat visually vanishes, leaving a bare
+    // composer (the old-width copy survives only in real scrollback).
+    if size.width != terminal.last_known_screen_size.width
+        || size.height < terminal.last_known_screen_size.height
+    {
+        scrollback.mark_flushed_stale();
+    }
+
     // The scrollback flush must wrap to the SAME width `insert_history_lines`
     // uses (the full viewport width), so the line accounting stays consistent.
     let wrap_width = usize::from(width).max(1);
