@@ -1206,6 +1206,16 @@ impl Store {
                 self.state.status = t!("status.edit_field_prompt").into_owned();
                 None
             }
+            LocalAction::RunSlashCommand(draft) => {
+                // Codex Enter semantics: run the highlighted command NOW.
+                // Close the popup first so a command that opens its own menu
+                // (its "command page") lands on a clean stack, then execute
+                // the draft through the same path a composer submit takes.
+                self.close_menu();
+                self.state.set_composer_text(draft);
+                self.state.focus = FocusPane::Composer;
+                self.compose_command()
+            }
             LocalAction::Onboarding(action) => self.dispatch_onboarding_action(action, inline_args),
             LocalAction::Skills => self.dispatch_skills_inline(inline_args.unwrap_or_default()),
             LocalAction::McpConfig => self.dispatch_mcp_inline(inline_args.unwrap_or_default()),
@@ -16287,13 +16297,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(labels, vec!["/keymap"]);
 
-        // Uniform completion: accepting the filtered item completes it into the
-        // composer (it does NOT open the menu yet) — consistent across all
-        // commands, argful or not.
+        // Codex Enter semantics: accepting the filtered item DISPATCHES it
+        // immediately — one Enter opens the command's page; the composer is
+        // left clean (no complete-then-Enter-again round trip).
         assert!(store.accept_active_menu_item().is_none());
-        assert_eq!(store.state.composer, "/keymap");
-        // The follow-up Enter resolves the now-complete command and opens it.
-        assert!(store.compose_command().is_none());
+        assert_eq!(store.state.composer, "");
         assert_eq!(
             store
                 .state

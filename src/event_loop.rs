@@ -1563,12 +1563,13 @@ fn slash_help_enter_executes(store: &Store) -> bool {
         return true;
     }
     let registry = crate::menu::CommandRegistry::with_core_commands();
-    if matches!(
-        registry.resolve(draft),
-        crate::menu::CommandResolution::Found { .. }
-    ) {
-        // Exact command (or alias) name: run it directly.
-        return true;
+    if let crate::menu::CommandResolution::Found { command, .. } = registry.resolve(draft) {
+        // Resolvable name with NO arguments typed yet: dispatch directly
+        // unless the command REQUIRES arguments — bare dispatch of those is
+        // only a usage error, so they route to the accept path and complete
+        // as "/name " for argument typing (codex completes there too, via
+        // Tab; Enter doubles as our completion key for required-arg drafts).
+        return command.inline_args != crate::menu::types::InlineArgMode::Required;
     }
     // Partial name: execute only if the popup has nothing left to offer.
     store
@@ -3572,6 +3573,57 @@ mod tests {
             handle_key(&mut store, modified_key(KeyCode::Enter, KeyModifiers::NONE)),
             KeyAction::Continue
         ));
+    }
+
+    /// Codex Enter semantics: Enter on a highlighted ARGUMENT-LESS command
+    /// dispatches it immediately — one Enter from partial name to the
+    /// command's page (here `/them` → the theme menu), never the old
+    /// complete-into-composer + second-Enter round trip. Argful commands
+    /// complete with a trailing space instead (args must be typed anyway;
+    /// the next Enter executes the draft directly).
+    #[test]
+    fn slash_popup_enter_dispatches_selection_like_codex() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        for ch in "/them".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        handle_key(&mut store, key(KeyCode::Enter));
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_THEME),
+            "one Enter on a partial argless command must open its page"
+        );
+        assert!(
+            store.state.composer.is_empty(),
+            "dispatch must not leave the completed name in the composer"
+        );
+
+        // Optional-arg command: bare dispatch is valid (opens its page) —
+        // one Enter must go straight there too, composer cleared.
+        store.close_menu();
+        store.state.set_composer_text("");
+        for ch in "/lang".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        handle_key(&mut store, key(KeyCode::Enter));
+        assert!(
+            store.state.composer.is_empty(),
+            "optional-arg command dispatches bare, composer cleared"
+        );
+        assert_ne!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_HELP),
+            "dispatch must leave the help popup (command page or closed)"
+        );
     }
 
     /// Live-terminal bug: typing `/btw <args>` filtered the registry with the
