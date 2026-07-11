@@ -4986,17 +4986,19 @@ fn push_btw_aside_card(
     }
 }
 
-/// Render the `/btw` aside as a floating overlay pinned to the TOP of the live
-/// viewport. It draws over the top rows of the live tail each frame (never
-/// flushed to scrollback) and vanishes on the next prompt submit — so the aside
-/// reads as a distinct top pane instead of mingling with the streaming reply.
+/// Render the `/btw` aside as a floating BORDERED pane pinned to the TOP of
+/// the live viewport. It draws over the top rows of the live tail each frame
+/// (never flushed to scrollback) and vanishes on the next prompt submit. The
+/// border + title are load-bearing: a borderless overlay reads as embedded
+/// transcript text whenever the tail is short — the box is what makes it a
+/// visibly distinct window over the session instead of part of the flow.
 fn render_btw_overlay(
     frame: &mut impl FrameLike,
     app: &AppState,
     palette: Palette,
     tail_area: Rect,
 ) {
-    if tail_area.width == 0 || tail_area.height == 0 {
+    if tail_area.width < 4 || tail_area.height < 3 {
         return;
     }
     let Some(session) = app.active_session() else {
@@ -5006,20 +5008,30 @@ fn render_btw_overlay(
         return;
     };
     let mut lines = Vec::new();
-    push_btw_aside_card(&mut lines, palette, aside, tail_area.width as usize);
+    // Inner width: the block borders consume one column each side.
+    push_btw_aside_card(&mut lines, palette, aside, tail_area.width as usize - 2);
+    // The card opens with a spacer line for the inline flow; inside a bordered
+    // pane the border already separates it — drop leading blanks.
+    while line_is_blank(lines.first()) {
+        lines.remove(0);
+    }
     if lines.is_empty() {
         return;
     }
-    let height = (lines.len() as u16).min(tail_area.height);
+    // +2 for the top/bottom border rows.
+    let height = (lines.len() as u16 + 2).min(tail_area.height);
     let overlay = Rect {
         x: tail_area.x,
         y: tail_area.y,
         width: tail_area.width,
         height,
     };
+    let title = t!("app.btw.pane_title").into_owned();
     frame.render_widget(Clear, overlay);
     frame.render_widget(
-        Paragraph::new(lines).style(palette.text().bg(palette.surface)),
+        Paragraph::new(lines)
+            .style(palette.text().bg(palette.surface))
+            .block(titled_block(title, palette, false, None)),
         overlay,
     );
 }
@@ -9385,6 +9397,16 @@ mod tests {
         assert!(
             text.contains("/btw still with me?"),
             "settled session must still render the aside overlay; got:\n{text}"
+        );
+        // The pane chrome is load-bearing: without the titled border the
+        // overlay reads as embedded transcript text, not its own window.
+        assert!(
+            text.contains("Aside — /btw"),
+            "aside must render as a titled pane, not bare lines; got:\n{text}"
+        );
+        assert!(
+            text.contains("┌") && text.contains("└"),
+            "aside pane must draw its border; got:\n{text}"
         );
     }
 

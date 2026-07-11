@@ -108,6 +108,7 @@ app:
   btw:
     answering: "Answering…"
     failed: "Aside failed: %{error}"
+    pane_title: "Aside — /btw"
   turn_summary:
     ran_for: "Ran for %{duration}"
     tasks_still_running: "%{count} background task(s) still running"
