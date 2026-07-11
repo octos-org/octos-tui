@@ -16799,3 +16799,71 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod running_row_regression {
+    use super::*;
+    use crate::model::*;
+    use crate::store::Store;
+    use octos_core::app_ui::AppUiEvent;
+    use octos_core::ui_protocol::*;
+
+    #[test]
+    fn running_bash_tool_started_renders_cc_card_not_legacy_verb_row() {
+        let session_id = SessionKey("local:t".into());
+        let mut store = Store {
+            state: AppState::new(
+                vec![SessionView {
+                    id: session_id.clone(),
+                    title: "t".into(),
+                    profile_id: Some("dev".into()),
+                    messages: vec![Message::user("go")],
+                    tasks: vec![],
+                    live_reply: None,
+                }],
+                0,
+                "ready".into(),
+                None,
+                false,
+            ),
+        };
+        let turn_id = TurnId::new();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
+            ToolStartedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id,
+                tool_call_id: "c1".into(),
+                tool_name: "bash".into(),
+                arguments: Some(serde_json::json!({
+                    "cmd": "sleep 20 && echo never-finishes",
+                    "timeout_ms": 30000
+                })),
+            },
+        )));
+        let palette = Palette::for_theme(crate::cli::ThemeName::Codex);
+        let backend = ratatui::backend::TestBackend::new(140, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("t");
+        terminal
+            .draw(|frame| render(frame, &store.state, palette))
+            .expect("render");
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            text.push('\n');
+        }
+        assert!(!text.contains("Using bash"), "old verb leaked:\n{text}");
+        assert!(!text.contains("{\"cmd\""), "raw JSON leaked:\n{text}");
+    }
+}
