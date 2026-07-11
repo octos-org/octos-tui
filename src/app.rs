@@ -612,19 +612,43 @@ pub fn finalized_history_lines_range_dedup_live(
             used_reply_coverages[coverage_idx] = true;
             let coverage = &live_coverages[coverage_idx];
             let suffix = &message.content[coverage.reply_flushed_text.len()..];
-            // Continuation of a reply whose prefix is already in scrollback
-            // (coverage is only matched when non-empty) — never re-issue the
-            // bullet, but do seed blank handling from the streamed prefix so a
-            // separator split across commit still renders like one document.
-            push_live_reply_block_seeded(
-                &mut lines,
-                palette,
-                suffix,
-                wrap_width,
-                false,
-                true,
-                live_reply_prefix_ends_blank(palette, &coverage.reply_flushed_text, wrap_width),
-            );
+            let prefix_ends_blank =
+                live_reply_prefix_ends_blank(palette, &coverage.reply_flushed_text, wrap_width);
+            // A trailing Session Summary in the suffix must render as a card
+            // here too — this live-flushed-prefix branch is the normal
+            // long-running-tool partial-completion case and otherwise emits
+            // flat markdown (codex P2 on #292). Split the prose suffix from the
+            // summary; render the prose seeded (no bullet), then the card.
+            if let Some(start) = session_summary_block_start(suffix) {
+                let body = suffix[..start].trim_end();
+                if !body.is_empty() {
+                    push_live_reply_block_seeded(
+                        &mut lines,
+                        palette,
+                        body,
+                        wrap_width,
+                        false,
+                        true,
+                        prefix_ends_blank,
+                    );
+                }
+                let bg = chat_message_bg(palette, "assistant");
+                push_session_summary_card(&mut lines, palette, &suffix[start..], bg, wrap_width);
+            } else {
+                // Continuation of a reply whose prefix is already in scrollback
+                // (coverage matched only when non-empty) — never re-issue the
+                // bullet, but seed blank handling from the streamed prefix so a
+                // separator split across commit still renders like one document.
+                push_live_reply_block_seeded(
+                    &mut lines,
+                    palette,
+                    suffix,
+                    wrap_width,
+                    false,
+                    true,
+                    prefix_ends_blank,
+                );
+            }
         } else if message.role.as_str() == "assistant" {
             let boundaries =
                 committed_reply_segment_boundaries_for_message(app, session, idx, &message.content);
@@ -746,6 +770,34 @@ fn push_committed_assistant_reply_segments(
     wrap_width: usize,
     boundaries: &[usize],
 ) {
+    // A trailing "Session Summary" block (appended after a partial reply) must
+    // render as a card here too — this segmented native-scrollback path is
+    // used for tool-backed replies and otherwise bypasses `push_message_block`'s
+    // summary detection (codex P2 on #292). Split the prose body from the
+    // summary, render the body's segments (boundaries within it), then the
+    // card. Recursion terminates because the body has no summary block.
+    if let Some(start) = session_summary_block_start(content) {
+        let body = content[..start].trim_end();
+        let summary = &content[start..];
+        if !body.is_empty() {
+            let body_boundaries: Vec<usize> = boundaries
+                .iter()
+                .copied()
+                .filter(|boundary| *boundary < body.len())
+                .collect();
+            push_committed_assistant_reply_segments(
+                lines,
+                palette,
+                body,
+                wrap_width,
+                &body_boundaries,
+            );
+        }
+        let bg = chat_message_bg(palette, "assistant");
+        push_session_summary_card(lines, palette, summary, bg, wrap_width);
+        return;
+    }
+
     let mut cursor = 0;
     let mut first = true;
     let mut previous_reply_has_output = false;
@@ -3617,6 +3669,32 @@ fn push_message_block(
         return;
     }
 
+    // The synthesized turn-completion "Session Summary" block (failure /
+    // no-answer / partial) renders as a distinct card: a colored + bold title
+    // and bold field labels, instead of flat muted markdown that buries the
+    // error. The block can be the whole message OR a suffix appended after a
+    // partial live reply (`{prose}\n\n{summary}`) — render the prose above it
+    // normally, then the card.
+    if role == "assistant"
+        && let Some(start) = session_summary_block_start(content)
+    {
+        let (prose, summary) = content.split_at(start);
+        let prose = prose.trim_end();
+        if !prose.is_empty() {
+            push_formatted_body_marked(
+                lines,
+                palette,
+                prose,
+                indent,
+                prose_marker,
+                Some(bg),
+                width,
+            );
+        }
+        push_session_summary_card(lines, palette, summary, bg, width);
+        return;
+    }
+
     push_formatted_body_marked(
         lines,
         palette,
@@ -3626,6 +3704,133 @@ fn push_message_block(
         Some(bg),
         width,
     );
+}
+
+/// A localized status string in every bundled locale, so a synthesized card
+/// stored in one language still matches after a `/lang` switch changes the
+/// locale `t!` resolves against (codex P2 on #292).
+fn localized_in_all_locales(key: &str) -> Vec<String> {
+    ["en", "zh"]
+        .into_iter()
+        .map(|locale| rust_i18n::t!(key, locale = locale).into_owned())
+        .collect()
+}
+
+/// Byte offset where a Session Summary block begins in `content`, if any. The
+/// block is either the whole message (failure / no-answer card) or a suffix
+/// appended after a partial live reply (`{prose}\n\n{summary}` — see
+/// `finalize_live_reply_text`). Locale-independent: the title is matched
+/// against every bundled locale so a stored card highlights regardless of the
+/// current UI language.
+fn session_summary_block_start(content: &str) -> Option<usize> {
+    let titles = localized_in_all_locales("status.summary_title");
+    let mut offset = 0usize;
+    let mut iter = content.lines().peekable();
+    while let Some(line) = iter.next() {
+        let is_title = titles.iter().any(|title| title == line);
+        let next_is_bullet = iter
+            .peek()
+            .is_some_and(|next| next.trim_start().starts_with("- "));
+        if is_title && next_is_bullet {
+            return Some(offset);
+        }
+        // `lines()` strips the `\n`; add it back. The final line has none, but
+        // a match returns before we reach past it, so the +1 is never used out
+        // of bounds.
+        offset += line.len() + 1;
+    }
+    None
+}
+
+/// Render a "Session Summary" card: the title in a bold attention color, then
+/// each `- Label: value` row with the label bolded so the Result / Error /
+/// Activity fields stand out. The `- Error:` row's value is drawn in the
+/// danger color so a failure reads as a failure at a glance. Every row is
+/// clipped to `width` so a narrow pane cannot wrap a value to column 0.
+fn push_session_summary_card(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    content: &str,
+    bg: Color,
+    width: usize,
+) {
+    let mut rows = content.lines();
+    let title = rows.next().unwrap_or_default();
+    // Title: `✦ Session Summary` in the highlight color, bold — a notice, not
+    // an error glyph (the same card also covers no-answer / partial, not only
+    // failure). The failure detail below carries the red.
+    lines.push(chat_line(
+        clip_line_spans(
+            vec![Span::styled(
+                format!("{ASSISTANT_BODY_INDENT}✦ {title}"),
+                Style::default()
+                    .fg(palette.highlight)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(bg),
+            )],
+            width,
+        ),
+        Some(bg),
+    ));
+
+    // Budget the value text so `indent + "- " + label + sep + value` fits the
+    // pane; the final `clip_line_spans` is the hard backstop so even a row
+    // whose prefix alone exceeds `width` (e.g. a long label on a 24-col pane)
+    // truncates rather than wrapping to column 0 (codex P2 on #292).
+    let label_lead = ASSISTANT_BODY_INDENT.width() + 2; // indent + "- "
+    let error_labels = localized_in_all_locales("status.summary_error_label");
+    for row in rows {
+        let row = row.strip_prefix("- ").unwrap_or(row);
+        // Labels use `": "` (en) or the fullwidth `"："` (zh, no space).
+        let split = row
+            .split_once(": ")
+            .map(|(label, value)| (label, value, ": "))
+            .or_else(|| {
+                row.split_once('：')
+                    .map(|(label, value)| (label, value, "："))
+            });
+        let Some((label, value, sep)) = split else {
+            // A label-less row: render as a plain muted line.
+            let budget = width.saturating_sub(label_lead);
+            lines.push(chat_line(
+                clip_line_spans(
+                    vec![
+                        Span::styled(format!("{ASSISTANT_BODY_INDENT}- "), palette.muted().bg(bg)),
+                        Span::styled(
+                            truncate_to_display_width(row, budget),
+                            palette.text().bg(bg),
+                        ),
+                    ],
+                    width,
+                ),
+                Some(bg),
+            ));
+            continue;
+        };
+        // The Error row's value carries the danger color; every other value is
+        // the normal text color. Locale-independent label match.
+        let value_style = if error_labels.iter().any(|l| l == label) {
+            Style::default().fg(palette.danger).bg(bg)
+        } else {
+            palette.text().bg(bg)
+        };
+        let label_with_sep = format!("{label}{sep}");
+        let value_budget = width.saturating_sub(label_lead + label_with_sep.width());
+        lines.push(chat_line(
+            clip_line_spans(
+                vec![
+                    Span::styled(format!("{ASSISTANT_BODY_INDENT}- "), palette.muted().bg(bg)),
+                    Span::styled(
+                        label_with_sep,
+                        palette.text().add_modifier(Modifier::BOLD).bg(bg),
+                    ),
+                    Span::styled(truncate_to_display_width(value, value_budget), value_style),
+                ],
+                width,
+            ),
+            Some(bg),
+        ));
+    }
 }
 
 /// Render a (chunk of a) streaming reply. `first` controls the `• ` prose
@@ -9652,6 +9857,194 @@ mod tests {
             let (_, next) = octopus_swim(big + OCTOPUS_STROKE_MS, wrap_width);
             assert_ne!(frame, next, "parked octopus must keep alternating strokes");
         }
+    }
+
+    #[test]
+    fn segmented_reply_still_renders_a_trailing_summary_as_a_card() {
+        // The native-scrollback segmented path (tool-backed replies) must also
+        // give a trailing Session Summary the card treatment, not flat
+        // markdown (codex P2 round 2 on #292).
+        let summary = t!(
+            "status.summary_partial_answer",
+            count = 2,
+            files = "none observed",
+            validation = "not reported",
+        )
+        .into_owned();
+        // A reply with an internal segment boundary (as a tool call inserts),
+        // then the appended summary.
+        let body = "First I ran a tool.\n\nThen I continued.";
+        let content = format!("{body}\n\n{summary}");
+        let boundaries = vec![body.find("\n\nThen").unwrap()];
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let mut lines = Vec::new();
+        push_committed_assistant_reply_segments(&mut lines, palette, &content, 120, &boundaries);
+        let text = lines_text(&lines);
+        assert!(
+            text.contains("First I ran a tool"),
+            "prose body renders: {text:?}"
+        );
+        assert!(
+            text.contains("✦"),
+            "the trailing summary gets the card glyph: {text:?}"
+        );
+    }
+
+    #[test]
+    fn session_summary_detected_as_a_suffix_after_partial_prose() {
+        // The partial-completion path appends the summary AFTER the model's
+        // partial reply (`{prose}\n\n{summary}`), so the title is NOT the
+        // first line — detection must still find it (codex P2 on #292).
+        let summary = t!(
+            "status.summary_partial_answer",
+            count = 3,
+            files = "none observed",
+            validation = "not reported",
+        )
+        .into_owned();
+        let content = format!("Emulator installed. Booting the AVD now:\n\n{summary}");
+
+        let start = session_summary_block_start(&content)
+            .expect("summary suffix must be detected after prose");
+        assert!(start > 0, "the block starts after the prose, not at 0");
+        assert_eq!(
+            &content[start..start + summary.len().min(20)],
+            &summary[..summary.len().min(20)]
+        );
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let mut lines = Vec::new();
+        push_message_block(&mut lines, palette, "assistant", &content, 120);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("Emulator installed"), "prose still renders");
+        assert!(
+            text.contains("✦"),
+            "the appended summary still gets the card treatment"
+        );
+    }
+
+    #[test]
+    fn session_summary_detection_is_locale_independent() {
+        // A card stored in English must still be recognized after a `/lang`
+        // switch to Chinese, and vice-versa (codex P2 on #292).
+        let en = t!("status.summary_title", locale = "en").into_owned();
+        let zh = t!("status.summary_title", locale = "zh").into_owned();
+        let en_card = format!("{en}\n- Result: done.");
+        let zh_card = format!("{zh}\n- 结果：完成。");
+        assert_eq!(session_summary_block_start(&en_card), Some(0));
+        assert_eq!(session_summary_block_start(&zh_card), Some(0));
+    }
+
+    #[test]
+    fn session_summary_rows_never_exceed_a_narrow_pane() {
+        // A 24-col pane: the `  - Risks / follow-up: ` prefix alone is wide,
+        // so the value budget goes to zero — the clip backstop must keep every
+        // emitted row within width instead of wrapping to column 0 (codex P2).
+        let content = t!(
+            "status.summary_failed",
+            code = "runtime_error",
+            message = "a fairly long error message that would overflow a narrow pane",
+            count = 20,
+            failed = "none recorded",
+        )
+        .into_owned();
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let mut lines = Vec::new();
+        push_message_block(&mut lines, palette, "assistant", &content, 24);
+        for line in &lines {
+            let cols: usize = line
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            assert!(cols <= 24, "row exceeds 24 cols: {cols} — {line:?}");
+        }
+    }
+
+    #[test]
+    fn session_summary_card_gets_a_highlighted_title_and_labels() {
+        // The synthesized failure "Session Summary" message renders as a
+        // distinct card — a highlight-colored bold title and bold field
+        // labels, with the error value in the danger color — instead of flat
+        // muted markdown (user report: "need highlights and color the title").
+        let content = t!(
+            "status.summary_failed",
+            code = "runtime_error",
+            message = "failed to send streaming request to Anthropic",
+            count = 20,
+            failed = "none recorded",
+        )
+        .into_owned();
+
+        assert_eq!(
+            session_summary_block_start(&content),
+            Some(0),
+            "the failure template starts a summary card at offset 0"
+        );
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let bg = chat_message_bg(palette, "assistant");
+        let mut lines = Vec::new();
+        push_message_block(&mut lines, palette, "assistant", &content, 120);
+
+        // Title row: bold + highlight color, prefixed with the ✦ notice glyph.
+        let title_line = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|s| s.content.contains("Session Summary"))
+            })
+            .expect("title line");
+        let title_span = title_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Session Summary"))
+            .unwrap();
+        assert!(
+            title_span.content.contains('✦'),
+            "title carries the ✦ notice glyph"
+        );
+        assert_eq!(
+            title_span.style.fg,
+            Some(palette.highlight),
+            "title is highlight-colored"
+        );
+        assert!(
+            title_span.style.add_modifier.contains(Modifier::BOLD),
+            "title is bold"
+        );
+
+        // The Error label is bold and its value is danger-colored.
+        let error_line = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|s| s.content.starts_with("Error")))
+            .expect("error line");
+        let label_span = error_line
+            .spans
+            .iter()
+            .find(|s| s.content.starts_with("Error"))
+            .unwrap();
+        assert!(
+            label_span.style.add_modifier.contains(Modifier::BOLD),
+            "the Error label is bold"
+        );
+        let value_span = error_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("failed to send"))
+            .expect("error value span");
+        assert_eq!(
+            value_span.style.fg,
+            Some(palette.danger),
+            "the error value is danger-colored"
+        );
+        let _ = bg;
     }
 
     #[test]

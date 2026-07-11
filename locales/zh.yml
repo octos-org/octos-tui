@@ -1228,6 +1228,8 @@ status:
   recovery_network_failed: "网络访问失败；请申请网络/代理/注册表权限，或使用离线回退方案"
   recovery_search_restricted: "搜索/抓取受限；请申请供应商配置，或在明确的离线告知下继续"
   diff_hunk_prompt: "将选中的差异代码块用作下一个编码轮次的上下文。\nfile: %{path}\nstatus: %{status}\nhunk: %{hunk}\n```diff\n"
+  summary_title: "会话摘要"
+  summary_error_label: "错误"
   summary_completed_no_answer: "会话摘要\n- 结果：轮次已完成，但 TUI 未收到最终的助手回答。\n- 活动：已记录 %{count} 个操作。\n- 文件改动：%{files}。\n- 验证：%{validation}。\n- 风险 / 后续：请查看上方活动，若所需回答不完整，请继续该轮次。"
   summary_partial_answer: "会话摘要\n- 结果：轮次已完成，但 TUI 仅收到部分实时回答。\n- 活动：已记录 %{count} 个操作。\n- 文件改动：%{files}。\n- 验证：%{validation}。\n- 风险 / 后续：服务器可能已持久化更完整的回答；若可见回答不完整，请继续。"
   summary_failed: "会话摘要\n- 结果：轮次在产生最终回答前失败。\n- 错误：%{code}：%{message}\n- 活动：已记录 %{count} 个操作。\n- 失败：%{failed}。\n- 风险 / 后续：请修复上方错误，或用更具体的指令继续该轮次。"
