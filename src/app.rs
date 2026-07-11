@@ -3368,19 +3368,29 @@ const OCTOPUS_SWEEP_ONE_WAY_MS: u128 = 4_000;
 /// strobe).
 const OCTOPUS_STROKE_MS: u128 = 150;
 
+/// How long the octopus rests at each edge before turning around. A pure
+/// triangle wave touches its peak for a single millisecond, but the event
+/// loop repaints only every ~120ms — sampled at 0, 120, …, 3960, 4080 the
+/// edge column is never painted (and on a `MAX == 1` pane the octopus
+/// appears frozen). Resting ≥ one repaint interval guarantees the far edge
+/// is visibly reached every sweep.
+const OCTOPUS_EDGE_DWELL_MS: u128 = 250;
+
 /// Pure elapsed→(leading-space offset, frame) mapping for the swimming octopus.
 ///
-/// The octopus travels horizontally as a triangle wave: the leading-space
-/// offset climbs `0 → MAX` in [`OCTOPUS_SWEEP_ONE_WAY_MS`] then falls back,
-/// forever, sweeping the FULL `wrap_width` — `MAX` keeps the octopus plus a
+/// The octopus travels horizontally as a trapezoid wave: the leading-space
+/// offset climbs `0 → MAX` in [`OCTOPUS_SWEEP_ONE_WAY_MS`], RESTS at the far
+/// edge for [`OCTOPUS_EDGE_DWELL_MS`], falls back, rests at the origin, and
+/// repeats — sweeping the FULL `wrap_width`. `MAX` keeps the octopus plus a
 /// one-column right margin inside it, measured in display *columns* via
 /// `unicode-width` (the CJK arm glyphs are double-width). Position is
-/// time-proportional, so it reaches the far edge every sweep on any width.
-/// The paddle frame alternates every [`OCTOPUS_STROKE_MS`] independent of
-/// travel. On a terminal too narrow to travel, `MAX` is 0 and the octopus
-/// paddles in place at the left margin rather than panicking. All arithmetic
-/// is overflow-safe: `offset` is bounded by `MAX`, so the caller's
-/// `" ".repeat(offset)` can never run away.
+/// time-proportional, so it reaches the far edge every sweep on any width,
+/// and the edge rest is at least one repaint interval so that frame is
+/// actually painted. The paddle frame alternates every [`OCTOPUS_STROKE_MS`]
+/// independent of travel. On a terminal too narrow to travel, `MAX` is 0 and
+/// the octopus paddles in place at the left margin rather than panicking.
+/// All arithmetic is overflow-safe: `offset` is bounded by `MAX`, so the
+/// caller's `" ".repeat(offset)` can never run away.
 fn octopus_swim(elapsed_ms: u128, wrap_width: usize) -> (usize, &'static str) {
     let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
     let frame = OCTOPUS_SWIM_FRAMES[((elapsed_ms / OCTOPUS_STROKE_MS) % 2) as usize];
@@ -3388,12 +3398,19 @@ fn octopus_swim(elapsed_ms: u128, wrap_width: usize) -> (usize, &'static str) {
     if max == 0 {
         return (0, frame);
     }
-    // Triangle wave in TIME (u128 end-to-end so a huge uptime can't
-    // truncate): phase ∈ [0, 2·SWEEP), folded to one_way ∈ [0, SWEEP],
-    // then scaled onto [0, MAX].
-    let cycle_ms = 2 * OCTOPUS_SWEEP_ONE_WAY_MS;
-    let phase = elapsed_ms % cycle_ms;
-    let one_way = phase.min(cycle_ms - phase);
+    // Trapezoid wave in TIME (u128 end-to-end so a huge uptime can't
+    // truncate): rise, dwell at MAX, fall, dwell at 0.
+    let leg_ms = OCTOPUS_SWEEP_ONE_WAY_MS + OCTOPUS_EDGE_DWELL_MS;
+    let phase = elapsed_ms % (2 * leg_ms);
+    let one_way = if phase < leg_ms {
+        // Rising for SWEEP ms, then resting at the far edge for DWELL ms.
+        phase.min(OCTOPUS_SWEEP_ONE_WAY_MS)
+    } else {
+        // Falling for SWEEP ms, then resting at the origin for DWELL ms
+        // (phase ≥ leg ⇒ the subtraction is ≤ SWEEP; saturation covers the
+        // origin rest where it would go negative).
+        (leg_ms + OCTOPUS_SWEEP_ONE_WAY_MS).saturating_sub(phase)
+    };
     let offset = ((one_way * max as u128) / OCTOPUS_SWEEP_ONE_WAY_MS) as usize;
     (offset, frame)
 }
@@ -9287,30 +9304,46 @@ mod tests {
     }
 
     #[test]
-    fn octopus_swim_reaches_the_far_edge_in_one_sweep_on_any_width() {
-        // The sweep is time-proportional: at exactly OCTOPUS_SWEEP_ONE_WAY_MS
-        // the octopus touches the far edge — on ANY terminal width. (The old
-        // fixed ms-per-column pace took ~21s one-way on a 146-column pane, so
-        // real thinking phases ended with the octopus around mid-screen.)
+    fn octopus_swim_rests_at_the_far_edge_for_a_visible_window() {
+        // The far edge must be PAINTABLE, not merely touched for a single
+        // millisecond: the event loop repaints only every ~120ms, so the
+        // octopus rests at MAX for the whole [SWEEP, SWEEP+DWELL] window —
+        // any repaint cadence ≤ DWELL lands at least one frame on the edge
+        // (codex P2 on the fixed-4s sweep). Same for the origin rest at the
+        // cycle tail.
         let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
-        for wrap_width in [20usize, 40, 80, 146, 200, 1000] {
+        assert!(
+            OCTOPUS_EDGE_DWELL_MS >= 200,
+            "edge rest must cover at least one ~120ms repaint interval"
+        );
+        let leg = OCTOPUS_SWEEP_ONE_WAY_MS + OCTOPUS_EDGE_DWELL_MS;
+        for wrap_width in [octopus_width + 2, 20usize, 40, 80, 146, 200, 1000] {
             let max = wrap_width.saturating_sub(octopus_width + 1);
-            let (at_peak, _) = octopus_swim(OCTOPUS_SWEEP_ONE_WAY_MS, wrap_width);
-            assert_eq!(
-                at_peak, max,
-                "far edge reached after one sweep at wrap_width={wrap_width}"
-            );
-            // …and it comes all the way back by the end of the cycle.
-            let (back, _) = octopus_swim(2 * OCTOPUS_SWEEP_ONE_WAY_MS, wrap_width);
-            assert_eq!(back, 0, "returns to origin at wrap_width={wrap_width}");
+            // Every sample within the far-edge rest window sits at MAX…
+            for t in (OCTOPUS_SWEEP_ONE_WAY_MS..=leg).step_by(50) {
+                let (offset, _) = octopus_swim(t, wrap_width);
+                assert_eq!(
+                    offset, max,
+                    "must rest at the far edge at {t}ms, wrap_width={wrap_width}"
+                );
+            }
+            // …and every sample within the origin rest window sits at 0.
+            for t in ((leg + OCTOPUS_SWEEP_ONE_WAY_MS)..2 * leg).step_by(50) {
+                let (offset, _) = octopus_swim(t, wrap_width);
+                assert_eq!(
+                    offset, 0,
+                    "must rest at the origin at {t}ms, wrap_width={wrap_width}"
+                );
+            }
         }
     }
 
     #[test]
-    fn octopus_swim_traces_a_symmetric_triangle_while_paddling() {
+    fn octopus_swim_traces_a_symmetric_trapezoid_while_paddling() {
         // Sampled through one full cycle: offset rises monotonically to MAX,
-        // falls monotonically back, is mirror-symmetric around the peak, and
-        // the paddle stroke alternates every OCTOPUS_STROKE_MS throughout.
+        // rests, falls monotonically back, rests at the origin — mirror-
+        // symmetric around the cycle — while the paddle stroke alternates
+        // every OCTOPUS_STROKE_MS throughout.
         let wrap_width = 120usize;
         let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
         let max = wrap_width.saturating_sub(octopus_width + 1);
@@ -9319,15 +9352,19 @@ mod tests {
             "the sweep must exceed the old 28-column cap (got MAX={max})"
         );
 
-        let cycle_ms = 2 * OCTOPUS_SWEEP_ONE_WAY_MS;
+        let leg = OCTOPUS_SWEEP_ONE_WAY_MS + OCTOPUS_EDGE_DWELL_MS;
+        let cycle_ms = 2 * leg;
         let mut previous = None;
         for t in (0..=cycle_ms).step_by(50) {
             let (offset, frame) = octopus_swim(t, wrap_width);
             assert!(offset <= max, "offset {offset} exceeded MAX {max} at {t}ms");
-            // Mirror symmetry: same distance from either end of the cycle.
-            let (mirrored, _) = octopus_swim(cycle_ms - t, wrap_width);
-            assert_eq!(offset, mirrored, "triangle asymmetric at {t}ms");
-            // Monotone rise then fall.
+            // Mirror symmetry around the far-edge rest: t and (cycle - DWELL
+            // - t) sit at the same height on opposite legs.
+            if t + OCTOPUS_EDGE_DWELL_MS <= cycle_ms {
+                let (mirrored, _) = octopus_swim(cycle_ms - OCTOPUS_EDGE_DWELL_MS - t, wrap_width);
+                assert_eq!(offset, mirrored, "trapezoid asymmetric at {t}ms");
+            }
+            // Monotone rise, then never rising again until the origin rest.
             if let Some((prev_t, prev_offset)) = previous {
                 if t <= OCTOPUS_SWEEP_ONE_WAY_MS {
                     assert!(
@@ -9337,7 +9374,7 @@ mod tests {
                 } else if prev_t >= OCTOPUS_SWEEP_ONE_WAY_MS {
                     assert!(
                         offset <= prev_offset,
-                        "falling leg climbed between {prev_t}ms and {t}ms"
+                        "post-peak the offset must never climb ({prev_t}ms → {t}ms)"
                     );
                 }
             }
@@ -9349,6 +9386,9 @@ mod tests {
             );
             previous = Some((t, offset));
         }
+        // The next cycle starts back at the origin.
+        let (wrapped, _) = octopus_swim(cycle_ms, wrap_width);
+        assert_eq!(wrapped, 0, "cycle wraps to the origin");
     }
 
     #[test]
@@ -9357,10 +9397,11 @@ mod tests {
         // the wrap boundary across full cycles, for a range of widths — and
         // reaches the far edge on every one of them (full-width travel).
         let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
+        let cycle_ms = 2 * (OCTOPUS_SWEEP_ONE_WAY_MS + OCTOPUS_EDGE_DWELL_MS);
         for wrap_width in [octopus_width + 2, 20, 40, 80, 200, 1000] {
             let max = wrap_width.saturating_sub(octopus_width + 1);
             let mut peak = 0usize;
-            for t in (0..2 * OCTOPUS_SWEEP_ONE_WAY_MS).step_by(25) {
+            for t in (0..cycle_ms).step_by(25) {
                 let (offset, _frame) = octopus_swim(t, wrap_width);
                 assert!(
                     offset + octopus_width <= wrap_width,
@@ -9368,14 +9409,7 @@ mod tests {
                 );
                 peak = peak.max(offset);
             }
-            // step_by sampling always hits the exact SWEEP_MS peak instant
-            // because 25 divides it; assert it rather than assuming.
-            let (at_peak, _) = octopus_swim(OCTOPUS_SWEEP_ONE_WAY_MS, wrap_width);
-            assert_eq!(
-                peak.max(at_peak),
-                max,
-                "far edge at wrap_width={wrap_width}"
-            );
+            assert_eq!(peak, max, "far edge at wrap_width={wrap_width}");
         }
     }
 
