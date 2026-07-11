@@ -3367,6 +3367,13 @@ pub struct AppState {
     /// Cleared on the session's next non-retry progress event so a settled
     /// turn doesn't linger as "retrying".
     pub session_retry: std::collections::HashMap<SessionKey, UiRetryBackoff>,
+    /// Latest whimsical persona status word per session, keyed with the
+    /// TURN it belongs to (from the server's `progress/updated{kind:
+    /// "status_word"}` rotator, e.g. "Conjuring" / "正在炼丹"). Rendered in the
+    /// harness gradient line above the composer only while it matches the
+    /// active turn — so a stale word from a prior turn (or a server-started
+    /// continuation) is ignored rather than lingering.
+    pub session_status_word: std::collections::HashMap<SessionKey, (TurnId, String)>,
     /// Per-session reasoning/thinking effort chosen via the `/thinking` command,
     /// keyed by `SessionKey` so each session keeps its own level. Attached to
     /// every `turn/start` for that session; absent = use the server
@@ -5327,6 +5334,7 @@ impl AppState {
             session_context_window: std::collections::HashMap::new(),
             completed_turns: std::collections::HashMap::new(),
             session_retry: std::collections::HashMap::new(),
+            session_status_word: std::collections::HashMap::new(),
             session_reasoning_effort: std::collections::HashMap::new(),
             session_reasoning_display: std::collections::HashSet::new(),
             finalized_by_switch: std::collections::HashMap::new(),
