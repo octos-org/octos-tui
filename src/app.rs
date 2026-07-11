@@ -214,6 +214,11 @@ fn live_tail_height_with_finalization(
         live_finalization,
     );
     let rows = transcript_visual_rows(&lines, wrap_width) as u16;
+    // The `/btw` aside draws as a floating overlay OVER the tail's top rows
+    // (`render_btw_overlay`) and adds no flow lines of its own — reserve its
+    // rows here or a settled/short tail starves the overlay's 3-row minimum
+    // and the pane becomes invisible while still answering (codex P1).
+    let rows = rows.max(btw_overlay_height_hint(app, width));
     // Cap the tail so it can't dominate the viewport; the rest stays in
     // scrollback. Scale with the terminal (at most half its height) rather than
     // a fixed 18 — a tall terminal shouldn't strand the live tail at 18 while a
@@ -301,6 +306,9 @@ pub fn render_viewport_with_finalization(
             render_live_tail_with_finalization(app, palette, root[0], live_finalization),
             root[0],
         );
+        // `/btw` aside floats over the top of the live tail so it reads as a
+        // distinct top pane instead of mingling with the streaming reply.
+        render_btw_overlay(frame, app, palette, root[0]);
     }
     if let Some(menu) = active_menu.as_ref() {
         menu_render::render_menu_surface(frame, root[1], menu, palette);
@@ -1273,6 +1281,8 @@ fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palet
         if app.transcript_pager_active {
             render_pager_scrollbar(frame, metrics, areas.transcript, palette);
         }
+        // `/btw` aside floats over the top of the transcript as a distinct pane.
+        render_btw_overlay(frame, app, palette, areas.transcript);
     }
     if let Some(menu) = active_menu.as_ref() {
         menu_render::render_menu_surface(frame, areas.menu, menu, palette);
@@ -3211,11 +3221,8 @@ fn should_show_turn_flow(app: &AppState, session: &SessionView) -> bool {
             .user_question
             .as_ref()
             .is_some_and(|picker| picker.visible)
-        // A `/btw` aside is the same class of live-only card: it must keep
-        // rendering after the session settles (the answer often lands right
-        // as — or after — the main turn completes) until the next prompt
-        // submit dismisses it.
-        || app.btw_asides.contains_key(&session.id)
+        // NB: a `/btw` aside no longer forces the turn flow — it renders as a
+        // floating top overlay (`render_btw_overlay`) so it doesn't mingle.
         || should_pin_recent_user_context(app, session)
 }
 
@@ -3244,12 +3251,9 @@ fn push_turn_flow(
         push_inline_user_question_card(lines, palette, picker, width);
     }
 
-    // `/btw` aside card: the question echo + its state (`✽ Answering…` → the
-    // answer block) rides the live pane like the approval/question cards — the
-    // exchange is ephemeral and never joins the committed transcript.
-    if let Some(aside) = app.btw_asides.get(&session.id) {
-        push_btw_aside_card(lines, palette, aside, width);
-    }
+    // `/btw` aside renders as a floating overlay pinned to the TOP of the live
+    // viewport (see `render_btw_overlay`), not inline here — otherwise it
+    // mingles with the streaming reply/activity below it.
 
     // Live reasoning for the active turn: codex-style, we DON'T render the
     // verbose "thinking" text. The deltas still accumulate in `live_reasoning`
@@ -3396,12 +3400,39 @@ pub(crate) fn progress_bar(frac: f64, width: usize) -> String {
 /// ```
 /// The percentage is honest: pre-compaction tokens over the session's
 /// context window (threshold as the fallback denominator).
+/// How long the settled "context compacted" block dwells after completion.
+/// The server pass is synchronous — started/completed land in one drain batch
+/// and draws only follow the batch — so without this dwell the block would
+/// paint zero frames, ever.
+const LIVE_COMPACTION_SETTLED_DISPLAY_SECS: u64 = 4;
+
 fn push_live_compaction_block(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
     comp: &crate::model::LiveCompaction,
     context_window: Option<u64>,
 ) {
+    if let Some(completed_at) = comp.completed_at {
+        // Settled: dwell for a short window, then render nothing (the entry
+        // itself is bounded by turn-terminal sweeps / the next Started).
+        if completed_at.elapsed().as_secs() >= LIVE_COMPACTION_SETTLED_DISPLAY_SECS {
+            return;
+        }
+        let after = comp
+            .token_estimate_after
+            .unwrap_or(comp.token_estimate_before);
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "✶ {} ({} → {} tokens)",
+                t!("status.activity_context_compacted"),
+                humanize_token_count(comp.token_estimate_before),
+                humanize_token_count(after),
+            ),
+            Style::default().fg(palette.accent),
+        )]));
+        lines.push(Line::from(""));
+        return;
+    }
     let elapsed = comp.started_at.elapsed().as_secs();
     let denominator = context_window
         .filter(|w| *w > 0)
@@ -4745,6 +4776,19 @@ fn compact_file_path(path: &str) -> String {
     format!(".../{}", components[components.len() - keep..].join("/"))
 }
 
+/// octos exposes several shell-family tools that all run a command string:
+/// `shell`/`sh`/`exec`/`exec_command` (field `command`) and the
+/// codex-compatible `bash` (field `cmd`, falling back to `command`). They all
+/// render as a real command line, never the raw JSON arguments blob. Kept in
+/// sync with the projection-side extraction in
+/// [`crate::store::tool_invocation_detail`].
+pub(crate) fn is_shell_family_tool(title: &str) -> bool {
+    matches!(
+        title.to_ascii_lowercase().as_str(),
+        "shell" | "sh" | "exec" | "exec_command" | "bash"
+    )
+}
+
 /// Longest raw-JSON fallback (display columns) `tool_invocation_text` will emit
 /// when it has no better human rendering — a hard cap so a pathological args
 /// blob can never be handed to the row builder unbounded. The per-row width
@@ -4999,82 +5043,12 @@ fn first_meaningful_arg(map: &serde_json::Map<String, serde_json::Value>) -> Opt
     }
     None
 }
-
 fn meaningful_output_lines(output: &str) -> Vec<&str> {
     output
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect()
-}
-
-fn tool_action_label(item: &ActivityItem, running: bool) -> String {
-    if item.title == "shell" {
-        return shell_action_label(
-            tool_invocation_text(item).as_deref().unwrap_or_default(),
-            running,
-        );
-    }
-
-    match (item.title.as_str(), running) {
-        ("read_file", true) => t!("app.tool.reading"),
-        ("read_file", false) => t!("app.tool.read"),
-        ("write_file", true) => t!("app.tool.writing"),
-        ("write_file", false) => t!("app.tool.wrote"),
-        ("edit_file" | "diff_edit", true) => t!("app.tool.editing"),
-        ("edit_file" | "diff_edit", false) => t!("app.tool.edited"),
-        ("list_dir", true) => t!("app.tool.listing"),
-        ("list_dir", false) => t!("app.tool.listed"),
-        ("grep" | "glob" | "web_search" | "deep_search", true) => t!("app.tool.searching"),
-        ("grep" | "glob" | "web_search" | "deep_search", false) => t!("app.tool.searched"),
-        ("web_fetch", true) => t!("app.tool.fetching"),
-        ("web_fetch", false) => t!("app.tool.fetched"),
-        ("browser", true) => t!("app.tool.browsing"),
-        ("browser", false) => t!("app.tool.browsed"),
-        ("spawn", true) => t!("app.tool.spawning"),
-        ("spawn", false) => t!("app.tool.spawned"),
-        ("send_file", true) => t!("app.tool.sending"),
-        ("send_file", false) => t!("app.tool.sent"),
-        ("manage_skills" | "admin_manage_skills", true) => t!("app.tool.managing"),
-        ("manage_skills" | "admin_manage_skills", false) => t!("app.tool.managed"),
-        (_, true) => t!("app.tool.using"),
-        (_, false) => t!("app.tool.used"),
-    }
-    .into_owned()
-}
-
-fn shell_action_label(command: &str, running: bool) -> String {
-    let command = command.trim_start();
-    let lower = command.to_ascii_lowercase();
-    let label = if lower.starts_with("sleep ") || lower.contains("; sleep ") {
-        ("app.tool.waiting", "app.tool.waited")
-    } else if lower.contains("cargo test")
-        || lower.contains("npm test")
-        || lower.contains("npm run test")
-        || lower.contains("pytest")
-        || lower.contains("go test")
-    {
-        ("app.tool.testing", "app.tool.tested")
-    } else if lower.contains("cargo build")
-        || lower.contains("npm run build")
-        || lower.contains("pnpm build")
-        || lower.contains("go build")
-    {
-        ("app.tool.building", "app.tool.built")
-    } else if lower.contains("npm install")
-        || lower.contains("pnpm install")
-        || lower.contains("cargo install")
-    {
-        ("app.tool.installing", "app.tool.installed")
-    } else {
-        ("app.tool.running", "app.tool.ran")
-    };
-
-    if running {
-        t!(label.0).into_owned()
-    } else {
-        t!(label.1).into_owned()
-    }
 }
 
 fn format_duration_ms(duration_ms: u64) -> String {
@@ -5196,6 +5170,90 @@ fn push_btw_aside_card(
             ]));
         }
     }
+}
+
+/// Render the `/btw` aside as a floating BORDERED pane pinned to the TOP of
+/// the live viewport. It draws over the top rows of the live tail each frame
+/// (never flushed to scrollback) and vanishes on the next prompt submit. The
+/// border + title are load-bearing: a borderless overlay reads as embedded
+/// transcript text whenever the tail is short — the box is what makes it a
+/// visibly distinct window over the session instead of part of the flow.
+/// Rows the `/btw` overlay pane wants (card lines sans leading blanks, plus
+/// the two border rows); `0` when the active session has no aside. The aside
+/// contributes NO lines to the turn flow, so [`live_tail_height_with_finalization`]
+/// must reserve these rows explicitly — a settled session's tail otherwise
+/// collapses to 1-2 rows, under [`render_btw_overlay`]'s 3-row minimum, and
+/// the pane silently stops drawing while the aside is still answering
+/// (codex P1). Kept in sync with `render_btw_overlay`'s layout math.
+fn btw_overlay_height_hint(app: &AppState, area_width: u16) -> u16 {
+    if area_width < 4 {
+        return 0;
+    }
+    let Some(session) = app.active_session() else {
+        return 0;
+    };
+    let Some(aside) = app.btw_asides.get(&session.id) else {
+        return 0;
+    };
+    let mut lines = Vec::new();
+    push_btw_aside_card(
+        &mut lines,
+        Palette::for_theme(app.theme),
+        aside,
+        area_width as usize - 2,
+    );
+    while line_is_blank(lines.first()) {
+        lines.remove(0);
+    }
+    if lines.is_empty() {
+        return 0;
+    }
+    (lines.len() as u16).saturating_add(2)
+}
+
+fn render_btw_overlay(
+    frame: &mut impl FrameLike,
+    app: &AppState,
+    palette: Palette,
+    tail_area: Rect,
+) {
+    if tail_area.width < 4 || tail_area.height < 3 {
+        return;
+    }
+    let Some(session) = app.active_session() else {
+        return;
+    };
+    let Some(aside) = app.btw_asides.get(&session.id) else {
+        return;
+    };
+    let mut lines = Vec::new();
+    // Inner width: the block borders consume one column each side.
+    push_btw_aside_card(&mut lines, palette, aside, tail_area.width as usize - 2);
+    // The card opens with a spacer line for the inline flow; inside a bordered
+    // pane the border already separates it — drop leading blanks.
+    while line_is_blank(lines.first()) {
+        lines.remove(0);
+    }
+    if lines.is_empty() {
+        return;
+    }
+    // +2 for the top/bottom border rows.
+    let height = (lines.len() as u16 + 2).min(tail_area.height);
+    let overlay = Rect {
+        x: tail_area.x,
+        y: tail_area.y,
+        width: tail_area.width,
+        height,
+    };
+    let title = t!("app.btw.pane_title").into_owned();
+    let close_hint = t!("app.btw.close_hint").into_owned();
+    frame.render_widget(Clear, overlay);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(palette.text().bg(palette.surface))
+            .block(titled_block(title, palette, false, Some(close_hint))),
+        overlay,
+    );
 }
 
 fn push_inline_user_question_card(
@@ -5982,7 +6040,15 @@ fn push_agent_task_group(
     }
 
     for (idx, item) in items.iter().enumerate() {
-        push_agent_task_child(lines, palette, item, idx == 0, expanded, wrap_width);
+        push_agent_task_child(
+            lines,
+            palette,
+            item,
+            idx == 0,
+            expanded,
+            wrap_width,
+            !collapse_settled,
+        );
     }
 
     // List this turn's running sub-agents (from session.tasks, attributed by
@@ -6007,6 +6073,131 @@ fn push_agent_task_group(
     }
 }
 
+/// Claude-Code-style display name for a tool (`bash` → `Bash`, `read_file` →
+/// `Read`, …). Unknown tools get their first letter capitalized.
+fn tool_display_name(title: &str) -> String {
+    match title {
+        "shell" | "exec" | "exec_command" | "bash" => "Bash".into(),
+        "read_file" => "Read".into(),
+        "write_file" => "Write".into(),
+        "edit_file" | "diff_edit" => "Edit".into(),
+        "list_dir" => "List".into(),
+        "grep" | "grep_tool" => "Grep".into(),
+        "glob" | "glob_tool" => "Glob".into(),
+        "web_search" | "deep_search" => "Search".into(),
+        "web_fetch" => "Fetch".into(),
+        "spawn" => "Spawn".into(),
+        "browser" => "Browser".into(),
+        "message" => "Message".into(),
+        "send_file" => "Send".into(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        }
+    }
+}
+
+/// The `⏺` card bullet, colored by status: green when the tool succeeded, red
+/// when it failed, and the animated spinner while it is still running.
+fn tool_card_bullet(item: &ActivityItem, palette: Palette) -> (String, Style) {
+    if is_running_activity(item) {
+        (spinner_frame().to_string(), palette.selected())
+    } else if activity_is_failed(item) {
+        // Failures keep a distinct glyph (not just red) so they stay legible
+        // without color; success drops the checkmark for the calmer `⏺`.
+        ("✗".to_string(), Style::default().fg(palette.danger))
+    } else if activity_is_completed(item) {
+        ("⏺".to_string(), Style::default().fg(palette.success))
+    } else {
+        // interrupted / skipped / pending — neutral, never a false green success.
+        ("⏺".to_string(), palette.muted())
+    }
+}
+
+/// Claude-Code-style tool-card header: `⏺ Bash(cmd)`. The invocation (shell
+/// command, spawn task, file path, …) renders in parens with raw JSON and the
+/// call-id stripped; multi-line commands indent to align under `(`. Every
+/// emitted line is budgeted + clipped to `wrap_width` display columns so it
+/// can never overflow and wrap to column 0 (the indent-not-honored bug).
+fn push_tool_card_header(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    item: &ActivityItem,
+    wrap_width: usize,
+) {
+    let (bullet, bullet_style) = tool_card_bullet(item, palette);
+    let name = tool_display_name(&item.title);
+    let duration = item
+        .duration_ms
+        .map(|ms| format!("  {}", format_duration_ms(ms)))
+        .unwrap_or_default();
+
+    let Some(invocation) = tool_invocation_text(item).filter(|text| !text.trim().is_empty()) else {
+        // No arguments to show: `⏺ Bash`.
+        let mut spans = vec![
+            Span::styled(bullet, bullet_style),
+            Span::styled(" ", palette.muted()),
+            Span::styled(name, palette.muted()),
+        ];
+        if !duration.is_empty() {
+            spans.push(Span::styled(duration, palette.muted()));
+        }
+        lines.push(Line::from(clip_line_spans(spans, wrap_width)));
+        return;
+    };
+
+    // Shell-family invocations keep the `$ ` prompt inside the parens —
+    // `⏺ Bash($ cargo test)` — the command-row marker #276 established; the
+    // prompt is part of the budgeted text so the width math stays exact.
+    let invocation = if is_shell_family_tool(&item.title) {
+        format!("$ {invocation}")
+    } else {
+        invocation
+    };
+
+    // Continuation lines align under the first char after `(`.
+    let cont_indent = " ".repeat(bullet.chars().count() + 1 + name.chars().count() + 1);
+    let cmd_lines: Vec<&str> = invocation.lines().collect();
+    let max_lines = 10usize;
+    let shown = cmd_lines.len().min(max_lines).max(1);
+    let clipped = cmd_lines.len() > shown;
+    // Budget the command text so lead-in + text + `)` + duration fit within
+    // `wrap_width` (unicode-width, so CJK commands stay exact).
+    let lead_width = cont_indent.width();
+    let text_budget = wrap_width
+        .saturating_sub(lead_width)
+        .saturating_sub(duration.width() + 2)
+        .max(8);
+
+    for idx in 0..shown {
+        let raw = cmd_lines.get(idx).copied().unwrap_or_default();
+        let last = idx + 1 == shown;
+        let mut text = truncate_to_display_width(raw, text_budget);
+        if last {
+            if clipped {
+                text.push('…');
+            }
+            text.push(')');
+        }
+        let mut spans = Vec::new();
+        if idx == 0 {
+            spans.push(Span::styled(bullet.clone(), bullet_style));
+            spans.push(Span::styled(" ", palette.muted()));
+            spans.push(Span::styled(format!("{name}("), palette.muted()));
+        } else {
+            spans.push(Span::styled(cont_indent.clone(), palette.muted()));
+        }
+        spans.push(Span::styled(text, palette.muted()));
+        if last && !duration.is_empty() {
+            spans.push(Span::styled(duration.clone(), palette.muted()));
+        }
+        lines.push(Line::from(clip_line_spans(spans, wrap_width)));
+    }
+}
+
 fn push_agent_task_child(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -6014,7 +6205,16 @@ fn push_agent_task_child(
     first: bool,
     expanded: bool,
     wrap_width: usize,
+    in_scrollback: bool,
 ) {
+    // Tool calls render as Claude-Code-style `⏺ Tool(arg)` cards; other
+    // activity rows (file mutations, progress) keep the `⎿ ✓ …` tree form.
+    if item.kind == ActivityKind::Tool {
+        push_tool_card_header(lines, palette, item, wrap_width);
+        push_compact_tool_preview(lines, palette, item, expanded, wrap_width, in_scrollback);
+        return;
+    }
+
     let (icon, icon_style) = activity_status_icon(item, palette);
     let prefix = if first { "  ⎿  " } else { "     " };
     // Display width consumed by the fixed lead-in (prefix + icon + one space);
@@ -6036,10 +6236,6 @@ fn push_agent_task_child(
     // no-op there; it only bites pathological cases.
     let spans = clip_line_spans(spans, wrap_width);
     lines.push(Line::from(spans));
-
-    if item.kind == ActivityKind::Tool {
-        push_compact_tool_preview(lines, palette, item, expanded, wrap_width);
-    }
 }
 
 fn compact_activity_spans(
@@ -6050,7 +6246,9 @@ fn compact_activity_spans(
     if let Some(mutation) = FileMutationActivity::from_item(item) {
         // Activity rows render uniformly muted, no bold: the runtime log must
         // never outweigh the reply prose or the user's own words.
-        let mut spans = vec![
+        // "preview ready" was dropped: the TUI exposes no action to open the
+        // preview here, so the label was a dead affordance.
+        return vec![
             Span::styled(
                 file_mutation_action_label(&mutation.operation),
                 palette.muted(),
@@ -6059,41 +6257,35 @@ fn compact_activity_spans(
             Span::styled(compact_file_path(&mutation.path), palette.muted()),
             Span::styled(format!("  {}", mutation.operation), palette.muted()),
         ];
-        if mutation.preview_ready {
-            spans.push(Span::styled(
-                format!("  {}", t!("app.activity.preview_ready")),
-                palette.selected(),
-            ));
-        }
-        return spans;
     }
 
-    if item.kind == ActivityKind::Tool {
-        let running = is_running_activity(item);
+    // Tool activities render as Claude-Code cards via `push_tool_card_header`;
+    // this path only handles non-tool rows (progress, generic).
+
+    // A context-compaction notice is an infrequent, notable event — render it
+    // prominently (accent + ✦) so it stands out from the muted activity stream
+    // instead of scrolling by unseen in a busy multi-agent session.
+    let compacted_title = t!("status.activity_context_compacted");
+    if item.kind == ActivityKind::Progress && item.title.as_str() == compacted_title.as_ref() {
         let mut spans = vec![
-            Span::styled(tool_action_label(item, running), palette.muted()),
-            Span::styled(" ", palette.muted()),
-            Span::styled(item.title.clone(), palette.muted()),
+            Span::styled("✦ ", Style::default().fg(palette.accent)),
+            Span::styled(
+                item.title.clone(),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {}", item.status), palette.muted()),
         ];
-        // Compute the trailing metadata (duration) up front so its width can be
-        // reserved — the invocation is truncated to fit BEFORE it, keeping the
-        // duration visible instead of getting clipped off the end.
+        // Reserve the trailing metadata (duration) width up front so the
+        // detail is truncated to fit BEFORE it, keeping the duration visible.
         let mut meta = Vec::new();
         push_compact_metadata_spans(&mut meta, palette, item);
-        if let Some(invocation) = tool_invocation_text(item) {
-            let prompt = if is_shell_like_tool(&item.title) {
-                "$ "
-            } else {
-                ""
-            };
-            spans.push(Span::styled(": ", palette.muted()));
-            let invocation_budget = remaining_content_budget(content_budget, &spans, &meta)
-                .saturating_sub(prompt.width());
+        if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
+            spans.push(Span::styled("  ", palette.muted()));
+            let detail_budget = remaining_content_budget(content_budget, &spans, &meta);
             spans.push(Span::styled(
-                format!(
-                    "{prompt}{}",
-                    truncate_to_display_width(&invocation, invocation_budget)
-                ),
+                truncate_to_display_width(detail, detail_budget),
                 palette.muted(),
             ));
         }
@@ -6158,10 +6350,11 @@ fn push_compact_tool_preview(
     item: &ActivityItem,
     expanded: bool,
     wrap_width: usize,
+    in_scrollback: bool,
 ) {
-    // The preview prefix `     │ ` is 7 display columns; budget the content so a
+    // The preview prefix `  ⎿ ` is 4 display columns; budget the content so a
     // preview line fits within `wrap_width` and never wraps to column 0.
-    const PREVIEW_PREFIX_COLS: usize = 7;
+    const PREVIEW_PREFIX_COLS: usize = 4;
     let preview_budget = wrap_width.saturating_sub(PREVIEW_PREFIX_COLS);
     let Some(output_preview) = item
         .output_preview
@@ -6177,7 +6370,12 @@ fn push_compact_tool_preview(
         meaningful
     };
     let total = preview_lines.len();
-    let line_limit = if expanded {
+    // Frozen scrollback can't be repainted, so the Ctrl+O affordance is dead
+    // there: render the full output and drop the hint. Only the live viewport
+    // (which the toggle genuinely repaints) collapses to a preview.
+    let line_limit = if in_scrollback {
+        total
+    } else if expanded {
         EXPANDED_TOOL_PREVIEW_LINES
     } else {
         COLLAPSED_TOOL_PREVIEW_LINES
@@ -6185,12 +6383,16 @@ fn push_compact_tool_preview(
     let shown = total.min(line_limit);
     for line in preview_lines.iter().take(shown) {
         lines.push(Line::from(vec![
-            Span::styled("     │ ", palette.border()),
+            Span::styled("  ⎿ ", palette.border()),
             Span::styled(
                 truncate_to_display_width(line, preview_budget),
                 palette.text(),
             ),
         ]));
+    }
+    if in_scrollback {
+        // Full output already shown; no un-actionable "(Ctrl+O expand)" hint.
+        return;
     }
     if total > shown {
         let action = if expanded {
@@ -6200,7 +6402,7 @@ fn push_compact_tool_preview(
         };
         lines.push(Line::from(clip_line_spans(
             vec![
-                Span::styled("     │ ", palette.border()),
+                Span::styled("  ⎿ ", palette.border()),
                 Span::styled(
                     t!(
                         "app.activity.more_lines_hidden",
@@ -6216,7 +6418,7 @@ fn push_compact_tool_preview(
     } else if expanded && total > COLLAPSED_TOOL_PREVIEW_LINES {
         lines.push(Line::from(clip_line_spans(
             vec![
-                Span::styled("     │ ", palette.border()),
+                Span::styled("  ⎿ ", palette.border()),
                 Span::styled(
                     t!("app.activity.expanded_hint").into_owned(),
                     palette.muted(),
@@ -7163,6 +7365,11 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
             .iter()
             .filter(|l| autonomy_loop_is_active(l))
             .count();
+        // Chips render every non-deleted loop (active + paused). Count paused
+        // too so the header reconciles with the chips — a `--solo` boot parks
+        // active loops to `paused`, which otherwise reads as "0 running" beside
+        // several visible chips.
+        let paused = state.loops.iter().filter(|l| l.status == "paused").count();
         spans.push(Span::styled(
             "↻ ",
             Style::default()
@@ -7170,8 +7377,12 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
                 .add_modifier(Modifier::BOLD)
                 .bg(palette.surface),
         ));
+        let mut loops_label = t!("app.autonomy.loops_running", count = running).to_string();
+        if paused > 0 {
+            loops_label.push_str(&t!("app.autonomy.loops_paused_suffix", count = paused));
+        }
         spans.push(Span::styled(
-            t!("app.autonomy.loops_running", count = running).to_string(),
+            loops_label,
             palette.title().bg(palette.surface),
         ));
         spans.push(Span::styled("   ", palette.text().bg(palette.surface)));
@@ -9422,20 +9633,60 @@ mod tests {
             false,
         );
         app.set_btw_answering(&session_id, "still with me?".into());
-        let session = app.active_session().expect("session");
-        assert!(
-            should_show_turn_flow(&app, session),
-            "an aside must keep the turn-flow (and its card) rendering on a settled session"
-        );
-        let lines =
-            live_tail_lines_with_finalization(&app, Palette::for_theme(ThemeName::Codex), 80, None);
-        let text = lines
-            .iter()
-            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
-            .collect::<String>();
+        // The aside now renders as a floating overlay, no longer gated on the
+        // turn flow — so it stays visible even after the session settles.
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let text = rendered_rows(&rendered_buffer(&app, palette)).join("\n");
         assert!(
             text.contains("/btw still with me?"),
-            "live tail must carry the aside card when idle; got {text:?}"
+            "settled session must still render the aside overlay; got:\n{text}"
+        );
+        // The pane chrome is load-bearing: without the titled border the
+        // overlay reads as embedded transcript text, not its own window.
+        assert!(
+            text.contains("Aside — /btw"),
+            "aside must render as a titled pane, not bare lines; got:\n{text}"
+        );
+        assert!(
+            text.contains("┌") && text.contains("└"),
+            "aside pane must draw its border; got:\n{text}"
+        );
+    }
+
+    /// codex P1 (merge reconcile): the aside no longer contributes lines to
+    /// the turn flow, so a SETTLED session's live tail collapses to 1-2 rows —
+    /// under `render_btw_overlay`'s 3-row minimum — and the overlay became
+    /// invisible in the real inline viewport (state kept it, nothing drew it).
+    /// The tail height hint must reserve the overlay's rows.
+    #[test]
+    fn btw_aside_overlay_survives_settled_inline_viewport() {
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("go"), Message::assistant("done")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.set_btw_answering(&session_id, "still with me?".into());
+        // Real inline-viewport path: the viewport is sized by live_ui_height
+        // (a settled tail otherwise reserves ~1 row) and the overlay draws
+        // over the tail's top rows.
+        let text = viewport_rows(&app, 100, 40).join("\n");
+        assert!(
+            text.contains("Aside — /btw"),
+            "settled inline viewport must still draw the aside pane; got:\n{text}"
+        );
+        assert!(
+            text.contains("/btw still with me?"),
+            "aside question echo missing from inline viewport; got:\n{text}"
         );
     }
 
@@ -11923,8 +12174,7 @@ mod tests {
         let text = rendered_text(&app);
 
         assert!(!text.contains("Activity"));
-        assert!(text.contains("Tested"));
-        assert!(text.contains("$ cargo test"));
+        assert!(text.contains("⏺ Bash($ cargo test"));
         assert!(text.contains("running 6 tests"));
         assert!(text.contains("1 more line(s) hidden (Ctrl+O expand)"));
         assert!(text.contains("1.2s"));
@@ -11974,6 +12224,7 @@ mod tests {
                     true,
                     false,
                     wrap_width,
+                    false,
                 );
                 assert!(
                     !lines.is_empty(),
@@ -12016,10 +12267,11 @@ mod tests {
             true,
             false,
             120,
+            false,
         );
         let text = lines_text(&lines);
         assert!(
-            text.contains("$ echo"),
+            text.contains("Bash($ echo"),
             "bash row must show the command: {text:?}"
         );
         assert!(
@@ -12045,6 +12297,7 @@ mod tests {
             true,
             false,
             wrap_width,
+            false,
         );
         lines_text(&lines)
     }
@@ -12291,6 +12544,7 @@ mod tests {
             false,
             false,
             120,
+            false,
         );
         let text = lines_text(&lines);
         assert!(
@@ -12476,7 +12730,7 @@ mod tests {
         let text = rendered_text(&app);
         let first_prompt = text.find("what is the status").expect("first prompt");
         let latest_prompt = text.find("are you working").expect("latest prompt");
-        let command = text.find("$ cargo test").expect("activity command");
+        let command = text.find("Bash($ cargo test").expect("activity command");
 
         assert!(first_prompt < latest_prompt);
         assert!(latest_prompt < command);
@@ -12522,7 +12776,7 @@ mod tests {
         let text = rendered_text(&app);
         let prompt = text.find("build the site").expect("user prompt");
         let work_log = text.find("Agent task completed").expect("agent task");
-        let command = text.find("$ cargo build").expect("tool command");
+        let command = text.find("Bash($ cargo build").expect("tool command");
         let answer = text
             .find("The site is built and ready.")
             .expect("assistant answer");
@@ -13539,12 +13793,219 @@ mod tests {
         app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
 
-        assert!(text.contains("Waited"));
+        assert!(text.contains("⏺ Bash($ sleep 20"));
         assert!(text.contains("20s"));
-        assert!(text.contains("Wrote"));
+        assert!(text.contains("⏺ Write(src/lib.rs"));
         assert!(text.contains("18ms"));
         assert!(!text.contains("Command  ▸ shell"));
         assert!(!text.contains("Tool  ▸ write_file"));
+    }
+
+    #[test]
+    fn render_activity_shows_bash_command_not_raw_json_args() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run a bash command")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // The codex-style `bash` tool carries its command in `arguments.cmd`
+        // (no `detail`), unlike `shell`/`exec` which set `detail`. It must
+        // still render as a real `$ command` line, not the raw JSON blob.
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+                .with_tool_call("bash-1")
+                .with_arguments(serde_json::json!({
+                    "cmd": "find . -name '*.ts' -newer server"
+                }))
+                .with_success(true)
+                .with_duration_ms(8),
+        );
+
+        app.expanded_tool_outputs = true;
+        let text = rendered_text(&app);
+
+        // Claude-Code-style card: `⏺ Bash(cmd)`, clean command, no JSON.
+        assert!(
+            text.contains("⏺ Bash($ find . -name '*.ts' -newer server)"),
+            "want Claude-Code-style bash card, got:\n{text}"
+        );
+        assert!(
+            !text.contains("call bash-1"),
+            "must not show the call id, got:\n{text}"
+        );
+        // No raw JSON arguments leaking through.
+        assert!(
+            !text.contains("{\"cmd\""),
+            "must not show raw JSON args, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn render_spawn_and_multiline_tool_cards_claude_code_style() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("spawn + multiline")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // spawn's task (projected into `detail`) renders as `⏺ Spawn(task)`.
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "spawn", "complete")
+                .with_tool_call("spawn-1")
+                .with_detail("Restart the Vite dev server")
+                .with_success(true)
+                .with_duration_ms(2500),
+        );
+        // A multi-line command keeps both lines (indented under `(`).
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+                .with_tool_call("bash-2")
+                .with_detail("cd /srv\nnpm run dev")
+                .with_success(true),
+        );
+
+        app.expanded_tool_outputs = true;
+        let text = rendered_text(&app);
+
+        assert!(
+            text.contains("⏺ Spawn(Restart the Vite dev server)"),
+            "spawn must show its task, got:\n{text}"
+        );
+        assert!(text.contains("⏺ Bash($ cd /srv"), "got:\n{text}");
+        assert!(
+            text.contains("npm run dev)"),
+            "multi-line command must keep its second line, got:\n{text}"
+        );
+        assert!(
+            !text.contains("spawn-1") && !text.contains("bash-2"),
+            "must not show call ids, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn compaction_notice_renders_prominently_with_marker() {
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id,
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("go")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // The persistent "context compacted" notice must stand out from the
+        // muted activity stream so it isn't lost in a busy session.
+        app.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            t!("status.activity_context_compacted").into_owned(),
+            "120k → 40k tokens",
+        ));
+        app.expanded_tool_outputs = true;
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("✦ context compacted"),
+            "compaction notice must render with a prominent marker, got:\n{text}"
+        );
+        assert!(text.contains("120k → 40k tokens"), "got:\n{text}");
+    }
+
+    #[test]
+    fn compaction_completed_event_renders_prominent_notice_end_to_end() {
+        use octos_core::app_ui::AppUiEvent;
+        use octos_core::ui_protocol::{
+            ContextCompactionCompletedEvent, UiContextCompactionRecord, UiContextState,
+            UiNotification,
+        };
+        let session_id = SessionKey("local:test".into());
+        // Compaction is reported DURING a turn — give the session a live reply
+        // so the notice is turn-stamped (else it is suppressed mid-turn).
+        let turn_id = TurnId::new();
+        let mut store = Store {
+            state: AppState::new(
+                vec![SessionView {
+                    id: session_id.clone(),
+                    title: "test".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::user("do heavy work")],
+                    tasks: vec![],
+                    live_reply: Some(crate::model::LiveReply {
+                        turn_id,
+                        text: String::new(),
+                    }),
+                }],
+                0,
+                "ready".into(),
+                None,
+                false,
+            ),
+        };
+
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
+                session_id: session_id.clone(),
+                context_state: UiContextState {
+                    session_id: session_id.clone(),
+                    thread_id: None,
+                    generation: 4,
+                    transcript_hash: "abc123".into(),
+                    item_count: 42,
+                    token_estimate: 40_000,
+                    recovery_state: "healthy".into(),
+                    last_checkpoint_id: None,
+                    last_compaction_id: Some("comp-001".into()),
+                },
+                compaction: UiContextCompactionRecord {
+                    compaction_id: "comp-001".into(),
+                    checkpoint_id: "chk-001".into(),
+                    status: "applied".into(),
+                    policy_id: "default".into(),
+                    trigger: "token_budget".into(),
+                    input_generation: 3,
+                    output_generation: Some(4),
+                    input_transcript_hash: "input-h".into(),
+                    replacement_transcript_hash: Some("abc123".into()),
+                    installed_transcript_hash: Some("abc123".into()),
+                    input_item_count: 130,
+                    retained_count: 42,
+                    dropped_count: 88,
+                    summary_item_id: Some("sum-1".into()),
+                    token_estimate_before: 120_000,
+                    token_estimate_after: Some(40_000),
+                    error: None,
+                },
+            }),
+        ));
+
+        store.state.expanded_tool_outputs = true;
+        let text = rendered_text(&store.state);
+        // Full path: Completed event → persistent notice → prominent ✦ render.
+        assert!(
+            text.contains("✦ context compacted"),
+            "a real compaction Completed event must render the prominent notice, got:\n{text}"
+        );
     }
 
     #[test]
@@ -13577,7 +14038,7 @@ mod tests {
 
         assert!(text.contains("Changed"));
         assert!(text.contains(".../blue-origin/src/pages/index.astro"));
-        assert!(text.contains("preview ready"));
+        assert!(!text.contains("preview ready"));
         assert!(!text.contains("File mutation: modify /tmp/work"));
     }
 
@@ -13855,9 +14316,8 @@ mod tests {
         app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
 
-        assert!(text.contains("failed"));
         assert!(text.contains("✗"));
-        assert!(text.contains("✓"));
+        assert!(text.contains("⏺"));
         assert!(text.contains("70s"));
         assert!(text.contains("6 passed"));
     }
@@ -14820,9 +15280,41 @@ mod tests {
         let text = rendered_text(&app);
         assert!(text.contains("Goal:"));
         assert!(text.contains("finish OAuth refactor"));
-        assert!(text.contains("Loops: 2 running"));
+        assert!(text.contains("Loops: 2 active"));
         assert!(text.contains("5m deploy-check"));
         assert!(text.contains("self-paced PR-watch"));
+    }
+
+    #[test]
+    fn autonomy_indicator_counts_paused_loops_alongside_active() {
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // A `--solo` boot parks active loops to `paused`: the header must read
+        // "0 active · 2 paused", not "0 running" beside two visible chips.
+        let mut l1 = sample_loop("l1", "deploy-check", "fixed_interval", Some(300));
+        l1.status = "paused".into();
+        let mut l2 = sample_loop("l2", "PR-watch", "self_paced", None);
+        l2.status = "paused".into();
+        app.set_session_loops(&session_id, vec![l1, l2]);
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Loops: 0 active · 2 paused"),
+            "paused loops must reconcile with the chips, got:\n{text}"
+        );
     }
 
     #[test]
@@ -15445,7 +15937,7 @@ mod tests {
         let update = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
         let inserted = lines_text(&update.lines_to_insert);
         assert!(
-            inserted.contains("Agent task completed") && inserted.contains("$ cargo test"),
+            inserted.contains("Agent task completed") && inserted.contains("Bash($ cargo test"),
             "completed activity should be inserted into scrollback mid-turn: {inserted:?}"
         );
         assert!(
@@ -15860,7 +16352,7 @@ mod tests {
         let first = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
         let first_text = lines_text(&first.lines_to_insert);
         assert!(first_text.contains("already flushed line"));
-        assert!(first_text.contains("$ cargo test"));
+        assert!(first_text.contains("Bash($ cargo test"));
 
         app.sessions[0].live_reply = None;
         app.sessions[0].messages.push(Message::assistant(
@@ -15887,7 +16379,7 @@ mod tests {
             "committed assistant should flush the unflushed suffix: {second_text:?}"
         );
         assert!(
-            !second_text.contains("$ cargo test"),
+            !second_text.contains("Bash($ cargo test"),
             "committed activity log must not duplicate the live-flushed action: {second_text:?}"
         );
         assert!(
@@ -16084,8 +16576,57 @@ mod tests {
             "missing activity log: {text:?}"
         );
         assert!(
-            text.contains("$ cargo build"),
+            text.contains("Bash($ cargo build"),
             "missing tool detail: {text:?}"
+        );
+    }
+
+    #[test]
+    fn scrollback_renders_full_tool_output_without_ctrl_o_hint() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = chat_app(vec![
+            Message::user("run tests"),
+            Message::assistant("Done."),
+        ]);
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_id.clone(),
+            request: Some("run tests".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+                    .with_turn(turn_id)
+                    .with_detail("cargo test")
+                    .with_output_preview("line1\nline2\nline3\nline4\nline5")
+                    .with_success(true),
+            ],
+        });
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let lines = finalized_history_lines_range(&app, palette, 80, 1);
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Frozen scrollback shows the FULL output (the toggle can't repaint it)…
+        for n in 1..=5 {
+            assert!(
+                text.contains(&format!("line{n}")),
+                "missing line{n}:\n{text}"
+            );
+        }
+        // …and never the un-actionable Ctrl+O hint.
+        assert!(
+            !text.contains("Ctrl+O"),
+            "scrollback must not show a dead Ctrl+O hint:\n{text}"
+        );
+        assert!(
+            !text.contains("hidden"),
+            "scrollback must not hide output:\n{text}"
         );
     }
 
@@ -16795,5 +17336,73 @@ mod tests {
                 "composer line {marker} must stay visible (not capped); rows: {rows:#?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod running_row_regression {
+    use super::*;
+    use crate::model::*;
+    use crate::store::Store;
+    use octos_core::app_ui::AppUiEvent;
+    use octos_core::ui_protocol::*;
+
+    #[test]
+    fn running_bash_tool_started_renders_cc_card_not_legacy_verb_row() {
+        let session_id = SessionKey("local:t".into());
+        let mut store = Store {
+            state: AppState::new(
+                vec![SessionView {
+                    id: session_id.clone(),
+                    title: "t".into(),
+                    profile_id: Some("dev".into()),
+                    messages: vec![Message::user("go")],
+                    tasks: vec![],
+                    live_reply: None,
+                }],
+                0,
+                "ready".into(),
+                None,
+                false,
+            ),
+        };
+        let turn_id = TurnId::new();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
+            ToolStartedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id,
+                tool_call_id: "c1".into(),
+                tool_name: "bash".into(),
+                arguments: Some(serde_json::json!({
+                    "cmd": "sleep 20 && echo never-finishes",
+                    "timeout_ms": 30000
+                })),
+            },
+        )));
+        let palette = Palette::for_theme(crate::cli::ThemeName::Codex);
+        let backend = ratatui::backend::TestBackend::new(140, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("t");
+        terminal
+            .draw(|frame| render(frame, &store.state, palette))
+            .expect("render");
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            text.push('\n');
+        }
+        assert!(!text.contains("Using bash"), "old verb leaked:\n{text}");
+        assert!(!text.contains("{\"cmd\""), "raw JSON leaked:\n{text}");
     }
 }
