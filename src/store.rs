@@ -7695,13 +7695,22 @@ impl Store {
                 // here meant the "Compacting…" block painted ZERO frames.
                 // The renderer dwells on the settled state for a short
                 // window; turn-terminal sweeps and the next Started insert
-                // still bound the entry's lifetime.
-                let live_compaction = self.state.live_compaction.get(&session_id).cloned();
-                if let Some(live) = self.state.live_compaction.get_mut(&session_id) {
-                    live.completed_at = Some(std::time::Instant::now());
-                    live.token_estimate_after =
-                        event.compaction.token_estimate_after.map(|v| v as u64);
-                }
+                // still bound the entry's lifetime. ERRORED completions keep
+                // main's behavior — drop the block outright: the settled
+                // dwell renders a success reduction (`✶ … X → Y tokens`) and
+                // must stay gated on `error.is_none()` like the durable
+                // notice below (codex P2 on the main-reconcile merge).
+                let live_compaction = if event.compaction.error.is_none() {
+                    let live_compaction = self.state.live_compaction.get(&session_id).cloned();
+                    if let Some(live) = self.state.live_compaction.get_mut(&session_id) {
+                        live.completed_at = Some(std::time::Instant::now());
+                        live.token_estimate_after =
+                            event.compaction.token_estimate_after.map(|v| v as u64);
+                    }
+                    live_compaction
+                } else {
+                    self.state.live_compaction.remove(&session_id)
+                };
                 let state = crate::model::ContextLifecycleState {
                     session_id: event.context_state.session_id.clone(),
                     thread_id: event.context_state.thread_id.clone(),
@@ -22697,6 +22706,90 @@ mod tests {
             .expect("completed must settle the live block in place, not remove it");
         assert!(live.completed_at.is_some(), "must be marked settled");
         assert_eq!(live.token_estimate_after, Some(31_000));
+    }
+
+    /// An ERRORED completion must not settle into the 4-second success dwell
+    /// (`✶ context compacted (X → Y tokens)`) — main removed the live block
+    /// for every completion and gates the durable notice on `error.is_none()`;
+    /// the settle-in-place dwell must keep that error gate (codex P2 on the
+    /// main-reconcile merge).
+    #[test]
+    fn errored_compaction_completed_drops_live_block_without_success_dwell() {
+        use octos_core::ui_protocol::{
+            ContextCompactionCompletedEvent, ContextCompactionStartedEvent,
+            UiContextCompactionRecord, UiContextState,
+        };
+
+        let session_id = SessionKey("local:test".into());
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "test".into(),
+            profile_id: None,
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        };
+        let context_state = UiContextState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 4,
+            transcript_hash: "abc123".into(),
+            item_count: 42,
+            token_estimate: 91_000,
+            recovery_state: "degraded".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        };
+
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionStarted(ContextCompactionStartedEvent {
+                session_id: session_id.clone(),
+                context_state: context_state.clone(),
+                trigger: "preflight".into(),
+                threshold_tokens: 96_000,
+            }),
+        ));
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
+                session_id: session_id.clone(),
+                context_state,
+                compaction: UiContextCompactionRecord {
+                    compaction_id: "comp-002".into(),
+                    checkpoint_id: "chk-002".into(),
+                    status: "failed".into(),
+                    policy_id: "default".into(),
+                    trigger: "preflight".into(),
+                    input_generation: 3,
+                    output_generation: None,
+                    input_transcript_hash: "input-h".into(),
+                    replacement_transcript_hash: None,
+                    installed_transcript_hash: None,
+                    input_item_count: 130,
+                    retained_count: 0,
+                    dropped_count: 0,
+                    summary_item_id: None,
+                    token_estimate_before: 91_000,
+                    token_estimate_after: None,
+                    error: Some("summarizer failed".into()),
+                },
+            }),
+        ));
+
+        assert!(
+            !store.state.live_compaction.contains_key(&session_id),
+            "an errored completion must drop the live block, not settle it into a success flash"
+        );
+        assert!(
+            !store
+                .state
+                .activity
+                .iter()
+                .any(|item| item.title.contains("compacted")),
+            "no durable success notice for an errored compaction"
+        );
     }
 
     /// The activity cap's blind oldest-first eviction dropped compaction

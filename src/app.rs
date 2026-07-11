@@ -214,6 +214,11 @@ fn live_tail_height_with_finalization(
         live_finalization,
     );
     let rows = transcript_visual_rows(&lines, wrap_width) as u16;
+    // The `/btw` aside draws as a floating overlay OVER the tail's top rows
+    // (`render_btw_overlay`) and adds no flow lines of its own — reserve its
+    // rows here or a settled/short tail starves the overlay's 3-row minimum
+    // and the pane becomes invisible while still answering (codex P1).
+    let rows = rows.max(btw_overlay_height_hint(app, width));
     // Cap the tail so it can't dominate the viewport; the rest stays in
     // scrollback. Scale with the terminal (at most half its height) rather than
     // a fixed 18 — a tall terminal shouldn't strand the live tail at 18 while a
@@ -5173,6 +5178,39 @@ fn push_btw_aside_card(
 /// border + title are load-bearing: a borderless overlay reads as embedded
 /// transcript text whenever the tail is short — the box is what makes it a
 /// visibly distinct window over the session instead of part of the flow.
+/// Rows the `/btw` overlay pane wants (card lines sans leading blanks, plus
+/// the two border rows); `0` when the active session has no aside. The aside
+/// contributes NO lines to the turn flow, so [`live_tail_height_with_finalization`]
+/// must reserve these rows explicitly — a settled session's tail otherwise
+/// collapses to 1-2 rows, under [`render_btw_overlay`]'s 3-row minimum, and
+/// the pane silently stops drawing while the aside is still answering
+/// (codex P1). Kept in sync with `render_btw_overlay`'s layout math.
+fn btw_overlay_height_hint(app: &AppState, area_width: u16) -> u16 {
+    if area_width < 4 {
+        return 0;
+    }
+    let Some(session) = app.active_session() else {
+        return 0;
+    };
+    let Some(aside) = app.btw_asides.get(&session.id) else {
+        return 0;
+    };
+    let mut lines = Vec::new();
+    push_btw_aside_card(
+        &mut lines,
+        Palette::for_theme(app.theme),
+        aside,
+        area_width as usize - 2,
+    );
+    while line_is_blank(lines.first()) {
+        lines.remove(0);
+    }
+    if lines.is_empty() {
+        return 0;
+    }
+    (lines.len() as u16).saturating_add(2)
+}
+
 fn render_btw_overlay(
     frame: &mut impl FrameLike,
     app: &AppState,
@@ -9612,6 +9650,43 @@ mod tests {
         assert!(
             text.contains("┌") && text.contains("└"),
             "aside pane must draw its border; got:\n{text}"
+        );
+    }
+
+    /// codex P1 (merge reconcile): the aside no longer contributes lines to
+    /// the turn flow, so a SETTLED session's live tail collapses to 1-2 rows —
+    /// under `render_btw_overlay`'s 3-row minimum — and the overlay became
+    /// invisible in the real inline viewport (state kept it, nothing drew it).
+    /// The tail height hint must reserve the overlay's rows.
+    #[test]
+    fn btw_aside_overlay_survives_settled_inline_viewport() {
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("go"), Message::assistant("done")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.set_btw_answering(&session_id, "still with me?".into());
+        // Real inline-viewport path: the viewport is sized by live_ui_height
+        // (a settled tail otherwise reserves ~1 row) and the overlay draws
+        // over the tail's top rows.
+        let text = viewport_rows(&app, 100, 40).join("\n");
+        assert!(
+            text.contains("Aside — /btw"),
+            "settled inline viewport must still draw the aside pane; got:\n{text}"
+        );
+        assert!(
+            text.contains("/btw still with me?"),
+            "aside question echo missing from inline viewport; got:\n{text}"
         );
     }
 
