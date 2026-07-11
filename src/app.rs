@@ -3344,56 +3344,40 @@ fn push_user_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, con
 
 /// A horizontal ASCII octopus that "swims" across the thinking line: a `[⇔]`
 /// head flanked by the tilted-line glyphs `彡`/`ミ` (one arm per side). The two
-/// frames now encode travel *direction* rather than an in-place paddle — the
-/// octopus ping-pongs left↔right (see [`octopus_swim`]) and faces the way it
-/// moves: `彡[⇔]ミ` swimming right, `ミ[⇔]彡` swimming left.
+/// frames are alternating paddle *strokes* — the arms flip mirror-image every
+/// column step while the octopus ping-pongs left↔right (see [`octopus_swim`]),
+/// so it visibly paddles the whole way instead of holding one pose per leg.
 ///
-///   `彡[⇔]ミ`   `ミ[⇔]彡`
+///   `彡[⇔]ミ` ⇄ `ミ[⇔]彡`
 const OCTOPUS_SWIM_FRAMES: [&str; 2] = ["彡[⇔]ミ", "ミ[⇔]彡"];
 
 /// Milliseconds the octopus spends per display column. ~150ms/col reads as a
-/// calm swim (a full left→right→left sweep is a couple of seconds on a typical
-/// terminal) rather than a strobe.
+/// calm swim (and a ~3 strokes/sec paddle) rather than a strobe.
 const OCTOPUS_SWIM_STEP_MS: u128 = 150;
-
-/// Cap on the ping-pong travel so the sweep stays legible on very wide
-/// terminals — a full-width dash would read as teleporting, not swimming.
-const OCTOPUS_SWIM_MAX_OFFSET: usize = 28;
 
 /// Pure elapsed→(leading-space offset, frame) mapping for the swimming octopus.
 ///
 /// The octopus travels horizontally as a triangle wave: the leading-space
-/// offset climbs `0 → MAX` (swimming right, `彡[⇔]ミ`), then falls `MAX → 0`
-/// (swimming left, `ミ[⇔]彡`), forever. `MAX` keeps the octopus plus a one-column
-/// right margin inside `wrap_width`, measured in display *columns* via
-/// `unicode-width` (the CJK arm glyphs are double-width), and is capped at
-/// [`OCTOPUS_SWIM_MAX_OFFSET`]. On a terminal too narrow to travel, `MAX` is 0
-/// and the octopus sits still (facing right) rather than panicking. All
-/// arithmetic is overflow-safe: `offset` is bounded by `MAX`, so the caller's
-/// `" ".repeat(offset)` can never run away.
+/// offset climbs `0 → MAX` then falls `MAX → 0`, forever, sweeping the FULL
+/// `wrap_width` — `MAX` keeps the octopus plus a one-column right margin
+/// inside it, measured in display *columns* via `unicode-width` (the CJK arm
+/// glyphs are double-width). The paddle frame alternates every column step
+/// independent of travel direction. On a terminal too narrow to travel,
+/// `MAX` is 0 and the octopus paddles in place at the left margin rather
+/// than panicking. All arithmetic is overflow-safe: `offset` is bounded by
+/// `MAX`, so the caller's `" ".repeat(offset)` can never run away.
 fn octopus_swim(elapsed_ms: u128, wrap_width: usize) -> (usize, &'static str) {
     let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
-    let max = wrap_width
-        .saturating_sub(octopus_width + 1)
-        .min(OCTOPUS_SWIM_MAX_OFFSET);
+    let max = wrap_width.saturating_sub(octopus_width + 1);
+    // Reduce in u128 first so a huge uptime can never truncate badly.
+    let steps = elapsed_ms / OCTOPUS_SWIM_STEP_MS;
+    let frame = OCTOPUS_SWIM_FRAMES[(steps % 2) as usize];
     if max == 0 {
-        return (0, OCTOPUS_SWIM_FRAMES[0]);
+        return (0, frame);
     }
     let cycle = 2 * max;
-    // Reduce modulo in u128 first so a huge uptime can never truncate badly.
-    let pos = ((elapsed_ms / OCTOPUS_SWIM_STEP_MS) % cycle as u128) as usize;
-    let (offset, moving_right) = if pos <= max {
-        (pos, true) // rising: swim right →
-    } else {
-        (cycle - pos, false) // falling: swim left ←
-    };
-    // Direction↔frame mapping — a single flippable line if the facing should
-    // ever be swapped.
-    let frame = if moving_right {
-        OCTOPUS_SWIM_FRAMES[0]
-    } else {
-        OCTOPUS_SWIM_FRAMES[1]
-    };
+    let pos = (steps % cycle as u128) as usize;
+    let offset = if pos <= max { pos } else { cycle - pos };
     (offset, frame)
 }
 
@@ -3469,12 +3453,12 @@ fn push_live_compaction_block(
     lines.push(Line::from(""));
 }
 
-/// Push a single dimmed line carrying only the swimming octopus — no text. The
+/// Push a single line carrying only the swimming octopus — no text. The
 /// octopus alone signals the thinking phase, traveling left↔right across the
-/// line (see [`octopus_swim`]). Mirrors the `reasoning` role's background from
-/// [`push_message_block`] / [`chat_message_bg`] so it reads as a dimmed
-/// continuation of that lane. `wrap_width` bounds the travel so the octopus
-/// never runs past the transcript's wrap edge.
+/// line (see [`octopus_swim`]) in the palette accent so it stays visible
+/// against the `reasoning` role's background from [`push_message_block`] /
+/// [`chat_message_bg`]. `wrap_width` bounds the travel so the octopus never
+/// runs past the transcript's wrap edge.
 fn push_thinking_indicator(lines: &mut Vec<Line<'static>>, palette: Palette, wrap_width: usize) {
     use std::sync::OnceLock;
     use std::time::Instant;
@@ -3490,7 +3474,10 @@ fn push_thinking_indicator(lines: &mut Vec<Line<'static>>, palette: Palette, wra
     }
 
     let bg = chat_message_bg(palette, "reasoning");
-    let style = palette.muted().add_modifier(Modifier::DIM).bg(bg);
+    let style = Style::default()
+        .fg(palette.accent)
+        .add_modifier(Modifier::BOLD)
+        .bg(bg);
     lines.push(chat_line(
         vec![Span::styled(
             format!("{}{}", " ".repeat(offset), frame),
@@ -4805,40 +4792,234 @@ const RAW_ARG_FALLBACK_COLS: usize = 512;
 
 /// A human-readable one-line invocation for a tool activity, preferring a real
 /// command string over the raw serialized arguments (which used to leak into
-/// the card as `{"cmd":…}`). Order: an explicit `detail`, then a shell-family
-/// tool's command string, then a compact `key=value` of the first meaningful
-/// object field, then a bounded raw-JSON fallback.
+/// the card as `{"cmd":…}`). Order: an explicit `detail` (run through the
+/// args-echo humanizer — the server path fills it with the protocol #1606
+/// `arguments_preview` JSON echo), then a shell-like tool's command string,
+/// then a compact `key=value` of the first meaningful object field, then a
+/// bounded raw-JSON fallback.
+///
+/// DISPLAY-ONLY: `ActivityItem.detail` itself is never rewritten — the
+/// envelope thread marker stored there is load-bearing for the turn-less
+/// reconcile ([`AppState::reconcile_envelope_thread_running_activity`]).
 fn tool_invocation_text(item: &ActivityItem) -> Option<String> {
     if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
-        return Some(detail.to_string());
+        return Some(humanize_args_echo(detail, &item.title));
     }
     let arguments = item.arguments.as_ref()?;
-    // Shell-family tools carry their command under `cmd`/`command`; surface
-    // that (untruncated — the card builder applies the display-width budget)
-    // instead of the JSON envelope. Empty fields are skipped so
-    // `{"cmd":"","command":"cargo test"}` still falls back to the real command.
-    if is_shell_family_tool(&item.title) {
-        if let Some(command) = ["cmd", "command"].into_iter().find_map(|key| {
-            arguments
-                .get(key)
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|command| !command.is_empty())
-        }) {
-            return Some(command.to_string());
+    // The envelope lane parks the same serialized args echo in `arguments` as
+    // a JSON String (its `detail` carries the thread marker instead): treat
+    // the inner text exactly like a detail echo — re-serializing it would
+    // render `"{\"cmd\":…`.
+    if let Some(echo) = arguments.as_str() {
+        let echo = echo.trim();
+        if !echo.is_empty() {
+            return Some(humanize_args_echo(echo, &item.title));
+        }
+    }
+    // Shell-like tools carry their command under `command`/`cmd`; surface that
+    // (untruncated — callers like `shell_action_label` match on the full text,
+    // and the row builder applies the display-width budget) instead of the JSON
+    // envelope.
+    if is_shell_like_tool(&item.title) {
+        if let Some(command) = shell_command_from_args(arguments) {
+            return Some(command);
         }
     }
     // Other tools with an object payload: show a compact `key=value` of the
     // first meaningful string/number field rather than the whole JSON blob.
     if let Some(map) = arguments.as_object() {
         if let Some(rendered) = first_meaningful_arg(map) {
-            return Some(rendered);
+            return Some(single_line_invocation(&rendered));
         }
     }
     // Last resort: bounded raw JSON (never an unbounded dump).
     serde_json::to_string(arguments)
         .ok()
         .map(|json| truncate_to_display_width(&json, RAW_ARG_FALLBACK_COLS))
+}
+
+/// The `command`/`cmd` string of a shell-like tool's args object, flattened to
+/// one line. `None` when the payload has no non-empty command string.
+fn shell_command_from_args(arguments: &serde_json::Value) -> Option<String> {
+    arguments
+        .get("command")
+        .or_else(|| arguments.get("cmd"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(single_line_invocation)
+}
+
+/// Humanize a serialized arguments echo for the one-line tool row. The server
+/// caps the echo (~700 bytes, protocol #1606), so a JSON object echo often
+/// arrives CUT mid-string — strict parsing gets the well-formed case, a
+/// lenient scan covers the truncated one, and a cleanup pass guarantees the
+/// floor: no raw `{"key":` prefix, no literal `\n`/`\t` escape leaking into
+/// the row.
+///
+/// `detail` ALSO carries already-decoded REAL invocation text (the `!`-bang
+/// echo, the live-lane command summaries, progress prose, thread markers), so
+/// the transforms are gated on the two serialized-echo shapes and everything
+/// else renders verbatim (one-lined only): a brace-group command `{ echo ok; }`
+/// is NOT a JSON echo (that requires `{"`), and `printf '\n'` keeps its
+/// intentional two-char escape (escape decoding requires the `key: value`
+/// preview opener).
+fn humanize_args_echo(echo: &str, title: &str) -> String {
+    let trimmed = echo.trim();
+    if looks_like_json_object_echo(trimmed) {
+        // Complete echo: strict parse, then the same rendering the
+        // object-arguments path uses (command string / first `key=value`).
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            let value = serde_json::Value::Object(map);
+            if is_shell_like_tool(title) {
+                if let Some(command) = shell_command_from_args(&value) {
+                    return command;
+                }
+            }
+            if let Some(map) = value.as_object() {
+                if let Some(rendered) = first_meaningful_arg(map) {
+                    return single_line_invocation(&rendered);
+                }
+            }
+        } else if is_shell_like_tool(title) {
+            // Truncated echo (strict parse fails): scan for the command key
+            // and decode the string value up to the cut.
+            if let Some(command) = lenient_echo_command(trimmed) {
+                return command;
+            }
+        }
+        // Floor for anything else `{`-shaped (truncated non-shell echo, or an
+        // object with no scalar field): strip the JSON framing and decode the
+        // common escapes so the row never shows `{"key":` or a literal `\n`.
+        return single_line_invocation(&scrub_json_echo_fragment(trimmed));
+    }
+    // The producer's `key: value` preview format JSON-encodes string values,
+    // so decode the common escapes there; rows are one-line, so an escaped
+    // newline becomes a space.
+    if has_key_value_echo_opener(trimmed) {
+        return single_line_invocation(&decode_json_string_escapes(trimmed));
+    }
+    // Plain already-decoded text (bang commands, live-lane invocation
+    // summaries, progress prose, thread markers): verbatim, one-lined.
+    single_line_invocation(trimmed)
+}
+
+/// A serialized JSON object echo starts `{"` (optionally with whitespace
+/// between — pretty printing), because the first thing inside a JSON object is
+/// a quoted key. A brace-group shell command (`{ echo ok; }`) does not, so it
+/// is never mistaken for an echo.
+fn looks_like_json_object_echo(text: &str) -> bool {
+    text.strip_prefix('{')
+        .is_some_and(|rest| rest.trim_start().starts_with('"'))
+}
+
+/// The `key: value` preview opener the #1606 producer emits for object args
+/// (`cmd: "grep …", timeout: 300`): a bare identifier-ish key, then `: `. Real
+/// commands/prose almost never start this way (`printf '\n'` has no colon; an
+/// `echo "note: x"` command's first token contains spaces/quotes and fails the
+/// key charset).
+fn has_key_value_echo_opener(text: &str) -> bool {
+    let Some((key, _)) = text.split_once(": ") else {
+        return false;
+    };
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+/// Lenient `command`/`cmd` extraction from a truncated JSON object echo that
+/// `serde_json` cannot parse (the ~700-byte cap cuts mid-string): find the
+/// key, then decode its string value up to the closing unescaped quote or the
+/// end of the input. Char-boundary safe (operates on `char`s, and the marker
+/// find can only land on ASCII boundaries).
+fn lenient_echo_command(echo: &str) -> Option<String> {
+    for key in ["\"command\"", "\"cmd\""] {
+        let Some(pos) = echo.find(key) else {
+            continue;
+        };
+        let rest = echo[pos + key.len()..].trim_start();
+        let Some(rest) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let Some(body) = rest.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let command = single_line_invocation(&decode_json_string_body(body, true));
+        if !command.is_empty() {
+            return Some(command);
+        }
+    }
+    None
+}
+
+/// Floor rendering for a truncated JSON echo with no better extraction: drop
+/// the leading `{`/`"` framing and decode the common escapes. The result is
+/// not pretty, but it never shows a raw `{"key":` prefix or a literal `\n`.
+fn scrub_json_echo_fragment(echo: &str) -> String {
+    let body = echo.strip_prefix('{').unwrap_or(echo).trim_start();
+    let body = body.strip_prefix('"').unwrap_or(body);
+    decode_json_string_escapes(body)
+}
+
+/// Decode the common JSON string escapes for one-line display: `\"`→`"`,
+/// `\\`→`\`, `\n`/`\t`/`\r`→space. Unknown escapes pass through verbatim and a
+/// dangling trailing backslash (left by the echo's byte cap) is dropped.
+fn decode_json_string_escapes(text: &str) -> String {
+    decode_json_string_body(text, false)
+}
+
+/// Shared escape decoder. With `stop_at_quote`, decoding ends at the first
+/// unescaped `"` (the value's closing quote in a JSON echo — trailing sibling
+/// keys are dropped); otherwise the whole input is decoded.
+fn decode_json_string_body(text: &str, stop_at_quote: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if stop_at_quote => break,
+            '\\' => match chars.next() {
+                Some('n' | 't' | 'r') => out.push(' '),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                // Dangling backslash at the truncation cut — drop it.
+                None => {}
+            },
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Rows are one-line: flatten real newlines/tabs in an invocation to spaces
+/// (the row is width-truncated by the builder; multi-line content belongs to
+/// the `│` output-preview lines, which are NOT run through this).
+fn single_line_invocation(text: &str) -> String {
+    if text.chars().any(|ch| matches!(ch, '\n' | '\r' | '\t')) {
+        text.chars()
+            .map(|ch| match ch {
+                '\n' | '\r' | '\t' => ' ',
+                other => other,
+            })
+            .collect::<String>()
+            .trim()
+            .to_string()
+    } else {
+        text.trim().to_string()
+    }
+}
+
+/// Case-insensitive check for the shell family whose invocation is a command
+/// string (`shell`/`bash`/`sh`). Kept in one place so the command-extraction in
+/// [`tool_invocation_text`] and the `$ ` prompt in the row builder agree.
+fn is_shell_like_tool(title: &str) -> bool {
+    matches!(title.to_ascii_lowercase().as_str(), "shell" | "bash" | "sh")
 }
 
 /// Render the first meaningful field of an args object as a compact
@@ -5928,6 +6109,15 @@ fn push_tool_card_header(
         }
         lines.push(Line::from(clip_line_spans(spans, wrap_width)));
         return;
+    };
+
+    // Shell-family invocations keep the `$ ` prompt inside the parens —
+    // `⏺ Bash($ cargo test)` — the command-row marker #276 established; the
+    // prompt is part of the budgeted text so the width math stays exact.
+    let invocation = if is_shell_family_tool(&item.title) {
+        format!("$ {invocation}")
+    } else {
+        invocation
     };
 
     // Continuation lines align under the first char after `(`.
@@ -9038,31 +9228,32 @@ mod tests {
     }
 
     #[test]
-    fn octopus_swim_starts_at_origin_facing_right() {
-        // elapsed=0 → sitting at the left margin, swimming right.
+    fn octopus_swim_starts_at_origin_with_the_first_stroke() {
+        // elapsed=0 → sitting at the left margin, first paddle stroke.
         let (offset, frame) = octopus_swim(0, 80);
         assert_eq!(offset, 0, "starts flush-left");
-        assert_eq!(frame, "彡[⇔]ミ", "the first phase faces right");
+        assert_eq!(frame, "彡[⇔]ミ");
         assert_eq!(frame, OCTOPUS_SWIM_FRAMES[0]);
     }
 
     #[test]
-    fn octopus_swim_ping_pongs_a_clean_triangle_wave() {
+    fn octopus_swim_ping_pongs_the_full_width_while_paddling() {
         // Sample one full period, one column-step at a time, and confirm the
-        // offset traces 0→MAX→0 (a triangle) while the frame faces the way it
-        // travels: right on the rise, left on the fall.
-        let wrap_width = 40usize;
+        // offset traces 0→MAX→0 (a triangle) spanning the FULL wrap width —
+        // no sweep cap — while the paddle frame alternates on every step.
+        let wrap_width = 120usize;
         let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
-        let max = wrap_width
-            .saturating_sub(octopus_width + 1)
-            .min(OCTOPUS_SWIM_MAX_OFFSET);
-        assert!(max > 0, "test needs a non-trivial sweep (got MAX={max})");
+        let max = wrap_width.saturating_sub(octopus_width + 1);
+        assert!(
+            max > 28,
+            "the sweep must exceed the old 28-column cap (got MAX={max})"
+        );
 
         // The triangle we expect, built independently of the implementation:
         // rise 0..=MAX, then fall MAX-1..=1 (the trough 0 opens the next period).
         let mut expected = Vec::new();
-        expected.extend(0..=max); // rising, swimming right
-        expected.extend((1..max).rev()); // falling, swimming left
+        expected.extend(0..=max); // rising →
+        expected.extend((1..max).rev()); // falling ←
         let cycle = expected.len();
         assert_eq!(cycle, 2 * max, "one period spans 2·MAX column-steps");
 
@@ -9075,52 +9266,65 @@ mod tests {
                 offset <= max,
                 "offset {offset} exceeded MAX {max} at {step}"
             );
-            // Facing matches direction: rising (step<=max) → right, else left.
-            let want_frame = if step <= max {
-                OCTOPUS_SWIM_FRAMES[0]
-            } else {
-                OCTOPUS_SWIM_FRAMES[1]
-            };
-            assert_eq!(frame, want_frame, "facing at step {step}");
+            // The arms flip mirror-image every column step, independent of
+            // travel direction.
+            assert_eq!(
+                frame,
+                OCTOPUS_SWIM_FRAMES[step % 2],
+                "paddle stroke at step {step}"
+            );
         }
 
-        // The period repeats: step `cycle` lands back at the origin, facing right.
-        let (wrapped, frame) = octopus_swim((cycle as u128) * OCTOPUS_SWIM_STEP_MS, wrap_width);
+        // The period repeats: step `cycle` lands back at the origin.
+        let (wrapped, _frame) = octopus_swim((cycle as u128) * OCTOPUS_SWIM_STEP_MS, wrap_width);
         assert_eq!(wrapped, 0, "period wraps back to the left margin");
-        assert_eq!(frame, OCTOPUS_SWIM_FRAMES[0]);
     }
 
     #[test]
     fn octopus_swim_never_overflows_the_wrap_width() {
         // The octopus (plus a one-column right margin) always stays inside the
-        // wrap boundary, across a long stretch of the animation, for a range of
-        // terminal widths — including the huge-terminal cap.
+        // wrap boundary, across a long stretch of the animation, for a range
+        // of terminal widths — and on wide terminals it actually reaches the
+        // far edge (full-width travel, not a capped sweep).
         let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
         for wrap_width in [octopus_width + 2, 20, 40, 80, 200, 1000] {
-            for step in 0..400u128 {
+            let max = wrap_width.saturating_sub(octopus_width + 1);
+            let mut peak = 0usize;
+            // 2·1000 steps covers a full period even at wrap_width=1000.
+            for step in 0..2000u128 {
                 let (offset, _frame) = octopus_swim(step * OCTOPUS_SWIM_STEP_MS, wrap_width);
                 assert!(
                     offset + octopus_width <= wrap_width,
                     "octopus overflowed wrap_width={wrap_width}: offset={offset}",
                 );
-                assert!(
-                    offset <= OCTOPUS_SWIM_MAX_OFFSET,
-                    "offset {offset} exceeded the sweep cap at wrap_width={wrap_width}",
-                );
+                peak = peak.max(offset);
             }
+            assert_eq!(
+                peak, max,
+                "sweep must reach the far edge at wrap_width={wrap_width}"
+            );
         }
     }
 
     #[test]
-    fn octopus_swim_tiny_terminal_sits_still_without_panicking() {
+    fn octopus_swim_tiny_terminal_paddles_in_place_without_panicking() {
         // A terminal too narrow to travel: MAX collapses to 0, so the octopus
-        // holds the left margin (facing right) instead of panicking or wrapping.
+        // holds the left margin — still paddling — instead of panicking or
+        // wrapping.
         let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
         for wrap_width in [0usize, 1, 2, octopus_width, octopus_width + 1] {
             // A large elapsed value also exercises the u128→usize math safely.
             let (offset, frame) = octopus_swim(9_999_999_999, wrap_width);
             assert_eq!(offset, 0, "no travel at wrap_width={wrap_width}");
-            assert_eq!(frame, OCTOPUS_SWIM_FRAMES[0], "faces right when still");
+            let steps = 9_999_999_999u128 / OCTOPUS_SWIM_STEP_MS;
+            assert_eq!(
+                frame,
+                OCTOPUS_SWIM_FRAMES[(steps % 2) as usize],
+                "keeps paddling in place"
+            );
+            // Consecutive steps still alternate strokes while parked.
+            let (_, next) = octopus_swim((steps + 1) * OCTOPUS_SWIM_STEP_MS, wrap_width);
+            assert_ne!(frame, next, "parked octopus must keep alternating strokes");
         }
     }
 
@@ -11895,7 +12099,7 @@ mod tests {
         let text = rendered_text(&app);
 
         assert!(!text.contains("Activity"));
-        assert!(text.contains("⏺ Bash(cargo test"));
+        assert!(text.contains("⏺ Bash($ cargo test"));
         assert!(text.contains("running 6 tests"));
         assert!(text.contains("1 more line(s) hidden (Ctrl+O expand)"));
         assert!(text.contains("1.2s"));
@@ -11992,7 +12196,7 @@ mod tests {
         );
         let text = lines_text(&lines);
         assert!(
-            text.contains("Bash(echo"),
+            text.contains("Bash($ echo"),
             "bash row must show the command: {text:?}"
         );
         assert!(
@@ -12007,6 +12211,243 @@ mod tests {
             !text.contains("call_01_UVIa9EBA331xAfxbPFPM4446"),
             "the call-id must not be displayed: {text:?}"
         );
+    }
+
+    fn agent_task_child_text(item: &ActivityItem, wrap_width: usize) -> String {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        push_agent_task_child(
+            &mut lines,
+            Palette::for_theme(ThemeName::Slate),
+            item,
+            true,
+            false,
+            wrap_width,
+            false,
+        );
+        lines_text(&lines)
+    }
+
+    /// Live-capture regression (#273 follow-up): on the real server path the
+    /// invocation comes from `detail` — the protocol #1606 `arguments_preview`
+    /// echo, a JSON serialization of the tool args capped at ~700 bytes, so it
+    /// often arrives CUT mid-string (no closing quote/brace, unparseable by
+    /// strict serde). The shell row must still extract `$ <command>`; the raw
+    /// `{"cmd":…` framing must never render.
+    #[test]
+    fn agent_task_bash_row_extracts_command_from_truncated_detail_echo() {
+        let item = ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+            .with_detail(
+                r#"{"cmd":"grep -n '<img' /Users/yuechen/dev/2026-world-cup/client/src/pages/HomePage.tsx /Users/yuechen/dev/2026-world-cup/client/s"#,
+            )
+            .with_tool_call("call_01_ABCDEFGHIJKLMNOP")
+            .with_success(true)
+            .with_duration_ms(33);
+        let text = agent_task_child_text(&item, 120);
+        assert!(
+            text.contains("$ grep -n '<img'"),
+            "truncated echo must still yield the command: {text:?}"
+        );
+        assert!(
+            !text.contains("{\"cmd\""),
+            "raw JSON echo must never render: {text:?}"
+        );
+    }
+
+    /// A complete (untruncated) args echo in `detail` parses strictly and the
+    /// shell row shows the command alone — sibling keys like `timeout` are
+    /// noise the raw echo used to drag in.
+    #[test]
+    fn agent_task_bash_row_extracts_command_from_complete_detail_echo() {
+        let item = ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+            .with_detail(r#"{"cmd":"echo hi","timeout":5}"#)
+            .with_success(true)
+            .with_duration_ms(21);
+        let text = agent_task_child_text(&item, 120);
+        assert!(
+            text.contains("$ echo hi"),
+            "complete echo must yield the command: {text:?}"
+        );
+        assert!(
+            !text.contains("{\"cmd\"") && !text.contains("timeout"),
+            "echo framing and sibling keys must not render: {text:?}"
+        );
+    }
+
+    /// The envelope live lane parks the same args echo in `arguments` as a
+    /// JSON String (detail carries the load-bearing thread marker there, and
+    /// after archival the echo can surface via `arguments`). A string-typed
+    /// `arguments` must be treated exactly like a detail echo — never
+    /// re-serialized into `"{\"cmd\":…`.
+    #[test]
+    fn agent_task_bash_row_extracts_command_from_string_arguments_echo() {
+        let item = ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+            .with_arguments(serde_json::Value::String(
+                r#"{"cmd":"echo hi","timeout":5}"#.into(),
+            ))
+            .with_success(true)
+            .with_duration_ms(21);
+        let text = agent_task_child_text(&item, 120);
+        assert!(
+            text.contains("$ echo hi"),
+            "string-arguments echo must yield the command: {text:?}"
+        );
+        assert!(
+            !text.contains("cmd") && !text.contains("\\\""),
+            "echo framing must not render (raw or re-escaped): {text:?}"
+        );
+    }
+
+    /// Non-shell tools: a complete args echo in `detail` renders the compact
+    /// `key=value` form (same as the object-arguments path), and JSON string
+    /// escapes (`\n`) never leak into the one-line row as literal two-char
+    /// sequences.
+    #[test]
+    fn agent_task_edit_row_compacts_complete_detail_echo() {
+        let item = ActivityItem::new(ActivityKind::Tool, "edit_file", "complete")
+            .with_detail(r#"{"path":"/a/App.tsx","new_string":"<Route/>\n  <Route/>"}"#)
+            .with_success(true)
+            .with_duration_ms(21);
+        let text = agent_task_child_text(&item, 120);
+        // serde_json maps iterate alphabetically (no preserve_order), so the
+        // first meaningful field is `new_string`; its REAL newline (decoded by
+        // the strict parse) must flatten to spaces in the one-line row.
+        assert!(
+            text.contains("new_string=<Route/>   <Route/>"),
+            "complete echo must compact to key=value: {text:?}"
+        );
+        assert!(
+            !text.contains("{\"path\""),
+            "raw JSON echo must never render: {text:?}"
+        );
+        assert!(
+            !text.contains("\\n"),
+            "literal backslash-n must never render: {text:?}"
+        );
+    }
+
+    /// Non-shell tools with a TRUNCATED echo (strict parse fails): the cleanup
+    /// pass must strip the `{"` framing and decode the common escapes — the
+    /// bar is NO raw `{"key":` prefix and NO literal `\n` in the row.
+    #[test]
+    fn agent_task_edit_row_scrubs_truncated_detail_echo() {
+        let item = ActivityItem::new(ActivityKind::Tool, "edit_file", "complete")
+            .with_detail(r#"{"path":"/a/App.tsx","new_string":"<Route/>\n  <Ro"#)
+            .with_success(true)
+            .with_duration_ms(21);
+        let text = agent_task_child_text(&item, 120);
+        assert!(
+            !text.contains("{\"path\""),
+            "raw JSON echo prefix must never render: {text:?}"
+        );
+        assert!(
+            !text.contains("\\n"),
+            "literal backslash-n must never render: {text:?}"
+        );
+        assert!(
+            text.contains("/a/App.tsx"),
+            "the echo's content should survive the scrub: {text:?}"
+        );
+    }
+
+    /// The producer's `key: value` preview format (object args rendered as
+    /// `path: "...", new_string: "..."`) JSON-encodes string values, so `\n`
+    /// escapes leak as literal two-char sequences — the display pass must
+    /// decode them (rows are one-line; an escaped newline becomes a space).
+    #[test]
+    fn agent_task_row_unescapes_key_value_echo_escapes() {
+        let item = ActivityItem::new(ActivityKind::Tool, "edit_file", "complete")
+            .with_detail(r#"path: "/a/App.tsx", new_string: "<Route/>\n  <Route/>""#)
+            .with_success(true)
+            .with_duration_ms(21);
+        let text = agent_task_child_text(&item, 120);
+        assert!(
+            !text.contains("\\n"),
+            "literal backslash-n must never render: {text:?}"
+        );
+        assert!(
+            text.contains("path: \"/a/App.tsx\""),
+            "non-JSON detail otherwise renders as-is: {text:?}"
+        );
+    }
+
+    /// Plain (non-JSON) details are untouched: a bang command echo and the
+    /// load-bearing envelope thread marker render verbatim.
+    #[test]
+    fn agent_task_row_keeps_plain_detail_verbatim() {
+        let bang = ActivityItem::new(ActivityKind::Tool, "bash", "complete")
+            .with_detail("! echo hi")
+            .with_success(true);
+        let text = agent_task_child_text(&bang, 120);
+        assert!(
+            text.contains("! echo hi"),
+            "plain detail must render unchanged: {text:?}"
+        );
+
+        let marker = ActivityItem::new(ActivityKind::Tool, "shell", "running")
+            .with_detail(AppState::envelope_tool_detail_for_thread("th-123"));
+        let text = agent_task_child_text(&marker, 120);
+        assert!(
+            text.contains("thread th-123"),
+            "thread marker must render unchanged: {text:?}"
+        );
+    }
+
+    /// Fidelity guard (codex review): `detail` ALSO carries already-decoded
+    /// REAL invocation text — the `!`-bang echo and the live-lane
+    /// `tool_invocation_detail` command summaries. A brace-group command must
+    /// keep its `{` (only `{"…` is a JSON echo), and an intentional two-char
+    /// `\n` in a real command (`printf '\n'`) must render verbatim — the
+    /// escape decode applies to serialized echo shapes, not plain commands.
+    #[test]
+    fn agent_task_row_keeps_real_commands_verbatim() {
+        for title in ["shell", "!"] {
+            let brace_group = ActivityItem::new(ActivityKind::Tool, title, "complete")
+                .with_detail("{ echo ok; }")
+                .with_success(true);
+            let text = agent_task_child_text(&brace_group, 120);
+            assert!(
+                text.contains("{ echo ok; }"),
+                "brace-group command must render verbatim for {title}: {text:?}"
+            );
+        }
+        let printf = ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+            .with_detail(r#"printf '\n' | wc -l"#)
+            .with_success(true);
+        let text = agent_task_child_text(&printf, 120);
+        assert!(
+            text.contains(r#"printf '\n' | wc -l"#),
+            "a real command's two-char escape must render verbatim: {text:?}"
+        );
+    }
+
+    /// The lenient extractor never panics on multibyte content, respects a
+    /// closing quote when one survived the cut, decodes escapes, and drops a
+    /// dangling backslash left by the byte cap.
+    #[test]
+    fn lenient_echo_extraction_handles_multibyte_escapes_and_cuts() {
+        let cases: &[(&str, &str)] = &[
+            // CJK content cut with the producer's ellipsis, no closing quote.
+            (
+                "{\"cmd\":\"echo 日本語のコマンド…",
+                "echo 日本語のコマンド…",
+            ),
+            // Closing quote survived the cut: trailing sibling junk dropped.
+            (r#"{"cmd":"echo hi","timeo"#, "echo hi"),
+            // Escaped quote/backslash decode; escaped newline becomes space.
+            (r#"{"cmd":"echo \"hi\" \\ a\nb"#, "echo \"hi\" \\ a b"),
+            // Dangling backslash at the cut is dropped.
+            (r#"{"cmd":"echo hi\"#, "echo hi"),
+            // `command` key works too.
+            (r#"{"command":"ls -la","cwd":"/tmp"}"#, "ls -la"),
+        ];
+        for (echo, expected) in cases {
+            let item = ActivityItem::new(ActivityKind::Tool, "bash", "complete").with_detail(*echo);
+            let text = tool_invocation_text(&item).expect("invocation");
+            assert_eq!(
+                &text, expected,
+                "echo {echo:?} must extract {expected:?}, got {text:?}"
+            );
+        }
     }
 
     /// The recovery-suggestion row (a non-Tool `Warning` activity) also predated
@@ -12214,7 +12655,7 @@ mod tests {
         let text = rendered_text(&app);
         let first_prompt = text.find("what is the status").expect("first prompt");
         let latest_prompt = text.find("are you working").expect("latest prompt");
-        let command = text.find("Bash(cargo test").expect("activity command");
+        let command = text.find("Bash($ cargo test").expect("activity command");
 
         assert!(first_prompt < latest_prompt);
         assert!(latest_prompt < command);
@@ -12260,7 +12701,7 @@ mod tests {
         let text = rendered_text(&app);
         let prompt = text.find("build the site").expect("user prompt");
         let work_log = text.find("Agent task completed").expect("agent task");
-        let command = text.find("Bash(cargo build").expect("tool command");
+        let command = text.find("Bash($ cargo build").expect("tool command");
         let answer = text
             .find("The site is built and ready.")
             .expect("assistant answer");
@@ -13277,7 +13718,7 @@ mod tests {
         app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
 
-        assert!(text.contains("⏺ Bash(sleep 20"));
+        assert!(text.contains("⏺ Bash($ sleep 20"));
         assert!(text.contains("20s"));
         assert!(text.contains("⏺ Write(src/lib.rs"));
         assert!(text.contains("18ms"));
@@ -13319,7 +13760,7 @@ mod tests {
 
         // Claude-Code-style card: `⏺ Bash(cmd)`, clean command, no JSON.
         assert!(
-            text.contains("⏺ Bash(find . -name '*.ts' -newer server)"),
+            text.contains("⏺ Bash($ find . -name '*.ts' -newer server)"),
             "want Claude-Code-style bash card, got:\n{text}"
         );
         assert!(
@@ -13372,7 +13813,7 @@ mod tests {
             text.contains("⏺ Spawn(Restart the Vite dev server)"),
             "spawn must show its task, got:\n{text}"
         );
-        assert!(text.contains("⏺ Bash(cd /srv"), "got:\n{text}");
+        assert!(text.contains("⏺ Bash($ cd /srv"), "got:\n{text}");
         assert!(
             text.contains("npm run dev)"),
             "multi-line command must keep its second line, got:\n{text}"
@@ -15421,7 +15862,7 @@ mod tests {
         let update = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
         let inserted = lines_text(&update.lines_to_insert);
         assert!(
-            inserted.contains("Agent task completed") && inserted.contains("Bash(cargo test"),
+            inserted.contains("Agent task completed") && inserted.contains("Bash($ cargo test"),
             "completed activity should be inserted into scrollback mid-turn: {inserted:?}"
         );
         assert!(
@@ -15836,7 +16277,7 @@ mod tests {
         let first = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
         let first_text = lines_text(&first.lines_to_insert);
         assert!(first_text.contains("already flushed line"));
-        assert!(first_text.contains("Bash(cargo test"));
+        assert!(first_text.contains("Bash($ cargo test"));
 
         app.sessions[0].live_reply = None;
         app.sessions[0].messages.push(Message::assistant(
@@ -15863,7 +16304,7 @@ mod tests {
             "committed assistant should flush the unflushed suffix: {second_text:?}"
         );
         assert!(
-            !second_text.contains("Bash(cargo test"),
+            !second_text.contains("Bash($ cargo test"),
             "committed activity log must not duplicate the live-flushed action: {second_text:?}"
         );
         assert!(
@@ -16060,7 +16501,7 @@ mod tests {
             "missing activity log: {text:?}"
         );
         assert!(
-            text.contains("Bash(cargo build"),
+            text.contains("Bash($ cargo build"),
             "missing tool detail: {text:?}"
         );
     }

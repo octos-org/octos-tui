@@ -3751,20 +3751,36 @@ impl Store {
         self.dispatch_menu_action(action)
     }
 
+    /// Catalog-backed menus load their data on OPEN: the onboarding
+    /// family/model steps previously dead-ended on "load the provider catalog
+    /// first" unless the user had pressed the manual load row — the reason
+    /// "/onboard only offers the saved provider" reads as a hard limit.
+    fn auto_fetch_for_menu(&mut self, id: &crate::menu::MenuId) -> Option<AppUiCommand> {
+        let is_catalog_menu = *id
+            == crate::menu::MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY)
+            || *id == crate::menu::MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL);
+        (is_catalog_menu
+            && self.state.profile_llm_catalog.is_none()
+            && self.profile_llm_catalog_supported())
+        .then(|| AppUiCommand::ProfileLlmCatalog(ProfileLlmCatalogParams::default()))
+    }
+
     fn dispatch_menu_action(&mut self, action: MenuAction) -> Option<AppUiCommand> {
         match action {
             MenuAction::OpenMenu(id) => {
+                let fetch = self.auto_fetch_for_menu(&id);
                 self.open_menu(id);
-                None
+                fetch
             }
             MenuAction::ReplaceMenu(id) => {
+                let fetch = self.auto_fetch_for_menu(&id);
                 self.state.menu_stack.replace(id);
                 self.refresh_active_menu();
                 if let Some(frame) = self.state.menu_stack.active() {
                     self.state.status =
                         t!("status.menu_label", id = frame.id.to_string()).into_owned();
                 }
-                None
+                fetch
             }
             MenuAction::Close => {
                 self.close_menu();
@@ -3780,7 +3796,18 @@ impl Store {
                 // dispatch outcome to its backend command here.
                 self.dispatch_local_action(action, None).into_command()
             }
-            MenuAction::SendAppUi(command) => Some(*command),
+            MenuAction::SendAppUi(mut command) => {
+                // A select without an explicit session targets the ACTIVE
+                // session: stamp it on the request itself so the transport's
+                // request-id correlation always carries attribution (the
+                // store drops unattributed results rather than guessing).
+                if let AppUiCommand::ProfileLlmSelect(params) = command.as_mut() {
+                    if params.session_id.is_none() {
+                        params.session_id = self.active_session().map(|session| session.id.clone());
+                    }
+                }
+                Some(*command)
+            }
             MenuAction::SubmitPrompt(prompt) => {
                 self.start_prompt_turn(prompt, t!("status.queued_menu_prompt").into_owned())
             }
@@ -5905,11 +5932,20 @@ impl Store {
 
     fn apply_model_select_event(&mut self, event: ModelSelectClientEvent) {
         let result = event.result;
+        // The transport correlates each select response with its request by
+        // JSON-RPC id and hands us the INITIATING session — immune to reply
+        // reordering, queue drift, and pre-send rejections. The echoed result
+        // key is deliberately never used for targeting (legacy servers echo a
+        // synthetic `profile:local:tui#coding` that can collide with a real
+        // session); an event without attribution is ignored, not guessed at.
+        let Some(session_id) = event.initiating_session else {
+            return;
+        };
         if let Some(status) = self
             .state
             .session_runtime_statuses
             .iter_mut()
-            .find(|status| status.session_id == result.session_id)
+            .find(|status| status.session_id == session_id)
         {
             status.model = Some(result.selected.clone());
             if let Some(stamp) = result.runtime_policy_stamp.clone() {
@@ -5920,7 +5956,7 @@ impl Store {
             .state
             .session_model_catalogs
             .iter_mut()
-            .find(|catalog| catalog.session_id == result.session_id)
+            .find(|catalog| catalog.session_id == session_id)
         {
             for model in &mut catalog.models {
                 model.selected = model.model == result.selected.model
@@ -17074,6 +17110,214 @@ mod tests {
         assert_eq!(store.state.sessions[0].messages.len(), 1);
         assert!(store.state.sessions[0].live_reply.is_none());
         assert_eq!(store.state.run_state.label(), "done");
+    }
+
+    /// A select result carries its initiating session (correlated by request
+    /// id in the transport) and lands exactly there — even if the user
+    /// switched sessions meanwhile; an unattributed result is ignored.
+    #[test]
+    fn model_select_result_lands_on_the_initiating_session() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        store
+            .state
+            .set_model_catalog(crate::model::SessionModelCatalog {
+                session_id: a.clone(),
+                models: vec![
+                    crate::model::ModelStatus {
+                        model: "deepseek-v4-pro".into(),
+                        provider: "deepseek".into(),
+                        title: None,
+                        family: None,
+                        route: None,
+                        selected: true,
+                        available: Some(true),
+                        queue_mode: None,
+                        qoe_policy: None,
+                    },
+                    crate::model::ModelStatus {
+                        model: "deepseek-chat".into(),
+                        provider: "deepseek".into(),
+                        title: None,
+                        family: None,
+                        route: None,
+                        selected: false,
+                        available: Some(true),
+                        queue_mode: None,
+                        qoe_policy: None,
+                    },
+                ],
+            });
+        // The user switches to B before A's reply lands.
+        store.state.switch_selected_session(1);
+
+        let event = |model: &str, initiating: Option<SessionKey>| {
+            crate::client_event::ModelSelectClientEvent {
+                result: crate::model::ModelSelectResult {
+                    // Legacy synthetic echo — never used for targeting.
+                    session_id: SessionKey("dev:local:tui#coding".into()),
+                    selected: crate::model::ModelStatus {
+                        model: model.into(),
+                        provider: "deepseek".into(),
+                        title: None,
+                        family: None,
+                        route: None,
+                        selected: true,
+                        available: Some(true),
+                        queue_mode: None,
+                        qoe_policy: None,
+                    },
+                    applied: true,
+                    runtime_policy_stamp: None,
+                },
+                message: "Model selected".into(),
+                initiating_session: initiating,
+            }
+        };
+
+        store.apply_client_event(ClientEvent::ModelSelect(event(
+            "deepseek-chat",
+            Some(a.clone()),
+        )));
+        assert!(
+            store
+                .state
+                .model_catalog_for(&a)
+                .expect("catalog")
+                .models
+                .iter()
+                .any(|model| model.model == "deepseek-chat" && model.selected),
+            "the switch lands on the INITIATING session A"
+        );
+        assert!(
+            store
+                .state
+                .model_catalog_for(&SessionKey("local:b".into()))
+                .is_none(),
+            "the active bystander session B stays untouched"
+        );
+
+        // Unattributed result: ignored, selection unchanged.
+        store.apply_client_event(ClientEvent::ModelSelect(event("deepseek-v4-pro", None)));
+        assert!(
+            store
+                .state
+                .model_catalog_for(&a)
+                .expect("catalog")
+                .models
+                .iter()
+                .any(|model| model.model == "deepseek-chat" && model.selected),
+            "an unattributed echo must not overwrite the selection"
+        );
+    }
+
+    /// A select dispatched WITHOUT an explicit session is stamped with the
+    /// active session at dispatch — attribution is total, and still flows
+    /// through the transport's request-id correlation.
+    #[test]
+    fn dispatch_stamps_the_active_session_onto_unattributed_selects() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let command = store.dispatch_menu_action(crate::menu::MenuAction::send_appui(
+            AppUiCommand::ProfileLlmSelect(crate::model::ProfileLlmSelectParams {
+                profile_id: Some("dev".into()),
+                session_id: None,
+                family_id: "deepseek".into(),
+                model_id: "deepseek-chat".into(),
+                route_id: "official".into(),
+            }),
+        ));
+        let Some(AppUiCommand::ProfileLlmSelect(params)) = command else {
+            panic!("expected the select command back, got {command:?}");
+        };
+        assert_eq!(
+            params.session_id,
+            Some(SessionKey("local:a".into())),
+            "the active session is stamped at dispatch"
+        );
+    }
+
+    /// Overlapping selects correlate by REQUEST attribution, not arrival
+    /// order: even when B's reply arrives before A's, each lands on its own
+    /// initiating session.
+    #[test]
+    fn out_of_order_select_replies_land_on_their_initiating_sessions() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        let b = SessionKey("local:b".into());
+        for session in [&a, &b] {
+            store
+                .state
+                .set_model_catalog(crate::model::SessionModelCatalog {
+                    session_id: session.clone(),
+                    models: vec![crate::model::ModelStatus {
+                        model: "deepseek-v4-pro".into(),
+                        provider: "deepseek".into(),
+                        title: None,
+                        family: None,
+                        route: None,
+                        selected: true,
+                        available: Some(true),
+                        queue_mode: None,
+                        qoe_policy: None,
+                    }],
+                });
+        }
+        let reply =
+            |model: &str, initiating: &SessionKey| crate::client_event::ModelSelectClientEvent {
+                result: crate::model::ModelSelectResult {
+                    session_id: SessionKey("dev:local:tui#coding".into()),
+                    selected: crate::model::ModelStatus {
+                        model: model.into(),
+                        provider: "deepseek".into(),
+                        title: None,
+                        family: None,
+                        route: None,
+                        selected: true,
+                        available: Some(true),
+                        queue_mode: None,
+                        qoe_policy: None,
+                    },
+                    applied: true,
+                    runtime_policy_stamp: None,
+                },
+                message: "Model selected".into(),
+                initiating_session: Some(initiating.clone()),
+            };
+        // B's reply arrives FIRST even though A asked first.
+        store.apply_client_event(ClientEvent::ModelSelect(reply("deepseek-reasoner", &b)));
+        store.apply_client_event(ClientEvent::ModelSelect(reply("deepseek-chat", &a)));
+
+        let selected_of = |store: &Store, session: &SessionKey| {
+            store.state.model_catalog_for(session).and_then(|catalog| {
+                catalog
+                    .models
+                    .iter()
+                    .find(|model| model.selected)
+                    .map(|model| model.model.clone())
+            })
+        };
+        assert_eq!(selected_of(&store, &a).as_deref(), Some("deepseek-chat"));
+        assert_eq!(
+            selected_of(&store, &b).as_deref(),
+            Some("deepseek-reasoner")
+        );
+    }
+
+    /// Opening the onboarding family step auto-loads the provider catalog —
+    /// previously it dead-ended on "load the catalog first" and the wizard
+    /// read as deepseek-only.
+    #[test]
+    fn opening_family_menu_auto_fetches_the_catalog() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG]);
+        assert!(store.state.profile_llm_catalog.is_none());
+        let command = store.dispatch_menu_action(crate::menu::MenuAction::OpenMenu(
+            crate::menu::MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY),
+        ));
+        assert!(
+            matches!(command, Some(AppUiCommand::ProfileLlmCatalog(_))),
+            "family-menu open must fetch the catalog; got {command:?}"
+        );
     }
 
     #[test]

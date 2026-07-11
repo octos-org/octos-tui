@@ -386,7 +386,7 @@ mod tests {
             .join("");
         assert!(update.reset, "late activity log changes finalized history");
         assert!(
-            text.contains("Agent task completed") && text.contains("Bash(cargo test"),
+            text.contains("Agent task completed") && text.contains("Bash($ cargo test"),
             "reflush should include archived activity log: {text:?}"
         );
     }

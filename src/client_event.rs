@@ -99,6 +99,10 @@ pub struct ModelListClientEvent {
 pub struct ModelSelectClientEvent {
     pub result: ModelSelectResult,
     pub message: String,
+    /// The session that initiated the select (correlated by JSON-RPC request
+    /// id in the transport). `None` only for unsolicited/legacy shapes —
+    /// which the store ignores rather than guessing a target.
+    pub initiating_session: Option<octos_core::SessionKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

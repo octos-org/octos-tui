@@ -341,6 +341,10 @@ impl ReconnectBackoff {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingRequest {
     method: String,
+    /// For `profile/llm/select`: the session that initiated the request, so
+    /// the response updates exactly that session's caches — correlation by
+    /// JSON-RPC request id, immune to reply reordering and queue drift.
+    select_session: Option<SessionKey>,
 }
 
 #[derive(Debug, Default)]
@@ -431,11 +435,20 @@ impl ProtocolExchange {
     ) -> Result<RpcRequest<serde_json::Value>> {
         let command = self.command_with_resume_cursor(command);
         let method = command.method().to_string();
+        let select_session = match &command {
+            AppUiCommand::ProfileLlmSelect(params) => params.session_id.clone(),
+            _ => None,
+        };
         let request_id = self.next_request_id();
         let request = rpc_request_from_command(request_id.clone(), command)?;
 
-        self.pending_requests
-            .insert(request_id, PendingRequest { method });
+        self.pending_requests.insert(
+            request_id,
+            PendingRequest {
+                method,
+                select_session,
+            },
+        );
 
         Ok(request)
     }
@@ -2834,7 +2847,10 @@ fn success_response_to_app_event(
         }
         crate::model::APPUI_METHOD_MODEL_SELECT => {
             match serde_json::from_value::<ModelSelectResult>(result) {
-                Ok(result) => Ok(Some(model_select_event(result))),
+                Ok(result) => Ok(Some(model_select_event(
+                    result,
+                    pending_request.select_session.clone(),
+                ))),
                 Err(err) => Ok(Some(
                     app_error(
                         "invalid_result",
@@ -3436,7 +3452,10 @@ fn model_list_event(result: ModelListResult) -> ClientEvent {
     })
 }
 
-fn model_select_event(result: ModelSelectResult) -> ClientEvent {
+fn model_select_event(
+    result: ModelSelectResult,
+    initiating_session: Option<SessionKey>,
+) -> ClientEvent {
     let prefix = if result.applied {
         "Model selected"
     } else {
@@ -3448,6 +3467,7 @@ fn model_select_event(result: ModelSelectResult) -> ClientEvent {
             result.selected.provider, result.selected.model
         ),
         result,
+        initiating_session,
     })
 }
 
@@ -4275,12 +4295,15 @@ impl AppUiBackend for MockAppUiBackend {
                     queue_mode: Some("interactive".into()),
                     qoe_policy: Some("mock".into()),
                 };
-                self.queue.push_back(model_select_event(ModelSelectResult {
-                    session_id: params.session_id,
-                    selected,
-                    applied: true,
-                    runtime_policy_stamp: None,
-                }));
+                self.queue.push_back(model_select_event(
+                    ModelSelectResult {
+                        session_id: params.session_id.clone(),
+                        selected,
+                        applied: true,
+                        runtime_policy_stamp: None,
+                    },
+                    Some(params.session_id),
+                ));
                 Ok(())
             }
             AppUiCommand::ProfileLlmCatalog(_) => {
@@ -4300,12 +4323,19 @@ impl AppUiBackend for MockAppUiBackend {
                     queue_mode: None,
                     qoe_policy: None,
                 };
-                self.queue.push_back(model_select_event(ModelSelectResult {
-                    session_id: Self::mock_session_key(&self.profile_id(), "m9"),
-                    selected,
-                    applied: true,
-                    runtime_policy_stamp: None,
-                }));
+                let initiating = params
+                    .session_id
+                    .clone()
+                    .unwrap_or_else(|| Self::mock_session_key(&self.profile_id(), "m9"));
+                self.queue.push_back(model_select_event(
+                    ModelSelectResult {
+                        session_id: initiating.clone(),
+                        selected,
+                        applied: true,
+                        runtime_policy_stamp: None,
+                    },
+                    Some(initiating),
+                ));
                 Ok(())
             }
             AppUiCommand::ProfileLlmUpsert(_)
@@ -6445,6 +6475,7 @@ mod tests {
         pending.insert(
             "skills-list".into(),
             PendingRequest {
+                select_session: None,
                 method: crate::model::APPUI_METHOD_PROFILE_SKILLS_LIST.into(),
             },
         );
@@ -6534,6 +6565,7 @@ mod tests {
             "status-1".into(),
             PendingRequest {
                 method: crate::model::APPUI_METHOD_SESSION_STATUS_READ.into(),
+                select_session: None,
             },
         );
         let frame = json!({
@@ -7881,6 +7913,7 @@ mod tests {
         assert_eq!(
             exchange.pending_requests.get(&request.id),
             Some(&PendingRequest {
+                select_session: None,
                 method: methods::APPROVAL_SCOPES_LIST.into(),
             })
         );
@@ -8159,6 +8192,7 @@ mod tests {
             backend.protocol.pending_requests.insert(
                 format!("existing-{index}"),
                 PendingRequest {
+                    select_session: None,
                     method: methods::APPROVAL_SCOPES_LIST.into(),
                 },
             );
@@ -8236,6 +8270,7 @@ mod tests {
         assert_eq!(
             backend.protocol.pending_requests.get(&request.id),
             Some(&PendingRequest {
+                select_session: None,
                 method: methods::TURN_START.into(),
             })
         );
