@@ -1395,6 +1395,15 @@ pub struct ContextLifecycleState {
 #[derive(Debug, Clone)]
 pub struct LiveCompaction {
     pub started_at: std::time::Instant,
+    /// Set when the matching `ContextCompactionCompleted` lands. The server
+    /// pass is synchronous, so started/completed arrive in one drain batch
+    /// and draws only follow the batch — without a settled dwell the block
+    /// would paint zero frames. The renderer keeps showing a settled state
+    /// for a short window after this timestamp.
+    pub completed_at: Option<std::time::Instant>,
+    /// Post-compaction estimate from the completed event (for the settled
+    /// `before → after` line).
+    pub token_estimate_after: Option<u64>,
     pub token_estimate_before: u64,
     pub threshold_tokens: u64,
     pub trigger: String,
@@ -3860,6 +3869,12 @@ pub struct ActivityItem {
     /// transcript's scroll (P2 tri-repo #246). `None` = unattributed (treated
     /// as active-view content).
     pub session_id: Option<SessionKey>,
+    /// Sticky rows are infrequent, notable notices (context compaction) that
+    /// (a) survive the activity cap's oldest-first eviction so a busy turn's
+    /// tool flood cannot silently drop them before they are archived, and
+    /// (b) when turnless, are adopted by the session's next `TurnStarted` so
+    /// they render in the turn flow and archive with the turn.
+    pub sticky: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3882,7 +3897,13 @@ impl ActivityItem {
             turn_id: None,
             tool_call_id: None,
             session_id: None,
+            sticky: false,
         }
+    }
+
+    pub fn with_sticky(mut self) -> Self {
+        self.sticky = true;
+        self
     }
 
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
@@ -6392,6 +6413,15 @@ impl AppState {
         }
     }
 
+    /// Codex-style dialog dismissal: unconditionally close the session's
+    /// `/btw` aside pane (Enter on an empty composer). Unlike
+    /// [`Self::clear_settled_btw_aside`] this also closes a still-answering
+    /// aside — the user chose to leave; a late answer for a dismissed aside
+    /// is dropped by `set_btw_answered`'s state guard.
+    pub fn dismiss_btw_aside(&mut self, session_id: &SessionKey) -> bool {
+        self.btw_asides.remove(session_id).is_some()
+    }
+
     /// Count of the session's still-running background work (pending/running
     /// tasks and sub-agents) — the `N still running` half of a turn summary.
     pub fn running_background_task_count(&self, session_id: &SessionKey) -> usize {
@@ -6850,8 +6880,26 @@ impl AppState {
             self.preserve_transcript_position_after_append(estimated_rows);
         }
         if self.activity.len() > MAX_ACTIVITY_ITEMS {
-            let excess = self.activity.len() - MAX_ACTIVITY_ITEMS;
-            self.activity.drain(0..excess);
+            let mut excess = self.activity.len() - MAX_ACTIVITY_ITEMS;
+            // Evict oldest NON-sticky rows first: sticky notices (context
+            // compaction) are infrequent and notable, and blind oldest-first
+            // eviction dropped them mid-turn — pushed before the turn's tool
+            // flood, they were always the first to go, vanishing before
+            // `capture_completed_turn_activity` could archive them.
+            let mut idx = 0;
+            while excess > 0 && idx < self.activity.len() {
+                if self.activity[idx].sticky {
+                    idx += 1;
+                } else {
+                    self.activity.remove(idx);
+                    excess -= 1;
+                }
+            }
+            // Degenerate case (everything left is sticky): still bound the
+            // list — the cap is a hard memory/render guarantee.
+            if excess > 0 {
+                self.activity.drain(0..excess);
+            }
         }
     }
 

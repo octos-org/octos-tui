@@ -97,7 +97,12 @@ fn scrollmode_registered_in_command_registry() {
 }
 
 #[test]
-fn popup_enter_completes_argful_command() {
+fn popup_enter_dispatches_optional_arg_command() {
+    // Codex Enter semantics (slash-popup Enter dispatches the selection):
+    // `/scrollmode` takes an OPTIONAL argument, so Enter on the highlighted
+    // entry dispatches it bare in ONE Enter — the no-arg form toggles the
+    // mode — instead of the old complete-into-composer + second-Enter round
+    // trip. Only REQUIRED-arg commands still complete (as "/name ").
     let mut store = chat_store();
 
     // Type `/scroll`: the popup opens and filters down to scrollmode
@@ -110,23 +115,27 @@ fn popup_enter_completes_argful_command() {
     }
     assert!(store.state.menu_stack.is_active(), "popup open");
 
-    // Enter on the selected entry COMPLETES the command into the composer —
-    // an argful command must not execute yet.
+    // Enter dispatches the bare command: the toggle runs, the composer is
+    // cleared, and the popup closes.
     handle_terminal_event(
         &mut store,
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
     assert_eq!(
-        store.state.composer, "/scrollmode ",
-        "Enter completes the full command with a trailing space"
+        store.state.composer, "",
+        "dispatch clears the composer instead of completing into it"
     );
     assert!(
-        !store.state.pinned_scroll,
-        "completion must not execute the toggle"
+        store.state.pinned_scroll,
+        "bare dispatch executes the toggle (native -> pinned)"
+    );
+    assert!(
+        !store.state.menu_stack.is_active(),
+        "executing closes the popup"
     );
 
-    // Type the argument and Enter again: now it runs and the popup closes.
-    for ch in "pinned".chars() {
+    // A typed-out command WITH an argument still executes directly.
+    for ch in "/scrollmode native".chars() {
         handle_terminal_event(
             &mut store,
             Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
@@ -136,7 +145,10 @@ fn popup_enter_completes_argful_command() {
         &mut store,
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
-    assert!(store.state.pinned_scroll, "the argument applies");
+    assert!(
+        !store.state.pinned_scroll,
+        "the typed argument applies (pinned -> native)"
+    );
     assert!(
         !store.state.menu_stack.is_active(),
         "executing closes the popup"

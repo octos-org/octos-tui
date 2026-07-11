@@ -291,6 +291,12 @@ pub enum LocalAction {
     SaveKeymap,
     RefreshMenu(MenuId),
     EditComposer(String),
+    /// Codex Enter semantics for the slash popup: dispatch the highlighted
+    /// command IMMEDIATELY (one Enter goes straight to the command's
+    /// page/menu/action) instead of completing its name into the composer
+    /// and requiring a second Enter. The string is the full slash draft to
+    /// run (e.g. "/theme").
+    RunSlashCommand(String),
     Onboarding(OnboardingAction),
     Skills,
     McpConfig,

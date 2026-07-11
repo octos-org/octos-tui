@@ -1370,6 +1370,22 @@ fn handle_composer_vim_key(store: &mut Store, key: &KeyEvent) -> Option<KeyActio
 }
 
 fn handle_composer_enter(store: &mut Store) -> KeyAction {
+    // Codex-style dialog dismissal: Enter on an EMPTY composer closes the
+    // `/btw` aside pane and returns to the live session (submitting a real
+    // prompt already dismisses it via `clear_settled_btw_aside`). Codex's
+    // bottom-pane views close on plain Enter; the aside is non-modal, so the
+    // empty-composer guard keeps Enter-to-send untouched.
+    if store.state.composer.is_empty() {
+        let dismissed = store
+            .state
+            .active_session()
+            .map(|session| session.id.clone())
+            .is_some_and(|session_id| store.state.dismiss_btw_aside(&session_id));
+        if dismissed {
+            store.state.status = t!("app.btw.closed").into_owned();
+            return KeyAction::Continue;
+        }
+    }
     let command = store.compose_command();
     if store.state.exit_requested {
         KeyAction::Quit
@@ -1478,6 +1494,12 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         }
         KeyCode::Enter => {
             if slash_help_query_active(store) && slash_help_enter_executes(store) {
+                // Executing the slash draft: the popup's job is done — CLOSE
+                // it before submitting. Leaving it open buried the command's
+                // result surface (e.g. the /btw aside pane) under a stale
+                // "No options available" box, which read as the command not
+                // running at all (live-terminal bug).
+                store.close_menu();
                 return handle_composer_enter(store);
             }
             let command = store.accept_active_menu_item();
@@ -1542,12 +1564,13 @@ fn slash_help_enter_executes(store: &Store) -> bool {
         return true;
     }
     let registry = crate::menu::CommandRegistry::with_core_commands();
-    if matches!(
-        registry.resolve(draft),
-        crate::menu::CommandResolution::Found { .. }
-    ) {
-        // Exact command (or alias) name: run it directly.
-        return true;
+    if let crate::menu::CommandResolution::Found { command, .. } = registry.resolve(draft) {
+        // Resolvable name with NO arguments typed yet: dispatch directly
+        // unless the command REQUIRES arguments — bare dispatch of those is
+        // only a usage error, so they route to the accept path and complete
+        // as "/name " for argument typing (codex completes there too, via
+        // Tab; Enter doubles as our completion key for required-arg drafts).
+        return command.inline_args != crate::menu::types::InlineArgMode::Required;
     }
     // Partial name: execute only if the popup has nothing left to offer.
     store
@@ -1578,12 +1601,17 @@ fn slash_help_menu_active(store: &Store) -> bool {
 
 fn sync_slash_help_search_query(store: &mut Store) {
     if let Some(frame) = store.state.menu_stack.active_mut() {
-        frame.search_query = store
+        // Filter by the COMMAND TOKEN only (codex command_popup behavior):
+        // once the user types arguments ("/btw what are you…"), matching the
+        // whole draft against the registry yields "No options available" for
+        // a perfectly valid command. The first token keeps the command
+        // matched + highlighted while arguments are typed.
+        let draft = store
             .state
             .composer
             .strip_prefix('/')
-            .unwrap_or(store.state.composer.as_str())
-            .to_string();
+            .unwrap_or(store.state.composer.as_str());
+        frame.search_query = draft.split_whitespace().next().unwrap_or("").to_string();
         frame.selected_index = 0;
     }
     store.refresh_active_menu();
@@ -3606,6 +3634,125 @@ mod tests {
         ));
         assert!(!store.state.expanded_tool_outputs);
         assert_eq!(store.state.status, "Collapsed tool output + diff");
+    }
+
+    /// Codex-style dialog dismissal: Enter on an EMPTY composer closes the
+    /// `/btw` aside pane; Enter with text still submits (and dismisses via the
+    /// submit path). Mirrors codex's bottom-pane "Enter to close" convention.
+    #[test]
+    fn empty_composer_enter_dismisses_btw_aside() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.set_btw_answering(&session_id, "quick q".into());
+        assert!(store.state.btw_asides.contains_key(&session_id));
+
+        assert!(matches!(
+            handle_key(&mut store, modified_key(KeyCode::Enter, KeyModifiers::NONE)),
+            KeyAction::Continue
+        ));
+        assert!(
+            !store.state.btw_asides.contains_key(&session_id),
+            "empty-composer Enter must close the aside pane"
+        );
+
+        // Without an aside, empty Enter stays a no-op (no send, no crash).
+        assert!(matches!(
+            handle_key(&mut store, modified_key(KeyCode::Enter, KeyModifiers::NONE)),
+            KeyAction::Continue
+        ));
+    }
+
+    /// Codex Enter semantics: Enter on a highlighted ARGUMENT-LESS command
+    /// dispatches it immediately — one Enter from partial name to the
+    /// command's page (here `/them` → the theme menu), never the old
+    /// complete-into-composer + second-Enter round trip. Argful commands
+    /// complete with a trailing space instead (args must be typed anyway;
+    /// the next Enter executes the draft directly).
+    #[test]
+    fn slash_popup_enter_dispatches_selection_like_codex() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        for ch in "/them".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        handle_key(&mut store, key(KeyCode::Enter));
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_THEME),
+            "one Enter on a partial argless command must open its page"
+        );
+        assert!(
+            store.state.composer.is_empty(),
+            "dispatch must not leave the completed name in the composer"
+        );
+
+        // Optional-arg command: bare dispatch is valid (opens its page) —
+        // one Enter must go straight there too, composer cleared.
+        store.close_menu();
+        store.state.set_composer_text("");
+        for ch in "/lang".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        handle_key(&mut store, key(KeyCode::Enter));
+        assert!(
+            store.state.composer.is_empty(),
+            "optional-arg command dispatches bare, composer cleared"
+        );
+        assert_ne!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_HELP),
+            "dispatch must leave the help popup (command page or closed)"
+        );
+    }
+
+    /// Live-terminal bug: typing `/btw <args>` filtered the registry with the
+    /// WHOLE draft (args included) — "No options available" — and Enter
+    /// executed the draft but left the stale popup open, burying the aside
+    /// pane. The popup must (a) keep filtering by the command token only and
+    /// (b) close when Enter executes the draft.
+    #[test]
+    fn slash_draft_with_args_keeps_match_and_enter_closes_menu() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+
+        for ch in "/btw what are you doing".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        assert_eq!(store.state.composer, "/btw what are you doing");
+        // (a) the filter uses the command token, so /btw stays matched.
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.search_query.as_str()),
+            Some("btw"),
+            "popup must filter by the command token, not the whole draft"
+        );
+
+        // (b) Enter executes the draft AND closes the popup.
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+        assert!(
+            store.state.menu_stack.active().is_none(),
+            "executing the slash draft must close the popup"
+        );
+        assert!(
+            !matches!(action, KeyAction::Quit),
+            "draft execution must not quit"
+        );
+        assert!(
+            store.state.composer.is_empty(),
+            "submitting the draft must clear the composer"
+        );
     }
 
     #[test]

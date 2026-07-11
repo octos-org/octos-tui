@@ -79,7 +79,8 @@ app:
     more_hunks_hidden: "还有 %{count} 个代码块已隐藏（Ctrl+O 展开）"
   autonomy:
     goal_prefix: "目标："
-    loops_running: "循环：%{count} 个运行中"
+    loops_running: "循环：%{count} 个活动中"
+    loops_paused_suffix: " · %{count} 个已暂停"
     goal_meta: " (%{status} · %{used}/%{budget} tokens)"
   statusbar:
     agents: "%{count} 个智能体"
@@ -98,6 +99,9 @@ app:
   btw:
     answering: "回答中…"
     failed: "旁路提问失败:%{error}"
+    pane_title: "旁白 — /btw"
+    close_hint: "回车 关闭"
+    closed: "旁白已关闭"
   turn_summary:
     ran_for: "耗时 %{duration}"
     tasks_still_running: "%{count} 个后台任务仍在运行"

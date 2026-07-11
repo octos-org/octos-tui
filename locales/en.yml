@@ -88,7 +88,8 @@ app:
     more_hunks_hidden: "+%{count} more hunk(s) hidden (Ctrl+O expand)"
   autonomy:
     goal_prefix: "Goal: "
-    loops_running: "Loops: %{count} running"
+    loops_running: "Loops: %{count} active"
+    loops_paused_suffix: " · %{count} paused"
     goal_meta: " (%{status} · %{used}/%{budget} tokens)"
   statusbar:
     agents: "%{count} agents"
@@ -107,6 +108,9 @@ app:
   btw:
     answering: "Answering…"
     failed: "Aside failed: %{error}"
+    pane_title: "Aside — /btw"
+    close_hint: "Enter to close"
+    closed: "aside closed"
   turn_summary:
     ran_for: "Ran for %{duration}"
     tasks_still_running: "%{count} background task(s) still running"

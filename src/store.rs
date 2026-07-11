@@ -1206,6 +1206,16 @@ impl Store {
                 self.state.status = t!("status.edit_field_prompt").into_owned();
                 None
             }
+            LocalAction::RunSlashCommand(draft) => {
+                // Codex Enter semantics: run the highlighted command NOW.
+                // Close the popup first so a command that opens its own menu
+                // (its "command page") lands on a clean stack, then execute
+                // the draft through the same path a composer submit takes.
+                self.close_menu();
+                self.state.set_composer_text(draft);
+                self.state.focus = FocusPane::Composer;
+                self.compose_command()
+            }
             LocalAction::Onboarding(action) => self.dispatch_onboarding_action(action, inline_args),
             LocalAction::Skills => self.dispatch_skills_inline(inline_args.unwrap_or_default()),
             LocalAction::McpConfig => self.dispatch_mcp_inline(inline_args.unwrap_or_default()),
@@ -3748,7 +3758,33 @@ impl Store {
             .active_menu
             .as_ref()
             .and_then(|menu| active_menu_selected_action(menu, selected_index))?;
-        self.dispatch_menu_action(action)
+        // Codex `dismiss_on_select` semantics: a LEAF selection closes the
+        // WHOLE menu stack — one pick = done, no Esc-chording back out of
+        // multi-level menus. Exempt are actions that manage the menu surface
+        // themselves:
+        //  * navigation — detected by the stack CHANGING under dispatch
+        //    (OpenMenu/ReplaceMenu/Close/..., or a local action that opens
+        //    its own page),
+        //  * RefreshMenu — the explicit stay-open mechanism for toggle rows,
+        //  * Onboarding actions + any selection while the wizard is in the
+        //    stack (the wizard owns its flow; its language step reuses the
+        //    same SetLanguageCode leaf and must return to the wizard),
+        //  * EditComposer — keeps the slash popup up for argument typing.
+        let path_before = self.state.menu_stack.path();
+        let keep_open = matches!(
+            &action,
+            MenuAction::Noop
+                | MenuAction::Local(LocalAction::RefreshMenu(_))
+                | MenuAction::Local(LocalAction::Onboarding(_))
+                | MenuAction::Local(LocalAction::EditComposer(_))
+        ) || path_before
+            .iter()
+            .any(|id| id.as_str().starts_with(crate::menu::registry::MENU_ONBOARD));
+        let command = self.dispatch_menu_action(action);
+        if !keep_open && self.state.menu_stack.path() == path_before {
+            self.close_all_menus();
+        }
+        command
     }
 
     /// Catalog-backed menus load their data on OPEN: the onboarding
@@ -7165,6 +7201,20 @@ impl Store {
                 // report times the turn itself, not the current visit to it.
                 self.state
                     .note_turn_started(&event.session_id, &event.turn_id);
+                // Adopt turnless sticky notices (context-compaction rows
+                // reported before this turn started, e.g. via the
+                // connection-independent drain) into this turn: a turnless
+                // row is hidden by the turn-flow filter while any turn is
+                // active and is never archived at turn end — adopting it
+                // makes it render in the flow and archive with the turn.
+                for item in self.state.activity.iter_mut() {
+                    if item.sticky
+                        && item.turn_id.is_none()
+                        && item.session_id.as_ref() == Some(&event.session_id)
+                    {
+                        item.turn_id = Some(event.turn_id.clone());
+                    }
+                }
                 let targets_active = self.event_targets_active_session(&event.session_id);
                 if let Some(session) = self.find_session_mut(&event.session_id) {
                     // Out-of-order lifecycle (nit 1): a MessageDelta may have
@@ -7647,9 +7697,12 @@ impl Store {
             }
             UiNotification::ContextCompactionStarted(event) => {
                 // UPCR-2026-026: in-progress compaction state. The serve
-                // pass is synchronous today, so completed may arrive in the
-                // same batch — the block then only flashes; the durable
-                // notice below still records the outcome.
+                // pass is synchronous today, so completed arrives in the
+                // SAME drain batch and draws only follow the batch — the
+                // completed handler therefore settles the block in place
+                // (rather than removing it) and the renderer dwells on the
+                // settled state for a short window; the durable notice
+                // still records the outcome permanently.
                 let turn_id = self
                     .find_session_mut(&event.session_id)
                     .and_then(|session| {
@@ -7659,6 +7712,8 @@ impl Store {
                     event.session_id.clone(),
                     crate::model::LiveCompaction {
                         started_at: std::time::Instant::now(),
+                        completed_at: None,
+                        token_estimate_after: None,
                         token_estimate_before: event.context_state.token_estimate as u64,
                         threshold_tokens: event.threshold_tokens as u64,
                         trigger: event.trigger.clone(),
@@ -7670,7 +7725,28 @@ impl Store {
             }
             UiNotification::ContextCompactionCompleted(event) => {
                 let session_id = event.session_id.clone();
-                let live_compaction = self.state.live_compaction.remove(&session_id);
+                // Settle the live block IN PLACE instead of removing it:
+                // started+completed land in one drain batch (synchronous
+                // server pass) and draws only follow the batch, so removal
+                // here meant the "Compacting…" block painted ZERO frames.
+                // The renderer dwells on the settled state for a short
+                // window; turn-terminal sweeps and the next Started insert
+                // still bound the entry's lifetime. ERRORED completions keep
+                // main's behavior — drop the block outright: the settled
+                // dwell renders a success reduction (`✶ … X → Y tokens`) and
+                // must stay gated on `error.is_none()` like the durable
+                // notice below (codex P2 on the main-reconcile merge).
+                let live_compaction = if event.compaction.error.is_none() {
+                    let live_compaction = self.state.live_compaction.get(&session_id).cloned();
+                    if let Some(live) = self.state.live_compaction.get_mut(&session_id) {
+                        live.completed_at = Some(std::time::Instant::now());
+                        live.token_estimate_after =
+                            event.compaction.token_estimate_after.map(|v| v as u64);
+                    }
+                    live_compaction
+                } else {
+                    self.state.live_compaction.remove(&session_id)
+                };
                 let state = crate::model::ContextLifecycleState {
                     session_id: event.context_state.session_id.clone(),
                     thread_id: event.context_state.thread_id.clone(),
@@ -7724,6 +7800,10 @@ impl Store {
                     let turn_id = self.find_session_mut(&session_id).and_then(|session| {
                         session.live_reply.as_ref().map(|live| live.turn_id.clone())
                     });
+                    // Sticky: survives the activity cap's oldest-first
+                    // eviction (a busy turn's tool flood otherwise dropped
+                    // the notice before it could be archived) and, when
+                    // turnless, is adopted by the session's next TurnStarted.
                     let mut notice = ActivityItem::new(
                         ActivityKind::Progress,
                         t!("status.activity_context_compacted").into_owned(),
@@ -7732,7 +7812,8 @@ impl Store {
                             humanize_token_count(before),
                             humanize_token_count(after)
                         ),
-                    );
+                    )
+                    .with_sticky();
                     // Mockup-style honest fullness bar: after-size over the
                     // session's REAL context window when known; else the
                     // started event's threshold (labeled as such); else no
@@ -7783,6 +7864,14 @@ impl Store {
                     notice.success = Some(true);
                     if let Some(turn_id) = turn_id {
                         notice = notice.with_turn(turn_id);
+                    } else {
+                        // No live turn (e.g. connection-independent drain, or
+                        // an emitter that reports before TurnStarted): stamp
+                        // the session so the next TurnStarted for THIS
+                        // session can adopt the notice into its turn — a
+                        // turnless row is hidden by the turn-flow filter for
+                        // the whole turn and never archived.
+                        notice = notice.with_session(session_id.clone());
                     }
                     self.state.push_activity(notice);
                 }
@@ -9957,11 +10046,17 @@ fn tool_invocation_detail(tool_name: &str, arguments: &Value) -> Option<String> 
         value
             .get(key)
             .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.trim().is_empty())
     }
 
     let detail = match tool_name {
-        "shell" => str_field(arguments, "command")?.to_string(),
+        // Shell-family tools all run a command string: shell/exec/exec_command
+        // carry it in `command`, the codex-style `bash` tool in `cmd` (falling
+        // back to `command`). `str_field` skips empty fields, so
+        // `{"cmd":"","command":…}` still falls back to the real command.
+        name if crate::app::is_shell_family_tool(name) => str_field(arguments, "cmd")
+            .or_else(|| str_field(arguments, "command"))?
+            .to_string(),
         "read_file" => {
             let path = str_field(arguments, "path")?;
             let start = arguments.get("start_line").and_then(Value::as_u64);
@@ -10015,6 +10110,11 @@ fn tool_invocation_detail(tool_name: &str, arguments: &Value) -> Option<String> 
         "glob" | "glob_tool" => str_field(arguments, "pattern")
             .or_else(|| str_field(arguments, "glob"))
             .unwrap_or("*")
+            .to_string(),
+        // spawn carries the delegated task text (not mode/limits) — show that,
+        // never the raw `{"mode":…,"task":…}` JSON.
+        "spawn" => str_field(arguments, "task")
+            .or_else(|| str_field(arguments, "prompt"))?
             .to_string(),
         _ => serde_json::to_string(arguments).ok()?,
     };
@@ -16246,6 +16346,67 @@ mod tests {
         ));
     }
 
+    /// Codex `dismiss_on_select`: a leaf pick collapses the WHOLE menu stack
+    /// (no Esc-chording out of multi-level menus); wizard flows are exempt.
+    #[test]
+    fn menu_leaf_selection_closes_all_levels() {
+        let mut store = store_with_empty_session();
+        // Two levels deep: help → theme.
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_THEME));
+        assert_eq!(store.state.menu_stack.path().len(), 2);
+        // Select a concrete theme row (a SetTheme leaf).
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected theme menu");
+        };
+        let idx = spec
+            .items
+            .iter()
+            .position(|item| item.id == "slate")
+            .expect("slate theme row");
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("active frame")
+            .selected_index = idx;
+        assert!(store.accept_active_menu_item().is_none());
+        assert!(
+            store.state.menu_stack.path().is_empty(),
+            "leaf selection must close ALL menu levels"
+        );
+        assert_eq!(store.state.theme.as_str(), "slate");
+    }
+
+    /// The onboarding wizard owns its own flow: a leaf pick inside it (the
+    /// language step reuses the SetLanguageCode leaf) must NOT nuke the stack.
+    #[test]
+    fn onboarding_leaf_selection_keeps_wizard_open() {
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_LANGUAGE));
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected onboarding language menu");
+        };
+        // Pick the row for the CURRENT locale (en) so the global locale is
+        // unchanged for parallel tests.
+        let idx = spec
+            .items
+            .iter()
+            .position(|item| item.id.ends_with(".en"))
+            .expect("en language row");
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("active frame")
+            .selected_index = idx;
+        assert!(store.accept_active_menu_item().is_none());
+        assert!(
+            !store.state.menu_stack.path().is_empty(),
+            "wizard-scoped selection must keep the wizard flow open"
+        );
+    }
+
     #[test]
     fn searchable_menu_filters_items_and_dispatches_filtered_action() {
         let mut store = store_with_empty_session();
@@ -16268,13 +16429,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(labels, vec!["/keymap"]);
 
-        // Uniform completion: accepting the filtered item completes it into the
-        // composer (it does NOT open the menu yet) — consistent across all
-        // commands, argful or not.
+        // Codex Enter semantics: accepting the filtered item DISPATCHES it
+        // immediately — one Enter opens the command's page; the composer is
+        // left clean (no complete-then-Enter-again round trip).
         assert!(store.accept_active_menu_item().is_none());
-        assert_eq!(store.state.composer, "/keymap");
-        // The follow-up Enter resolves the now-complete command and opens it.
-        assert!(store.compose_command().is_none());
+        assert_eq!(store.state.composer, "");
         assert_eq!(
             store
                 .state
@@ -21327,6 +21486,76 @@ mod tests {
         assert_eq!(store.state.run_state.label(), "running");
     }
 
+    /// Regression: the codex-style `bash` tool (and `exec`/`exec_command`) must
+    /// project a clean command `detail`, not the raw JSON arguments. This
+    /// exercises the real ToolStarted → projection path — a renderer-only test
+    /// misses that `tool_invocation_detail` pre-fills `detail` here, so the
+    /// renderer never reaches its own `cmd`/`command` extraction.
+    #[test]
+    fn bash_tool_projects_command_detail_not_json_args() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let turn_id = TurnId::new();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
+            ToolStartedEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                tool_call_id: "bash-1".into(),
+                tool_name: "bash".into(),
+                arguments: Some(serde_json::json!({"cmd": "pwd"})),
+            },
+        )));
+
+        assert_eq!(store.state.activity.len(), 1);
+        let activity = &store.state.activity[0];
+        assert_eq!(activity.title, "bash");
+        assert_eq!(
+            activity.detail.as_deref(),
+            Some("pwd"),
+            "bash must project the command, not raw JSON args"
+        );
+    }
+
+    /// Shell-family detail extraction: an empty `cmd` falls back to `command`
+    /// (codex P2), and `exec`/`exec_command` are covered alongside `bash`.
+    #[test]
+    fn shell_family_detail_extracts_command_across_aliases() {
+        assert_eq!(
+            tool_invocation_detail(
+                "bash",
+                &serde_json::json!({"cmd": "", "command": "cargo test"})
+            )
+            .as_deref(),
+            Some("cargo test"),
+            "empty cmd must fall back to command"
+        );
+        assert_eq!(
+            tool_invocation_detail("exec", &serde_json::json!({"command": "ls -la"})).as_deref(),
+            Some("ls -la")
+        );
+        assert_eq!(
+            tool_invocation_detail("exec_command", &serde_json::json!({"cmd": "make"})).as_deref(),
+            Some("make")
+        );
+        // spawn shows its task text, never the `{"mode":…,"task":…}` blob.
+        assert_eq!(
+            tool_invocation_detail(
+                "spawn",
+                &serde_json::json!({"mode": "sync", "task": "Do X"})
+            )
+            .as_deref(),
+            Some("Do X")
+        );
+        // A shell-family tool with no usable command yields no detail (like
+        // the original `shell` arm); the renderer then falls back to JSON.
+        assert_eq!(
+            tool_invocation_detail("bash", &serde_json::json!({"timeout_ms": 5000})),
+            None
+        );
+    }
+
     #[test]
     fn failed_tool_surfaces_recovery_suggestion() {
         let mut store = store_with_empty_session();
@@ -22162,6 +22391,8 @@ mod tests {
             session_id.clone(),
             crate::model::LiveCompaction {
                 started_at: std::time::Instant::now(),
+                completed_at: None,
+                token_estimate_after: None,
                 token_estimate_before: 1_000,
                 threshold_tokens: 800,
                 trigger: "preflight".into(),
@@ -22376,6 +22607,327 @@ mod tests {
             notice.turn_id.as_ref(),
             Some(&turn_id),
             "compaction notice must be stamped with the session's live turn"
+        );
+    }
+
+    /// A compaction reported with NO live turn (connection-independent drain,
+    /// or an emitter that reports before TurnStarted) lands turnless — the
+    /// turn-flow filter then hides it for the whole next turn and it is never
+    /// archived. The session's next TurnStarted must ADOPT it into the turn.
+    #[test]
+    fn turnless_compaction_notice_is_adopted_and_archived_with_next_turn() {
+        use octos_core::ui_protocol::{
+            ContextCompactionCompletedEvent, UiContextCompactionRecord, UiContextState,
+        };
+
+        let session_id = SessionKey("local:test".into());
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "test".into(),
+            profile_id: None,
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None, // no live turn at compaction time
+        };
+        let mut store = Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        };
+
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
+                session_id: session_id.clone(),
+                context_state: UiContextState {
+                    session_id: session_id.clone(),
+                    thread_id: None,
+                    generation: 4,
+                    transcript_hash: "abc123".into(),
+                    item_count: 42,
+                    token_estimate: 9_100,
+                    recovery_state: "healthy".into(),
+                    last_checkpoint_id: None,
+                    last_compaction_id: Some("comp-001".into()),
+                },
+                compaction: UiContextCompactionRecord {
+                    compaction_id: "comp-001".into(),
+                    checkpoint_id: "chk-001".into(),
+                    status: "applied".into(),
+                    policy_id: "default".into(),
+                    trigger: "agent_loop:turn_start".into(),
+                    input_generation: 3,
+                    output_generation: Some(4),
+                    input_transcript_hash: "input-h".into(),
+                    replacement_transcript_hash: Some("abc123".into()),
+                    installed_transcript_hash: Some("abc123".into()),
+                    input_item_count: 130,
+                    retained_count: 42,
+                    dropped_count: 88,
+                    summary_item_id: Some("sum-1".into()),
+                    token_estimate_before: 31_200,
+                    token_estimate_after: Some(9_100),
+                    error: None,
+                },
+            }),
+        ));
+
+        let notice = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.sticky)
+            .expect("turnless compaction notice must be pushed");
+        assert!(notice.turn_id.is_none());
+        assert_eq!(
+            notice.session_id.as_ref(),
+            Some(&session_id),
+            "turnless notice must be session-stamped for adoption"
+        );
+
+        // The next TurnStarted for this session adopts the notice…
+        let turn_id = TurnId::new();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        let notice = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.sticky)
+            .expect("notice still present");
+        assert_eq!(
+            notice.turn_id.as_ref(),
+            Some(&turn_id),
+            "TurnStarted must adopt the turnless notice into the new turn"
+        );
+
+        // …so the turn's terminal archives it with the turn.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            store
+                .state
+                .turn_activity_logs
+                .iter()
+                .any(|log| log.turn_id == turn_id && log.items.iter().any(|item| item.sticky)),
+            "adopted notice must be archived into the turn's activity log"
+        );
+    }
+
+    /// Started+Completed arrive in one drain batch (synchronous server pass)
+    /// and draws only follow the batch — removing the live block on Completed
+    /// meant it painted ZERO frames. Completed must settle it in place.
+    #[test]
+    fn compaction_completed_settles_live_block_in_place() {
+        use octos_core::ui_protocol::{
+            ContextCompactionCompletedEvent, ContextCompactionStartedEvent,
+            UiContextCompactionRecord, UiContextState,
+        };
+
+        let session_id = SessionKey("local:test".into());
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "test".into(),
+            profile_id: None,
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        };
+        let context_state = UiContextState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 4,
+            transcript_hash: "abc123".into(),
+            item_count: 42,
+            token_estimate: 91_000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        };
+
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionStarted(ContextCompactionStartedEvent {
+                session_id: session_id.clone(),
+                context_state: context_state.clone(),
+                trigger: "preflight".into(),
+                threshold_tokens: 96_000,
+            }),
+        ));
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
+                session_id: session_id.clone(),
+                context_state,
+                compaction: UiContextCompactionRecord {
+                    compaction_id: "comp-001".into(),
+                    checkpoint_id: "chk-001".into(),
+                    status: "applied".into(),
+                    policy_id: "default".into(),
+                    trigger: "preflight".into(),
+                    input_generation: 3,
+                    output_generation: Some(4),
+                    input_transcript_hash: "input-h".into(),
+                    replacement_transcript_hash: Some("abc123".into()),
+                    installed_transcript_hash: Some("abc123".into()),
+                    input_item_count: 130,
+                    retained_count: 42,
+                    dropped_count: 88,
+                    summary_item_id: Some("sum-1".into()),
+                    token_estimate_before: 91_000,
+                    token_estimate_after: Some(31_000),
+                    error: None,
+                },
+            }),
+        ));
+
+        let live = store
+            .state
+            .live_compaction
+            .get(&session_id)
+            .expect("completed must settle the live block in place, not remove it");
+        assert!(live.completed_at.is_some(), "must be marked settled");
+        assert_eq!(live.token_estimate_after, Some(31_000));
+    }
+
+    /// An ERRORED completion must not settle into the 4-second success dwell
+    /// (`✶ context compacted (X → Y tokens)`) — main removed the live block
+    /// for every completion and gates the durable notice on `error.is_none()`;
+    /// the settle-in-place dwell must keep that error gate (codex P2 on the
+    /// main-reconcile merge).
+    #[test]
+    fn errored_compaction_completed_drops_live_block_without_success_dwell() {
+        use octos_core::ui_protocol::{
+            ContextCompactionCompletedEvent, ContextCompactionStartedEvent,
+            UiContextCompactionRecord, UiContextState,
+        };
+
+        let session_id = SessionKey("local:test".into());
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "test".into(),
+            profile_id: None,
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        };
+        let context_state = UiContextState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 4,
+            transcript_hash: "abc123".into(),
+            item_count: 42,
+            token_estimate: 91_000,
+            recovery_state: "degraded".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        };
+
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionStarted(ContextCompactionStartedEvent {
+                session_id: session_id.clone(),
+                context_state: context_state.clone(),
+                trigger: "preflight".into(),
+                threshold_tokens: 96_000,
+            }),
+        ));
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
+                session_id: session_id.clone(),
+                context_state,
+                compaction: UiContextCompactionRecord {
+                    compaction_id: "comp-002".into(),
+                    checkpoint_id: "chk-002".into(),
+                    status: "failed".into(),
+                    policy_id: "default".into(),
+                    trigger: "preflight".into(),
+                    input_generation: 3,
+                    output_generation: None,
+                    input_transcript_hash: "input-h".into(),
+                    replacement_transcript_hash: None,
+                    installed_transcript_hash: None,
+                    input_item_count: 130,
+                    retained_count: 0,
+                    dropped_count: 0,
+                    summary_item_id: None,
+                    token_estimate_before: 91_000,
+                    token_estimate_after: None,
+                    error: Some("summarizer failed".into()),
+                },
+            }),
+        ));
+
+        assert!(
+            !store.state.live_compaction.contains_key(&session_id),
+            "an errored completion must drop the live block, not settle it into a success flash"
+        );
+        assert!(
+            !store
+                .state
+                .activity
+                .iter()
+                .any(|item| item.title.contains("compacted")),
+            "no durable success notice for an errored compaction"
+        );
+    }
+
+    /// The activity cap's blind oldest-first eviction dropped compaction
+    /// notices mid-turn (they predate the turn's tool flood), erasing them
+    /// before `capture_completed_turn_activity` could archive them. Sticky
+    /// rows must survive the cap.
+    #[test]
+    fn sticky_activity_survives_cap_eviction() {
+        let session_id = SessionKey("local:test".into());
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "test".into(),
+            profile_id: None,
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut state = AppState::new(vec![session], 0, "ready".into(), None, false);
+
+        state.push_activity(
+            ActivityItem::new(
+                ActivityKind::Progress,
+                "context compacted",
+                "31k → 9k tokens",
+            )
+            .with_sticky(),
+        );
+        for idx in 0..100 {
+            state.push_activity(ActivityItem::new(
+                ActivityKind::Tool,
+                "bash",
+                format!("tool {idx}"),
+            ));
+        }
+
+        assert_eq!(
+            state.activity.len(),
+            80,
+            "the cap must still bound the list"
+        );
+        assert!(
+            state.activity.iter().any(|item| item.sticky),
+            "the sticky notice must survive the tool flood"
         );
     }
 
