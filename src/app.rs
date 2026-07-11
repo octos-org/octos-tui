@@ -3232,11 +3232,11 @@ fn should_show_turn_flow(app: &AppState, session: &SessionView) -> bool {
 }
 
 /// Whether the ACTIVE session's turn is in its "thinking" phase: the model
-/// has started reasoning (`live_reasoning` non-empty), no answer has streamed
-/// yet (`live_reply.text` empty), AND no tool has started for this turn (a
-/// tool run is acting, not thinking — codex P2). This is exactly when the
-/// swimming octopus shows; the status bar reads "Thinking" under the same
-/// predicate, then flips to "Working" the moment the answer OR a tool begins.
+/// has started reasoning (`live_reasoning` non-empty) and no answer has
+/// streamed yet (`live_reply.text` empty). This is EXACTLY the swimming-octopus
+/// condition, which the status-bar "Thinking" label tracks verbatim (the user
+/// asked for "Thinking when the octopus swimming"); it flips to "Working" the
+/// moment the answer begins streaming.
 fn active_turn_is_thinking(app: &AppState) -> bool {
     let Some((session_id, turn_id)) = app.active_turn() else {
         return false;
@@ -3249,14 +3249,14 @@ fn active_turn_is_thinking(app: &AppState) -> bool {
         .active_session()
         .and_then(|session| session.live_reply.as_ref())
         .is_none_or(|live_reply| live_reply.text.trim().is_empty());
-    // A `ToolStarted` for this turn adds a Tool activity item before any
-    // answer delta; from then on the turn is ACTING, so it is Working, not
-    // Thinking (the octopus stops too, keeping the two in sync).
-    let tool_running = app
-        .activity
-        .iter()
-        .any(|item| item.turn_id.as_ref() == Some(turn_id) && item.kind == ActivityKind::Tool);
-    reasoning_started && answer_not_started && !tool_running
+    // Deliberately NOT gated on tool activity: this predicate IS the swimming
+    // octopus, which the user asked the label to track ("Thinking when the
+    // octopus swimming animated"). The octopus swims from the first reasoning
+    // delta until the answer streams — including while tools run — so the
+    // label matches it exactly, and it depends only on durable live-turn
+    // state (reasoning + reply), never transient activity rows that a
+    // snapshot replay or activity eviction could drop (codex round 2).
+    reasoning_started && answer_not_started
 }
 
 fn push_turn_flow(
@@ -17856,27 +17856,6 @@ mod tests {
         assert!(
             status.contains("Working"),
             "no reasoning -> status bar Working: {status:?}"
-        );
-
-        // Reasoning present but a tool has started for the turn -> Working
-        // (acting, not thinking) — codex P2.
-        let mut tool_running = active_turn_app("");
-        let (sid, tid) = tool_running
-            .active_turn()
-            .map(|(s, t)| (s.clone(), t.clone()))
-            .unwrap();
-        tool_running
-            .live_reasoning
-            .insert((sid, tid.clone()), "reasoning".to_string());
-        tool_running.status = "ready".into();
-        tool_running.push_activity(
-            ActivityItem::new(ActivityKind::Tool, "shell", "running")
-                .with_tool_call("t1")
-                .with_turn(tid),
-        );
-        assert!(
-            !active_turn_is_thinking(&tool_running),
-            "a running tool means Working, not Thinking"
         );
 
         // Reasoning present but run_state is Error -> the Error label is not
