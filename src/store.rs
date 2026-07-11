@@ -5672,6 +5672,11 @@ impl Store {
                 let session_runtime_statuses = self.state.session_runtime_statuses.clone();
                 let profile_llm_catalog = self.state.profile_llm_catalog.clone();
                 let profile_llm_state = self.state.profile_llm_state.clone();
+                // One-shot re-flush request: a snapshot replay draining
+                // between an aside dismissal and the next draw must not eat
+                // it, or the vacated rows stay blank after reconnect when the
+                // committed history is unchanged (codex P2 on #288).
+                let transcript_reflush_requested = self.state.transcript_reflush_requested;
                 let profile_skills = self.state.profile_skills.clone();
                 let profile_skill_registry = self.state.profile_skill_registry.clone();
                 let session_model_catalogs = self.state.session_model_catalogs.clone();
@@ -5763,6 +5768,7 @@ impl Store {
                 state.session_runtime_statuses = session_runtime_statuses;
                 state.profile_llm_catalog = profile_llm_catalog;
                 state.profile_llm_state = profile_llm_state;
+                state.transcript_reflush_requested = transcript_reflush_requested;
                 state.profile_skills = profile_skills;
                 state.profile_skill_registry = profile_skill_registry;
                 state.session_model_catalogs = session_model_catalogs;
@@ -13590,6 +13596,81 @@ mod tests {
         );
     }
 
+    /// codex P2 round 3: the reflush SCOPE is captured at dismissal time — a
+    /// `TurnCompleted` draining between the dismissal and the next draw must
+    /// not demote a mid-stream dismissal to the committed-only path (whose
+    /// live dedup re-inserts only the post-prefix suffix, leaving the band).
+    #[test]
+    fn reflush_scope_survives_a_turn_settling_before_the_draw() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streamed prefix…");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.set_btw_answering(&session_id, "q?".into());
+        assert!(store.state.resolve_btw_answer(&session_id, "a".into()));
+
+        // Dismiss WHILE the live reply is in flight…
+        assert!(store.state.dismiss_btw_aside(&session_id));
+        // …then the turn settles before the event loop reaches the draw.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            store.state.sessions[0].live_reply.is_none(),
+            "the turn settled"
+        );
+
+        assert_eq!(
+            store.state.take_transcript_reflush_request(),
+            Some(crate::model::TranscriptReflushScope::WithLive),
+            "the dismissal-time streaming scope must survive the settle"
+        );
+
+        // And a dismissal AFTER settle records the committed-only scope.
+        store.state.set_btw_answering(&session_id, "q2?".into());
+        assert!(store.state.resolve_btw_answer(&session_id, "a2".into()));
+        assert!(store.state.dismiss_btw_aside(&session_id));
+        assert_eq!(
+            store.state.take_transcript_reflush_request(),
+            Some(crate::model::TranscriptReflushScope::CommittedOnly),
+            "a settled dismissal keeps the dedup-preserving committed path"
+        );
+    }
+
+    /// A snapshot replay draining between an aside dismissal and the next
+    /// draw must not eat the one-shot re-flush request (codex P2 on #288) —
+    /// with unchanged committed history the tracker would emit nothing and
+    /// the vacated rows would stay blank after reconnect.
+    #[test]
+    fn snapshot_replay_preserves_the_transcript_reflush_request() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming…");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.set_btw_answering(&session_id, "q?".into());
+        assert!(store.state.resolve_btw_answer(&session_id, "a".into()));
+        assert!(store.state.dismiss_btw_aside(&session_id));
+
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: store.state.sessions.clone(),
+            selected_session: 0,
+            status: "resynced".into(),
+            target: None,
+            readonly: false,
+        }));
+
+        assert!(
+            store.state.take_transcript_reflush_request().is_some(),
+            "the re-flush request must survive a snapshot replay"
+        );
+    }
+
     /// The old child's whole-job orchestration signals died with it: the NEW
     /// child never knew those sessions, so it will never send the terminal
     /// `active:false` — a stale entry pins the "Working" indicator forever
@@ -18025,6 +18106,63 @@ mod tests {
         assert!(
             store.state.btw_aside_for(&session_id).is_some(),
             "an answering aside survives a prompt submit"
+        );
+    }
+
+    /// Dismissing an aside (Enter on empty composer, or the next prompt
+    /// clearing a settled one) shrinks the live region by the aside's full
+    /// wrapped height — the vacated rows strand as a blank band above the
+    /// composer that nothing refills once the turn is settled (user report:
+    /// "huge blank space"). Both removal paths must request the one-shot
+    /// transcript re-flush the event loop turns into a scrollback re-insert.
+    #[test]
+    fn dismissing_a_btw_aside_requests_a_transcript_reflush() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming…");
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Explicit dismissal (Enter on the empty composer).
+        store.state.set_btw_answering(&session_id, "q1?".into());
+        assert!(store.state.resolve_btw_answer(&session_id, "a1".into()));
+        assert!(
+            store.state.take_transcript_reflush_request().is_none(),
+            "no request while the aside is up"
+        );
+        assert!(store.state.dismiss_btw_aside(&session_id));
+        assert_eq!(
+            store.state.take_transcript_reflush_request(),
+            Some(crate::model::TranscriptReflushScope::WithLive),
+            "mid-stream dismissal must request the coherent live block"
+        );
+        assert!(
+            store.state.take_transcript_reflush_request().is_none(),
+            "the request is one-shot"
+        );
+
+        // Prompt-submit dismissal of a settled aside requests it too.
+        store.state.set_btw_answering(&session_id, "q2?".into());
+        assert!(store.state.resolve_btw_answer(&session_id, "a2".into()));
+        store.state.composer = "next actual prompt".into();
+        let _ = store.compose_command();
+        assert!(
+            store.state.btw_aside_for(&session_id).is_none(),
+            "settled aside dismissed by the submit"
+        );
+        assert!(
+            store.state.take_transcript_reflush_request().is_some(),
+            "prompt-submit dismissal must request the re-flush"
+        );
+
+        // A no-op clear (aside still answering) must NOT request one.
+        store.state.set_btw_answering(&session_id, "q3?".into());
+        store.state.clear_settled_btw_aside(&session_id);
+        assert!(
+            store.state.btw_aside_for(&session_id).is_some(),
+            "answering aside survives"
+        );
+        assert!(
+            store.state.take_transcript_reflush_request().is_none(),
+            "no removal -> no re-flush request"
         );
     }
 

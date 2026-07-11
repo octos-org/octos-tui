@@ -262,7 +262,7 @@ where
 /// 8-bit CSI/OSC forms) — is removed. Removing the introducer defuses the
 /// whole escape sequence (its params become inert printable text). Styling
 /// and span boundaries are preserved. Clean spans are left unallocated.
-fn sanitize_line_in_place(line: &mut Line<'_>) {
+pub(crate) fn sanitize_line_in_place(line: &mut Line<'_>) {
     for span in &mut line.spans {
         let content = span.content.as_ref();
         if content.chars().any(char::is_control) {
@@ -287,43 +287,99 @@ fn sanitize_span_content(content: &str) -> String {
 
 /// Word-wrap a [`Line`] to `width` display columns, preserving per-span style.
 /// Empty lines round up to one physical row.
+///
+/// A "word" here is a maximal non-whitespace run even when it crosses span
+/// boundaries: inline markdown renders one word as several adjacent styled
+/// spans (`**bold**tail`, `BOTTOM_VISIBLE_UNIQUE`), and breaking at the seam
+/// would split the word mid-token — ratatui's own wrapper never does.
 pub(crate) fn wrap_line(line: &Line, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     if line.width() <= width {
         return vec![owned_line(line)];
     }
 
-    let mut out: Vec<Line<'static>> = Vec::new();
-    let mut cur: Vec<Span<'static>> = Vec::new();
-    let mut cur_width = 0usize;
-
+    // Tokenize into wrap units: styled pieces grouped so that a run of
+    // non-whitespace pieces (possibly from different spans) forms ONE unit.
+    struct Unit {
+        pieces: Vec<Span<'static>>,
+        width: usize,
+        ws: bool,
+    }
+    let mut units: Vec<Unit> = Vec::new();
     for span in &line.spans {
         // Split the span into words while keeping whitespace runs attached so
         // wrapping doesn't drop the spacing inside a styled run.
         for word in split_keep_ws(span.content.as_ref()) {
             let w = word.width();
-            if cur_width + w > width && cur_width > 0 {
-                out.push(finish_line(std::mem::take(&mut cur), line.style));
-                cur_width = 0;
-                if word.trim().is_empty() {
-                    continue; // don't start a wrapped row with leading whitespace
+            let ws = word.chars().all(char::is_whitespace);
+            let piece = Span::styled(word.to_string(), span.style);
+            match units.last_mut() {
+                Some(unit) if !unit.ws && !ws => {
+                    unit.pieces.push(piece);
+                    unit.width += w;
                 }
+                _ => units.push(Unit {
+                    pieces: vec![piece],
+                    width: w,
+                    ws,
+                }),
             }
-            // A single word longer than the width: hard-split it.
-            if w > width {
-                for chunk in hard_split(word, width) {
-                    let cw = chunk.width();
-                    if cur_width + cw > width && cur_width > 0 {
+        }
+    }
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_width = 0usize;
+
+    for unit in units {
+        if cur_width + unit.width > width && cur_width > 0 {
+            out.push(finish_line(std::mem::take(&mut cur), line.style));
+            cur_width = 0;
+            if unit.ws {
+                continue; // don't start a wrapped row with leading whitespace
+            }
+        }
+        if unit.width > width {
+            // A single word longer than the width: hard-split it piece-wise so
+            // each fragment keeps its own span's style. The budget accounting
+            // MUST use the same per-char widths the cutter used (`used`), not
+            // `str::width` of the chunk — control characters count 0 for the
+            // cutter but 1 for `str::width`, and the mismatch let `cur_width`
+            // exceed `width` and underflow `width - cur_width` (codex r2 P1).
+            for piece in unit.pieces {
+                let mut rest = piece.content.as_ref();
+                while !rest.is_empty() {
+                    let (chunk, used, tail) =
+                        split_at_display_width(rest, width.saturating_sub(cur_width));
+                    if chunk.is_empty() {
+                        if cur_width == 0 {
+                            // A single glyph wider than the whole width (a CJK
+                            // cell at width 1): emit it anyway — mirrors the
+                            // pre-existing hard-split behavior — and flush its
+                            // row at once, or `cur_width > width` would
+                            // underflow `width - cur_width` on the next char
+                            // (codex-review finding).
+                            let ch_len = rest.chars().next().map_or(0, char::len_utf8);
+                            let (glyph, tail) = rest.split_at(ch_len);
+                            cur.push(Span::styled(glyph.to_string(), piece.style));
+                            out.push(finish_line(std::mem::take(&mut cur), line.style));
+                            rest = tail;
+                            continue;
+                        }
                         out.push(finish_line(std::mem::take(&mut cur), line.style));
                         cur_width = 0;
+                        continue;
                     }
-                    cur.push(Span::styled(chunk.to_string(), span.style));
-                    cur_width += cw;
+                    cur.push(Span::styled(chunk.to_string(), piece.style));
+                    cur_width += used;
+                    rest = tail;
                 }
-            } else {
-                cur.push(Span::styled(word.to_string(), span.style));
-                cur_width += w;
             }
+        } else {
+            for piece in unit.pieces {
+                cur.push(piece);
+            }
+            cur_width += unit.width;
         }
     }
     if !cur.is_empty() {
@@ -333,6 +389,25 @@ pub(crate) fn wrap_line(line: &Line, width: usize) -> Vec<Line<'static>> {
         out.push(Line::default().style(line.style));
     }
     out
+}
+
+/// Longest prefix of `s` whose display width is `<= cols` (char-boundary
+/// safe): returns the prefix, the per-char width it consumed (the caller must
+/// account with THIS value, not `str::width`, so cutter and budget agree on
+/// zero-width/control chars), and the remainder.
+fn split_at_display_width(s: &str, cols: usize) -> (&str, usize, &str) {
+    let mut end = 0;
+    let mut used = 0usize;
+    for (i, ch) in s.char_indices() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cw > cols {
+            break;
+        }
+        end = i + ch.len_utf8();
+        used += cw;
+    }
+    let (chunk, rest) = s.split_at(end);
+    (chunk, used, rest)
 }
 
 fn finish_line(spans: Vec<Span<'static>>, style: ratatui::style::Style) -> Line<'static> {
@@ -365,29 +440,6 @@ fn split_keep_ws(s: &str) -> Vec<&str> {
     }
     if start < s.len() {
         out.push(&s[start..]);
-    }
-    out
-}
-
-/// Hard-split an over-long word into `width`-column chunks (char boundaries).
-fn hard_split(word: &str, width: usize) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    let mut col = 0usize;
-    for (i, ch) in word.char_indices() {
-        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if col + cw > width && i > start {
-            out.push(&word[start..i]);
-            start = i;
-            col = 0;
-        }
-        col += cw;
-    }
-    if start < word.len() {
-        out.push(&word[start..]);
-    }
-    if out.is_empty() {
-        out.push(word);
     }
     out
 }
@@ -1441,5 +1493,107 @@ mod tests {
         let s = "a  bc   d";
         let parts = split_keep_ws(s);
         assert_eq!(parts.concat(), s);
+    }
+
+    /// Inline markdown renders one word as several adjacent styled spans
+    /// (`BOTTOM_VISIBLE_UNIQUE` → "BOTTOM" + italic "VISIBLE" + "UNIQUE").
+    /// The wrap must treat the glued run as ONE word — ratatui's own wrapper
+    /// never breaks inside it — while each piece keeps its span style.
+    #[test]
+    fn wrap_keeps_word_glued_across_span_boundaries() {
+        use ratatui::style::Stylize;
+        let line = Line::from(vec![
+            Span::from("final wrapped row should remain visible BOTTOM"),
+            "VISIBLE".italic(),
+            Span::from("UNIQUE"),
+        ]);
+        let out = wrap_line(&line, 52);
+        assert!(out.len() >= 2, "expected wrapping, got {out:?}");
+        for l in &out {
+            assert!(l.width() <= 52, "row too wide: {l:?}");
+        }
+        let rows: Vec<String> = out
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(
+            rows.iter().any(|row| row.contains("BOTTOMVISIBLEUNIQUE")),
+            "glued word must stay on one row: {rows:#?}"
+        );
+        assert!(
+            out.iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.content.as_ref() == "VISIBLE"
+                    && s.style.add_modifier.contains(Modifier::ITALIC)),
+            "the styled middle piece keeps its own style: {out:#?}"
+        );
+    }
+
+    /// codex-review regression (r2 P1): control characters count 0 columns in
+    /// the char-based cutter but 1 in `str::width`, so budget accounting mixed
+    /// the two and `width - cur_width` could underflow on adversarial input
+    /// (ESC-bearing spans). The wrapper must never panic, whatever the bytes.
+    #[test]
+    fn wrap_survives_control_characters_without_underflow() {
+        use ratatui::style::Stylize;
+        let line = Line::from(vec![
+            Span::from(format!("\u{1b}\u{1b}{}", "a".repeat(79))),
+            "b".bold(),
+            Span::from("c"),
+        ]);
+        let out = wrap_line(&line, 80);
+        let rejoined: String = out
+            .iter()
+            .flat_map(|l| &l.spans)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            rejoined.contains(&"a".repeat(79)) && rejoined.contains('b') && rejoined.contains('c'),
+            "no visible character may be lost: {out:?}"
+        );
+    }
+
+    /// codex-review regression: at a one-column width, a double-width glyph is
+    /// force-emitted (it can never fit), which used to leave
+    /// `cur_width > width` and underflow `width - cur_width` on the NEXT
+    /// character. The forced glyph must flush its row immediately.
+    #[test]
+    fn wrap_survives_double_width_glyph_at_one_column_width() {
+        let line = Line::from(vec![Span::from("中a中b")]);
+        let out = wrap_line(&line, 1);
+        let rejoined: String = out
+            .iter()
+            .flat_map(|l| &l.spans)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(rejoined, "中a中b", "no character may be lost");
+        for l in &out {
+            assert!(
+                l.width() <= 2,
+                "each row holds at most the one forced glyph: {out:?}"
+            );
+        }
+    }
+
+    /// A glued multi-span run longer than the width hard-splits piece-wise:
+    /// rows stay within budget (unicode-width — CJK counts 2), styles stick to
+    /// their pieces, and no character is lost.
+    #[test]
+    fn wrap_hard_splits_overlong_glued_run_piecewise() {
+        use ratatui::style::Stylize;
+        let line = Line::from(vec!["aaaa".bold(), Span::from("bb中文中文中文bb")]);
+        let out = wrap_line(&line, 6);
+        for l in &out {
+            assert!(l.width() <= 6, "row too wide: {l:?}");
+        }
+        let rejoined: String = out
+            .iter()
+            .flat_map(|l| &l.spans)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            rejoined, "aaaabb中文中文中文bb",
+            "hard-splitting must not lose characters"
+        );
     }
 }
