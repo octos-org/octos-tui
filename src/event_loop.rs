@@ -26,7 +26,7 @@ use crate::{
     app,
     cli::Cli,
     client_event::ClientEvent,
-    insert_history::insert_history_lines,
+    insert_history::insert_history_lines_with_size,
     model::{AppState, AppUiCommand, ApprovalModalAction, FocusPane},
     store::Store,
     theme::Palette,
@@ -267,6 +267,20 @@ where
     let size = terminal.size()?;
     let width = size.width;
 
+    // This frame will take the FULL viewport reset inside
+    // `resize_viewport_to` (width change either direction, or terminal-
+    // height shrink — mirror of its exact condition): the reset clears the
+    // whole visible screen, erasing the transcript rows already flushed
+    // there. Forget the flushed watermark BEFORE the sync below, so this
+    // same frame re-inserts the committed history freshly wrapped at the
+    // new width — otherwise the chat visually vanishes, leaving a bare
+    // composer (the old-width copy survives only in real scrollback).
+    if size.width != terminal.last_known_screen_size.width
+        || size.height < terminal.last_known_screen_size.height
+    {
+        scrollback.mark_flushed_stale();
+    }
+
     // The scrollback flush must wrap to the SAME width `insert_history_lines`
     // uses (the full viewport width), so the line accounting stays consistent.
     let wrap_width = usize::from(width).max(1);
@@ -294,7 +308,7 @@ where
                 &store.state,
                 palette,
                 height,
-                size.height,
+                size,
                 update.lines_to_insert,
                 live_tail_finalization,
             )
@@ -305,7 +319,7 @@ where
             &store.state,
             palette,
             height,
-            size.height,
+            size,
             update.lines_to_insert,
             live_tail_finalization,
         )
@@ -317,16 +331,19 @@ fn draw_inline_frame<B>(
     state: &crate::model::AppState,
     palette: Palette,
     height: u16,
-    terminal_height: u16,
+    size: ratatui::layout::Size,
     lines_to_insert: Vec<ratatui::text::Line<'static>>,
     live_tail_finalization: Option<app::LiveTurnFinalization>,
 ) -> Result<()>
 where
     B: Backend + io::Write,
 {
-    terminal.resize_viewport_to(height)?;
+    // `size` is the SAME snapshot the caller used for the scrollback
+    // stale-mark — one sample drives both the reset decision and the
+    // re-flush, so they can never disagree about a mid-frame resize.
+    terminal.resize_viewport_to_size(height, size)?;
     if !lines_to_insert.is_empty() {
-        insert_history_lines(terminal, lines_to_insert)?;
+        insert_history_lines_with_size(terminal, lines_to_insert, size)?;
         terminal.invalidate_viewport();
     }
     terminal.draw(|frame| {
@@ -334,7 +351,7 @@ where
             frame,
             state,
             palette,
-            terminal_height,
+            size.height,
             live_tail_finalization.as_ref(),
         );
     })?;

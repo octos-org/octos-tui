@@ -62,7 +62,26 @@ fn reset_scroll_region<W: Write>(w: &mut W) -> io::Result<()> {
 /// otherwise). Updates `terminal.viewport_area` so the next draw paints in the
 /// viewport's new position. Cursor-position-neutral: restores the cursor to
 /// where it was on entry.
-pub fn insert_history_lines<B>(terminal: &mut Terminal<B>, mut lines: Vec<Line>) -> io::Result<()>
+pub fn insert_history_lines<B>(terminal: &mut Terminal<B>, lines: Vec<Line>) -> io::Result<()>
+where
+    B: Backend + Write,
+{
+    let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
+    insert_history_lines_with_size(terminal, lines, screen_size)
+}
+
+/// [`insert_history_lines`] against a caller-supplied screen size.
+///
+/// The inline draw path samples the screen size ONCE per frame and threads
+/// that snapshot through the viewport reset, the scrollback stale-mark, AND
+/// this insertion (codex P2 on #281): re-sampling here could combine the
+/// frame's old viewport top with a mid-frame-resized screen height, letting
+/// the DECSTBM/index feeds below scroll or overwrite live-viewport rows.
+pub fn insert_history_lines_with_size<B>(
+    terminal: &mut Terminal<B>,
+    mut lines: Vec<Line>,
+    screen_size: Size,
+) -> io::Result<()>
 where
     B: Backend + Write,
 {
@@ -78,7 +97,6 @@ where
         sanitize_line_in_place(line);
     }
 
-    let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
     let mut area = terminal.viewport_area;
     let last_cursor_pos = terminal.last_known_cursor_pos;
     let visible_history_rows = terminal.visible_history_rows();
@@ -898,6 +916,39 @@ mod tests {
     /// is NOT this is a non-default (theme) background.
     fn default_bg_seq() -> &'static str {
         "\x1b[49m"
+    }
+
+    #[test]
+    fn insert_with_size_honors_the_callers_snapshot_not_the_backend() {
+        // codex P2 on #281: the inline draw threads ONE per-frame size
+        // snapshot through the viewport reset, the scrollback stale-mark,
+        // and this insertion. If a mid-frame resize shrinks the backend
+        // after the sample, insertion must keep computing its DECSTBM
+        // region from the snapshot the viewport was laid out for — mixing
+        // the old viewport top with a re-sampled (shorter) screen height
+        // could scroll or overwrite live-viewport rows.
+        let snapshot = Size::new(40, 10);
+        let mut t = Terminal::new(RecordingBackend::new(40, 10)).expect("terminal");
+        // Viewport pinned at the bottom of the 10-row snapshot, one spare
+        // row below the top region (bottom() == 9 < snapshot height 10).
+        t.set_viewport_area(Rect::new(0, 8, 40, 1));
+        // The backend has ALREADY shrunk to 6 rows (mid-frame resize).
+        t.backend_mut().size = Size::new(40, 6);
+
+        insert_history_lines_with_size(&mut t, vec![text_line("kept line")], snapshot)
+            .expect("insert with snapshot");
+
+        // The scroll region math ran against the 10-row snapshot: the
+        // region bottom is the snapshot height, not the shrunken backend's.
+        let out = String::from_utf8_lossy(&t.backend().buf);
+        assert!(
+            out.contains("\x1b[9;10r"),
+            "DECSTBM region must come from the snapshot (rows 9..10): {out:?}"
+        );
+        assert!(
+            !out.contains(";6r"),
+            "region bottom must not re-sample the shrunken backend: {out:?}"
+        );
     }
 
     #[test]
