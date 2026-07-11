@@ -1822,12 +1822,25 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
 
 fn onboarding_family_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let Some(catalog) = ctx.app.profile_llm_catalog else {
-        return MenuBuildResult::Unavailable(MenuStatusSpec {
+        // Opening this menu auto-sends `profile/llm/catalog` (see
+        // `auto_fetch_for_menu`); render Loading until the result refreshes
+        // the menu rather than dead-ending on "load the catalog first". When
+        // the server never advertised the catalog method, no fetch is in
+        // flight — stay Unavailable instead of loading forever.
+        let spec = MenuStatusSpec {
             id: MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY),
             title: t!("menu.onboard.family.title").into_owned(),
             message: t!("menu.onboard.unavailable_catalog_msg").into_owned(),
             footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
-        });
+        };
+        return if ctx
+            .availability
+            .supports_method(APPUI_METHOD_PROFILE_LLM_CATALOG)
+        {
+            MenuBuildResult::Loading(spec)
+        } else {
+            MenuBuildResult::Unavailable(spec)
+        };
     };
     let default_state;
     let state = if let Some(state) = ctx.app.onboarding {
@@ -1897,12 +1910,23 @@ fn onboarding_model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         });
     }
     let Some(catalog) = ctx.app.profile_llm_catalog else {
-        return MenuBuildResult::Unavailable(MenuStatusSpec {
+        // Same auto-fetch contract as the family step: Loading only while a
+        // fetch can actually be in flight; Unavailable on servers that never
+        // advertised the catalog method.
+        let spec = MenuStatusSpec {
             id: MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL),
             title: t!("menu.onboard.model.title").into_owned(),
             message: t!("menu.onboard.unavailable_catalog_msg").into_owned(),
             footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
-        });
+        };
+        return if ctx
+            .availability
+            .supports_method(APPUI_METHOD_PROFILE_LLM_CATALOG)
+        {
+            MenuBuildResult::Loading(spec)
+        } else {
+            MenuBuildResult::Unavailable(spec)
+        };
     };
     let Some(models) = catalog
         .families
@@ -3006,6 +3030,7 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 let action = if can_select {
                     MenuAction::send_appui(AppUiCommand::ProfileLlmSelect(ProfileLlmSelectParams {
                         profile_id: profile_id.clone(),
+                        session_id: ctx.app.selected_session_id.cloned(),
                         family_id: model
                             .family
                             .clone()
