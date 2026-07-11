@@ -3249,14 +3249,22 @@ fn active_turn_is_thinking(app: &AppState) -> bool {
         .active_session()
         .and_then(|session| session.live_reply.as_ref())
         .is_none_or(|live_reply| live_reply.text.trim().is_empty());
-    // Not thinking while parked on an operator decision: an approval-gated
-    // tool sets run_state Blocked and the status bar shows "Waiting", so the
-    // octopus must stop too rather than animate over a wait (codex round 3).
-    // Durable state (approval/question presence + run_state), not transient
-    // activity rows.
-    let awaiting_operator = app.approval.is_some()
-        || app.user_question.is_some()
-        || matches!(app.run_state, SessionRunState::Blocked { .. });
+    // Not thinking while parked on an operator decision FOR THIS session: an
+    // approval-gated tool sets run_state Blocked and the status bar shows
+    // "Waiting", so the octopus must stop too (codex round 3). The
+    // approval/question slots are global, so scope them to the active session
+    // — a background session's pending decision must not suppress the octopus
+    // here (codex round 4). Durable state, not transient activity rows.
+    let decision_for_active = app
+        .approval
+        .as_ref()
+        .is_some_and(|approval| &approval.session_id == session_id)
+        || app
+            .user_question
+            .as_ref()
+            .is_some_and(|question| &question.session_id == session_id);
+    let awaiting_operator =
+        decision_for_active || matches!(app.run_state, SessionRunState::Blocked { .. });
     // Deliberately NOT gated on tool activity: this predicate IS the swimming
     // octopus, which the user asked the label to track ("Thinking when the
     // octopus swimming"). The octopus swims from the first reasoning delta
