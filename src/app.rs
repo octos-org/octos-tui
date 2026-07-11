@@ -4829,11 +4829,18 @@ fn shell_command_from_args(arguments: &serde_json::Value) -> Option<String> {
 /// arrives CUT mid-string — strict parsing gets the well-formed case, a
 /// lenient scan covers the truncated one, and a cleanup pass guarantees the
 /// floor: no raw `{"key":` prefix, no literal `\n`/`\t` escape leaking into
-/// the row. Non-JSON text (bang echoes, thread markers, progress prose)
-/// passes through with only the escape/one-line normalization.
+/// the row.
+///
+/// `detail` ALSO carries already-decoded REAL invocation text (the `!`-bang
+/// echo, the live-lane command summaries, progress prose, thread markers), so
+/// the transforms are gated on the two serialized-echo shapes and everything
+/// else renders verbatim (one-lined only): a brace-group command `{ echo ok; }`
+/// is NOT a JSON echo (that requires `{"`), and `printf '\n'` keeps its
+/// intentional two-char escape (escape decoding requires the `key: value`
+/// preview opener).
 fn humanize_args_echo(echo: &str, title: &str) -> String {
     let trimmed = echo.trim();
-    if trimmed.starts_with('{') {
+    if looks_like_json_object_echo(trimmed) {
         // Complete echo: strict parse, then the same rendering the
         // object-arguments path uses (command string / first `key=value`).
         if let Ok(serde_json::Value::Object(map)) =
@@ -4862,11 +4869,39 @@ fn humanize_args_echo(echo: &str, title: &str) -> String {
         // common escapes so the row never shows `{"key":` or a literal `\n`.
         return single_line_invocation(&scrub_json_echo_fragment(trimmed));
     }
-    // Not a JSON object echo. The producer's `key: value` preview format still
-    // JSON-encodes string values, so decode the common escapes; rows are
-    // one-line, so an escaped newline becomes a space. Plain text without
-    // backslashes passes through unchanged.
-    single_line_invocation(&decode_json_string_escapes(trimmed))
+    // The producer's `key: value` preview format JSON-encodes string values,
+    // so decode the common escapes there; rows are one-line, so an escaped
+    // newline becomes a space.
+    if has_key_value_echo_opener(trimmed) {
+        return single_line_invocation(&decode_json_string_escapes(trimmed));
+    }
+    // Plain already-decoded text (bang commands, live-lane invocation
+    // summaries, progress prose, thread markers): verbatim, one-lined.
+    single_line_invocation(trimmed)
+}
+
+/// A serialized JSON object echo starts `{"` (optionally with whitespace
+/// between — pretty printing), because the first thing inside a JSON object is
+/// a quoted key. A brace-group shell command (`{ echo ok; }`) does not, so it
+/// is never mistaken for an echo.
+fn looks_like_json_object_echo(text: &str) -> bool {
+    text.strip_prefix('{')
+        .is_some_and(|rest| rest.trim_start().starts_with('"'))
+}
+
+/// The `key: value` preview opener the #1606 producer emits for object args
+/// (`cmd: "grep …", timeout: 300`): a bare identifier-ish key, then `: `. Real
+/// commands/prose almost never start this way (`printf '\n'` has no colon; an
+/// `echo "note: x"` command's first token contains spaces/quotes and fails the
+/// key charset).
+fn has_key_value_echo_opener(text: &str) -> bool {
+    let Some((key, _)) = text.split_once(": ") else {
+        return false;
+    };
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
 }
 
 /// Lenient `command`/`cmd` extraction from a truncated JSON object echo that
@@ -12175,6 +12210,34 @@ mod tests {
         assert!(
             text.contains("thread th-123"),
             "thread marker must render unchanged: {text:?}"
+        );
+    }
+
+    /// Fidelity guard (codex review): `detail` ALSO carries already-decoded
+    /// REAL invocation text — the `!`-bang echo and the live-lane
+    /// `tool_invocation_detail` command summaries. A brace-group command must
+    /// keep its `{` (only `{"…` is a JSON echo), and an intentional two-char
+    /// `\n` in a real command (`printf '\n'`) must render verbatim — the
+    /// escape decode applies to serialized echo shapes, not plain commands.
+    #[test]
+    fn agent_task_row_keeps_real_commands_verbatim() {
+        for title in ["shell", "!"] {
+            let brace_group = ActivityItem::new(ActivityKind::Tool, title, "complete")
+                .with_detail("{ echo ok; }")
+                .with_success(true);
+            let text = agent_task_child_text(&brace_group, 120);
+            assert!(
+                text.contains("{ echo ok; }"),
+                "brace-group command must render verbatim for {title}: {text:?}"
+            );
+        }
+        let printf = ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+            .with_detail(r#"printf '\n' | wc -l"#)
+            .with_success(true);
+        let text = agent_task_child_text(&printf, 120);
+        assert!(
+            text.contains(r#"printf '\n' | wc -l"#),
+            "a real command's two-char escape must render verbatim: {text:?}"
         );
     }
 
