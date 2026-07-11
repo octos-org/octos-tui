@@ -3613,6 +3613,36 @@ pub struct AppState {
     /// instead of clobbering the live composer. Local-only, preserved across
     /// snapshot replays.
     pub pending_rewind_prefill: Option<(SessionKey, String)>,
+    /// Prompts of turns the user interrupted (Esc/Ctrl+C), stashed until each
+    /// turn actually SETTLES (its `turn/completed`/`turn/error` terminal, or
+    /// the hydrate finalize after a backend restart). Restoring at
+    /// interrupt-REQUEST time filled the composer while the turn was still
+    /// streaming, and a non-empty composer silently blocks the `/` slash
+    /// popup (it only opens on an empty composer) — the reported "slash menu
+    /// is not usable while the LLM is outputting". At most ONE entry per
+    /// session (flat `Vec`, consistent with `permission_profiles` /
+    /// `session_runtime_statuses` neighbours; codex round-2 P2: a single
+    /// global slot let session B's interrupt overwrite session A's). Applied
+    /// by the settle handlers into the live composer (active session,
+    /// still-empty composer, no open menu), or into the session's saved draft
+    /// when the user switched away (the `pending_rewind_prefill` convention);
+    /// an entry is dropped when staged messages own its session's next turn
+    /// slot or a newer turn/submit supersedes it. Local-only, preserved
+    /// across snapshot replays.
+    pub pending_interrupt_restores: Vec<PendingInterruptRestore>,
+}
+
+/// See [`AppState::pending_interrupt_restores`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInterruptRestore {
+    pub session_id: SessionKey,
+    pub turn_id: TurnId,
+    pub prompt: String,
+    /// The turn's terminal already arrived but a menu was open at that
+    /// moment, so the composer fill was deferred once more (codex round-3
+    /// P2: consuming it there lost the prompt permanently). A settled entry
+    /// applies when the menu stack empties.
+    pub settled: bool,
 }
 
 /// M16-G2 per-session lifecycle ledger entry. The TUI keeps these in
@@ -5375,6 +5405,7 @@ impl AppState {
             resume_list_loaded: false,
             rewind_turns: Vec::new(),
             pending_rewind_prefill: None,
+            pending_interrupt_restores: Vec::new(),
         }
     }
 
