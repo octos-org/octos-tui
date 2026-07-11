@@ -1040,6 +1040,12 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::Up => {
             move_up(store);
         }
+        KeyCode::PageDown if btw_aside_open(&store.state) => {
+            scroll_open_btw_aside(store, 8);
+        }
+        KeyCode::PageUp if btw_aside_open(&store.state) => {
+            scroll_open_btw_aside(store, -8);
+        }
         KeyCode::PageDown => match store.state.focus {
             FocusPane::Workspace => store.state.workspace.scroll_down(8),
             FocusPane::Git => store.state.git.scroll_down(8),
@@ -1384,6 +1390,27 @@ fn handle_composer_vim_key(store: &mut Store, key: &KeyEvent) -> Option<KeyActio
         _ => {}
     }
     Some(KeyAction::Continue)
+}
+
+/// Whether the active session has a `/btw` overlay on screen (so PageUp/PageDown
+/// scroll it instead of the transcript). The overlay is non-modal — it floats
+/// over the live tail — so it takes the paging keys only while present.
+fn btw_aside_open(state: &crate::model::AppState) -> bool {
+    state
+        .active_session()
+        .is_some_and(|session| state.btw_aside_for(&session.id).is_some())
+}
+
+/// Scroll the active session's `/btw` overlay by `delta` rows (render clamps to
+/// the true content max).
+fn scroll_open_btw_aside(store: &mut Store, delta: i32) {
+    if let Some(session_id) = store
+        .state
+        .active_session()
+        .map(|session| session.id.clone())
+    {
+        store.state.nudge_btw_scroll(&session_id, delta);
+    }
 }
 
 fn handle_composer_enter(store: &mut Store) -> KeyAction {
@@ -1941,6 +1968,10 @@ fn toggle_transcript_pager(store: &mut Store) {
 }
 
 fn scroll_current_surface_down(store: &mut Store, lines: usize) {
+    if btw_aside_open(&store.state) {
+        scroll_open_btw_aside(store, lines as i32);
+        return;
+    }
     if store.state.task_output.active {
         store.state.task_output.scroll_down(lines);
         return;
@@ -1979,6 +2010,10 @@ fn scroll_current_surface_down(store: &mut Store, lines: usize) {
 }
 
 fn scroll_current_surface_up(store: &mut Store, lines: usize) {
+    if btw_aside_open(&store.state) {
+        scroll_open_btw_aside(store, -(lines as i32));
+        return;
+    }
     if store.state.task_output.active {
         store.state.task_output.scroll_up(lines);
         return;

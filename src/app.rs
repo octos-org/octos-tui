@@ -5214,6 +5214,28 @@ fn push_btw_aside_card(
 /// collapses to 1-2 rows, under [`render_btw_overlay`]'s 3-row minimum, and
 /// the pane silently stops drawing while the aside is still answering
 /// (codex P1). Kept in sync with `render_btw_overlay`'s layout math.
+/// Build the `/btw` overlay's inner lines, WRAPPED to `inner_width`, with the
+/// card's leading spacer dropped (the border already separates it). Wrapping
+/// here — mirroring every other transcript pane, which the overlay's own
+/// `Paragraph` historically did NOT — is what makes the physical-row count exact
+/// so the pane can size to fit and scroll precisely. Shared by the height hint
+/// and the renderer so the two never drift.
+fn btw_overlay_wrapped_lines(
+    palette: Palette,
+    aside: &crate::model::BtwAside,
+    inner_width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    push_btw_aside_card(&mut lines, palette, aside, inner_width);
+    while line_is_blank(lines.first()) {
+        lines.remove(0);
+    }
+    lines
+        .iter()
+        .flat_map(|line| crate::insert_history::wrap_line(line, inner_width))
+        .collect()
+}
+
 fn btw_overlay_height_hint(app: &AppState, area_width: u16) -> u16 {
     if area_width < 4 {
         return 0;
@@ -5224,20 +5246,18 @@ fn btw_overlay_height_hint(app: &AppState, area_width: u16) -> u16 {
     let Some(aside) = app.btw_asides.get(&session.id) else {
         return 0;
     };
-    let mut lines = Vec::new();
-    push_btw_aside_card(
-        &mut lines,
+    let wrapped = btw_overlay_wrapped_lines(
         Palette::for_theme(app.theme),
         aside,
         area_width as usize - 2,
     );
-    while line_is_blank(lines.first()) {
-        lines.remove(0);
-    }
-    if lines.is_empty() {
+    if wrapped.is_empty() {
         return 0;
     }
-    (lines.len() as u16).saturating_add(2)
+    // Ask for the full wrapped content + borders; the caller
+    // (`live_tail_height_with_finalization`) caps the tail at half the viewport,
+    // and the renderer scrolls whatever still doesn't fit.
+    (wrapped.len() as u16).saturating_add(2)
 }
 
 fn render_btw_overlay(
@@ -5255,19 +5275,29 @@ fn render_btw_overlay(
     let Some(aside) = app.btw_asides.get(&session.id) else {
         return;
     };
-    let mut lines = Vec::new();
-    // Inner width: the block borders consume one column each side.
-    push_btw_aside_card(&mut lines, palette, aside, tail_area.width as usize - 2);
-    // The card opens with a spacer line for the inline flow; inside a bordered
-    // pane the border already separates it — drop leading blanks.
-    while line_is_blank(lines.first()) {
-        lines.remove(0);
-    }
-    if lines.is_empty() {
+    // Inner width: the block borders consume one column each side. Wrapping to
+    // this width means no line is ever hard-clipped mid-word at the border
+    // (the pre-fix overlay had no `.wrap()`, so long prose was cut).
+    let inner_width = tail_area.width as usize - 2;
+    let wrapped = btw_overlay_wrapped_lines(palette, aside, inner_width);
+    if wrapped.is_empty() {
         return;
     }
-    // +2 for the top/bottom border rows.
-    let height = (lines.len() as u16 + 2).min(tail_area.height);
+    let content_rows = wrapped.len();
+    // Rows available for content inside the pane borders. The tail area is
+    // already capped at half the viewport by the caller, so a long answer can
+    // exceed this — in which case we scroll rather than silently drop rows.
+    let max_content = tail_area.height.saturating_sub(2) as usize;
+    if max_content == 0 {
+        return;
+    }
+    let scrollable = content_rows > max_content;
+    let visible_rows = content_rows.min(max_content);
+    // Clamp the stored offset to the true max each frame (mirrors the
+    // transcript-scroll pattern: setters saturate, render clamps for display).
+    let max_offset = content_rows.saturating_sub(visible_rows) as u16;
+    let offset = aside.scroll.min(max_offset);
+    let height = visible_rows as u16 + 2;
     let overlay = Rect {
         x: tail_area.x,
         y: tail_area.y,
@@ -5276,11 +5306,26 @@ fn render_btw_overlay(
     };
     let title = t!("app.btw.pane_title").into_owned();
     let close_hint = t!("app.btw.close_hint").into_owned();
+    let mut block = titled_block(title, palette, false, Some(close_hint));
+    if scrollable {
+        // Bottom-border position indicator so the user knows content is hidden
+        // and how to reach it.
+        let shown_end = offset as usize + visible_rows;
+        let indicator = format!(
+            " {}\u{2013}{}/{} \u{00b7} PgUp/PgDn ",
+            offset as usize + 1,
+            shown_end,
+            content_rows
+        );
+        block = block
+            .title_bottom(Line::from(Span::styled(indicator, palette.muted())).right_aligned());
+    }
     frame.render_widget(Clear, overlay);
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(wrapped)
+            .scroll((offset, 0))
             .style(palette.text().bg(palette.surface))
-            .block(titled_block(title, palette, false, Some(close_hint))),
+            .block(block),
         overlay,
     );
 }
@@ -9847,6 +9892,82 @@ mod tests {
         assert!(
             text.contains("/btw still with me?"),
             "aside question echo missing from inline viewport; got:\n{text}"
+        );
+    }
+
+    fn app_with_long_btw_answer() -> (AppState, SessionKey) {
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("go"), Message::assistant("done")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.set_btw_answering(
+            &session_id,
+            "tell me more about what you are working on".into(),
+        );
+        let answer = "I'm working on integrating Astro into your World Cup 2026 frontend to provide better component-based architecture. The idea is to use Astro as a meta-framework wrapping your existing React islands.\n\nWhat's been done so far:\n- Researched Astro's React integration docs\n- Set up an Astro project alongside your existing React app\n- Got Astro to build successfully\n\nCurrent blocker: The Astro SSR pages try to fetch data from your GraphQL server at localhost:4000 during build time, but this sandbox environment blocks outbound network so the build data step fails.\n\nLikely next step: Switching the Astro pages to use client-side fetching instead of SSR fetch, so the browser does the GraphQL call at runtime instead of the build doing it.";
+        app.resolve_btw_answer(&session_id, answer.into());
+        (app, session_id)
+    }
+
+    #[test]
+    fn btw_overlay_wraps_long_prose_instead_of_clipping() {
+        let (app, _session_id) = app_with_long_btw_answer();
+        // Tall terminal: the whole answer fits, so nothing is clipped and no
+        // scroll indicator appears.
+        let text = viewport_rows(&app, 100, 44).join("\n");
+        // The overflowing word ("component-based") wraps to a following row
+        // rather than being hard-cut at the border mid-word.
+        assert!(
+            text.contains("component-based architecture"),
+            "long prose must wrap intact, not clip mid-word; got:\n{text}"
+        );
+        // The tail paragraphs (previously dropped) are now visible in full.
+        assert!(
+            text.contains("Likely next step"),
+            "content below the fold must render when it fits; got:\n{text}"
+        );
+        assert!(
+            !text.contains("PgUp/PgDn"),
+            "no scroll indicator when everything fits; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn btw_overlay_scrolls_when_taller_than_the_pane() {
+        let (mut app, session_id) = app_with_long_btw_answer();
+        // Short terminal: the pane is capped at half the viewport, so the answer
+        // can't fit — a position indicator must appear instead of silent drops.
+        let top = viewport_rows(&app, 100, 20).join("\n");
+        assert!(
+            top.contains("PgUp/PgDn"),
+            "a too-tall answer must show a scroll indicator; got:\n{top}"
+        );
+        assert!(
+            top.contains("I'm working on integrating Astro"),
+            "unscrolled overlay starts at the top; got:\n{top}"
+        );
+        assert!(
+            !top.contains("Likely next step"),
+            "the tail is below the fold before scrolling; got:\n{top}"
+        );
+
+        // Scroll down: the window moves to reveal lower content.
+        app.nudge_btw_scroll(&session_id, 12);
+        let scrolled = viewport_rows(&app, 100, 20).join("\n");
+        assert!(
+            scrolled.contains("Likely next step"),
+            "scrolling must reveal content below the fold; got:\n{scrolled}"
         );
     }
 

@@ -287,7 +287,7 @@ fn sanitize_span_content(content: &str) -> String {
 
 /// Word-wrap a [`Line`] to `width` display columns, preserving per-span style.
 /// Empty lines round up to one physical row.
-fn wrap_line(line: &Line, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn wrap_line(line: &Line, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     if line.width() <= width {
         return vec![owned_line(line)];

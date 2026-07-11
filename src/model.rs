@@ -3733,6 +3733,10 @@ pub struct BtwAside {
     pub session_id: SessionKey,
     pub question: String,
     pub state: BtwAsideState,
+    /// Physical-row scroll offset for the overlay when the answer is taller than
+    /// the pane (which is capped at half the viewport). The render path clamps
+    /// this against the true max each frame, mirroring `transcript_scroll`.
+    pub scroll: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6368,8 +6372,27 @@ impl AppState {
                 session_id: session_id.clone(),
                 question,
                 state: BtwAsideState::Answering,
+                scroll: 0,
             },
         );
+    }
+
+    /// Scroll the active session's `/btw` overlay by `delta` physical rows
+    /// (positive = reveal lower content). Saturating; the render path clamps to
+    /// the true content max. Returns `true` when an aside was present to scroll,
+    /// so the key handler knows the event was consumed.
+    pub fn nudge_btw_scroll(&mut self, session_id: &SessionKey, delta: i32) -> bool {
+        match self.btw_asides.get_mut(session_id) {
+            Some(aside) => {
+                aside.scroll = if delta >= 0 {
+                    aside.scroll.saturating_add(delta as u16)
+                } else {
+                    aside.scroll.saturating_sub((-delta) as u16)
+                };
+                true
+            }
+            None => false,
+        }
     }
 
     /// Resolve the ANSWERING aside for `session_id` with the server's answer.
@@ -6379,6 +6402,8 @@ impl AppState {
         match self.btw_asides.get_mut(session_id) {
             Some(aside) if aside.state == BtwAsideState::Answering => {
                 aside.state = BtwAsideState::Answered(answer);
+                // Fresh answer starts at the top.
+                aside.scroll = 0;
                 true
             }
             _ => false,
