@@ -7292,7 +7292,7 @@ fn autonomy_indicator_height(app: &AppState) -> u16 {
             if state.goal.is_some() {
                 rows += 1;
             }
-            if !state.loops.is_empty() {
+            if state.loops.iter().any(autonomy_loop_is_active) {
                 rows += 1;
             }
             if let Some(plan) = state.plan.as_ref() {
@@ -7387,17 +7387,19 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
             Span::styled(parenthetical, palette.muted().bg(palette.surface)),
         ]));
     }
-    if !state.loops.is_empty() {
+    // The loops row shows only while something is actually FIRING: a
+    // paused-only session must not pin a permanent banner above the composer
+    // (user report: long-parked test loops kept a "0 active · 3 paused" row
+    // forever). Paused loops stay discoverable via the status-bar chip and
+    // `/loop`; once at least one loop is active, paused siblings still render
+    // here (muted chips + the paused suffix) so the header reconciles.
+    if state.loops.iter().any(autonomy_loop_is_active) {
         let mut spans: Vec<Span<'static>> = Vec::new();
         let running = state
             .loops
             .iter()
             .filter(|l| autonomy_loop_is_active(l))
             .count();
-        // Chips render every non-deleted loop (active + paused). Count paused
-        // too so the header reconciles with the chips — a `--solo` boot parks
-        // active loops to `paused`, which otherwise reads as "0 running" beside
-        // several visible chips.
         let paused = state.loops.iter().filter(|l| l.status == "paused").count();
         spans.push(Span::styled(
             "↻ ",
@@ -15355,7 +15357,7 @@ mod tests {
     }
 
     #[test]
-    fn autonomy_indicator_counts_paused_loops_alongside_active() {
+    fn autonomy_indicator_hides_when_only_paused_loops_remain() {
         let session_id = SessionKey("local:test".into());
         let mut app = AppState::new(
             vec![SessionView {
@@ -15371,18 +15373,56 @@ mod tests {
             None,
             false,
         );
-        // A `--solo` boot parks active loops to `paused`: the header must read
-        // "0 active · 2 paused", not "0 running" beside two visible chips.
+        // Nothing is firing — paused-only sessions must not pin a loops row
+        // above the composer (user report: three long-parked test loops kept
+        // a permanent "0 active · 3 paused" banner). The status-bar chip
+        // remains the discoverable hint that `/loop` has parked entries.
         let mut l1 = sample_loop("l1", "deploy-check", "fixed_interval", Some(300));
         l1.status = "paused".into();
         let mut l2 = sample_loop("l2", "PR-watch", "self_paced", None);
         l2.status = "paused".into();
         app.set_session_loops(&session_id, vec![l1, l2]);
 
+        assert_eq!(
+            autonomy_indicator_height(&app),
+            0,
+            "paused-only loops must not reserve an indicator row"
+        );
         let text = rendered_text(&app);
         assert!(
-            text.contains("Loops: 0 active · 2 paused"),
-            "paused loops must reconcile with the chips, got:\n{text}"
+            !text.contains("Loops:"),
+            "paused-only loops must hide the loops row, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn autonomy_indicator_keeps_paused_suffix_beside_active_loops() {
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // With at least one ACTIVE loop the row shows, and paused siblings
+        // still reconcile with their (muted) chips.
+        let l1 = sample_loop("l1", "deploy-check", "fixed_interval", Some(300));
+        let mut l2 = sample_loop("l2", "PR-watch", "self_paced", None);
+        l2.status = "paused".into();
+        app.set_session_loops(&session_id, vec![l1, l2]);
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Loops: 1 active · 1 paused"),
+            "active row must keep the paused suffix, got:\n{text}"
         );
     }
 
