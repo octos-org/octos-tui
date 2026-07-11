@@ -109,6 +109,7 @@ app:
     state_label: "状态"
     idle: "空闲"
     working: "运行中"
+    waiting: "等待中"
     blocked: "已阻塞"
     done: "已完成"
     error: "错误"
