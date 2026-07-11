@@ -26,7 +26,7 @@ use crate::{
     app,
     cli::Cli,
     client_event::ClientEvent,
-    insert_history::insert_history_lines,
+    insert_history::insert_history_lines_with_size,
     model::{AppState, AppUiCommand, ApprovalModalAction, FocusPane},
     store::Store,
     theme::Palette,
@@ -343,7 +343,7 @@ where
     // re-flush, so they can never disagree about a mid-frame resize.
     terminal.resize_viewport_to_size(height, size)?;
     if !lines_to_insert.is_empty() {
-        insert_history_lines(terminal, lines_to_insert)?;
+        insert_history_lines_with_size(terminal, lines_to_insert, size)?;
         terminal.invalidate_viewport();
     }
     terminal.draw(|frame| {
