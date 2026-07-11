@@ -1507,6 +1507,16 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
 
     match key.code {
         KeyCode::Esc => {
+            // Esc on the slash popup dismisses its composer draft too (the
+            // token that opened/filtered it — codex's dismiss semantics).
+            // Leaving "/the" behind made the NEXT `/` append into it instead
+            // of reopening the popup, and read as a user draft to the settled
+            // interrupt-restore's menu-close retry (which must never clobber
+            // real text). Cleared BEFORE the close so that retry sees the
+            // empty composer it needs.
+            if slash_help_capture_active(store) {
+                store.state.set_composer_text("");
+            }
             // Esc closes/backs out of menus, EXCEPT the root onboarding wizard
             // step while onboarding is in progress: that menu is only auto-opened
             // on first launch, so closing it would strand the user (issue #5).
@@ -2371,6 +2381,58 @@ mod tests {
             entries.iter().map(|s| s.to_string()).collect(),
         );
         store
+    }
+
+    #[test]
+    fn esc_dismisses_slash_popup_draft_and_applies_settled_restore() {
+        // Esc on the slash popup dismisses the WHOLE popup including its
+        // composer draft (codex's dismiss semantics). Leaving "/" behind made
+        // the next `/` append ("//", no popup) and blocked the settled
+        // interrupt-restore's menu-close retry (the hook must never clobber a
+        // real draft, and "/" read as one).
+        let mut store = store_with_live_reply_text("streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        let turn_id = store.state.sessions[0]
+            .live_reply
+            .as_ref()
+            .expect("live turn")
+            .turn_id
+            .clone();
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            "the interrupted prompt".into(),
+        );
+        store.state.focus = FocusPane::Composer;
+
+        // Esc interrupts (arms the deferred restore), `/` opens the popup.
+        handle_key(&mut store, key(KeyCode::Esc));
+        handle_key(&mut store, key(KeyCode::Char('/')));
+        assert!(store.state.menu_stack.is_active());
+        assert_eq!(store.state.composer, "/");
+
+        // The turn settles while the popup is open: restore defers again.
+        store.apply_event(AppUiEvent::Protocol(
+            octos_core::ui_protocol::UiNotification::TurnError(
+                octos_core::ui_protocol::TurnErrorEvent {
+                    session_id,
+                    topic: None,
+                    turn_id,
+                    code: "interrupted".into(),
+                    message: "turn interrupted by client".into(),
+                },
+            ),
+        ));
+        assert!(store.state.menu_stack.is_active(), "popup stays up");
+
+        // Esc dismisses the popup AND its slash draft; the settled restore
+        // then lands in the now-empty composer.
+        handle_key(&mut store, key(KeyCode::Esc));
+        assert!(!store.state.menu_stack.is_active());
+        assert_eq!(
+            store.state.composer, "the interrupted prompt",
+            "dismissing the popup hands the interrupted prompt back"
+        );
     }
 
     #[test]
