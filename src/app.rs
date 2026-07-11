@@ -3617,6 +3617,15 @@ fn push_message_block(
         return;
     }
 
+    // The synthesized turn-completion "Session Summary" cards (failure /
+    // no-answer / partial) render as a distinct block: a colored + bold title
+    // and bold field labels, instead of flat muted markdown that buries the
+    // error under everything else it says.
+    if role == "assistant" && is_session_summary_card(content) {
+        push_session_summary_card(lines, palette, content, bg, width);
+        return;
+    }
+
     push_formatted_body_marked(
         lines,
         palette,
@@ -3626,6 +3635,97 @@ fn push_message_block(
         Some(bg),
         width,
     );
+}
+
+/// Whether `content` is a synthesized turn-completion "Session Summary" card
+/// (see the `status.summary_*` locale templates): its first line is exactly
+/// the localized summary title and the body is the `- Label: value` list.
+fn is_session_summary_card(content: &str) -> bool {
+    let title = t!("status.summary_title");
+    content
+        .split_once('\n')
+        .is_some_and(|(first, rest)| first == title.as_ref() && rest.trim_start().starts_with("- "))
+}
+
+/// Render a "Session Summary" card: the title in a bold attention color, then
+/// each `- Label: value` row with the label bolded so the Result / Error /
+/// Activity fields stand out. The `- Error:` row's value is drawn in the
+/// danger color so a failure reads as a failure at a glance.
+fn push_session_summary_card(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    content: &str,
+    bg: Color,
+    width: usize,
+) {
+    let mut rows = content.lines();
+    let title = rows.next().unwrap_or_default();
+    // Title: `✦ Session Summary` in the highlight color, bold — a notice, not
+    // an error glyph (the same card also covers no-answer / partial, not only
+    // failure). The failure detail below carries the red.
+    lines.push(chat_line(
+        vec![Span::styled(
+            format!("{ASSISTANT_BODY_INDENT}✦ {title}"),
+            Style::default()
+                .fg(palette.highlight)
+                .add_modifier(Modifier::BOLD)
+                .bg(bg),
+        )],
+        Some(bg),
+    ));
+
+    // Budget the value text so `indent + "- " + label + ": " + value` fits the
+    // pane and never wraps to column 0 (the #273 indent-not-honored class).
+    let label_lead = ASSISTANT_BODY_INDENT.width() + 2; // indent + "- "
+    let error_label = t!("status.summary_error_label");
+    for row in rows {
+        let row = row.strip_prefix("- ").unwrap_or(row);
+        // Labels use `": "` (en) or the fullwidth `"："` (zh, no space).
+        let split = row
+            .split_once(": ")
+            .map(|(label, value)| (label, value, ": "))
+            .or_else(|| {
+                row.split_once('：')
+                    .map(|(label, value)| (label, value, "："))
+            });
+        let Some((label, value, sep)) = split else {
+            // A label-less row: render as a plain muted line.
+            let budget = width.saturating_sub(label_lead).max(8);
+            lines.push(chat_line(
+                vec![
+                    Span::styled(format!("{ASSISTANT_BODY_INDENT}- "), palette.muted().bg(bg)),
+                    Span::styled(
+                        truncate_to_display_width(row, budget),
+                        palette.text().bg(bg),
+                    ),
+                ],
+                Some(bg),
+            ));
+            continue;
+        };
+        // The Error row's value carries the danger color; every other value is
+        // the normal text color. Detected via the localized label.
+        let value_style = if label == error_label.as_ref() {
+            Style::default().fg(palette.danger).bg(bg)
+        } else {
+            palette.text().bg(bg)
+        };
+        let label_with_sep = format!("{label}{sep}");
+        let value_budget = width
+            .saturating_sub(label_lead + label_with_sep.width())
+            .max(8);
+        lines.push(chat_line(
+            vec![
+                Span::styled(format!("{ASSISTANT_BODY_INDENT}- "), palette.muted().bg(bg)),
+                Span::styled(
+                    label_with_sep,
+                    palette.text().add_modifier(Modifier::BOLD).bg(bg),
+                ),
+                Span::styled(truncate_to_display_width(value, value_budget), value_style),
+            ],
+            Some(bg),
+        ));
+    }
 }
 
 /// Render a (chunk of a) streaming reply. `first` controls the `• ` prose
@@ -9636,6 +9736,86 @@ mod tests {
             let (_, next) = octopus_swim(big + OCTOPUS_STROKE_MS, wrap_width);
             assert_ne!(frame, next, "parked octopus must keep alternating strokes");
         }
+    }
+
+    #[test]
+    fn session_summary_card_gets_a_highlighted_title_and_labels() {
+        // The synthesized failure "Session Summary" message renders as a
+        // distinct card — a highlight-colored bold title and bold field
+        // labels, with the error value in the danger color — instead of flat
+        // muted markdown (user report: "need highlights and color the title").
+        let content = t!(
+            "status.summary_failed",
+            code = "runtime_error",
+            message = "failed to send streaming request to Anthropic",
+            count = 20,
+            failed = "none recorded",
+        )
+        .into_owned();
+
+        assert!(
+            is_session_summary_card(&content),
+            "the failure template must be recognized as a summary card"
+        );
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let bg = chat_message_bg(palette, "assistant");
+        let mut lines = Vec::new();
+        push_message_block(&mut lines, palette, "assistant", &content, 120);
+
+        // Title row: bold + highlight color, prefixed with the ✦ notice glyph.
+        let title_line = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|s| s.content.contains("Session Summary"))
+            })
+            .expect("title line");
+        let title_span = title_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Session Summary"))
+            .unwrap();
+        assert!(
+            title_span.content.contains('✦'),
+            "title carries the ✦ notice glyph"
+        );
+        assert_eq!(
+            title_span.style.fg,
+            Some(palette.highlight),
+            "title is highlight-colored"
+        );
+        assert!(
+            title_span.style.add_modifier.contains(Modifier::BOLD),
+            "title is bold"
+        );
+
+        // The Error label is bold and its value is danger-colored.
+        let error_line = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|s| s.content.starts_with("Error")))
+            .expect("error line");
+        let label_span = error_line
+            .spans
+            .iter()
+            .find(|s| s.content.starts_with("Error"))
+            .unwrap();
+        assert!(
+            label_span.style.add_modifier.contains(Modifier::BOLD),
+            "the Error label is bold"
+        );
+        let value_span = error_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("failed to send"))
+            .expect("error value span");
+        assert_eq!(
+            value_span.style.fg,
+            Some(palette.danger),
+            "the error value is danger-colored"
+        );
+        let _ = bg;
     }
 
     #[test]

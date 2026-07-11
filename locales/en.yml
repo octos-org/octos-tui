@@ -776,6 +776,8 @@ status:
   # Staged diff-hunk context prompt (inserted into the composer / sent to the agent)
   diff_hunk_prompt: "Use this selected diff hunk as context for the next coding turn.\nfile: %{path}\nstatus: %{status}\nhunk: %{hunk}\n```diff\n"
   # Turn-completion fallback "Session Summary" assistant cards
+  summary_title: "Session Summary"
+  summary_error_label: "Error"
   summary_completed_no_answer: "Session Summary\n- Result: Turn completed, but the TUI did not receive a final assistant answer.\n- Activity: %{count} action(s) recorded.\n- Files changed: %{files}.\n- Validation: %{validation}.\n- Risks / follow-up: Review the activity above and continue the turn if the requested answer is incomplete."
   summary_partial_answer: "Session Summary\n- Result: Turn completed, but the TUI only received a partial live answer.\n- Activity: %{count} action(s) recorded.\n- Files changed: %{files}.\n- Validation: %{validation}.\n- Risks / follow-up: The server may have persisted a fuller answer; continue if the visible answer is incomplete."
   summary_failed: "Session Summary\n- Result: Turn failed before producing a final answer.\n- Error: %{code}: %{message}\n- Activity: %{count} action(s) recorded.\n- Failures: %{failed}.\n- Risks / follow-up: Fix the error above or continue the turn with a more specific instruction."
