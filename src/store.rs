@@ -9035,6 +9035,14 @@ impl Store {
     /// cannot resurrect it — then wake the staged drain so queued prompts
     /// flow to the new child instead of wedging forever.
     pub fn reconcile_after_backend_relaunch(&mut self) -> Option<AppUiCommand> {
+        // The old child's whole-job orchestration signals died with it. The
+        // NEW child never knew these sessions, so it will never emit their
+        // terminal `active:false` — a stale entry would pin the "Working"
+        // indicator forever (its only other clears are a live-turn interrupt
+        // or that terminal event). Drop them all; the new child's first
+        // orchestration tick re-asserts any session that is genuinely active.
+        self.state.orchestration.clear();
+        self.state.session_retry.clear();
         let latched: Vec<(octos_core::SessionKey, TurnId)> = self
             .state
             .sessions
@@ -9074,6 +9082,12 @@ impl Store {
                 message: t!("status.backend_relaunched_turn_lost").into_owned(),
             });
             follow_up = follow_up.or(command);
+        }
+        // A turn that died between submit and its first latched delta left
+        // run_state in-progress with nothing above to fail it — settle the
+        // chip so the status bar cannot read "Working" against a dead child.
+        if self.state.run_state.is_active() && self.state.active_turn().is_none() {
+            self.state.set_run_state_idle();
         }
         follow_up.or_else(|| self.submit_next_pending_if_idle())
     }
@@ -13295,6 +13309,43 @@ mod tests {
         assert!(
             format!("{command:?}").contains("queued prompt"),
             "the drained command must carry the staged prompt, got {command:?}"
+        );
+    }
+
+    /// The old child's whole-job orchestration signals died with it: the NEW
+    /// child never knew those sessions, so it will never send the terminal
+    /// `active:false` — a stale entry pins the "Working" indicator forever
+    /// (user report: Working never stopped after the backend was killed
+    /// mid-task and relaunched). The relaunch reconcile must drop them all;
+    /// genuinely-active sessions get re-asserted by the new child's first
+    /// orchestration tick.
+    #[test]
+    fn backend_relaunch_clears_stale_orchestration() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        for key in ["local:a", "local:b"] {
+            let session_id = SessionKey(key.into());
+            store.state.orchestration.insert(
+                session_id.clone(),
+                octos_core::ui_protocol::SessionOrchestrationEvent {
+                    session_id,
+                    active: true,
+                    running_agents: 1,
+                    pending_continuations: 0,
+                    phase: Some("working".into()),
+                },
+            );
+        }
+        store.state.set_run_state_in_progress();
+
+        store.apply_client_event(ClientEvent::BackendRelaunched);
+
+        assert!(
+            store.state.orchestration.is_empty(),
+            "stale orchestration entries must die with the old child"
+        );
+        assert!(
+            !store.state.run_state.is_active(),
+            "no latched turn + dead child -> the run cannot still be in progress"
         );
     }
 
