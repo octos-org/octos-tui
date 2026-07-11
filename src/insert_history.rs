@@ -262,7 +262,7 @@ where
 /// 8-bit CSI/OSC forms) — is removed. Removing the introducer defuses the
 /// whole escape sequence (its params become inert printable text). Styling
 /// and span boundaries are preserved. Clean spans are left unallocated.
-fn sanitize_line_in_place(line: &mut Line<'_>) {
+pub(crate) fn sanitize_line_in_place(line: &mut Line<'_>) {
     for span in &mut line.spans {
         let content = span.content.as_ref();
         if content.chars().any(char::is_control) {
@@ -341,11 +341,16 @@ pub(crate) fn wrap_line(line: &Line, width: usize) -> Vec<Line<'static>> {
         }
         if unit.width > width {
             // A single word longer than the width: hard-split it piece-wise so
-            // each fragment keeps its own span's style.
+            // each fragment keeps its own span's style. The budget accounting
+            // MUST use the same per-char widths the cutter used (`used`), not
+            // `str::width` of the chunk — control characters count 0 for the
+            // cutter but 1 for `str::width`, and the mismatch let `cur_width`
+            // exceed `width` and underflow `width - cur_width` (codex r2 P1).
             for piece in unit.pieces {
                 let mut rest = piece.content.as_ref();
                 while !rest.is_empty() {
-                    let (chunk, tail) = split_at_display_width(rest, width - cur_width);
+                    let (chunk, used, tail) =
+                        split_at_display_width(rest, width.saturating_sub(cur_width));
                     if chunk.is_empty() {
                         if cur_width == 0 {
                             // A single glyph wider than the whole width (a CJK
@@ -366,7 +371,7 @@ pub(crate) fn wrap_line(line: &Line, width: usize) -> Vec<Line<'static>> {
                         continue;
                     }
                     cur.push(Span::styled(chunk.to_string(), piece.style));
-                    cur_width += chunk.width();
+                    cur_width += used;
                     rest = tail;
                 }
             }
@@ -387,8 +392,10 @@ pub(crate) fn wrap_line(line: &Line, width: usize) -> Vec<Line<'static>> {
 }
 
 /// Longest prefix of `s` whose display width is `<= cols` (char-boundary
-/// safe), plus the remainder.
-fn split_at_display_width(s: &str, cols: usize) -> (&str, &str) {
+/// safe): returns the prefix, the per-char width it consumed (the caller must
+/// account with THIS value, not `str::width`, so cutter and budget agree on
+/// zero-width/control chars), and the remainder.
+fn split_at_display_width(s: &str, cols: usize) -> (&str, usize, &str) {
     let mut end = 0;
     let mut used = 0usize;
     for (i, ch) in s.char_indices() {
@@ -399,7 +406,8 @@ fn split_at_display_width(s: &str, cols: usize) -> (&str, &str) {
         end = i + ch.len_utf8();
         used += cw;
     }
-    s.split_at(end)
+    let (chunk, rest) = s.split_at(end);
+    (chunk, used, rest)
 }
 
 fn finish_line(spans: Vec<Span<'static>>, style: ratatui::style::Style) -> Line<'static> {
@@ -1518,6 +1526,30 @@ mod tests {
                 .any(|s| s.content.as_ref() == "VISIBLE"
                     && s.style.add_modifier.contains(Modifier::ITALIC)),
             "the styled middle piece keeps its own style: {out:#?}"
+        );
+    }
+
+    /// codex-review regression (r2 P1): control characters count 0 columns in
+    /// the char-based cutter but 1 in `str::width`, so budget accounting mixed
+    /// the two and `width - cur_width` could underflow on adversarial input
+    /// (ESC-bearing spans). The wrapper must never panic, whatever the bytes.
+    #[test]
+    fn wrap_survives_control_characters_without_underflow() {
+        use ratatui::style::Stylize;
+        let line = Line::from(vec![
+            Span::from(format!("\u{1b}\u{1b}{}", "a".repeat(79))),
+            "b".bold(),
+            Span::from("c"),
+        ]);
+        let out = wrap_line(&line, 80);
+        let rejoined: String = out
+            .iter()
+            .flat_map(|l| &l.spans)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            rejoined.contains(&"a".repeat(79)) && rejoined.contains('b') && rejoined.contains('c'),
+            "no visible character may be lost: {out:?}"
         );
     }
 

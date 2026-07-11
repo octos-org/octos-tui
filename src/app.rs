@@ -4221,6 +4221,17 @@ fn finish_hanging_body(
         return;
     }
 
+    // Sanitize BEFORE measuring — the same order `insert_history` uses. Tabs
+    // render as four columns once scrollback sanitizes them, so measuring the
+    // raw `\t` (0 columns here, 1 in `str::width`) under-counted the row: it
+    // passed the pre-wrap check, then insert-time wrapping split it back to a
+    // column-zero continuation, losing the hang (codex r2 P2). Stripping the
+    // other control chars here also keeps the pre-wrap cutter's budget honest
+    // (codex r2 P1) and renders deterministically in the live lane.
+    for line in lines[body_start..].iter_mut() {
+        crate::insert_history::sanitize_line_in_place(line);
+    }
+
     if let Some(marker) = prose_marker
         && let Some(first_line) = lines[body_start..]
             .iter_mut()
@@ -17086,6 +17097,49 @@ mod tests {
             line_texts(&pending_lines),
             vec!["› queued question"],
             "pending-message rows keep their `› ` prefix"
+        );
+    }
+
+    /// codex-review (r2 P2): tabs render as FOUR columns once
+    /// `insert_history` sanitizes scrollback, but the body used to be
+    /// measured with the raw `\t` (0–1 columns), so a tab-bearing code row
+    /// passed the pre-wrap check and was then re-wrapped to a column-zero
+    /// continuation at insert time — losing the hang. Assistant bodies must
+    /// sanitize (expand tabs, strip controls) BEFORE measuring, mirroring
+    /// insert_history's sanitize-first-wrap-after order, so rendered rows
+    /// carry no raw controls and stay within the wrap width post-expansion.
+    #[test]
+    fn assistant_body_expands_tabs_before_prewrap_measurement() {
+        let wrap_width = 16usize;
+        let mut lines = Vec::new();
+        push_message_block(
+            &mut lines,
+            Palette::for_theme(ThemeName::Slate),
+            "assistant",
+            "```\nab\tcdefgh\n```\n\nprose\twith tab",
+            wrap_width,
+        );
+        let texts = line_texts(&lines);
+        for (idx, (line, text)) in lines.iter().zip(&texts).enumerate() {
+            assert!(
+                !text.contains('\t') && !text.chars().any(char::is_control),
+                "row {idx} must carry no raw control characters: {text:?}"
+            );
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref().width())
+                .sum();
+            assert!(
+                w <= wrap_width,
+                "row {idx} width {w} exceeds wrap_width {wrap_width} after tab expansion: {texts:#?}"
+            );
+        }
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.starts_with("  ") && text.contains("cdefgh")),
+            "the tab-bearing code row still hangs: {texts:#?}"
         );
     }
 
