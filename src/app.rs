@@ -746,6 +746,34 @@ fn push_committed_assistant_reply_segments(
     wrap_width: usize,
     boundaries: &[usize],
 ) {
+    // A trailing "Session Summary" block (appended after a partial reply) must
+    // render as a card here too — this segmented native-scrollback path is
+    // used for tool-backed replies and otherwise bypasses `push_message_block`'s
+    // summary detection (codex P2 on #292). Split the prose body from the
+    // summary, render the body's segments (boundaries within it), then the
+    // card. Recursion terminates because the body has no summary block.
+    if let Some(start) = session_summary_block_start(content) {
+        let body = content[..start].trim_end();
+        let summary = &content[start..];
+        if !body.is_empty() {
+            let body_boundaries: Vec<usize> = boundaries
+                .iter()
+                .copied()
+                .filter(|boundary| *boundary < body.len())
+                .collect();
+            push_committed_assistant_reply_segments(
+                lines,
+                palette,
+                body,
+                wrap_width,
+                &body_boundaries,
+            );
+        }
+        let bg = chat_message_bg(palette, "assistant");
+        push_session_summary_card(lines, palette, summary, bg, wrap_width);
+        return;
+    }
+
     let mut cursor = 0;
     let mut first = true;
     let mut previous_reply_has_output = false;
@@ -9789,6 +9817,38 @@ mod tests {
             let (_, next) = octopus_swim(big + OCTOPUS_STROKE_MS, wrap_width);
             assert_ne!(frame, next, "parked octopus must keep alternating strokes");
         }
+    }
+
+    #[test]
+    fn segmented_reply_still_renders_a_trailing_summary_as_a_card() {
+        // The native-scrollback segmented path (tool-backed replies) must also
+        // give a trailing Session Summary the card treatment, not flat
+        // markdown (codex P2 round 2 on #292).
+        let summary = t!(
+            "status.summary_partial_answer",
+            count = 2,
+            files = "none observed",
+            validation = "not reported",
+        )
+        .into_owned();
+        // A reply with an internal segment boundary (as a tool call inserts),
+        // then the appended summary.
+        let body = "First I ran a tool.\n\nThen I continued.";
+        let content = format!("{body}\n\n{summary}");
+        let boundaries = vec![body.find("\n\nThen").unwrap()];
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let mut lines = Vec::new();
+        push_committed_assistant_reply_segments(&mut lines, palette, &content, 120, &boundaries);
+        let text = lines_text(&lines);
+        assert!(
+            text.contains("First I ran a tool"),
+            "prose body renders: {text:?}"
+        );
+        assert!(
+            text.contains("✦"),
+            "the trailing summary gets the card glyph: {text:?}"
+        );
     }
 
     #[test]
