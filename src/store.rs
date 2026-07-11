@@ -4443,35 +4443,67 @@ impl Store {
         }
     }
 
+    /// A newer turn in `session_id` supersedes that session's pending
+    /// interrupt-restore: restoring the old prompt while the successor streams
+    /// would re-block the `/` slash popup (a non-empty composer). Fires from
+    /// BOTH the `TurnStarted` arm and the delta-first lazy-bind path, so a
+    /// successor whose `TurnStarted` never reached this client still supersedes.
+    /// The entry for the SAME turn (a terminal that already settled it) is kept.
+    fn supersede_pending_interrupt_restore(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        self.state
+            .pending_interrupt_restores
+            .retain(|pending| pending.session_id != *session_id || pending.turn_id == *turn_id);
+    }
+
     /// Menu-close hook for a restore whose terminal arrived WHILE a menu was
     /// open (see `restore_interrupted_prompt_on_settle`): once the stack is
-    /// empty, apply the active session's settled entry. A non-empty composer
-    /// (e.g. a dispatch just completed a slash draft into it) leaves the
-    /// entry for a later close — never clobber, never lose.
+    /// empty, apply the active session's settled entry into the live composer.
+    /// A non-empty composer (e.g. a dispatch just completed a slash draft into
+    /// it) leaves the active entry for a later close — never clobber, never
+    /// lose.
     fn apply_settled_interrupt_restore_after_menu_close(&mut self) {
         if self.state.menu_stack.is_active() {
             return;
         }
-        let Some(active_id) = self
+        let active_id = self
             .state
             .active_session()
-            .map(|session| session.id.clone())
-        else {
-            return;
-        };
-        let Some(index) = self
+            .map(|session| session.id.clone());
+        // Active session's settled entry → live composer, only while it is
+        // still empty (a completed dispatch may have filled it; then the
+        // entry waits for a later close).
+        if let Some(active_id) = active_id.as_ref()
+            && self.state.composer.is_empty()
+            && let Some(index) = self
+                .state
+                .pending_interrupt_restores
+                .iter()
+                .position(|pending| pending.settled && pending.session_id == *active_id)
+        {
+            let pending = self.state.pending_interrupt_restores.remove(index);
+            self.apply_interrupt_restore(pending, true);
+        }
+        // Settled entries whose session is NO LONGER active were orphaned when
+        // the user switched selection while the menu was open (codex round-4):
+        // the active-session lookup above can never reach them and no later
+        // event re-triggers them. Flush each into its own session's saved
+        // draft now — a non-active entry can only ever route to a draft, so
+        // this is the same terminal disposition it would have gotten had the
+        // menu closed before the switch.
+        let orphaned: Vec<usize> = self
             .state
             .pending_interrupt_restores
             .iter()
-            .position(|pending| pending.settled && pending.session_id == active_id)
-        else {
-            return;
-        };
-        if !self.state.composer.is_empty() {
-            return;
+            .enumerate()
+            .filter(|(_, pending)| {
+                pending.settled && active_id.as_ref() != Some(&pending.session_id)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in orphaned.into_iter().rev() {
+            let pending = self.state.pending_interrupt_restores.remove(index);
+            self.apply_interrupt_restore(pending, false);
         }
-        let pending = self.state.pending_interrupt_restores.remove(index);
-        self.apply_interrupt_restore(pending, true);
     }
 
     pub fn respond_approval_command(
@@ -7369,9 +7401,7 @@ impl Store {
                 // successor streams would re-block the `/` slash popup
                 // (non-empty composer), which is exactly what the deferral
                 // exists to prevent. Other sessions' entries are untouched.
-                self.state.pending_interrupt_restores.retain(|pending| {
-                    pending.session_id != event.session_id || pending.turn_id == event.turn_id
-                });
+                self.supersede_pending_interrupt_restore(&event.session_id, &event.turn_id);
                 // A new turn for the active session starts a fresh live_reply
                 // UNCONDITIONALLY — server-INITIATED master-continuation turns
                 // (reason=child_completed / scatter_join_complete) carry no
@@ -7468,6 +7498,13 @@ impl Store {
                     self.commit_pending_live_reply_for_turn_switch(&session_id, &turn_id);
                     self.state
                         .record_turn_prompt_anchor_from_latest_user(&session_id, &turn_id);
+                    // A successor turn that materializes DELTA-FIRST (its
+                    // `TurnStarted` never reached this client) supersedes the
+                    // session's pending interrupt-restore exactly as the
+                    // `TurnStarted` arm does — otherwise the stale prompt
+                    // survives to re-block the `/` popup on the next menu
+                    // close while this successor streams (codex round-4).
+                    self.supersede_pending_interrupt_restore(&session_id, &turn_id);
                 }
                 let mut reset_scroll = false;
                 if let Some(session) = self.find_session_mut(&session_id) {
@@ -22665,6 +22702,129 @@ mod tests {
         assert_eq!(
             store.state.composer, "prompt behind the popup",
             "closing the menu applies the settled restore"
+        );
+        assert!(store.state.pending_interrupt_restores.is_empty());
+    }
+
+    #[test]
+    fn settled_restore_dropped_when_successor_lazy_binds_after_menu_settle() {
+        // codex r4: A settles UNDER a menu (entry kept, settled) which also
+        // clears live_reply; successor B's first delta then lazy-binds with
+        // live_reply == None, which used to skip the supersede (it lived
+        // behind the prior-turn early return). Closing the menu then filled
+        // the composer with A's prompt while B streamed.
+        let turn_a = TurnId::new();
+        let mut store = store_with_live_reply(turn_a.clone(), "streaming a");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_a.clone(),
+            "prompt for a".into(),
+        );
+        store.interrupt_command().expect("A's turn interrupts");
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a,
+                code: "interrupted".into(),
+                message: "turn interrupted by client".into(),
+            },
+        )));
+        assert!(
+            store
+                .state
+                .pending_interrupt_restores
+                .iter()
+                .any(|pending| pending.settled),
+            "the entry waits out the open menu"
+        );
+
+        // Successor B lazy-binds from its first delta (no TurnStarted, and
+        // live_reply is None after A's settle).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id,
+                topic: None,
+                turn_id: TurnId::new(),
+                text: "successor stream".into(),
+            },
+        )));
+
+        store.close_menu();
+        assert!(
+            store.state.composer.is_empty(),
+            "A's settled restore is superseded by the lazy-bound successor"
+        );
+        assert!(store.state.pending_interrupt_restores.is_empty());
+    }
+
+    #[test]
+    fn settled_restore_lands_in_draft_when_selection_switched_before_close() {
+        // codex r4: the menu-close retry only looked at the ACTIVE session.
+        // If the selection switched while the menu was open, the settled
+        // entry was skipped and had no later trigger — it must land in its
+        // own session's draft on that close.
+        let turn_a = TurnId::new();
+        let session_a = SessionView {
+            id: SessionKey("local:a".into()),
+            title: "a".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: Some(LiveReply {
+                turn_id: turn_a.clone(),
+                text: "streaming a".into(),
+            }),
+        };
+        let session_b = SessionView {
+            id: SessionKey("local:b".into()),
+            title: "b".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: AppState::new(vec![session_a, session_b], 0, "ready".into(), None, false),
+        };
+        let session_a_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_a_id.clone(),
+            turn_a.clone(),
+            "prompt for a".into(),
+        );
+        store.interrupt_command().expect("A's turn interrupts");
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_a_id.clone(),
+                topic: None,
+                turn_id: turn_a,
+                code: "interrupted".into(),
+                message: "turn interrupted by client".into(),
+            },
+        )));
+
+        // Selection moves to B while the menu is still open.
+        store.state.switch_selected_session(1);
+        store.close_menu();
+
+        assert!(
+            store.state.composer.is_empty(),
+            "B's live composer must not receive A's prompt"
+        );
+        let draft = store
+            .state
+            .composer_drafts
+            .iter()
+            .find(|draft| draft.session_id == session_a_id)
+            .map(|draft| draft.text.clone());
+        assert_eq!(
+            draft.as_deref(),
+            Some("prompt for a"),
+            "the settled entry lands in A's draft at menu close"
         );
         assert!(store.state.pending_interrupt_restores.is_empty());
     }
