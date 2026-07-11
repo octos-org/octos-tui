@@ -442,6 +442,19 @@ impl Store {
             // it (an answering one stays; its result may still land).
             self.state.clear_settled_btw_aside(&session_id);
         }
+        self.queue_or_start_prompt_turn(prompt, t!("status.queued_turn_start").into_owned())
+    }
+
+    /// Mid-turn staging chokepoint for every prompt submission (composer,
+    /// menu `SubmitPrompt`, `PromptTemplate`): an active turn stages the
+    /// prompt onto the session's queue — starting a SECOND `turn/start`
+    /// concurrently with the live turn corrupts run-state bookkeeping and
+    /// races the server — while an idle session starts the turn.
+    fn queue_or_start_prompt_turn(
+        &mut self,
+        prompt: String,
+        queued_status: String,
+    ) -> Option<AppUiCommand> {
         if self.state.active_turn().is_some() {
             self.state.pending_messages.push(prompt);
             self.state.status = t!("status.message_staged").into_owned();
@@ -449,7 +462,7 @@ impl Store {
             return None;
         }
 
-        self.start_prompt_turn(prompt, t!("status.queued_turn_start").into_owned())
+        self.start_prompt_turn(prompt, queued_status)
     }
 
     #[allow(dead_code)]
@@ -1100,14 +1113,17 @@ impl Store {
                 SlashDispatchOutcome::Rejected
             }
             CommandEntry::PromptTemplate(template) => {
-                // Submits a turn; only `None` when there is no active session
-                // (nothing was submitted) — treat that as rejected (fail-closed).
-                match self.start_prompt_turn(
-                    (*template).to_string(),
-                    t!("status.queued_prompt_template").into_owned(),
-                ) {
-                    Some(command) => SlashDispatchOutcome::accepted(Some(command)),
-                    None => SlashDispatchOutcome::Rejected,
+                // Submits a turn. Rejected only when there is no active
+                // session (nothing ran — fail-closed); a mid-turn STAGE is an
+                // accepted client-side run (no backend command yet, the
+                // staged drain submits it when the live turn settles).
+                if self.active_session().is_none() {
+                    SlashDispatchOutcome::Rejected
+                } else {
+                    SlashDispatchOutcome::accepted(self.queue_or_start_prompt_turn(
+                        (*template).to_string(),
+                        t!("status.queued_prompt_template").into_owned(),
+                    ))
                 }
             }
         }
@@ -3845,7 +3861,12 @@ impl Store {
                 Some(*command)
             }
             MenuAction::SubmitPrompt(prompt) => {
-                self.start_prompt_turn(prompt, t!("status.queued_menu_prompt").into_owned())
+                // Mid-turn a menu prompt STAGES (like a composer submit)
+                // instead of racing a second `turn/start` under the live turn.
+                self.queue_or_start_prompt_turn(
+                    prompt,
+                    t!("status.queued_menu_prompt").into_owned(),
+                )
             }
             MenuAction::Noop => None,
         }
@@ -4196,6 +4217,10 @@ impl Store {
         prompt: String,
         status: impl Into<String>,
     ) -> Option<AppUiCommand> {
+        // A new submit (typed, menu-driven, or the staged drain) supersedes a
+        // pending interrupt-restore: the user moved on, and restoring the old
+        // prompt under the new turn would re-block the `/` slash popup.
+        self.state.pending_interrupt_restore = None;
         let session_id = self.active_session()?.id.clone();
         let turn_id = octos_core::ui_protocol::TurnId::new();
         self.state.record_submitted_user_prompt(
@@ -4284,17 +4309,29 @@ impl Store {
             return None;
         };
 
-        // A user Esc/Ctrl+C is a "stop and let me edit/resend" gesture, so put
-        // the interrupted turn's prompt back into the composer. Only when the
-        // composer is empty — never clobber text the user has since typed. This
-        // is the single user-initiated interrupt chokepoint (both Esc and
-        // Ctrl+C route here), so the restore fires exactly once and is always
-        // user-driven; genuine turn errors never reach it.
+        // A user Esc/Ctrl+C is a "stop and let me edit/resend" gesture, so the
+        // interrupted turn's prompt comes back to the composer — but only once
+        // the turn actually SETTLES (its terminal arrives), not here at
+        // request time. The interrupt is async: the turn may keep streaming
+        // for a while (or forever, when it is wedged), and filling the
+        // composer while it is still live silently blocked the `/` slash
+        // popup (it only opens on an EMPTY composer) — typing the status
+        // line's own "/stop" guidance then STAGED "old prompt/stop" as a chat
+        // message. Stash the prompt instead; `commit_live_reply` /
+        // `fail_live_reply` apply it when this turn's terminal lands. Armed
+        // only from an empty composer — never clobber text the user has since
+        // typed (the apply site re-checks). This is the single user-initiated
+        // interrupt chokepoint (both Esc and Ctrl+C route here), so the stash
+        // is always user-driven; genuine turn errors never arm it.
         if self.state.composer.is_empty()
             && let Some(prompt) = self.state.submitted_prompt_for_turn(&session_id, &turn_id)
             && !prompt.trim().is_empty()
         {
-            self.state.set_composer_text(prompt);
+            self.state.pending_interrupt_restore = Some(crate::model::PendingInterruptRestore {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                prompt,
+            });
         }
 
         self.state.status = t!("status.interrupt_requested_active_turn").into_owned();
@@ -4302,6 +4339,69 @@ impl Store {
             session_id,
             turn_id,
         }))
+    }
+
+    /// Apply (or drop) the deferred Esc/Ctrl+C prompt restore when the
+    /// interrupted turn's terminal lands (see `interrupt_command`). The prompt
+    /// goes into the live composer only when the session is still active, the
+    /// composer is still empty, and no menu is open (filling the composer
+    /// under the slash popup would flip its key routing into composer-edit
+    /// mid-browse). A switched-away session receives it as its saved composer
+    /// draft instead — the `pending_rewind_prefill` convention. Staged
+    /// messages waiting for the turn slot win outright: their drain submits
+    /// next, and the old prompt stays reachable through composer history.
+    fn restore_interrupted_prompt_on_settle(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        if self
+            .state
+            .pending_interrupt_restore
+            .as_ref()
+            .is_none_or(|pending| pending.session_id != *session_id || pending.turn_id != *turn_id)
+        {
+            return;
+        }
+        let pending = self
+            .state
+            .pending_interrupt_restore
+            .take()
+            .expect("matched above");
+        let pending_is_active = self
+            .state
+            .active_session()
+            .is_some_and(|session| session.id == pending.session_id);
+        let staged_for_session = if pending_is_active {
+            !self.state.pending_messages.is_empty()
+        } else {
+            self.state
+                .pending_messages_by_session
+                .get(&pending.session_id)
+                .is_some_and(|queue| !queue.is_empty())
+        };
+        if staged_for_session {
+            return;
+        }
+        if pending_is_active {
+            if self.state.composer.is_empty() && !self.state.menu_stack.is_active() {
+                // Same composer-set mechanism as the rewind prefill.
+                self.state.set_composer_text(pending.prompt);
+                self.state.focus = FocusPane::Composer;
+            }
+        } else if let Some(draft) = self
+            .state
+            .composer_drafts
+            .iter_mut()
+            .find(|draft| draft.session_id == pending.session_id)
+        {
+            if draft.text.is_empty() {
+                draft.text = pending.prompt;
+            }
+        } else {
+            self.state
+                .composer_drafts
+                .push(crate::model::ComposerDraft {
+                    session_id: pending.session_id,
+                    text: pending.prompt,
+                });
+        }
     }
 
     pub fn respond_approval_command(
@@ -5509,6 +5609,10 @@ impl Store {
                 // echoed in a snapshot, so preserve both across replays.
                 let rewind_turns = self.state.rewind_turns.clone();
                 let pending_rewind_prefill = self.state.pending_rewind_prefill.clone();
+                // Local-only in-flight interrupt-restore stash: the server
+                // never echoes it, and dropping it across a replay would lose
+                // the deferred edit/resend prompt for the interrupted turn.
+                let pending_interrupt_restore = self.state.pending_interrupt_restore.clone();
                 // Local-only turn-lifecycle guards the server never echoes.
                 // Dropping `completed_turns` across a replay reopens the #218
                 // late-delta wedge on reconnect: `is_turn_completed` forgets a
@@ -5575,6 +5679,7 @@ impl Store {
                 state.resume_list_loaded = resume_list_loaded;
                 state.rewind_turns = rewind_turns;
                 state.pending_rewind_prefill = pending_rewind_prefill;
+                state.pending_interrupt_restore = pending_interrupt_restore;
                 state.completed_turns = completed_turns;
                 state.finalized_by_switch = finalized_by_switch;
                 state.live_reasoning = live_reasoning;
@@ -7184,6 +7289,21 @@ impl Store {
                 // on turn so a stale/continuation TurnStarted for a DIFFERENT
                 // turn cannot drop a newer staged submit's gate.
                 self.release_staged_gate_for_turn(&event.session_id, &event.turn_id);
+                // A NEWER turn in this session supersedes a pending
+                // interrupt-restore for an older one: restoring the old
+                // prompt while the successor streams would re-block the `/`
+                // slash popup (non-empty composer), which is exactly what the
+                // deferral exists to prevent.
+                if self
+                    .state
+                    .pending_interrupt_restore
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.session_id == event.session_id && pending.turn_id != event.turn_id
+                    })
+                {
+                    self.state.pending_interrupt_restore = None;
+                }
                 // A new turn for the active session starts a fresh live_reply
                 // UNCONDITIONALLY — server-INITIATED master-continuation turns
                 // (reason=child_completed / scatter_join_complete) carry no
@@ -8445,6 +8565,10 @@ impl Store {
     }
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
+        // The turn the user interrupted has settled — its deferred prompt
+        // restore applies now (before the duplicate-terminal early returns:
+        // any first terminal for the armed turn consumes the stash).
+        self.restore_interrupted_prompt_on_settle(&event.session_id, &event.turn_id);
         // Hang safety (the #218 lesson): a compaction block must never
         // outlive ITS turn — but a stale/duplicate terminal for an older
         // turn must not clear a newer turn's block.
@@ -8641,6 +8765,10 @@ impl Store {
     }
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
+        // The interrupted turn has settled (an Esc/Ctrl+C typically lands here
+        // as the server's `code == "interrupted"` terminal) — apply the
+        // deferred prompt restore (mirror of `commit_live_reply`).
+        self.restore_interrupted_prompt_on_settle(&event.session_id, &event.turn_id);
         if self
             .state
             .live_compaction
@@ -22134,20 +22262,362 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_restores_submitted_prompt_into_empty_composer() {
+    fn interrupt_defers_prompt_restore_until_the_turn_settles() {
         let turn_id = TurnId::new();
         let mut store = store_with_live_reply(turn_id.clone(), "streaming");
         let session_id = store.state.sessions[0].id.clone();
-        store
-            .state
-            .record_submitted_user_prompt(session_id, turn_id, "fix the flaky test".into());
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            "fix the flaky test".into(),
+        );
         assert!(store.state.composer.is_empty());
 
         store.interrupt_command().expect("active turn interrupts");
 
+        // The interrupt is only REQUESTED — the turn is still live and the
+        // server may keep streaming (or never settle: the wedged-turn case).
+        // The composer must stay empty so `/` still opens the slash popup
+        // while the stream continues.
+        assert!(
+            store.state.composer.is_empty(),
+            "no restore while the interrupted turn is still live"
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                text: " more words".into(),
+            },
+        )));
+        assert!(
+            store.state.composer.is_empty(),
+            "post-interrupt deltas must not trigger the restore either"
+        );
+
+        // The interrupt lands (the turn's terminal) — NOW the prompt comes
+        // back for edit/resend, the original #270 affordance.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                code: "interrupted".into(),
+                message: "turn interrupted by client".into(),
+            },
+        )));
         assert_eq!(
             store.state.composer, "fix the flaky test",
-            "the interrupted prompt is restored so it can be edited and resent"
+            "the interrupted prompt is restored once the turn actually stops"
+        );
+        assert_eq!(store.state.focus, FocusPane::Composer);
+        assert!(store.state.pending_interrupt_restore.is_none());
+    }
+
+    #[test]
+    fn interrupt_restore_applies_on_turn_completed_terminal_too() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            "summarize the diff".into(),
+        );
+
+        store.interrupt_command().expect("active turn interrupts");
+        assert!(store.state.composer.is_empty());
+
+        // Some servers settle an interrupted turn with a normal completion.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert_eq!(store.state.composer, "summarize the diff");
+    }
+
+    #[test]
+    fn interrupt_restore_skips_when_user_typed_meanwhile() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            "fix the flaky test".into(),
+        );
+
+        store.interrupt_command().expect("active turn interrupts");
+        store
+            .state
+            .set_composer_text("a new idea I typed after Esc");
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                code: "interrupted".into(),
+                message: "turn interrupted by client".into(),
+            },
+        )));
+        assert_eq!(
+            store.state.composer, "a new idea I typed after Esc",
+            "text typed between Esc and the terminal must never be clobbered"
+        );
+        assert!(store.state.pending_interrupt_restore.is_none());
+    }
+
+    #[test]
+    fn interrupt_restore_yields_to_staged_messages() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            "original prompt".into(),
+        );
+
+        store.interrupt_command().expect("active turn interrupts");
+        // The user queued a replacement while the turn was live (the
+        // Esc-with-staged flow): the staged drain owns the next turn slot.
+        store
+            .state
+            .pending_messages
+            .push("replacement prompt".into());
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                code: "interrupted".into(),
+                message: "turn interrupted by client".into(),
+            },
+        )));
+        assert!(
+            store.state.composer.is_empty(),
+            "the restore must not fight the staged submit for the next turn"
+        );
+    }
+
+    #[test]
+    fn interrupt_restore_dropped_when_a_new_turn_starts() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            "original prompt".into(),
+        );
+        store.interrupt_command().expect("active turn interrupts");
+
+        // A successor turn starts (continuation / a new submit): restoring the
+        // OLD prompt mid-new-turn would re-block the slash popup.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: TurnId::new(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                code: "interrupted".into(),
+                message: "turn interrupted by client".into(),
+            },
+        )));
+        assert!(
+            store.state.composer.is_empty(),
+            "a superseded interrupt-restore must not fill the composer"
+        );
+        assert!(store.state.pending_interrupt_restore.is_none());
+    }
+
+    #[test]
+    fn interrupt_restore_lands_in_draft_when_session_switched() {
+        let turn_id = TurnId::new();
+        let session_a = SessionView {
+            id: SessionKey("local:a".into()),
+            title: "a".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: Some(LiveReply {
+                turn_id: turn_id.clone(),
+                text: "streaming".into(),
+            }),
+        };
+        let session_b = SessionView {
+            id: SessionKey("local:b".into()),
+            title: "b".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: AppState::new(vec![session_a, session_b], 0, "ready".into(), None, false),
+        };
+        let session_a_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_a_id.clone(),
+            turn_id.clone(),
+            "prompt for a".into(),
+        );
+        store.interrupt_command().expect("active turn interrupts");
+
+        store.state.switch_selected_session(1);
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_a_id.clone(),
+                topic: None,
+                turn_id,
+                code: "interrupted".into(),
+                message: "turn interrupted by client".into(),
+            },
+        )));
+
+        assert!(
+            store.state.composer.is_empty(),
+            "session B's live composer must not receive session A's prompt"
+        );
+        let draft = store
+            .state
+            .composer_drafts
+            .iter()
+            .find(|draft| draft.session_id == session_a_id)
+            .map(|draft| draft.text.clone());
+        assert_eq!(
+            draft.as_deref(),
+            Some("prompt for a"),
+            "the restored prompt becomes session A's draft (rewind-prefill convention)"
+        );
+    }
+
+    #[test]
+    fn menu_submit_prompt_stages_during_active_turn() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming");
+
+        let command = store.dispatch_menu_action(MenuAction::SubmitPrompt("run the report".into()));
+
+        assert!(
+            command.is_none(),
+            "a menu prompt must not start a second concurrent turn"
+        );
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["run the report".to_string()],
+            "the menu prompt is staged like a mid-turn composer submit"
+        );
+    }
+
+    #[test]
+    fn prompt_template_stages_during_active_turn() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming");
+
+        let outcome = store.dispatch_command_entry(
+            &crate::menu::types::CommandEntry::PromptTemplate("template body"),
+            None,
+        );
+
+        assert!(
+            matches!(outcome, SlashDispatchOutcome::Accepted(None)),
+            "a staged template is an accepted client-side run, got {outcome:?}"
+        );
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["template body".to_string()]
+        );
+    }
+
+    #[test]
+    fn slash_popup_survives_stream_deltas_with_selection() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
+        store.select_next_menu_item();
+        store.select_next_menu_item();
+        let selected = store
+            .state
+            .menu_stack
+            .active()
+            .expect("menu open")
+            .selected_index;
+        assert!(selected > 0, "selection moved off the first row");
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                text: "delta while browsing".into(),
+            },
+        )));
+
+        assert!(
+            store.state.menu_stack.is_active(),
+            "a stream delta must not close the slash popup"
+        );
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .expect("menu open")
+                .selected_index,
+            selected,
+            "a stream delta must not reset the popup selection"
+        );
+    }
+
+    #[test]
+    fn interrupt_restore_skips_while_a_menu_is_open() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            "original prompt".into(),
+        );
+        store.interrupt_command().expect("active turn interrupts");
+
+        // The user is browsing the slash popup when the interrupt lands:
+        // filling the composer under it would flip the popup's key routing
+        // into composer-edit mid-browse.
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                code: "interrupted".into(),
+                message: "turn interrupted by client".into(),
+            },
+        )));
+
+        assert!(
+            store.state.composer.is_empty(),
+            "the restore must not fill the composer under an open menu"
         );
     }
 

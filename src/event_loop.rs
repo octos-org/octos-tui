@@ -2374,6 +2374,46 @@ mod tests {
     }
 
     #[test]
+    fn slash_popup_opens_mid_turn_after_esc_interrupt() {
+        // The reported flow: a long turn is streaming, the status line coaches
+        // "Esc interrupt | /stop to close". The user presses Esc, the turn
+        // keeps streaming (interrupts are async — or the turn is wedged), then
+        // they type `/`. The popup must open: the interrupt must NOT have
+        // filled the composer behind their back while the turn is still live.
+        let mut store = store_with_live_reply_text("streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        let turn_id = store.state.sessions[0]
+            .live_reply
+            .as_ref()
+            .expect("live turn")
+            .turn_id
+            .clone();
+        store.state.record_submitted_user_prompt(
+            session_id,
+            turn_id,
+            "do a full code review pls".into(),
+        );
+        store.state.focus = FocusPane::Composer;
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+        assert!(
+            matches!(action, KeyAction::Send(_)),
+            "Esc interrupts the active turn"
+        );
+        assert!(
+            store.state.composer.is_empty(),
+            "the composer stays empty while the interrupted turn still streams"
+        );
+
+        handle_key(&mut store, key(KeyCode::Char('/')));
+        assert!(
+            store.state.menu_stack.is_active(),
+            "`/` must open the slash popup mid-turn after an Esc interrupt"
+        );
+        assert_eq!(store.state.composer, "/");
+    }
+
+    #[test]
     fn up_from_empty_composer_recalls_newest_then_older() {
         let mut store = composer_store_with_history(&["older", "newest"]);
         handle_key(&mut store, key(KeyCode::Up));

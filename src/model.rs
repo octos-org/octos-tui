@@ -3601,6 +3601,26 @@ pub struct AppState {
     /// instead of clobbering the live composer. Local-only, preserved across
     /// snapshot replays.
     pub pending_rewind_prefill: Option<(SessionKey, String)>,
+    /// Prompt of the turn the user interrupted (Esc/Ctrl+C), stashed until
+    /// that turn actually SETTLES (its `turn/completed`/`turn/error` terminal
+    /// arrives). Restoring at interrupt-REQUEST time filled the composer while
+    /// the turn was still streaming, and a non-empty composer silently blocks
+    /// the `/` slash popup (it only opens on an empty composer) — the reported
+    /// "slash menu is not usable while the LLM is outputting". Applied by the
+    /// terminal handlers into the live composer (active session, still-empty
+    /// composer, no open menu), or into the session's saved draft when the
+    /// user switched away (the `pending_rewind_prefill` convention); dropped
+    /// when staged messages own the next turn slot or a newer turn starts.
+    /// Local-only, preserved across snapshot replays.
+    pub pending_interrupt_restore: Option<PendingInterruptRestore>,
+}
+
+/// See [`AppState::pending_interrupt_restore`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInterruptRestore {
+    pub session_id: SessionKey,
+    pub turn_id: TurnId,
+    pub prompt: String,
 }
 
 /// M16-G2 per-session lifecycle ledger entry. The TUI keeps these in
@@ -5349,6 +5369,7 @@ impl AppState {
             resume_list_loaded: false,
             rewind_turns: Vec::new(),
             pending_rewind_prefill: None,
+            pending_interrupt_restore: None,
         }
     }
 
