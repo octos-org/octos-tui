@@ -308,7 +308,7 @@ where
                 &store.state,
                 palette,
                 height,
-                size.height,
+                size,
                 update.lines_to_insert,
                 live_tail_finalization,
             )
@@ -319,7 +319,7 @@ where
             &store.state,
             palette,
             height,
-            size.height,
+            size,
             update.lines_to_insert,
             live_tail_finalization,
         )
@@ -331,14 +331,17 @@ fn draw_inline_frame<B>(
     state: &crate::model::AppState,
     palette: Palette,
     height: u16,
-    terminal_height: u16,
+    size: ratatui::layout::Size,
     lines_to_insert: Vec<ratatui::text::Line<'static>>,
     live_tail_finalization: Option<app::LiveTurnFinalization>,
 ) -> Result<()>
 where
     B: Backend + io::Write,
 {
-    terminal.resize_viewport_to(height)?;
+    // `size` is the SAME snapshot the caller used for the scrollback
+    // stale-mark — one sample drives both the reset decision and the
+    // re-flush, so they can never disagree about a mid-frame resize.
+    terminal.resize_viewport_to_size(height, size)?;
     if !lines_to_insert.is_empty() {
         insert_history_lines(terminal, lines_to_insert)?;
         terminal.invalidate_viewport();
@@ -348,7 +351,7 @@ where
             frame,
             state,
             palette,
-            terminal_height,
+            size.height,
             live_tail_finalization.as_ref(),
         );
     })?;

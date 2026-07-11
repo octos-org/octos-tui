@@ -253,7 +253,13 @@ where
             || self.target_viewport_area(height, size) != self.viewport_area
     }
 
-    fn resize_viewport_to_size(&mut self, height: u16, size: Size) -> io::Result<()> {
+    /// [`Self::resize_viewport_to`] against a caller-supplied screen size.
+    ///
+    /// The inline draw path samples the size ONCE and threads that snapshot
+    /// through both the scrollback stale-mark decision and this reset, so a
+    /// resize landing between two samples can never full-clear the screen
+    /// without the same frame restaging the transcript (codex P1 on #281).
+    pub fn resize_viewport_to_size(&mut self, height: u16, size: Size) -> io::Result<()> {
         let old_area = self.viewport_area;
         let target = self.target_viewport_area(height, size);
         let width_changed = size.width != self.last_known_screen_size.width;
@@ -954,6 +960,49 @@ mod tests {
         // History extent scrolled with the content, not dropped.
         assert_eq!(terminal.visible_history_bottom(), 6);
         assert_eq!(terminal.visible_history_rows(), 5);
+    }
+
+    #[test]
+    fn resize_viewport_to_size_honors_the_callers_snapshot_not_the_backend() {
+        // codex P1 on #281: the event loop samples the screen size once and
+        // threads that snapshot through BOTH the scrollback stale-mark and
+        // this reset. If the backend resizes between the sample and the
+        // draw, the reset must still act on the caller's snapshot — acting
+        // on a fresh backend sample would full-clear the screen for a size
+        // change the stale-mark never saw, losing the transcript with no
+        // re-flush. The newer size is handled next frame, where the sample
+        // and last_known_screen_size disagree and both paths fire together.
+        let mut terminal = Terminal::new(RecordingBackend::new(12, 10)).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 8, 12, 2));
+        terminal.set_visible_history_extent(5, 6);
+        terminal.last_known_screen_size = Size::new(12, 10);
+
+        // The backend has ALREADY shrunk (mid-gap resize)…
+        terminal.backend_mut().size = Size::new(10, 10);
+        // …but the caller passes its earlier 12-wide snapshot: same size as
+        // last_known -> incremental path, NO full clear, snapshot recorded.
+        terminal
+            .resize_viewport_to_size(2, Size::new(12, 10))
+            .expect("same-snapshot resize");
+        assert!(
+            !terminal.backend().clears.contains(&ClearType::All),
+            "must not full-clear for a size change the caller never saw: {:?}",
+            terminal.backend().clears
+        );
+        assert_eq!(terminal.last_known_screen_size, Size::new(12, 10));
+
+        // Next frame samples fresh (10 wide) -> width change vs last_known,
+        // so the stale-mark condition fires AND this reset full-clears — the
+        // two decisions agree because they share the snapshot.
+        assert_ne!(
+            Size::new(10, 10).width,
+            terminal.last_known_screen_size.width
+        );
+        terminal
+            .resize_viewport_to_size(2, Size::new(10, 10))
+            .expect("fresh-snapshot resize");
+        assert_eq!(terminal.backend().clears, vec![ClearType::All]);
+        assert_eq!(terminal.last_known_screen_size, Size::new(10, 10));
     }
 
     #[test]
