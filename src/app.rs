@@ -5027,11 +5027,12 @@ fn render_btw_overlay(
         height,
     };
     let title = t!("app.btw.pane_title").into_owned();
+    let close_hint = t!("app.btw.close_hint").into_owned();
     frame.render_widget(Clear, overlay);
     frame.render_widget(
         Paragraph::new(lines)
             .style(palette.text().bg(palette.surface))
-            .block(titled_block(title, palette, false, None)),
+            .block(titled_block(title, palette, false, Some(close_hint))),
         overlay,
     );
 }

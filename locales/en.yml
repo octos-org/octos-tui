@@ -109,6 +109,8 @@ app:
     answering: "Answering…"
     failed: "Aside failed: %{error}"
     pane_title: "Aside — /btw"
+    close_hint: "Enter to close"
+    closed: "aside closed"
   turn_summary:
     ran_for: "Ran for %{duration}"
     tasks_still_running: "%{count} background task(s) still running"

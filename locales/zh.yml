@@ -100,6 +100,8 @@ app:
     answering: "回答中…"
     failed: "旁路提问失败:%{error}"
     pane_title: "旁白 — /btw"
+    close_hint: "回车 关闭"
+    closed: "旁白已关闭"
   turn_summary:
     ran_for: "耗时 %{duration}"
     tasks_still_running: "%{count} 个后台任务仍在运行"

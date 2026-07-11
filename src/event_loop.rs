@@ -1369,6 +1369,22 @@ fn handle_composer_vim_key(store: &mut Store, key: &KeyEvent) -> Option<KeyActio
 }
 
 fn handle_composer_enter(store: &mut Store) -> KeyAction {
+    // Codex-style dialog dismissal: Enter on an EMPTY composer closes the
+    // `/btw` aside pane and returns to the live session (submitting a real
+    // prompt already dismisses it via `clear_settled_btw_aside`). Codex's
+    // bottom-pane views close on plain Enter; the aside is non-modal, so the
+    // empty-composer guard keeps Enter-to-send untouched.
+    if store.state.composer.is_empty() {
+        let dismissed = store
+            .state
+            .active_session()
+            .map(|session| session.id.clone())
+            .is_some_and(|session_id| store.state.dismiss_btw_aside(&session_id));
+        if dismissed {
+            store.state.status = t!("app.btw.closed").into_owned();
+            return KeyAction::Continue;
+        }
+    }
     let command = store.compose_command();
     if store.state.exit_requested {
         KeyAction::Quit
@@ -3518,6 +3534,33 @@ mod tests {
         ));
         assert!(!store.state.expanded_tool_outputs);
         assert_eq!(store.state.status, "Collapsed tool output + diff");
+    }
+
+    /// Codex-style dialog dismissal: Enter on an EMPTY composer closes the
+    /// `/btw` aside pane; Enter with text still submits (and dismisses via the
+    /// submit path). Mirrors codex's bottom-pane "Enter to close" convention.
+    #[test]
+    fn empty_composer_enter_dismisses_btw_aside() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.set_btw_answering(&session_id, "quick q".into());
+        assert!(store.state.btw_asides.contains_key(&session_id));
+
+        assert!(matches!(
+            handle_key(&mut store, modified_key(KeyCode::Enter, KeyModifiers::NONE)),
+            KeyAction::Continue
+        ));
+        assert!(
+            !store.state.btw_asides.contains_key(&session_id),
+            "empty-composer Enter must close the aside pane"
+        );
+
+        // Without an aside, empty Enter stays a no-op (no send, no crash).
+        assert!(matches!(
+            handle_key(&mut store, modified_key(KeyCode::Enter, KeyModifiers::NONE)),
+            KeyAction::Continue
+        ));
     }
 
     #[test]

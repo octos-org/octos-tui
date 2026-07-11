@@ -6408,6 +6408,15 @@ impl AppState {
         }
     }
 
+    /// Codex-style dialog dismissal: unconditionally close the session's
+    /// `/btw` aside pane (Enter on an empty composer). Unlike
+    /// [`Self::clear_settled_btw_aside`] this also closes a still-answering
+    /// aside — the user chose to leave; a late answer for a dismissed aside
+    /// is dropped by `set_btw_answered`'s state guard.
+    pub fn dismiss_btw_aside(&mut self, session_id: &SessionKey) -> bool {
+        self.btw_asides.remove(session_id).is_some()
+    }
+
     /// Count of the session's still-running background work (pending/running
     /// tasks and sub-agents) — the `N still running` half of a turn summary.
     pub fn running_background_task_count(&self, session_id: &SessionKey) -> usize {
