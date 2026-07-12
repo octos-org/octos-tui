@@ -3476,62 +3476,9 @@ impl Store {
         false
     }
 
-    /// Best-effort `agent/output/read` for a sub-agent of the active session.
-    /// Emitted when the peek switches onto an agent so its existing output loads
-    /// even if it predates selection or arrives after a reconnect. Returns
-    /// `None` (and sets no status) when the backend doesn't advertise the method
-    /// or there is no active session — the live output deltas still populate the
-    /// overlay in that case.
-    pub fn read_active_agent_output_command(&self, agent_id: &str) -> Option<AppUiCommand> {
-        let supported =
-            self.state.capabilities.as_ref().is_some_and(|caps| {
-                caps.supports_method(crate::model::APPUI_METHOD_AGENT_OUTPUT_READ)
-            });
-        if !supported {
-            return None;
-        }
-        // Only fetch when the overlay has nothing to show yet: once live deltas
-        // populate the cache they are the source of truth (and set_agent_output
-        // is fill-if-empty, so a read over a populated cache is dropped anyway).
-        // This targets output that predates selection — e.g. a completed agent
-        // whose stream has already ended.
-        if self
-            .state
-            .active_agent_output(agent_id)
-            .is_some_and(|text| !text.is_empty())
-        {
-            return None;
-        }
-        let session_id = self.state.active_session()?.id.clone();
-        Some(AppUiCommand::ReadAgentOutput(
-            crate::model::AgentOutputReadParams {
-                session_id,
-                agent_id: agent_id.to_string(),
-                cursor: None,
-            },
-        ))
-    }
-
-    /// Advance the peek to the next target and, when it lands on an agent, emit a
-    /// best-effort output fetch (see [`Self::read_active_agent_output_command`]).
-    pub fn select_next_peek(&mut self) -> Option<AppUiCommand> {
-        self.state.select_next_chat_view();
-        self.peek_output_fetch()
-    }
-
-    /// Step the peek to the previous target, fetching output on landing.
-    pub fn select_prev_peek(&mut self) -> Option<AppUiCommand> {
-        self.state.select_prev_chat_view();
-        self.peek_output_fetch()
-    }
-
-    fn peek_output_fetch(&self) -> Option<AppUiCommand> {
-        match &self.state.chat_view {
-            crate::model::ChatViewTarget::Agent(id) => self.read_active_agent_output_command(id),
-            crate::model::ChatViewTarget::Main => None,
-        }
-    }
-
+    /// Gate a capability-negotiated AppUI *feature* (vs. a JSON-RPC method).
+    /// Returns `true` when the backend advertised it; otherwise sets a status
+    /// line explaining it isn't available and returns `false`.
     fn require_appui_feature(&mut self, feature: &'static str) -> bool {
         if self
             .state

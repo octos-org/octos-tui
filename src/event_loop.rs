@@ -968,18 +968,9 @@ fn handle_agent_peek_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
     match key.code {
-        // Cycle to the next / previous target (wrapping through `main`), fetching
-        // output on landing so the overlay isn't empty for pre-existing output.
-        KeyCode::Tab => {
-            if let Some(command) = store.select_next_peek() {
-                return KeyAction::send(command);
-            }
-        }
-        KeyCode::BackTab => {
-            if let Some(command) = store.select_prev_peek() {
-                return KeyAction::send(command);
-            }
-        }
+        // Cycle to the next / previous target (wrapping through `main`).
+        KeyCode::Tab => store.state.select_next_chat_view(),
+        KeyCode::BackTab => store.state.select_prev_chat_view(),
         // Leave the peek back to the inline chat.
         KeyCode::Esc => {
             store
@@ -1056,21 +1047,16 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         // cycle. Gated to the inline composer (not the pager or an inspector
         // pane) so a peek is only entered from a clean inline state; once a peek
         // is active `handle_agent_peek_key` owns Tab (this arm is unreachable
-        // then). Selecting an agent emits a best-effort output fetch. No-op when
-        // the session has no sub-agents.
+        // then). No-op when the session has no sub-agents.
         KeyCode::Tab
             if store.state.focus == FocusPane::Composer && !store.state.transcript_pager_active =>
         {
-            if let Some(command) = store.select_next_peek() {
-                return KeyAction::send(command);
-            }
+            store.state.select_next_chat_view();
         }
         KeyCode::BackTab
             if store.state.focus == FocusPane::Composer && !store.state.transcript_pager_active =>
         {
-            if let Some(command) = store.select_prev_peek() {
-                return KeyAction::send(command);
-            }
+            store.state.select_prev_chat_view();
         }
         // Esc clears a stale peek selection (an `Agent(id)` whose agent has
         // vanished, so `agent_view_active` is false and this handler — not
@@ -2111,14 +2097,9 @@ fn toggle_transcript_pager(store: &mut Store) {
 }
 
 fn scroll_current_surface_down(store: &mut Store, lines: usize) {
-    // See `scroll_current_surface_up`: a live peek renders above /btw, so it
-    // takes the wheel first; a real modal makes the peek yield and wins below.
+    // See `scroll_current_surface_up` for the surface precedence.
     if app::agent_view_active(&store.state) {
         store.state.scroll_agent_view_down(lines);
-        return;
-    }
-    if btw_aside_open(&store.state) {
-        scroll_open_btw_aside(store, lines as i32);
         return;
     }
     if store.state.task_output.active {
@@ -2135,6 +2116,12 @@ fn scroll_current_surface_down(store: &mut Store, lines: usize) {
     }
     if store.state.turn_state_detail.active {
         store.state.turn_state_detail.scroll_down(lines);
+        return;
+    }
+    // Mirrors `scroll_current_surface_up`: /btw sits under the detail modals but
+    // over the focused pane.
+    if btw_aside_open(&store.state) {
+        scroll_open_btw_aside(store, lines as i32);
         return;
     }
 
@@ -2159,16 +2146,12 @@ fn scroll_current_surface_down(store: &mut Store, lines: usize) {
 }
 
 fn scroll_current_surface_up(store: &mut Store, lines: usize) {
-    // The peek is a full-screen overlay rendered ABOVE any /btw aside, so it
-    // takes the wheel first — otherwise the aside (hidden behind the peek) would
-    // eat the scroll. Checked before btw: when a real modal is up the peek
-    // yields (agent_view_active is false) and the modal branches below win.
+    // A live peek is a full-screen overlay above everything, so it takes the
+    // wheel first. When a real modal is up the peek yields (agent_view_active is
+    // false) and the surface precedence below applies: detail modals (rendered on
+    // top) beat a /btw aside, which beats the focused pane.
     if app::agent_view_active(&store.state) {
         store.state.scroll_agent_view_up(lines);
-        return;
-    }
-    if btw_aside_open(&store.state) {
-        scroll_open_btw_aside(store, -(lines as i32));
         return;
     }
     if store.state.task_output.active {
@@ -2185,6 +2168,12 @@ fn scroll_current_surface_up(store: &mut Store, lines: usize) {
     }
     if store.state.turn_state_detail.active {
         store.state.turn_state_detail.scroll_up(lines);
+        return;
+    }
+    // The /btw aside sits under any detail modal (which renders on top of it) but
+    // over the focused pane, so it takes the wheel after the modals, before focus.
+    if btw_aside_open(&store.state) {
+        scroll_open_btw_aside(store, -(lines as i32));
         return;
     }
 
@@ -2643,50 +2632,6 @@ mod tests {
 
         handle_key(&mut store, key(KeyCode::Char('z')));
         assert_eq!(store.state.composer, "z");
-    }
-
-    #[test]
-    fn selecting_a_peek_target_fetches_that_agents_output() {
-        let mut store = store_with_sessions(1);
-        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
-            crate::model::APPUI_METHOD_AGENT_OUTPUT_READ,
-        ]));
-        let sid = store.state.active_session().unwrap().id.clone();
-        store
-            .state
-            .upsert_session_agent(&sid, sample_agent_record(&sid, "ag-1"));
-
-        // Landing on an agent emits a best-effort output read so the overlay
-        // isn't empty for output that predates selection or survived a reconnect.
-        let cmd = store.select_next_peek();
-        assert!(
-            matches!(&cmd, Some(AppUiCommand::ReadAgentOutput(p)) if p.agent_id == "ag-1"),
-            "expected ReadAgentOutput for ag-1, got {cmd:?}"
-        );
-
-        // Wrapping back to `main` fetches nothing.
-        assert!(store.select_next_peek().is_none());
-    }
-
-    #[test]
-    fn peek_output_fetch_skipped_when_cache_already_populated() {
-        let mut store = store_with_sessions(1);
-        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
-            crate::model::APPUI_METHOD_AGENT_OUTPUT_READ,
-        ]));
-        let sid = store.state.active_session().unwrap().id.clone();
-        store
-            .state
-            .upsert_session_agent(&sid, sample_agent_record(&sid, "ag-1"));
-        // Deltas already populated the cache: it's the live source of truth, so
-        // selecting the agent must NOT issue a read that could clobber it.
-        store.state.append_agent_output(
-            &sid,
-            "ag-1",
-            octos_core::ui_protocol::OutputCursor { offset: 5 },
-            "already streaming\n",
-        );
-        assert!(store.select_next_peek().is_none());
     }
 
     fn store_with_live_reply_text(text: &str) -> Store {
@@ -3922,6 +3867,36 @@ mod tests {
             }),
         );
         assert_eq!(store.state.workspace.scroll, 4);
+    }
+
+    #[test]
+    fn mouse_wheel_over_a_peek_scrolls_the_agent_view_not_the_transcript() {
+        use crate::model::ChatViewTarget;
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        let sid = store.state.active_session().unwrap().id.clone();
+        store
+            .state
+            .upsert_session_agent(&sid, sample_agent_record(&sid, "ag-1"));
+        handle_key(&mut store, key(KeyCode::Tab));
+        assert_eq!(store.state.chat_view, ChatViewTarget::Agent("ag-1".into()));
+
+        // A live peek is the top of the surface precedence, so the wheel drives
+        // its own from-bottom offset and leaves the hidden transcript untouched.
+        let wheel = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+        handle_terminal_event(&mut store, wheel(MouseEventKind::ScrollUp));
+        assert_eq!(store.state.agent_view_scroll, 4);
+        assert_eq!(store.state.transcript_scroll, 0);
+        handle_terminal_event(&mut store, wheel(MouseEventKind::ScrollDown));
+        assert_eq!(store.state.agent_view_scroll, 0);
+        assert_eq!(store.state.transcript_scroll, 0);
     }
 
     #[test]

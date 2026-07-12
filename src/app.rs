@@ -16602,31 +16602,44 @@ mod tests {
     }
 
     #[test]
-    fn agent_output_read_only_fills_an_empty_cache() {
+    fn explicit_output_read_overwrites_the_cache_then_deltas_resume() {
         let mut app = autonomy_app_state();
         let sid = app.active_session().unwrap().id.clone();
-        // Streamed deltas populate the cache first; they are the live source of
-        // truth. An in-flight full read that arrives afterward must NOT overwrite
-        // them (that would clobber newer output, or drop the read's prefix).
+        // `set_agent_output` backs only the explicit `/agents output <id>`
+        // command (peeking no longer auto-reads), so a user-requested snapshot
+        // is authoritative: it replaces whatever the cache held and re-seeds the
+        // cursor. Live deltas then resume appending from that cursor.
         app.append_agent_output(
             &sid,
             "worker",
             octos_core::ui_protocol::OutputCursor { offset: 10 },
-            "live streamed output\n",
+            "partial streamed output\n",
         );
         app.set_agent_output(
             &sid,
             "worker",
-            "stale full snapshot".into(),
-            octos_core::ui_protocol::OutputCursor { offset: 99 },
+            "full snapshot up to here\n".into(),
+            octos_core::ui_protocol::OutputCursor { offset: 24 },
         );
         assert_eq!(
             app.active_agent_output("worker"),
-            Some("live streamed output\n")
+            Some("full snapshot up to here\n"),
+            "an explicit read replaces the cache with the fetched snapshot"
         );
 
-        // But a read DOES fill an EMPTY cache — output that predates selection,
-        // e.g. a completed agent whose stream already ended.
+        // A delta past the snapshot's cursor appends cleanly (shared offset space).
+        app.append_agent_output(
+            &sid,
+            "worker",
+            octos_core::ui_protocol::OutputCursor { offset: 33 },
+            "next chunk\n",
+        );
+        assert_eq!(
+            app.active_agent_output("worker"),
+            Some("full snapshot up to here\nnext chunk\n")
+        );
+
+        // Into an empty cache the read simply fills it (e.g. a completed agent).
         app.set_agent_output(
             &sid,
             "idle",

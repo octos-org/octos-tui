@@ -5988,15 +5988,6 @@ impl AppState {
             .iter()
             .position(|cache| cache.agent_id == agent_id)
         {
-            // A read snapshot only FILLS an empty cache: once streamed deltas
-            // have populated it they are the live source of truth and must win.
-            // Overwriting with an in-flight full read would clobber newer output
-            // (or, if guarded numerically, drop the read's authoritative
-            // prefix). The read is only needed for output that predates
-            // selection — e.g. a completed agent — where the cache is empty.
-            if !entry.agent_outputs[pos].text.is_empty() {
-                return;
-            }
             entry.agent_outputs[pos] = AutonomyAgentOutputCache {
                 agent_id: agent_id.to_string(),
                 text,
