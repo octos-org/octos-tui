@@ -182,8 +182,8 @@ fn resolve_backend(program: &str) -> Result<Resolved> {
 fn outdated_error(found: &str) -> eyre::Report {
     eyre!(
         "octos {found} is older than the {MIN_OCTOS_VERSION} this octos-tui needs. \
-         Update the octos server — `brew upgrade octos-org/octos/octos` or \
-         `npm install -g @octos-org/octos@latest` — then relaunch."
+         Update the octos server (`brew upgrade octos-org/octos/octos` or \
+         `npm install -g @octos-org/octos@latest`), then relaunch."
     )
 }
 
@@ -411,8 +411,8 @@ fn run_installer() -> Result<()> {
         ));
     };
     eprintln!(
-        "octos-tui: octos backend not found — installing the octos server via {how} \
-         (set {OPT_OUT_ENV}=1 to skip)…"
+        "octos-tui: octos backend not found; installing the octos server via {how} \
+         (set {OPT_OUT_ENV}=1 to skip)..."
     );
     // On Windows `brew`/`npm` are `.cmd` shims, which a direct spawn can't
     // execute; run them through `cmd /C` like the stdio transport does (codex).
