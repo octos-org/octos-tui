@@ -54,13 +54,13 @@ pub fn ensure_octos_backend(cli: &mut Cli) -> Result<()> {
     let Some(command) = cli.stdio_command.clone() else {
         return Ok(()); // WebSocket launch — no local backend to provision.
     };
-    if bare_octos_program(&command).is_none() {
-        // Explicit path / PATH override / shell-syntax / non-octos — the user's
-        // own setup, and not something we can safely probe or rewrite.
+    let Some(program) = bare_octos_program(&command) else {
+        // Explicit path / PATH override / non-octos — the user's own setup, and
+        // not something we can safely probe or rewrite.
         return Ok(());
-    }
+    };
 
-    match resolve_backend()? {
+    match resolve_backend(&program)? {
         // Already on PATH — the bare `octos serve` command works as-is.
         Resolved::OnPath => Ok(()),
         // Usable only in the install dir — rewrite the command to launch it
@@ -116,13 +116,16 @@ fn opted_out() -> bool {
     std::env::var_os(OPT_OUT_ENV).is_some_and(|v| !v.is_empty())
 }
 
-/// Find a usable octos. Probes BOTH `PATH` and `~/.octos/bin` up front (codex:
-/// so a compatible install-dir backend isn't re-installed every launch just
-/// because a stale octos sits earlier on `PATH`), preferring a `Ready` one. An
-/// `Outdated`-only situation asks the user to update; a fully-`Missing` one
-/// installs (unless opted out) and re-resolves.
-fn resolve_backend() -> Result<Resolved> {
-    let on_path = probe(Path::new("octos"));
+/// Find a usable octos. `program` is the exact name the stdio command runs
+/// (`octos` or `octos.exe`) — we probe THAT on `PATH`, not a hardcoded `octos`,
+/// since POSIX won't resolve `octos` to a user-specified `octos.exe` and would
+/// misreport a working backend as missing (codex). Probes BOTH `PATH` and
+/// `~/.octos/bin` up front (so a compatible install-dir backend isn't
+/// re-installed every launch just because a stale octos sits earlier on
+/// `PATH`), preferring a `Ready` one. An `Outdated`-only situation asks the user
+/// to update; a fully-`Missing` one installs (unless opted out) and re-resolves.
+fn resolve_backend(program: &str) -> Result<Resolved> {
+    let on_path = probe(Path::new(program));
     let dir_octos = install_dir_octos();
     let in_dir = dir_octos.as_ref().map(|p| probe(p));
 
@@ -156,7 +159,7 @@ fn resolve_backend() -> Result<Resolved> {
     // Re-resolve. A brew/npm install lands on PATH; a pre-existing install.sh
     // deployment lives in ~/.octos/bin. Require `Ready`, not merely present —
     // an OLDER octos still first on PATH must not be accepted.
-    if matches!(probe(Path::new("octos")), Probe::Ready) {
+    if matches!(probe(Path::new(program)), Probe::Ready) {
         return Ok(Resolved::OnPath);
     }
     if let Some(dir) = install_dir_octos() {
@@ -327,14 +330,22 @@ fn rewrite_program(command: &str, octos_path: &Path) -> Option<String> {
         return None;
     }
     let mut tokens = shlex::split(body)?;
-    let mut idx = 0;
-    if tokens.first().is_some_and(|t| t == "env") {
-        idx = 1;
-    }
+    let has_env_keyword = tokens.first().is_some_and(|t| t == "env");
+    let mut idx = usize::from(has_env_keyword);
+    let assignments_start = idx;
     while tokens.get(idx).is_some_and(|t| is_env_assignment(t)) {
         idx += 1;
     }
     *tokens.get_mut(idx)? = octos_path.to_string_lossy().into_owned();
+    // A DIRECT `VAR=value` prefix (no leading `env`) is fine as typed, but
+    // `try_join` re-quotes it (`'VAR=value'`), and `sh -c` then treats the
+    // quoted token as the *command name* rather than an assignment — so the
+    // backend never launches. Prepend `env` so the (re-quoted) assignments are
+    // parsed as `env`'s own args instead (codex). A leading `env` already does
+    // this; no assignments → nothing to protect.
+    if !has_env_keyword && idx > assignments_start {
+        tokens.insert(0, "env".to_owned());
+    }
     let joined = shlex::try_join(tokens.iter().map(String::as_str)).ok()?;
     Some(format!("{prefix}{joined}"))
 }
@@ -503,6 +514,19 @@ mod tests {
         assert_eq!(
             rewrite_program("octos serve", spaced).as_deref(),
             Some("'/home/a b/.octos/bin/octos' serve")
+        );
+        // A DIRECT assignment prefix (no `env` keyword) gains one, so `sh -c`
+        // keeps it an assignment instead of reading the re-quoted token as a
+        // command name (codex).
+        let rewritten = rewrite_program("OCTOS_HOME=/data octos serve", p).unwrap();
+        assert_eq!(
+            shlex::split(&rewritten).unwrap(),
+            [
+                "env",
+                "OCTOS_HOME=/data",
+                "/home/u/.octos/bin/octos",
+                "serve"
+            ]
         );
         // Shell syntax we can't round-trip → None, so the caller errors with an
         // "add octos to PATH" message rather than emitting a mangled command.
