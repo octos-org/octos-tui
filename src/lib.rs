@@ -8,6 +8,7 @@ rust_i18n::i18n!("locales", fallback = "en");
 
 pub mod app;
 pub mod autonomy;
+pub mod backend_ensure;
 pub mod cli;
 pub mod client_event;
 pub mod clipboard;
