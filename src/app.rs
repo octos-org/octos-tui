@@ -16602,79 +16602,41 @@ mod tests {
     }
 
     #[test]
-    fn agent_output_read_does_not_clobber_newer_deltas() {
+    fn agent_output_read_only_fills_an_empty_cache() {
         let mut app = autonomy_app_state();
         let sid = app.active_session().unwrap().id.clone();
-        // A streamed delta advances the cache to cursor 10.
+        // Streamed deltas populate the cache first; they are the live source of
+        // truth. An in-flight full read that arrives afterward must NOT overwrite
+        // them (that would clobber newer output, or drop the read's prefix).
         app.append_agent_output(
             &sid,
             "worker",
             octos_core::ui_protocol::OutputCursor { offset: 10 },
             "live streamed output\n",
         );
-        // A stale read snapshot (cursor 4, sent before the delta) must NOT
-        // overwrite the newer cached output.
         app.set_agent_output(
             &sid,
             "worker",
-            "old snapshot".into(),
-            octos_core::ui_protocol::OutputCursor { offset: 4 },
+            "stale full snapshot".into(),
+            octos_core::ui_protocol::OutputCursor { offset: 99 },
         );
         assert_eq!(
             app.active_agent_output("worker"),
             Some("live streamed output\n")
         );
 
-        // A fresh read (cursor 12) DOES apply.
+        // But a read DOES fill an EMPTY cache — output that predates selection,
+        // e.g. a completed agent whose stream already ended.
         app.set_agent_output(
             &sid,
-            "worker",
-            "full refreshed output".into(),
-            octos_core::ui_protocol::OutputCursor { offset: 12 },
+            "idle",
+            "final output of a completed agent".into(),
+            octos_core::ui_protocol::OutputCursor { offset: 5 },
         );
         assert_eq!(
-            app.active_agent_output("worker"),
-            Some("full refreshed output")
+            app.active_agent_output("idle"),
+            Some("final output of a completed agent")
         );
-    }
-
-    #[test]
-    fn peek_scroll_compensates_for_appended_output_when_scrolled_up() {
-        use crate::model::ChatViewTarget;
-        let mut app = autonomy_app_state();
-        let sid = app.active_session().unwrap().id.clone();
-        app.upsert_session_agent(&sid, sample_agent("worker", "running"));
-        app.set_chat_view(ChatViewTarget::Agent("worker".into()));
-        // Seed the cache, then scroll up 3 rows.
-        app.append_agent_output(
-            &sid,
-            "worker",
-            octos_core::ui_protocol::OutputCursor { offset: 5 },
-            "line one\n",
-        );
-        app.scroll_agent_view_up(3);
-
-        // Two lines append below; the from-bottom offset advances so the reader's
-        // position holds instead of drifting toward newer output.
-        app.append_agent_output(
-            &sid,
-            "worker",
-            octos_core::ui_protocol::OutputCursor { offset: 20 },
-            "new A\nnew B\n",
-        );
-        assert_eq!(app.agent_view_scroll, 5);
-
-        // At the bottom (offset 0) the peek follows newest output — no bump.
-        app.set_chat_view(ChatViewTarget::Main);
-        app.set_chat_view(ChatViewTarget::Agent("worker".into()));
-        assert_eq!(app.agent_view_scroll, 0);
-        app.append_agent_output(
-            &sid,
-            "worker",
-            octos_core::ui_protocol::OutputCursor { offset: 40 },
-            "more\n",
-        );
-        assert_eq!(app.agent_view_scroll, 0);
     }
 
     #[test]

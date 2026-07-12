@@ -2111,6 +2111,12 @@ fn toggle_transcript_pager(store: &mut Store) {
 }
 
 fn scroll_current_surface_down(store: &mut Store, lines: usize) {
+    // See `scroll_current_surface_up`: a live peek renders above /btw, so it
+    // takes the wheel first; a real modal makes the peek yield and wins below.
+    if app::agent_view_active(&store.state) {
+        store.state.scroll_agent_view_down(lines);
+        return;
+    }
     if btw_aside_open(&store.state) {
         scroll_open_btw_aside(store, lines as i32);
         return;
@@ -2129,10 +2135,6 @@ fn scroll_current_surface_down(store: &mut Store, lines: usize) {
     }
     if store.state.turn_state_detail.active {
         store.state.turn_state_detail.scroll_down(lines);
-        return;
-    }
-    if app::agent_view_active(&store.state) {
-        store.state.scroll_agent_view_down(lines);
         return;
     }
 
@@ -2157,6 +2159,14 @@ fn scroll_current_surface_down(store: &mut Store, lines: usize) {
 }
 
 fn scroll_current_surface_up(store: &mut Store, lines: usize) {
+    // The peek is a full-screen overlay rendered ABOVE any /btw aside, so it
+    // takes the wheel first — otherwise the aside (hidden behind the peek) would
+    // eat the scroll. Checked before btw: when a real modal is up the peek
+    // yields (agent_view_active is false) and the modal branches below win.
+    if app::agent_view_active(&store.state) {
+        store.state.scroll_agent_view_up(lines);
+        return;
+    }
     if btw_aside_open(&store.state) {
         scroll_open_btw_aside(store, -(lines as i32));
         return;
@@ -2175,12 +2185,6 @@ fn scroll_current_surface_up(store: &mut Store, lines: usize) {
     }
     if store.state.turn_state_detail.active {
         store.state.turn_state_detail.scroll_up(lines);
-        return;
-    }
-    // A live sub-agent peek owns the wheel too, scrolling its own output rather
-    // than the main transcript hidden behind it.
-    if app::agent_view_active(&store.state) {
-        store.state.scroll_agent_view_up(lines);
         return;
     }
 
@@ -2661,6 +2665,27 @@ mod tests {
         );
 
         // Wrapping back to `main` fetches nothing.
+        assert!(store.select_next_peek().is_none());
+    }
+
+    #[test]
+    fn peek_output_fetch_skipped_when_cache_already_populated() {
+        let mut store = store_with_sessions(1);
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_AGENT_OUTPUT_READ,
+        ]));
+        let sid = store.state.active_session().unwrap().id.clone();
+        store
+            .state
+            .upsert_session_agent(&sid, sample_agent_record(&sid, "ag-1"));
+        // Deltas already populated the cache: it's the live source of truth, so
+        // selecting the agent must NOT issue a read that could clobber it.
+        store.state.append_agent_output(
+            &sid,
+            "ag-1",
+            octos_core::ui_protocol::OutputCursor { offset: 5 },
+            "already streaming\n",
+        );
         assert!(store.select_next_peek().is_none());
     }
 

@@ -5988,11 +5988,13 @@ impl AppState {
             .iter()
             .position(|cache| cache.agent_id == agent_id)
         {
-            // Reject a stale read snapshot: a streamed delta may have advanced
-            // the cached cursor past this (uncursored) read while it was in
-            // flight, so overwriting would clobber newer output. Apply only when
-            // the snapshot is at least as new as what is cached.
-            if cursor.offset < entry.agent_outputs[pos].cursor.offset {
+            // A read snapshot only FILLS an empty cache: once streamed deltas
+            // have populated it they are the live source of truth and must win.
+            // Overwriting with an in-flight full read would clobber newer output
+            // (or, if guarded numerically, drop the read's authoritative
+            // prefix). The read is only needed for output that predates
+            // selection — e.g. a completed agent — where the cache is empty.
+            if !entry.agent_outputs[pos].text.is_empty() {
                 return;
             }
             entry.agent_outputs[pos] = AutonomyAgentOutputCache {
@@ -6020,44 +6022,32 @@ impl AppState {
         text: &str,
     ) {
         let entry = self.session_autonomy_mut(session_id);
-        let appended_lines = if let Some(pos) = entry
+        if let Some(pos) = entry
             .agent_outputs
             .iter()
             .position(|cache| cache.agent_id == agent_id)
         {
             let cache = &mut entry.agent_outputs[pos];
-            let grew = if cursor.offset < cache.cursor.offset {
+            if cursor.offset < cache.cursor.offset {
                 // Backend rewound; replace.
                 cache.text = text.to_string();
-                None
             } else {
                 cache.text.push_str(text);
-                Some(text.matches('\n').count())
-            };
+            }
             cache.cursor = cursor;
-            grew
         } else {
             entry.agent_outputs.push(AutonomyAgentOutputCache {
                 agent_id: agent_id.to_string(),
                 text: text.to_string(),
                 cursor,
             });
-            None
-        };
-
-        // Keep a scrolled-up peek of THIS agent anchored to the operator's
-        // reading position: when lines are appended below, advance the
-        // from-bottom offset by the same count so the visible region doesn't
-        // drift toward newer output. Approximated by logical lines (a long
-        // wrapped line can still drift slightly); at the bottom (offset 0) the
-        // peek simply follows the newest output with no drift.
-        if let Some(added) = appended_lines
-            && added > 0
-            && self.agent_view_scroll > 0
-            && matches!(&self.chat_view, ChatViewTarget::Agent(id) if id.as_str() == agent_id)
-        {
-            self.agent_view_scroll = self.agent_view_scroll.saturating_add(added);
         }
+        // NOTE: the peek's `agent_view_scroll` is a plain from-bottom offset, so
+        // at the bottom (offset 0) it follows newest output with no drift; a
+        // manually scrolled-up peek does drift as new output streams in. A
+        // precise anchor needs the wrapped visual-row count, which only the
+        // renderer knows — deliberately not approximated here (a newline count
+        // over/under-compensates at ordinary chunk boundaries).
     }
 
     /// Enqueue a pending reconnect hydration command. Bounded — extra

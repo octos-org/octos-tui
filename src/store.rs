@@ -3490,6 +3490,18 @@ impl Store {
         if !supported {
             return None;
         }
+        // Only fetch when the overlay has nothing to show yet: once live deltas
+        // populate the cache they are the source of truth (and set_agent_output
+        // is fill-if-empty, so a read over a populated cache is dropped anyway).
+        // This targets output that predates selection — e.g. a completed agent
+        // whose stream has already ended.
+        if self
+            .state
+            .active_agent_output(agent_id)
+            .is_some_and(|text| !text.is_empty())
+        {
+            return None;
+        }
         let session_id = self.state.active_session()?.id.clone();
         Some(AppUiCommand::ReadAgentOutput(
             crate::model::AgentOutputReadParams {
