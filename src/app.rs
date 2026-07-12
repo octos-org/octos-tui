@@ -355,13 +355,19 @@ pub fn render_viewport_with_finalization(
     // reserve the row — so the reservation and this layout always agree.
     let agent_strip_height = agent_strip_height(app, terminal_height);
     let active_menu = active_menu_surface(app);
-    // Budget the menu against the room left AFTER every fixed chrome row
-    // (composer, status, the autonomy/harness indicators, and the selector
-    // strip). Subtracting only composer+status let a tall slash menu overcommit
-    // the root layout, so Ratatui compressed the `Min(1)` tail or clipped the
-    // bottom rows once indicators or the strip were present.
+    // Budget the menu against the room left AFTER every OTHER row in the root
+    // layout: the `Min(1)` live-tail floor, composer, status, the
+    // autonomy/harness indicators, and the selector strip. Omitting any of them
+    // (originally composer+status only) let a tall slash menu overcommit the
+    // layout, so Ratatui compressed a fixed row — the tail floor included, since
+    // `Min(1)` yields before a `Length` when space is short.
     let menu_available = area.height.saturating_sub(
-        composer_height + 1 + autonomy_height + harness_height + agent_strip_height,
+        1 // Min(1) live-tail floor
+            + composer_height
+            + 1 // status
+            + autonomy_height
+            + harness_height
+            + agent_strip_height,
     );
     let menu_height = menu_height_for_viewport(active_menu.as_ref(), area.width, menu_available);
 
@@ -8284,8 +8290,16 @@ const AGENT_STRIP_MIN_TERMINAL_ROWS: u16 = 12;
 /// (hidden). Height-gated so a constrained terminal never oversubscribes the
 /// live layout. Both the height reservation (`live_ui_height`) and the render
 /// pass call this with the same terminal height, so they always agree.
+///
+/// Also hidden while the transcript pager is up: the strip switches views via
+/// Tab, but Tab is disabled in the pager (it never enters a peek), so the strip
+/// is non-interactive there — and the pager's `Min(8)` transcript floor makes
+/// its extra row overcommit sooner than the inline flow's `Min(1)` tail.
 fn agent_strip_height(app: &AppState, terminal_height: u16) -> u16 {
-    if terminal_height < AGENT_STRIP_MIN_TERMINAL_ROWS || app.active_session_agents().is_empty() {
+    if app.transcript_pager_active
+        || terminal_height < AGENT_STRIP_MIN_TERMINAL_ROWS
+        || app.active_session_agents().is_empty()
+    {
         0
     } else {
         1
@@ -16767,6 +16781,22 @@ mod tests {
     }
 
     #[test]
+    fn down_recovers_when_home_ran_before_the_bound_was_measured() {
+        // codex round-6 case: Tab then Home batched before the peek's first draw,
+        // so the bound is still `usize::MAX` when Home stores its jump.
+        let mut app = autonomy_app_state();
+        app.scroll_agent_view_up(usize::MAX); // Home, unmeasured
+        assert_eq!(app.agent_view_scroll, usize::MAX);
+
+        // The first draw measures the real maximum...
+        app.record_agent_view_scroll_max(12);
+        // ...and Down snaps the stale over-shoot down before moving — not stuck
+        // decrementing the sentinel.
+        app.scroll_agent_view_down(1);
+        assert_eq!(app.agent_view_scroll, 11);
+    }
+
+    #[test]
     fn wants_mouse_capture_stays_on_for_a_detail_modal_over_a_peek() {
         let mut app = autonomy_app_state();
         let sid = app.active_session().unwrap().id.clone();
@@ -16804,6 +16834,19 @@ mod tests {
             1,
             "restored at the floor"
         );
+    }
+
+    #[test]
+    fn agent_strip_hidden_while_transcript_pager_open() {
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+        app.upsert_session_agent(&sid, sample_agent("worker", "running"));
+        assert_eq!(agent_strip_height(&app, 40), 1, "shown in the inline flow");
+
+        // In the pager the strip's Tab control is disabled and its extra row
+        // overcommits the `Min(8)` transcript layout, so it is dropped.
+        app.transcript_pager_active = true;
+        assert_eq!(agent_strip_height(&app, 40), 0, "hidden under the pager");
     }
 
     #[test]

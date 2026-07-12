@@ -7325,9 +7325,16 @@ impl AppState {
             .min(self.agent_view_scroll_max.get());
     }
 
-    /// Scroll the sub-agent peek toward the newest output (down / bottom).
+    /// Scroll the sub-agent peek toward the newest output (down / bottom). Snaps
+    /// any over-shoot down to the last-rendered maximum BEFORE subtracting, so a
+    /// `Home` (`usize::MAX`) processed while the bound was still unmeasured — e.g.
+    /// `Tab` then `Home` batched before the peek's first draw — doesn't leave the
+    /// offset stuck decrementing a huge sentinel once a real bound exists.
     pub fn scroll_agent_view_down(&mut self, lines: usize) {
-        self.agent_view_scroll = self.agent_view_scroll.saturating_sub(lines);
+        self.agent_view_scroll = self
+            .agent_view_scroll
+            .min(self.agent_view_scroll_max.get())
+            .saturating_sub(lines);
     }
 
     /// Advance the main-pane view to the next target in `[Main, …sub-agents]`,
