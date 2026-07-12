@@ -242,12 +242,15 @@ fn prompt_transport(
     } else if let Some(endpoint) = &current_endpoint {
         println!("  current: endpoint {endpoint}");
     }
-    // Clear every spelling of the OTHER transport (and any stale `mode`, which
-    // `from_args` gives priority over inference — a lingering `mock` would
-    // silently ignore the chosen backend). Nulls are removals in
-    // `merge_into_config` and are filtered out of schema validation.
-    let clear = |answers: &mut serde_json::Map<String, serde_json::Value>, keys: &[&str]| {
-        for key in keys {
+    // Null EVERY transport spelling (both transports' canonical keys and all
+    // their aliases) plus a stale `mode`, then set only the chosen canonical
+    // key. This guarantees no legacy alias of either transport survives — a
+    // leftover `base-url` beside a new `endpoint` would be rejected as a
+    // duplicate serde field, and a lingering `mode: mock` would silently ignore
+    // the chosen backend (codex). Nulls are removals in `merge_into_config` and
+    // are filtered out of schema validation.
+    let clear_all_transport = |answers: &mut serde_json::Map<String, serde_json::Value>| {
+        for key in STDIO_KEYS.iter().chain(ENDPOINT_KEYS) {
             answers.insert((*key).into(), serde_json::Value::Null);
         }
         answers.insert("mode".into(), serde_json::Value::Null);
@@ -263,8 +266,8 @@ fn prompt_transport(
                 raw.trim().to_string()
             };
             let normalized = parse_stdio_command(&value).map_err(|message| eyre!("{message}"))?;
+            clear_all_transport(answers);
             answers.insert("stdio-command".into(), normalized.into());
-            clear(answers, ENDPOINT_KEYS);
         }
         "2" => {
             let raw = read_line("  WebSocket endpoint (ws://... or wss://...): ")?;
@@ -274,8 +277,8 @@ fn prompt_transport(
                 return Ok(());
             }
             let normalized = parse_websocket_url(value).map_err(|message| eyre!("{message}"))?;
+            clear_all_transport(answers);
             answers.insert("endpoint".into(), normalized.into());
-            clear(answers, STDIO_KEYS);
         }
         _ => {} // keep current
     }
