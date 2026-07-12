@@ -972,6 +972,18 @@ pub fn finalized_live_turn_lines_between(
         .map(|(_, item)| item)
         .collect::<Vec<_>>();
     if !new_activity.is_empty() {
+        // Each scrollback delta flush builds a fresh buffer, so a pure-activity
+        // delta (a sub-agent completing with no reply text ahead of it) reaches
+        // the finalized section with an EMPTY buffer — which defeats that
+        // section's own `!lines.is_empty()` leading-blank guard and packs
+        // consecutive agent-task cards together in native scrollback. Seed the
+        // separator here so every flushed card stays blank-separated from the
+        // previous scrollback block. (A reply-delta-then-activity flush leaves
+        // `lines` non-empty, so the section's guard handles that case and this
+        // never double-blanks.)
+        if lines.is_empty() {
+            lines.push(Line::from(""));
+        }
         push_finalized_activity_items_section(
             &mut lines,
             palette,
@@ -17806,6 +17818,67 @@ mod tests {
                 .iter()
                 .any(|text| text.contains('•')),
             "a whitespace-only body must not render a dangling marker"
+        );
+    }
+
+    /// Scrollback-flush lane: consecutive PURE-activity delta flushes (each a
+    /// sub-agent completing mid-turn, no reply text between them) must stay
+    /// blank-separated in native scrollback. Regression for the "agent task
+    /// cards pack together" report — each delta flush builds a fresh buffer, so
+    /// the leading-blank guard inside `push_finalized_activity_items_section`
+    /// sees an empty buffer and is skipped, leaving cards abutting.
+    #[test]
+    fn consecutive_scrollback_agent_task_cards_are_blank_separated() {
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("go")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: "working".into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+
+        let mut tracker = ScrollbackTracker::new();
+        let mut inserted: Vec<Line<'static>> = Vec::new();
+        for (call, detail) in [("call-1", "first task"), ("call-2", "second task")] {
+            app.push_activity(
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_id.clone())
+                    .with_tool_call(call)
+                    .with_detail(detail)
+                    .with_success(true),
+            );
+            let update = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
+            inserted.extend(update.lines_to_insert);
+        }
+
+        let texts = line_texts(&inserted);
+        let cards = texts
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, text)| text.contains("Agent task completed").then_some(idx))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cards.len(),
+            2,
+            "both completions flush as their own scrollback card: {texts:#?}"
+        );
+        assert!(
+            texts[cards[0] + 1..cards[1]]
+                .iter()
+                .any(|text| text.trim().is_empty()),
+            "consecutive scrollback agent-task cards must be blank-separated: {texts:#?}"
         );
     }
 
