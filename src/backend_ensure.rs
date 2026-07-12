@@ -116,23 +116,26 @@ fn opted_out() -> bool {
     std::env::var_os(OPT_OUT_ENV).is_some_and(|v| !v.is_empty())
 }
 
-/// Find a usable octos. `program` is the exact name the stdio command runs
-/// (`octos` or `octos.exe`) — we probe THAT on `PATH`, not a hardcoded `octos`,
-/// since POSIX won't resolve `octos` to a user-specified `octos.exe` and would
-/// misreport a working backend as missing (codex). Probes BOTH `PATH` and
-/// `~/.octos/bin` up front (so a compatible install-dir backend isn't
-/// re-installed every launch just because a stale octos sits earlier on
-/// `PATH`), preferring a `Ready` one. An `Outdated`-only situation asks the user
-/// to update; a fully-`Missing` one installs (unless opted out) and re-resolves.
+/// Find a usable octos. `program` is the bare name the stdio command runs
+/// (always `octos` today) — threaded so the probe targets exactly what the
+/// command names rather than a hardcoded string. Tries `PATH` first and, only
+/// when that isn't `Ready`, the legacy `~/.octos/bin` — so a stale install-dir
+/// binary can't block a working launch. An `Outdated`-only situation asks the
+/// user to update; a fully-`Missing` one installs (unless opted out) and
+/// re-resolves.
 fn resolve_backend(program: &str) -> Result<Resolved> {
     let on_path = probe(Path::new(program));
-    let dir_octos = install_dir_octos();
-    let in_dir = dir_octos.as_ref().map(|p| probe(p));
-
-    // Prefer a Ready backend: PATH (no rewrite) first, then the install dir.
+    // Fast path: a Ready octos on PATH needs no rewrite — and we must NOT probe
+    // the legacy dir here. Doing so eagerly runs `~/.octos/bin/octos --version`
+    // on every otherwise-working launch, so a stale binary (or one whose
+    // `--version` hangs) would block or execute for nothing (codex).
     if matches!(on_path, Probe::Ready) {
         return Ok(Resolved::OnPath);
     }
+
+    // PATH octos isn't usable — now it's worth probing the legacy install dir.
+    let dir_octos = install_dir_octos();
+    let in_dir = dir_octos.as_ref().map(|p| probe(p));
     if let (Some(dir), Some(Probe::Ready)) = (&dir_octos, &in_dir) {
         return Ok(Resolved::AtPath(dir.clone()));
     }
@@ -294,7 +297,13 @@ fn bare_octos_program(command: &str) -> Option<String> {
     if program.contains('/') || program.contains('\\') {
         return None; // explicit path — user's own setup
     }
-    (program == "octos" || program == "octos.exe").then(|| program.to_owned())
+    // Only a bare `octos` is our canonical, provisionable form. We deliberately
+    // do NOT accept `octos.exe`: it's never the canonical command (bare `octos`
+    // is, and Windows `cmd /C` resolves it to whatever `.exe`/`.cmd` exists),
+    // and npm — our Windows installer — ships an `octos.cmd` shim, never an
+    // `octos.exe`, so an `octos.exe` command isn't reliably provisionable
+    // anyway. Such a command is left to the user (codex).
+    (program == "octos").then(|| program.to_owned())
 }
 
 /// Shell metacharacters whose presence means split+rejoin (and `sh -c`
@@ -480,6 +489,7 @@ mod tests {
             "./octos serve",                      // explicit path
             "my-custom-backend --stdio",          // not octos
             "env A=1 my-backend serve",           // not octos
+            "octos.exe serve --stdio",            // not canonical; npm can't provision .exe
             "env PATH=/custom/bin:$PATH octos serve", // PATH override — can't probe same octos
             "PATH=/opt/octos/bin octos serve",    // leading PATH override
         ] {
