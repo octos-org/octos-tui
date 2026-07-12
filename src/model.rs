@@ -5833,6 +5833,10 @@ impl AppState {
     ) {
         let entry = self.session_autonomy_mut(session_id);
         entry.agents = agents;
+        // A roster refresh can drop the sub-agent the main pane is peeking
+        // (completed and pruned by the backend); fall the view back to `Main`
+        // so the peek never strands on a vanished agent.
+        self.normalize_chat_view();
     }
 
     /// Upsert one agent record by `agent_id`. The wire schema may
@@ -7214,6 +7218,29 @@ impl AppState {
             .unwrap_or(&[])
     }
 
+    /// The cached streamed output for a sub-agent of the active session, if
+    /// any has arrived. This is the flat text the backend exposes for a worker
+    /// (`agent/output/*`) — a running log, not a turn-by-turn transcript, since
+    /// the backend deliberately discards a sub-agent's message history.
+    pub fn active_agent_output(&self, agent_id: &str) -> Option<&str> {
+        let session = self.active_session()?;
+        self.session_autonomy_for(&session.id)?
+            .agent_outputs
+            .iter()
+            .find(|cache| cache.agent_id == agent_id)
+            .map(|cache| cache.text.as_str())
+    }
+
+    /// The record for a sub-agent of the active session, by id.
+    pub fn active_agent_record(
+        &self,
+        agent_id: &str,
+    ) -> Option<&octos_core::ui_protocol::UiAgentRecord> {
+        self.active_session_agents()
+            .iter()
+            .find(|agent| agent.agent_id == agent_id)
+    }
+
     /// The ordered set of selectable chat targets: `Main` first, then one
     /// `Agent(id)` per active-session sub-agent.
     fn chat_view_order(&self) -> Vec<ChatViewTarget> {
@@ -7226,17 +7253,27 @@ impl AppState {
         order
     }
 
+    /// Set the main-pane view. Whenever the target actually changes, the shared
+    /// transcript scroll is reset to the bottom so a scroll offset from one view
+    /// (main, or a previously-selected agent) never leaks into the next.
+    pub fn set_chat_view(&mut self, target: ChatViewTarget) {
+        if self.chat_view != target {
+            self.chat_view = target;
+            self.transcript_scroll = 0;
+        }
+    }
+
     /// Advance the main-pane view to the next target in `[Main, …sub-agents]`,
     /// wrapping. No-op (stays/returns to `Main`) when the session has no
     /// sub-agents.
     pub fn select_next_chat_view(&mut self) {
         let order = self.chat_view_order();
         if order.len() <= 1 {
-            self.chat_view = ChatViewTarget::Main;
+            self.set_chat_view(ChatViewTarget::Main);
             return;
         }
         let current = order.iter().position(|t| *t == self.chat_view).unwrap_or(0);
-        self.chat_view = order[(current + 1) % order.len()].clone();
+        self.set_chat_view(order[(current + 1) % order.len()].clone());
     }
 
     /// Move the main-pane view to the previous target in `[Main, …sub-agents]`,
@@ -7244,15 +7281,16 @@ impl AppState {
     pub fn select_prev_chat_view(&mut self) {
         let order = self.chat_view_order();
         if order.len() <= 1 {
-            self.chat_view = ChatViewTarget::Main;
+            self.set_chat_view(ChatViewTarget::Main);
             return;
         }
         let current = order.iter().position(|t| *t == self.chat_view).unwrap_or(0);
-        self.chat_view = if current == 0 {
+        let prev = if current == 0 {
             order[order.len() - 1].clone()
         } else {
             order[current - 1].clone()
         };
+        self.set_chat_view(prev);
     }
 
     /// Fall back to `Main` when the selected sub-agent is no longer present
@@ -7260,12 +7298,13 @@ impl AppState {
     /// selection from stranding the main pane on a vanished agent.
     pub fn normalize_chat_view(&mut self) {
         if let ChatViewTarget::Agent(id) = &self.chat_view {
+            let id = id.clone();
             let still_present = self
                 .active_session_agents()
                 .iter()
-                .any(|agent| &agent.agent_id == id);
+                .any(|agent| agent.agent_id == id);
             if !still_present {
-                self.chat_view = ChatViewTarget::Main;
+                self.set_chat_view(ChatViewTarget::Main);
             }
         }
     }

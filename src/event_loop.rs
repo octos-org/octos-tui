@@ -694,25 +694,6 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
-    // Alt+Up/Down cycles the main pane between `main` and each running sub-agent
-    // (the selector strip under the composer). Handled here — before the
-    // composer-modified-key block and the plain Up/Down history arms — so the
-    // vertical arrows aren't first swallowed by word-nav or composer history
-    // when the composer is focused. A no-op when the session has no sub-agents.
-    if key.modifiers.contains(KeyModifiers::ALT) {
-        match key.code {
-            KeyCode::Up => {
-                store.state.select_prev_chat_view();
-                return KeyAction::Continue;
-            }
-            KeyCode::Down => {
-                store.state.select_next_chat_view();
-                return KeyAction::Continue;
-            }
-            _ => {}
-        }
-    }
-
     // Modified-key composer edits are gated on no modal owning the keyboard:
     // the approval/question modals force-focus the composer, so without the
     // gate Ctrl+W / Alt+b / Shift+Enter kept mutating the hidden draft while a
@@ -998,9 +979,37 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return action;
     }
 
+    // While peeking a sub-agent the composer is hidden behind the full-screen
+    // output; swallow text-editing keys so typing / Enter / Backspace don't
+    // silently mutate the hidden draft. Navigation (Tab / Shift+Tab / Esc) and
+    // scroll (arrows / Page) fall through to the match below and keep working.
+    if store.state.chat_view != crate::model::ChatViewTarget::Main {
+        match key.code {
+            KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete => {
+                return KeyAction::Continue;
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
+        // Tab / Shift+Tab cycle the main pane across `[main, …running
+        // sub-agents]` (the selector strip under the composer) and select as
+        // they move. This repurposes Tab away from the now-disabled side-panel
+        // focus cycle; it is a no-op when the active session has no sub-agents.
         KeyCode::Tab => {
-            store.state.focus = store.state.focus.next();
+            store.state.select_next_chat_view();
+        }
+        KeyCode::BackTab => {
+            store.state.select_prev_chat_view();
+        }
+        // Esc first backs out of a sub-agent view to the main chat — before the
+        // turn-interrupt / refocus Esc arms below — so it reads as "leave the
+        // peek", not "cancel the turn".
+        KeyCode::Esc if store.state.chat_view != crate::model::ChatViewTarget::Main => {
+            store
+                .state
+                .set_chat_view(crate::model::ChatViewTarget::Main);
         }
         KeyCode::Esc if store.state.transcript_pager_active => {
             store.state.exit_transcript_pager();
@@ -1044,6 +1053,22 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         }
         KeyCode::Up if store.state.transcript_pager_active => {
             store.state.scroll_transcript_up(1);
+        }
+        // While peeking a sub-agent, Up/Down/PageUp/PageDown scroll that agent's
+        // output (which reuses the shared `transcript_scroll` from-bottom offset)
+        // rather than driving composer history. Placed ahead of the composer and
+        // general scroll arms so the peek owns the vertical keys while it is open.
+        KeyCode::Down if store.state.chat_view != crate::model::ChatViewTarget::Main => {
+            store.state.scroll_transcript_down(1);
+        }
+        KeyCode::Up if store.state.chat_view != crate::model::ChatViewTarget::Main => {
+            store.state.scroll_transcript_up(1);
+        }
+        KeyCode::PageDown if store.state.chat_view != crate::model::ChatViewTarget::Main => {
+            store.state.scroll_transcript_down(8);
+        }
+        KeyCode::PageUp if store.state.chat_view != crate::model::ChatViewTarget::Main => {
+            store.state.scroll_transcript_up(8);
         }
         // In the composer, Up/Down move the cursor between logical lines; at the
         // first/last line they fall back to the existing transcript scroll so
@@ -2438,7 +2463,7 @@ mod tests {
     }
 
     #[test]
-    fn alt_up_down_cycles_chat_view_between_main_and_agents() {
+    fn tab_cycles_chat_view_between_main_and_agents() {
         use crate::model::ChatViewTarget;
         let mut store = store_with_sessions(1);
         store.state.focus = FocusPane::Composer;
@@ -2452,20 +2477,46 @@ mod tests {
 
         assert_eq!(store.state.chat_view, ChatViewTarget::Main);
 
-        // Alt+Down cycles forward through [main, ag-1, ag-2] and wraps.
-        handle_key(&mut store, modified_key(KeyCode::Down, KeyModifiers::ALT));
+        // Tab cycles forward through [main, ag-1, ag-2] and wraps.
+        handle_key(&mut store, key(KeyCode::Tab));
         assert_eq!(store.state.chat_view, ChatViewTarget::Agent("ag-1".into()));
-        handle_key(&mut store, modified_key(KeyCode::Down, KeyModifiers::ALT));
+        handle_key(&mut store, key(KeyCode::Tab));
         assert_eq!(store.state.chat_view, ChatViewTarget::Agent("ag-2".into()));
-        handle_key(&mut store, modified_key(KeyCode::Down, KeyModifiers::ALT));
+        handle_key(&mut store, key(KeyCode::Tab));
         assert_eq!(store.state.chat_view, ChatViewTarget::Main);
 
-        // Alt+Up steps backward.
-        handle_key(&mut store, modified_key(KeyCode::Up, KeyModifiers::ALT));
+        // Shift+Tab (BackTab) steps backward.
+        handle_key(&mut store, key(KeyCode::BackTab));
         assert_eq!(store.state.chat_view, ChatViewTarget::Agent("ag-2".into()));
 
-        // The composer is untouched by the view switch.
+        // Tab drives the switcher, not focus: the composer keeps focus and its
+        // text is untouched by the view switch.
         assert_eq!(store.state.composer, "");
+        assert_eq!(store.state.focus, FocusPane::Composer);
+    }
+
+    #[test]
+    fn peeking_agent_swallows_composer_text_keys() {
+        use crate::model::ChatViewTarget;
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        let sid = store.state.active_session().unwrap().id.clone();
+        store
+            .state
+            .upsert_session_agent(&sid, sample_agent_record(&sid, "ag-1"));
+
+        // Enter the agent peek, then type: the hidden composer must not change.
+        handle_key(&mut store, key(KeyCode::Tab));
+        assert_eq!(store.state.chat_view, ChatViewTarget::Agent("ag-1".into()));
+        handle_key(&mut store, key(KeyCode::Char('x')));
+        handle_key(&mut store, key(KeyCode::Char('y')));
+        assert_eq!(store.state.composer, "");
+
+        // Esc backs out to the main chat, where typing works again.
+        handle_key(&mut store, key(KeyCode::Esc));
+        assert_eq!(store.state.chat_view, ChatViewTarget::Main);
+        handle_key(&mut store, key(KeyCode::Char('z')));
+        assert_eq!(store.state.composer, "z");
     }
 
     fn store_with_live_reply_text(text: &str) -> Store {
@@ -3752,7 +3803,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_and_jk_navigation_cover_m9_panes_without_stealing_composer_text() {
+    fn jk_navigation_covers_m9_panes_without_stealing_composer_text() {
         let mut store = store_with_sessions(1);
         store
             .state
@@ -3765,39 +3816,15 @@ mod tests {
                 status: "ready".into(),
             });
 
-        assert!(matches!(
-            handle_key(&mut store, key(KeyCode::Tab)),
-            KeyAction::Continue
-        ));
-        assert_eq!(store.state.focus, FocusPane::Sessions);
-        assert!(matches!(
-            handle_key(&mut store, key(KeyCode::Tab)),
-            KeyAction::Continue
-        ));
-        assert_eq!(store.state.focus, FocusPane::Tasks);
-        assert!(matches!(
-            handle_key(&mut store, key(KeyCode::Tab)),
-            KeyAction::Continue
-        ));
-        assert_eq!(store.state.focus, FocusPane::Artifacts);
+        // The side panel is no longer reachable via Tab (Tab drives the sub-agent
+        // switcher now), but its panes still navigate with j/k when focused
+        // directly — set focus per pane and exercise the movement.
+        store.state.focus = FocusPane::Artifacts;
         assert!(matches!(
             handle_key(&mut store, key(KeyCode::Char('j'))),
             KeyAction::Continue
         ));
         assert_eq!(store.state.artifacts.selected, 1);
-
-        for expected in [
-            FocusPane::Transcript,
-            FocusPane::Workspace,
-            FocusPane::Git,
-            FocusPane::Composer,
-        ] {
-            assert!(matches!(
-                handle_key(&mut store, key(KeyCode::Tab)),
-                KeyAction::Continue
-            ));
-            assert_eq!(store.state.focus, expected);
-        }
 
         store.state.focus = FocusPane::Workspace;
         assert!(matches!(
@@ -3824,14 +3851,11 @@ mod tests {
     #[test]
     fn session_switch_preserves_per_session_composer_drafts() {
         let mut store = store_with_sessions(2);
-        store.state.focus = FocusPane::Composer;
         store.state.composer = "draft one".into();
 
-        assert!(matches!(
-            handle_key(&mut store, key(KeyCode::Tab)),
-            KeyAction::Continue
-        ));
-        assert_eq!(store.state.focus, FocusPane::Sessions);
+        // Tab now drives the sub-agent switcher rather than side-panel focus;
+        // reach the Sessions pane directly to exercise draft preservation.
+        store.state.focus = FocusPane::Sessions;
         assert!(matches!(
             handle_key(&mut store, key(KeyCode::Char('j'))),
             KeyAction::Continue

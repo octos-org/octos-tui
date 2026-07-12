@@ -32,6 +32,12 @@ pub fn render(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
     if app.activity_navigator.active {
         render_activity_navigator_overlay(frame, app, palette);
         return;
+    } else if agent_view_active(app) {
+        // Peeking a sub-agent: the whole screen becomes that agent's output
+        // (full-screen, like the transcript pager) so the native scrollback that
+        // holds the real chat is never touched. Tab/Shift+Tab/Esc restore it.
+        render_agent_overlay(frame, app, palette);
+        return;
     } else if inspector_visible(app) {
         render_inspector_layout(frame, app, palette);
     } else {
@@ -70,6 +76,17 @@ fn inspector_visible(app: &AppState) -> bool {
     )
 }
 
+/// True when the main pane is peeking a still-present sub-agent — the state that
+/// swaps the inline chat for the full-screen agent-output overlay. A selection
+/// pointing at a vanished agent is NOT active (the switcher normalizes it back
+/// to `Main`), so this never strands the UI on a dead agent.
+pub fn agent_view_active(app: &AppState) -> bool {
+    matches!(
+        &app.chat_view,
+        crate::model::ChatViewTarget::Agent(id) if app.active_agent_record(id).is_some()
+    )
+}
+
 // ===========================================================================
 // Inline-viewport rendering (codex-style scrollback model).
 //
@@ -91,6 +108,7 @@ fn inspector_visible(app: &AppState) -> bool {
 /// alt-screen only for transient overlays (transcript pager, resume picker).
 pub fn wants_fullscreen_overlay(app: &AppState) -> bool {
     app.activity_navigator.active
+        || agent_view_active(app)
         || inspector_visible(app)
         || onboarding_first_launch_active(app)
         || app.transcript_pager_active
@@ -2368,6 +2386,128 @@ pub fn activity_navigator_areas(area: Rect) -> ActivityNavigatorAreas {
         detail: body[1],
         hint: vertical[2],
     }
+}
+
+/// Full-screen overlay shown when the main pane is peeking a sub-agent
+/// (`chat_view == Agent(id)`). Renders that agent's streamed output over the
+/// whole terminal — the native scrollback holding the real chat is left
+/// untouched — with the selector strip and a key hint pinned at the bottom.
+fn render_agent_overlay(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
+    let crate::model::ChatViewTarget::Agent(agent_id) = &app.chat_view else {
+        return;
+    };
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+
+    let strip_height = agent_strip_height(app);
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(strip_height),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    frame.render_widget(
+        render_agent_overlay_body(app, palette, root[0], agent_id),
+        root[0],
+    );
+    if strip_height > 0 {
+        frame.render_widget(render_agent_strip(app, palette), root[1]);
+    }
+    frame.render_widget(render_agent_overlay_hint(palette), root[2]);
+}
+
+/// The scrollable body of the agent peek: an identity/status header followed by
+/// the agent's streamed output log, anchored to the bottom via the shared
+/// `transcript_scroll` (rows-from-bottom) so freshly streamed output stays in
+/// view.
+fn render_agent_overlay_body(
+    app: &AppState,
+    palette: Palette,
+    area: Rect,
+    agent_id: &str,
+) -> Paragraph<'static> {
+    let wrap_width = transcript_wrap_width(area);
+    let lines = agent_overlay_lines(app, palette, agent_id);
+
+    // Inner height excludes the 2 border rows drawn by the block below.
+    let visible_height = transcript_visible_height(area).saturating_sub(2).max(1);
+    let total_rows = transcript_visual_rows(&lines, wrap_width);
+    let max_scroll = total_rows.saturating_sub(visible_height);
+    let scroll_from_bottom = app.transcript_scroll.min(max_scroll);
+    let scroll_top =
+        u16::try_from(max_scroll.saturating_sub(scroll_from_bottom)).unwrap_or(u16::MAX);
+
+    Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .style(Style::default().fg(palette.text).bg(palette.surface_alt))
+                .border_style(palette.border()),
+        )
+        .scroll((scroll_top, 0))
+        .wrap(Wrap { trim: false })
+}
+
+/// Build the agent-peek body lines: an identity/status/task header, a blank
+/// separator, then the streamed output (or a placeholder until any arrives).
+/// The sub-agent has no turn-by-turn transcript — only this streamed log — so
+/// the header supplies the context a chat transcript otherwise would.
+fn agent_overlay_lines(app: &AppState, palette: Palette, agent_id: &str) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(agent) = app.active_agent_record(agent_id) {
+        let name = if agent.nickname.trim().is_empty() {
+            agent.role.clone()
+        } else {
+            agent.nickname.clone()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} {name}", agent_status_glyph(&agent.status)),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  ·  {}", agent.status), palette.muted()),
+        ]));
+        let task = agent
+            .last_task
+            .as_deref()
+            .or(agent.title.as_deref())
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        if let Some(task) = task {
+            lines.push(Line::from(Span::styled(
+                format!("task: {task}"),
+                palette.muted(),
+            )));
+        }
+        lines.push(Line::from(String::new()));
+    }
+    match app.active_agent_output(agent_id) {
+        Some(text) if !text.trim().is_empty() => {
+            for raw in text.lines() {
+                lines.push(Line::from(raw.to_string()));
+            }
+        }
+        _ => lines.push(Line::from(Span::styled(
+            "(no output captured yet — this agent streams its result here as it works)".to_string(),
+            palette.muted(),
+        ))),
+    }
+    lines
+}
+
+/// Bottom hint row for the agent peek: the keys that move between agents / the
+/// main chat and scroll the output.
+fn render_agent_overlay_hint(palette: Palette) -> Paragraph<'static> {
+    Paragraph::new(Line::from(Span::styled(
+        " Tab next · Shift+Tab prev · ↑/↓ scroll · Esc back to chat ".to_string(),
+        palette.muted().bg(palette.surface),
+    )))
+    .style(Style::default().bg(palette.surface))
 }
 
 fn render_activity_navigator_overlay(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
@@ -16345,6 +16485,67 @@ mod tests {
             ChatViewTarget::Main,
             "agent selection must not carry across sessions"
         );
+    }
+
+    #[test]
+    fn agent_view_overlay_renders_selected_agent_output() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+        app.upsert_session_agent(&sid, sample_agent("researcher", "running"));
+        app.set_agent_output(
+            &sid,
+            "researcher",
+            "Investigating the corpus\nFound 12 candidate sources".into(),
+            octos_core::ui_protocol::OutputCursor { offset: 0 },
+        );
+
+        // Main view: the inline chat is shown, NOT the agent's output.
+        assert!(!agent_view_active(&app));
+        let main_text = rendered_text(&app);
+        assert!(!main_text.contains("candidate sources"));
+
+        // Peeking the agent: the overlay takes over and shows its output + hint.
+        app.set_chat_view(ChatViewTarget::Agent("researcher".into()));
+        assert!(agent_view_active(&app));
+        assert!(wants_fullscreen_overlay(&app));
+        let peek_text = rendered_text(&app);
+        assert!(
+            peek_text.contains("Investigating the corpus"),
+            "overlay shows the agent's streamed output"
+        );
+        assert!(peek_text.contains("candidate sources"));
+        assert!(
+            peek_text.contains("Esc back to chat"),
+            "overlay shows the navigation hint"
+        );
+    }
+
+    #[test]
+    fn agent_view_inactive_when_selected_agent_absent() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        // A selection pointing at a non-existent agent must not trigger the
+        // full-screen takeover (the switcher normalizes such stragglers to Main).
+        app.set_chat_view(ChatViewTarget::Agent("ghost".into()));
+        assert!(!agent_view_active(&app));
+        assert!(!wants_fullscreen_overlay(&app));
+    }
+
+    #[test]
+    fn agent_roster_refresh_drops_peek_of_vanished_agent() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+        app.upsert_session_agent(&sid, sample_agent("worker", "running"));
+        app.set_chat_view(ChatViewTarget::Agent("worker".into()));
+        assert!(agent_view_active(&app));
+
+        // A refresh that no longer lists "worker" (completed and pruned by the
+        // backend) must fall the peek back to the main chat.
+        app.set_session_agents(&sid, vec![]);
+        assert_eq!(app.chat_view, ChatViewTarget::Main);
+        assert!(!agent_view_active(&app));
     }
 
     #[test]
