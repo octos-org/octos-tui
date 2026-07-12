@@ -2236,6 +2236,7 @@ fn onboarding_first_launch_active(app: &AppState) -> bool {
             matches!(
                 frame.id.as_str(),
                 crate::menu::registry::MENU_ONBOARD
+                    | crate::menu::registry::MENU_PROFILE_PICKER
                     | crate::menu::registry::MENU_ONBOARD_LANGUAGE
                     | crate::menu::registry::MENU_ONBOARD_FAMILY
                     | crate::menu::registry::MENU_ONBOARD_MODEL

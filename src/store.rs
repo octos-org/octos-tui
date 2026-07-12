@@ -2229,6 +2229,11 @@ impl Store {
 
         match action {
             OnboardingAction::Open => {
+                // From the Phase 3 startup picker's "Create a new profile" row,
+                // replace the picker rather than stacking onboarding over it.
+                if self.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER) {
+                    self.close_all_menus();
+                }
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
                 // A profile that already has a saved provider must not read as
                 // "not set" — fetch the server-saved LLM state for display.
@@ -2289,6 +2294,16 @@ impl Store {
                 self.refresh_active_menu_and_advance();
                 None
             }
+            OnboardingAction::SetRequestedId(requested_id) => {
+                self.state.onboarding.requested_id = requested_id.trim().to_owned();
+                self.state.onboarding.local_profile_created = false;
+                self.state.onboarding.clear_local_profile_recovery();
+                self.state.onboarding.last_message =
+                    Some(t!("status.profile_name_updated").into_owned());
+                self.state.status = t!("status.onboarding_profile_name_updated").into_owned();
+                self.refresh_active_menu_and_advance();
+                None
+            }
             OnboardingAction::SetProfileId(profile_id) => {
                 self.state.onboarding.profile_id = non_empty_string(profile_id);
                 self.state.onboarding.last_message =
@@ -2303,7 +2318,15 @@ impl Store {
                 // provider start row like that path does; when the rebuilt
                 // menu has no provider rows (no step swap happened), keep the
                 // wizard's usual advance-to-next-row behavior.
-                if self.state.menu_stack.is_active() {
+                if self.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER) {
+                    // Attaching from the Phase 3 startup picker: leave the
+                    // picker entirely and enter that profile's onboarding
+                    // (provider setup), so Esc does not fall back into the
+                    // picker mid-setup.
+                    self.close_all_menus();
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                    self.focus_provider_start_row();
+                } else if self.state.menu_stack.is_active() {
                     self.refresh_active_menu();
                     if !self.focus_provider_start_row() {
                         self.advance_active_menu_selection();
@@ -2544,6 +2567,10 @@ impl Store {
             "code" | "otp" => {
                 self.dispatch_onboarding_action(OnboardingAction::SetOtpCode(rest.to_owned()), None)
             }
+            "profile-name" | "name-profile" | "id" => self.dispatch_onboarding_action(
+                OnboardingAction::SetRequestedId(rest.to_owned()),
+                None,
+            ),
             "profile" | "profile-id" => self
                 .dispatch_onboarding_action(OnboardingAction::SetProfileId(rest.to_owned()), None),
             "family" | "family-id" => self
@@ -2842,10 +2869,20 @@ impl Store {
             self.state.status = t!("status.local_profile_create_in_progress").into_owned();
             return None;
         }
-        // M22-B: client-side pre-flight validation catches obvious
-        // bad fields before a backend round-trip; surfaces typed
-        // recovery instead of a generic "incomplete" status.
-        if let Err(recovery) = self.state.onboarding.validate_local_profile() {
+        // Phase 2: when the server advertises nameable profiles, the Profile
+        // step is a single "Name this profile" prompt sent as `requested_id`;
+        // otherwise fall back to the legacy name/username/email create so the
+        // TUI keeps working against older servers.
+        let use_requested_id = self.local_profile_requested_id_supported();
+        // Client-side pre-flight validation catches obvious bad fields before a
+        // backend round-trip; surfaces typed recovery instead of a generic
+        // "incomplete" status. Each flow validates only the fields it sends.
+        let validation = if use_requested_id {
+            self.state.onboarding.validate_local_profile_requested_id()
+        } else {
+            self.state.onboarding.validate_local_profile()
+        };
+        if let Err(recovery) = validation {
             self.state.status = recovery.message.clone();
             self.state.onboarding.last_message = Some(recovery.message.clone());
             let focus_field = recovery.focus_field;
@@ -2859,15 +2896,32 @@ impl Store {
         }
         self.state.onboarding.open_session_after_profile_create = open_session_after_create;
         self.state.onboarding.local_profile_create_pending = true;
-        self.state.onboarding.local_profile_create_pending_username =
-            Some(self.state.onboarding.username.clone());
+        // The collision-recovery snapshot names whichever id was submitted:
+        // the requested profile id in the nameable flow, the username legacy.
+        self.state.onboarding.local_profile_create_pending_username = Some(if use_requested_id {
+            self.state.onboarding.effective_requested_id()
+        } else {
+            self.state.onboarding.username.clone()
+        });
         self.state.onboarding.local_profile_recovery = None;
         self.state.onboarding.last_message = Some(t!("status.creating_local_profile").into_owned());
-        Some(AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
-            name: self.state.onboarding.name.clone(),
-            username: self.state.onboarding.username.clone(),
-            email: self.state.onboarding.email.clone(),
-        }))
+        let params = if use_requested_id {
+            // Send ONLY requested_id; leave name/username/email empty so the
+            // server derives display metadata from the id. `skip_serializing_if`
+            // keeps the other fields out of the way of the server's defaults.
+            ProfileLocalCreateParams {
+                requested_id: Some(self.state.onboarding.effective_requested_id()),
+                ..ProfileLocalCreateParams::default()
+            }
+        } else {
+            ProfileLocalCreateParams {
+                requested_id: None,
+                name: self.state.onboarding.name.clone(),
+                username: self.state.onboarding.username.clone(),
+                email: self.state.onboarding.email.clone(),
+            }
+        };
+        Some(AppUiCommand::ProfileLocalCreate(params))
     }
 
     fn onboarding_refresh_catalog_command(&mut self) -> Option<AppUiCommand> {
@@ -3300,6 +3354,21 @@ impl Store {
             })
     }
 
+    /// Phase 2 capability negotiation: `true` only when the connected server
+    /// advertises the nameable-profiles feature. Gates the slimmed single-prompt
+    /// Profile step + the `requested_id` wire field; when `false` the TUI keeps
+    /// the legacy name/username/email create so it works against older servers.
+    fn local_profile_requested_id_supported(&self) -> bool {
+        self.state
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                capabilities.supports_feature(
+                    crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1,
+                )
+            })
+    }
+
     fn profile_llm_catalog_supported(&self) -> bool {
         self.state
             .capabilities
@@ -3324,6 +3393,7 @@ impl Store {
             matches!(
                 frame.id.as_str(),
                 crate::menu::registry::MENU_ONBOARD
+                    | crate::menu::registry::MENU_PROFILE_PICKER
                     | crate::menu::registry::MENU_ONBOARD_FAMILY
                     | crate::menu::registry::MENU_ONBOARD_MODEL
                     | crate::menu::registry::MENU_ONBOARD_ROUTE
@@ -3410,9 +3480,12 @@ impl Store {
     /// was actually closed.
     pub fn handle_menu_escape(&mut self) -> bool {
         if self.onboarding_in_progress()
-            && self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD)
+            && (self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD)
+                || self.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER))
         {
-            // No-op: keep the root onboarding wizard open.
+            // No-op: keep the root onboarding wizard / startup profile picker
+            // open. Both auto-open on first launch, so closing them would strand
+            // the user on a blank screen; each offers explicit Exit rows.
             return false;
         }
         self.close_menu()
@@ -3761,6 +3834,7 @@ impl Store {
             crate::model::OnboardingLocalProfileField::Name => "onboard.local.name",
             crate::model::OnboardingLocalProfileField::Username => "onboard.local.username",
             crate::model::OnboardingLocalProfileField::Email => "onboard.local.email",
+            crate::model::OnboardingLocalProfileField::RequestedId => "onboard.local.requested_id",
         };
         self.select_active_menu_item_by_id(row_id)
     }
@@ -6170,8 +6244,36 @@ impl Store {
         let supports_legacy_auth = crate::menu::registry::APPUI_FIRST_LAUNCH_LEGACY_AUTH_METHODS
             .iter()
             .all(|method| capabilities.supports_method(method));
-        if supports_local_solo || supports_legacy_auth {
-            self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        if !(supports_local_solo || supports_legacy_auth) {
+            return;
+        }
+
+        // Phase 3 startup picker. Only a local-solo backend has nameable
+        // on-disk profiles to attach, so the picker/attach branches are gated on
+        // that; a pinned `--profile-id`, a first-ever run, or a legacy-auth
+        // server all fall through to the pre-existing single onboarding entry.
+        let decision = crate::model::StartupProfileDecision::decide(
+            self.state.onboarding.launch_profile_id.as_deref(),
+            &self.state.onboarding.available_profiles,
+        );
+        match decision {
+            // >1 profile, nothing pinned: let the user choose which to attach.
+            crate::model::StartupProfileDecision::Pick(_) if supports_local_solo => {
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER));
+            }
+            // Exactly one profile, nothing pinned: attach it silently and drop
+            // into that profile's setup instead of re-running create.
+            crate::model::StartupProfileDecision::Attach(profile_id) if supports_local_solo => {
+                self.state.status =
+                    t!("status.attached_profile", profile = profile_id.clone()).into_owned();
+                self.state.onboarding.profile_id = Some(profile_id);
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+            }
+            // Pinned `--profile-id`, a first-ever run with no profiles, or a
+            // legacy-auth server: unchanged behavior — open onboarding.
+            _ => {
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+            }
         }
     }
 
@@ -15599,6 +15701,200 @@ mod tests {
             store.state.active_menu.is_none(),
             "no capabilities means no auto-open of onboarding"
         );
+    }
+
+    // ---- Phase 3: startup profile picker wiring ----
+
+    fn local_solo_capabilities_event() -> ClientEvent {
+        ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+                    &[],
+                ),
+            },
+            message: "Octos UI capabilities refreshed: 1 method".into(),
+        })
+    }
+
+    #[test]
+    fn first_launch_opens_picker_when_multiple_profiles_and_no_pin() {
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.available_profiles = vec!["glm".into(), "deepseek".into()];
+
+        store.apply_client_event(local_solo_capabilities_event());
+
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER),
+            "more than one profile must open the attach picker"
+        );
+    }
+
+    #[test]
+    fn first_launch_attaches_single_profile_silently() {
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.available_profiles = vec!["glm".into()];
+
+        store.apply_client_event(local_solo_capabilities_event());
+
+        // Exactly one profile is attached (no picker) and the wizard opens
+        // straight into that profile's setup rather than the create step.
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+        assert_eq!(store.state.onboarding.profile_id.as_deref(), Some("glm"));
+    }
+
+    #[test]
+    fn first_launch_pin_skips_picker_even_with_multiple_profiles() {
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.launch_profile_id = Some("coding".into());
+        store.state.onboarding.available_profiles = vec!["glm".into(), "deepseek".into()];
+
+        store.apply_client_event(local_solo_capabilities_event());
+
+        // A pinned --profile-id is honored unchanged: onboarding, never picker,
+        // and the picker's silent-attach must not stomp the pinned profile.
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+        assert!(store.state.onboarding.profile_id.is_none());
+    }
+
+    #[test]
+    fn first_launch_onboards_when_no_profiles_exist() {
+        let mut store = protocol_store_without_sessions();
+
+        store.apply_client_event(local_solo_capabilities_event());
+
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+        assert!(store.state.onboarding.profile_id.is_none());
+    }
+
+    #[test]
+    fn picker_select_attaches_profile_and_leaves_picker_for_onboarding() {
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.available_profiles = vec!["glm".into(), "deepseek".into()];
+        store.apply_client_event(local_solo_capabilities_event());
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER));
+
+        // The picker's row dispatches SetProfileId for the chosen profile.
+        store.dispatch_onboarding_action(
+            crate::model::OnboardingAction::SetProfileId("glm".into()),
+            None,
+        );
+
+        assert_eq!(store.state.onboarding.profile_id.as_deref(), Some("glm"));
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
+            "selecting a profile leaves the picker for that profile's setup"
+        );
+        assert!(!store.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER));
+    }
+
+    #[test]
+    fn picker_create_new_replaces_picker_with_onboarding() {
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.available_profiles = vec!["glm".into(), "deepseek".into()];
+        store.apply_client_event(local_solo_capabilities_event());
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER));
+
+        // The picker's "Create a new profile" row opens the onboarding create
+        // step (no profile pinned) in place of the picker.
+        store.dispatch_onboarding_action(crate::model::OnboardingAction::Open, None);
+
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+        assert!(store.state.onboarding.profile_id.is_none());
+        // Replaced, not stacked: closing onboarding must not reveal the picker.
+        store.close_all_menus();
+        assert!(!store.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER));
+    }
+
+    #[test]
+    fn escape_keeps_startup_picker_open() {
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.available_profiles = vec!["glm".into(), "deepseek".into()];
+        store.apply_client_event(local_solo_capabilities_event());
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER));
+
+        let closed = store.handle_menu_escape();
+        assert!(
+            !closed,
+            "Esc must not strand the user by closing the picker"
+        );
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER));
+    }
+
+    // ---- Phase 2: nameable-profiles create-command negotiation ----
+
+    #[test]
+    fn create_local_profile_sends_requested_id_when_feature_advertised() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            [crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1],
+        ));
+        store.state.onboarding.requested_id = "glm".into();
+
+        let command = store
+            .dispatch_onboarding_action(crate::model::OnboardingAction::CreateLocalProfile, None)
+            .expect("nameable create emits profile/local/create");
+        let AppUiCommand::ProfileLocalCreate(params) = command else {
+            panic!("expected profile/local/create, got {command:?}");
+        };
+        assert_eq!(params.requested_id.as_deref(), Some("glm"));
+        assert!(params.name.is_empty());
+        assert!(params.username.is_empty());
+        assert!(params.email.is_empty());
+    }
+
+    #[test]
+    fn create_local_profile_uses_family_suggestion_when_id_untyped() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            [crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1],
+        ));
+        // No typed id, but a chosen family → suggestion is sent.
+        store.state.onboarding.provider.family_id = "glm-4.6".into();
+
+        let command = store
+            .dispatch_onboarding_action(crate::model::OnboardingAction::CreateLocalProfile, None)
+            .expect("suggestion drives the create");
+        let AppUiCommand::ProfileLocalCreate(params) = command else {
+            panic!("expected profile/local/create");
+        };
+        assert_eq!(params.requested_id.as_deref(), Some("glm"));
+    }
+
+    #[test]
+    fn create_local_profile_falls_back_to_legacy_shape_without_feature() {
+        // Older server: method advertised, feature NOT advertised → legacy
+        // name/username/email create with no requested_id.
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.name = "Ada Lovelace".into();
+        store.state.onboarding.username = "ada".into();
+        store.state.onboarding.email = "ada@example.com".into();
+
+        let command = store
+            .dispatch_onboarding_action(crate::model::OnboardingAction::CreateLocalProfile, None)
+            .expect("legacy create emits profile/local/create");
+        let AppUiCommand::ProfileLocalCreate(params) = command else {
+            panic!("expected profile/local/create");
+        };
+        assert!(
+            params.requested_id.is_none(),
+            "legacy shape omits requested_id"
+        );
+        assert_eq!(params.name, "Ada Lovelace");
+        assert_eq!(params.username, "ada");
+        assert_eq!(params.email, "ada@example.com");
+    }
+
+    #[test]
+    fn onboard_profile_name_command_sets_requested_id() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.composer = "/onboard profile-name glm".into();
+        assert!(store.compose_command().is_none());
+        assert_eq!(store.state.onboarding.requested_id, "glm");
     }
 
     /// M22-A: `/setup` is an alias of `/onboard`, so typing either

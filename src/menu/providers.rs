@@ -61,6 +61,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::OnboardModel,
         Provider::OnboardRoute,
         Provider::OnboardWorkspace,
+        Provider::ProfilePicker,
         Provider::Login,
         Provider::Theme,
         Provider::Thinking,
@@ -90,6 +91,7 @@ pub fn core_menu_registry() -> MenuRegistry {
 enum Provider {
     Help,
     Onboard,
+    ProfilePicker,
     OnboardLanguage,
     OnboardFamily,
     OnboardModel,
@@ -119,6 +121,7 @@ impl MenuProvider for Provider {
         MenuId::from(match self {
             Self::Help => MENU_HELP,
             Self::Onboard => MENU_ONBOARD,
+            Self::ProfilePicker => crate::menu::registry::MENU_PROFILE_PICKER,
             Self::OnboardLanguage => MENU_ONBOARD_LANGUAGE,
             Self::OnboardFamily => crate::menu::registry::MENU_ONBOARD_FAMILY,
             Self::OnboardModel => crate::menu::registry::MENU_ONBOARD_MODEL,
@@ -148,6 +151,7 @@ impl MenuProvider for Provider {
         match self {
             Self::Help => MenuBuildResult::Ready(help_menu(ctx)),
             Self::Onboard => onboarding_menu(ctx),
+            Self::ProfilePicker => profile_picker_menu(ctx),
             Self::OnboardLanguage => MenuBuildResult::Ready(onboarding_language_menu()),
             Self::OnboardFamily => onboarding_family_menu(ctx),
             Self::OnboardModel => onboarding_model_menu(ctx),
@@ -1058,7 +1062,7 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let current_profile = ctx.app.current_profile;
     let local_profile_create = local_profile_create_supported(ctx);
     if local_profile_create && state.effective_profile_id(current_profile).is_none() {
-        return onboarding_local_profile_menu(state);
+        return onboarding_local_profile_menu(state, local_profile_requested_id_supported(ctx));
     }
     if state.effective_profile_id(current_profile).is_some() {
         return onboarding_provider_setup_menu(ctx, state, current_profile);
@@ -1290,6 +1294,72 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             title: Some(t!("menu.onboard.preview_title").into_owned()),
             rows: onboarding_preview_rows(state, current_profile),
         }),
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Phase 3 startup picker: "attach which profile?". Lists the local profiles
+/// discovered at launch; selecting one attaches it (via `SetProfileId`, the
+/// same path `/onboard profile <id>` uses) and the wizard advances straight to
+/// provider setup for that profile. A trailing row starts a fresh profile
+/// through the normal onboarding create step. Only reached when more than one
+/// profile exists and no `--profile-id` was pinned (see
+/// `maybe_open_onboarding_on_first_launch`).
+fn profile_picker_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let profiles = ctx
+        .app
+        .onboarding
+        .map(|onboarding| onboarding.available_profiles.as_slice())
+        .unwrap_or(&[]);
+
+    let mut items: Vec<MenuItem> = profiles
+        .iter()
+        .enumerate()
+        .map(|(index, profile)| {
+            let mut item = MenuItem::new(
+                format!("profile.pick.{index}"),
+                profile.clone(),
+                MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SetProfileId(
+                    profile.clone(),
+                ))),
+            )
+            .with_description(t!("menu.profile_picker.item.attach.desc"));
+            if let Some(shortcut) = numeric_shortcut(index) {
+                item = item.with_shortcut(shortcut);
+            }
+            item
+        })
+        .collect();
+
+    items.push(
+        MenuItem::new(
+            "profile.pick.new",
+            t!("menu.profile_picker.item.create.label"),
+            // Open the onboarding create step (Name-this-profile) rather than
+            // creating immediately — the user still names the new profile.
+            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::Open)),
+        )
+        .with_description(t!("menu.profile_picker.item.create.desc")),
+    );
+    items.push(
+        MenuItem::new(
+            "profile.pick.exit",
+            t!("menu.onboard.item.exit.label"),
+            MenuAction::Local(LocalAction::Exit),
+        )
+        .with_description(t!("menu.onboard.item.exit.desc")),
+    );
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER),
+        title: t!("menu.profile_picker.title").into_owned(),
+        subtitle: Some(t!("menu.profile_picker.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: profiles.len() > 8,
+        search_placeholder: Some(t!("menu.profile_picker.search").into_owned()),
+        footer_hint: Some(t!("menu.profile_picker.footer").into_owned()),
+        preview: None,
         mode: MenuMode::SingleSelect,
     })
 }
@@ -1739,8 +1809,11 @@ fn onboarding_next_action_hint(
     t!("onboarding.wizard.next.finish_remaining").into_owned()
 }
 
-fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResult {
-    let items = vec![
+fn onboarding_local_profile_menu(
+    state: &OnboardingWizardState,
+    requested_id_supported: bool,
+) -> MenuBuildResult {
+    let mut items = vec![
         onboarding_language_row(),
         MenuItem::new(
             "onboard.local.status",
@@ -1748,27 +1821,44 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
             MenuAction::Noop,
         )
         .with_description(t!("onboarding.local.description")),
-        onboarding_edit_item(
-            "onboard.local.name",
-            t!("onboarding.field.full_name"),
-            state.has_name().then_some(state.name.as_str()),
-            "/onboard name ",
-        )
-        .with_state(MenuItemState::required(state.has_name())),
-        onboarding_edit_item(
-            "onboard.local.username",
-            t!("onboarding.field.username"),
-            state.has_username().then_some(state.username.as_str()),
-            "/onboard username ",
-        )
-        .with_state(MenuItemState::required(state.has_username())),
-        onboarding_edit_item(
-            "onboard.local.email",
-            t!("onboarding.field.email"),
-            state.has_email().then_some(state.email.as_str()),
-            "/onboard email ",
-        )
-        .with_state(MenuItemState::required(state.has_email())),
+    ];
+
+    if requested_id_supported {
+        // Phase 2: a solo local tool does not need a full identity. Collapse the
+        // step to ONE prompt — "Name this profile" — pre-suggesting a value from
+        // the chosen provider/model family. The user accepts the suggestion with
+        // a single keypress on Continue, or edits it first.
+        items.push(onboarding_requested_id_row(state));
+    } else {
+        // Legacy fallback for older servers that do not advertise the nameable
+        // feature: keep the full name/username/email create so the TUI still
+        // works end-to-end against an older octos.
+        items.extend([
+            onboarding_edit_item(
+                "onboard.local.name",
+                t!("onboarding.field.full_name"),
+                state.has_name().then_some(state.name.as_str()),
+                "/onboard name ",
+            )
+            .with_state(MenuItemState::required(state.has_name())),
+            onboarding_edit_item(
+                "onboard.local.username",
+                t!("onboarding.field.username"),
+                state.has_username().then_some(state.username.as_str()),
+                "/onboard username ",
+            )
+            .with_state(MenuItemState::required(state.has_username())),
+            onboarding_edit_item(
+                "onboard.local.email",
+                t!("onboarding.field.email"),
+                state.has_email().then_some(state.email.as_str()),
+                "/onboard email ",
+            )
+            .with_state(MenuItemState::required(state.has_email())),
+        ]);
+    }
+
+    items.push(
         MenuItem::new(
             "onboard.local.create",
             t!("onboarding.local.continue"),
@@ -1777,7 +1867,16 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
             )),
         )
         .with_description(t!("onboarding.local.create_action"))
-        .maybe_disabled(onboarding_local_profile_disabled_reason(state)),
+        .maybe_disabled(if requested_id_supported {
+            // The effective id is always non-empty (typed or suggested), so
+            // Continue is never blocked in the nameable flow.
+            None
+        } else {
+            onboarding_local_profile_disabled_reason(state)
+        }),
+    );
+
+    items.extend([
         // Escape hatches (issue: the wizard auto-opens and swallows Esc, so it
         // MUST offer visible ways out). An existing profile id routes the
         // wizard straight to provider setup via the same `/onboard profile`
@@ -1794,7 +1893,7 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
             MenuAction::Local(LocalAction::Exit),
         )
         .with_description(t!("menu.onboard.item.exit.desc")),
-    ];
+    ]);
 
     // Wizard framing: the language step is already satisfied by the default
     // English locale, so this screen is the first required profile input step.
@@ -1803,7 +1902,7 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
     // `local_create_supported = true`, `current_profile = None`, and no saved
     // provider (no profile means nothing can be hydrated).
     let progress = crate::menu::wizard::WizardProgress::from_state(state, None, true, false);
-    let next_action = if state.local_profile_ready() {
+    let next_action = if requested_id_supported || state.local_profile_ready() {
         t!("onboarding.wizard.next.local_continue")
     } else {
         t!("onboarding.wizard.next.local_fill_fields")
@@ -2072,6 +2171,35 @@ fn onboarding_edit_item(
         MenuAction::Local(LocalAction::EditComposer(draft.into())),
     )
     .with_description(t!("onboarding.action_edit"))
+}
+
+/// Phase 2: the single "Name this profile" row. Shows the user's typed id or,
+/// while untouched, the provider-derived suggestion tagged `(suggested)`. Enter
+/// pre-fills the composer with `/onboard profile-name <id>` seeded with the
+/// current value/suggestion so the user can accept it verbatim or edit it. The
+/// draft is dynamic (the suggestion varies), so this row is built inline rather
+/// than through `onboarding_edit_item`'s `&'static str` draft.
+fn onboarding_requested_id_row(state: &OnboardingWizardState) -> MenuItem {
+    let label = t!("onboarding.field.profile_name");
+    let (rendered_value, seed) = if state.has_requested_id() {
+        let typed = state.requested_id.trim().to_owned();
+        (typed.clone(), typed)
+    } else {
+        let suggestion = state.suggested_profile_id();
+        (
+            t!("onboarding.value_suggested", value = &suggestion).into_owned(),
+            suggestion,
+        )
+    };
+    MenuItem::new(
+        "onboard.local.requested_id",
+        format!("{label}: {rendered_value}"),
+        MenuAction::Local(LocalAction::EditComposer(format!(
+            "/onboard profile-name {seed}"
+        ))),
+    )
+    .with_description(t!("onboarding.field.profile_name_desc"))
+    .with_state(MenuItemState::required(state.has_requested_id()))
 }
 
 /// The server-saved primary provider for the wizard's effective profile, read
@@ -4083,6 +4211,14 @@ fn local_profile_create_supported(ctx: &MenuContext<'_>) -> bool {
         .supports_method(APPUI_METHOD_PROFILE_LOCAL_CREATE)
 }
 
+/// Phase 2: `true` when the server advertises nameable solo profiles. Selects
+/// the slimmed single-prompt Profile step over the legacy name/username/email
+/// screen. Backward compatible: `false` against older servers.
+fn local_profile_requested_id_supported(ctx: &MenuContext<'_>) -> bool {
+    ctx.availability
+        .supports_feature(crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1)
+}
+
 fn action_missing_reason(ctx: &MenuContext<'_>, method: &'static str) -> Option<String> {
     (!ctx.availability.supports_method(method)).then(|| method_missing_reason(ctx, method))
 }
@@ -5621,6 +5757,117 @@ mod tests {
             panic!("expected AppUI action");
         };
         command.as_ref()
+    }
+
+    fn ready_spec(result: MenuBuildResult) -> MenuSpec {
+        match result {
+            MenuBuildResult::Ready(spec) => spec,
+            other => panic!("expected a ready menu, got {other:?}"),
+        }
+    }
+
+    fn has_row(spec: &MenuSpec, id: &str) -> bool {
+        spec.items.iter().any(|item| item.id == id)
+    }
+
+    #[test]
+    fn profile_step_shows_single_name_prompt_when_requested_id_supported() {
+        let state = OnboardingWizardState::default();
+        let spec = ready_spec(onboarding_local_profile_menu(&state, true));
+
+        assert!(
+            has_row(&spec, "onboard.local.requested_id"),
+            "nameable flow shows the single Name-this-profile row"
+        );
+        assert!(
+            !has_row(&spec, "onboard.local.name")
+                && !has_row(&spec, "onboard.local.username")
+                && !has_row(&spec, "onboard.local.email"),
+            "nameable flow drops the name/username/email rows"
+        );
+        // Continue is never blocked — a suggestion is always available.
+        let create = spec
+            .items
+            .iter()
+            .find(|item| item.id == "onboard.local.create")
+            .expect("create row present");
+        assert!(
+            create.disabled_reason.is_none(),
+            "Continue is enabled (accepts the suggested id)"
+        );
+    }
+
+    #[test]
+    fn profile_step_falls_back_to_full_fields_without_feature() {
+        let state = OnboardingWizardState::default();
+        let spec = ready_spec(onboarding_local_profile_menu(&state, false));
+
+        assert!(
+            has_row(&spec, "onboard.local.name")
+                && has_row(&spec, "onboard.local.username")
+                && has_row(&spec, "onboard.local.email"),
+            "legacy flow keeps name/username/email for older servers"
+        );
+        assert!(
+            !has_row(&spec, "onboard.local.requested_id"),
+            "legacy flow has no requested_id prompt"
+        );
+    }
+
+    #[test]
+    fn onboarding_menu_routes_to_single_prompt_when_feature_negotiated() {
+        let capabilities = CapabilitySet::from_methods_and_features(
+            [APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            [crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1],
+        );
+        let onboarding = OnboardingWizardState::default();
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(onboarding_menu(&ctx));
+        assert!(has_row(&spec, "onboard.local.requested_id"));
+        assert!(!has_row(&spec, "onboard.local.email"));
+    }
+
+    #[test]
+    fn profile_picker_lists_profiles_with_attach_and_create_rows() {
+        let onboarding = OnboardingWizardState {
+            available_profiles: vec!["glm".into(), "deepseek".into()],
+            ..OnboardingWizardState::default()
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(profile_picker_menu(&ctx));
+
+        // One attach row per profile carrying a SetProfileId action + a
+        // trailing "create new" row.
+        let glm = spec
+            .items
+            .iter()
+            .find(|item| item.label == "glm")
+            .expect("glm row present");
+        assert!(matches!(
+            &glm.action,
+            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SetProfileId(id)))
+                if id == "glm"
+        ));
+        assert!(spec.items.iter().any(|item| item.label == "deepseek"));
+        assert!(has_row(&spec, "profile.pick.new"), "offers a create escape");
     }
 
     fn runtime_status(session_id: &SessionKey) -> SessionRuntimeStatus {
