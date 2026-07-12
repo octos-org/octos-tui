@@ -41,6 +41,22 @@ const SKIP: &[&str] = &[
 /// (and what `backend_ensure` auto-provisions).
 const DEFAULT_STDIO_COMMAND: &str = "octos serve --stdio --solo";
 
+/// All config spellings that mean "stdio transport" (`CliFileConfig` accepts the
+/// snake alias). Used to READ the current value and to CLEAR every form when the
+/// user switches to the endpoint transport, so no stale key survives to trip the
+/// launch-time transport-conflict check (codex).
+const STDIO_KEYS: &[&str] = &["stdio-command", "stdio_command"];
+
+/// All config spellings that mean "endpoint transport" (`CliFileConfig` renames
+/// `base_url` to `endpoint` with these aliases). Same read/clear rationale.
+const ENDPOINT_KEYS: &[&str] = &[
+    "endpoint",
+    "base-url",
+    "base_url",
+    "protocol-endpoint",
+    "protocol_endpoint",
+];
+
 /// Parsed `octos-tui config …` invocation (the `config` token already stripped
 /// by the dispatcher).
 #[derive(Debug)]
@@ -114,7 +130,10 @@ pub fn run(args: ConfigArgs) -> Result<i32> {
 fn show(path: &Path) -> Result<i32> {
     match std::fs::read_to_string(path) {
         Ok(contents) if contents.trim().is_empty() => {
-            println!("{} is empty. Run `octos-tui config` to set it up.", path.display());
+            println!(
+                "{} is empty. Run `octos-tui config` to set it up.",
+                path.display()
+            );
             Ok(0)
         }
         Ok(contents) => {
@@ -205,42 +224,58 @@ fn prompt_transport(
     current: &serde_json::Map<String, serde_json::Value>,
     answers: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
-    let current_stdio = current.get("stdio-command").and_then(|v| v.as_str());
-    let current_endpoint = current.get("endpoint").and_then(|v| v.as_str());
+    // Read the current transport across ALL accepted spellings, so a config
+    // using the legacy `stdio_command` / `base-url` forms is shown and defaulted
+    // correctly instead of being silently replaced (codex).
+    let lookup = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|key| current.get(*key).and_then(|v| v.as_str()))
+            .map(str::to_string)
+    };
+    let current_stdio = lookup(STDIO_KEYS);
+    let current_endpoint = lookup(ENDPOINT_KEYS);
     println!("Backend transport — how octos-tui reaches the octos server:");
     println!("  [1] stdio     spawn a local octos server (recommended; auto-installs it)");
-    println!("  [2] endpoint  connect to a running server over WebSocket (ws://…)");
-    if let Some(stdio) = current_stdio {
+    println!("  [2] endpoint  connect to a running server over WebSocket (ws://...)");
+    if let Some(stdio) = &current_stdio {
         println!("  current: stdio `{stdio}`");
-    } else if let Some(endpoint) = current_endpoint {
+    } else if let Some(endpoint) = &current_endpoint {
         println!("  current: endpoint {endpoint}");
     }
+    // Clear every spelling of the OTHER transport (and any stale `mode`, which
+    // `from_args` gives priority over inference — a lingering `mock` would
+    // silently ignore the chosen backend). Nulls are removals in
+    // `merge_into_config` and are filtered out of schema validation.
+    let clear = |answers: &mut serde_json::Map<String, serde_json::Value>, keys: &[&str]| {
+        for key in keys {
+            answers.insert((*key).into(), serde_json::Value::Null);
+        }
+        answers.insert("mode".into(), serde_json::Value::Null);
+    };
     let choice = read_line("Choose 1/2, or Enter to keep current: ")?;
     match choice.trim() {
         "1" => {
-            let default = current_stdio.unwrap_or(DEFAULT_STDIO_COMMAND);
+            let default = current_stdio.as_deref().unwrap_or(DEFAULT_STDIO_COMMAND);
             let raw = read_line(&format!("  stdio command [{default}]: "))?;
             let value = if raw.trim().is_empty() {
                 default.to_string()
             } else {
                 raw.trim().to_string()
             };
-            let normalized =
-                parse_stdio_command(&value).map_err(|message| eyre!("{message}"))?;
+            let normalized = parse_stdio_command(&value).map_err(|message| eyre!("{message}"))?;
             answers.insert("stdio-command".into(), normalized.into());
-            answers.insert("endpoint".into(), serde_json::Value::Null); // clear the alternative
+            clear(answers, ENDPOINT_KEYS);
         }
         "2" => {
-            let raw = read_line("  WebSocket endpoint (ws://… or wss://…): ")?;
+            let raw = read_line("  WebSocket endpoint (ws://... or wss://...): ")?;
             let value = raw.trim();
             if value.is_empty() {
                 println!("  (no endpoint entered — leaving transport unchanged)");
                 return Ok(());
             }
-            let normalized =
-                parse_websocket_url(value).map_err(|message| eyre!("{message}"))?;
+            let normalized = parse_websocket_url(value).map_err(|message| eyre!("{message}"))?;
             answers.insert("endpoint".into(), normalized.into());
-            answers.insert("stdio-command".into(), serde_json::Value::Null);
+            clear(answers, STDIO_KEYS);
         }
         _ => {} // keep current
     }
@@ -310,9 +345,16 @@ fn prompt_string(
 }
 
 /// Validate the collected answers against the launch schema so we never write a
-/// config the launcher would reject.
+/// config the launcher would reject. Null entries are removals (not values), and
+/// several transport aliases map to one serde field, so they're filtered out
+/// first — otherwise deserialization would reject them as duplicate fields.
 fn validate(answers: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
-    serde_json::from_value::<CliFileConfig>(serde_json::Value::Object(answers.clone()))
+    let values: serde_json::Map<String, serde_json::Value> = answers
+        .iter()
+        .filter(|(_, value)| !value.is_null())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    serde_json::from_value::<CliFileConfig>(serde_json::Value::Object(values))
         .map(|_| ())
         .wrap_err("the collected settings don't match the config schema")
 }
@@ -360,8 +402,18 @@ mod tests {
             .get_arguments()
             .filter_map(|a| a.get_long().map(String::from))
             .collect();
-        for key in ["config", "no-readonly", "auth-token", "mode", "endpoint", "stdio-command"] {
-            assert!(longs.contains(&key.to_string()), "expected arg --{key} to exist");
+        for key in [
+            "config",
+            "no-readonly",
+            "auth-token",
+            "mode",
+            "endpoint",
+            "stdio-command",
+        ] {
+            assert!(
+                longs.contains(&key.to_string()),
+                "expected arg --{key} to exist"
+            );
         }
     }
 
@@ -379,7 +431,10 @@ mod tests {
 
         let mut wrong_type = serde_json::Map::new();
         wrong_type.insert("vim-mode".into(), "definitely-not-a-bool".into());
-        assert!(validate(&wrong_type).is_err(), "wrong value type must be rejected");
+        assert!(
+            validate(&wrong_type).is_err(),
+            "wrong value type must be rejected"
+        );
     }
 
     #[test]
@@ -391,8 +446,20 @@ mod tests {
             .filter_map(|a| a.get_long().map(String::from))
             .filter(|k| !SKIP.contains(&k.as_str()))
             .collect();
-        for key in ["session", "profile-id", "cwd", "readonly", "theme", "lang", "scroll-mode", "vim-mode"] {
-            assert!(prompted.contains(&key.to_string()), "wizard should prompt --{key}");
+        for key in [
+            "session",
+            "profile-id",
+            "cwd",
+            "readonly",
+            "theme",
+            "lang",
+            "scroll-mode",
+            "vim-mode",
+        ] {
+            assert!(
+                prompted.contains(&key.to_string()),
+                "wizard should prompt --{key}"
+            );
         }
     }
 }

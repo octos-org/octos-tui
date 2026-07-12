@@ -240,10 +240,19 @@ mod tests {
             Some(Route::Config(args)) => assert!(matches!(args.action, config::ConfigAction::Path)),
             other => panic!("expected Route::Config(Path), got {other:?}"),
         }
-        match route(&argv(&["octos-tui", "config", "show", "--config", "/tmp/c.json"])) {
+        match route(&argv(&[
+            "octos-tui",
+            "config",
+            "show",
+            "--config",
+            "/tmp/c.json",
+        ])) {
             Some(Route::Config(args)) => {
                 assert!(matches!(args.action, config::ConfigAction::Show));
-                assert_eq!(args.config.as_deref(), Some(std::path::Path::new("/tmp/c.json")));
+                assert_eq!(
+                    args.config.as_deref(),
+                    Some(std::path::Path::new("/tmp/c.json"))
+                );
             }
             other => panic!("expected Route::Config(Show), got {other:?}"),
         }
