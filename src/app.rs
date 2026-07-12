@@ -142,15 +142,30 @@ pub fn wants_fullscreen_overlay(app: &AppState) -> bool {
         || app.turn_state_detail.active
 }
 
+/// The detail overlays that render full-screen (alt-screen, no native scrollback
+/// behind them) and that `scroll_current_surface_*` routes the wheel to. Capture
+/// must stay on while one is up so the wheel actually scrolls it: a detail modal
+/// opening over a peek flips `agent_view_active` false, and without this the
+/// capture would drop even though the modal is a full-screen wheel target.
+fn scrollable_detail_modal_active(app: &AppState) -> bool {
+    app.task_output.active
+        || app.artifact_detail.active
+        || app.thread_graph_detail.active
+        || app.turn_state_detail.active
+}
+
 /// Mouse capture policy. In the default `native` scroll-mode, capture is on
-/// ONLY while a full-screen overlay is up — the transcript pager or a sub-agent
-/// peek — so the wheel scrolls that overlay while the inline chat flow keeps
-/// native terminal selection/copy untouched (both overlays are alt-screen, with
-/// no native scrollback behind them to preserve). In `pinned` scroll-mode the
-/// user explicitly trades native selection for a wheel that always scrolls the
-/// app (composer pinned), so capture stays on.
+/// ONLY while a full-screen overlay is up — the transcript pager, a sub-agent
+/// peek, or a detail modal — so the wheel scrolls that overlay while the inline
+/// chat flow keeps native terminal selection/copy untouched (these overlays are
+/// alt-screen, with no native scrollback behind them to preserve). In `pinned`
+/// scroll-mode the user explicitly trades native selection for a wheel that
+/// always scrolls the app (composer pinned), so capture stays on.
 pub fn wants_mouse_capture(app: &AppState) -> bool {
-    app.transcript_pager_active || app.pinned_scroll || agent_view_active(app)
+    app.transcript_pager_active
+        || app.pinned_scroll
+        || agent_view_active(app)
+        || scrollable_detail_modal_active(app)
 }
 
 /// Watermarks for active-turn content that has already been written into native
@@ -212,8 +227,9 @@ pub fn live_ui_height_with_finalization(
     // The sub-agent selector strip renders between the composer and the status
     // row (see `render_viewport_with_finalization`); reserve its row here too or
     // the live viewport is oversubscribed by one row whenever agents exist and
-    // Ratatui compresses a fixed row at the tail floor.
-    let agent_strip_height = agent_strip_height(app);
+    // Ratatui compresses a fixed row at the tail floor. Height-gated on the same
+    // `height` the render pass uses, so reservation and layout never disagree.
+    let agent_strip_height = agent_strip_height(app, height);
     let chrome =
         menu_height + autonomy_height + harness_height + agent_strip_height + composer_height + 1; // +1 status
 
@@ -333,15 +349,21 @@ pub fn render_viewport_with_finalization(
     // reserved (cap floors at 3), clipping multi-line input. Everything else
     // legitimately lays out within `area`.
     let composer_height = composer_height_for_size(app, area.width, terminal_height);
-    let active_menu = active_menu_surface(app);
-    let menu_height = menu_height_for_viewport(
-        active_menu.as_ref(),
-        area.width,
-        area.height.saturating_sub(composer_height + 1),
-    );
     let autonomy_height = autonomy_indicator_height(app);
     let harness_height = harness_status_height(app);
-    let agent_strip_height = agent_strip_height(app);
+    // Height-gated on `terminal_height` — the SAME basis `live_ui_height` used to
+    // reserve the row — so the reservation and this layout always agree.
+    let agent_strip_height = agent_strip_height(app, terminal_height);
+    let active_menu = active_menu_surface(app);
+    // Budget the menu against the room left AFTER every fixed chrome row
+    // (composer, status, the autonomy/harness indicators, and the selector
+    // strip). Subtracting only composer+status let a tall slash menu overcommit
+    // the root layout, so Ratatui compressed the `Min(1)` tail or clipped the
+    // bottom rows once indicators or the strip were present.
+    let menu_available = area.height.saturating_sub(
+        composer_height + 1 + autonomy_height + harness_height + agent_strip_height,
+    );
+    let menu_height = menu_height_for_viewport(active_menu.as_ref(), area.width, menu_available);
 
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -2114,7 +2136,7 @@ fn chat_layout_areas_for_menu(
     let desired_menu_height = menu_height_hint(active_menu, area.width, area.height);
     let autonomy_height = autonomy_indicator_height(app);
     let harness_height = harness_status_height(app);
-    let agent_strip_height = agent_strip_height(app);
+    let agent_strip_height = agent_strip_height(app, area.height);
     let surface_budget = area.height.saturating_sub(
         min_transcript_height(area.height)
             + composer_height
@@ -2431,7 +2453,9 @@ fn render_agent_overlay(frame: &mut impl FrameLike, app: &AppState, palette: Pal
     let area = frame.area();
     frame.render_widget(Clear, area);
 
-    let strip_height = agent_strip_height(app);
+    // The peek is full-screen, so `area.height` is the whole terminal — the same
+    // basis the inline strip uses, keeping the affordance consistent.
+    let strip_height = agent_strip_height(app, area.height);
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2468,6 +2492,9 @@ fn render_agent_overlay_body(
     let visible_height = transcript_visible_height(area).saturating_sub(2).max(1);
     let total_rows = transcript_visual_rows(&lines, wrap_width);
     let max_scroll = total_rows.saturating_sub(visible_height);
+    // Feed the true maximum back so `scroll_agent_view_up`/Home clamp to it
+    // instead of overshooting with a sentinel (see `agent_view_scroll_max`).
+    app.record_agent_view_scroll_max(max_scroll);
     let scroll_from_bottom = app.agent_view_scroll.min(max_scroll);
     let scroll_top =
         u16::try_from(max_scroll.saturating_sub(scroll_from_bottom)).unwrap_or(u16::MAX);
@@ -2518,7 +2545,7 @@ fn agent_overlay_lines(app: &AppState, palette: Palette, agent_id: &str) -> Vec<
         }
         lines.push(Line::from(String::new()));
     }
-    match app.active_agent_output(agent_id) {
+    match app.active_agent_output_or_tail(agent_id) {
         Some(text) if !text.trim().is_empty() => {
             for raw in text.lines() {
                 lines.push(Line::from(raw.to_string()));
@@ -8244,10 +8271,21 @@ fn agent_strip_chips(app: &AppState) -> Vec<(&'static str, String, bool)> {
     chips
 }
 
+/// Minimum terminal rows before the selector strip claims its row. Below this a
+/// full composer + status + the `Min(1)` tail + the reserved scrollback already
+/// fill the screen, so adding the strip would force Ratatui to collapse a fixed
+/// row (clipping the composer or status). The Tab switcher still works without
+/// the strip — it is a visual aid, not the control surface — so on a tiny
+/// terminal we drop it rather than corrupt the layout.
+const AGENT_STRIP_MIN_TERMINAL_ROWS: u16 = 12;
+
 /// Rows the agent strip occupies under the composer: 1 when the active session
-/// has sub-agents, else 0 (hidden).
-fn agent_strip_height(app: &AppState) -> u16 {
-    if app.active_session_agents().is_empty() {
+/// has sub-agents AND the terminal is tall enough to afford the row, else 0
+/// (hidden). Height-gated so a constrained terminal never oversubscribes the
+/// live layout. Both the height reservation (`live_ui_height`) and the render
+/// pass call this with the same terminal height, so they always agree.
+fn agent_strip_height(app: &AppState, terminal_height: u16) -> u16 {
+    if terminal_height < AGENT_STRIP_MIN_TERMINAL_ROWS || app.active_session_agents().is_empty() {
         0
     } else {
         1
@@ -16669,12 +16707,103 @@ mod tests {
     #[test]
     fn agent_strip_height_reflects_agent_presence() {
         let mut app = autonomy_app_state();
-        assert_eq!(agent_strip_height(&app), 0, "hidden with no agents");
+        assert_eq!(agent_strip_height(&app, 40), 0, "hidden with no agents");
         app.upsert_session_agent(
             &SessionKey("local:test".into()),
             sample_agent("ag-1", "running"),
         );
-        assert_eq!(agent_strip_height(&app), 1, "one row once agents exist");
+        assert_eq!(
+            agent_strip_height(&app, 40),
+            1,
+            "one row once agents exist on a normal terminal"
+        );
+    }
+
+    #[test]
+    fn peek_output_falls_back_to_the_record_tail_when_cache_is_empty() {
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+        let mut rec = sample_agent("worker", "done");
+        rec.output_tail = Some("tail snapshot from agent/list\n".into());
+        app.upsert_session_agent(&sid, rec);
+
+        // No live delta yet (e.g. a completed agent, or just after a reconnect):
+        // the peek shows the record's `output_tail` instead of the placeholder.
+        assert_eq!(
+            app.active_agent_output_or_tail("worker"),
+            Some("tail snapshot from agent/list\n")
+        );
+
+        // A live delta is strictly fresher and supersedes the snapshot.
+        app.append_agent_output(
+            &sid,
+            "worker",
+            octos_core::ui_protocol::OutputCursor { offset: 5 },
+            "live delta wins\n",
+        );
+        assert_eq!(
+            app.active_agent_output_or_tail("worker"),
+            Some("live delta wins\n")
+        );
+    }
+
+    #[test]
+    fn home_clamps_to_measured_max_so_down_is_not_stuck() {
+        let mut app = autonomy_app_state();
+        // The overlay renderer measured a 20-row maximum on the last frame.
+        app.record_agent_view_scroll_max(20);
+
+        app.scroll_agent_view_up(usize::MAX); // Home
+        assert_eq!(app.agent_view_scroll, 20, "Home lands exactly at the top");
+
+        // Down moves the view immediately — there is no huge sentinel to unwind.
+        app.scroll_agent_view_down(1);
+        assert_eq!(app.agent_view_scroll, 19);
+
+        // Selecting a new target relaxes the clamp to "unmeasured" so the next
+        // frame's real bound applies rather than the previous agent's.
+        app.set_chat_view(crate::model::ChatViewTarget::Agent("worker".into()));
+        assert_eq!(app.agent_view_scroll_max.get(), usize::MAX);
+    }
+
+    #[test]
+    fn wants_mouse_capture_stays_on_for_a_detail_modal_over_a_peek() {
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+        app.upsert_session_agent(&sid, sample_agent("worker", "running"));
+        app.set_chat_view(crate::model::ChatViewTarget::Agent("worker".into()));
+        assert!(wants_mouse_capture(&app), "the peek captures the wheel");
+
+        // A detail modal opens over the peek: it now owns the screen (the peek
+        // yields), but it is still a full-screen wheel target, so capture must
+        // stay on or the wheel would be silently dead over it.
+        app.task_output.active = true;
+        assert!(!agent_view_active(&app), "the peek yields to the modal");
+        assert!(
+            wants_mouse_capture(&app),
+            "capture stays on so the wheel scrolls the detail modal"
+        );
+    }
+
+    #[test]
+    fn agent_strip_hidden_on_a_constrained_terminal() {
+        let mut app = autonomy_app_state();
+        app.upsert_session_agent(
+            &SessionKey("local:test".into()),
+            sample_agent("ag-1", "running"),
+        );
+        // Below the floor the strip would force Ratatui to collapse a fixed row,
+        // so it is dropped (Tab still switches views without it).
+        assert_eq!(
+            agent_strip_height(&app, AGENT_STRIP_MIN_TERMINAL_ROWS - 1),
+            0,
+            "dropped when the terminal can't afford the row"
+        );
+        assert_eq!(
+            agent_strip_height(&app, AGENT_STRIP_MIN_TERMINAL_ROWS),
+            1,
+            "restored at the floor"
+        );
     }
 
     #[test]

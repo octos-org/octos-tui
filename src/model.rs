@@ -3736,6 +3736,16 @@ pub struct AppState {
     /// main transcript scroll don't drift the peek (which renders only the
     /// agent's output). Reset to the bottom whenever the peek target changes.
     pub agent_view_scroll: usize,
+    /// The largest meaningful `agent_view_scroll` (wrapped-rows − visible-rows),
+    /// recorded by the overlay renderer each frame — it is the only place that
+    /// knows the wrapped-row count. `scroll_agent_view_up` clamps against it so a
+    /// jump-to-top (`usize::MAX`) or repeated over-scroll can't push the offset
+    /// past the top and leave Down/wheel-down "stuck" unwinding a huge sentinel.
+    /// `usize::MAX` means "not measured yet" (unbounded) — the peek always draws
+    /// before a scroll key is read, so production sees a real bound first; the
+    /// sentinel only relaxes the clamp in render-less unit tests. A `Cell`
+    /// because rendering borrows `&AppState`; stale by at most one frame.
+    pub agent_view_scroll_max: std::cell::Cell<usize>,
     /// Full-screen transcript pager (alt-screen). While active the complete
     /// committed transcript scrolls in the upper pane and the composer stays
     /// pinned to the bottom row — the inline chat flow cannot offer that
@@ -5673,6 +5683,7 @@ impl AppState {
             chat_view: ChatViewTarget::Main,
             transcript_scroll: 0,
             agent_view_scroll: 0,
+            agent_view_scroll_max: std::cell::Cell::new(usize::MAX),
             transcript_pager_active: false,
             pinned_scroll: false,
             vim_mode: false,
@@ -7244,6 +7255,22 @@ impl AppState {
             .map(|cache| cache.text.as_str())
     }
 
+    /// Output to show in the peek: the live delta cache when it holds anything,
+    /// otherwise the `output_tail` snapshot the `agent/list` projection carries
+    /// on the record. Since peeking no longer auto-fetches, this fallback is what
+    /// makes a reconnected or already-completed agent show its output instead of
+    /// the empty placeholder — no request, no cursor merge. Live deltas, once
+    /// they arrive, always win (they are strictly fresher than the snapshot).
+    pub fn active_agent_output_or_tail(&self, agent_id: &str) -> Option<&str> {
+        if let Some(text) = self.active_agent_output(agent_id)
+            && !text.is_empty()
+        {
+            return Some(text);
+        }
+        self.active_agent_record(agent_id)
+            .and_then(|agent| agent.output_tail.as_deref())
+    }
+
     /// The record for a sub-agent of the active session, by id.
     pub fn active_agent_record(
         &self,
@@ -7274,13 +7301,28 @@ impl AppState {
         if self.chat_view != target {
             self.chat_view = target;
             self.agent_view_scroll = 0;
+            // The old target's row count is meaningless for the new one; reset to
+            // "not measured yet" — the next overlay draw re-records the real
+            // bound before any scroll key is read.
+            self.agent_view_scroll_max.set(usize::MAX);
         }
     }
 
-    /// Scroll the sub-agent peek toward older output (up). Clamped against the
-    /// real wrapped-row count at render time.
+    /// Record the peek's maximum scroll offset (wrapped-rows − visible-rows). The
+    /// overlay renderer is the only code that knows the wrapped-row count, so it
+    /// feeds it back here for `scroll_agent_view_up` to clamp against.
+    pub fn record_agent_view_scroll_max(&self, max: usize) {
+        self.agent_view_scroll_max.set(max);
+    }
+
+    /// Scroll the sub-agent peek toward older output (up), clamped to the top so
+    /// a `usize::MAX` jump-to-top (or repeated over-scroll) can't overshoot the
+    /// last-rendered maximum and strand Down/wheel-down unwinding the excess.
     pub fn scroll_agent_view_up(&mut self, lines: usize) {
-        self.agent_view_scroll = self.agent_view_scroll.saturating_add(lines);
+        self.agent_view_scroll = self
+            .agent_view_scroll
+            .saturating_add(lines)
+            .min(self.agent_view_scroll_max.get());
     }
 
     /// Scroll the sub-agent peek toward the newest output (down / bottom).
