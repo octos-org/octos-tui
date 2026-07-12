@@ -16135,6 +16135,118 @@ mod tests {
         )
     }
 
+    fn sample_agent(id: &str, status: &str) -> octos_core::ui_protocol::UiAgentRecord {
+        octos_core::ui_protocol::UiAgentRecord {
+            agent_id: id.into(),
+            parent_agent_id: None,
+            session_id: SessionKey("local:test".into()),
+            task_id: None,
+            path: "/root".into(),
+            role: "worker".into(),
+            nickname: id.into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: status.into(),
+            last_task: None,
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    #[test]
+    fn chat_view_selector_cycles_main_then_agents() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        app.upsert_session_agent(&sid, sample_agent("ag-1", "running"));
+        app.upsert_session_agent(&sid, sample_agent("ag-2", "running"));
+
+        assert_eq!(app.chat_view, ChatViewTarget::Main, "defaults to Main");
+
+        // next: Main -> ag-1 -> ag-2 -> Main (wrap)
+        app.select_next_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Agent("ag-1".into()));
+        app.select_next_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Agent("ag-2".into()));
+        app.select_next_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Main);
+
+        // prev from Main wraps back to the last agent
+        app.select_prev_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Agent("ag-2".into()));
+    }
+
+    #[test]
+    fn chat_view_selector_is_noop_without_agents() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        app.select_next_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Main);
+        app.select_prev_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Main);
+    }
+
+    #[test]
+    fn chat_view_normalizes_to_main_when_selected_agent_disappears() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        app.upsert_session_agent(&sid, sample_agent("ag-1", "running"));
+        app.select_next_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Agent("ag-1".into()));
+
+        // The agent completes and is pruned from the session.
+        app.session_autonomy_mut(&sid).agents.clear();
+        app.normalize_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Main);
+    }
+
+    #[test]
+    fn chat_view_resets_to_main_on_session_switch() {
+        use crate::model::ChatViewTarget;
+        let mut app = AppState::new(
+            vec![
+                SessionView {
+                    id: SessionKey("local:a".into()),
+                    title: "a".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+                SessionView {
+                    id: SessionKey("local:b".into()),
+                    title: "b".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+            ],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.upsert_session_agent(&SessionKey("local:a".into()), sample_agent("ag-1", "running"));
+        app.select_next_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Agent("ag-1".into()));
+
+        app.switch_selected_session(1);
+        assert_eq!(
+            app.chat_view,
+            ChatViewTarget::Main,
+            "agent selection must not carry across sessions"
+        );
+    }
+
     fn sample_loop(
         loop_id: &str,
         prompt: &str,

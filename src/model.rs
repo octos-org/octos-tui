@@ -3484,6 +3484,18 @@ pub enum ComposerMode {
     Normal,
 }
 
+/// Which conversation the main pane is showing: the active session's own chat
+/// (`Main`), or a selected sub-agent's live output (`Agent`, keyed by the
+/// stable `UiAgentRecord::agent_id`). The agent-strip selector cycles through
+/// `[Main, …session sub-agents]`; selecting a sub-agent redirects the main pane
+/// to that agent's streamed output and back.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ChatViewTarget {
+    #[default]
+    Main,
+    Agent(String),
+}
+
 impl FocusPane {
     pub fn next(self) -> Self {
         match self {
@@ -3714,6 +3726,9 @@ pub struct AppState {
     >,
     pub selected_session: usize,
     pub selected_task: usize,
+    /// Which conversation the main pane renders: the session chat, or a
+    /// selected sub-agent's live output. Resets to `Main` on session switch.
+    pub chat_view: ChatViewTarget,
     pub transcript_scroll: usize,
     /// Full-screen transcript pager (alt-screen). While active the complete
     /// committed transcript scrolls in the upper pane and the composer stays
@@ -5649,6 +5664,7 @@ impl AppState {
             finalized_by_switch: std::collections::HashMap::new(),
             selected_session,
             selected_task: 0,
+            chat_view: ChatViewTarget::Main,
             transcript_scroll: 0,
             transcript_pager_active: false,
             pinned_scroll: false,
@@ -7063,6 +7079,9 @@ impl AppState {
         self.composer_history.reset_navigation(); // end history browse on switch
         self.selected_session = index;
         self.selected_task = 0;
+        // The new session has its own (or no) sub-agents; a carried-over agent
+        // selection would point at the wrong session's agent.
+        self.chat_view = ChatViewTarget::Main;
         self.transcript_scroll = 0;
         self.load_composer_draft_for_selected_session();
         self.load_pending_messages_for_selected_session();
@@ -7181,6 +7200,73 @@ impl AppState {
             self.selected_task = session.tasks.len() - 1;
         } else {
             self.selected_task -= 1;
+        }
+    }
+
+    /// Sub-agents of the active session, in display order (stable by
+    /// `agent_id`). Empty when there is no active session or it has none.
+    pub fn active_session_agents(&self) -> &[octos_core::ui_protocol::UiAgentRecord] {
+        let Some(session) = self.active_session() else {
+            return &[];
+        };
+        self.session_autonomy_for(&session.id)
+            .map(|state| state.agents.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The ordered set of selectable chat targets: `Main` first, then one
+    /// `Agent(id)` per active-session sub-agent.
+    fn chat_view_order(&self) -> Vec<ChatViewTarget> {
+        let mut order = vec![ChatViewTarget::Main];
+        order.extend(
+            self.active_session_agents()
+                .iter()
+                .map(|agent| ChatViewTarget::Agent(agent.agent_id.clone())),
+        );
+        order
+    }
+
+    /// Advance the main-pane view to the next target in `[Main, …sub-agents]`,
+    /// wrapping. No-op (stays/returns to `Main`) when the session has no
+    /// sub-agents.
+    pub fn select_next_chat_view(&mut self) {
+        let order = self.chat_view_order();
+        if order.len() <= 1 {
+            self.chat_view = ChatViewTarget::Main;
+            return;
+        }
+        let current = order.iter().position(|t| *t == self.chat_view).unwrap_or(0);
+        self.chat_view = order[(current + 1) % order.len()].clone();
+    }
+
+    /// Move the main-pane view to the previous target in `[Main, …sub-agents]`,
+    /// wrapping.
+    pub fn select_prev_chat_view(&mut self) {
+        let order = self.chat_view_order();
+        if order.len() <= 1 {
+            self.chat_view = ChatViewTarget::Main;
+            return;
+        }
+        let current = order.iter().position(|t| *t == self.chat_view).unwrap_or(0);
+        self.chat_view = if current == 0 {
+            order[order.len() - 1].clone()
+        } else {
+            order[current - 1].clone()
+        };
+    }
+
+    /// Fall back to `Main` when the selected sub-agent is no longer present
+    /// (completed and pruned, or the active session changed). Keeps a stale
+    /// selection from stranding the main pane on a vanished agent.
+    pub fn normalize_chat_view(&mut self) {
+        if let ChatViewTarget::Agent(id) = &self.chat_view {
+            let still_present = self
+                .active_session_agents()
+                .iter()
+                .any(|agent| &agent.agent_id == id);
+            if !still_present {
+                self.chat_view = ChatViewTarget::Main;
+            }
         }
     }
 
