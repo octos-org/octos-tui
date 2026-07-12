@@ -694,6 +694,25 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
+    // Alt+Up/Down cycles the main pane between `main` and each running sub-agent
+    // (the selector strip under the composer). Handled here — before the
+    // composer-modified-key block and the plain Up/Down history arms — so the
+    // vertical arrows aren't first swallowed by word-nav or composer history
+    // when the composer is focused. A no-op when the session has no sub-agents.
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        match key.code {
+            KeyCode::Up => {
+                store.state.select_prev_chat_view();
+                return KeyAction::Continue;
+            }
+            KeyCode::Down => {
+                store.state.select_next_chat_view();
+                return KeyAction::Continue;
+            }
+            _ => {}
+        }
+    }
+
     // Modified-key composer edits are gated on no modal owning the keyboard:
     // the approval/question modals force-focus the composer, so without the
     // gate Ctrl+W / Alt+b / Shift+Enter kept mutating the hidden draft while a
@@ -2388,6 +2407,65 @@ mod tests {
         Store {
             state: AppState::new(sessions, 0, "ready".into(), None, false),
         }
+    }
+
+    fn sample_agent_record(
+        session_id: &SessionKey,
+        id: &str,
+    ) -> octos_core::ui_protocol::UiAgentRecord {
+        octos_core::ui_protocol::UiAgentRecord {
+            agent_id: id.into(),
+            parent_agent_id: None,
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "/root".into(),
+            role: "worker".into(),
+            nickname: id.into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: "running".into(),
+            last_task: None,
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    #[test]
+    fn alt_up_down_cycles_chat_view_between_main_and_agents() {
+        use crate::model::ChatViewTarget;
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        let sid = store.state.active_session().unwrap().id.clone();
+        store
+            .state
+            .upsert_session_agent(&sid, sample_agent_record(&sid, "ag-1"));
+        store
+            .state
+            .upsert_session_agent(&sid, sample_agent_record(&sid, "ag-2"));
+
+        assert_eq!(store.state.chat_view, ChatViewTarget::Main);
+
+        // Alt+Down cycles forward through [main, ag-1, ag-2] and wraps.
+        handle_key(&mut store, modified_key(KeyCode::Down, KeyModifiers::ALT));
+        assert_eq!(store.state.chat_view, ChatViewTarget::Agent("ag-1".into()));
+        handle_key(&mut store, modified_key(KeyCode::Down, KeyModifiers::ALT));
+        assert_eq!(store.state.chat_view, ChatViewTarget::Agent("ag-2".into()));
+        handle_key(&mut store, modified_key(KeyCode::Down, KeyModifiers::ALT));
+        assert_eq!(store.state.chat_view, ChatViewTarget::Main);
+
+        // Alt+Up steps backward.
+        handle_key(&mut store, modified_key(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(store.state.chat_view, ChatViewTarget::Agent("ag-2".into()));
+
+        // The composer is untouched by the view switch.
+        assert_eq!(store.state.composer, "");
     }
 
     fn store_with_live_reply_text(text: &str) -> Store {
