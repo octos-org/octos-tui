@@ -76,15 +76,39 @@ fn inspector_visible(app: &AppState) -> bool {
     )
 }
 
-/// True when the main pane is peeking a still-present sub-agent — the state that
-/// swaps the inline chat for the full-screen agent-output overlay. A selection
-/// pointing at a vanished agent is NOT active (the switcher normalizes it back
-/// to `Main`), so this never strands the UI on a dead agent.
+/// Modal/overlay surfaces that must own the keyboard and the screen over a
+/// sub-agent peek. Mirrors `event_loop::modal_owns_keyboard` (kept in sync): the
+/// peek yields BOTH its rendering and its input while one of these is up, so an
+/// approval / question / detail modal that arrives mid-peek renders visibly and
+/// its keys aren't consumed behind an opaque overlay.
+fn peek_yields_to_modal(app: &AppState) -> bool {
+    app.activity_navigator.active
+        || app
+            .approval
+            .as_ref()
+            .is_some_and(|approval| approval.visible)
+        || app
+            .user_question
+            .as_ref()
+            .is_some_and(|picker| picker.visible)
+        || app.task_output.active
+        || app.artifact_detail.active
+        || app.thread_graph_detail.active
+        || app.turn_state_detail.active
+}
+
+/// True when the main pane is peeking a still-present sub-agent AND no modal is
+/// up — the state that swaps the inline chat for the full-screen agent-output
+/// overlay and gives that overlay the keyboard. A selection pointing at a
+/// vanished agent is NOT active (so the inline composer stays editable), and a
+/// modal takes precedence (so it renders and receives keys). The event loop
+/// gates the peek's keyboard ownership on this same predicate.
 pub fn agent_view_active(app: &AppState) -> bool {
-    matches!(
-        &app.chat_view,
-        crate::model::ChatViewTarget::Agent(id) if app.active_agent_record(id).is_some()
-    )
+    !peek_yields_to_modal(app)
+        && matches!(
+            &app.chat_view,
+            crate::model::ChatViewTarget::Agent(id) if app.active_agent_record(id).is_some()
+        )
 }
 
 // ===========================================================================
@@ -2436,7 +2460,7 @@ fn render_agent_overlay_body(
     let visible_height = transcript_visible_height(area).saturating_sub(2).max(1);
     let total_rows = transcript_visual_rows(&lines, wrap_width);
     let max_scroll = total_rows.saturating_sub(visible_height);
-    let scroll_from_bottom = app.transcript_scroll.min(max_scroll);
+    let scroll_from_bottom = app.agent_view_scroll.min(max_scroll);
     let scroll_top =
         u16::try_from(max_scroll.saturating_sub(scroll_from_bottom)).unwrap_or(u16::MAX);
 
@@ -11229,7 +11253,7 @@ mod tests {
         assert!(!text.contains("ws://"));
         assert!(!text.contains("Transcript"));
         assert!(text.contains("Composer"));
-        assert!(text.contains("Tab inspector"));
+        assert!(text.contains("Tab agents"));
         assert!(!text.contains("Current Tasks"));
         assert!(!text.contains("tasks/status"));
         assert!(!text.contains("Sessions"));
@@ -16533,6 +16557,27 @@ mod tests {
     }
 
     #[test]
+    fn agent_view_yields_to_modal() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+        app.upsert_session_agent(&sid, sample_agent("worker", "running"));
+        app.set_chat_view(ChatViewTarget::Agent("worker".into()));
+        assert!(agent_view_active(&app), "peek active with no modal");
+
+        // A modal must take the screen and keyboard back from the peek, else it
+        // renders behind the opaque overlay while still consuming keys.
+        app.task_output.active = true;
+        assert!(!agent_view_active(&app), "peek yields while a modal is up");
+
+        app.task_output.active = false;
+        assert!(
+            agent_view_active(&app),
+            "peek resumes after the modal closes"
+        );
+    }
+
+    #[test]
     fn agent_roster_refresh_drops_peek_of_vanished_agent() {
         use crate::model::ChatViewTarget;
         let mut app = autonomy_app_state();
@@ -17065,7 +17110,7 @@ mod tests {
             "composer chrome intact: {rendered:?}"
         );
         assert!(
-            rendered.contains("Tab inspector"),
+            rendered.contains("Tab agents"),
             "composer hint not clobbered: {rendered:?}"
         );
         // Regression (duplicate ctx%): on a wide terminal (rendered_text uses
@@ -17159,14 +17204,14 @@ mod tests {
     #[test]
     fn harness_status_row_does_not_collide_with_composer_when_idle() {
         // Idle render: the dedicated harness row takes height 0, so the
-        // composer's top-border chrome ("Composer  Enter send | Tab inspector")
+        // composer's top-border chrome ("Composer  Enter send | Tab agents")
         // is fully intact — the collision that caused the prior revert
         // (249fe652) cannot recur because the indicator is never on the border.
         let app = autonomy_app_state();
         assert_eq!(harness_status_height(&app), 0);
         let text = rendered_text(&app);
         assert!(text.contains("Composer"), "{text:?}");
-        assert!(text.contains("Tab inspector"), "{text:?}");
+        assert!(text.contains("Tab agents"), "{text:?}");
         assert!(
             !text.contains("Orchestrating"),
             "idle harness row must be absent: {text:?}"

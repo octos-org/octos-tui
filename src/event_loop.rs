@@ -563,7 +563,11 @@ fn handle_terminal_event_with_input_state(
     now: Instant,
 ) -> KeyAction {
     if let Event::Key(key) = event {
-        if is_plain_composer_enter(store, &key)
+        // Skip the unbracketed-paste newline heuristic while a peek owns the
+        // keyboard — otherwise a pasted newline lands in the hidden composer.
+        // The peek handles the Enter itself (swallows it) via `handle_key`.
+        if !app::agent_view_active(&store.state)
+            && is_plain_composer_enter(store, &key)
             && input_state.should_insert_unbracketed_paste_newline(now, next_event_waiting)
         {
             store.state.insert_composer_text("\n");
@@ -665,6 +669,17 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             .map_or(KeyAction::Continue, KeyAction::send);
     }
 
+    // A live sub-agent peek OWNS the keyboard, exactly like a modal: routed here
+    // — after the always-on quit/interrupt keys but BEFORE every composer /
+    // Ctrl / paste mutation path — so typing, Ctrl+U, word-deletes, Vim edits
+    // and paste can't leak into the composer that is hidden behind the overlay.
+    // `agent_view_active` is false while any modal is up (so the modal keeps the
+    // keyboard) or when the selected agent has vanished (so the inline composer
+    // stays editable).
+    if app::agent_view_active(&store.state) {
+        return handle_agent_peek_key(store, key);
+    }
+
     if is_control_char(&key, 'u') {
         // Swallowed (not cleared) while a modal owns the keyboard: clearing
         // staged messages / the hidden draft under a dialog is invisible data
@@ -737,7 +752,9 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
 }
 
 fn handle_paste(store: &mut Store, text: &str) -> KeyAction {
-    if text.is_empty() {
+    // A peek owns the keyboard and hides the composer; drop pastes so they can't
+    // silently accumulate in the hidden draft.
+    if text.is_empty() || app::agent_view_active(&store.state) {
         return KeyAction::Continue;
     }
 
@@ -929,6 +946,45 @@ fn is_invisible_format_char(c: char) -> bool {
     )
 }
 
+/// Keyboard handler for the full-screen sub-agent peek. Reached from
+/// `handle_key` only while `agent_view_active` — i.e. the peek is the active
+/// surface — so it runs ahead of every composer / Ctrl / paste path and the peek
+/// can safely OWN the keyboard. Navigation and scroll act; Ctrl+C / Ctrl+Q are
+/// already handled upstream in `handle_key`; every other key is swallowed so it
+/// can't reach the composer hidden behind the overlay.
+fn handle_agent_peek_key(store: &mut Store, key: KeyEvent) -> KeyAction {
+    match key.code {
+        // Cycle to the next / previous target (wrapping through `main`), fetching
+        // output on landing so the overlay isn't empty for pre-existing output.
+        KeyCode::Tab => {
+            if let Some(command) = store.select_next_peek() {
+                return KeyAction::send(command);
+            }
+        }
+        KeyCode::BackTab => {
+            if let Some(command) = store.select_prev_peek() {
+                return KeyAction::send(command);
+            }
+        }
+        // Leave the peek back to the inline chat.
+        KeyCode::Esc => {
+            store
+                .state
+                .set_chat_view(crate::model::ChatViewTarget::Main);
+        }
+        // Scroll the agent output via its own from-bottom offset.
+        KeyCode::Up => store.state.scroll_agent_view_up(1),
+        KeyCode::Down => store.state.scroll_agent_view_down(1),
+        KeyCode::PageUp => store.state.scroll_agent_view_up(8),
+        KeyCode::PageDown => store.state.scroll_agent_view_down(8),
+        KeyCode::Home => store.state.scroll_agent_view_up(usize::MAX),
+        KeyCode::End => store.state.scroll_agent_view_down(usize::MAX),
+        // Everything else (text, Enter, Backspace, `/`, Vim keys, …) is swallowed.
+        _ => {}
+    }
+    KeyAction::Continue
+}
+
 fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     if store.state.activity_navigator.active {
         return handle_activity_navigator_key(store, key);
@@ -979,33 +1035,33 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return action;
     }
 
-    // While peeking a sub-agent the composer is hidden behind the full-screen
-    // output; swallow text-editing keys so typing / Enter / Backspace don't
-    // silently mutate the hidden draft. Navigation (Tab / Shift+Tab / Esc) and
-    // scroll (arrows / Page) fall through to the match below and keep working.
-    if store.state.chat_view != crate::model::ChatViewTarget::Main {
-        match key.code {
-            KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete => {
-                return KeyAction::Continue;
-            }
-            _ => {}
-        }
-    }
-
     match key.code {
-        // Tab / Shift+Tab cycle the main pane across `[main, …running
-        // sub-agents]` (the selector strip under the composer) and select as
-        // they move. This repurposes Tab away from the now-disabled side-panel
-        // focus cycle; it is a no-op when the active session has no sub-agents.
-        KeyCode::Tab => {
-            store.state.select_next_chat_view();
+        // Tab / Shift+Tab ENTER the sub-agent peek from the inline chat: they
+        // cycle the main pane across `[main, …running sub-agents]` and select as
+        // they move, repurposing Tab away from the now-disabled side-panel focus
+        // cycle. Gated to the inline composer (not the pager or an inspector
+        // pane) so a peek is only entered from a clean inline state; once a peek
+        // is active `handle_agent_peek_key` owns Tab (this arm is unreachable
+        // then). Selecting an agent emits a best-effort output fetch. No-op when
+        // the session has no sub-agents.
+        KeyCode::Tab
+            if store.state.focus == FocusPane::Composer && !store.state.transcript_pager_active =>
+        {
+            if let Some(command) = store.select_next_peek() {
+                return KeyAction::send(command);
+            }
         }
-        KeyCode::BackTab => {
-            store.state.select_prev_chat_view();
+        KeyCode::BackTab
+            if store.state.focus == FocusPane::Composer && !store.state.transcript_pager_active =>
+        {
+            if let Some(command) = store.select_prev_peek() {
+                return KeyAction::send(command);
+            }
         }
-        // Esc first backs out of a sub-agent view to the main chat — before the
-        // turn-interrupt / refocus Esc arms below — so it reads as "leave the
-        // peek", not "cancel the turn".
+        // Esc clears a stale peek selection (an `Agent(id)` whose agent has
+        // vanished, so `agent_view_active` is false and this handler — not
+        // `handle_agent_peek_key` — sees the key). A live peek's Esc is handled
+        // upstream in `handle_key`.
         KeyCode::Esc if store.state.chat_view != crate::model::ChatViewTarget::Main => {
             store
                 .state
@@ -1053,22 +1109,6 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         }
         KeyCode::Up if store.state.transcript_pager_active => {
             store.state.scroll_transcript_up(1);
-        }
-        // While peeking a sub-agent, Up/Down/PageUp/PageDown scroll that agent's
-        // output (which reuses the shared `transcript_scroll` from-bottom offset)
-        // rather than driving composer history. Placed ahead of the composer and
-        // general scroll arms so the peek owns the vertical keys while it is open.
-        KeyCode::Down if store.state.chat_view != crate::model::ChatViewTarget::Main => {
-            store.state.scroll_transcript_down(1);
-        }
-        KeyCode::Up if store.state.chat_view != crate::model::ChatViewTarget::Main => {
-            store.state.scroll_transcript_up(1);
-        }
-        KeyCode::PageDown if store.state.chat_view != crate::model::ChatViewTarget::Main => {
-            store.state.scroll_transcript_down(8);
-        }
-        KeyCode::PageUp if store.state.chat_view != crate::model::ChatViewTarget::Main => {
-            store.state.scroll_transcript_up(8);
         }
         // In the composer, Up/Down move the cursor between logical lines; at the
         // first/last line they fall back to the existing transcript scroll so
@@ -2077,6 +2117,10 @@ fn scroll_current_surface_down(store: &mut Store, lines: usize) {
         store.state.turn_state_detail.scroll_down(lines);
         return;
     }
+    if app::agent_view_active(&store.state) {
+        store.state.scroll_agent_view_down(lines);
+        return;
+    }
 
     match store.state.focus {
         FocusPane::Workspace => store.state.workspace.scroll_down(lines),
@@ -2117,6 +2161,12 @@ fn scroll_current_surface_up(store: &mut Store, lines: usize) {
     }
     if store.state.turn_state_detail.active {
         store.state.turn_state_detail.scroll_up(lines);
+        return;
+    }
+    // A live sub-agent peek owns the wheel too, scrolling its own output rather
+    // than the main transcript hidden behind it.
+    if app::agent_view_active(&store.state) {
+        store.state.scroll_agent_view_up(lines);
         return;
     }
 
@@ -2517,6 +2567,87 @@ mod tests {
         assert_eq!(store.state.chat_view, ChatViewTarget::Main);
         handle_key(&mut store, key(KeyCode::Char('z')));
         assert_eq!(store.state.composer, "z");
+    }
+
+    #[test]
+    fn peek_owns_keyboard_swallows_ctrl_u_and_scrolls_its_own_offset() {
+        use crate::model::ChatViewTarget;
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.composer = "keep me".into();
+        let sid = store.state.active_session().unwrap().id.clone();
+        store
+            .state
+            .upsert_session_agent(&sid, sample_agent_record(&sid, "ag-1"));
+
+        handle_key(&mut store, key(KeyCode::Tab));
+        assert_eq!(store.state.chat_view, ChatViewTarget::Agent("ag-1".into()));
+
+        // Ctrl+U runs BEFORE the old guard in handle_key; the peek must own it so
+        // it can't clear the hidden draft.
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(store.state.composer, "keep me");
+
+        // Up scrolls the peek's OWN offset, leaving the main transcript scroll be.
+        handle_key(&mut store, key(KeyCode::Up));
+        assert_eq!(store.state.agent_view_scroll, 1);
+        assert_eq!(store.state.transcript_scroll, 0);
+    }
+
+    #[test]
+    fn tab_in_pager_does_not_enter_peek() {
+        use crate::model::ChatViewTarget;
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        let sid = store.state.active_session().unwrap().id.clone();
+        store
+            .state
+            .upsert_session_agent(&sid, sample_agent_record(&sid, "ag-1"));
+        store.state.transcript_pager_active = true;
+
+        // A peek is only entered from the inline chat; Tab in the pager is a
+        // no-op (so leaving states never strands the app in alt-screen).
+        handle_key(&mut store, key(KeyCode::Tab));
+        assert_eq!(store.state.chat_view, ChatViewTarget::Main);
+    }
+
+    #[test]
+    fn stale_agent_selection_keeps_composer_editable() {
+        use crate::model::ChatViewTarget;
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        // Selection points at an agent absent from the roster: `agent_view_active`
+        // is false, so the visible inline composer must remain editable.
+        store.state.chat_view = ChatViewTarget::Agent("ghost".into());
+
+        handle_key(&mut store, key(KeyCode::Char('z')));
+        assert_eq!(store.state.composer, "z");
+    }
+
+    #[test]
+    fn selecting_a_peek_target_fetches_that_agents_output() {
+        let mut store = store_with_sessions(1);
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_AGENT_OUTPUT_READ,
+        ]));
+        let sid = store.state.active_session().unwrap().id.clone();
+        store
+            .state
+            .upsert_session_agent(&sid, sample_agent_record(&sid, "ag-1"));
+
+        // Landing on an agent emits a best-effort output read so the overlay
+        // isn't empty for output that predates selection or survived a reconnect.
+        let cmd = store.select_next_peek();
+        assert!(
+            matches!(&cmd, Some(AppUiCommand::ReadAgentOutput(p)) if p.agent_id == "ag-1"),
+            "expected ReadAgentOutput for ag-1, got {cmd:?}"
+        );
+
+        // Wrapping back to `main` fetches nothing.
+        assert!(store.select_next_peek().is_none());
     }
 
     fn store_with_live_reply_text(text: &str) -> Store {

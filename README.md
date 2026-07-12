@@ -327,7 +327,7 @@ Set the palette at launch with `--theme <name>`, or switch live with `/theme`
 ### In-session keys and slash commands
 
 ```text
-Tab        switch to the inspector pane (Esc returns to chat)
+Tab        peek a running sub-agent's output; Tab/Shift+Tab cycle main↔agents, Esc returns to chat
 PgUp/PgDn  scroll the transcript (PgUp also opens the pager)
 y / s / n  approve once / approve for session / deny a pending tool approval
 Alt+A      re-show the pending approval prompt

@@ -142,8 +142,8 @@ app:
   hint:
     # Pane/modal footer hints (keyboard keys kept literal).
     list_nav: "j/k or Up/Down"
-    composer_send: "Enter send | Shift+Enter / Ctrl+J newline | Tab inspector"
-    statusbar_keys: "Tab inspector | Ctrl+O expand"
+    composer_send: "Enter send | Shift+Enter / Ctrl+J newline | Tab agents"
+    statusbar_keys: "Tab agents | Ctrl+O expand"
     menu: "Menu | j/k move | Enter accept | Esc close"
     onboarding: "Onboarding | Enter continue | type to edit fields"
     approval: "Approval | y once | s session | n deny | d diff"

@@ -3730,6 +3730,12 @@ pub struct AppState {
     /// selected sub-agent's live output. Resets to `Main` on session switch.
     pub chat_view: ChatViewTarget,
     pub transcript_scroll: usize,
+    /// Scroll offset (rows from the bottom) for the sub-agent peek overlay. Kept
+    /// separate from `transcript_scroll` so the main view's scroll is preserved
+    /// across a peek, and — critically — so incoming activity rows that bump the
+    /// main transcript scroll don't drift the peek (which renders only the
+    /// agent's output). Reset to the bottom whenever the peek target changes.
+    pub agent_view_scroll: usize,
     /// Full-screen transcript pager (alt-screen). While active the complete
     /// committed transcript scrolls in the upper pane and the composer stays
     /// pinned to the bottom row — the inline chat flow cannot offer that
@@ -5666,6 +5672,7 @@ impl AppState {
             selected_task: 0,
             chat_view: ChatViewTarget::Main,
             transcript_scroll: 0,
+            agent_view_scroll: 0,
             transcript_pager_active: false,
             pinned_scroll: false,
             vim_mode: false,
@@ -7253,14 +7260,26 @@ impl AppState {
         order
     }
 
-    /// Set the main-pane view. Whenever the target actually changes, the shared
-    /// transcript scroll is reset to the bottom so a scroll offset from one view
-    /// (main, or a previously-selected agent) never leaks into the next.
+    /// Set the main-pane view. Whenever the target actually changes, the peek
+    /// scroll is reset to the bottom so one agent's (or the placeholder's)
+    /// offset never leaks into the next. The main `transcript_scroll` is left
+    /// untouched, so returning to `Main` restores the chat where it was.
     pub fn set_chat_view(&mut self, target: ChatViewTarget) {
         if self.chat_view != target {
             self.chat_view = target;
-            self.transcript_scroll = 0;
+            self.agent_view_scroll = 0;
         }
+    }
+
+    /// Scroll the sub-agent peek toward older output (up). Clamped against the
+    /// real wrapped-row count at render time.
+    pub fn scroll_agent_view_up(&mut self, lines: usize) {
+        self.agent_view_scroll = self.agent_view_scroll.saturating_add(lines);
+    }
+
+    /// Scroll the sub-agent peek toward the newest output (down / bottom).
+    pub fn scroll_agent_view_down(&mut self, lines: usize) {
+        self.agent_view_scroll = self.agent_view_scroll.saturating_sub(lines);
     }
 
     /// Advance the main-pane view to the next target in `[Main, …sub-agents]`,
