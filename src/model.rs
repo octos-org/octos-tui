@@ -169,6 +169,16 @@ pub const APPUI_FEATURE_CODING_AGENT_CONTROL_V1: &str = "coding.agent_control.v1
 pub const APPUI_FEATURE_CODING_GOAL_RUNTIME_V1: &str = "coding.goal_runtime.v1";
 pub const APPUI_FEATURE_CODING_LOOP_RUNTIME_V1: &str = "coding.loop_runtime.v1";
 
+/// Additive `profile/local/create` capability: the server honors an optional
+/// `requested_id` (the meaningful profile name the user types, e.g. `glm`) and
+/// treats `name`/`username`/`email` as optional. Advertised by servers that
+/// support nameable solo profiles. When negotiated, the onboarding Profile step
+/// collapses to a single "Name this profile" prompt and sends `requested_id`;
+/// when ABSENT the TUI falls back to the legacy `{name, username, email}` flow
+/// so it keeps working against older servers.
+pub const APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1: &str =
+    "profile.local_create.requested_id.v1";
+
 /// M15-E backend-owned agent inspection methods (UPCR-2026-021).
 pub const APPUI_METHOD_AGENT_LIST: &str = "agent/list";
 pub const APPUI_METHOD_AGENT_STATUS_READ: &str = "agent/status/read";
@@ -1891,10 +1901,20 @@ pub struct AuthLogoutResult {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileLocalCreateParams {
+    /// Meaningful profile id the user typed during onboarding (nameable-profiles
+    /// flow, e.g. `glm`). Omitted from the wire when `None` so an older server
+    /// receives exactly the legacy `{name, username, email}` shape and derives
+    /// the id from `username` as before. Only sent when the server advertises
+    /// [`APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_id: Option<String>,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub username: String,
+    #[serde(default)]
     pub email: String,
 }
 
@@ -1919,6 +1939,8 @@ pub enum OnboardingAction {
     SetUsername(String),
     SetEmail(String),
     SetOtpCode(String),
+    /// Nameable-profiles flow: set the single "Name this profile" value.
+    SetRequestedId(String),
     SetProfileId(String),
     SetProviderSelection(Box<LlmSelectionConfig>),
     SetFamilyId(String),
@@ -2120,6 +2142,10 @@ pub enum OnboardingLocalProfileField {
     Name,
     Username,
     Email,
+    /// Nameable-profiles flow: the single "Name this profile" prompt
+    /// (the requested profile id). Focused when that flow's validation
+    /// rejects an (effectively) empty id.
+    RequestedId,
 }
 
 impl OnboardingLocalProfileField {
@@ -2128,6 +2154,7 @@ impl OnboardingLocalProfileField {
             Self::Name => "name",
             Self::Username => "username",
             Self::Email => "email",
+            Self::RequestedId => "profile-name",
         }
     }
 }
@@ -2138,6 +2165,21 @@ pub struct OnboardingWizardState {
     pub username: String,
     pub email: String,
     pub otp_code: String,
+    /// Nameable-profiles flow (Phase 2): the single profile id the user types at
+    /// the "Name this profile" prompt (e.g. `glm`). Sent as `requested_id` when
+    /// the server advertises
+    /// [`APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1`]. Empty until the
+    /// user edits it, in which case a provider-derived suggestion is used.
+    pub requested_id: String,
+    /// Phase 3 startup picker: the `--profile-id` the process launched with, if
+    /// any. Seeded once at launch. Drives [`StartupProfileDecision`]; a pinned
+    /// id is honored unchanged and never triggers the picker.
+    pub launch_profile_id: Option<String>,
+    /// Phase 3 startup picker: existing local profile ids discovered at launch
+    /// (solo servers store them on disk). Empty on legacy/remote servers or a
+    /// first-ever run. Drives the 0/1/N [`StartupProfileDecision`] and populates
+    /// the picker menu.
+    pub available_profiles: Vec<String>,
     pub profile_id: Option<String>,
     pub local_profile_created: bool,
     pub open_session_after_profile_create: bool,
@@ -2208,6 +2250,9 @@ impl Default for OnboardingWizardState {
             username: String::new(),
             email: String::new(),
             otp_code: String::new(),
+            requested_id: String::new(),
+            launch_profile_id: None,
+            available_profiles: Vec::new(),
             profile_id: None,
             local_profile_created: false,
             open_session_after_profile_create: false,
@@ -2282,6 +2327,49 @@ impl OnboardingWizardState {
         // that, the TUI must keep email required so the menu does
         // not invite the user into a guaranteed-failure submission.
         self.has_name() && self.has_username() && self.has_email()
+    }
+
+    /// Nameable-profiles flow: `true` when the user has typed a profile id.
+    pub fn has_requested_id(&self) -> bool {
+        !self.requested_id.trim().is_empty()
+    }
+
+    /// The profile id suggested by default at the "Name this profile" prompt,
+    /// derived from the chosen provider/model family (e.g. the zai/glm family
+    /// suggests `glm`). Falls back to a neutral id when no family is picked yet.
+    pub fn suggested_profile_id(&self) -> String {
+        suggest_profile_id_for_family(&self.provider.family_id)
+    }
+
+    /// The id the nameable-profiles create actually sends: the user's typed
+    /// value when present, otherwise the provider-derived suggestion. Always
+    /// non-empty, so the "Continue" action never dead-ends on a blank field —
+    /// the user can accept the suggestion with a single keypress. The server
+    /// normalizes and collision-suffixes it, returning the final id.
+    pub fn effective_requested_id(&self) -> String {
+        let typed = self.requested_id.trim();
+        if typed.is_empty() {
+            self.suggested_profile_id()
+        } else {
+            typed.to_owned()
+        }
+    }
+
+    /// Nameable-profiles pre-flight: the effective id is always non-empty, so
+    /// this normally succeeds. It still guards defensively (an all-whitespace
+    /// suggestion should never happen) so the create path has one validation
+    /// entry point mirroring [`Self::validate_local_profile`].
+    pub fn validate_local_profile_requested_id(
+        &self,
+    ) -> Result<(), OnboardingLocalProfileRecovery> {
+        if self.effective_requested_id().trim().is_empty() {
+            return Err(OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::InvalidField,
+                focus_field: OnboardingLocalProfileField::RequestedId,
+                message: "Name this profile first. Use /onboard profile-name <id>.".into(),
+            });
+        }
+        Ok(())
     }
 
     /// M22-C: the path the user wants to use for the session. Falls
@@ -2731,6 +2819,116 @@ fn looks_like_email(value: &str) -> bool {
         && !domain.trim().is_empty()
         && !domain.starts_with('.')
         && !domain.ends_with('.')
+}
+
+/// Normalize a free-form string into a profile-id-safe slug: lowercase ASCII,
+/// `[a-z0-9]` kept, every other run collapsed to a single `-`, edges trimmed.
+/// Mirrors the server's normalization closely enough that the suggested id we
+/// show usually equals the id the server assigns (before any collision suffix).
+pub fn slugify_profile_id(value: &str) -> String {
+    let mut slug = String::with_capacity(value.len());
+    let mut pending_dash = false;
+    for ch in value.trim().chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.push(lower);
+        } else {
+            pending_dash = true;
+        }
+    }
+    slug
+}
+
+/// Suggest a default profile id from the chosen model/provider family. Known
+/// families map to a short, friendly handle (the zai/glm family suggests `glm`,
+/// deepseek suggests `deepseek`, …); an unrecognized-but-present family is
+/// slugified; an empty family falls back to a neutral `octos`. Pure and
+/// deterministic so onboarding UX can test the mapping directly.
+pub fn suggest_profile_id_for_family(family_id: &str) -> String {
+    let normalized = family_id.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return "octos".to_owned();
+    }
+    // Substring match: catalog family ids vary (`glm`, `glm-4`, `zai/glm`,
+    // `openai/gpt-4o`), so match on the recognizable brand token.
+    const KNOWN: &[(&str, &str)] = &[
+        ("glm", "glm"),
+        ("zai", "glm"),
+        ("deepseek", "deepseek"),
+        ("claude", "claude"),
+        ("anthropic", "claude"),
+        ("gpt", "openai"),
+        ("openai", "openai"),
+        ("o1", "openai"),
+        ("gemini", "gemini"),
+        ("google", "gemini"),
+        ("qwen", "qwen"),
+        ("llama", "llama"),
+        ("mistral", "mistral"),
+        ("grok", "grok"),
+        ("xai", "grok"),
+        ("kimi", "kimi"),
+        ("moonshot", "kimi"),
+    ];
+    for (needle, suggestion) in KNOWN {
+        if normalized.contains(needle) {
+            return (*suggestion).to_owned();
+        }
+    }
+    let slug = slugify_profile_id(&normalized);
+    if slug.is_empty() {
+        "octos".to_owned()
+    } else {
+        slug
+    }
+}
+
+/// The launch-time decision for which local profile to attach (Phase 3).
+/// Computed from the `--profile-id` flag and the set of existing profiles so
+/// the wiring stays a pure, testable function of its two inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupProfileDecision {
+    /// `--profile-id` was passed: honor it unchanged, never prompt.
+    Pinned(String),
+    /// Exactly one profile exists and none was pinned: attach it silently.
+    Attach(String),
+    /// More than one profile exists and none was pinned: show the picker.
+    Pick(Vec<String>),
+    /// No profiles exist (and none pinned): run first-launch onboarding.
+    Onboard,
+}
+
+impl StartupProfileDecision {
+    /// Decide from the pinned `--profile-id` (if any) and the discovered
+    /// profile ids. A pinned id always wins (`Pinned`); otherwise the count of
+    /// distinct, non-empty profiles chooses `Onboard` (0), `Attach` (1), or
+    /// `Pick` (N>1). Blank entries are ignored and duplicates collapsed so the
+    /// count reflects real, attachable profiles.
+    pub fn decide(cli_profile_id: Option<&str>, available: &[String]) -> Self {
+        if let Some(pinned) = cli_profile_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Self::Pinned(pinned.to_owned());
+        }
+        let mut profiles: Vec<String> = available
+            .iter()
+            .map(|profile| profile.trim())
+            .filter(|profile| !profile.is_empty())
+            .map(str::to_owned)
+            .collect();
+        profiles.sort();
+        profiles.dedup();
+        match profiles.len() {
+            0 => Self::Onboard,
+            1 => Self::Attach(profiles.remove(0)),
+            _ => Self::Pick(profiles),
+        }
+    }
 }
 
 pub fn auth_me_email(result: &AuthMeResult) -> Option<&str> {
@@ -8886,6 +9084,129 @@ mod tests {
             .validate_local_profile()
             .expect_err("empty email must be rejected pre-flight");
         assert_eq!(err.focus_field, OnboardingLocalProfileField::Email);
+    }
+
+    // ---- Phase 2: nameable-profiles (requested_id) flow ----
+
+    fn state_with_family(family: &str) -> OnboardingWizardState {
+        let mut state = OnboardingWizardState::default();
+        state.provider.family_id = family.into();
+        state
+    }
+
+    #[test]
+    fn should_suggest_glm_when_family_is_zai_glm() {
+        assert_eq!(suggest_profile_id_for_family("glm-4.6"), "glm");
+        assert_eq!(suggest_profile_id_for_family("zai/glm"), "glm");
+        assert_eq!(suggest_profile_id_for_family("GLM"), "glm");
+    }
+
+    #[test]
+    fn should_suggest_known_family_handles() {
+        assert_eq!(suggest_profile_id_for_family("deepseek-v4"), "deepseek");
+        assert_eq!(suggest_profile_id_for_family("gpt-4o"), "openai");
+        assert_eq!(suggest_profile_id_for_family("claude-sonnet"), "claude");
+        assert_eq!(suggest_profile_id_for_family("gemini-2.5"), "gemini");
+    }
+
+    #[test]
+    fn should_slugify_unknown_family_when_not_recognized() {
+        assert_eq!(
+            suggest_profile_id_for_family("Acme Model X"),
+            "acme-model-x"
+        );
+    }
+
+    #[test]
+    fn should_suggest_octos_when_family_is_empty() {
+        assert_eq!(suggest_profile_id_for_family(""), "octos");
+        assert_eq!(suggest_profile_id_for_family("   "), "octos");
+    }
+
+    #[test]
+    fn slugify_collapses_separators_and_trims_edges() {
+        assert_eq!(slugify_profile_id("  My Profile!!  "), "my-profile");
+        assert_eq!(slugify_profile_id("a__b--c"), "a-b-c");
+        assert_eq!(slugify_profile_id("---"), "");
+    }
+
+    #[test]
+    fn effective_requested_id_prefers_typed_over_suggestion() {
+        let mut state = state_with_family("glm-4.6");
+        assert_eq!(
+            state.effective_requested_id(),
+            "glm",
+            "falls back to family"
+        );
+        state.requested_id = "  my-glm ".into();
+        assert_eq!(state.effective_requested_id(), "my-glm", "typed id wins");
+    }
+
+    #[test]
+    fn validate_requested_id_ok_when_suggestion_available() {
+        // Even with no typed id, the family-derived suggestion is non-empty,
+        // so the nameable-flow pre-flight passes (Continue is never blocked).
+        let state = state_with_family("deepseek");
+        assert!(state.validate_local_profile_requested_id().is_ok());
+        assert!(!state.has_requested_id());
+    }
+
+    // ---- Phase 3: startup profile decision (0/1/N) ----
+
+    fn profiles(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    #[test]
+    fn should_pin_when_profile_id_flag_is_present() {
+        let decision = StartupProfileDecision::decide(Some("coding"), &profiles(&["a", "b"]));
+        assert_eq!(decision, StartupProfileDecision::Pinned("coding".into()));
+    }
+
+    #[test]
+    fn should_pin_and_trim_whitespace_flag() {
+        let decision = StartupProfileDecision::decide(Some("  glm  "), &[]);
+        assert_eq!(decision, StartupProfileDecision::Pinned("glm".into()));
+    }
+
+    #[test]
+    fn should_onboard_when_zero_profiles_and_no_flag() {
+        assert_eq!(
+            StartupProfileDecision::decide(None, &[]),
+            StartupProfileDecision::Onboard
+        );
+        // A blank/whitespace flag is treated as absent.
+        assert_eq!(
+            StartupProfileDecision::decide(Some("   "), &[]),
+            StartupProfileDecision::Onboard
+        );
+    }
+
+    #[test]
+    fn should_attach_when_exactly_one_profile_and_no_flag() {
+        assert_eq!(
+            StartupProfileDecision::decide(None, &profiles(&["glm"])),
+            StartupProfileDecision::Attach("glm".into())
+        );
+    }
+
+    #[test]
+    fn should_pick_when_more_than_one_profile_and_no_flag() {
+        let decision = StartupProfileDecision::decide(None, &profiles(&["glm", "deepseek"]));
+        assert_eq!(
+            decision,
+            StartupProfileDecision::Pick(profiles(&["deepseek", "glm"])),
+            "picker list is sorted and complete"
+        );
+    }
+
+    #[test]
+    fn should_ignore_blank_and_duplicate_profiles_when_counting() {
+        // Blanks dropped, duplicates collapsed → one real profile → Attach.
+        assert_eq!(
+            StartupProfileDecision::decide(None, &profiles(&["glm", "", "glm", "  "])),
+            StartupProfileDecision::Attach("glm".into())
+        );
     }
 
     #[test]

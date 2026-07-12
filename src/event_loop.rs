@@ -122,6 +122,18 @@ pub fn run(cli: Cli) -> Result<()> {
             .as_ref()
             .map(|path| path.to_string_lossy().to_string()),
     );
+    // Phase 3 startup picker: remember the pinned `--profile-id` (honored
+    // unchanged, never triggers the picker) and, for a locally-spawned solo
+    // backend, discover the profiles already on disk. Skipped when a profile is
+    // pinned (nothing to pick) or for remote/WebSocket launches (no local
+    // profiles dir to read). Best-effort — an empty list just runs onboarding.
+    store.state.onboarding.launch_profile_id = cli.profile_id.clone();
+    if cli.profile_id.is_none() {
+        if let Some(stdio_command) = cli.stdio_command.as_deref() {
+            store.state.onboarding.available_profiles =
+                crate::profiles::discover_local_profile_ids(Some(stdio_command));
+        }
+    }
     let mut input_state = TerminalInputState::default();
     let mut scrollback = ScrollbackTracker::new();
     // Force a draw on the first iteration.

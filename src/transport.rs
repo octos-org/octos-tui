@@ -3599,13 +3599,19 @@ fn auth_logout_event(result: AuthLogoutResult) -> ClientEvent {
 
 fn profile_local_create_event(result: ProfileLocalCreateResult) -> ClientEvent {
     let action = if result.created { "created" } else { "loaded" };
-    ClientEvent::ProfileLocalCreate(ProfileLocalCreateClientEvent {
-        message: format!(
+    // Surface the server-assigned final id (it may be collision-suffixed, e.g.
+    // `glm-2`). The email suffix is only shown when present — the nameable
+    // (requested_id) flow sends no email, so the message reads cleanly as
+    // "Local solo profile created: glm-2" instead of a dangling "( )".
+    let message = if result.email.trim().is_empty() {
+        format!("Local solo profile {action}: {}", result.profile_id)
+    } else {
+        format!(
             "Local solo profile {action}: {} ({})",
             result.profile_id, result.email
-        ),
-        result,
-    })
+        )
+    };
+    ClientEvent::ProfileLocalCreate(ProfileLocalCreateClientEvent { message, result })
 }
 
 fn auth_status_message(result: &AuthStatusResult) -> String {
@@ -6142,6 +6148,7 @@ mod tests {
         let local_profile = rpc_request_from_command(
             "tui-11b".into(),
             AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
+                requested_id: None,
                 name: "Ada Lovelace".into(),
                 username: "ada".into(),
                 email: "ada@example.com".into(),
@@ -6823,6 +6830,7 @@ mod tests {
                 ApprovalDecision::Deny,
             )),
             AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
+                requested_id: None,
                 name: "Ada Lovelace".into(),
                 username: "ada".into(),
                 email: "ada@example.com".into(),
@@ -8600,6 +8608,7 @@ mod tests {
 
         let local_profile_request = backend
             .build_tracked_request(AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
+                requested_id: None,
                 name: "Ada Lovelace".into(),
                 username: "ada".into(),
                 email: "ada@example.com".into(),
