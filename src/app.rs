@@ -291,6 +291,7 @@ pub fn render_viewport_with_finalization(
     );
     let autonomy_height = autonomy_indicator_height(app);
     let harness_height = harness_status_height(app);
+    let agent_strip_height = agent_strip_height(app);
 
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -300,6 +301,7 @@ pub fn render_viewport_with_finalization(
             Constraint::Length(autonomy_height),
             Constraint::Length(harness_height),
             Constraint::Length(composer_height),
+            Constraint::Length(agent_strip_height),
             Constraint::Length(1),
         ])
         .split(area);
@@ -326,7 +328,10 @@ pub fn render_viewport_with_finalization(
     }
     frame.render_widget(render_composer(app, palette, root[4]), root[4]);
     set_composer_cursor(frame, app, root[4]);
-    frame.render_widget(render_status(app, palette), root[5]);
+    if agent_strip_height > 0 {
+        frame.render_widget(render_agent_strip(app, palette), root[5]);
+    }
+    frame.render_widget(render_status(app, palette), root[6]);
 }
 
 /// The live (uncommitted / in-flight) transcript tail rendered inside the
@@ -1367,6 +1372,9 @@ fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palet
         areas.composer,
     );
     set_composer_cursor(frame, app, areas.composer);
+    if areas.agent_strip.height > 0 {
+        frame.render_widget(render_agent_strip(app, palette), areas.agent_strip);
+    }
     frame.render_widget(render_status(app, palette), areas.status);
 }
 
@@ -1377,6 +1385,9 @@ pub struct ChatLayoutAreas {
     pub autonomy: Rect,
     pub harness: Rect,
     pub composer: Rect,
+    /// Sub-agent selector strip, directly under the composer (0-height when the
+    /// session has no sub-agents).
+    pub agent_strip: Rect,
     pub status: Rect,
 }
 
@@ -2053,8 +2064,14 @@ fn chat_layout_areas_for_menu(
     let desired_menu_height = menu_height_hint(active_menu, area.width, area.height);
     let autonomy_height = autonomy_indicator_height(app);
     let harness_height = harness_status_height(app);
+    let agent_strip_height = agent_strip_height(app);
     let surface_budget = area.height.saturating_sub(
-        min_transcript_height(area.height) + composer_height + autonomy_height + harness_height + 1,
+        min_transcript_height(area.height)
+            + composer_height
+            + autonomy_height
+            + harness_height
+            + agent_strip_height
+            + 1,
     );
     let menu_height = desired_menu_height.min(surface_budget);
     let root = Layout::default()
@@ -2065,6 +2082,7 @@ fn chat_layout_areas_for_menu(
             Constraint::Length(autonomy_height),
             Constraint::Length(harness_height),
             Constraint::Length(composer_height),
+            Constraint::Length(agent_strip_height),
             Constraint::Length(1),
         ])
         .split(area);
@@ -2075,7 +2093,8 @@ fn chat_layout_areas_for_menu(
         autonomy: root[2],
         harness: root[3],
         composer: root[4],
-        status: root[5],
+        agent_strip: root[5],
+        status: root[6],
     }
 }
 
@@ -8011,6 +8030,84 @@ fn plan_indicator_lines(
 fn render_autonomy_indicator(app: &AppState, palette: Palette) -> Paragraph<'static> {
     let lines = autonomy_indicator_lines(app, palette);
     Paragraph::new(Text::from(lines)).style(Style::default().fg(palette.text).bg(palette.surface))
+}
+
+/// Status glyph for a sub-agent chip in the agent strip.
+fn agent_status_glyph(status: &str) -> &'static str {
+    match status.to_ascii_lowercase().as_str() {
+        "running" | "spawned" | "in_progress" => "⏵",
+        "completed" | "complete" | "done" | "ready" => "✔",
+        "failed" | "error" => "✖",
+        "cancelled" | "canceled" | "interrupted" => "⊘",
+        _ => "•",
+    }
+}
+
+/// Logical chips for the agent strip: `(glyph, label, selected)`. `main` first,
+/// then one chip per active-session sub-agent. Empty when the session has no
+/// sub-agents (the strip is then hidden). Split from rendering so the
+/// selection/labeling logic is unit-testable without a frame.
+fn agent_strip_chips(app: &AppState) -> Vec<(&'static str, String, bool)> {
+    let agents = app.active_session_agents();
+    if agents.is_empty() {
+        return Vec::new();
+    }
+    let mut chips = vec![(
+        "⌂",
+        "main".to_string(),
+        matches!(app.chat_view, crate::model::ChatViewTarget::Main),
+    )];
+    for agent in agents {
+        let selected = matches!(
+            &app.chat_view,
+            crate::model::ChatViewTarget::Agent(id) if id == &agent.agent_id
+        );
+        let label = if agent.nickname.trim().is_empty() {
+            agent.role.clone()
+        } else {
+            agent.nickname.clone()
+        };
+        chips.push((agent_status_glyph(&agent.status), label, selected));
+    }
+    chips
+}
+
+/// Rows the agent strip occupies under the composer: 1 when the active session
+/// has sub-agents, else 0 (hidden).
+fn agent_strip_height(app: &AppState) -> u16 {
+    if app.active_session_agents().is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+/// Render the sub-agent selector strip shown under the composer: `main` plus a
+/// chip per sub-agent, the selected target highlighted. Selection is moved in
+/// the event loop; selecting an agent redirects the main pane to its live
+/// output.
+fn render_agent_strip(app: &AppState, palette: Palette) -> Paragraph<'static> {
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(
+        " agents ".to_string(),
+        palette.muted().bg(palette.surface),
+    )];
+    for (glyph, label, selected) in agent_strip_chips(app) {
+        let chip = format!(" {glyph} {label} ");
+        let style = if selected {
+            Style::default()
+                .fg(palette.surface)
+                .bg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            palette.text().bg(palette.surface)
+        };
+        spans.push(Span::styled(chip, style));
+        spans.push(Span::styled(
+            "  ".to_string(),
+            Style::default().bg(palette.surface),
+        ));
+    }
+    Paragraph::new(Line::from(spans)).style(Style::default().bg(palette.surface))
 }
 
 /// Fallback context-window denominator for `ctx N%`, used only until a cost
@@ -16235,7 +16332,10 @@ mod tests {
             None,
             false,
         );
-        app.upsert_session_agent(&SessionKey("local:a".into()), sample_agent("ag-1", "running"));
+        app.upsert_session_agent(
+            &SessionKey("local:a".into()),
+            sample_agent("ag-1", "running"),
+        );
         app.select_next_chat_view();
         assert_eq!(app.chat_view, ChatViewTarget::Agent("ag-1".into()));
 
@@ -16245,6 +16345,45 @@ mod tests {
             ChatViewTarget::Main,
             "agent selection must not carry across sessions"
         );
+    }
+
+    #[test]
+    fn agent_strip_height_reflects_agent_presence() {
+        let mut app = autonomy_app_state();
+        assert_eq!(agent_strip_height(&app), 0, "hidden with no agents");
+        app.upsert_session_agent(
+            &SessionKey("local:test".into()),
+            sample_agent("ag-1", "running"),
+        );
+        assert_eq!(agent_strip_height(&app), 1, "one row once agents exist");
+    }
+
+    #[test]
+    fn agent_status_glyph_maps_states() {
+        assert_eq!(agent_status_glyph("running"), "⏵");
+        assert_eq!(agent_status_glyph("completed"), "✔");
+        assert_eq!(agent_status_glyph("failed"), "✖");
+        assert_eq!(agent_status_glyph("cancelled"), "⊘");
+        assert_eq!(agent_status_glyph("mystery"), "•");
+    }
+
+    #[test]
+    fn agent_strip_chips_lists_main_and_marks_selection() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        app.upsert_session_agent(&sid, sample_agent("weather", "running"));
+        app.upsert_session_agent(&sid, sample_agent("news", "completed"));
+        app.chat_view = ChatViewTarget::Agent("news".into());
+
+        let chips = agent_strip_chips(&app);
+        assert_eq!(chips.len(), 3, "main + two agents");
+        assert_eq!(chips[0].1, "main");
+        assert!(!chips[0].2, "main not selected");
+        assert_eq!(chips[1].1, "weather");
+        assert_eq!(chips[2].1, "news");
+        assert!(chips[2].2, "selected agent marked");
+        assert_eq!(chips[2].0, "✔", "completed glyph");
     }
 
     fn sample_loop(
