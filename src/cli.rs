@@ -378,29 +378,45 @@ pub fn load_config_file(path: &Path) -> Result<CliFileConfig> {
 /// session was launched without `--config`) so saved UI settings round-trip on
 /// the next plain launch. `None` when no default path resolves or the file is
 /// absent/unreadable (see [`load_config_file_if_present`]).
+///
+/// A corrupt/unreadable auto-discovered config is NON-FATAL — startup proceeds
+/// with built-in defaults — but the user is told why their saved settings were
+/// ignored, via a prominent stderr notice (an explicit `--config` still
+/// hard-errors, in `from_args`). The notice is produced by the pure loader and
+/// only *printed* here, so its content stays unit-testable without capturing
+/// stderr.
 fn load_default_config_file() -> Option<CliFileConfig> {
-    load_config_file_if_present(&default_config_path()?)
+    let (config, notice) = load_config_file_if_present(&default_config_path()?);
+    if let Some(notice) = notice {
+        eprintln!("{notice}");
+    }
+    config
 }
 
-/// Leniently load an *auto-discovered* config file: a missing file is the
-/// normal first-run case and yields `None`; a present-but-unreadable/corrupt
-/// file must NOT block startup — unlike an explicit `--config`, the user didn't
-/// ask for this file — so we warn and fall back to built-in defaults rather
-/// than propagating the error. (Kept path-injectable so it's testable without
-/// mutating the process-global `$HOME`.)
-fn load_config_file_if_present(path: &Path) -> Option<CliFileConfig> {
+/// Leniently load an *auto-discovered* config file, returning `(maybe-config,
+/// maybe-notice)`. A missing file is the normal first-run case → `(None, None)`.
+/// A present-but-unreadable/corrupt file must NOT block startup — unlike an
+/// explicit `--config`, the user didn't ask for this file — so it yields
+/// `(None, Some(notice))`: no config (the caller falls back to built-in
+/// defaults) plus a user-facing notice (path + parse error + the defaults
+/// fallback) for the caller to surface on stderr. Returning the notice instead
+/// of printing it keeps this pure and unit-testable without capturing stderr,
+/// and keeps it path-injectable (no `$HOME` mutation).
+fn load_config_file_if_present(path: &Path) -> (Option<CliFileConfig>, Option<String>) {
     if !path.exists() {
-        return None;
+        return (None, None);
     }
     match load_config_file(path) {
-        Ok(config) => Some(config),
-        Err(error) => {
-            eprintln!(
-                "warning: ignoring unreadable default TUI config {}: {error}",
-                path.display()
-            );
-            None
-        }
+        Ok(config) => (Some(config), None),
+        // `{error:#}` renders the whole eyre chain — "failed to parse TUI config
+        // <path>: <serde error>" — so the notice carries both the offending path
+        // and the exact parse error, then we name the defaults fallback.
+        Err(error) => (
+            None,
+            Some(format!(
+                "warning: {error:#}. Starting with built-in defaults instead."
+            )),
+        ),
     }
 }
 
@@ -632,22 +648,59 @@ mod tests {
     fn default_config_load_is_lenient_and_path_injectable() {
         let path = write_config("default-config", r#"{ "theme": "claude" }"#);
 
-        // Present + valid → loaded (this is what makes /saveconfig round-trip).
-        let cfg = super::load_config_file_if_present(&path).expect("present default config loads");
-        assert_eq!(cfg.theme, Some(ThemeName::Claude));
+        // Present + valid → loaded (this is what makes /saveconfig round-trip),
+        // with no notice.
+        let (cfg, notice) = super::load_config_file_if_present(&path);
+        assert_eq!(
+            cfg.expect("present default config loads").theme,
+            Some(ThemeName::Claude)
+        );
+        assert!(notice.is_none(), "a valid config produces no notice");
 
-        // Absent → None.
+        // Absent → None, silently (the normal first-run case).
         fs::remove_file(&path).expect("remove config");
+        let (cfg, notice) = super::load_config_file_if_present(&path);
+        assert!(cfg.is_none(), "absent default config yields None");
+        assert!(notice.is_none(), "absent config is silent");
+
+        // Present but corrupt → None (skipped, not a fatal startup error) WITH a
+        // user-facing notice.
+        fs::write(&path, "{ not valid json").expect("write corrupt config");
+        let (cfg, notice) = super::load_config_file_if_present(&path);
         assert!(
-            super::load_config_file_if_present(&path).is_none(),
-            "absent default config yields None"
+            cfg.is_none(),
+            "corrupt default config is skipped, not fatal"
+        );
+        assert!(notice.is_some(), "corrupt default config surfaces a notice");
+        let _ = fs::remove_file(&path);
+    }
+
+    // A corrupt auto-discovered config must be NON-FATAL (startup proceeds with
+    // built-in defaults) yet VISIBLE (the user is told why their saved settings
+    // were ignored — the path + the parse error). An explicit `--config` still
+    // hard-errors; that propagation is exercised by `load_config_file` in
+    // `from_args`, e.g. `rejects_model_provider_fields_in_tui_config`.
+    #[test]
+    fn should_surface_a_notice_and_yield_defaults_when_auto_config_is_corrupt() {
+        let path = write_config("corrupt-auto-config", "{ not valid json");
+        let (config, notice) = super::load_config_file_if_present(&path);
+
+        // Non-fatal: no config → the caller falls back to built-in defaults.
+        assert!(
+            config.is_none(),
+            "corrupt auto-config must not block startup"
         );
 
-        // Present but corrupt → None (skipped, not a fatal startup error).
-        fs::write(&path, "{ not valid json").expect("write corrupt config");
+        // Prominent + actionable: names the offending path, the parse error, and
+        // the defaults fallback.
+        let notice = notice.expect("a corrupt auto-config surfaces a user notice");
         assert!(
-            super::load_config_file_if_present(&path).is_none(),
-            "corrupt default config is skipped, not fatal"
+            notice.contains(&path.display().to_string()),
+            "notice names the offending path: {notice}"
+        );
+        assert!(
+            notice.contains("built-in defaults"),
+            "notice explains the defaults fallback: {notice}"
         );
         let _ = fs::remove_file(&path);
     }
