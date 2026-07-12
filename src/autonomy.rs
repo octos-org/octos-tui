@@ -93,8 +93,13 @@ pub enum TurnCommand {
 /// Parsed `/goal` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalCommand {
-    /// `/goal <objective>` — set a new active goal.
-    Set(String),
+    /// `/goal <objective> [--budget <n>[k|m]]` — set (or re-budget) an
+    /// active goal. `token_budget` is `None` when the user did not pass
+    /// `--budget`, in which case the backend applies its own default.
+    Set {
+        objective: String,
+        token_budget: Option<u64>,
+    },
     /// Bare `/goal` — show current goal.
     Show,
     /// `/goal pause`.
@@ -177,6 +182,9 @@ pub enum AutonomyParseError {
     /// `/goal <objective>` with empty objective (after stripping
     /// whitespace).
     EmptyGoalObjective,
+    /// `/goal ... --budget <value>` where the value was missing or did
+    /// not parse as a positive token count.
+    InvalidBudget(String),
     /// `/loop ... every <interval>` where the interval failed to parse.
     InvalidInterval(String),
 }
@@ -202,6 +210,12 @@ impl std::fmt::Display for AutonomyParseError {
             }
             Self::EmptyLoopPrompt => f.write_str("/loop requires a prompt"),
             Self::EmptyGoalObjective => f.write_str("/goal requires an objective"),
+            Self::InvalidBudget(raw) => {
+                write!(
+                    f,
+                    "could not parse --budget `{raw}` (try 500k, 2m, or 50000)"
+                )
+            }
             Self::InvalidInterval(raw) => {
                 write!(f, "could not parse interval `{raw}`")
             }
@@ -394,13 +408,91 @@ fn parse_goal(tail: &str) -> Result<GoalCommand, AutonomyParseError> {
         "clear" => return Ok(GoalCommand::Clear),
         _ => {}
     }
-    // Otherwise treat the entire remainder as the objective.
-    let objective = trimmed.to_string();
+    // Pull an optional `--budget <value>` flag out of the remainder; the
+    // rest is the objective. Setting a goal with a budget both creates a
+    // fresh goal AND re-activates a budget_limited one (the dispatch
+    // sends status=active), so `/goal <obj> --budget 5m` is the way to
+    // un-freeze a goal that hit its cap.
+    let (objective, token_budget) = extract_budget_flag(trimmed)?;
+    let objective = objective.trim().to_string();
     if objective.is_empty() {
         Err(AutonomyParseError::EmptyGoalObjective)
     } else {
-        Ok(GoalCommand::Set(objective))
+        Ok(GoalCommand::Set {
+            objective,
+            token_budget,
+        })
     }
+}
+
+/// Remove an optional `--budget <value>` / `--budget=<value>` flag from
+/// the goal remainder, returning the objective text (flag stripped) and
+/// the parsed token budget. A `--budget` with a missing or unparseable
+/// value is a hard error so it surfaces a hint instead of silently
+/// folding the flag into the objective text. When the flag is absent the
+/// budget is `None` and the backend default applies.
+fn extract_budget_flag(input: &str) -> Result<(String, Option<u64>), AutonomyParseError> {
+    // Fast path: no `--budget` token → the objective is the input verbatim
+    // (outer trim only), preserving any internal whitespace the user typed.
+    // Detect the flag as a whole whitespace-delimited token so an
+    // objective that merely contains the substring `--budget` mid-word is
+    // never mangled. Only when a real flag is present do we tokenize (and
+    // accept single-space normalization of the objective as the cost of
+    // the opt-in flag syntax).
+    let has_flag = input
+        .split_whitespace()
+        .any(|word| word == "--budget" || word.starts_with("--budget="));
+    if !has_flag {
+        return Ok((input.trim().to_string(), None));
+    }
+    let mut objective_words: Vec<&str> = Vec::new();
+    let mut token_budget: Option<u64> = None;
+    let mut words = input.split_whitespace();
+    while let Some(word) = words.next() {
+        if let Some(value) = word.strip_prefix("--budget=") {
+            token_budget = Some(parse_token_budget(value)?);
+        } else if word == "--budget" {
+            let value = words
+                .next()
+                .ok_or_else(|| AutonomyParseError::InvalidBudget(word.to_string()))?;
+            token_budget = Some(parse_token_budget(value)?);
+        } else {
+            objective_words.push(word);
+        }
+    }
+    Ok((objective_words.join(" "), token_budget))
+}
+
+/// Parse a human-friendly token budget: a positive number with an
+/// optional `k` (×1_000) or `m` (×1_000_000) suffix, case-insensitive.
+/// Examples: `50000`, `500k`, `2m`, `1.5m`. The backend enforces the hard
+/// ceiling; this only rejects values that are not a positive number.
+fn parse_token_budget(raw: &str) -> Result<u64, AutonomyParseError> {
+    let raw = raw.trim();
+    let invalid = || AutonomyParseError::InvalidBudget(raw.to_string());
+    let lower = raw.to_ascii_lowercase();
+    let (digits, multiplier) = if let Some(rest) = lower.strip_suffix('k') {
+        (rest, 1_000_f64)
+    } else if let Some(rest) = lower.strip_suffix('m') {
+        (rest, 1_000_000_f64)
+    } else {
+        (lower.as_str(), 1_f64)
+    };
+    let value: f64 = digits.trim().parse().map_err(|_| invalid())?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(invalid());
+    }
+    let tokens = (value * multiplier).round();
+    // `u64::MAX as f64` rounds UP to 2^64, so a plain `> u64::MAX as f64`
+    // lets exactly-2^64 through and the cast then saturates to u64::MAX.
+    // Reject at 2^64 (exclusive) instead. (Absurd magnitudes like this are
+    // rejected server-side anyway, but returning InvalidBudget gives the
+    // user a hint rather than a silently clamped value.)
+    const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
+    if !tokens.is_finite() || tokens < 1.0 || tokens >= TWO_POW_64 {
+        return Err(invalid());
+    }
+    Ok(tokens as u64)
 }
 
 fn parse_loop(tail: &str) -> Result<LoopCommand, AutonomyParseError> {
@@ -717,10 +809,77 @@ mod tests {
         let parsed = parse_autonomy_slash("/goal ship the supervised-task UX by Friday").unwrap();
         assert_eq!(
             parsed,
-            Some(AutonomyCommand::Goal(GoalCommand::Set(
-                "ship the supervised-task UX by Friday".into()
-            )))
+            Some(AutonomyCommand::Goal(GoalCommand::Set {
+                objective: "ship the supervised-task UX by Friday".into(),
+                token_budget: None,
+            }))
         );
+    }
+
+    #[test]
+    fn goal_set_parses_budget_flag_with_suffixes() {
+        // Trailing flag, `k`/`m` suffixes, `--budget=` form, and mid-text
+        // placement all resolve to raw token counts with the flag removed
+        // from the objective.
+        for (input, expected_budget) in [
+            ("/goal improve kim score --budget 2m", 2_000_000_u64),
+            ("/goal improve kim score --budget 500k", 500_000),
+            ("/goal improve kim score --budget=1.5m", 1_500_000),
+            ("/goal improve kim score --budget 50000", 50_000),
+        ] {
+            assert_eq!(
+                parse_autonomy_slash(input).unwrap(),
+                Some(AutonomyCommand::Goal(GoalCommand::Set {
+                    objective: "improve kim score".into(),
+                    token_budget: Some(expected_budget),
+                })),
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn goal_set_rejects_malformed_budget() {
+        for input in [
+            "/goal do things --budget",     // missing value
+            "/goal do things --budget abc", // non-numeric
+            "/goal do things --budget 0",   // non-positive
+            "/goal do things --budget -5",  // negative
+            // 2^64 exactly: `u64::MAX as f64` rounds to this, so it must
+            // be rejected rather than silently clamped to u64::MAX.
+            "/goal do things --budget 18446744073709551616",
+            "/goal do things --budget 20000000000000000000", // > 2^64
+        ] {
+            assert!(
+                matches!(
+                    parse_autonomy_slash(input),
+                    Err(AutonomyParseError::InvalidBudget(_))
+                ),
+                "expected InvalidBudget for: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn goal_set_without_budget_preserves_objective_whitespace() {
+        // A no-flag objective must reach dispatch verbatim (outer trim
+        // only) — the budget parsing must not normalize internal spacing.
+        let parsed = parse_autonomy_slash("/goal keep   the    spacing").unwrap();
+        assert_eq!(
+            parsed,
+            Some(AutonomyCommand::Goal(GoalCommand::Set {
+                objective: "keep   the    spacing".into(),
+                token_budget: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn goal_budget_flag_only_still_requires_objective() {
+        assert!(matches!(
+            parse_autonomy_slash("/goal --budget 2m"),
+            Err(AutonomyParseError::EmptyGoalObjective)
+        ));
     }
 
     #[test]

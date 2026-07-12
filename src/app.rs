@@ -7818,6 +7818,16 @@ fn autonomy_loop_is_active(record: &octos_core::ui_protocol::UiLoopRecord) -> bo
 
 /// Build the line set for the sticky autonomy indicator. Returns 0, 1,
 /// or 2 lines (goal first, then loops).
+/// Render a raw token count in K units for the goal chip: 174_763 →
+/// "175K", 2_000_000 → "2000K", 0 → "0K". Rounded to the nearest thousand
+/// so the goal budget reads at a glance instead of as a raw 6–9 digit
+/// number (user request: "tui should display in K unit"). Rounds without
+/// the overflow that `saturating_add(500)` would hit near `u64::MAX`.
+fn format_tokens_k(tokens: u64) -> String {
+    let k = tokens / 1_000 + u64::from(tokens % 1_000 >= 500);
+    format!("{k}K")
+}
+
 fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> {
     let Some(state) = active_session_autonomy(app) else {
         return Vec::new();
@@ -7832,8 +7842,8 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
         let parenthetical = t!(
             "app.autonomy.goal_meta",
             status = goal.status,
-            used = goal.tokens_used,
-            budget = goal.token_budget
+            used = format_tokens_k(goal.tokens_used),
+            budget = format_tokens_k(goal.token_budget)
         )
         .into_owned();
         lines.push(Line::from(vec![
@@ -16274,6 +16284,18 @@ mod tests {
     }
 
     #[test]
+    fn format_tokens_k_rounds_to_nearest_thousand() {
+        assert_eq!(format_tokens_k(0), "0K");
+        assert_eq!(format_tokens_k(499), "0K");
+        assert_eq!(format_tokens_k(500), "1K");
+        assert_eq!(format_tokens_k(12_000), "12K");
+        assert_eq!(format_tokens_k(174_763), "175K");
+        assert_eq!(format_tokens_k(2_000_000), "2000K");
+        // No overflow / correct rounding at the u64 ceiling.
+        assert_eq!(format_tokens_k(u64::MAX), "18446744073709552K");
+    }
+
+    #[test]
     fn render_autonomy_indicator_goal_only_renders_one_row() {
         let mut app = autonomy_app_state();
         let session_id = SessionKey("local:test".into());
@@ -16304,7 +16326,10 @@ mod tests {
         );
         assert!(text.contains("finish the OAuth refactor"));
         assert!(text.contains("active"));
-        assert!(text.contains("12000/50000"));
+        assert!(
+            text.contains("12K/50K"),
+            "goal tokens render in K units, got: {text}"
+        );
         assert!(!text.contains("Loops:"), "loops row must be hidden");
     }
 
