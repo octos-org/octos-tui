@@ -850,7 +850,10 @@ impl Store {
                     },
                 ))
             }
-            GoalCommand::Set(objective) => {
+            GoalCommand::Set {
+                objective,
+                token_budget,
+            } => {
                 let objective = objective.trim().to_string();
                 if objective.is_empty() {
                     self.state.status = t!("status.goal_objective_empty").into_owned();
@@ -866,8 +869,11 @@ impl Store {
                         session_id,
                         profile_id,
                         objective,
+                        // status=active makes this both create a fresh
+                        // goal and re-activate a budget_limited one, so
+                        // `/goal <obj> --budget N` resumes a capped goal.
                         status: Some("active".into()),
-                        token_budget: None,
+                        token_budget,
                         transition_actor: Some("user".into()),
                         action: crate::model::SessionGoalSetAction::Set,
                     },
@@ -25111,6 +25117,29 @@ mod tests {
                 assert_eq!(params.objective, "finish the review by Friday");
                 assert_eq!(params.status.as_deref(), Some("active"));
                 assert_eq!(params.transition_actor.as_deref(), Some("user"));
+                assert_eq!(
+                    params.token_budget, None,
+                    "no --budget ⇒ backend default applies"
+                );
+            }
+            other => panic!("expected SetSessionGoal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn goal_set_with_budget_flag_threads_budget_to_dispatch() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/goal improve kim score --budget 5m".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::SetSessionGoal(params) => {
+                assert_eq!(params.objective, "improve kim score");
+                assert_eq!(
+                    params.token_budget,
+                    Some(5_000_000),
+                    "--budget must reach SetSessionGoal so the backend honors it"
+                );
+                // status=active is what re-activates a budget_limited goal.
+                assert_eq!(params.status.as_deref(), Some("active"));
             }
             other => panic!("expected SetSessionGoal, got {other:?}"),
         }
