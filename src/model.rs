@@ -7330,6 +7330,14 @@ impl AppState {
     /// `Home` (`usize::MAX`) processed while the bound was still unmeasured — e.g.
     /// `Tab` then `Home` batched before the peek's first draw — doesn't leave the
     /// offset stuck decrementing a huge sentinel once a real bound exists.
+    ///
+    /// Residual (intentionally not handled): if `Home` AND a `Down`/`PageDown`
+    /// are BOTH processed in the same input batch before that first draw, the
+    /// down-move subtracts from the unmeasured sentinel and is absorbed into the
+    /// top position — that one move is lost and recovered by the next down-key.
+    /// Handling it precisely needs a symbolic top-anchor threaded through every
+    /// scroll op; not worth it for a state only reachable by a sub-frame burst of
+    /// three distinct keys (unreachable by human typing / key-repeat).
     pub fn scroll_agent_view_down(&mut self, lines: usize) {
         self.agent_view_scroll = self
             .agent_view_scroll
