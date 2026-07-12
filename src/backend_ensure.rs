@@ -263,6 +263,56 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Locate an `octos` binary to run an auxiliary command like `octos config`,
+/// WITHOUT installing or version-gating — any present octos can edit its own
+/// config file. Prefers a PATH `octos` (Windows: `where` resolves `.exe`/`.cmd`/
+/// `.ps1` shims), then the legacy `~/.octos/bin` install dir. Returns the
+/// program to spawn (`"octos"`, or a resolved path), or `None` when none exists.
+pub fn locate_octos() -> Option<std::ffi::OsString> {
+    if cfg!(windows) {
+        // Windows: `where` mirrors the PATH + PATHEXT resolution the child would
+        // use, so an npm `.cmd` shim is found (a direct `.exe`-only spawn misses it).
+        if let Some(found) = where_first(Path::new("octos")) {
+            return Some(found.into_os_string());
+        }
+    } else {
+        // Unix: bare `octos` on PATH. NotFound means absent; any other spawn
+        // outcome means it's present (let the real run surface any real error).
+        match Command::new("octos").arg("--version").output() {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Some(std::ffi::OsString::from("octos")),
+        }
+    }
+    // Legacy install-dir fallback (both platforms).
+    let dir = install_dir_octos()?;
+    dir.exists().then(|| dir.into_os_string())
+}
+
+/// Build a [`Command`] that runs `octos <args...>` via the located octos binary,
+/// or `None` if no octos is found. Windows `.cmd`/`.bat`/`.ps1` shims (as npm
+/// ships `octos`) can't be exec'd directly, so they run through `cmd /C`. Used
+/// to delegate `octos-tui config` → `octos config` while keeping the server's
+/// config logic (and its config file) the single source of truth.
+pub fn octos_command(args: &[&str]) -> Option<Command> {
+    let octos = locate_octos()?;
+    let mut cmd = if cfg!(windows) && is_windows_shim(&octos) {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(&octos);
+        c
+    } else {
+        Command::new(&octos)
+    };
+    cmd.args(args);
+    Some(cmd)
+}
+
+/// Whether `program` is a Windows shim that must be run through `cmd /C` rather
+/// than exec'd directly (a `.cmd`/`.bat`/`.ps1`, e.g. npm's `octos` shim).
+fn is_windows_shim(program: &std::ffi::OsStr) -> bool {
+    let lower = program.to_string_lossy().to_ascii_lowercase();
+    lower.ends_with(".cmd") || lower.ends_with(".bat") || lower.ends_with(".ps1")
+}
+
 /// The program a `--stdio-command` runs, IFF it is a **bare** `octos` (no path
 /// separator) resolved through `PATH`. Handles a leading `env` + `VAR=value`
 /// assignments and an optional `stdio:` transport-label prefix. This decides
@@ -456,6 +506,28 @@ fn have(program: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_windows_shim_detects_cmd_bat_ps1_only() {
+        use std::ffi::OsStr;
+        for shim in [
+            r"C:\Users\a\AppData\Roaming\npm\octos.cmd",
+            r"C:\x\octos.CMD",
+            r"C:\x\octos.bat",
+            r"C:\x\octos.ps1",
+        ] {
+            assert!(
+                is_windows_shim(OsStr::new(shim)),
+                "should be a shim: {shim}"
+            );
+        }
+        for exe in [r"C:\x\octos.exe", "octos", "/usr/local/bin/octos"] {
+            assert!(
+                !is_windows_shim(OsStr::new(exe)),
+                "should NOT be a shim: {exe}"
+            );
+        }
+    }
 
     #[test]
     fn bare_octos_program_matches_the_standard_shapes() {

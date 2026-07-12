@@ -227,13 +227,33 @@ mod tests {
     }
 
     #[test]
-    fn route_recognizes_config_and_defaults_to_wizard() {
-        // Bare `config` → wizard action.
+    fn route_recognizes_config_and_defaults_to_combined() {
+        // Bare `config` → the combined hub (client / server / both).
         match route(&argv(&["octos-tui", "config"])) {
             Some(Route::Config(args)) => {
-                assert!(matches!(args.action, config::ConfigAction::Wizard));
+                assert!(matches!(args.action, config::ConfigAction::Combined));
             }
             other => panic!("expected Route::Config, got {other:?}"),
+        }
+        // Explicit client / server actions parse.
+        match route(&argv(&["octos-tui", "config", "client"])) {
+            Some(Route::Config(args)) => {
+                assert!(matches!(args.action, config::ConfigAction::Client))
+            }
+            other => panic!("expected Route::Config(Client), got {other:?}"),
+        }
+        // `wizard` remains an alias for the client wizard (back-compat).
+        match route(&argv(&["octos-tui", "config", "wizard"])) {
+            Some(Route::Config(args)) => {
+                assert!(matches!(args.action, config::ConfigAction::Client))
+            }
+            other => panic!("expected Route::Config(Client) via wizard alias, got {other:?}"),
+        }
+        match route(&argv(&["octos-tui", "config", "server"])) {
+            Some(Route::Config(args)) => {
+                assert!(matches!(args.action, config::ConfigAction::Server))
+            }
+            other => panic!("expected Route::Config(Server), got {other:?}"),
         }
         // Explicit actions parse.
         match route(&argv(&["octos-tui", "config", "path"])) {

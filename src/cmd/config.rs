@@ -67,7 +67,12 @@ pub struct ConfigArgs {
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigAction {
-    Wizard,
+    /// The hub: interactively choose client / server / both.
+    Combined,
+    /// The octos-tui client wizard only (writes the client config).
+    Client,
+    /// Delegate to `octos config` (the server configures its own config file).
+    Server,
     Show,
     Path,
 }
@@ -76,30 +81,37 @@ pub enum ConfigAction {
 #[derive(Debug, Parser)]
 #[command(
     name = "octos-tui config",
-    about = "Configure octos-tui interactively and inspect the saved config"
+    about = "Configure octos-tui (client) and/or the octos server, each in its own config file"
 )]
 pub struct ConfigCli {
     #[command(subcommand)]
     action: Option<ConfigActionCli>,
-    /// Config file to read/write (default: ~/.config/octos-tui/config.json).
+    /// Client config file to read/write (default: ~/.config/octos-tui/config.json).
+    /// Applies to the CLIENT only; the server always uses its own config.
     #[arg(long = "config", value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
 enum ConfigActionCli {
-    /// Walk every option, explain it, and save your choices (this is the default).
-    Wizard,
-    /// Print the current saved config.
+    /// Configure just the octos-tui client (alias: `wizard`).
+    #[command(alias = "wizard")]
+    Client,
+    /// Configure the octos server by delegating to `octos config`.
+    Server,
+    /// Print the saved client config.
     Show,
-    /// Print the resolved config file path.
+    /// Print the resolved client config file path.
     Path,
 }
 
 impl ConfigCli {
     pub fn into_args(self) -> ConfigArgs {
         let action = match self.action {
-            None | Some(ConfigActionCli::Wizard) => ConfigAction::Wizard,
+            // No subcommand -> the combined hub (client / server / both).
+            None => ConfigAction::Combined,
+            Some(ConfigActionCli::Client) => ConfigAction::Client,
+            Some(ConfigActionCli::Server) => ConfigAction::Server,
             Some(ConfigActionCli::Show) => ConfigAction::Show,
             Some(ConfigActionCli::Path) => ConfigAction::Path,
         };
@@ -123,8 +135,61 @@ pub fn run(args: ConfigArgs) -> Result<i32> {
             Ok(0)
         }
         ConfigAction::Show => show(&path),
-        ConfigAction::Wizard => wizard(&path),
+        ConfigAction::Client => wizard(&path),
+        ConfigAction::Server => server_config(),
+        ConfigAction::Combined => combined(&path),
     }
+}
+
+/// The hub: let the user configure the client, the server, or both. Each writes
+/// its OWN config file — this only orchestrates the two existing wizards, it
+/// never merges them into a shared file.
+fn combined(client_path: &Path) -> Result<i32> {
+    if !is_tty() {
+        bail!(
+            "`octos-tui config` needs an interactive terminal. Run it in a terminal, or use \
+             `octos-tui config client` / `octos config` directly."
+        );
+    }
+    println!("What would you like to configure?");
+    println!("  [1] octos-tui client   -> {}", client_path.display());
+    println!("  [2] octos server       -> runs `octos config` (its own config file)");
+    println!("  [3] both");
+    let choice = read_line("Choose 1/2/3 (or Enter to cancel): ")?;
+    match choice.trim() {
+        "1" => wizard(client_path),
+        "2" => server_config(),
+        "3" => {
+            println!("\n--- octos-tui client ---");
+            let client = wizard(client_path)?;
+            println!("\n--- octos server ---");
+            let server = server_config()?;
+            // Surface the first non-zero exit so a failed half isn't masked.
+            Ok(if client != 0 { client } else { server })
+        }
+        "" => {
+            println!("Cancelled.");
+            Ok(0)
+        }
+        other => bail!("`{other}` is not one of 1/2/3"),
+    }
+}
+
+/// Configure the octos SERVER by delegating to its own `octos config` command,
+/// inheriting this terminal so the server's interactive wizard drives it. The
+/// server owns its config file and logic; octos-tui only launches it.
+fn server_config() -> Result<i32> {
+    let mut command = crate::backend_ensure::octos_command(&["config"]).ok_or_else(|| {
+        eyre!(
+            "octos server not found — can't configure it. Install it \
+             (`brew install octos-org/octos/octos` or `npm install -g @octos-org/octos`), \
+             then re-run, or run `octos config` yourself once it's on PATH."
+        )
+    })?;
+    let status = command
+        .status()
+        .wrap_err("failed to run `octos config` (is the octos server installed?)")?;
+    Ok(status.code().unwrap_or(1))
 }
 
 fn show(path: &Path) -> Result<i32> {
