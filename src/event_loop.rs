@@ -563,10 +563,13 @@ fn handle_terminal_event_with_input_state(
     now: Instant,
 ) -> KeyAction {
     if let Event::Key(key) = event {
-        // Skip the unbracketed-paste newline heuristic while a peek owns the
-        // keyboard — otherwise a pasted newline lands in the hidden composer.
-        // The peek handles the Enter itself (swallows it) via `handle_key`.
-        if !app::agent_view_active(&store.state)
+        // Skip the unbracketed-paste newline heuristic while a modal or a peek
+        // owns the keyboard — both force Composer focus, so without this an
+        // Enter (or pasted newline) lands in the hidden draft and never reaches
+        // the modal's / peek's Enter handler. Those surfaces handle Enter
+        // themselves downstream.
+        if !modal_owns_keyboard(store)
+            && !app::agent_view_active(&store.state)
             && is_plain_composer_enter(store, &key)
             && input_state.should_insert_unbracketed_paste_newline(now, next_event_waiting)
         {
@@ -953,6 +956,17 @@ fn is_invisible_format_char(c: char) -> bool {
 /// already handled upstream in `handle_key`; every other key is swallowed so it
 /// can't reach the composer hidden behind the overlay.
 fn handle_agent_peek_key(store: &mut Store, key: KeyEvent) -> KeyAction {
+    // Alt+A stays a global recovery valve even while peeking: re-show a hidden
+    // pending question/approval. A hidden modal does NOT make the peek yield
+    // (nothing is visible to render), so without this the peek would swallow the
+    // one key that recovers it. Once re-shown the modal is visible, the peek
+    // yields, and the modal owns the keyboard.
+    if is_alt_char(&key, 'a') {
+        if !store.show_pending_user_question() {
+            store.show_pending_approval();
+        }
+        return KeyAction::Continue;
+    }
     match key.code {
         // Cycle to the next / previous target (wrapping through `main`), fetching
         // output on landing so the overlay isn't empty for pre-existing output.

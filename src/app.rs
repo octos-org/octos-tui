@@ -143,12 +143,14 @@ pub fn wants_fullscreen_overlay(app: &AppState) -> bool {
 }
 
 /// Mouse capture policy. In the default `native` scroll-mode, capture is on
-/// ONLY while the transcript pager is up, so the wheel scrolls the pager and
-/// the inline chat flow keeps native terminal selection/copy untouched. In
-/// `pinned` scroll-mode the user explicitly trades native selection for a
-/// wheel that always scrolls the app (composer pinned), so capture stays on.
+/// ONLY while a full-screen overlay is up — the transcript pager or a sub-agent
+/// peek — so the wheel scrolls that overlay while the inline chat flow keeps
+/// native terminal selection/copy untouched (both overlays are alt-screen, with
+/// no native scrollback behind them to preserve). In `pinned` scroll-mode the
+/// user explicitly trades native selection for a wheel that always scrolls the
+/// app (composer pinned), so capture stays on.
 pub fn wants_mouse_capture(app: &AppState) -> bool {
-    app.transcript_pager_active || app.pinned_scroll
+    app.transcript_pager_active || app.pinned_scroll || agent_view_active(app)
 }
 
 /// Watermarks for active-turn content that has already been written into native
@@ -207,7 +209,13 @@ pub fn live_ui_height_with_finalization(
     let menu_height = menu_height_hint(active_menu.as_ref(), width, height);
     let autonomy_height = autonomy_indicator_height(app);
     let harness_height = harness_status_height(app);
-    let chrome = menu_height + autonomy_height + harness_height + composer_height + 1; // +1 status
+    // The sub-agent selector strip renders between the composer and the status
+    // row (see `render_viewport_with_finalization`); reserve its row here too or
+    // the live viewport is oversubscribed by one row whenever agents exist and
+    // Ratatui compresses a fixed row at the tail floor.
+    let agent_strip_height = agent_strip_height(app);
+    let chrome =
+        menu_height + autonomy_height + harness_height + agent_strip_height + composer_height + 1; // +1 status
 
     let tail_height = live_tail_height_with_finalization(app, width, height, live_finalization);
     // The live-tail pane is laid out with `Constraint::Min(1)`, so it always
@@ -16591,6 +16599,96 @@ mod tests {
         app.set_session_agents(&sid, vec![]);
         assert_eq!(app.chat_view, ChatViewTarget::Main);
         assert!(!agent_view_active(&app));
+    }
+
+    #[test]
+    fn agent_output_read_does_not_clobber_newer_deltas() {
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+        // A streamed delta advances the cache to cursor 10.
+        app.append_agent_output(
+            &sid,
+            "worker",
+            octos_core::ui_protocol::OutputCursor { offset: 10 },
+            "live streamed output\n",
+        );
+        // A stale read snapshot (cursor 4, sent before the delta) must NOT
+        // overwrite the newer cached output.
+        app.set_agent_output(
+            &sid,
+            "worker",
+            "old snapshot".into(),
+            octos_core::ui_protocol::OutputCursor { offset: 4 },
+        );
+        assert_eq!(
+            app.active_agent_output("worker"),
+            Some("live streamed output\n")
+        );
+
+        // A fresh read (cursor 12) DOES apply.
+        app.set_agent_output(
+            &sid,
+            "worker",
+            "full refreshed output".into(),
+            octos_core::ui_protocol::OutputCursor { offset: 12 },
+        );
+        assert_eq!(
+            app.active_agent_output("worker"),
+            Some("full refreshed output")
+        );
+    }
+
+    #[test]
+    fn peek_scroll_compensates_for_appended_output_when_scrolled_up() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+        app.upsert_session_agent(&sid, sample_agent("worker", "running"));
+        app.set_chat_view(ChatViewTarget::Agent("worker".into()));
+        // Seed the cache, then scroll up 3 rows.
+        app.append_agent_output(
+            &sid,
+            "worker",
+            octos_core::ui_protocol::OutputCursor { offset: 5 },
+            "line one\n",
+        );
+        app.scroll_agent_view_up(3);
+
+        // Two lines append below; the from-bottom offset advances so the reader's
+        // position holds instead of drifting toward newer output.
+        app.append_agent_output(
+            &sid,
+            "worker",
+            octos_core::ui_protocol::OutputCursor { offset: 20 },
+            "new A\nnew B\n",
+        );
+        assert_eq!(app.agent_view_scroll, 5);
+
+        // At the bottom (offset 0) the peek follows newest output — no bump.
+        app.set_chat_view(ChatViewTarget::Main);
+        app.set_chat_view(ChatViewTarget::Agent("worker".into()));
+        assert_eq!(app.agent_view_scroll, 0);
+        app.append_agent_output(
+            &sid,
+            "worker",
+            octos_core::ui_protocol::OutputCursor { offset: 40 },
+            "more\n",
+        );
+        assert_eq!(app.agent_view_scroll, 0);
+    }
+
+    #[test]
+    fn live_ui_height_reserves_agent_strip_row() {
+        let mut app = autonomy_app_state();
+        let without = live_ui_height(&app, 80, 40);
+        let sid = app.active_session().unwrap().id.clone();
+        app.upsert_session_agent(&sid, sample_agent("worker", "running"));
+        let with = live_ui_height(&app, 80, 40);
+        assert_eq!(
+            with,
+            without + 1,
+            "the strip row must be reserved once agents exist"
+        );
     }
 
     #[test]
