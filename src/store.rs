@@ -1277,7 +1277,12 @@ impl Store {
                     // and fetch the session list; the `SessionList` result
                     // refreshes the open menu into `Ready` rows.
                     self.open_menu(MenuId::from(crate::menu::registry::MENU_RESUME));
-                    Some(AppUiCommand::ListSessions(SessionListParams {}))
+                    // `cwd: None` here; the transport stamps the launch
+                    // workspace cwd onto the request (see
+                    // `ProtocolAppUiBackend::fill_session_list_cwd`) so a
+                    // server with per-project session storage scopes the
+                    // listing to this project.
+                    Some(AppUiCommand::ListSessions(SessionListParams { cwd: None }))
                 } else if !self.state.resume_list_loaded {
                     // `/resume <query>` before the list ever loaded: the local
                     // resolve below would ALWAYS fail (`resume_sessions` is only
@@ -1290,7 +1295,12 @@ impl Store {
                         frame.search_query = arg.to_owned();
                     }
                     self.refresh_active_menu();
-                    Some(AppUiCommand::ListSessions(SessionListParams {}))
+                    // `cwd: None` here; the transport stamps the launch
+                    // workspace cwd onto the request (see
+                    // `ProtocolAppUiBackend::fill_session_list_cwd`) so a
+                    // server with per-project session storage scopes the
+                    // listing to this project.
+                    Some(AppUiCommand::ListSessions(SessionListParams { cwd: None }))
                 } else {
                     // `/resume <query>` shortcut: resolve to a session id
                     // (exact / prefix / substring) and switch directly, reusing

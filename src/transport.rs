@@ -1674,7 +1674,36 @@ impl ProtocolAppUiBackend {
         &mut self,
         command: AppUiCommand,
     ) -> Result<RpcRequest<serde_json::Value>> {
+        let command = self.fill_session_list_cwd(command);
         self.protocol.build_tracked_request(command)
+    }
+
+    /// Stamp the launch workspace cwd onto an outgoing `session/list` request
+    /// so a server with per-project session storage (`appui.sessions_in_cwd`)
+    /// lists THIS project's sessions rather than the global/per-profile store.
+    ///
+    /// Reuses the exact same `self.launch.cwd` the client already sends on
+    /// `session/open` (see [`Self::launch_session_open_command`] and
+    /// `bootstrap`), so `/resume` and the `/sessions` picker scope to the
+    /// current project. Only fills when the caller left `cwd` unset — the
+    /// store always constructs `SessionListParams { cwd: None }`, and an
+    /// explicit cwd (e.g. a test) is preserved.
+    ///
+    /// Backward compatible with old servers: when `launch.cwd` is `None` the
+    /// params still serialize to the historical empty object `{}`, and a
+    /// server without the `appui.sessions_in_cwd` flag (or one that never
+    /// negotiated `session.workspace_cwd.v1`) simply ignores the field. This
+    /// mirrors how `session/open` already sends `cwd` unconditionally from
+    /// this layer — the transport does not track the negotiated capability
+    /// set (the store does), and sending an ignored `cwd` is harmless.
+    fn fill_session_list_cwd(&self, command: AppUiCommand) -> AppUiCommand {
+        let AppUiCommand::ListSessions(mut params) = command else {
+            return command;
+        };
+        if params.cwd.is_none() {
+            params.cwd = self.launch.cwd.clone();
+        }
+        AppUiCommand::ListSessions(params)
     }
 
     fn decode_rpc_text(&mut self, text: &str) -> Result<Option<ClientEvent>> {
@@ -6757,7 +6786,7 @@ mod tests {
                 after: None,
                 include: Vec::new(),
             }),
-            AppUiCommand::ListSessions(octos_core::ui_protocol::SessionListParams {}),
+            AppUiCommand::ListSessions(octos_core::ui_protocol::SessionListParams { cwd: None }),
             AppUiCommand::GetThreadGraph(ThreadGraphGetParams {
                 session_id: session_id.clone(),
                 at: None,
@@ -9023,6 +9052,54 @@ mod tests {
             .expect("request builds");
 
         assert_eq!(request.params["cwd"], json!("/tmp/project"));
+    }
+
+    #[test]
+    fn protocol_session_list_request_includes_workspace_cwd_when_launch_has_one() {
+        // `session/list` carries the SAME launch workspace cwd the client
+        // already sends on `session/open` (see `fill_session_list_cwd`), so a
+        // server with per-project session storage lists THIS project's
+        // sessions. The store constructs the command with `cwd: None`; the
+        // transport stamps `launch.cwd`.
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            cwd: Some("/tmp/project".into()),
+            ..AppUiLaunch::default()
+        });
+        let request = backend
+            .build_tracked_request(AppUiCommand::ListSessions(
+                octos_core::ui_protocol::SessionListParams { cwd: None },
+            ))
+            .expect("request builds");
+
+        assert_eq!(request.method, methods::SESSION_LIST);
+        assert_eq!(request.params["cwd"], json!("/tmp/project"));
+    }
+
+    #[test]
+    fn protocol_session_list_request_is_empty_object_when_launch_has_no_cwd() {
+        // Backward compat: with no launch cwd the `session/list` request
+        // serializes to the historical empty object `{}` (no `cwd` key), so an
+        // old server deserializes it unchanged.
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            cwd: None,
+            ..AppUiLaunch::default()
+        });
+        let request = backend
+            .build_tracked_request(AppUiCommand::ListSessions(
+                octos_core::ui_protocol::SessionListParams { cwd: None },
+            ))
+            .expect("request builds");
+
+        assert_eq!(request.method, methods::SESSION_LIST);
+        assert_eq!(request.params, json!({}));
     }
 
     #[test]

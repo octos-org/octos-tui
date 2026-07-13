@@ -9295,4 +9295,28 @@ mod tests {
         assert!(!state.local_profile_create_pending);
         assert!(state.local_profile_recovery.is_none());
     }
+
+    #[test]
+    fn should_serialize_to_empty_object_when_session_list_params_has_no_cwd() {
+        // Wire-compat: a no-cwd `session/list` request must serialize to the
+        // historical empty object `{}`, byte-identical to what old clients
+        // sent, so an OLD server (no per-project session storage) still
+        // deserializes it unchanged (`cwd: None` -> legacy global listing).
+        let params = SessionListParams { cwd: None };
+        let wire = serde_json::to_value(&params).expect("SessionListParams serializes");
+        assert_eq!(wire, serde_json::json!({}));
+    }
+
+    #[test]
+    fn should_serialize_cwd_field_when_session_list_params_has_cwd() {
+        // With a workspace cwd present the request carries `{"cwd": "..."}`,
+        // which a server with `appui.sessions_in_cwd` (and the negotiated
+        // `session.workspace_cwd.v1` feature) honors to scope the listing to
+        // the project rooted at that path.
+        let params = SessionListParams {
+            cwd: Some("/tmp/project".into()),
+        };
+        let wire = serde_json::to_value(&params).expect("SessionListParams serializes");
+        assert_eq!(wire, serde_json::json!({ "cwd": "/tmp/project" }));
+    }
 }
