@@ -22,21 +22,44 @@ pub fn discover_local_profile_ids(stdio_command: Option<&str>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// How a launch command resolves the server data dir.
+#[derive(Debug, PartialEq, Eq)]
+enum DataDirResolution {
+    /// No `--data-dir` / `OCTOS_HOME=` override — the default `~/.octos` applies.
+    None,
+    /// An override we resolved to a concrete path.
+    Resolved(PathBuf),
+    /// An explicit override we could NOT resolve statically (e.g. a `$PWD`-style
+    /// shell expression). We must NOT guess a default here — that would point at
+    /// a DIFFERENT server's profiles.
+    Unresolvable,
+}
+
 /// Resolve `<data_dir>/profiles` from the launch command. An explicit
 /// `--data-dir` wins over an `OCTOS_HOME=` prefix, which wins over the
-/// conventional `~/.octos`.
+/// conventional `~/.octos`. Returns `None` (no profiles dir) when there is no
+/// launch command, or when the command names an override we cannot resolve —
+/// the latter degrades the picker to onboarding rather than offering profiles
+/// from the wrong server.
 pub fn solo_profiles_dir(stdio_command: Option<&str>) -> Option<PathBuf> {
-    let data_dir = stdio_command
-        .and_then(data_dir_from_command)
-        .or_else(default_octos_home)?;
+    let data_dir = match stdio_command.map(data_dir_from_command) {
+        // Explicit-but-unresolvable override: do NOT fall back to the default.
+        Some(DataDirResolution::Unresolvable) => return None,
+        Some(DataDirResolution::Resolved(dir)) => dir,
+        // No override in the command → the conventional default.
+        Some(DataDirResolution::None) => default_octos_home()?,
+        // No launch command at all (remote/WebSocket launch).
+        None => return None,
+    };
     Some(data_dir.join("profiles"))
 }
 
 /// Parse the server data dir out of a launch command's tokens: `--data-dir
 /// <path>` / `--data-dir=<path>`, else a leading `OCTOS_HOME=<path>` env
-/// assignment. Returns `None` when neither is present or the value is a shell
-/// expression we cannot resolve statically (e.g. `$PWD/.octos`).
-fn data_dir_from_command(command: &str) -> Option<PathBuf> {
+/// assignment. Distinguishes "no override present" ([`DataDirResolution::None`])
+/// from "override present but unresolvable" ([`DataDirResolution::Unresolvable`])
+/// so the caller can default only in the former case.
+fn data_dir_from_command(command: &str) -> DataDirResolution {
     let tokens = shlex::split(command).unwrap_or_default();
 
     // `--data-dir <path>` or `--data-dir=<path>` (explicit flag wins).
@@ -46,9 +69,12 @@ fn data_dir_from_command(command: &str) -> Option<PathBuf> {
             return resolve_path_token(rest);
         }
         if token == "--data-dir" {
-            if let Some(path) = iter.next() {
-                return resolve_path_token(path);
-            }
+            return match iter.next() {
+                Some(path) => resolve_path_token(path),
+                // `--data-dir` with no value is a malformed but explicit
+                // override — refuse to guess.
+                None => DataDirResolution::Unresolvable,
+            };
         }
     }
 
@@ -64,18 +90,18 @@ fn data_dir_from_command(command: &str) -> Option<PathBuf> {
         }
     }
 
-    None
+    DataDirResolution::None
 }
 
-/// Turn a raw path token into a usable [`PathBuf`], expanding a leading `~`.
-/// Rejects tokens carrying an unresolved shell variable (`$…`), which we cannot
-/// evaluate here — callers fall back to the default in that case.
-fn resolve_path_token(raw: &str) -> Option<PathBuf> {
+/// Resolve a raw path token, expanding a leading `~`. A token carrying an
+/// unresolved shell variable (`$…`) or an empty value is [`Unresolvable`] — an
+/// explicit override we must not silently replace with the default.
+fn resolve_path_token(raw: &str) -> DataDirResolution {
     let cleaned = raw.trim().trim_matches(['"', '\'']);
     if cleaned.is_empty() || cleaned.contains('$') {
-        return None;
+        return DataDirResolution::Unresolvable;
     }
-    Some(expand_tilde(cleaned))
+    DataDirResolution::Resolved(expand_tilde(cleaned))
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
@@ -174,29 +200,70 @@ mod tests {
 
     #[test]
     fn should_read_data_dir_from_data_dir_flag() {
-        let dir = data_dir_from_command("octos serve --stdio --solo --data-dir /srv/octos")
-            .expect("data-dir parsed");
-        assert_eq!(dir, PathBuf::from("/srv/octos"));
+        assert_eq!(
+            data_dir_from_command("octos serve --stdio --solo --data-dir /srv/octos"),
+            DataDirResolution::Resolved(PathBuf::from("/srv/octos"))
+        );
     }
 
     #[test]
     fn should_read_data_dir_from_equals_form() {
-        let dir = data_dir_from_command("octos serve --data-dir=/srv/eq").expect("parsed");
-        assert_eq!(dir, PathBuf::from("/srv/eq"));
+        assert_eq!(
+            data_dir_from_command("octos serve --data-dir=/srv/eq"),
+            DataDirResolution::Resolved(PathBuf::from("/srv/eq"))
+        );
     }
 
     #[test]
     fn should_read_data_dir_from_octos_home_env_prefix() {
-        let dir =
-            data_dir_from_command("OCTOS_HOME=/srv/home octos serve --stdio").expect("parsed");
-        assert_eq!(dir, PathBuf::from("/srv/home"));
+        assert_eq!(
+            data_dir_from_command("OCTOS_HOME=/srv/home octos serve --stdio"),
+            DataDirResolution::Resolved(PathBuf::from("/srv/home"))
+        );
     }
 
     #[test]
-    fn should_reject_unresolvable_shell_path() {
-        // `$PWD/.octos` cannot be resolved statically → None (caller defaults).
-        assert!(data_dir_from_command("OCTOS_HOME=\"$PWD/.octos\" octos serve").is_none());
-        assert!(data_dir_from_command("octos serve").is_none());
+    fn should_report_none_when_no_override_present() {
+        // No `--data-dir` / `OCTOS_HOME=` → default `~/.octos` is correct.
+        assert_eq!(
+            data_dir_from_command("octos serve --stdio --solo"),
+            DataDirResolution::None
+        );
+    }
+
+    #[test]
+    fn should_report_unresolvable_for_shell_expression_override() {
+        // An explicit-but-dynamic override must be flagged unresolvable, NOT
+        // silently defaulted (that would scan a DIFFERENT server's profiles).
+        assert_eq!(
+            data_dir_from_command("OCTOS_HOME=\"$PWD/.octos\" octos serve"),
+            DataDirResolution::Unresolvable
+        );
+        assert_eq!(
+            data_dir_from_command("octos serve --data-dir $HOME/x"),
+            DataDirResolution::Unresolvable
+        );
+    }
+
+    #[test]
+    fn solo_profiles_dir_returns_none_for_unresolvable_override() {
+        // The whole point of the P2 fix: an unresolvable override degrades to
+        // "no profiles" (→ onboarding) instead of falling back to the default
+        // dir and offering foreign profiles.
+        assert!(solo_profiles_dir(Some("OCTOS_HOME=$PWD/.octos octos serve --stdio")).is_none());
+        // No command at all (remote launch) also yields no local profiles dir.
+        assert!(solo_profiles_dir(None).is_none());
+    }
+
+    #[test]
+    fn solo_profiles_dir_defaults_only_when_no_override() {
+        // No override → default `~/.octos/profiles` (ends with the expected tail).
+        let dir = solo_profiles_dir(Some("octos serve --stdio --solo"));
+        // Only assert structure when a home dir is resolvable in the test env.
+        if let Some(dir) = dir {
+            assert!(dir.ends_with("profiles"));
+            assert!(dir.to_string_lossy().contains(".octos"));
+        }
     }
 
     #[test]

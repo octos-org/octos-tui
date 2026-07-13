@@ -2368,7 +2368,18 @@ impl Store {
                     t!("status.provider_family_updated").into_owned(),
                 );
                 if from_family_menu {
-                    self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
+                    if self.current_profile_for_onboarding().is_none() {
+                        // Phase 2 nameable flow: no profile exists yet, so the
+                        // family was chosen only to seed the "Name this profile"
+                        // suggestion — return to the profile step (with the
+                        // suggestion now reflecting the family) rather than
+                        // diving into model/route setup, which belongs to
+                        // post-create provider configuration.
+                        self.close_all_menus();
+                        self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                    } else {
+                        self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
+                    }
                 }
                 None
             }
@@ -6269,8 +6280,19 @@ impl Store {
                 self.state.onboarding.profile_id = Some(profile_id);
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
             }
-            // Pinned `--profile-id`, a first-ever run with no profiles, or a
-            // legacy-auth server: unchanged behavior — open onboarding.
+            // Pinned `--profile-id`: honor it. This launch has no snapshot
+            // session or resolved current profile yet, so WITHOUT attaching the
+            // wizard would route to `profile/local/create` and ignore the pin.
+            // Seed the pinned id as the resolved profile so the wizard scopes to
+            // it (provider setup + hydration) instead of creating a new one.
+            crate::model::StartupProfileDecision::Pinned(profile_id) => {
+                if self.state.onboarding.effective_profile_id(None).is_none() {
+                    self.state.onboarding.profile_id = Some(profile_id);
+                }
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+            }
+            // A first-ever run with no profiles, or a legacy-auth server, or a
+            // non-solo Pick/Attach: unchanged behavior — open onboarding.
             _ => {
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
             }
@@ -15744,17 +15766,18 @@ mod tests {
     }
 
     #[test]
-    fn first_launch_pin_skips_picker_even_with_multiple_profiles() {
+    fn first_launch_pin_attaches_pinned_profile_and_skips_picker() {
         let mut store = protocol_store_without_sessions();
         store.state.onboarding.launch_profile_id = Some("coding".into());
         store.state.onboarding.available_profiles = vec!["glm".into(), "deepseek".into()];
 
         store.apply_client_event(local_solo_capabilities_event());
 
-        // A pinned --profile-id is honored unchanged: onboarding, never picker,
-        // and the picker's silent-attach must not stomp the pinned profile.
+        // A pinned --profile-id is honored: never the picker, and the pin is
+        // attached as the resolved profile so the wizard scopes to it (provider
+        // setup) instead of routing to profile/local/create for a new profile.
         assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
-        assert!(store.state.onboarding.profile_id.is_none());
+        assert_eq!(store.state.onboarding.profile_id.as_deref(), Some("coding"));
     }
 
     #[test]
@@ -15861,6 +15884,46 @@ mod tests {
             panic!("expected profile/local/create");
         };
         assert_eq!(params.requested_id.as_deref(), Some("glm"));
+    }
+
+    #[test]
+    fn selecting_family_pre_profile_seeds_suggestion_and_returns_to_profile_step() {
+        // Nameable flow, no profile yet: picking a family from the profile step
+        // seeds the name suggestion (glm, not the empty→octos default) and
+        // returns to the profile step — NOT into model/route setup.
+        let mut store = protocol_store_without_sessions();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY));
+        assert!(store.state.onboarding.effective_profile_id(None).is_none());
+
+        store.dispatch_onboarding_action(
+            crate::model::OnboardingAction::SetFamilyId("glm-4.6".into()),
+            None,
+        );
+
+        assert_eq!(store.state.onboarding.provider.family_id, "glm-4.6");
+        assert_eq!(store.state.onboarding.suggested_profile_id(), "glm");
+        assert_eq!(store.state.onboarding.effective_requested_id(), "glm");
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
+            "pre-profile family choice returns to the profile step"
+        );
+        assert!(!store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_MODEL));
+    }
+
+    #[test]
+    fn selecting_family_post_profile_still_advances_to_model_step() {
+        // Regression: once a profile exists, choosing a family advances into
+        // provider setup (model step) as before.
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.profile_id = Some("glm".into());
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY));
+
+        store.dispatch_onboarding_action(
+            crate::model::OnboardingAction::SetFamilyId("gpt-4o".into()),
+            None,
+        );
+
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_MODEL));
     }
 
     #[test]
