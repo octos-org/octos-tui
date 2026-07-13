@@ -21,6 +21,9 @@ pub const MENU_ONBOARD_ROUTE: &str = "onboard-route";
 /// UX2 B.2: workspace staging + validation lives on its OWN onboarding step
 /// screen (the "Set Up LLM Provider" menu now configures provider/model only).
 pub const MENU_ONBOARD_WORKSPACE: &str = "onboard-workspace";
+/// Phase 3 startup picker: "attach which profile?" shown at launch when more
+/// than one local profile exists and no `--profile-id` was pinned.
+pub const MENU_PROFILE_PICKER: &str = "profile-picker";
 pub const MENU_LOGIN: &str = "login";
 pub const MENU_PROVIDER: &str = "provider";
 pub const MENU_MODEL: &str = "model";

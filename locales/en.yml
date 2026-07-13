@@ -245,6 +245,7 @@ app:
 onboarding:
   welcome_title: "Welcome to Octos"
   value_saved: "%{value} (saved)"
+  value_suggested: "%{value} (suggested)"
   api_key_saved: "saved in profile"
   value_not_set: "not set"
   action_edit: "Enter edit"
@@ -252,6 +253,8 @@ onboarding:
     full_name: "Full name"
     username: "Username"
     email: "Email"
+    profile_name: "Name this profile"
+    profile_name_desc: "Enter to edit — a short id like glm or deepseek (used to store this setup)."
     existing_profile: "Use existing profile (ID)"
   local:
     title: "Create your local Octos profile"
@@ -259,6 +262,7 @@ onboarding:
     subtitle: "Set up a local solo profile to continue."
     continue: "Continue"
     create_action: "Create profile"
+    family_desc: "Enter to pick your model family — it suggests a profile name (e.g. glm)."
     footer: "Up/Down choose | Enter edit or continue | type value, Enter save"
   language:
     title: "Choose Language"
@@ -369,7 +373,7 @@ onboarding:
     explain_now: "Now: %{title}"
     explain:
       language: "Choose the language Octos uses while you finish setup.\nEnglish is selected by default. Pick 中文 if you want the rest of onboarding and the app to switch immediately.\nYou can change this later with `/lang`."
-      profile: "Octos needs a local identity to attach your settings, providers, and history to.\nFill in your name, a short username, and an email (kept locally as metadata — no code is sent), then continue.\nThis profile stays on this machine."
+      profile: "Octos needs a local profile to attach your settings, providers, and history to.\nName this profile with a short id (like glm or deepseek) and continue — you can accept the suggested name with one keypress. (Older servers ask for name, username, and email instead.)\nThis profile stays on this machine; nothing is sent."
       provider: "Choose which AI model powers Octos.\nPick a model family (e.g. GPT, Claude), then a specific model, then the provider route that serves it (official or an alternative).\nThis decides who Octos talks to and how good the coding help is — you can change it later."
       connect: "Prove the model actually answers before you rely on it.\nPaste your provider API key, then run the live test. Octos sends one small request and reports success or the exact error.\nThis catches a bad key or wrong route now, not mid-task."
       save: "Persist the verified provider into your profile JSON so it survives restarts.\nSave it as your primary provider (or add it as a fallback). Until you save, the route lives only in this session.\nAfter saving, the workspace step unlocks."
@@ -540,6 +544,9 @@ status:
   onboarding_otp_code_updated: "Onboarding OTP code updated"
   profile_updated: "Profile updated"
   onboarding_profile_updated: "Onboarding profile updated"
+  profile_name_updated: "Profile name updated"
+  onboarding_profile_name_updated: "Onboarding profile name updated"
+  attached_profile: "Attached profile %{profile}"
   provider_route_selected: "Provider route selected; enter API key"
   provider_family_updated: "Provider family updated"
   provider_model_updated: "Provider model updated"
@@ -1018,6 +1025,17 @@ menu:
     search: Filter models
     subtitle: Server-returned profile LLM models.
     title: Model
+  profile_picker:
+    title: "Attach a profile"
+    subtitle: "Pick which local profile to use for this session."
+    search: "Filter profiles"
+    footer: "Enter attach | Up/Down move | Esc close"
+    item:
+      attach:
+        desc: "Attach this profile for the session."
+      create:
+        label: "Create a new profile"
+        desc: "Start onboarding to create a fresh local profile instead."
   onboard:
     family:
       footer: Enter choose family | Esc back

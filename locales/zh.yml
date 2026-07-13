@@ -233,6 +233,7 @@ app:
 onboarding:
   welcome_title: "欢迎使用 Octos"
   value_saved: "%{value}（已保存）"
+  value_suggested: "%{value}（建议）"
   api_key_saved: "已保存于档案"
   value_not_set: "未设置"
   action_edit: "回车编辑"
@@ -240,6 +241,8 @@ onboarding:
     full_name: "姓名"
     username: "用户名"
     email: "邮箱"
+    profile_name: "为此档案命名"
+    profile_name_desc: "回车编辑 —— 例如 glm 或 deepseek 这样的简短 ID（用于保存此配置）。"
     existing_profile: "使用已有档案（输入 ID）"
   local:
     title: "创建你的本地 Octos 档案"
@@ -247,6 +250,7 @@ onboarding:
     subtitle: "设置本地单人档案以继续。"
     continue: "继续"
     create_action: "创建档案"
+    family_desc: "回车选择模型系列 —— 会据此建议档案名称（例如 glm）。"
     footer: "上/下 选择 | 回车 编辑或继续 | 输入后回车保存"
   language:
     title: "选择语言"
@@ -350,7 +354,7 @@ onboarding:
     explain_now: "当前：%{title}"
     explain:
       language: "选择完成设置时 Octos 使用的语言。\n默认已选择 English。如果想让后续引导流程和应用立即切换为中文，请选择 中文。\n之后也可以使用 `/lang` 更改。"
-      profile: "Octos 需要一个本地身份，用于关联你的设置、供应商和历史记录。\n填写姓名、简短的用户名和邮箱（仅作为本地元数据保存，不会发送任何代码），然后继续。\n该档案仅保存在本机。"
+      profile: "Octos 需要一个本地档案，用于关联你的设置、供应商和历史记录。\n为此档案取一个简短的 ID（例如 glm 或 deepseek）后继续 —— 只需一次按键即可采用建议名称。（较旧的服务器会改为要求填写姓名、用户名和邮箱。）\n该档案仅保存在本机，不会发送任何信息。"
       provider: "选择驱动 Octos 的 AI 模型。\n先选模型系列（如 GPT、Claude），再选具体模型，最后选择提供该模型的供应商线路（官方或替代线路）。\n这决定了 Octos 与谁通信以及编码辅助的质量——之后可随时更改。"
       connect: "在依赖该模型之前，先确认它确实能够响应。\n粘贴你的供应商 API 密钥，然后运行实时测试。Octos 会发送一个小请求并报告成功或具体错误。\n这样能在此刻发现密钥错误或线路不对，而不是任务进行中才发现。"
       save: "将验证通过的供应商持久化到档案 JSON 中，以便重启后仍然可用。\n可将其保存为主供应商（或添加为备用）。保存前，该线路仅存在于当前会话中。\n保存后，工作区步骤即可解锁。"
@@ -610,6 +614,17 @@ menu:
     search: 筛选模型
     subtitle: 服务器返回的档案 LLM 模型。
     title: 模型
+  profile_picker:
+    title: "选择要附加的档案"
+    subtitle: "选择本次会话使用哪个本地档案。"
+    search: "筛选档案"
+    footer: "回车 附加 | 上/下 移动 | Esc 关闭"
+    item:
+      attach:
+        desc: "为本次会话附加此档案。"
+      create:
+        label: "创建新档案"
+        desc: "改为开始引导以创建全新的本地档案。"
   onboard:
     family:
       footer: 回车 选择系列 | Esc 返回
@@ -1029,6 +1044,9 @@ status:
   onboarding_otp_code_updated: "已更新引导 OTP 验证码"
   profile_updated: "档案已更新"
   onboarding_profile_updated: "已更新引导档案"
+  profile_name_updated: "档案名称已更新"
+  onboarding_profile_name_updated: "已更新引导档案名称"
+  attached_profile: "已附加档案 %{profile}"
   provider_route_selected: "已选择供应商线路；请输入 API 密钥"
   provider_family_updated: "供应商模型系列已更新"
   provider_model_updated: "供应商模型已更新"
