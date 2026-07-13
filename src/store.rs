@@ -6280,19 +6280,25 @@ impl Store {
                 self.state.onboarding.profile_id = Some(profile_id);
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
             }
-            // Pinned `--profile-id`: honor it. This launch has no snapshot
-            // session or resolved current profile yet, so WITHOUT attaching the
-            // wizard would route to `profile/local/create` and ignore the pin.
-            // Seed the pinned id as the resolved profile so the wizard scopes to
-            // it (provider setup + hydration) instead of creating a new one.
-            crate::model::StartupProfileDecision::Pinned(profile_id) => {
+            // Pinned `--profile-id` on a LOCAL-SOLO server: honor it. This
+            // launch has no snapshot session or resolved current profile yet, so
+            // WITHOUT attaching the wizard would route to `profile/local/create`
+            // and ignore the pin. Seed the pinned id as the resolved profile so
+            // the wizard scopes to it (provider setup + hydration) instead of
+            // creating a new one. Gated on local-solo (same surface as the picker
+            // / requested_id path): on a legacy OTP server, pre-resolving the
+            // profile would make `onboarding_menu` render provider setup and skip
+            // the send_code/verify rows, leaving no way to authenticate — so a
+            // legacy `--profile-id` launch falls through to the OTP path below.
+            crate::model::StartupProfileDecision::Pinned(profile_id) if supports_local_solo => {
                 if self.state.onboarding.effective_profile_id(None).is_none() {
                     self.state.onboarding.profile_id = Some(profile_id);
                 }
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
             }
-            // A first-ever run with no profiles, or a legacy-auth server, or a
-            // non-solo Pick/Attach: unchanged behavior — open onboarding.
+            // A first-ever run with no profiles, a legacy-auth server (incl. a
+            // legacy `--profile-id` launch), or a non-solo Pick/Attach:
+            // unchanged behavior — open onboarding (OTP path intact).
             _ => {
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
             }
@@ -15778,6 +15784,51 @@ mod tests {
         // setup) instead of routing to profile/local/create for a new profile.
         assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
         assert_eq!(store.state.onboarding.profile_id.as_deref(), Some("coding"));
+    }
+
+    #[test]
+    fn first_launch_legacy_pin_keeps_otp_surface_and_does_not_pre_resolve() {
+        // A LEGACY email-OTP server (send_code/verify/me, NO profile/local/create)
+        // launched with --profile-id must NOT pre-resolve the profile: doing so
+        // would make onboarding_menu render provider setup and skip the OTP rows,
+        // leaving the first-launch menu with no way to authenticate.
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.launch_profile_id = Some("coding".into());
+
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[
+                        crate::model::APPUI_METHOD_AUTH_STATUS,
+                        crate::model::APPUI_METHOD_AUTH_SEND_CODE,
+                        crate::model::APPUI_METHOD_AUTH_VERIFY,
+                        crate::model::APPUI_METHOD_AUTH_ME,
+                    ],
+                    &[],
+                ),
+            },
+            message: "Octos UI capabilities refreshed: 4 methods".into(),
+        }));
+
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+        assert!(
+            store.state.onboarding.profile_id.is_none(),
+            "legacy pin must not pre-resolve the profile before OTP completes"
+        );
+        // The rendered onboarding surface still offers the OTP auth path
+        // (send-code / verify rows), not provider setup.
+        let menu = store
+            .state
+            .active_menu
+            .as_ref()
+            .expect("onboarding menu built");
+        let MenuBuildResult::Ready(spec) = menu else {
+            panic!("expected a ready legacy onboarding menu, got {menu:?}");
+        };
+        assert!(
+            spec.items.iter().any(|item| item.id == "onboard.auth.send"),
+            "legacy --profile-id launch must keep the OTP send-code row"
+        );
     }
 
     #[test]
