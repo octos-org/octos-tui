@@ -213,19 +213,24 @@ fn live_tail_height_with_finalization(
         wrap_width,
         live_finalization,
     );
-    let rows = transcript_visual_rows(&lines, wrap_width) as u16;
+    let transcript_rows = transcript_visual_rows(&lines, wrap_width) as u16;
+    // The STREAMING transcript is always capped at half the viewport so a long
+    // in-flight turn can't dominate the screen — the rest stays in scrollback.
+    let half = (height / 2).max(3);
+    let capped_transcript = transcript_rows.min(half);
     // The `/btw` aside draws as a floating overlay OVER the tail's top rows
     // (`render_btw_overlay`) and adds no flow lines of its own — reserve its
-    // rows here or a settled/short tail starves the overlay's 3-row minimum
-    // and the pane becomes invisible while still answering (codex P1).
-    let rows = rows.max(btw_overlay_height_hint(app, width));
-    // Cap the tail so it can't dominate the viewport; the rest stays in
-    // scrollback. Scale with the terminal (at most half its height) rather than
-    // a fixed 18 — a tall terminal shouldn't strand the live tail at 18 while a
-    // short one over-reserves. The outer `live_ui_height` clamp still guarantees
-    // `LIVE_VIEWPORT_MIN_SCROLLBACK` rows of scrollback remain visible.
-    let max_tail = (height / 2).max(3);
-    rows.clamp(0, max_tail)
+    // rows here or a settled/short tail starves the overlay's 3-row minimum and
+    // the pane becomes invisible while still answering (codex P1). Unlike the
+    // transcript, a `/btw` aside is a focused reading surface the user
+    // explicitly opened, so ITS reservation may exceed the half mark to fit the
+    // whole answer rather than stranding its tail behind a scroll. Merging AFTER
+    // the transcript cap keeps a long stream half-capped even while an aside is
+    // open (only the aside's own height grows). The outer `live_ui_height` clamp
+    // still reserves `LIVE_VIEWPORT_MIN_SCROLLBACK` rows of scrollback, and the
+    // overlay scrolls whatever still doesn't fit on a small terminal.
+    let btw_hint = btw_overlay_height_hint(app, width);
+    capped_transcript.max(btw_hint).min(height)
 }
 
 pub(crate) fn live_tail_has_guarded_sections(
@@ -607,19 +612,43 @@ pub fn finalized_history_lines_range_dedup_live(
             used_reply_coverages[coverage_idx] = true;
             let coverage = &live_coverages[coverage_idx];
             let suffix = &message.content[coverage.reply_flushed_text.len()..];
-            // Continuation of a reply whose prefix is already in scrollback
-            // (coverage is only matched when non-empty) — never re-issue the
-            // bullet, but do seed blank handling from the streamed prefix so a
-            // separator split across commit still renders like one document.
-            push_live_reply_block_seeded(
-                &mut lines,
-                palette,
-                suffix,
-                wrap_width,
-                false,
-                true,
-                live_reply_prefix_ends_blank(palette, &coverage.reply_flushed_text, wrap_width),
-            );
+            let prefix_ends_blank =
+                live_reply_prefix_ends_blank(palette, &coverage.reply_flushed_text, wrap_width);
+            // A trailing Session Summary in the suffix must render as a card
+            // here too — this live-flushed-prefix branch is the normal
+            // long-running-tool partial-completion case and otherwise emits
+            // flat markdown (codex P2 on #292). Split the prose suffix from the
+            // summary; render the prose seeded (no bullet), then the card.
+            if let Some(start) = session_summary_block_start(suffix) {
+                let body = suffix[..start].trim_end();
+                if !body.is_empty() {
+                    push_live_reply_block_seeded(
+                        &mut lines,
+                        palette,
+                        body,
+                        wrap_width,
+                        false,
+                        true,
+                        prefix_ends_blank,
+                    );
+                }
+                let bg = chat_message_bg(palette, "assistant");
+                push_session_summary_card(&mut lines, palette, &suffix[start..], bg, wrap_width);
+            } else {
+                // Continuation of a reply whose prefix is already in scrollback
+                // (coverage matched only when non-empty) — never re-issue the
+                // bullet, but seed blank handling from the streamed prefix so a
+                // separator split across commit still renders like one document.
+                push_live_reply_block_seeded(
+                    &mut lines,
+                    palette,
+                    suffix,
+                    wrap_width,
+                    false,
+                    true,
+                    prefix_ends_blank,
+                );
+            }
         } else if message.role.as_str() == "assistant" {
             let boundaries =
                 committed_reply_segment_boundaries_for_message(app, session, idx, &message.content);
@@ -741,6 +770,34 @@ fn push_committed_assistant_reply_segments(
     wrap_width: usize,
     boundaries: &[usize],
 ) {
+    // A trailing "Session Summary" block (appended after a partial reply) must
+    // render as a card here too — this segmented native-scrollback path is
+    // used for tool-backed replies and otherwise bypasses `push_message_block`'s
+    // summary detection (codex P2 on #292). Split the prose body from the
+    // summary, render the body's segments (boundaries within it), then the
+    // card. Recursion terminates because the body has no summary block.
+    if let Some(start) = session_summary_block_start(content) {
+        let body = content[..start].trim_end();
+        let summary = &content[start..];
+        if !body.is_empty() {
+            let body_boundaries: Vec<usize> = boundaries
+                .iter()
+                .copied()
+                .filter(|boundary| *boundary < body.len())
+                .collect();
+            push_committed_assistant_reply_segments(
+                lines,
+                palette,
+                body,
+                wrap_width,
+                &body_boundaries,
+            );
+        }
+        let bg = chat_message_bg(palette, "assistant");
+        push_session_summary_card(lines, palette, summary, bg, wrap_width);
+        return;
+    }
+
     let mut cursor = 0;
     let mut first = true;
     let mut previous_reply_has_output = false;
@@ -915,6 +972,18 @@ pub fn finalized_live_turn_lines_between(
         .map(|(_, item)| item)
         .collect::<Vec<_>>();
     if !new_activity.is_empty() {
+        // Each scrollback delta flush builds a fresh buffer, so a pure-activity
+        // delta (a sub-agent completing with no reply text ahead of it) reaches
+        // the finalized section with an EMPTY buffer — which defeats that
+        // section's own `!lines.is_empty()` leading-blank guard and packs
+        // consecutive agent-task cards together in native scrollback. Seed the
+        // separator here so every flushed card stays blank-separated from the
+        // previous scrollback block. (A reply-delta-then-activity flush leaves
+        // `lines` non-empty, so the section's guard handles that case and this
+        // never double-blanks.)
+        if lines.is_empty() {
+            lines.push(Line::from(""));
+        }
         push_finalized_activity_items_section(
             &mut lines,
             palette,
@@ -3226,6 +3295,48 @@ fn should_show_turn_flow(app: &AppState, session: &SessionView) -> bool {
         || should_pin_recent_user_context(app, session)
 }
 
+/// Whether the ACTIVE session's turn is in its "thinking" phase: the model
+/// has started reasoning (`live_reasoning` non-empty) and no answer has
+/// streamed yet (`live_reply.text` empty). This is EXACTLY the swimming-octopus
+/// condition, which the status-bar "Thinking" label tracks verbatim (the user
+/// asked for "Thinking when the octopus swimming"); it flips to "Working" the
+/// moment the answer begins streaming.
+fn active_turn_is_thinking(app: &AppState) -> bool {
+    let Some((session_id, turn_id)) = app.active_turn() else {
+        return false;
+    };
+    let reasoning_started = app
+        .live_reasoning
+        .get(&(session_id.clone(), turn_id.clone()))
+        .is_some_and(|reasoning| !reasoning.trim().is_empty());
+    let answer_not_started = app
+        .active_session()
+        .and_then(|session| session.live_reply.as_ref())
+        .is_none_or(|live_reply| live_reply.text.trim().is_empty());
+    // Not thinking while parked on an operator decision FOR THIS session: an
+    // approval-gated tool sets run_state Blocked and the status bar shows
+    // "Waiting", so the octopus must stop too (codex round 3). The
+    // approval/question slots are global, so scope them to the active session
+    // — a background session's pending decision must not suppress the octopus
+    // here (codex round 4). Durable state, not transient activity rows.
+    let decision_for_active = app
+        .approval
+        .as_ref()
+        .is_some_and(|approval| &approval.session_id == session_id)
+        || app
+            .user_question
+            .as_ref()
+            .is_some_and(|question| &question.session_id == session_id);
+    let awaiting_operator =
+        decision_for_active || matches!(app.run_state, SessionRunState::Blocked { .. });
+    // Deliberately NOT gated on tool activity: this predicate IS the swimming
+    // octopus, which the user asked the label to track ("Thinking when the
+    // octopus swimming"). The octopus swims from the first reasoning delta
+    // until the answer streams — including while tools run — so the label
+    // matches it exactly.
+    reasoning_started && answer_not_started && !awaiting_operator
+}
+
 fn push_turn_flow(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -3261,17 +3372,10 @@ fn push_turn_flow(
     // hand them to the message's reasoning_content); we only surface a single
     // dimmed swimming-octopus indicator, and ONLY while the model is still
     // reasoning — once the answer has started streaming (`live_reply.text` has
-    // non-empty content for the active turn) we drop the indicator too.
-    if let Some((session_id, turn_id)) = app.active_turn()
-        && app
-            .live_reasoning
-            .get(&(session_id.clone(), turn_id.clone()))
-            .is_some_and(|reasoning| !reasoning.trim().is_empty())
-        && session
-            .live_reply
-            .as_ref()
-            .is_none_or(|live_reply| live_reply.text.trim().is_empty())
-    {
+    // non-empty content for the active turn) we drop the indicator too. The
+    // status-bar "Thinking" label is gated on the SAME predicate
+    // (`active_turn_is_thinking`) so the octopus and the label never disagree.
+    if active_turn_is_thinking(app) {
         push_thinking_indicator(lines, palette, width);
     }
 
@@ -3565,6 +3669,12 @@ fn push_reasoning_block(
     }
 }
 
+/// Hanging indent for assistant message bodies: the `• ` marker (2 display
+/// columns) sits on the first visual line only, and every other physical line
+/// of the same message hangs under it by this prefix, so the body reads as one
+/// contiguous block (the Claude Code reference shape).
+const ASSISTANT_BODY_INDENT: &str = "  ";
+
 fn push_message_block(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -3587,6 +3697,7 @@ fn push_message_block(
 
     let bg = chat_message_bg(palette, role);
     let indent = match role {
+        "assistant" => ASSISTANT_BODY_INDENT,
         "tool" => "$ ",
         "reasoning" => "· ",
         "btw" => "· ",
@@ -3605,6 +3716,32 @@ fn push_message_block(
         return;
     }
 
+    // The synthesized turn-completion "Session Summary" block (failure /
+    // no-answer / partial) renders as a distinct card: a colored + bold title
+    // and bold field labels, instead of flat muted markdown that buries the
+    // error. The block can be the whole message OR a suffix appended after a
+    // partial live reply (`{prose}\n\n{summary}`) — render the prose above it
+    // normally, then the card.
+    if role == "assistant"
+        && let Some(start) = session_summary_block_start(content)
+    {
+        let (prose, summary) = content.split_at(start);
+        let prose = prose.trim_end();
+        if !prose.is_empty() {
+            push_formatted_body_marked(
+                lines,
+                palette,
+                prose,
+                indent,
+                prose_marker,
+                Some(bg),
+                width,
+            );
+        }
+        push_session_summary_card(lines, palette, summary, bg, width);
+        return;
+    }
+
     push_formatted_body_marked(
         lines,
         palette,
@@ -3614,6 +3751,133 @@ fn push_message_block(
         Some(bg),
         width,
     );
+}
+
+/// A localized status string in every bundled locale, so a synthesized card
+/// stored in one language still matches after a `/lang` switch changes the
+/// locale `t!` resolves against (codex P2 on #292).
+fn localized_in_all_locales(key: &str) -> Vec<String> {
+    ["en", "zh"]
+        .into_iter()
+        .map(|locale| rust_i18n::t!(key, locale = locale).into_owned())
+        .collect()
+}
+
+/// Byte offset where a Session Summary block begins in `content`, if any. The
+/// block is either the whole message (failure / no-answer card) or a suffix
+/// appended after a partial live reply (`{prose}\n\n{summary}` — see
+/// `finalize_live_reply_text`). Locale-independent: the title is matched
+/// against every bundled locale so a stored card highlights regardless of the
+/// current UI language.
+fn session_summary_block_start(content: &str) -> Option<usize> {
+    let titles = localized_in_all_locales("status.summary_title");
+    let mut offset = 0usize;
+    let mut iter = content.lines().peekable();
+    while let Some(line) = iter.next() {
+        let is_title = titles.iter().any(|title| title == line);
+        let next_is_bullet = iter
+            .peek()
+            .is_some_and(|next| next.trim_start().starts_with("- "));
+        if is_title && next_is_bullet {
+            return Some(offset);
+        }
+        // `lines()` strips the `\n`; add it back. The final line has none, but
+        // a match returns before we reach past it, so the +1 is never used out
+        // of bounds.
+        offset += line.len() + 1;
+    }
+    None
+}
+
+/// Render a "Session Summary" card: the title in a bold attention color, then
+/// each `- Label: value` row with the label bolded so the Result / Error /
+/// Activity fields stand out. The `- Error:` row's value is drawn in the
+/// danger color so a failure reads as a failure at a glance. Every row is
+/// clipped to `width` so a narrow pane cannot wrap a value to column 0.
+fn push_session_summary_card(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    content: &str,
+    bg: Color,
+    width: usize,
+) {
+    let mut rows = content.lines();
+    let title = rows.next().unwrap_or_default();
+    // Title: `✦ Session Summary` in the highlight color, bold — a notice, not
+    // an error glyph (the same card also covers no-answer / partial, not only
+    // failure). The failure detail below carries the red.
+    lines.push(chat_line(
+        clip_line_spans(
+            vec![Span::styled(
+                format!("{ASSISTANT_BODY_INDENT}✦ {title}"),
+                Style::default()
+                    .fg(palette.highlight)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(bg),
+            )],
+            width,
+        ),
+        Some(bg),
+    ));
+
+    // Budget the value text so `indent + "- " + label + sep + value` fits the
+    // pane; the final `clip_line_spans` is the hard backstop so even a row
+    // whose prefix alone exceeds `width` (e.g. a long label on a 24-col pane)
+    // truncates rather than wrapping to column 0 (codex P2 on #292).
+    let label_lead = ASSISTANT_BODY_INDENT.width() + 2; // indent + "- "
+    let error_labels = localized_in_all_locales("status.summary_error_label");
+    for row in rows {
+        let row = row.strip_prefix("- ").unwrap_or(row);
+        // Labels use `": "` (en) or the fullwidth `"："` (zh, no space).
+        let split = row
+            .split_once(": ")
+            .map(|(label, value)| (label, value, ": "))
+            .or_else(|| {
+                row.split_once('：')
+                    .map(|(label, value)| (label, value, "："))
+            });
+        let Some((label, value, sep)) = split else {
+            // A label-less row: render as a plain muted line.
+            let budget = width.saturating_sub(label_lead);
+            lines.push(chat_line(
+                clip_line_spans(
+                    vec![
+                        Span::styled(format!("{ASSISTANT_BODY_INDENT}- "), palette.muted().bg(bg)),
+                        Span::styled(
+                            truncate_to_display_width(row, budget),
+                            palette.text().bg(bg),
+                        ),
+                    ],
+                    width,
+                ),
+                Some(bg),
+            ));
+            continue;
+        };
+        // The Error row's value carries the danger color; every other value is
+        // the normal text color. Locale-independent label match.
+        let value_style = if error_labels.iter().any(|l| l == label) {
+            Style::default().fg(palette.danger).bg(bg)
+        } else {
+            palette.text().bg(bg)
+        };
+        let label_with_sep = format!("{label}{sep}");
+        let value_budget = width.saturating_sub(label_lead + label_with_sep.width());
+        lines.push(chat_line(
+            clip_line_spans(
+                vec![
+                    Span::styled(format!("{ASSISTANT_BODY_INDENT}- "), palette.muted().bg(bg)),
+                    Span::styled(
+                        label_with_sep,
+                        palette.text().add_modifier(Modifier::BOLD).bg(bg),
+                    ),
+                    Span::styled(truncate_to_display_width(value, value_budget), value_style),
+                ],
+                width,
+            ),
+            Some(bg),
+        ));
+    }
 }
 
 /// Render a (chunk of a) streaming reply. `first` controls the `• ` prose
@@ -3633,7 +3897,15 @@ fn push_live_reply_block(
 
     let bg = chat_message_bg(palette, "assistant");
     let marker = first.then_some("• ");
-    push_formatted_body_marked(lines, palette, content, "", marker, Some(bg), width);
+    push_formatted_body_marked(
+        lines,
+        palette,
+        content,
+        ASSISTANT_BODY_INDENT,
+        marker,
+        Some(bg),
+        width,
+    );
 }
 
 fn push_live_reply_block_seeded(
@@ -3662,7 +3934,7 @@ fn push_live_reply_block_seeded(
         lines,
         palette,
         content,
-        "",
+        ASSISTANT_BODY_INDENT,
         marker,
         Some(bg),
         width,
@@ -3975,6 +4247,11 @@ fn push_formatted_body_marked_seeded(
     let mut prose = Vec::new();
     let mut table = Vec::new();
     let mut checkbox_index = 1usize;
+    let body_start = lines.len();
+    // Hanging (all-whitespace) indents keep their blank separators truly blank
+    // — no trailing spaces in immutable scrollback; glyph gutters (`· `, `$ `)
+    // keep marking their blank rows.
+    let separator_indent = if indent.trim().is_empty() { "" } else { indent };
     let normalized = content.trim_matches(|ch: char| ch.is_whitespace() && ch != '\n');
 
     for raw_line in normalized.lines() {
@@ -3984,7 +4261,7 @@ fn push_formatted_body_marked_seeded(
             raw_line.trim()
         };
         if let Some(rest) = line.trim_start().strip_prefix("```") {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             if let Some((language, body)) = in_code.take() {
                 push_code_block_lines(lines, palette, indent, bg, &language, &body, true);
@@ -4023,12 +4300,15 @@ fn push_formatted_body_marked_seeded(
         }
 
         if line.is_empty() {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             checkbox_index = 1;
             if !last_blank && (previous_reply_has_output || !lines.is_empty()) {
                 lines.push(chat_line(
-                    vec![Span::styled(indent, style_bg(palette.border(), bg))],
+                    vec![Span::styled(
+                        separator_indent,
+                        style_bg(palette.border(), bg),
+                    )],
                     bg,
                 ));
                 last_blank = true;
@@ -4038,25 +4318,25 @@ fn push_formatted_body_marked_seeded(
         last_blank = false;
 
         if let Some(command) = shell_command_from_line(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             push_command_row(lines, palette, indent, command);
             continue;
         }
 
         if markdown_table_separator(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             continue;
         }
 
         if let Some(cells) = markdown_table_cells(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             table.push(cells.into_iter().map(str::to_owned).collect());
             continue;
         }
 
         if markdown_hr(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             let rule_width = width.saturating_sub(indent.chars().count()).clamp(1, 40);
             lines.push(chat_line(
@@ -4070,7 +4350,7 @@ fn push_formatted_body_marked_seeded(
         }
 
         if let Some(heading) = markdown_heading(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             let mut spans = vec![Span::styled(indent, style_bg(palette.border(), bg))];
             spans.extend(inline_markdown_spans(
@@ -4084,7 +4364,7 @@ fn push_formatted_body_marked_seeded(
         }
 
         if let Some((_checked, text)) = markdown_checkbox(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             let mut spans = vec![
                 Span::styled(indent, style_bg(palette.border(), bg)),
@@ -4105,7 +4385,7 @@ fn push_formatted_body_marked_seeded(
         }
 
         if let Some(text) = markdown_bullet(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             let mut spans = vec![
                 Span::styled(indent, style_bg(palette.border(), bg)),
@@ -4122,7 +4402,7 @@ fn push_formatted_body_marked_seeded(
         }
 
         if let Some((number, text)) = markdown_numbered(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             let mut spans = vec![
                 Span::styled(indent, style_bg(palette.border(), bg)),
@@ -4139,7 +4419,7 @@ fn push_formatted_body_marked_seeded(
         }
 
         if let Some(text) = markdown_blockquote(line) {
-            flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+            flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
             // Render as a quoted line with a left bar + muted italics, instead of
             // leaking the literal `>` marker into prose.
@@ -4167,8 +4447,109 @@ fn push_formatted_body_marked_seeded(
         // frame.
         push_code_block_lines(lines, palette, indent, bg, &language, &body, false);
     }
-    flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
+    flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
     flush_markdown_table(lines, palette, &mut table, indent, bg, width);
+    finish_hanging_body(lines, body_start, palette, indent, prose_marker, bg, width);
+}
+
+/// Post-pass for hanging-indent bodies (assistant messages, whose `indent` is
+/// the all-whitespace [`ASSISTANT_BODY_INDENT`]): swap the first non-blank
+/// row's leading indent span for the `• ` prose marker, then pre-wrap any
+/// over-width row so its wrapped continuations keep the hang. Both downstream
+/// wrap paths (ratatui's `Wrap { trim: false }` in the live tail and
+/// `insert_history::wrap_line` for native scrollback) restart wrapped rows at
+/// column 0, so the body must never hand them an over-width line. Glyph-gutter
+/// bodies (`$ `, `· `, `› `) and unindented bodies are left exactly as before.
+fn finish_hanging_body(
+    lines: &mut Vec<Line<'static>>,
+    body_start: usize,
+    palette: Palette,
+    indent: &'static str,
+    prose_marker: Option<&'static str>,
+    bg: Option<Color>,
+    width: usize,
+) {
+    if indent.is_empty() || !indent.trim().is_empty() {
+        return;
+    }
+
+    // Sanitize BEFORE measuring — the same order `insert_history` uses. Tabs
+    // render as four columns once scrollback sanitizes them, so measuring the
+    // raw `\t` (0 columns here, 1 in `str::width`) under-counted the row: it
+    // passed the pre-wrap check, then insert-time wrapping split it back to a
+    // column-zero continuation, losing the hang (codex r2 P2). Stripping the
+    // other control chars here also keeps the pre-wrap cutter's budget honest
+    // (codex r2 P1) and renders deterministically in the live lane.
+    for line in lines[body_start..].iter_mut() {
+        crate::insert_history::sanitize_line_in_place(line);
+    }
+
+    if let Some(marker) = prose_marker
+        && let Some(first_line) = lines[body_start..]
+            .iter_mut()
+            .find(|line| !line_is_blank(Some(line)))
+    {
+        let marker_span = Span::styled(marker, style_bg(palette.selected(), bg));
+        match first_line.spans.first_mut() {
+            // Every body emitter leads with the indent span; the marker
+            // replaces it 1:1 (same display width), keeping the row width
+            // unchanged.
+            Some(lead) if lead.content.as_ref() == indent => *lead = marker_span,
+            _ => first_line.spans.insert(0, marker_span),
+        }
+    }
+
+    let line_width = |line: &Line<'static>| -> usize {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref().width())
+            .sum()
+    };
+    if lines[body_start..]
+        .iter()
+        .all(|line| line_width(line) <= width)
+    {
+        return;
+    }
+
+    let content_width = width.saturating_sub(indent.width()).max(1);
+    let body = lines.split_off(body_start);
+    for mut line in body {
+        if line_width(&line) <= width {
+            lines.push(line);
+            continue;
+        }
+        // Detach the leading indent/marker span, wrap the remainder to the
+        // hang-reduced width, then re-attach: row 0 keeps its own lead,
+        // continuation rows get the hang.
+        let lead = match line.spans.first() {
+            Some(span)
+                if span.content.as_ref() == indent
+                    || prose_marker.is_some_and(|marker| span.content.as_ref() == marker) =>
+            {
+                Some(line.spans.remove(0))
+            }
+            _ => None,
+        };
+        let hang_style = lead
+            .as_ref()
+            .map(|span| span.style)
+            .unwrap_or_else(|| style_bg(palette.border(), bg));
+        let style = line.style;
+        let rest = Line::from(std::mem::take(&mut line.spans)).style(style);
+        for (row_idx, row) in crate::insert_history::wrap_line(&rest, content_width)
+            .into_iter()
+            .enumerate()
+        {
+            let mut spans = Vec::with_capacity(row.spans.len() + 1);
+            match (&lead, row_idx) {
+                (Some(lead), 0) => spans.push(lead.clone()),
+                _ => spans.push(Span::styled(indent, hang_style)),
+            }
+            spans.extend(row.spans);
+            lines.push(Line::from(spans).style(style));
+        }
+    }
 }
 
 fn flush_prose_paragraph(
@@ -4176,7 +4557,6 @@ fn flush_prose_paragraph(
     palette: Palette,
     prose: &mut Vec<String>,
     indent: &'static str,
-    prose_marker: Option<&'static str>,
     bg: Option<Color>,
 ) {
     if prose.is_empty() {
@@ -4185,9 +4565,6 @@ fn flush_prose_paragraph(
 
     let paragraph = prose.join(" ");
     let mut spans = vec![Span::styled(indent, style_bg(palette.border(), bg))];
-    if let Some(marker) = prose_marker {
-        spans.push(Span::styled(marker, style_bg(palette.selected(), bg)));
-    }
     spans.extend(inline_markdown_spans(
         &paragraph,
         style_bg(palette.text(), bg),
@@ -6191,11 +6568,19 @@ fn tool_card_bullet(item: &ActivityItem, palette: Palette) -> (String, Style) {
     }
 }
 
-/// Claude-Code-style tool-card header: `⏺ Bash(cmd)`. The invocation (shell
-/// command, spawn task, file path, …) renders in parens with raw JSON and the
-/// call-id stripped; multi-line commands indent to align under `(`. Every
-/// emitted line is budgeted + clipped to `wrap_width` display columns so it
-/// can never overflow and wrap to column 0 (the indent-not-honored bug).
+/// Leading indent for a tool card rendered as an agent-task-group CHILD:
+/// the card is always emitted under a group header (`⣻ Orchestrating…`), so
+/// its bullet must nest instead of sitting flush at column 0 where it reads
+/// as a sibling of the header. Two columns puts the `⏺`/spinner bullet at the
+/// same tree level as the `⎿` connector of non-tool children.
+const TOOL_CARD_CHILD_INDENT: &str = "  ";
+
+/// Claude-Code-style tool-card header: `  ⏺ Bash(cmd)` (indented as a group
+/// child). The invocation (shell command, spawn task, file path, …) renders
+/// in parens with raw JSON and the call-id stripped; multi-line commands
+/// indent to align under `(`. Every emitted line is budgeted + clipped to
+/// `wrap_width` display columns so it can never overflow and wrap to column 0
+/// (the indent-not-honored bug).
 fn push_tool_card_header(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -6204,14 +6589,17 @@ fn push_tool_card_header(
 ) {
     let (bullet, bullet_style) = tool_card_bullet(item, palette);
     let name = tool_display_name(&item.title);
+    let indent = TOOL_CARD_CHILD_INDENT;
+    let indent_cols = indent.width();
     let duration = item
         .duration_ms
         .map(|ms| format!("  {}", format_duration_ms(ms)))
         .unwrap_or_default();
 
     let Some(invocation) = tool_invocation_text(item).filter(|text| !text.trim().is_empty()) else {
-        // No arguments to show: `⏺ Bash`.
+        // No arguments to show: `  ⏺ Bash`.
         let mut spans = vec![
+            Span::styled(indent, palette.muted()),
             Span::styled(bullet, bullet_style),
             Span::styled(" ", palette.muted()),
             Span::styled(name, palette.muted()),
@@ -6224,7 +6612,7 @@ fn push_tool_card_header(
     };
 
     // Shell-family invocations keep the `$ ` prompt inside the parens —
-    // `⏺ Bash($ cargo test)` — the command-row marker #276 established; the
+    // `  ⏺ Bash($ cargo test)` — the command-row marker #276 established; the
     // prompt is part of the budgeted text so the width math stays exact.
     let invocation = if is_shell_family_tool(&item.title) {
         format!("$ {invocation}")
@@ -6232,14 +6620,16 @@ fn push_tool_card_header(
         invocation
     };
 
-    // Continuation lines align under the first char after `(`.
-    let cont_indent = " ".repeat(bullet.chars().count() + 1 + name.chars().count() + 1);
+    // Continuation lines align under the first char after `(`, INCLUDING the
+    // leading child indent so multi-line commands stay under the card.
+    let cont_indent =
+        " ".repeat(indent_cols + bullet.chars().count() + 1 + name.chars().count() + 1);
     let cmd_lines: Vec<&str> = invocation.lines().collect();
     let max_lines = 10usize;
     let shown = cmd_lines.len().min(max_lines).max(1);
     let clipped = cmd_lines.len() > shown;
-    // Budget the command text so lead-in + text + `)` + duration fit within
-    // `wrap_width` (unicode-width, so CJK commands stay exact).
+    // Budget the command text so indent + lead-in + text + `)` + duration fit
+    // within `wrap_width` (unicode-width, so CJK commands stay exact).
     let lead_width = cont_indent.width();
     let text_budget = wrap_width
         .saturating_sub(lead_width)
@@ -6258,6 +6648,7 @@ fn push_tool_card_header(
         }
         let mut spans = Vec::new();
         if idx == 0 {
+            spans.push(Span::styled(indent, palette.muted()));
             spans.push(Span::styled(bullet.clone(), bullet_style));
             spans.push(Span::styled(" ", palette.muted()));
             spans.push(Span::styled(format!("{name}("), palette.muted()));
@@ -6426,9 +6817,11 @@ fn push_compact_tool_preview(
     wrap_width: usize,
     in_scrollback: bool,
 ) {
-    // The preview prefix `  ⎿ ` is 4 display columns; budget the content so a
+    // The preview prefix `    ⎿ ` is 6 display columns — the 2-col child
+    // indent of the tool card (`TOOL_CARD_CHILD_INDENT`) plus `  ⎿ ` — so the
+    // output nests under the indented `⏺` bullet. Budget the content so a
     // preview line fits within `wrap_width` and never wraps to column 0.
-    const PREVIEW_PREFIX_COLS: usize = 4;
+    const PREVIEW_PREFIX_COLS: usize = 6;
     let preview_budget = wrap_width.saturating_sub(PREVIEW_PREFIX_COLS);
     let Some(output_preview) = item
         .output_preview
@@ -6457,7 +6850,7 @@ fn push_compact_tool_preview(
     let shown = total.min(line_limit);
     for line in preview_lines.iter().take(shown) {
         lines.push(Line::from(vec![
-            Span::styled("  ⎿ ", palette.border()),
+            Span::styled("    ⎿ ", palette.border()),
             Span::styled(
                 truncate_to_display_width(line, preview_budget),
                 palette.text(),
@@ -6476,7 +6869,7 @@ fn push_compact_tool_preview(
         };
         lines.push(Line::from(clip_line_spans(
             vec![
-                Span::styled("  ⎿ ", palette.border()),
+                Span::styled("    ⎿ ", palette.border()),
                 Span::styled(
                     t!(
                         "app.activity.more_lines_hidden",
@@ -6492,7 +6885,7 @@ fn push_compact_tool_preview(
     } else if expanded && total > COLLAPSED_TOOL_PREVIEW_LINES {
         lines.push(Line::from(clip_line_spans(
             vec![
-                Span::styled("  ⎿ ", palette.border()),
+                Span::styled("    ⎿ ", palette.border()),
                 Span::styled(
                     t!("app.activity.expanded_hint").into_owned(),
                     palette.muted(),
@@ -6561,6 +6954,20 @@ fn task_group_counts(full_items: &[&ActivityItem]) -> (usize, usize, usize, usiz
     (total, completed, active, failed)
 }
 
+/// The single-variant diff-preview status the server always sends today
+/// (`DiffPreviewGetStatus::Ready`). It carries no information, so it is
+/// suppressed from the header; any other value is surfaced.
+fn is_default_diff_status(status: &str) -> bool {
+    status == "ready"
+}
+
+/// The single-variant diff-preview source the server always sends today
+/// (`DiffPreviewSource::PendingStore`) — an internal implementation detail.
+/// Suppressed from the header; any other value is surfaced.
+fn is_default_diff_source(source: &str) -> bool {
+    source == "pending_store"
+}
+
 fn push_inline_diff_preview(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -6585,7 +6992,7 @@ fn push_inline_diff_preview(
     ]));
 
     if let Some(preview) = &diff.preview {
-        lines.push(Line::from(vec![
+        let mut header = vec![
             Span::styled("    ", palette.muted()),
             Span::styled(
                 preview
@@ -6594,17 +7001,30 @@ fn push_inline_diff_preview(
                     .unwrap_or_else(|| t!("app.diff.inline_patch").to_string()),
                 palette.text().add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  ", palette.muted()),
-            Span::styled(
-                diff.status.as_deref().unwrap_or("unknown").to_string(),
-                palette.muted(),
-            ),
-            Span::styled("  ", palette.muted()),
-            Span::styled(
-                diff.source.as_deref().unwrap_or("unknown").to_string(),
-                palette.muted(),
-            ),
-        ]));
+        ];
+        // Only surface `status`/`source` when they carry information. Today both
+        // are single-variant protocol constants ("ready" / "pending_store")
+        // that are pure noise — and "pending_store" is an internal server
+        // implementation detail — so the defaults are suppressed and the row
+        // shows just the operation + path (e.g. "modify …"). An unrecognized
+        // future value is still shown so genuinely new states aren't swallowed.
+        if let Some(status) = diff
+            .status
+            .as_deref()
+            .filter(|status| !is_default_diff_status(status))
+        {
+            header.push(Span::styled("  ", palette.muted()));
+            header.push(Span::styled(status.to_string(), palette.muted()));
+        }
+        if let Some(source) = diff
+            .source
+            .as_deref()
+            .filter(|source| !is_default_diff_source(source))
+        {
+            header.push(Span::styled("  ", palette.muted()));
+            header.push(Span::styled(source.to_string(), palette.muted()));
+        }
+        lines.push(Line::from(header));
 
         if preview.files.is_empty() {
             lines.push(Line::from(vec![
@@ -7398,6 +7818,16 @@ fn autonomy_loop_is_active(record: &octos_core::ui_protocol::UiLoopRecord) -> bo
 
 /// Build the line set for the sticky autonomy indicator. Returns 0, 1,
 /// or 2 lines (goal first, then loops).
+/// Render a raw token count in K units for the goal chip: 174_763 →
+/// "175K", 2_000_000 → "2000K", 0 → "0K". Rounded to the nearest thousand
+/// so the goal budget reads at a glance instead of as a raw 6–9 digit
+/// number (user request: "tui should display in K unit"). Rounds without
+/// the overflow that `saturating_add(500)` would hit near `u64::MAX`.
+fn format_tokens_k(tokens: u64) -> String {
+    let k = tokens / 1_000 + u64::from(tokens % 1_000 >= 500);
+    format!("{k}K")
+}
+
 fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> {
     let Some(state) = active_session_autonomy(app) else {
         return Vec::new();
@@ -7412,8 +7842,8 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
         let parenthetical = t!(
             "app.autonomy.goal_meta",
             status = goal.status,
-            used = goal.tokens_used,
-            budget = goal.token_budget
+            used = format_tokens_k(goal.tokens_used),
+            budget = format_tokens_k(goal.token_budget)
         )
         .into_owned();
         lines.push(Line::from(vec![
@@ -7660,12 +8090,35 @@ fn harness_status_lines(
     let session_id = session.id.clone();
     let status = app.orchestration.get(&session_id);
 
+    // The whimsical persona status word (server `progress/updated{kind:
+    // "status_word"}`, rotated ~every 8s — e.g. "Conjuring", "正在炼丹") wins
+    // over the flat "Working" phase so the gradient line reads `⣻ Conjuring…`
+    // like the web ThinkingIndicator. It replaces ONLY the generic working
+    // phase; a real "orchestrating" / "re-entering" phase (sub-agents running,
+    // master re-entry) still shows, since that is information the operator
+    // should see rather than a decorative word. The `…` reads as an ongoing
+    // action.
+    // Only the ACTIVE turn's word shows — a word keyed to a settled/prior turn
+    // (or a server-started continuation before its own first rotation) is
+    // ignored, so a stale word never lingers (codex P2 on #294).
+    let active_turn_id = app.active_turn().map(|(_, turn_id)| turn_id);
+    let persona_word = app
+        .session_status_word
+        .get(&session_id)
+        .filter(|(word_turn, _)| active_turn_id == Some(word_turn))
+        .map(|(_, word)| word.trim())
+        .filter(|word| !word.is_empty())
+        .map(|word| format!("{word}…"));
     let phase = match status.and_then(|s| s.phase.as_deref()) {
         Some("orchestrating") => t!("app.harness.orchestrating").to_string(),
         Some("re-entering") => t!("app.harness.re_entering").to_string(),
-        Some("working") => t!("app.harness.working").to_string(),
+        Some("working") => persona_word
+            .clone()
+            .unwrap_or_else(|| t!("app.harness.working").to_string()),
         Some(other) if !other.is_empty() => other.to_string(),
-        _ => t!("app.harness.working").to_string(),
+        _ => persona_word
+            .clone()
+            .unwrap_or_else(|| t!("app.harness.working").to_string()),
     };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -8320,15 +8773,45 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
     // A turn parked on an operator decision is not "Working": the model is
     // stopped until the human answers. Show a distinct Waiting state (with a
     // steady `?` instead of the spinner) whenever an approval or an
-    // AskUserQuestion is pending — visible OR collapsed, the turn is parked
-    // either way — and fall back to the plain run_state display otherwise.
-    let waiting_on_operator = matches!(app.run_state, SessionRunState::InProgress)
-        && (app.approval.is_some() || app.user_question.is_some());
+    // AskUserQuestion is pending FOR THE ACTIVE SESSION — visible or
+    // collapsed, the turn is parked either way. The arrival path parks
+    // run_state at Blocked (and some mid-turn paths keep InProgress), so
+    // both count (codex P1: the InProgress-only gate never fired on the
+    // real flow, and an unscoped modal check marked the active session
+    // waiting for another session's decision).
+    let active_session_id = app.active_session().map(|session| session.id.clone());
+    let pending_decision_for_active = active_session_id.as_ref().is_some_and(|session_id| {
+        app.approval
+            .as_ref()
+            .is_some_and(|approval| &approval.session_id == session_id)
+            || app
+                .user_question
+                .as_ref()
+                .is_some_and(|question| &question.session_id == session_id)
+    });
+    let waiting_on_operator = pending_decision_for_active
+        && matches!(
+            app.run_state,
+            SessionRunState::InProgress | SessionRunState::Blocked { .. }
+        );
     let (state_marker, state_label, state_style) = if waiting_on_operator {
         (
             "?".to_string(),
             t!("app.status.waiting").to_string(),
             palette.selected().add_modifier(Modifier::BOLD),
+        )
+    } else if matches!(app.run_state, SessionRunState::InProgress) && active_turn_is_thinking(app) {
+        // Reasoning phase (octopus swimming): keep the animated spinner marker
+        // and the in-progress style, but label it "Thinking" — the turn is
+        // running, but it is not yet acting (no answer/tool output). Flips to
+        // "Working" the moment the answer or a tool call begins. Gated on
+        // InProgress so a late terminal (e.g. an Error for a switch-finalized
+        // turn while a successor is still live-and-blank) is never masked by
+        // the Thinking label (codex P2).
+        (
+            run_state_marker(&app.run_state).to_string(),
+            t!("app.status.thinking").to_string(),
+            run_state_style(&app.run_state, palette),
         )
     } else {
         (
@@ -9497,6 +9980,194 @@ mod tests {
     }
 
     #[test]
+    fn segmented_reply_still_renders_a_trailing_summary_as_a_card() {
+        // The native-scrollback segmented path (tool-backed replies) must also
+        // give a trailing Session Summary the card treatment, not flat
+        // markdown (codex P2 round 2 on #292).
+        let summary = t!(
+            "status.summary_partial_answer",
+            count = 2,
+            files = "none observed",
+            validation = "not reported",
+        )
+        .into_owned();
+        // A reply with an internal segment boundary (as a tool call inserts),
+        // then the appended summary.
+        let body = "First I ran a tool.\n\nThen I continued.";
+        let content = format!("{body}\n\n{summary}");
+        let boundaries = vec![body.find("\n\nThen").unwrap()];
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let mut lines = Vec::new();
+        push_committed_assistant_reply_segments(&mut lines, palette, &content, 120, &boundaries);
+        let text = lines_text(&lines);
+        assert!(
+            text.contains("First I ran a tool"),
+            "prose body renders: {text:?}"
+        );
+        assert!(
+            text.contains("✦"),
+            "the trailing summary gets the card glyph: {text:?}"
+        );
+    }
+
+    #[test]
+    fn session_summary_detected_as_a_suffix_after_partial_prose() {
+        // The partial-completion path appends the summary AFTER the model's
+        // partial reply (`{prose}\n\n{summary}`), so the title is NOT the
+        // first line — detection must still find it (codex P2 on #292).
+        let summary = t!(
+            "status.summary_partial_answer",
+            count = 3,
+            files = "none observed",
+            validation = "not reported",
+        )
+        .into_owned();
+        let content = format!("Emulator installed. Booting the AVD now:\n\n{summary}");
+
+        let start = session_summary_block_start(&content)
+            .expect("summary suffix must be detected after prose");
+        assert!(start > 0, "the block starts after the prose, not at 0");
+        assert_eq!(
+            &content[start..start + summary.len().min(20)],
+            &summary[..summary.len().min(20)]
+        );
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let mut lines = Vec::new();
+        push_message_block(&mut lines, palette, "assistant", &content, 120);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("Emulator installed"), "prose still renders");
+        assert!(
+            text.contains("✦"),
+            "the appended summary still gets the card treatment"
+        );
+    }
+
+    #[test]
+    fn session_summary_detection_is_locale_independent() {
+        // A card stored in English must still be recognized after a `/lang`
+        // switch to Chinese, and vice-versa (codex P2 on #292).
+        let en = t!("status.summary_title", locale = "en").into_owned();
+        let zh = t!("status.summary_title", locale = "zh").into_owned();
+        let en_card = format!("{en}\n- Result: done.");
+        let zh_card = format!("{zh}\n- 结果：完成。");
+        assert_eq!(session_summary_block_start(&en_card), Some(0));
+        assert_eq!(session_summary_block_start(&zh_card), Some(0));
+    }
+
+    #[test]
+    fn session_summary_rows_never_exceed_a_narrow_pane() {
+        // A 24-col pane: the `  - Risks / follow-up: ` prefix alone is wide,
+        // so the value budget goes to zero — the clip backstop must keep every
+        // emitted row within width instead of wrapping to column 0 (codex P2).
+        let content = t!(
+            "status.summary_failed",
+            code = "runtime_error",
+            message = "a fairly long error message that would overflow a narrow pane",
+            count = 20,
+            failed = "none recorded",
+        )
+        .into_owned();
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let mut lines = Vec::new();
+        push_message_block(&mut lines, palette, "assistant", &content, 24);
+        for line in &lines {
+            let cols: usize = line
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            assert!(cols <= 24, "row exceeds 24 cols: {cols} — {line:?}");
+        }
+    }
+
+    #[test]
+    fn session_summary_card_gets_a_highlighted_title_and_labels() {
+        // The synthesized failure "Session Summary" message renders as a
+        // distinct card — a highlight-colored bold title and bold field
+        // labels, with the error value in the danger color — instead of flat
+        // muted markdown (user report: "need highlights and color the title").
+        let content = t!(
+            "status.summary_failed",
+            code = "runtime_error",
+            message = "failed to send streaming request to Anthropic",
+            count = 20,
+            failed = "none recorded",
+        )
+        .into_owned();
+
+        assert_eq!(
+            session_summary_block_start(&content),
+            Some(0),
+            "the failure template starts a summary card at offset 0"
+        );
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let bg = chat_message_bg(palette, "assistant");
+        let mut lines = Vec::new();
+        push_message_block(&mut lines, palette, "assistant", &content, 120);
+
+        // Title row: bold + highlight color, prefixed with the ✦ notice glyph.
+        let title_line = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|s| s.content.contains("Session Summary"))
+            })
+            .expect("title line");
+        let title_span = title_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Session Summary"))
+            .unwrap();
+        assert!(
+            title_span.content.contains('✦'),
+            "title carries the ✦ notice glyph"
+        );
+        assert_eq!(
+            title_span.style.fg,
+            Some(palette.highlight),
+            "title is highlight-colored"
+        );
+        assert!(
+            title_span.style.add_modifier.contains(Modifier::BOLD),
+            "title is bold"
+        );
+
+        // The Error label is bold and its value is danger-colored.
+        let error_line = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|s| s.content.starts_with("Error")))
+            .expect("error line");
+        let label_span = error_line
+            .spans
+            .iter()
+            .find(|s| s.content.starts_with("Error"))
+            .unwrap();
+        assert!(
+            label_span.style.add_modifier.contains(Modifier::BOLD),
+            "the Error label is bold"
+        );
+        let value_span = error_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("failed to send"))
+            .expect("error value span");
+        assert_eq!(
+            value_span.style.fg,
+            Some(palette.danger),
+            "the error value is danger-colored"
+        );
+        let _ = bg;
+    }
+
+    #[test]
     fn render_composer_collapses_home_dir_in_cwd_footer() {
         // Build the cwd from the runner's actual HOME so the assertion is
         // deterministic across machines and exercises the real render path.
@@ -9636,6 +10307,11 @@ mod tests {
             "in-progress without a pending decision stays Working: {status_row:?}"
         );
 
+        // The REAL arrival path parks run_state at Blocked (codex P1: the
+        // InProgress-only gate never fired on the actual flow).
+        app.run_state = SessionRunState::Blocked {
+            message: "Run command".into(),
+        };
         app.approval = Some(ApprovalModalState {
             session_id: session_id.clone(),
             approval_id: ApprovalId::new(),
@@ -9671,8 +10347,22 @@ mod tests {
             "collapsed-but-pending approval still Waiting: {status_row:?}"
         );
 
-        // Resolved -> back to Working.
+        // Another session's decision must NOT mark this one waiting: with
+        // the modal re-keyed to a different session the label falls back to
+        // the plain run_state (Blocked here).
+        if let Some(approval) = app.approval.as_mut() {
+            approval.session_id = SessionKey("local:other".into());
+        }
+        let rows = rendered_rows(&rendered_buffer(&app, palette));
+        let status_row = row_containing(&rows, "approval gated");
+        assert!(
+            !status_row.contains("Waiting"),
+            "another session's decision must not read Waiting here: {status_row:?}"
+        );
+
+        // Resolved -> back to the plain run_state display.
         app.approval = None;
+        app.run_state = SessionRunState::InProgress;
         let rows = rendered_rows(&rendered_buffer(&app, palette));
         let status_row = row_containing(&rows, "approval gated");
         assert!(
@@ -9918,6 +10608,31 @@ mod tests {
         let answer = "I'm working on integrating Astro into your World Cup 2026 frontend to provide better component-based architecture. The idea is to use Astro as a meta-framework wrapping your existing React islands.\n\nWhat's been done so far:\n- Researched Astro's React integration docs\n- Set up an Astro project alongside your existing React app\n- Got Astro to build successfully\n\nCurrent blocker: The Astro SSR pages try to fetch data from your GraphQL server at localhost:4000 during build time, but this sandbox environment blocks outbound network so the build data step fails.\n\nLikely next step: Switching the Astro pages to use client-side fetching instead of SSR fetch, so the browser does the GraphQL call at runtime instead of the build doing it.";
         app.resolve_btw_answer(&session_id, answer.into());
         (app, session_id)
+    }
+
+    #[test]
+    fn btw_overlay_grows_to_fit_a_long_answer_on_a_tall_terminal() {
+        // Regression: the aside was capped at half the viewport, so a long
+        // answer stranded its last line behind a scroll even with screen space
+        // to spare (reported: "…gives you a proper" cut off). It must now grow
+        // to show the WHOLE answer and drop the scroll indicator.
+        let (app, _session_id) = app_with_long_btw_answer();
+        // Height 30 at width 100: the answer wraps to more than half of 30 (the
+        // old cap), so the old code stranded its tail behind a scroll — but it
+        // fits comfortably within the full viewport minus composer + scrollback.
+        let text = viewport_rows(&app, 100, 30).join("\n");
+        assert!(
+            text.contains("Likely next step"),
+            "the tail paragraph must render; got:\n{text}"
+        );
+        assert!(
+            text.contains("instead of the build doing it."),
+            "the FINAL sentence must be fully visible, not stranded; got:\n{text}"
+        );
+        assert!(
+            !text.contains("PgUp/PgDn"),
+            "a fitting answer must not show a scroll indicator when it fits; got:\n{text}"
+        );
     }
 
     #[test]
@@ -11233,7 +11948,7 @@ mod tests {
     }
 
     #[test]
-    fn render_assistant_markdown_is_left_aligned_without_marker_leakage() {
+    fn render_assistant_markdown_hangs_body_without_marker_leakage() {
         let app = AppState::new(
             vec![SessionView {
                 id: SessionKey("local:test".into()),
@@ -11263,10 +11978,12 @@ mod tests {
                 .find("•")
                 .is_some_and(|idx| idx < prose.find("First paragraph").unwrap())
         );
-        assert_eq!(bullet.find("- "), Some(0));
+        // Body rows hang 2 columns under the marker — never a second `• `.
+        assert_eq!(bullet.find("- "), Some(2));
         // The table is now drawn as a real bordered grid, so its rows start with
-        // the box border rather than the raw cell text — still no marker leakage.
-        assert!(table.starts_with("│"));
+        // the box border (after the hang) rather than the raw cell text — still
+        // no marker leakage.
+        assert!(table.starts_with("  │"));
         assert!(table.contains("Page"));
         assert!(!text.contains("|---|---|"));
         assert!(!text.contains("**Either**"));
@@ -14041,6 +14758,67 @@ mod tests {
     }
 
     #[test]
+    fn tool_card_children_are_indented_under_the_group_header() {
+        // A tool activity renders as a `⏺ Bash(...)` card, but it is always a
+        // CHILD of the agent-task group header (`⣻ Orchestrating…` / `• Agent
+        // task …`). Its bullet must be indented so it nests under the header
+        // instead of sitting flush at column 0 where it reads as a sibling
+        // (user report: "bash commands should be indented").
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("done")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_tool_call("wait-1")
+                .with_detail("curl -L https://example.com -o /tmp/x.dmg")
+                .with_success(true)
+                .with_output_preview("downloaded 120MB")
+                .with_duration_ms(3200),
+        );
+
+        // Expanded so the settled group shows its child rows (a live/running
+        // turn shows them too — same non-collapsed path the user hit).
+        app.expanded_tool_outputs = true;
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let rows = rendered_rows(&rendered_buffer(&app, palette));
+
+        let card_row = rows
+            .iter()
+            .find(|row| row.contains("Bash($ curl"))
+            .unwrap_or_else(|| panic!("no Bash card row; got:\n{}", rows.join("\n")));
+        assert!(
+            card_row.starts_with("  ⏺")
+                || card_row.starts_with("  ") && card_row.trim_start().starts_with('⏺'),
+            "the tool card bullet must be indented as a group child, got: {card_row:?}"
+        );
+        assert!(
+            !card_row.trim_end().starts_with("⏺"),
+            "the tool card must NOT be flush at column 0: {card_row:?}"
+        );
+
+        // The `⎿` output preview nests one step further under the indented card.
+        let preview_row = rows
+            .iter()
+            .find(|row| row.contains("downloaded 120MB"))
+            .expect("preview row");
+        assert!(
+            preview_row.starts_with("    ⎿"),
+            "the preview must nest under the indented card, got: {preview_row:?}"
+        );
+    }
+
+    #[test]
     fn render_activity_uses_action_keywords_for_wait_and_file_tools() {
         let mut app = AppState::new(
             vec![SessionView {
@@ -14863,7 +15641,7 @@ mod tests {
     }
 
     #[test]
-    fn render_diff_preview_modal_includes_status_files_and_hunks() {
+    fn render_diff_preview_modal_omits_default_status_and_source_labels() {
         let app = app_with_diff(DiffPreviewGetResult {
             status: "ready".into(),
             source: "pending_store".into(),
@@ -14900,8 +15678,21 @@ mod tests {
 
         assert!(text.contains("Diff Preview"));
         assert!(text.contains("Roman numeral patch"));
-        assert!(text.contains("ready"));
-        assert!(text.contains("pending_store"));
+        // The default single-variant labels ("ready" / "pending_store") must
+        // not render in the header. Slice the header region (the title through
+        // the hint line that immediately follows it) so the word "ready" in the
+        // unrelated bottom status bar can't mask a regression.
+        let title = text.find("Roman numeral patch").expect("title in header");
+        let hint = text.find("select hunk").expect("hint after header");
+        let header_region = &text[title..hint];
+        assert!(
+            !header_region.contains("ready"),
+            "default status label must be suppressed: {header_region:?}"
+        );
+        assert!(
+            !header_region.contains("pending_store"),
+            "default source label must be suppressed: {header_region:?}"
+        );
         assert!(text.contains("modified"));
         assert!(text.contains("src/roman.rs"));
         assert!(text.contains("@@ -1 +1 @@"));
@@ -15493,6 +16284,18 @@ mod tests {
     }
 
     #[test]
+    fn format_tokens_k_rounds_to_nearest_thousand() {
+        assert_eq!(format_tokens_k(0), "0K");
+        assert_eq!(format_tokens_k(499), "0K");
+        assert_eq!(format_tokens_k(500), "1K");
+        assert_eq!(format_tokens_k(12_000), "12K");
+        assert_eq!(format_tokens_k(174_763), "175K");
+        assert_eq!(format_tokens_k(2_000_000), "2000K");
+        // No overflow / correct rounding at the u64 ceiling.
+        assert_eq!(format_tokens_k(u64::MAX), "18446744073709552K");
+    }
+
+    #[test]
     fn render_autonomy_indicator_goal_only_renders_one_row() {
         let mut app = autonomy_app_state();
         let session_id = SessionKey("local:test".into());
@@ -15523,7 +16326,10 @@ mod tests {
         );
         assert!(text.contains("finish the OAuth refactor"));
         assert!(text.contains("active"));
-        assert!(text.contains("12000/50000"));
+        assert!(
+            text.contains("12K/50K"),
+            "goal tokens render in K units, got: {text}"
+        );
         assert!(!text.contains("Loops:"), "loops row must be hidden");
     }
 
@@ -15664,6 +16470,71 @@ mod tests {
         // A tiny window clamps to a full gauge rather than overflowing.
         app.session_context_window.insert(session_id.clone(), 1_000);
         assert_eq!(harness_context_ratio(&app), Some(1.0));
+    }
+
+    #[test]
+    fn harness_line_shows_the_persona_word_over_the_working_phase() {
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+        // Active turn (word keys to it) with a plain working phase.
+        let turn_id = octos_core::ui_protocol::TurnId::new();
+        app.sessions[0].live_reply = Some(crate::model::LiveReply {
+            turn_id: turn_id.clone(),
+            text: String::new(),
+        });
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 0,
+                pending_continuations: 0,
+                phase: Some("working".into()),
+            },
+        );
+        app.session_status_word
+            .insert(session_id.clone(), (turn_id.clone(), "Conjuring".into()));
+
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex), true)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            text.contains("Conjuring…"),
+            "persona word shows with ellipsis: {text:?}"
+        );
+        assert!(
+            !text.contains("Working"),
+            "the flat Working phase is replaced: {text:?}"
+        );
+
+        // A REAL orchestrating phase (sub-agents) keeps its informative label,
+        // not the decorative word.
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 2,
+                pending_continuations: 0,
+                phase: Some("orchestrating".into()),
+            },
+        );
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex), true)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            text.contains("Orchestrating"),
+            "orchestrating phase kept: {text:?}"
+        );
+        assert!(
+            !text.contains("Conjuring"),
+            "word does not mask a real phase: {text:?}"
+        );
     }
 
     #[test]
@@ -16469,11 +17340,11 @@ mod tests {
         ));
         let body = rendered
             .iter()
-            .position(|line| line == "Body one.")
+            .position(|line| line == "  Body one.")
             .expect("first segment body should render before the boundary");
         let heading = rendered
             .iter()
-            .position(|line| line == "Step 2")
+            .position(|line| line == "  Step 2")
             .expect("second segment heading should render as markdown");
 
         assert_eq!(
@@ -16543,8 +17414,8 @@ mod tests {
             .expect("first segment should render as assistant prose");
         let second = rendered
             .iter()
-            .position(|line| line == "Step 2: b." || line == "• Step 2: b.")
-            .expect("second segment should render as a discrete markdown block");
+            .position(|line| line == "  Step 2: b.")
+            .expect("second segment should render as a discrete hanging markdown block");
 
         assert_eq!(
             rendered.get(first + 1).map(String::as_str),
@@ -16559,6 +17430,480 @@ mod tests {
         assert!(
             !rendered.iter().any(|line| line.contains("a.Step 2")),
             "committed assistant segment boundary must prevent gluing: {rendered:#?}"
+        );
+    }
+
+    // ---- assistant body hanging indent ----
+    // The reference shape (Claude Code): the `• ` marker sits on the FIRST
+    // visual line of an assistant message, and EVERY other physical line of
+    // the same message — paragraphs, list items, headings, code rows, wrapped
+    // continuations — hangs two columns under it, so the body reads as one
+    // contiguous block. Blank separators stay truly blank.
+
+    /// The hanging indent must be exactly as wide as the `• ` marker, or the
+    /// continuation lines don't align under the first line's text.
+    #[test]
+    fn assistant_hanging_indent_matches_marker_display_width() {
+        assert_eq!(ASSISTANT_BODY_INDENT, "  ");
+        assert_eq!(ASSISTANT_BODY_INDENT.width(), "• ".width());
+    }
+
+    /// The user-reported shape: a committed multi-paragraph assistant message
+    /// used to drop every paragraph after the first back to column 0.
+    #[test]
+    fn committed_assistant_multi_paragraph_body_hangs_under_marker() {
+        let app = chat_app(vec![
+            Message::user("install android studio"),
+            Message::assistant(
+                "Homebrew is available. Let me install Android Studio via cask:\n\n\
+                 Homebrew has permission issues in this sandbox. Let me download directly:\n\n\
+                 The sandbox is blocking curl SSL and Homebrew. Let me try another way:",
+            ),
+        ]);
+        let rendered = line_texts(&finalized_history_lines_range(
+            &app,
+            Palette::for_theme(ThemeName::Slate),
+            100,
+            1,
+        ));
+        assert_eq!(
+            rendered,
+            vec![
+                "• Homebrew is available. Let me install Android Studio via cask:".to_string(),
+                "".into(),
+                "  Homebrew has permission issues in this sandbox. Let me download directly:"
+                    .into(),
+                "".into(),
+                "  The sandbox is blocking curl SSL and Homebrew. Let me try another way:".into(),
+            ],
+            "the whole body must hang under the marker"
+        );
+    }
+
+    /// A long single paragraph at a narrow wrap width: every wrapped
+    /// continuation row carries the 2-column hang, no row exceeds the wrap
+    /// width (unicode-width — CJK stays in budget), and no words are lost.
+    #[test]
+    fn assistant_wrapped_paragraph_rows_hang_and_fit_width() {
+        let body = "The sandbox is blocking curl SSL and Homebrew so the 安装过程 must fall \
+                    back to a manual download flow that keeps going for quite a while longer.";
+        for wrap_width in [24usize, 40, 61, 80] {
+            let mut lines = Vec::new();
+            push_message_block(
+                &mut lines,
+                Palette::for_theme(ThemeName::Slate),
+                "assistant",
+                body,
+                wrap_width,
+            );
+            let texts = line_texts(&lines);
+            assert!(
+                texts.len() > 1,
+                "wrap_width {wrap_width} must produce wrapped rows: {texts:#?}"
+            );
+            for (idx, (line, text)) in lines.iter().zip(&texts).enumerate() {
+                let w: usize = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref().width())
+                    .sum();
+                assert!(
+                    w <= wrap_width,
+                    "row {idx} width {w} exceeds wrap_width {wrap_width}: {text:?}"
+                );
+                if idx == 0 {
+                    assert!(
+                        text.starts_with("• "),
+                        "first row carries the marker: {text:?}"
+                    );
+                } else {
+                    assert!(
+                        text.starts_with("  ") && !text.starts_with("   "),
+                        "wrapped continuation rows hang at exactly 2 columns: {text:?}"
+                    );
+                }
+            }
+            let mut rejoined = texts
+                .iter()
+                .map(|text| text.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            rejoined = rejoined.trim_start_matches("• ").to_string();
+            assert_eq!(
+                rejoined.split_whitespace().collect::<Vec<_>>(),
+                body.split_whitespace().collect::<Vec<_>>(),
+                "wrapping must not drop or reorder words at wrap_width {wrap_width}"
+            );
+        }
+    }
+
+    /// The Claude-Code reference shape: a numbered-list body hangs its list
+    /// rows AND their wrapped continuations under the marker line.
+    #[test]
+    fn assistant_numbered_list_hangs_items_and_wrapped_continuations() {
+        let body = "Complete inventory, grouped by PR — the fixes:\n\n\
+                    1. session_cost was turn-scoped and needed to become cumulative across \
+                    the whole session lifetime\n\
+                    2. the summary row double-counted cache reads";
+        let wrap_width = 48usize;
+        let mut lines = Vec::new();
+        push_message_block(
+            &mut lines,
+            Palette::for_theme(ThemeName::Slate),
+            "assistant",
+            body,
+            wrap_width,
+        );
+        let texts = line_texts(&lines);
+        assert!(
+            texts[0].starts_with("• "),
+            "first row carries the marker: {texts:#?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.starts_with("  1. ")),
+            "list rows hang at 2 columns: {texts:#?}"
+        );
+        let item_row = texts
+            .iter()
+            .position(|text| text.starts_with("  1. "))
+            .expect("numbered item row");
+        assert!(
+            texts[item_row + 1].starts_with("  ") && !texts[item_row + 1].trim().is_empty(),
+            "the wrapped continuation of a long list item hangs too: {texts:#?}"
+        );
+        for (idx, (line, text)) in lines.iter().zip(&texts).enumerate() {
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref().width())
+                .sum();
+            assert!(
+                w <= wrap_width,
+                "row {idx} width {w} exceeds wrap_width {wrap_width}: {text:?}"
+            );
+            if text.trim().is_empty() {
+                assert_eq!(text, "", "blank separators stay truly blank: {texts:#?}");
+            } else if idx > 0 {
+                assert!(
+                    text.starts_with("  "),
+                    "every non-blank body row hangs: {text:?}"
+                );
+            }
+        }
+    }
+
+    /// A heading-first assistant message: the marker sits on the heading (the
+    /// first visual line, CC-style) and the rest of the body hangs.
+    #[test]
+    fn assistant_heading_first_body_carries_marker_on_heading() {
+        let mut lines = Vec::new();
+        push_message_block(
+            &mut lines,
+            Palette::for_theme(ThemeName::Slate),
+            "assistant",
+            "### Step 2\n\nNow I'll add a style block.",
+            80,
+        );
+        assert_eq!(
+            line_texts(&lines),
+            vec!["• Step 2", "", "  Now I'll add a style block."],
+            "the marker goes on the first visual line even when it is a heading"
+        );
+    }
+
+    /// Fenced code inside an assistant body: the frame rows and code rows all
+    /// hang under the marker line.
+    #[test]
+    fn assistant_code_block_rows_hang_under_marker() {
+        let mut lines = Vec::new();
+        push_message_block(
+            &mut lines,
+            Palette::for_theme(ThemeName::Slate),
+            "assistant",
+            "Run this:\n\n```rust\nfn main() {}\n```",
+            80,
+        );
+        let texts = line_texts(&lines);
+        assert_eq!(texts[0], "• Run this:");
+        assert!(
+            texts.iter().any(|text| text.starts_with("  ┌─ rust")),
+            "fence header hangs: {texts:#?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.starts_with("  │ fn main()")),
+            "code rows hang: {texts:#?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.starts_with("  └─")),
+            "fence footer hangs: {texts:#?}"
+        );
+    }
+
+    /// Live streaming lane: the hang applies mid-stream. The first batch
+    /// carries the marker; continuation batches hang every line and never
+    /// re-issue the bullet.
+    #[test]
+    fn live_reply_batches_hang_under_marker_mid_stream() {
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let mut first_batch = Vec::new();
+        push_live_reply_block(
+            &mut first_batch,
+            palette,
+            "Para one settled.\n\nPara two settled.",
+            80,
+            true,
+        );
+        assert_eq!(
+            line_texts(&first_batch),
+            vec!["• Para one settled.", "", "  Para two settled."],
+            "first batch: marker on line 1, later paragraphs hang"
+        );
+
+        let mut continuation = Vec::new();
+        push_live_reply_block(
+            &mut continuation,
+            palette,
+            "Para three keeps going.",
+            80,
+            false,
+        );
+        assert_eq!(
+            line_texts(&continuation),
+            vec!["  Para three keeps going."],
+            "continuation batches hang without re-issuing the bullet"
+        );
+    }
+
+    /// Scrollback-flush lane (immutable — must be right the first time): the
+    /// delta between two flush watermarks renders continuation chunks with the
+    /// hang, and a wrapped-at-flush-time long paragraph hangs its rows.
+    #[test]
+    fn scrollback_flush_delta_hangs_continuation_lines() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let text = "first block done.\n\nsecond block, which is long enough that a narrow \
+                    terminal must wrap it across several physical rows to fit.\n\n";
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("go")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: text.into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+
+        let wrap_width = 40usize;
+        let mut mid = LiveTurnFinalization::new(&session_id, &turn_id);
+        mid.reply_flushed_text = "first block done.\n\n".to_string();
+        let next = next_live_turn_finalization(&app, Some(&mid)).expect("watermark");
+        assert_eq!(next.reply_flushed_text, text, "fully settled text flushes");
+
+        let second_batch = finalized_live_turn_lines_between(
+            &app,
+            Palette::for_theme(ThemeName::Slate),
+            wrap_width,
+            &mid,
+            &next,
+        );
+        let texts = line_texts(&second_batch);
+        assert!(
+            texts.iter().filter(|text| !text.trim().is_empty()).count() > 1,
+            "the long continuation paragraph must wrap: {texts:#?}"
+        );
+        for (line, text) in second_batch.iter().zip(&texts) {
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref().width())
+                .sum();
+            assert!(
+                w <= wrap_width,
+                "flushed row width {w} exceeds wrap_width {wrap_width}: {text:?}"
+            );
+            if !text.trim().is_empty() {
+                assert!(
+                    text.starts_with("  ") && !text.starts_with("• "),
+                    "flushed continuation rows hang, no re-issued bullet: {text:?}"
+                );
+            }
+        }
+    }
+
+    /// Regression guard: the other roles keep their own prefix systems — no
+    /// 2-space hang leaks into user prompts or tool bodies.
+    #[test]
+    fn non_assistant_roles_keep_their_prefixes_unchanged() {
+        let palette = Palette::for_theme(ThemeName::Slate);
+
+        let mut user_lines = Vec::new();
+        push_message_block(&mut user_lines, palette, "user", "line one\nline two", 80);
+        assert_eq!(
+            line_texts(&user_lines),
+            vec!["▌ line one", "▌ line two"],
+            "user prompts keep the gutter, gain no hang"
+        );
+
+        let mut tool_lines = Vec::new();
+        push_message_block(
+            &mut tool_lines,
+            palette,
+            "tool",
+            "para one.\n\npara two.",
+            80,
+        );
+        assert_eq!(
+            line_texts(&tool_lines),
+            vec!["$ para one.", "$ ", "$ para two."],
+            "tool bodies keep their `$ ` gutter on every row, gain no hang"
+        );
+
+        let mut pending_lines = Vec::new();
+        push_formatted_body(
+            &mut pending_lines,
+            palette,
+            "queued question",
+            "› ",
+            None,
+            80,
+        );
+        assert_eq!(
+            line_texts(&pending_lines),
+            vec!["› queued question"],
+            "pending-message rows keep their `› ` prefix"
+        );
+    }
+
+    /// codex-review (r2 P2): tabs render as FOUR columns once
+    /// `insert_history` sanitizes scrollback, but the body used to be
+    /// measured with the raw `\t` (0–1 columns), so a tab-bearing code row
+    /// passed the pre-wrap check and was then re-wrapped to a column-zero
+    /// continuation at insert time — losing the hang. Assistant bodies must
+    /// sanitize (expand tabs, strip controls) BEFORE measuring, mirroring
+    /// insert_history's sanitize-first-wrap-after order, so rendered rows
+    /// carry no raw controls and stay within the wrap width post-expansion.
+    #[test]
+    fn assistant_body_expands_tabs_before_prewrap_measurement() {
+        let wrap_width = 16usize;
+        let mut lines = Vec::new();
+        push_message_block(
+            &mut lines,
+            Palette::for_theme(ThemeName::Slate),
+            "assistant",
+            "```\nab\tcdefgh\n```\n\nprose\twith tab",
+            wrap_width,
+        );
+        let texts = line_texts(&lines);
+        for (idx, (line, text)) in lines.iter().zip(&texts).enumerate() {
+            assert!(
+                !text.contains('\t') && !text.chars().any(char::is_control),
+                "row {idx} must carry no raw control characters: {text:?}"
+            );
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref().width())
+                .sum();
+            assert!(
+                w <= wrap_width,
+                "row {idx} width {w} exceeds wrap_width {wrap_width} after tab expansion: {texts:#?}"
+            );
+        }
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.starts_with("  ") && text.contains("cdefgh")),
+            "the tab-bearing code row still hangs: {texts:#?}"
+        );
+    }
+
+    /// Empty and whitespace-only assistant bodies stay inert (no marker-only
+    /// line, no panic).
+    #[test]
+    fn assistant_empty_and_whitespace_bodies_stay_inert() {
+        let palette = Palette::for_theme(ThemeName::Slate);
+
+        let mut empty_lines = Vec::new();
+        push_message_block(&mut empty_lines, palette, "assistant", "", 80);
+        assert_eq!(line_texts(&empty_lines), vec!["<empty>"]);
+
+        let mut blank_lines = Vec::new();
+        push_message_block(&mut blank_lines, palette, "assistant", "   ", 80);
+        assert!(
+            !line_texts(&blank_lines)
+                .iter()
+                .any(|text| text.contains('•')),
+            "a whitespace-only body must not render a dangling marker"
+        );
+    }
+
+    /// Scrollback-flush lane: consecutive PURE-activity delta flushes (each a
+    /// sub-agent completing mid-turn, no reply text between them) must stay
+    /// blank-separated in native scrollback. Regression for the "agent task
+    /// cards pack together" report — each delta flush builds a fresh buffer, so
+    /// the leading-blank guard inside `push_finalized_activity_items_section`
+    /// sees an empty buffer and is skipped, leaving cards abutting.
+    #[test]
+    fn consecutive_scrollback_agent_task_cards_are_blank_separated() {
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("go")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: "working".into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+
+        let mut tracker = ScrollbackTracker::new();
+        let mut inserted: Vec<Line<'static>> = Vec::new();
+        for (call, detail) in [("call-1", "first task"), ("call-2", "second task")] {
+            app.push_activity(
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_id.clone())
+                    .with_tool_call(call)
+                    .with_detail(detail)
+                    .with_success(true),
+            );
+            let update = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
+            inserted.extend(update.lines_to_insert);
+        }
+
+        let texts = line_texts(&inserted);
+        let cards = texts
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, text)| text.contains("Agent task completed").then_some(idx))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cards.len(),
+            2,
+            "both completions flush as their own scrollback card: {texts:#?}"
+        );
+        assert!(
+            texts[cards[0] + 1..cards[1]]
+                .iter()
+                .any(|text| text.trim().is_empty()),
+            "consecutive scrollback agent-task cards must be blank-separated: {texts:#?}"
         );
     }
 
@@ -16770,19 +18115,19 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                "1",
+                "  1",
                 "",
-                "I'll create demo.html with an HTML5 skeleton.",
+                "  I'll create demo.html with an HTML5 skeleton.",
                 "",
-                "Step 2",
+                "• Step 2",
                 "",
-                "• Now I'll add a style block.",
+                "  Now I'll add a style block.",
                 "",
-                "Step 3",
+                "• Step 3",
                 "",
-                "• Finally, I'll add an <h1>.",
+                "  Finally, I'll add an <h1>.",
             ],
-            "later assistant messages must render as fresh markdown blocks, not live-reply continuations"
+            "later assistant messages must render as fresh markdown blocks (own marker, hanging body), not live-reply continuations"
         );
     }
 
@@ -17163,6 +18508,89 @@ mod tests {
     }
 
     #[test]
+    fn status_shows_thinking_while_reasoning_then_working_once_answering() {
+        // User ask: the status must read "Thinking" while the octopus swims
+        // (reasoning started, no answer yet) and "Working" once the answer or
+        // a tool begins — the octopus and the label share one predicate.
+        // Reasoning phase: empty live_reply.text + non-empty live_reasoning.
+        let mut thinking = active_turn_app("");
+        let (sid, tid) = thinking
+            .active_turn()
+            .map(|(s, t)| (s.clone(), t.clone()))
+            .unwrap();
+        thinking
+            .live_reasoning
+            .insert((sid, tid), "reasoning about the request".to_string());
+        thinking.status = "ready".into(); // neutral status message
+        assert!(active_turn_is_thinking(&thinking), "predicate must be true");
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let rows = rendered_rows(&rendered_buffer(&thinking, palette));
+        let status = row_containing(&rows, " state ");
+        assert!(
+            status.contains("Thinking"),
+            "status bar must read Thinking: {status:?}"
+        );
+        assert!(
+            !status.contains("Working"),
+            "status bar not Working while thinking: {status:?}"
+        );
+
+        // Answer streaming: live_reply.text non-empty -> Working.
+        let mut answering = active_turn_app("here is the answer");
+        let (sid, tid) = answering
+            .active_turn()
+            .map(|(s, t)| (s.clone(), t.clone()))
+            .unwrap();
+        answering
+            .live_reasoning
+            .insert((sid, tid), "reasoning about the request".to_string());
+        answering.status = "ready".into();
+        assert!(!active_turn_is_thinking(&answering));
+        let rows = rendered_rows(&rendered_buffer(&answering, palette));
+        let status = row_containing(&rows, " state ");
+        assert!(
+            status.contains("Working"),
+            "status bar must read Working: {status:?}"
+        );
+        assert!(
+            !status.contains("Thinking"),
+            "status bar not Thinking while answering: {status:?}"
+        );
+
+        // In progress but NO reasoning yet (e.g. straight to tools) -> Working.
+        let mut no_reason = active_turn_app("");
+        no_reason.status = "ready".into();
+        assert!(!active_turn_is_thinking(&no_reason));
+        let rows = rendered_rows(&rendered_buffer(&no_reason, palette));
+        let status = row_containing(&rows, " state ");
+        assert!(
+            status.contains("Working"),
+            "no reasoning -> status bar Working: {status:?}"
+        );
+
+        // Reasoning present but run_state is Error -> the Error label is not
+        // masked by Thinking (codex P2).
+        let mut errored = active_turn_app("");
+        let (sid, tid) = errored
+            .active_turn()
+            .map(|(s, t)| (s.clone(), t.clone()))
+            .unwrap();
+        errored
+            .live_reasoning
+            .insert((sid, tid), "reasoning".to_string());
+        errored.status = "ready".into();
+        errored.run_state = SessionRunState::Error {
+            message: "boom".into(),
+        };
+        let rows = rendered_rows(&rendered_buffer(&errored, palette));
+        let status = row_containing(&rows, " state ");
+        assert!(
+            !status.contains("Thinking"),
+            "an Error state must not be masked by Thinking: {status:?}"
+        );
+    }
+
+    #[test]
     fn live_reasoning_before_answer_renders_swimming_octopus_without_text() {
         // Codex-style live render: with non-empty live_reasoning and NO answer
         // streamed yet, push_turn_flow surfaces a single dimmed swimming-octopus
@@ -17441,6 +18869,27 @@ mod tests {
         assert!(
             tall > short,
             "the cap scales with terminal height: {tall} vs {short}"
+        );
+    }
+
+    #[test]
+    fn long_stream_stays_half_capped_even_with_a_btw_aside_open() {
+        // Regression (codex P2 on the aside-height fix): raising the tail cap for
+        // a `/btw` aside must lift ONLY the aside's own reservation — a long
+        // in-flight stream behind a short aside must still be half-capped so it
+        // can't grow the viewport and displace scrollback.
+        let huge = (1..=80)
+            .map(|i| format!("para {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut app = active_turn_app(&huge);
+        let session_id = app.active_session().expect("active session").id.clone();
+        // A short aside (just "Answering…"), far smaller than half the screen.
+        app.set_btw_answering(&session_id, "quick q".into());
+        let tail = live_tail_height_with_finalization(&app, 80, 50, None);
+        assert!(
+            tail <= 25,
+            "a long stream must stay half-capped despite an open aside: {tail}"
         );
     }
 

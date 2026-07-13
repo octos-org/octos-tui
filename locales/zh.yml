@@ -81,7 +81,7 @@ app:
     goal_prefix: "目标："
     loops_running: "循环：%{count} 个活动中"
     loops_paused_suffix: " · %{count} 个已暂停"
-    goal_meta: " (%{status} · %{used}/%{budget} tokens)"
+    goal_meta: " (%{status} · %{used}/%{budget} Token)"
   statusbar:
     agents: "%{count} 个智能体"
     re_entering: "重新进入中"
@@ -109,6 +109,7 @@ app:
     state_label: "状态"
     idle: "空闲"
     working: "运行中"
+    thinking: "思考中"
     waiting: "等待中"
     blocked: "已阻塞"
     done: "已完成"
@@ -384,6 +385,8 @@ command:
   agents:
     desc: 查看或中断后端智能体
   aliases_label: 别名：
+  copy:
+    desc: 将最近一条助手回复复制到剪贴板（支持 SSH 环境）。
   cost:
     desc: 显示服务器报告的 token 和费用用量
   exit:
@@ -447,6 +450,23 @@ lang:
   unknown: 未知语言 '%{value}'。可选：en、zh。
   usage: 当前语言：%{current}。用法：/lang <en|zh>。
 menu:
+  availability:
+    approval_has_focus: 审批弹窗正占用键盘焦点
+    blocked_read_only: 只读模式下已阻止
+    feature_flag_disabled: "功能开关 `%{flag}` 已禁用"
+    feature_unavailable: "Octos UI 能力 `%{feature}` 不可用"
+    method_unavailable: "Octos UI 方法 `%{method}` 不可用"
+    method_unsupported: "不支持 Octos UI 方法 `%{method}`：%{reason}"
+    requires_active_turn: 需要活动的回合或后台任务
+    requires_approval_modal: 需要可见的审批弹窗
+    requires_disconnected: 需要断开连接模式
+    requires_idle_turn: 需要当前回合处于空闲状态
+    requires_mock_mode: 需要 mock 模式
+    requires_one_of: "需要以下方法之一：%{methods}"
+    requires_open_session: 需要打开的会话
+    requires_protocol_mode: 需要 protocol 模式
+    requires_ui_server: 需要已连接的 Octos UI 服务器
+    ui_unavailable: Octos UI 能力不可用
   component:
     footer: 空格 切换 | 回车 保存 | Esc 关闭
     preview_title: 预览
@@ -474,16 +494,23 @@ menu:
     title: 费用
     unavailable_no_session: 用量统计需要一个打开的 Octos UI 会话。
     unavailable_title: 费用不可用
+  empty: 没有可用选项
+  filter:
+    placeholder: 筛选选项
   footer:
     enter_apply_esc_close: 回车 应用 | Esc 关闭
     enter_run_esc_close: 回车 执行 | Esc 关闭
     esc_back: Esc 返回
     esc_close: Esc 关闭
+    multi: "上/下 移动 | Enter 确认 | Esc 取消"
+    select: "Enter 确认 | Esc 取消 | 上/下 移动"
   help:
     footer: 回车 打开/运行 | Esc 关闭
     search: 筛选命令
     subtitle: 命令由共享注册表解析。
     title: 斜杠命令
+  item:
+    default_suffix: " 默认"
   keymap:
     item:
       composer_delete_word:
@@ -759,6 +786,8 @@ menu:
     title: 供应商
     unavailable_title: 供应商不可用
   runtime_preview_title: 运行时
+  search:
+    label: "搜索 "
   skills:
     item:
       cache_empty:
@@ -894,6 +923,7 @@ menu:
     subtitle: 服务器端搜索、网页、浏览器和 MCP 工具设置。
     title: 工具设置
     unavailable_title: 工具设置不可用
+  unavailable: 菜单不可用
 status:
   opening_diff_preview: "正在打开差异预览：%{operation} %{path}"
   opening_inline_diff_preview: "正在打开内联差异预览：%{title}"
@@ -1228,6 +1258,8 @@ status:
   recovery_network_failed: "网络访问失败；请申请网络/代理/注册表权限，或使用离线回退方案"
   recovery_search_restricted: "搜索/抓取受限；请申请供应商配置，或在明确的离线告知下继续"
   diff_hunk_prompt: "将选中的差异代码块用作下一个编码轮次的上下文。\nfile: %{path}\nstatus: %{status}\nhunk: %{hunk}\n```diff\n"
+  summary_title: "会话摘要"
+  summary_error_label: "错误"
   summary_completed_no_answer: "会话摘要\n- 结果：轮次已完成，但 TUI 未收到最终的助手回答。\n- 活动：已记录 %{count} 个操作。\n- 文件改动：%{files}。\n- 验证：%{validation}。\n- 风险 / 后续：请查看上方活动，若所需回答不完整，请继续该轮次。"
   summary_partial_answer: "会话摘要\n- 结果：轮次已完成，但 TUI 仅收到部分实时回答。\n- 活动：已记录 %{count} 个操作。\n- 文件改动：%{files}。\n- 验证：%{validation}。\n- 风险 / 后续：服务器可能已持久化更完整的回答；若可见回答不完整，请继续。"
   summary_failed: "会话摘要\n- 结果：轮次在产生最终回答前失败。\n- 错误：%{code}：%{message}\n- 活动：已记录 %{count} 个操作。\n- 失败：%{failed}。\n- 风险 / 后续：请修复上方错误，或用更具体的指令继续该轮次。"

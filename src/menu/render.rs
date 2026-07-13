@@ -140,7 +140,7 @@ fn selection_view_from_spec(
     view.search_placeholder = spec.searchable.then(|| {
         spec.search_placeholder
             .clone()
-            .unwrap_or_else(|| "Filter options".into())
+            .unwrap_or_else(|| t!("menu.filter.placeholder").into_owned())
     });
     view.footer_hint = spec.footer_hint.clone();
     view.preview = spec.preview.as_ref().map(selection_preview_from_spec);
@@ -190,7 +190,7 @@ fn multi_select_view_from_spec(
     view.search_placeholder = spec.searchable.then(|| {
         spec.search_placeholder
             .clone()
-            .unwrap_or_else(|| "Filter options".into())
+            .unwrap_or_else(|| t!("menu.filter.placeholder").into_owned())
     });
     view.footer_hint = spec.footer_hint.clone();
     view.preview = spec.preview.as_ref().map(multi_select_preview_from_spec);

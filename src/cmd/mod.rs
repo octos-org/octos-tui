@@ -8,6 +8,7 @@
 //! runs it, returning the desired process exit code; otherwise it returns
 //! `None` and the caller proceeds to the normal TUI launch.
 
+pub mod config;
 pub mod doctor;
 pub mod github;
 pub mod install_method;
@@ -16,11 +17,12 @@ pub mod update;
 use clap::Parser;
 use eyre::Result;
 
+use config::{ConfigArgs, ConfigCli};
 use doctor::DoctorArgs;
 use update::UpdateArgs;
 
 /// Recognized subcommand names. Kept tiny so we never shadow a flag.
-const SUBCOMMANDS: &[&str] = &["update", "doctor"];
+const SUBCOMMANDS: &[&str] = &["update", "doctor", "config"];
 
 /// Inspect `argv` (excluding the program name) for a leading subcommand. If the
 /// first non-flag positional is `update`/`doctor`, run it and return its exit
@@ -38,6 +40,7 @@ where
     match route(&argv) {
         Some(Route::Update(args)) => Ok(Some(update::run(args)?.exit_code())),
         Some(Route::Doctor(args)) => Ok(Some(doctor::run(args)?)),
+        Some(Route::Config(args)) => Ok(Some(config::run(args)?)),
         None => Ok(None),
     }
 }
@@ -49,6 +52,7 @@ where
 enum Route {
     Update(UpdateArgs),
     Doctor(DoctorArgs),
+    Config(ConfigArgs),
 }
 
 /// Parse `argv` into a [`Route`] if it leads with a known subcommand; otherwise
@@ -67,6 +71,7 @@ fn route(argv: &[String]) -> Option<Route> {
     match first.as_str() {
         "update" => Some(Route::Update(UpdateCli::parse_from(&sub_argv).into_args())),
         "doctor" => Some(Route::Doctor(DoctorCli::parse_from(&sub_argv).into_args())),
+        "config" => Some(Route::Config(ConfigCli::parse_from(&sub_argv).into_args())),
         _ => unreachable!("guarded by SUBCOMMANDS"),
     }
 }
@@ -219,6 +224,38 @@ mod tests {
             args.data_dir.as_deref(),
             Some(std::path::Path::new("/tmp/x"))
         );
+    }
+
+    #[test]
+    fn route_recognizes_config_and_defaults_to_wizard() {
+        // Bare `config` → wizard action.
+        match route(&argv(&["octos-tui", "config"])) {
+            Some(Route::Config(args)) => {
+                assert!(matches!(args.action, config::ConfigAction::Wizard));
+            }
+            other => panic!("expected Route::Config, got {other:?}"),
+        }
+        // Explicit actions parse.
+        match route(&argv(&["octos-tui", "config", "path"])) {
+            Some(Route::Config(args)) => assert!(matches!(args.action, config::ConfigAction::Path)),
+            other => panic!("expected Route::Config(Path), got {other:?}"),
+        }
+        match route(&argv(&[
+            "octos-tui",
+            "config",
+            "show",
+            "--config",
+            "/tmp/c.json",
+        ])) {
+            Some(Route::Config(args)) => {
+                assert!(matches!(args.action, config::ConfigAction::Show));
+                assert_eq!(
+                    args.config.as_deref(),
+                    Some(std::path::Path::new("/tmp/c.json"))
+                );
+            }
+            other => panic!("expected Route::Config(Show), got {other:?}"),
+        }
     }
 
     #[test]

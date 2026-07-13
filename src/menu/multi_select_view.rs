@@ -208,7 +208,7 @@ fn render_item_list(view: &MultiSelectView, area: Rect, buf: &mut Buffer, palett
             .or(view.search_placeholder.as_deref())
             .unwrap_or_default();
         header.push(Line::from(vec![
-            Span::styled("Search ", palette.title()),
+            Span::styled(t!("menu.search.label").to_string(), palette.title()),
             Span::styled(query.to_string(), palette.text()),
         ]));
     }
@@ -239,7 +239,7 @@ fn item_rows(
     }
     if view.items.is_empty() {
         return vec![Line::from(Span::styled(
-            "No options available",
+            t!("menu.empty").to_string(),
             palette.muted(),
         ))];
     }
@@ -331,7 +331,7 @@ fn item_row(
         text.push_str(description);
     }
     if item.default {
-        text.push_str(" default");
+        text.push_str(&t!("menu.item.default_suffix"));
     }
 
     let mut spans = vec![Span::styled(fit_text(&text, width), style)];
@@ -389,8 +389,8 @@ fn render_footer(area: Rect, buf: &mut Buffer, palette: Palette, view: &MultiSel
     // Promise only what is wired: there is no Space-toggle or Alt+Up/Alt+Down
     // reorder handling anywhere (checkboxes render read-only), so the footer
     // must not advertise them.
-    let fallback = "Up/Down move | Enter confirm | Esc cancel";
-    let text = view.footer_hint.as_deref().unwrap_or(fallback);
+    let fallback = t!("menu.footer.multi");
+    let text = view.footer_hint.as_deref().unwrap_or(&fallback);
     Paragraph::new(Line::from(Span::styled(
         fit_text(text, usize::from(area.width)),
         palette.muted().bg(palette.surface),

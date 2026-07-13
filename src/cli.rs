@@ -445,6 +445,25 @@ pub fn save_ui_settings(
     scroll_mode: ScrollMode,
     vim_mode: bool,
 ) -> Result<()> {
+    let mut entries = serde_json::Map::new();
+    entries.insert("theme".into(), theme.as_str().into());
+    entries.insert("lang".into(), lang.code().into());
+    entries.insert("scroll-mode".into(), scroll_mode.as_str().into());
+    entries.insert("vim-mode".into(), vim_mode.into());
+    merge_into_config(path, &entries)
+}
+
+/// Merge `entries` (kebab-case config keys → JSON values) into the config file,
+/// PRESERVING whatever is already there: the existing JSON is read as a generic
+/// object and only these keys are patched, so any keys the caller didn't touch
+/// (transport, UI, unknown) survive. A missing or empty file starts from an
+/// empty object. For each kebab key written, the legacy snake_case alias is
+/// dropped so the canonical key is authoritative. This is the one write path
+/// behind both `/saveconfig` (UI keys) and `octos-tui config` (all keys).
+pub fn merge_into_config(
+    path: &Path,
+    entries: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
     let mut root = match fs::read_to_string(path) {
         Ok(contents) if contents.trim().is_empty() => {
             serde_json::Value::Object(serde_json::Map::new())
@@ -457,8 +476,8 @@ pub fn save_ui_settings(
         }
         // Any OTHER read error (permissions, invalid UTF-8, …) must NOT be
         // treated as empty: that would overwrite an existing config with only
-        // the UI keys, dropping the transport/unknown keys it otherwise
-        // preserves. Surface it so the save aborts instead of clobbering.
+        // these keys, dropping the ones it otherwise preserves. Surface it so
+        // the save aborts instead of clobbering.
         Err(error) => {
             return Err(error)
                 .wrap_err_with(|| format!("failed to read TUI config {}", path.display()));
@@ -467,13 +486,22 @@ pub fn save_ui_settings(
     let object = root
         .as_object_mut()
         .ok_or_else(|| eyre!("TUI config {} is not a JSON object", path.display()))?;
-    object.insert("theme".into(), theme.as_str().into());
-    object.insert("lang".into(), lang.code().into());
-    object.insert("scroll-mode".into(), scroll_mode.as_str().into());
-    object.insert("vim-mode".into(), vim_mode.into());
-    // Drop any legacy snake_case aliases so the canonical keys are authoritative.
-    object.remove("scroll_mode");
-    object.remove("vim_mode");
+    for (key, value) in entries {
+        // A `null` value means "remove this key" (JSON-merge-patch semantics),
+        // so the wizard can clear the unused transport when the user picks the
+        // other one; any other value is written as-is.
+        if value.is_null() {
+            object.remove(key);
+        } else {
+            object.insert(key.clone(), value.clone());
+        }
+        // Drop the legacy snake_case alias of any kebab key so the canonical
+        // key stays authoritative (e.g. writing `scroll-mode` removes a stale
+        // `scroll_mode`).
+        if key.contains('-') {
+            object.remove(&key.replace('-', "_"));
+        }
+    }
 
     if let Some(parent) = path
         .parent()
@@ -487,6 +515,13 @@ pub fn save_ui_settings(
     serialized.push('\n');
     fs::write(path, serialized)
         .wrap_err_with(|| format!("failed to write TUI config {}", path.display()))
+}
+
+/// The clap `Command` for the top-level TUI args — exposed so `octos-tui config`
+/// can introspect every option (help text, defaults, enum choices) and stay in
+/// sync as flags are added, rather than hand-mirroring the list.
+pub fn cli_command() -> clap::Command {
+    <CliArgs as clap::CommandFactory>::command()
 }
 
 pub fn parse_websocket_url(value: &str) -> std::result::Result<String, String> {

@@ -1,22 +1,36 @@
 class OctosTui < Formula
   desc "Terminal UI client for the Octos UI Protocol"
   homepage "https://github.com/octos-org/octos-tui"
-  version "0.1.5"
+  version "0.2.1"
   if OS.mac? && Hardware::CPU.arm?
-    url "https://github.com/octos-org/octos-tui/releases/download/v0.1.5/octos-tui-aarch64-apple-darwin.tar.xz"
-    sha256 "e3c13442cf8f6e90562cf51b2c7dea960d79b18ae5b2b8ec0ca565ffb5d4c498"
+    url "https://github.com/octos-org/octos-tui/releases/download/v0.2.1/octos-tui-aarch64-apple-darwin.tar.xz"
+    sha256 "1cd65a06cef6b8f6e969be74228aa87481cd55259f1c0998972a29f49f4b42e4"
   end
   if OS.linux?
     if Hardware::CPU.arm?
-      url "https://github.com/octos-org/octos-tui/releases/download/v0.1.5/octos-tui-aarch64-unknown-linux-gnu.tar.xz"
-      sha256 "eaa6956add9fa3ecab33d851cb52da46e9e980e3ac957f43f77cc6db05baf410"
+      url "https://github.com/octos-org/octos-tui/releases/download/v0.2.1/octos-tui-aarch64-unknown-linux-gnu.tar.xz"
+      sha256 "80853d88417220994e711dcadd197a7b34f33d8d63b3ab7f695e05fb16269e17"
     end
     if Hardware::CPU.intel?
-      url "https://github.com/octos-org/octos-tui/releases/download/v0.1.5/octos-tui-x86_64-unknown-linux-gnu.tar.xz"
-      sha256 "d97fbc0efc35a573844801192951fc8f796bf8ebcbaab0aa69155057e3926730"
+      url "https://github.com/octos-org/octos-tui/releases/download/v0.2.1/octos-tui-x86_64-unknown-linux-gnu.tar.xz"
+      sha256 "f5c73fe15cfd5323fcc6e21f317cf9fbf48703ae140a4deaee053dc50cd872eb"
     end
   end
   license "Apache-2.0"
+
+  # octos-tui is a CLIENT; a local launch spawns `octos serve --stdio` as its
+  # backend. We deliberately do NOT `depends_on "octos-org/octos/octos"`: Homebrew
+  # does not auto-tap third-party dependency taps, so that would abort the
+  # install with "tap must be installed explicitly". Instead the tui
+  # auto-installs the octos server on first run if it's missing (see caveats).
+  def caveats
+    <<~EOS
+      octos-tui talks to the `octos` server backend. If octos isn't installed,
+      octos-tui installs the latest release automatically on first run
+      (set OCTOS_TUI_NO_AUTO_INSTALL=1 to disable). To install it up front:
+        brew install octos-org/octos/octos
+    EOS
+  end
 
   BINARY_ALIASES = {
     "aarch64-apple-darwin":      {},

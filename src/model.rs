@@ -3367,6 +3367,13 @@ pub struct AppState {
     /// Cleared on the session's next non-retry progress event so a settled
     /// turn doesn't linger as "retrying".
     pub session_retry: std::collections::HashMap<SessionKey, UiRetryBackoff>,
+    /// Latest whimsical persona status word per session, keyed with the
+    /// TURN it belongs to (from the server's `progress/updated{kind:
+    /// "status_word"}` rotator, e.g. "Conjuring" / "正在炼丹"). Rendered in the
+    /// harness gradient line above the composer only while it matches the
+    /// active turn — so a stale word from a prior turn (or a server-started
+    /// continuation) is ignored rather than lingering.
+    pub session_status_word: std::collections::HashMap<SessionKey, (TurnId, String)>,
     /// Per-session reasoning/thinking effort chosen via the `/thinking` command,
     /// keyed by `SessionKey` so each session keeps its own level. Attached to
     /// every `turn/start` for that session; absent = use the server
@@ -3522,6 +3529,18 @@ pub struct AppState {
     pub turn_started_at: std::collections::HashMap<(SessionKey, TurnId), std::time::Instant>,
     /// Latest `/btw` aside per session (see [`BtwAside`]).
     pub btw_asides: std::collections::HashMap<SessionKey, BtwAside>,
+    /// One-shot request to re-flush the transcript into terminal scrollback
+    /// on the next draw. Set when a tall live-region pane (the `/btw` aside)
+    /// is dismissed: the viewport shrink strands a blank band between the
+    /// transcript tail and the composer that nothing refills once the turn
+    /// is settled. Consumed by the event loop, which marks the scrollback
+    /// tracker stale so the same frame re-inserts the transcript over the
+    /// vacated rows (the same machinery a width-resize uses). The scope is
+    /// captured AT DISMISSAL TIME — a `TurnCompleted` draining before the
+    /// next draw must not demote a mid-stream dismissal to the committed-
+    /// only path, whose live-dedup would re-insert only the post-prefix
+    /// suffix and leave the band (codex P2 round 3).
+    pub transcript_reflush_requested: Option<TranscriptReflushScope>,
     pub expanded_tool_outputs: bool,
     pub menu_stack: MenuStack,
     pub active_menu: Option<MenuBuildResult>,
@@ -3601,6 +3620,36 @@ pub struct AppState {
     /// instead of clobbering the live composer. Local-only, preserved across
     /// snapshot replays.
     pub pending_rewind_prefill: Option<(SessionKey, String)>,
+    /// Prompts of turns the user interrupted (Esc/Ctrl+C), stashed until each
+    /// turn actually SETTLES (its `turn/completed`/`turn/error` terminal, or
+    /// the hydrate finalize after a backend restart). Restoring at
+    /// interrupt-REQUEST time filled the composer while the turn was still
+    /// streaming, and a non-empty composer silently blocks the `/` slash
+    /// popup (it only opens on an empty composer) — the reported "slash menu
+    /// is not usable while the LLM is outputting". At most ONE entry per
+    /// session (flat `Vec`, consistent with `permission_profiles` /
+    /// `session_runtime_statuses` neighbours; codex round-2 P2: a single
+    /// global slot let session B's interrupt overwrite session A's). Applied
+    /// by the settle handlers into the live composer (active session,
+    /// still-empty composer, no open menu), or into the session's saved draft
+    /// when the user switched away (the `pending_rewind_prefill` convention);
+    /// an entry is dropped when staged messages own its session's next turn
+    /// slot or a newer turn/submit supersedes it. Local-only, preserved
+    /// across snapshot replays.
+    pub pending_interrupt_restores: Vec<PendingInterruptRestore>,
+}
+
+/// See [`AppState::pending_interrupt_restores`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInterruptRestore {
+    pub session_id: SessionKey,
+    pub turn_id: TurnId,
+    pub prompt: String,
+    /// The turn's terminal already arrived but a menu was open at that
+    /// moment, so the composer fill was deferred once more (codex round-3
+    /// P2: consuming it there lost the prompt permanently). A settled entry
+    /// applies when the menu stack empties.
+    pub settled: bool,
 }
 
 /// M16-G2 per-session lifecycle ledger entry. The TUI keeps these in
@@ -3744,6 +3793,19 @@ pub enum BtwAsideState {
     Answering,
     Answered(String),
     Failed(String),
+}
+
+/// Scope of a pending one-shot transcript re-flush (see
+/// `AppState::transcript_reflush_requested`): whether the dismissal happened
+/// while the session's main turn was still streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptReflushScope {
+    /// Turn settled at dismissal — committed-only re-flush (live dedup
+    /// watermarks preserved).
+    CommittedOnly,
+    /// Main turn still streaming at dismissal — re-emit the coherent
+    /// committed+live block.
+    WithLive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5272,6 +5334,7 @@ impl AppState {
             session_context_window: std::collections::HashMap::new(),
             completed_turns: std::collections::HashMap::new(),
             session_retry: std::collections::HashMap::new(),
+            session_status_word: std::collections::HashMap::new(),
             session_reasoning_effort: std::collections::HashMap::new(),
             session_reasoning_display: std::collections::HashSet::new(),
             finalized_by_switch: std::collections::HashMap::new(),
@@ -5323,6 +5386,7 @@ impl AppState {
             turn_activity_summaries: Vec::new(),
             turn_started_at: std::collections::HashMap::new(),
             btw_asides: std::collections::HashMap::new(),
+            transcript_reflush_requested: None,
             expanded_tool_outputs: false,
             menu_stack: MenuStack::new(),
             active_menu: None,
@@ -5349,6 +5413,7 @@ impl AppState {
             resume_list_loaded: false,
             rewind_turns: Vec::new(),
             pending_rewind_prefill: None,
+            pending_interrupt_restores: Vec::new(),
         }
     }
 
@@ -6435,6 +6500,7 @@ impl AppState {
             .is_some_and(|aside| !matches!(aside.state, BtwAsideState::Answering))
         {
             self.btw_asides.remove(session_id);
+            self.request_transcript_reflush(session_id);
         }
     }
 
@@ -6444,7 +6510,41 @@ impl AppState {
     /// aside — the user chose to leave; a late answer for a dismissed aside
     /// is dropped by `set_btw_answered`'s state guard.
     pub fn dismiss_btw_aside(&mut self, session_id: &SessionKey) -> bool {
-        self.btw_asides.remove(session_id).is_some()
+        let removed = self.btw_asides.remove(session_id).is_some();
+        if removed {
+            self.request_transcript_reflush(session_id);
+        }
+        removed
+    }
+
+    /// Record the one-shot re-flush request, capturing the dismissal-time
+    /// streaming scope (see the field docs): a live reply in flight for the
+    /// session means the frame must re-emit the coherent committed+live
+    /// block, and that decision must survive the turn settling before the
+    /// next draw.
+    fn request_transcript_reflush(&mut self, session_id: &SessionKey) {
+        let live_streaming = self
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .is_some_and(|session| session.live_reply.is_some());
+        let scope = if live_streaming {
+            TranscriptReflushScope::WithLive
+        } else {
+            TranscriptReflushScope::CommittedOnly
+        };
+        // A WithLive request must not be demoted by a same-frame settled
+        // dismissal of another pane; keep the stronger scope.
+        self.transcript_reflush_requested = match self.transcript_reflush_requested {
+            Some(TranscriptReflushScope::WithLive) => Some(TranscriptReflushScope::WithLive),
+            _ => Some(scope),
+        };
+    }
+
+    /// One-shot take of the pending transcript re-flush request (see the
+    /// field docs) — returns a value at most once per request.
+    pub fn take_transcript_reflush_request(&mut self) -> Option<TranscriptReflushScope> {
+        self.transcript_reflush_requested.take()
     }
 
     /// Count of the session's still-running background work (pending/running

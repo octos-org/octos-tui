@@ -18,6 +18,20 @@ class OctosTui < Formula
   end
   license "Apache-2.0"
 
+  # octos-tui is a CLIENT; a local launch spawns `octos serve --stdio` as its
+  # backend. We deliberately do NOT `depends_on "octos-org/octos/octos"`: Homebrew
+  # does not auto-tap third-party dependency taps, so that would abort the
+  # install with "tap must be installed explicitly". Instead the tui
+  # auto-installs the octos server on first run if it's missing (see caveats).
+  def caveats
+    <<~EOS
+      octos-tui talks to the `octos` server backend. If octos isn't installed,
+      octos-tui installs the latest release automatically on first run
+      (set OCTOS_TUI_NO_AUTO_INSTALL=1 to disable). To install it up front:
+        brew install octos-org/octos/octos
+    EOS
+  end
+
   BINARY_ALIASES = {
     "aarch64-apple-darwin":      {},
     "aarch64-unknown-linux-gnu": {},
