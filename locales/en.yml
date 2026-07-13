@@ -262,6 +262,7 @@ onboarding:
     subtitle: "Set up a local solo profile to continue."
     continue: "Continue"
     create_action: "Create profile"
+    family_desc: "Enter to pick your model family — it suggests a profile name (e.g. glm)."
     footer: "Up/Down choose | Enter edit or continue | type value, Enter save"
   language:
     title: "Choose Language"

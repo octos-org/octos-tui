@@ -250,6 +250,7 @@ onboarding:
     subtitle: "设置本地单人档案以继续。"
     continue: "继续"
     create_action: "创建档案"
+    family_desc: "回车选择模型系列 —— 会据此建议档案名称（例如 glm）。"
     footer: "上/下 选择 | 回车 编辑或继续 | 输入后回车保存"
   language:
     title: "选择语言"

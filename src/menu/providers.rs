@@ -1062,7 +1062,12 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let current_profile = ctx.app.current_profile;
     let local_profile_create = local_profile_create_supported(ctx);
     if local_profile_create && state.effective_profile_id(current_profile).is_none() {
-        return onboarding_local_profile_menu(state, local_profile_requested_id_supported(ctx));
+        return onboarding_local_profile_menu(
+            state,
+            local_profile_requested_id_supported(ctx),
+            ctx.availability
+                .supports_method(APPUI_METHOD_PROFILE_LLM_CATALOG),
+        );
     }
     if state.effective_profile_id(current_profile).is_some() {
         return onboarding_provider_setup_menu(ctx, state, current_profile);
@@ -1812,6 +1817,7 @@ fn onboarding_next_action_hint(
 fn onboarding_local_profile_menu(
     state: &OnboardingWizardState,
     requested_id_supported: bool,
+    catalog_supported: bool,
 ) -> MenuBuildResult {
     let mut items = vec![
         onboarding_language_row(),
@@ -1828,6 +1834,26 @@ fn onboarding_local_profile_menu(
         // step to ONE prompt — "Name this profile" — pre-suggesting a value from
         // the chosen provider/model family. The user accepts the suggestion with
         // a single keypress on Continue, or edits it first.
+        //
+        // The suggestion is only meaningful once a family is picked, and the
+        // profile step runs BEFORE provider setup — so offer the family choice
+        // here (when the catalog is available). Picking `glm` here makes the
+        // name row suggest `glm`; selecting the family returns to this step
+        // (see `SetFamilyId`) rather than diving into model/route setup.
+        if catalog_supported {
+            items.push(
+                MenuItem::new(
+                    "onboard.local.family",
+                    format!(
+                        "{}: {}",
+                        t!("menu.onboard.item.family.label"),
+                        onboarding_family_label(state, None)
+                    ),
+                    MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY)),
+                )
+                .with_description(t!("onboarding.local.family_desc")),
+            );
+        }
         items.push(onboarding_requested_id_row(state));
     } else {
         // Legacy fallback for older servers that do not advertise the nameable
@@ -5773,7 +5799,7 @@ mod tests {
     #[test]
     fn profile_step_shows_single_name_prompt_when_requested_id_supported() {
         let state = OnboardingWizardState::default();
-        let spec = ready_spec(onboarding_local_profile_menu(&state, true));
+        let spec = ready_spec(onboarding_local_profile_menu(&state, true, false));
 
         assert!(
             has_row(&spec, "onboard.local.requested_id"),
@@ -5798,9 +5824,52 @@ mod tests {
     }
 
     #[test]
+    fn profile_step_offers_family_choice_when_catalog_supported() {
+        // With the catalog available, the nameable step offers a family choice
+        // BEFORE the name prompt so the suggested id can derive from it.
+        let state = OnboardingWizardState::default();
+        let spec = ready_spec(onboarding_local_profile_menu(&state, true, true));
+
+        let family_pos = spec
+            .items
+            .iter()
+            .position(|i| i.id == "onboard.local.family");
+        let name_pos = spec
+            .items
+            .iter()
+            .position(|i| i.id == "onboard.local.requested_id");
+        assert!(family_pos.is_some(), "family choice row present");
+        assert!(
+            family_pos < name_pos,
+            "family is chosen before the name is prompted"
+        );
+        // No catalog → no family row (falls back to the plain name prompt).
+        let no_catalog = ready_spec(onboarding_local_profile_menu(&state, true, false));
+        assert!(!has_row(&no_catalog, "onboard.local.family"));
+    }
+
+    #[test]
+    fn profile_step_name_row_reflects_chosen_family_suggestion() {
+        // After a family is staged, the Name row pre-fills `/onboard
+        // profile-name <suggestion>` derived from it (glm, not octos).
+        let mut state = OnboardingWizardState::default();
+        state.provider.family_id = "glm-4.6".into();
+        let spec = ready_spec(onboarding_local_profile_menu(&state, true, true));
+        let name_row = spec
+            .items
+            .iter()
+            .find(|i| i.id == "onboard.local.requested_id")
+            .expect("name row present");
+        let MenuAction::Local(LocalAction::EditComposer(draft)) = &name_row.action else {
+            panic!("name row edits the composer");
+        };
+        assert_eq!(draft, "/onboard profile-name glm");
+    }
+
+    #[test]
     fn profile_step_falls_back_to_full_fields_without_feature() {
         let state = OnboardingWizardState::default();
-        let spec = ready_spec(onboarding_local_profile_menu(&state, false));
+        let spec = ready_spec(onboarding_local_profile_menu(&state, false, true));
 
         assert!(
             has_row(&spec, "onboard.local.name")
@@ -5812,6 +5881,8 @@ mod tests {
             !has_row(&spec, "onboard.local.requested_id"),
             "legacy flow has no requested_id prompt"
         );
+        // The family choice is nameable-flow only.
+        assert!(!has_row(&spec, "onboard.local.family"));
     }
 
     #[test]
