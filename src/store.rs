@@ -7063,17 +7063,60 @@ impl Store {
         self.state.status = event.message;
     }
 
-    fn apply_profile_llm_list_event(&mut self, event: ProfileLlmListClientEvent) {
-        if self.state.onboarding.profile_id.is_none() {
-            if let Some(profile_id) = event
-                .result
-                .profile_id
-                .as_deref()
-                .and_then(|profile_id| non_empty_string(profile_id.to_owned()))
-            {
-                self.state.onboarding.profile_id = Some(profile_id);
-            }
+    /// True while first-launch onboarding is resolving the profile through
+    /// legacy email-OTP (`send_code`/`verify`/`me`) and auth is NOT yet done:
+    /// no session, no local-solo support, legacy auth advertised, and the
+    /// profile still unresolved (auth not verified). While this holds, a
+    /// pre-auth startup reply (`profile/llm/list` / skills) must be IGNORED —
+    /// not just for the `onboarding.profile_id` seed but for `profile_llm_state`
+    /// / `profile_skills` too, since `current_profile_for_onboarding` derives the
+    /// resolved profile from any of them and would flip the menu to provider
+    /// setup, dropping the OTP rows. Once OTP auth resolves the profile
+    /// (`apply_auth_me` sets `profile_id` + `auth_verified`), this is false and
+    /// hydration proceeds normally.
+    fn legacy_otp_first_launch_active(&self) -> bool {
+        if !self.state.sessions.is_empty()
+            || self.local_profile_create_supported()
+            || self.state.onboarding.profile_id.is_some()
+            || self.state.onboarding.auth_verified
+        {
+            return false;
         }
+        self.state
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                crate::menu::registry::APPUI_FIRST_LAUNCH_LEGACY_AUTH_METHODS
+                    .iter()
+                    .all(|method| capabilities.supports_method(method))
+            })
+    }
+
+    /// Pre-resolve `onboarding.profile_id` from a startup reply that echoes a
+    /// profile id (e.g. a `--profile-id` launch's bootstrap `profile/llm/list`),
+    /// when it is not already resolved. Callers gate the legacy-OTP case via
+    /// [`Self::legacy_otp_first_launch_active`] before invoking this.
+    fn maybe_seed_onboarding_profile_id(&mut self, reply_profile_id: Option<&str>) {
+        if self.state.onboarding.profile_id.is_some() {
+            return;
+        }
+        if let Some(profile_id) =
+            reply_profile_id.and_then(|profile_id| non_empty_string(profile_id.to_owned()))
+        {
+            self.state.onboarding.profile_id = Some(profile_id);
+        }
+    }
+
+    fn apply_profile_llm_list_event(&mut self, event: ProfileLlmListClientEvent) {
+        // Legacy email-OTP first-launch: ignore a pre-auth reply entirely so the
+        // profile stays unresolved (both the seed AND profile_llm_state, which
+        // resolves it via current_profile_for_onboarding) and the OTP rows
+        // survive until auth completes. Re-fetched post-auth via the hydrate
+        // command once the profile legitimately resolves.
+        if self.legacy_otp_first_launch_active() {
+            return;
+        }
+        self.maybe_seed_onboarding_profile_id(event.result.profile_id.as_deref());
         self.state.profile_llm_state = Some(event.result.clone());
         if let Some(session_id) = self.active_session().map(|session| session.id.clone()) {
             self.state.set_model_catalog(SessionModelCatalog {
@@ -7177,16 +7220,13 @@ impl Store {
     }
 
     fn apply_profile_skills_list_event(&mut self, event: ProfileSkillsListClientEvent) {
-        if self.state.onboarding.profile_id.is_none() {
-            if let Some(profile_id) = event
-                .result
-                .profile_id
-                .as_deref()
-                .and_then(|profile_id| non_empty_string(profile_id.to_owned()))
-            {
-                self.state.onboarding.profile_id = Some(profile_id);
-            }
+        // See `apply_profile_llm_list_event`: ignore a pre-auth reply during
+        // legacy email-OTP first-launch so it does not resolve the profile
+        // (`profile_skills` also feeds `current_profile_for_onboarding`).
+        if self.legacy_otp_first_launch_active() {
+            return;
         }
+        self.maybe_seed_onboarding_profile_id(event.result.profile_id.as_deref());
         self.state.profile_skills = Some(event.result);
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
@@ -7200,16 +7240,13 @@ impl Store {
         &mut self,
         event: ProfileSkillsRegistrySearchClientEvent,
     ) {
-        if self.state.onboarding.profile_id.is_none() {
-            if let Some(profile_id) = event
-                .result
-                .profile_id
-                .as_deref()
-                .and_then(|profile_id| non_empty_string(profile_id.to_owned()))
-            {
-                self.state.onboarding.profile_id = Some(profile_id);
-            }
+        // See `apply_profile_llm_list_event`: ignore a pre-auth reply during
+        // legacy email-OTP first-launch (it also feeds
+        // `current_profile_for_onboarding` via `profile_skill_registry`).
+        if self.legacy_otp_first_launch_active() {
+            return;
         }
+        self.maybe_seed_onboarding_profile_id(event.result.profile_id.as_deref());
         self.state.profile_skill_registry = Some(event.result);
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
@@ -15745,6 +15782,40 @@ mod tests {
         })
     }
 
+    /// Capabilities for a LEGACY email-OTP backend: advertises the auth OTP
+    /// methods but NOT `profile/local/create`.
+    fn legacy_auth_capabilities_event() -> ClientEvent {
+        ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[
+                        crate::model::APPUI_METHOD_AUTH_STATUS,
+                        crate::model::APPUI_METHOD_AUTH_SEND_CODE,
+                        crate::model::APPUI_METHOD_AUTH_VERIFY,
+                        crate::model::APPUI_METHOD_AUTH_ME,
+                    ],
+                    &[],
+                ),
+            },
+            message: "Octos UI capabilities refreshed: 4 methods".into(),
+        })
+    }
+
+    fn assert_active_menu_has_row(store: &Store, row_id: &str) {
+        let menu = store
+            .state
+            .active_menu
+            .as_ref()
+            .expect("an onboarding menu is built");
+        let MenuBuildResult::Ready(spec) = menu else {
+            panic!("expected a ready menu, got {menu:?}");
+        };
+        assert!(
+            spec.items.iter().any(|item| item.id == row_id),
+            "active menu is missing row `{row_id}`"
+        );
+    }
+
     #[test]
     fn first_launch_opens_picker_when_multiple_profiles_and_no_pin() {
         let mut store = protocol_store_without_sessions();
@@ -15789,46 +15860,52 @@ mod tests {
     #[test]
     fn first_launch_legacy_pin_keeps_otp_surface_and_does_not_pre_resolve() {
         // A LEGACY email-OTP server (send_code/verify/me, NO profile/local/create)
-        // launched with --profile-id must NOT pre-resolve the profile: doing so
-        // would make onboarding_menu render provider setup and skip the OTP rows,
-        // leaving the first-launch menu with no way to authenticate.
+        // launched with --profile-id must NOT pre-resolve the profile via the
+        // decision arm: doing so would make onboarding_menu render provider setup
+        // and skip the OTP rows, leaving the menu with no way to authenticate.
         let mut store = protocol_store_without_sessions();
         store.state.onboarding.launch_profile_id = Some("coding".into());
 
-        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
-            result: crate::model::ConfigCapabilitiesListResult {
-                capabilities: UiProtocolCapabilities::new(
-                    &[
-                        crate::model::APPUI_METHOD_AUTH_STATUS,
-                        crate::model::APPUI_METHOD_AUTH_SEND_CODE,
-                        crate::model::APPUI_METHOD_AUTH_VERIFY,
-                        crate::model::APPUI_METHOD_AUTH_ME,
-                    ],
-                    &[],
-                ),
-            },
-            message: "Octos UI capabilities refreshed: 4 methods".into(),
-        }));
+        store.apply_client_event(legacy_auth_capabilities_event());
 
         assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
         assert!(
             store.state.onboarding.profile_id.is_none(),
             "legacy pin must not pre-resolve the profile before OTP completes"
         );
-        // The rendered onboarding surface still offers the OTP auth path
-        // (send-code / verify rows), not provider setup.
-        let menu = store
-            .state
-            .active_menu
-            .as_ref()
-            .expect("onboarding menu built");
-        let MenuBuildResult::Ready(spec) = menu else {
-            panic!("expected a ready legacy onboarding menu, got {menu:?}");
-        };
+        // The rendered onboarding surface still offers the OTP auth path.
+        assert_active_menu_has_row(&store, "onboard.auth.send");
+    }
+
+    #[test]
+    fn legacy_profile_llm_list_during_onboarding_keeps_otp_surface() {
+        // The SECOND path: a `--profile-id` protocol launch's bootstrap requests
+        // `profile/llm/list`; on a legacy server that reply must NOT pre-resolve
+        // the profile (which would flip the open first-launch menu to provider
+        // setup and drop the OTP rows). Reproduce the ordering: legacy caps open
+        // OTP onboarding, THEN the pre-auth list reply lands.
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.launch_profile_id = Some("coding".into());
+        store.apply_client_event(legacy_auth_capabilities_event());
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+
+        store.apply_client_event(ClientEvent::ProfileLlmList(ProfileLlmListClientEvent {
+            result: crate::model::ProfileLlmListResult {
+                profile_id: Some("coding".into()),
+                primary: None,
+                fallbacks: Vec::new(),
+                llm: None,
+                runtime_policy_stamp: None,
+            },
+            message: "Loaded profile LLM settings".into(),
+        }));
+
         assert!(
-            spec.items.iter().any(|item| item.id == "onboard.auth.send"),
-            "legacy --profile-id launch must keep the OTP send-code row"
+            store.state.onboarding.profile_id.is_none(),
+            "pre-auth profile/llm/list must not pre-resolve the profile on legacy"
         );
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+        assert_active_menu_has_row(&store, "onboard.auth.send");
     }
 
     #[test]
