@@ -112,6 +112,11 @@ impl Lang {
     }
 }
 
+/// The stdio backend command a bare launch defaults to (and that
+/// `backend_ensure` auto-provisions). Mirrors the documented
+/// `octos serve --stdio --solo`.
+pub const DEFAULT_STDIO_COMMAND: &str = "octos serve --stdio --solo";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cli {
     /// JSON config file used as launch defaults.
@@ -316,19 +321,24 @@ impl Cli {
             file_config.readonly.unwrap_or(false)
         };
 
-        // Mode resolution: explicit (CLI flag, then config) always wins.
-        // When neither sets a mode but a transport IS configured
-        // (stdio-command or endpoint), infer Protocol — otherwise
-        // `octos-tui --stdio-command '…'` would silently launch the MOCK
-        // backend and ignore the transport. Mock stays the default only
-        // for a transport-less launch.
-        let mode = args.mode.or(file_config.mode).unwrap_or_else(|| {
-            if stdio_command.is_some() || base_url.is_some() {
-                Mode::Protocol
+        // Mode resolution: an explicit mode (CLI flag, then config) always
+        // wins. With NO explicit mode, default to the real backend
+        // (`Protocol`) — a bare `octos-tui` launch spawns/auto-provisions
+        // `octos serve --stdio` (see `backend_ensure`) rather than the mock
+        // demo. The mock is now reachable only via an explicit `--mode mock`
+        // or `"mode": "mock"` in config.
+        let mode = args.mode.or(file_config.mode).unwrap_or(Mode::Protocol);
+
+        // A Protocol launch with no transport configured (the bare case, or a
+        // lone `--mode protocol`) gets the default stdio command, which
+        // `backend_ensure` provisions. An explicit `--endpoint`/`--stdio-command`
+        // is honored as-is; Mock needs no transport.
+        let stdio_command =
+            if mode == Mode::Protocol && stdio_command.is_none() && base_url.is_none() {
+                Some(DEFAULT_STDIO_COMMAND.to_string())
             } else {
-                Mode::Mock
-            }
-        });
+                stdio_command
+            };
 
         Ok(Self {
             config: args.config,
@@ -742,13 +752,27 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_mock_mode() {
+    fn should_default_bare_launch_to_stdio_protocol() {
+        // A bare launch (no mode, no transport, no config) now connects to the
+        // real backend over stdio (auto-provisioned) instead of the mock demo.
         let cli = Cli::try_parse_from(["octos-tui"]).expect("cli parses");
 
-        assert_eq!(cli.mode, Mode::Mock);
+        assert_eq!(cli.mode, Mode::Protocol);
         assert!(cli.base_url.is_none());
-        assert!(cli.stdio_command.is_none());
+        assert_eq!(
+            cli.stdio_command.as_deref(),
+            Some(super::DEFAULT_STDIO_COMMAND)
+        );
         assert_eq!(cli.theme, ThemeName::Codex);
+    }
+
+    #[test]
+    fn should_select_mock_only_via_explicit_mode() {
+        // The mock demo is still reachable, but only explicitly.
+        let cli = Cli::try_parse_from(["octos-tui", "--mode", "mock"]).expect("cli parses");
+        assert_eq!(cli.mode, Mode::Mock);
+        assert!(cli.stdio_command.is_none());
+        assert!(cli.base_url.is_none());
     }
 
     // A configured transport with no explicit mode must NOT silently
