@@ -1025,6 +1025,30 @@ menu:
     search: Filter models
     subtitle: Server-returned profile LLM models.
     title: Model
+  launch_prompt:
+    unavailable: "No launch decision is pending."
+    footer: "Enter choose | Up/Down move | Esc cancel"
+    item:
+      cancel:
+        label: "Not now"
+        desc: "Return without opening a session."
+    activate:
+      title: "Activate this folder?"
+      subtitle: "%{cwd}"
+      item:
+        activate:
+          label: "Activate with %{profile}"
+          desc: "Start this folder's conversation for %{profile}."
+    cross:
+      title: "This folder belongs to another brain"
+      subtitle: "%{cwd}"
+      item:
+        start:
+          label: "Start %{profile} here"
+          desc: "Begin a new conversation for %{profile} in this folder."
+        switch:
+          label: "Switch to %{profile}"
+          desc: "Resume this folder's %{profile} conversation."
   profile_picker:
     title: "Attach a profile"
     subtitle: "Pick which local profile to use for this session."

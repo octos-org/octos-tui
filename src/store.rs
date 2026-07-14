@@ -6358,25 +6358,43 @@ impl Store {
 
     /// Apply a `launch/resolve` decision (Model A). Resume opens the folder's
     /// resolved brain straight away — a bare launch resumes the profile last
-    /// used in this folder. Activate/CrossProfile currently open the resolved
-    /// profile too; the interactive "activate this space?" and "switch or start
-    /// fresh?" prompts land in a follow-up increment. NoProfile (or a decision
-    /// with no resolvable profile) falls through to the legacy onboarding path.
+    /// used in this folder. Activate ("this folder has no conversation yet") and
+    /// CrossProfile ("this folder belongs to another brain") stage the launch
+    /// prompt and open its menu, whose items emit the `session/open` follow-up.
+    /// NoProfile (or a decision with no resolvable profile / cwd) falls through
+    /// to the legacy onboarding path.
     fn apply_launch_resolve_event(
         &mut self,
         result: crate::model::LaunchResolveResult,
     ) -> Option<AppUiCommand> {
-        use crate::model::LaunchDecisionKind;
+        use crate::model::{LaunchDecisionKind, LaunchPromptState};
         match result.decision {
-            LaunchDecisionKind::Resume
-            | LaunchDecisionKind::Activate
-            | LaunchDecisionKind::CrossProfile => match result.resolved_profile {
+            LaunchDecisionKind::Resume => match result.resolved_profile {
                 Some(profile_id) => self.open_resolved_launch_session(profile_id),
                 None => {
                     self.maybe_open_onboarding_on_first_launch();
                     None
                 }
             },
+            LaunchDecisionKind::Activate | LaunchDecisionKind::CrossProfile => {
+                let (Some(resolved_profile), Some(cwd)) = (
+                    result.resolved_profile,
+                    onboarding_workspace_cwd(&self.state.workspace.root),
+                ) else {
+                    // No resolvable profile or local cwd — fall back to
+                    // onboarding rather than opening an empty prompt.
+                    self.maybe_open_onboarding_on_first_launch();
+                    return None;
+                };
+                self.state.onboarding.launch_prompt = Some(LaunchPromptState {
+                    decision: result.decision,
+                    resolved_profile,
+                    existing_profiles: result.existing_profiles,
+                    cwd,
+                });
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_LAUNCH_PROMPT));
+                None
+            }
             LaunchDecisionKind::NoProfile => {
                 self.maybe_open_onboarding_on_first_launch();
                 None
@@ -15848,6 +15866,37 @@ mod tests {
         };
         assert_eq!(params.profile_id.as_deref(), Some("dev"));
         assert_eq!(params.cwd.as_deref(), Some("/tmp/launch-project"));
+    }
+
+    /// An `Activate` decision (this folder has no conversation yet) stages the
+    /// launch prompt and opens its menu rather than opening a session directly —
+    /// the user confirms activating the space first.
+    #[test]
+    fn launch_resolve_activate_opens_prompt_menu() {
+        let mut store = protocol_store_without_sessions();
+        store.state.workspace.root = "/tmp/launch-project".into();
+
+        let follow_up = store.apply_client_event(ClientEvent::LaunchResolve(
+            crate::model::LaunchResolveResult {
+                decision: crate::model::LaunchDecisionKind::Activate,
+                resolved_profile: Some("dev".into()),
+                existing_profiles: Vec::new(),
+            },
+        ));
+
+        assert!(
+            follow_up.is_none(),
+            "activate opens a prompt, it must not emit a command directly"
+        );
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_LAUNCH_PROMPT));
+        let prompt = store
+            .state
+            .onboarding
+            .launch_prompt
+            .as_ref()
+            .expect("activate stages the launch prompt");
+        assert_eq!(prompt.resolved_profile, "dev");
+        assert_eq!(prompt.cwd, "/tmp/launch-project");
     }
 
     /// M22-A: legacy email-OTP onboarding triggers first-launch flow

@@ -1985,6 +1985,24 @@ pub struct LaunchResolveResult {
     pub existing_profiles: Vec<String>,
 }
 
+/// Transient state for an open launch prompt (Activate / CrossProfile). Stashed
+/// on the onboarding wizard state so the `launch_prompt` menu provider can
+/// render the decision. Only raised for decisions that carry a resolved profile
+/// — Resume opens straight through and NoProfile routes to onboarding, so
+/// neither ever populates this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchPromptState {
+    pub decision: LaunchDecisionKind,
+    /// The brain the launch resolved to (the launching profile for
+    /// CrossProfile, the sticky/default for Activate).
+    pub resolved_profile: String,
+    /// Other profiles already used in this folder (CrossProfile only).
+    pub existing_profiles: Vec<String>,
+    /// The folder the prompt is deciding for; attached to `session/open` so the
+    /// session lands in this folder's per-project store.
+    pub cwd: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum OnboardingAction {
     Open,
@@ -2235,6 +2253,10 @@ pub struct OnboardingWizardState {
     /// first-ever run. Drives the 0/1/N [`StartupProfileDecision`] and populates
     /// the picker menu.
     pub available_profiles: Vec<String>,
+    /// Per-project launch flow: the pending Activate / CrossProfile prompt for
+    /// the `launch_prompt` menu, stashed when a `launch/resolve` decision needs
+    /// the user to choose. `None` outside that prompt. See [`LaunchPromptState`].
+    pub launch_prompt: Option<LaunchPromptState>,
     pub profile_id: Option<String>,
     pub local_profile_created: bool,
     pub open_session_after_profile_create: bool,
@@ -2308,6 +2330,7 @@ impl Default for OnboardingWizardState {
             requested_id: String::new(),
             launch_profile_id: None,
             available_profiles: Vec::new(),
+            launch_prompt: None,
             profile_id: None,
             local_profile_created: false,
             open_session_after_profile_create: false,

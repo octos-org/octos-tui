@@ -62,6 +62,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::OnboardRoute,
         Provider::OnboardWorkspace,
         Provider::ProfilePicker,
+        Provider::LaunchPrompt,
         Provider::Login,
         Provider::Theme,
         Provider::Thinking,
@@ -92,6 +93,7 @@ enum Provider {
     Help,
     Onboard,
     ProfilePicker,
+    LaunchPrompt,
     OnboardLanguage,
     OnboardFamily,
     OnboardModel,
@@ -122,6 +124,7 @@ impl MenuProvider for Provider {
             Self::Help => MENU_HELP,
             Self::Onboard => MENU_ONBOARD,
             Self::ProfilePicker => crate::menu::registry::MENU_PROFILE_PICKER,
+            Self::LaunchPrompt => crate::menu::registry::MENU_LAUNCH_PROMPT,
             Self::OnboardLanguage => MENU_ONBOARD_LANGUAGE,
             Self::OnboardFamily => crate::menu::registry::MENU_ONBOARD_FAMILY,
             Self::OnboardModel => crate::menu::registry::MENU_ONBOARD_MODEL,
@@ -152,6 +155,7 @@ impl MenuProvider for Provider {
             Self::Help => MenuBuildResult::Ready(help_menu(ctx)),
             Self::Onboard => onboarding_menu(ctx),
             Self::ProfilePicker => profile_picker_menu(ctx),
+            Self::LaunchPrompt => launch_prompt_menu(ctx),
             Self::OnboardLanguage => MenuBuildResult::Ready(onboarding_language_menu()),
             Self::OnboardFamily => onboarding_family_menu(ctx),
             Self::OnboardModel => onboarding_model_menu(ctx),
@@ -1364,6 +1368,127 @@ fn profile_picker_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         searchable: profiles.len() > 8,
         search_placeholder: Some(t!("menu.profile_picker.search").into_owned()),
         footer_hint: Some(t!("menu.profile_picker.footer").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Per-project launch prompt (Model A). Renders the Activate / CrossProfile
+/// choice raised from a `launch/resolve` decision: Activate confirms opening the
+/// resolved brain in an as-yet-unused folder; CrossProfile offers to start the
+/// launching brain here or switch to one already used in this folder. Every
+/// choice sends `session/open` carrying this folder's cwd so the session lands
+/// in the folder's per-project store. Renders Unavailable if no prompt is
+/// staged (defensive — the store only opens this menu with one set).
+fn launch_prompt_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let Some(prompt) = ctx
+        .app
+        .onboarding
+        .and_then(|onboarding| onboarding.launch_prompt.as_ref())
+    else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec::new(
+            MenuId::from(crate::menu::registry::MENU_LAUNCH_PROMPT),
+            t!("menu.launch_prompt.activate.title").into_owned(),
+            t!("menu.launch_prompt.unavailable").into_owned(),
+        ));
+    };
+
+    let open_session = |profile: &str| -> MenuAction {
+        let session_id =
+            octos_core::SessionKey::with_profile_topic(profile, "local", "tui", "coding");
+        MenuAction::send_appui(AppUiCommand::OpenSession(
+            octos_core::ui_protocol::SessionOpenParams {
+                session_id,
+                topic: None,
+                profile_id: Some(profile.to_owned()),
+                cwd: Some(prompt.cwd.clone()),
+                sandbox: None,
+                after: None,
+            },
+        ))
+    };
+
+    let (title, subtitle, mut items) = match prompt.decision {
+        crate::model::LaunchDecisionKind::Activate => {
+            let mut activate = MenuItem::new(
+                "launch.activate",
+                t!(
+                    "menu.launch_prompt.activate.item.activate.label",
+                    profile = prompt.resolved_profile.clone()
+                ),
+                open_session(&prompt.resolved_profile),
+            )
+            .with_description(t!("menu.launch_prompt.activate.item.activate.desc"));
+            if let Some(shortcut) = numeric_shortcut(0) {
+                activate = activate.with_shortcut(shortcut);
+            }
+            (
+                t!("menu.launch_prompt.activate.title").into_owned(),
+                t!(
+                    "menu.launch_prompt.activate.subtitle",
+                    cwd = prompt.cwd.clone()
+                )
+                .into_owned(),
+                vec![activate],
+            )
+        }
+        // CrossProfile (and any non-Activate decision that reached the prompt):
+        // "start the launching brain here" first, then one switch row per
+        // profile already used in this folder.
+        _ => {
+            let mut items = vec![
+                MenuItem::new(
+                    "launch.start",
+                    t!(
+                        "menu.launch_prompt.cross.item.start.label",
+                        profile = prompt.resolved_profile.clone()
+                    ),
+                    open_session(&prompt.resolved_profile),
+                )
+                .with_description(t!("menu.launch_prompt.cross.item.start.desc")),
+            ];
+            for (index, existing) in prompt.existing_profiles.iter().enumerate() {
+                let mut item = MenuItem::new(
+                    format!("launch.switch.{index}"),
+                    t!(
+                        "menu.launch_prompt.cross.item.switch.label",
+                        profile = existing.clone()
+                    ),
+                    open_session(existing),
+                )
+                .with_description(t!("menu.launch_prompt.cross.item.switch.desc"));
+                // Reserve shortcut 1 for "start here"; switch rows follow.
+                if let Some(shortcut) = numeric_shortcut(index + 1) {
+                    item = item.with_shortcut(shortcut);
+                }
+                items.push(item);
+            }
+            (
+                t!("menu.launch_prompt.cross.title").into_owned(),
+                t!("menu.launch_prompt.cross.subtitle", cwd = prompt.cwd.clone()).into_owned(),
+                items,
+            )
+        }
+    };
+
+    items.push(
+        MenuItem::new(
+            "launch.cancel",
+            t!("menu.launch_prompt.item.cancel.label"),
+            MenuAction::Local(LocalAction::Exit),
+        )
+        .with_description(t!("menu.launch_prompt.item.cancel.desc")),
+    );
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_LAUNCH_PROMPT),
+        title,
+        subtitle: Some(subtitle),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.launch_prompt.footer").into_owned()),
         preview: None,
         mode: MenuMode::SingleSelect,
     })
@@ -5939,6 +6064,90 @@ mod tests {
         ));
         assert!(spec.items.iter().any(|item| item.label == "deepseek"));
         assert!(has_row(&spec, "profile.pick.new"), "offers a create escape");
+    }
+
+    #[test]
+    fn launch_prompt_cross_profile_offers_start_here_and_switch_rows() {
+        let onboarding = OnboardingWizardState {
+            launch_prompt: Some(crate::model::LaunchPromptState {
+                decision: crate::model::LaunchDecisionKind::CrossProfile,
+                resolved_profile: "glm".into(),
+                existing_profiles: vec!["deepseek".into()],
+                cwd: "/tmp/proj".into(),
+            }),
+            ..OnboardingWizardState::default()
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(launch_prompt_menu(&ctx));
+
+        // "Start <launching> here" opens the launching brain in this folder.
+        let start = spec
+            .items
+            .iter()
+            .find(|item| item.id == "launch.start")
+            .expect("start-here row present");
+        let AppUiCommand::OpenSession(params) = appui_command(&start.action) else {
+            panic!("start row must open a session");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("glm"));
+        assert_eq!(params.cwd.as_deref(), Some("/tmp/proj"));
+
+        // One switch row per profile already used in this folder.
+        let switch = spec
+            .items
+            .iter()
+            .find(|item| item.id == "launch.switch.0")
+            .expect("switch row present");
+        let AppUiCommand::OpenSession(switch_params) = appui_command(&switch.action) else {
+            panic!("switch row must open a session");
+        };
+        assert_eq!(switch_params.profile_id.as_deref(), Some("deepseek"));
+        assert!(has_row(&spec, "launch.cancel"), "offers a cancel escape");
+    }
+
+    #[test]
+    fn launch_prompt_activate_confirms_single_profile() {
+        let onboarding = OnboardingWizardState {
+            launch_prompt: Some(crate::model::LaunchPromptState {
+                decision: crate::model::LaunchDecisionKind::Activate,
+                resolved_profile: "glm".into(),
+                existing_profiles: Vec::new(),
+                cwd: "/tmp/proj".into(),
+            }),
+            ..OnboardingWizardState::default()
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(launch_prompt_menu(&ctx));
+
+        let activate = spec
+            .items
+            .iter()
+            .find(|item| item.id == "launch.activate")
+            .expect("activate row present");
+        let AppUiCommand::OpenSession(params) = appui_command(&activate.action) else {
+            panic!("activate row must open a session");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("glm"));
+        // Activate is a single-profile confirm — no switch rows.
+        assert!(!has_row(&spec, "launch.switch.0"));
     }
 
     fn runtime_status(session_id: &SessionKey) -> SessionRuntimeStatus {

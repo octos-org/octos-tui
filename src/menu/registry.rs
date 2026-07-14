@@ -24,6 +24,9 @@ pub const MENU_ONBOARD_WORKSPACE: &str = "onboard-workspace";
 /// Phase 3 startup picker: "attach which profile?" shown at launch when more
 /// than one local profile exists and no `--profile-id` was pinned.
 pub const MENU_PROFILE_PICKER: &str = "profile-picker";
+/// Per-project launch prompt (Model A): the Activate / CrossProfile choice
+/// raised from a `launch/resolve` decision. See `launch_prompt_menu`.
+pub const MENU_LAUNCH_PROMPT: &str = "launch-prompt";
 pub const MENU_LOGIN: &str = "login";
 pub const MENU_PROVIDER: &str = "provider";
 pub const MENU_MODEL: &str = "model";

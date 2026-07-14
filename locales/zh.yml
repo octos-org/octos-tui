@@ -614,6 +614,30 @@ menu:
     search: 筛选模型
     subtitle: 服务器返回的档案 LLM 模型。
     title: 模型
+  launch_prompt:
+    unavailable: "没有待处理的启动决策。"
+    footer: "Enter 选择 | 上/下 移动 | Esc 取消"
+    item:
+      cancel:
+        label: "暂不"
+        desc: "返回而不打开会话。"
+    activate:
+      title: "激活此文件夹？"
+      subtitle: "%{cwd}"
+      item:
+        activate:
+          label: "使用 %{profile} 激活"
+          desc: "在此文件夹中为 %{profile} 开始会话。"
+    cross:
+      title: "此文件夹属于另一个大脑"
+      subtitle: "%{cwd}"
+      item:
+        start:
+          label: "在此启动 %{profile}"
+          desc: "在此文件夹中为 %{profile} 开始新会话。"
+        switch:
+          label: "切换到 %{profile}"
+          desc: "恢复此文件夹的 %{profile} 会话。"
   profile_picker:
     title: "选择要附加的档案"
     subtitle: "选择本次会话使用哪个本地档案。"
