@@ -249,6 +249,11 @@ onboarding:
   api_key_saved: "saved in profile"
   value_not_set: "not set"
   action_edit: "Enter edit"
+  make_default:
+    label: "Make this your default brain"
+    desc: "The brain a bare launch opens in a folder it hasn't seen before."
+    enabled: "on"
+    disabled: "off"
   field:
     full_name: "Full name"
     username: "Username"
@@ -385,6 +390,8 @@ onboarding:
     workspace_open_label: "Continue to Workspace →"
     workspace_open_description: "Stage and validate the project folder Octos will code in, then activate."
     workspace_locked_reason: "save a provider first"
+    finish_label: "Finish — brain ready →"
+    finish_description: "Your brain is set up. Relaunch Octos here to start a session with it."
     # Activate row (provider-setup screen) label + description.
     activate_ready_label: "▶ Activate workspace — open coding session (Enter)"
     activate_blocked_label: "Activate workspace — open coding session"
@@ -546,6 +553,7 @@ status:
   onboarding_profile_updated: "Onboarding profile updated"
   profile_name_updated: "Profile name updated"
   onboarding_profile_name_updated: "Onboarding profile name updated"
+  make_default_updated: "Default-brain preference updated"
   attached_profile: "Attached profile %{profile}"
   provider_route_selected: "Provider route selected; enter API key"
   provider_family_updated: "Provider family updated"
@@ -1025,6 +1033,42 @@ menu:
     search: Filter models
     subtitle: Server-returned profile LLM models.
     title: Model
+  onboard_done:
+    title: "You're all set"
+    subtitle: "Brain \"%{profile}\" is ready."
+    subtitle_generic: "Your brain is ready."
+    footer: "Enter select | Esc close"
+    item:
+      ready:
+        label: "Relaunch Octos here to start a session"
+        desc: "This folder activates for your brain on the next launch."
+      exit:
+        label: "Close"
+        desc: "Leave onboarding."
+  launch_prompt:
+    unavailable: "No launch decision is pending."
+    footer: "Enter choose | Up/Down move | Esc cancel"
+    item:
+      cancel:
+        label: "Not now"
+        desc: "Return without opening a session."
+    activate:
+      title: "Activate this folder?"
+      subtitle: "%{cwd}"
+      item:
+        activate:
+          label: "Activate with %{profile}"
+          desc: "Start this folder's conversation for %{profile}."
+    cross:
+      title: "This folder belongs to another brain"
+      subtitle: "%{cwd}"
+      item:
+        start:
+          label: "Start %{profile} here"
+          desc: "Begin a new conversation for %{profile} in this folder."
+        switch:
+          label: "Switch to %{profile}"
+          desc: "Resume this folder's %{profile} conversation."
   profile_picker:
     title: "Attach a profile"
     subtitle: "Pick which local profile to use for this session."
