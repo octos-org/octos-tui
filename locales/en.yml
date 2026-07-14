@@ -249,6 +249,11 @@ onboarding:
   api_key_saved: "saved in profile"
   value_not_set: "not set"
   action_edit: "Enter edit"
+  make_default:
+    label: "Make this your default brain"
+    desc: "The brain a bare launch opens in a folder it hasn't seen before."
+    enabled: "on"
+    disabled: "off"
   field:
     full_name: "Full name"
     username: "Username"
@@ -546,6 +551,7 @@ status:
   onboarding_profile_updated: "Onboarding profile updated"
   profile_name_updated: "Profile name updated"
   onboarding_profile_name_updated: "Onboarding profile name updated"
+  make_default_updated: "Default-brain preference updated"
   attached_profile: "Attached profile %{profile}"
   provider_route_selected: "Provider route selected; enter API key"
   provider_family_updated: "Provider family updated"

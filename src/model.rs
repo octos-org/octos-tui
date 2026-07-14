@@ -185,6 +185,13 @@ pub const APPUI_FEATURE_CODING_LOOP_RUNTIME_V1: &str = "coding.loop_runtime.v1";
 pub const APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1: &str =
     "profile.local_create.requested_id.v1";
 
+/// The server honors the optional `make_default` field on
+/// `profile/local/create`, recording the created profile as the machine's
+/// global default. When ABSENT the onboarding "Make this your default brain?"
+/// toggle is hidden and `make_default` is never sent, so older servers get the
+/// unchanged create shape.
+pub const APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1: &str = "profile.local_create.default.v1";
+
 /// M15-E backend-owned agent inspection methods (UPCR-2026-021).
 pub const APPUI_METHOD_AGENT_LIST: &str = "agent/list";
 pub const APPUI_METHOD_AGENT_STATUS_READ: &str = "agent/status/read";
@@ -1929,6 +1936,13 @@ pub struct ProfileLocalCreateParams {
     pub username: String,
     #[serde(default)]
     pub email: String,
+    /// When `Some(true)`, ask the server to record the created profile as the
+    /// machine's global default (the brain a bare launch resolves to in a folder
+    /// with no sticky profile). Omitted from the wire when `None` so older
+    /// servers get the unchanged shape. Only sent when the server advertises
+    /// [`APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub make_default: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2014,6 +2028,9 @@ pub enum OnboardingAction {
     SetOtpCode(String),
     /// Nameable-profiles flow: set the single "Name this profile" value.
     SetRequestedId(String),
+    /// Nameable-profiles flow: toggle whether the created profile becomes the
+    /// machine's global default (sends `make_default` on create).
+    SetMakeDefault(bool),
     SetProfileId(String),
     SetProviderSelection(Box<LlmSelectionConfig>),
     SetFamilyId(String),
@@ -2244,6 +2261,12 @@ pub struct OnboardingWizardState {
     /// [`APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1`]. Empty until the
     /// user edits it, in which case a provider-derived suggestion is used.
     pub requested_id: String,
+    /// Nameable-profiles flow: when true, the create sends `make_default` so the
+    /// server records this profile as the machine's global default (the brain a
+    /// bare launch resolves to in a fresh folder). Toggled by the onboarding
+    /// "Make this your default brain?" row; only surfaced/sent when the server
+    /// advertises [`APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1`].
+    pub make_default: bool,
     /// Phase 3 startup picker: the `--profile-id` the process launched with, if
     /// any. Seeded once at launch. Drives [`StartupProfileDecision`]; a pinned
     /// id is honored unchanged and never triggers the picker.
@@ -2328,6 +2351,7 @@ impl Default for OnboardingWizardState {
             email: String::new(),
             otp_code: String::new(),
             requested_id: String::new(),
+            make_default: false,
             launch_profile_id: None,
             available_profiles: Vec::new(),
             launch_prompt: None,

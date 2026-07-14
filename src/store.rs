@@ -2314,6 +2314,16 @@ impl Store {
                 self.refresh_active_menu_and_advance();
                 None
             }
+            OnboardingAction::SetMakeDefault(make_default) => {
+                self.state.onboarding.make_default = make_default;
+                self.state.onboarding.last_message =
+                    Some(t!("status.make_default_updated").into_owned());
+                self.state.status = t!("status.make_default_updated").into_owned();
+                // A toggle stays on the same step — refresh in place, don't
+                // advance the wizard.
+                self.refresh_active_menu_if_open();
+                None
+            }
             OnboardingAction::SetProfileId(profile_id) => {
                 self.state.onboarding.profile_id = non_empty_string(profile_id);
                 self.state.onboarding.last_message =
@@ -2926,12 +2936,16 @@ impl Store {
         });
         self.state.onboarding.local_profile_recovery = None;
         self.state.onboarding.last_message = Some(t!("status.creating_local_profile").into_owned());
+        // Only send `make_default` when the server advertises the feature and
+        // the user toggled it on; otherwise omit it (older-server-compatible).
+        let make_default = self.onboarding_make_default_flag();
         let params = if use_requested_id {
             // Send ONLY requested_id; leave name/username/email empty so the
             // server derives display metadata from the id. `skip_serializing_if`
             // keeps the other fields out of the way of the server's defaults.
             ProfileLocalCreateParams {
                 requested_id: Some(self.state.onboarding.effective_requested_id()),
+                make_default,
                 ..ProfileLocalCreateParams::default()
             }
         } else {
@@ -2940,6 +2954,7 @@ impl Store {
                 name: self.state.onboarding.name.clone(),
                 username: self.state.onboarding.username.clone(),
                 email: self.state.onboarding.email.clone(),
+                make_default,
             }
         };
         Some(AppUiCommand::ProfileLocalCreate(params))
@@ -3388,6 +3403,24 @@ impl Store {
                     crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1,
                 )
             })
+    }
+
+    fn local_profile_make_default_supported(&self) -> bool {
+        self.state
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                capabilities
+                    .supports_feature(crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1)
+            })
+    }
+
+    /// The `make_default` flag to send on `profile/local/create`: `Some(true)`
+    /// only when the server supports the feature AND the user toggled it on;
+    /// `None` otherwise so the wire stays minimal and older-server-compatible.
+    fn onboarding_make_default_flag(&self) -> Option<bool> {
+        (self.local_profile_make_default_supported() && self.state.onboarding.make_default)
+            .then_some(true)
     }
 
     fn profile_llm_catalog_supported(&self) -> bool {
@@ -16223,6 +16256,74 @@ mod tests {
         assert!(params.name.is_empty());
         assert!(params.username.is_empty());
         assert!(params.email.is_empty());
+    }
+
+    #[test]
+    fn create_local_profile_sends_make_default_when_toggled_and_supported() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            [
+                crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1,
+                crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1,
+            ],
+        ));
+        store.state.onboarding.requested_id = "glm".into();
+
+        // The toggle action flips the onboarding flag.
+        store.dispatch_onboarding_action(
+            crate::model::OnboardingAction::SetMakeDefault(true),
+            None,
+        );
+        assert!(store.state.onboarding.make_default);
+
+        let command = store
+            .dispatch_onboarding_action(crate::model::OnboardingAction::CreateLocalProfile, None)
+            .expect("create emits profile/local/create");
+        let AppUiCommand::ProfileLocalCreate(params) = command else {
+            panic!("expected profile/local/create, got {command:?}");
+        };
+        assert_eq!(params.make_default, Some(true));
+    }
+
+    #[test]
+    fn create_local_profile_omits_make_default_when_off_or_unsupported() {
+        // Feature advertised but the toggle is off → omit `make_default`.
+        let mut supported = store_with_empty_session();
+        supported.state.capabilities =
+            Some(crate::menu::CapabilitySet::from_methods_and_features(
+                [crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+                [
+                    crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1,
+                    crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1,
+                ],
+            ));
+        supported.state.onboarding.requested_id = "glm".into();
+        let AppUiCommand::ProfileLocalCreate(off) = supported
+            .dispatch_onboarding_action(crate::model::OnboardingAction::CreateLocalProfile, None)
+            .expect("create")
+        else {
+            panic!("expected profile/local/create");
+        };
+        assert_eq!(off.make_default, None);
+
+        // Toggle on but the server does NOT advertise the feature → still
+        // omitted, so an older server gets the unchanged create shape.
+        let mut unsupported = store_with_empty_session();
+        unsupported.state.capabilities =
+            Some(crate::menu::CapabilitySet::from_methods_and_features(
+                [crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+                [crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1],
+            ));
+        unsupported.state.onboarding.requested_id = "glm".into();
+        unsupported.state.onboarding.make_default = true;
+        let AppUiCommand::ProfileLocalCreate(gated) = unsupported
+            .dispatch_onboarding_action(crate::model::OnboardingAction::CreateLocalProfile, None)
+            .expect("create")
+        else {
+            panic!("expected profile/local/create");
+        };
+        assert_eq!(gated.make_default, None);
     }
 
     #[test]

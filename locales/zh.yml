@@ -237,6 +237,11 @@ onboarding:
   api_key_saved: "已保存于档案"
   value_not_set: "未设置"
   action_edit: "回车编辑"
+  make_default:
+    label: "设为默认大脑"
+    desc: "在未访问过的新文件夹中，直接启动时打开的大脑。"
+    enabled: "开"
+    disabled: "关"
   field:
     full_name: "姓名"
     username: "用户名"
@@ -1070,6 +1075,7 @@ status:
   onboarding_profile_updated: "已更新引导档案"
   profile_name_updated: "档案名称已更新"
   onboarding_profile_name_updated: "已更新引导档案名称"
+  make_default_updated: "默认大脑偏好已更新"
   attached_profile: "已附加档案 %{profile}"
   provider_route_selected: "已选择供应商线路；请输入 API 密钥"
   provider_family_updated: "供应商模型系列已更新"

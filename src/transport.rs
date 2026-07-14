@@ -6198,6 +6198,7 @@ mod tests {
                 name: "Ada Lovelace".into(),
                 username: "ada".into(),
                 email: "ada@example.com".into(),
+                make_default: None,
             }),
         )
         .expect("local profile request encodes");
@@ -6880,6 +6881,7 @@ mod tests {
                 name: "Ada Lovelace".into(),
                 username: "ada".into(),
                 email: "ada@example.com".into(),
+                make_default: None,
             }),
             AppUiCommand::SetPermissionProfile(PermissionProfileSetParams {
                 session_id,
@@ -8658,6 +8660,7 @@ mod tests {
                 name: "Ada Lovelace".into(),
                 username: "ada".into(),
                 email: "ada@example.com".into(),
+                make_default: None,
             }))
             .expect("local profile request builds");
         let local_profile_frame = json!({
