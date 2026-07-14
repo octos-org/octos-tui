@@ -59,6 +59,12 @@ pub const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 pub const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 pub const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
 pub const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str = "profile/skills/remove";
+/// Per-project launch decision (`launch/resolve`). The TUI calls this on first
+/// launch to learn whether to resume the folder's sticky brain, prompt to
+/// activate an empty folder, offer a cross-profile switch, or fall through to
+/// onboarding. Defined locally because the pinned octos-core rev predates the
+/// method; gated on [`APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1`].
+pub const APPUI_METHOD_LAUNCH_RESOLVE: &str = "launch/resolve";
 
 /// M12-E feature flag for per-session workspace cwd requests
 /// (`session.workspace_cwd.v1`, UPCR-2026-003). The TUI must NOT
@@ -632,6 +638,12 @@ pub enum AppUiCommand {
     /// `/resume` picker. A READ (non-mutating) method (see
     /// [`ProtocolAppUiBackend::readonly_allows_command`]).
     ListSessions(SessionListParams),
+    /// `launch/resolve` — per-project launch decision (Model A). Sent on first
+    /// launch to resolve requested→sticky→default and learn whether to resume
+    /// the folder's brain, prompt to activate an empty folder, offer a
+    /// cross-profile switch, or open onboarding. A READ (non-mutating) method;
+    /// gated on `session.workspace_cwd.v1`.
+    LaunchResolve(LaunchResolveParams),
     /// `session/rollback` — conversation-only rewind for `/rewind`. Drops the
     /// last `num_turns` user turns from the active session and returns the
     /// trimmed transcript. A MUTATING method: intentionally NOT listed in
@@ -726,6 +738,7 @@ impl AppUiCommand {
             Self::ReadTaskArtifact(_) => APPUI_METHOD_TASK_ARTIFACT_READ,
             Self::HydrateSession(_) => APPUI_METHOD_SESSION_HYDRATE,
             Self::ListSessions(_) => octos_core::ui_protocol::methods::SESSION_LIST,
+            Self::LaunchResolve(_) => APPUI_METHOD_LAUNCH_RESOLVE,
             Self::SessionRollback(_) => octos_core::ui_protocol::methods::SESSION_ROLLBACK,
             Self::GetThreadGraph(_) => APPUI_METHOD_THREAD_GRAPH_GET,
             Self::GetTurnState(_) => APPUI_METHOD_TURN_STATE_GET,
@@ -1928,6 +1941,48 @@ pub struct ProfileLocalCreateResult {
     #[serde(default)]
     pub created: bool,
     pub runtime_mode: String,
+}
+
+/// Parameters for `launch/resolve` — the per-project launch decision. `cwd` is
+/// the folder the user launched in; `profile_id` is the explicitly requested
+/// brain (`--profile`), omitted for a bare launch so the server falls back to
+/// the folder's sticky profile then the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchResolveParams {
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+/// The server's per-project launch decision. Mirrors the server-side
+/// `LaunchDecisionKind`; snake_case on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchDecisionKind {
+    /// The resolved profile already has an activated store in this folder —
+    /// resume its conversation.
+    Resume,
+    /// The resolved profile exists but this folder has no store yet — prompt to
+    /// activate the space before opening.
+    Activate,
+    /// The launching profile differs from the profile(s) already used in this
+    /// folder — offer to switch or start fresh.
+    CrossProfile,
+    /// No profile could be resolved (none requested, no sticky, no default) —
+    /// fall through to onboarding.
+    NoProfile,
+}
+
+/// Result of `launch/resolve`. `resolved_profile` is the brain the decision
+/// points at (set for Resume/Activate/CrossProfile); `existing_profiles` lists
+/// the other profiles already used in this folder (populated for CrossProfile).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchResolveResult {
+    pub decision: LaunchDecisionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub existing_profiles: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

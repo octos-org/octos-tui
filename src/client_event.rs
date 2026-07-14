@@ -11,7 +11,7 @@ use crate::model::{
     AgentArtifactListResult, AgentArtifactReadResult, AgentCloseResult, AgentInterruptResult,
     AgentListResult, AgentOutputReadResult, AgentStatusReadResult, AuthLogoutResult, AuthMeResult,
     AuthSendCodeResult, AuthStatusResult, AuthVerifyResult, ConfigCapabilitiesListResult,
-    DiffPreviewGetResult, LoopCreateResult, LoopListResult, LoopMutationResult,
+    DiffPreviewGetResult, LaunchResolveResult, LoopCreateResult, LoopListResult, LoopMutationResult,
     McpConfigListResult, McpConfigMutationResult, McpStatusListResult, ModelListResult,
     ModelSelectResult, ProfileLlmCatalogResult, ProfileLlmListResult, ProfileLlmMutationResult,
     ProfileLocalCreateResult, ProfileSkillsListResult, ProfileSkillsMutationResult,
@@ -35,6 +35,11 @@ pub enum ClientEvent {
     /// Result of a `session/list` request, used to populate the `/resume`
     /// session picker.
     SessionList(SessionListResult),
+    /// Result of a `launch/resolve` request: the per-project launch decision
+    /// that drives whether the client resumes the folder's brain, prompts to
+    /// activate the space, offers a cross-profile switch, or opens onboarding
+    /// on first launch.
+    LaunchResolve(LaunchResolveResult),
     /// Result of a `session/rollback` request (`/rewind`): the later user turns
     /// were dropped from the session and `thread` carries the trimmed
     /// transcript to re-render (same shape as `session/hydrate`).

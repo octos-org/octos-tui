@@ -5123,6 +5123,11 @@ impl Store {
                 self.refresh_active_menu_if_open();
                 follow_up
             }
+            ClientEvent::LaunchResolve(result) => {
+                let follow_up = self.apply_launch_resolve_event(result);
+                self.refresh_active_menu_if_open();
+                follow_up
+            }
             ClientEvent::DiffPreview(result) => {
                 self.apply_diff_preview_result(result);
                 None
@@ -6236,6 +6241,15 @@ impl Store {
             event.message.clone(),
         ));
         self.state.status = event.message;
+        // Per-project launch decision (Model A). When the backend advertises
+        // `session.workspace_cwd.v1` + `launch/resolve` and this is a clean
+        // first launch, resolve the folder's brain BEFORE falling into
+        // onboarding: `launch/resolve` tells us whether to resume the sticky
+        // profile, prompt to activate an empty folder, offer a cross-profile
+        // switch, or onboard. Older servers (no feature) fall through unchanged.
+        if let Some(command) = self.maybe_resolve_launch_on_first_launch() {
+            return Some(command);
+        }
         self.maybe_open_onboarding_on_first_launch();
         // When the wizard auto-opened (e.g. launched with --profile-id but no
         // session yet), hydrate the saved provider for the resolved profile so
@@ -6245,6 +6259,33 @@ impl Store {
         } else {
             None
         }
+    }
+
+    /// First-launch hook for the per-project launch flow. Emits `launch/resolve`
+    /// to learn the folder's launch decision when the backend supports it and we
+    /// are on a clean first launch (no session, no menu, a local cwd). Returns
+    /// `None` to fall through to the legacy onboarding path — for an older
+    /// server, a remote transport with no local cwd, or a launch that already
+    /// has a session or an open menu.
+    fn maybe_resolve_launch_on_first_launch(&mut self) -> Option<AppUiCommand> {
+        if !self.state.sessions.is_empty() || self.state.menu_stack.is_active() {
+            return None;
+        }
+        let supports = self.state.capabilities.as_ref().is_some_and(|caps| {
+            caps.supports_feature(crate::model::APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1)
+                && caps.supports_method(crate::model::APPUI_METHOD_LAUNCH_RESOLVE)
+        });
+        if !supports {
+            return None;
+        }
+        // No resolvable local cwd (remote-only transport, `unknown`, …) means
+        // there is no per-project decision to make — let onboarding handle it.
+        let cwd = onboarding_workspace_cwd(&self.state.workspace.root)?;
+        let profile_id = self.state.onboarding.launch_profile_id.clone();
+        Some(AppUiCommand::LaunchResolve(crate::model::LaunchResolveParams {
+            cwd,
+            profile_id,
+        }))
     }
 
     fn maybe_open_onboarding_on_first_launch(&mut self) {
@@ -6313,6 +6354,53 @@ impl Store {
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
             }
         }
+    }
+
+    /// Apply a `launch/resolve` decision (Model A). Resume opens the folder's
+    /// resolved brain straight away — a bare launch resumes the profile last
+    /// used in this folder. Activate/CrossProfile currently open the resolved
+    /// profile too; the interactive "activate this space?" and "switch or start
+    /// fresh?" prompts land in a follow-up increment. NoProfile (or a decision
+    /// with no resolvable profile) falls through to the legacy onboarding path.
+    fn apply_launch_resolve_event(
+        &mut self,
+        result: crate::model::LaunchResolveResult,
+    ) -> Option<AppUiCommand> {
+        use crate::model::LaunchDecisionKind;
+        match result.decision {
+            LaunchDecisionKind::Resume
+            | LaunchDecisionKind::Activate
+            | LaunchDecisionKind::CrossProfile => match result.resolved_profile {
+                Some(profile_id) => self.open_resolved_launch_session(profile_id),
+                None => {
+                    self.maybe_open_onboarding_on_first_launch();
+                    None
+                }
+            },
+            LaunchDecisionKind::NoProfile => {
+                self.maybe_open_onboarding_on_first_launch();
+                None
+            }
+        }
+    }
+
+    /// Build the `session/open` command for a launch-resolved profile, attaching
+    /// the workspace cwd so the session lands in this folder's per-project store.
+    fn open_resolved_launch_session(&mut self, profile_id: String) -> Option<AppUiCommand> {
+        let session_id =
+            octos_core::SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding");
+        self.state.status =
+            t!("status.opening_coding_session", profile = profile_id.clone()).into_owned();
+        Some(AppUiCommand::OpenSession(
+            octos_core::ui_protocol::SessionOpenParams {
+                session_id,
+                topic: None,
+                profile_id: Some(profile_id),
+                cwd: onboarding_workspace_cwd(&self.state.workspace.root),
+                sandbox: None,
+                after: None,
+            },
+        ))
     }
 
     fn apply_model_list_event(&mut self, event: ModelListClientEvent) {
@@ -15677,6 +15765,89 @@ mod tests {
             store.state.active_menu.is_none(),
             "onboarding must not auto-open without a profile-creation method"
         );
+    }
+
+    /// Model A launch flow: on a clean first launch, a backend advertising
+    /// `launch/resolve` + `session.workspace_cwd.v1` makes the client request
+    /// the per-project launch decision (carrying this folder's cwd and the
+    /// requested profile) BEFORE opening onboarding.
+    #[test]
+    fn first_launch_requests_launch_resolve_when_workspace_cwd_advertised() {
+        let mut store = protocol_store_without_sessions();
+        store.state.workspace.root = "/tmp/launch-project".into();
+        store.state.onboarding.launch_profile_id = Some("dev".into());
+
+        let follow_up =
+            store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+                result: crate::model::ConfigCapabilitiesListResult {
+                    capabilities: UiProtocolCapabilities::new(
+                        &[crate::model::APPUI_METHOD_LAUNCH_RESOLVE],
+                        &[],
+                    )
+                    .with_supported_features([
+                        crate::model::APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1,
+                    ]),
+                },
+                message: "Octos UI capabilities refreshed".into(),
+            }));
+
+        let Some(AppUiCommand::LaunchResolve(params)) = follow_up else {
+            panic!("first launch must request launch/resolve, got: {follow_up:?}");
+        };
+        assert_eq!(params.cwd, "/tmp/launch-project");
+        assert_eq!(params.profile_id.as_deref(), Some("dev"));
+        assert!(
+            store.state.active_menu.is_none(),
+            "launch/resolve defers onboarding until the decision lands"
+        );
+    }
+
+    /// The launch/resolve probe is gated on `session.workspace_cwd.v1`: an older
+    /// server that advertises the method but not the feature must fall through
+    /// to the legacy onboarding path, never emitting `launch/resolve`.
+    #[test]
+    fn first_launch_skips_launch_resolve_without_workspace_cwd_feature() {
+        let mut store = protocol_store_without_sessions();
+        store.state.workspace.root = "/tmp/launch-project".into();
+
+        let follow_up =
+            store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+                result: crate::model::ConfigCapabilitiesListResult {
+                    capabilities: UiProtocolCapabilities::new(
+                        &[crate::model::APPUI_METHOD_LAUNCH_RESOLVE],
+                        &[],
+                    ),
+                },
+                message: "Octos UI capabilities refreshed".into(),
+            }));
+
+        assert!(
+            !matches!(follow_up, Some(AppUiCommand::LaunchResolve(_))),
+            "launch/resolve must be gated on session.workspace_cwd.v1"
+        );
+    }
+
+    /// A `Resume` decision opens the folder's resolved brain straight away —
+    /// the sticky bare-launch path — attaching the workspace cwd so the session
+    /// lands in this folder's per-project store.
+    #[test]
+    fn launch_resolve_resume_opens_folder_session() {
+        let mut store = protocol_store_without_sessions();
+        store.state.workspace.root = "/tmp/launch-project".into();
+
+        let follow_up = store.apply_client_event(ClientEvent::LaunchResolve(
+            crate::model::LaunchResolveResult {
+                decision: crate::model::LaunchDecisionKind::Resume,
+                resolved_profile: Some("dev".into()),
+                existing_profiles: Vec::new(),
+            },
+        ));
+
+        let Some(AppUiCommand::OpenSession(params)) = follow_up else {
+            panic!("resume must open the folder session, got: {follow_up:?}");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("dev"));
+        assert_eq!(params.cwd.as_deref(), Some("/tmp/launch-project"));
     }
 
     /// M22-A: legacy email-OTP onboarding triggers first-launch flow

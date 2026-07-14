@@ -1729,6 +1729,7 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ReadTaskArtifact(_)
                 | AppUiCommand::HydrateSession(_)
                 | AppUiCommand::ListSessions(_)
+                | AppUiCommand::LaunchResolve(_)
                 | AppUiCommand::ListTasks(_)
                 | AppUiCommand::GetThreadGraph(_)
                 | AppUiCommand::GetTurnState(_)
@@ -2575,6 +2576,7 @@ fn rpc_request_from_command(
         AppUiCommand::AuthMe(params) => serde_json::to_value(params),
         AppUiCommand::AuthLogout(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLocalCreate(params) => serde_json::to_value(params),
+        AppUiCommand::LaunchResolve(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmCatalog(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmList(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmUpsert(params) => serde_json::to_value(params),
@@ -2961,6 +2963,21 @@ fn success_response_to_app_event(
                         format!(
                             "failed to decode UI protocol result for {}: {err}",
                             crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_LAUNCH_RESOLVE => {
+            match serde_json::from_value::<crate::model::LaunchResolveResult>(result) {
+                Ok(result) => Ok(Some(ClientEvent::LaunchResolve(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_LAUNCH_RESOLVE
                         ),
                     )
                     .into(),
