@@ -51,6 +51,8 @@ pub enum AgentsCommand {
     Interrupt(String),
     /// `/agents close <agent_id>`.
     Close(String),
+    /// `/agents spawn <N> <prompt>` — request the LLM spawn N parallel agents.
+    Spawn { count: u32, prompt: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +189,10 @@ pub enum AutonomyParseError {
     InvalidBudget(String),
     /// `/loop ... every <interval>` where the interval failed to parse.
     InvalidInterval(String),
+    /// `/agents spawn` where the count token is missing, non-numeric, or zero.
+    InvalidSpawnCount(String),
+    /// `/agents spawn <N>` with no prompt text after the count.
+    EmptySpawnPrompt,
 }
 
 impl std::fmt::Display for AutonomyParseError {
@@ -218,6 +224,13 @@ impl std::fmt::Display for AutonomyParseError {
             }
             Self::InvalidInterval(raw) => {
                 write!(f, "could not parse interval `{raw}`")
+            }
+            Self::InvalidSpawnCount(raw) => write!(
+                f,
+                "spawn count must be a positive integer, got `{raw}`"
+            ),
+            Self::EmptySpawnPrompt => {
+                f.write_str("/agents spawn requires a prompt after the count")
             }
         }
     }
@@ -287,8 +300,27 @@ fn parse_agents(tail: &str) -> Result<AgentsCommand, AutonomyParseError> {
             args,
         )?)),
         "close" => Ok(AgentsCommand::Close(require_id("/agents close", args)?)),
+        "spawn" => parse_agents_spawn(args),
         other => Err(AutonomyParseError::UnknownAgentsVerb(other.to_string())),
     }
+}
+
+fn parse_agents_spawn(args: &str) -> Result<AgentsCommand, AutonomyParseError> {
+    let (count_token, prompt_rest) = split_head(args);
+    if count_token.is_empty() {
+        return Err(AutonomyParseError::InvalidSpawnCount(String::new()));
+    }
+    let count: u32 = count_token
+        .parse()
+        .map_err(|_| AutonomyParseError::InvalidSpawnCount(count_token.to_string()))?;
+    if count == 0 {
+        return Err(AutonomyParseError::InvalidSpawnCount(count_token.to_string()));
+    }
+    let prompt = prompt_rest.to_string();
+    if prompt.is_empty() {
+        return Err(AutonomyParseError::EmptySpawnPrompt);
+    }
+    Ok(AgentsCommand::Spawn { count, prompt })
 }
 
 fn parse_agent_artifact_read(args: &str) -> Result<AgentsCommand, AutonomyParseError> {
@@ -1087,6 +1119,68 @@ mod tests {
         assert_eq!(
             parse_autonomy_slash("agents list").unwrap(),
             Some(AutonomyCommand::Agents(AgentsCommand::List))
+        );
+    }
+
+    #[test]
+    fn agents_spawn_parses_count_and_prompt() {
+        assert_eq!(
+            parse_autonomy_slash("/agents spawn 3 run all tests").unwrap(),
+            Some(AutonomyCommand::Agents(AgentsCommand::Spawn {
+                count: 3,
+                prompt: "run all tests".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn agents_spawn_count_one_is_valid() {
+        assert_eq!(
+            parse_autonomy_slash("/agents spawn 1 fix lint").unwrap(),
+            Some(AutonomyCommand::Agents(AgentsCommand::Spawn {
+                count: 1,
+                prompt: "fix lint".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn agents_spawn_zero_count_is_rejected() {
+        assert_eq!(
+            parse_autonomy_slash("/agents spawn 0 anything").unwrap_err(),
+            AutonomyParseError::InvalidSpawnCount("0".into())
+        );
+    }
+
+    #[test]
+    fn agents_spawn_non_numeric_count_is_rejected() {
+        assert_eq!(
+            parse_autonomy_slash("/agents spawn abc prompt").unwrap_err(),
+            AutonomyParseError::InvalidSpawnCount("abc".into())
+        );
+    }
+
+    #[test]
+    fn agents_spawn_missing_prompt_is_rejected() {
+        assert_eq!(
+            parse_autonomy_slash("/agents spawn 3").unwrap_err(),
+            AutonomyParseError::EmptySpawnPrompt
+        );
+    }
+
+    #[test]
+    fn agents_spawn_empty_args_is_rejected() {
+        assert_eq!(
+            parse_autonomy_slash("/agents spawn").unwrap_err(),
+            AutonomyParseError::InvalidSpawnCount("".into())
+        );
+    }
+
+    #[test]
+    fn agents_spawn_overflow_count_is_rejected() {
+        assert_eq!(
+            parse_autonomy_slash("/agents spawn 4294967296 prompt").unwrap_err(),
+            AutonomyParseError::InvalidSpawnCount("4294967296".into())
         );
     }
 }
