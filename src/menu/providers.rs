@@ -3397,14 +3397,24 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 .disabled("profile/llm/list returned no models for this profile"),
             );
         } else {
+            // Exactly ONE row is the active model. The catalog's `selected`
+            // primary wins (the server marks precisely one, by
+            // family+model+route); only if none is selected do we fall back to
+            // the row matching the live runtime model id. Resolving a single
+            // index — rather than an OR per row — guarantees at most one `*`
+            // even when a backend erroneously marks several rows `selected` (a
+            // mock/misbehaving server — the "everything shows *" symptom) or two
+            // configured entries share a model id (same model via two providers
+            // or routes), where the old id-only OR lit up every match.
+            let current_idx = models.iter().position(|model| model.selected).or_else(|| {
+                ctx.app
+                    .current_model
+                    .and_then(|current| models.iter().position(|model| model.model == current))
+            });
             for (idx, model) in models.iter().enumerate() {
                 let id = format!("model.select.{idx}");
                 let state = MenuItemState {
-                    current: model.selected
-                        || ctx
-                            .app
-                            .current_model
-                            .is_some_and(|current| current == model.model),
+                    current: current_idx == Some(idx),
                     ..MenuItemState::default()
                 };
                 let action = if can_select {
@@ -7890,6 +7900,95 @@ mod tests {
         assert_eq!(params.family_id, "deepseek");
         assert_eq!(params.route_id, "coding");
         assert!(select.state.current);
+    }
+
+    #[test]
+    fn model_menu_marks_exactly_one_active_row() {
+        // Bug 3 hardening: the `*` marker must land on exactly one row. Two
+        // failure inputs the old id-only `current_model == model.model` OR
+        // painted wrong: (1) two entries sharing a model id, and (2) a
+        // misbehaving/mock backend that marks every row `selected` (the
+        // reported "everything shows *"). A real SSOT backend marks exactly one
+        // (verified live), so this is defensive robustness against bad inputs.
+        let registry = core_menu_registry();
+        let capabilities =
+            CapabilitySet::from_methods([APPUI_METHOD_MODEL_LIST, APPUI_METHOD_MODEL_SELECT]);
+        let session_id = SessionKey("local:test".into());
+        let model = |name: &str, provider: &str, selected: bool| ModelStatus {
+            model: name.into(),
+            provider: provider.into(),
+            title: Some(format!("{provider} / {name}")),
+            family: Some(provider.into()),
+            route: Some("official".into()),
+            selected,
+            available: Some(true),
+            queue_mode: None,
+            qoe_policy: None,
+        };
+        let marked_ids = |catalog: &SessionModelCatalog, current: Option<&'static str>| {
+            let ctx = MenuContext {
+                availability: AvailabilityContext::protocol(&capabilities),
+                app: MenuAppSnapshot {
+                    selected_session_id: Some(&session_id),
+                    model_catalog: Some(catalog),
+                    current_model: current,
+                    ..MenuAppSnapshot::default()
+                },
+                terminal: TerminalSize::default(),
+                theme_name: None,
+                selected_path: &[],
+            };
+            let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL), &ctx)
+            else {
+                panic!("expected model menu");
+            };
+            spec.items
+                .iter()
+                .filter(|item| item.id.starts_with("model.select.") && item.state.current)
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Same model id via two providers (a real failover config). Only the
+        // primary is `selected`; the live model id matches BOTH rows.
+        let dup = SessionModelCatalog {
+            session_id: session_id.clone(),
+            models: vec![
+                model("shared-model", "openai", true),
+                model("shared-model", "openrouter", false),
+            ],
+        };
+        assert_eq!(
+            marked_ids(&dup, Some("shared-model")),
+            vec!["model.select.0".to_string()],
+            "duplicate model ids must mark only the selected (primary) row",
+        );
+
+        // A backend that marks EVERY row selected → client still shows one.
+        let all_selected = SessionModelCatalog {
+            session_id: session_id.clone(),
+            models: vec![
+                model("m-a", "openai", true),
+                model("m-b", "zai", true),
+                model("m-c", "deepseek", true),
+            ],
+        };
+        assert_eq!(
+            marked_ids(&all_selected, None).len(),
+            1,
+            "a multi-selected backend must not paint every row active",
+        );
+
+        // No row selected → fall back to the live runtime model (first match).
+        let none_selected = SessionModelCatalog {
+            session_id: session_id.clone(),
+            models: vec![model("m-a", "openai", false), model("m-b", "zai", false)],
+        };
+        assert_eq!(
+            marked_ids(&none_selected, Some("m-b")),
+            vec!["model.select.1".to_string()],
+            "with nothing selected, the live runtime model marks its row",
+        );
     }
 
     #[test]
