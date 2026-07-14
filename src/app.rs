@@ -2242,6 +2242,7 @@ fn onboarding_first_launch_active(app: &AppState) -> bool {
                     | crate::menu::registry::MENU_ONBOARD_MODEL
                     | crate::menu::registry::MENU_ONBOARD_ROUTE
                     | crate::menu::registry::MENU_ONBOARD_WORKSPACE
+                    | crate::menu::registry::MENU_ONBOARD_DONE
             )
         })
 }

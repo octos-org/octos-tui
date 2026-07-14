@@ -3456,6 +3456,9 @@ impl Store {
                     // the user into the coding surface), not leave the workspace
                     // menu stacked over the chat.
                     | crate::menu::registry::MENU_ONBOARD_WORKSPACE
+                    // Model A launch-flow terminal screen (launch instructions):
+                    // treated as onboarding so Esc/Exit tears the wizard down.
+                    | crate::menu::registry::MENU_ONBOARD_DONE
             )
         })
     }

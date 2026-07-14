@@ -20,7 +20,15 @@ pub const MENU_ONBOARD_MODEL: &str = "onboard-model";
 pub const MENU_ONBOARD_ROUTE: &str = "onboard-route";
 /// UX2 B.2: workspace staging + validation lives on its OWN onboarding step
 /// screen (the "Set Up LLM Provider" menu now configures provider/model only).
+/// Retained for older servers without the launch flow; on a launch-flow server
+/// the provider step ends at [`MENU_ONBOARD_DONE`] instead.
 pub const MENU_ONBOARD_WORKSPACE: &str = "onboard-workspace";
+/// Terminal onboarding screen on a launch-flow server (Model A): the profile +
+/// provider are set, so onboarding ends here with launch instructions instead
+/// of staging a workspace / opening a session — launch-time activation
+/// (`launch/resolve`) opens the session on the next start. See
+/// `onboarding_done_menu`.
+pub const MENU_ONBOARD_DONE: &str = "onboard-done";
 /// Phase 3 startup picker: "attach which profile?" shown at launch when more
 /// than one local profile exists and no `--profile-id` was pinned.
 pub const MENU_PROFILE_PICKER: &str = "profile-picker";

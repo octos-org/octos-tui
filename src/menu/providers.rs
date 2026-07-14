@@ -61,6 +61,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::OnboardModel,
         Provider::OnboardRoute,
         Provider::OnboardWorkspace,
+        Provider::OnboardDone,
         Provider::ProfilePicker,
         Provider::LaunchPrompt,
         Provider::Login,
@@ -99,6 +100,7 @@ enum Provider {
     OnboardModel,
     OnboardRoute,
     OnboardWorkspace,
+    OnboardDone,
     Login,
     Theme,
     Thinking,
@@ -130,6 +132,7 @@ impl MenuProvider for Provider {
             Self::OnboardModel => crate::menu::registry::MENU_ONBOARD_MODEL,
             Self::OnboardRoute => crate::menu::registry::MENU_ONBOARD_ROUTE,
             Self::OnboardWorkspace => crate::menu::registry::MENU_ONBOARD_WORKSPACE,
+            Self::OnboardDone => crate::menu::registry::MENU_ONBOARD_DONE,
             Self::Login => MENU_LOGIN,
             Self::Theme => MENU_THEME,
             Self::Thinking => crate::menu::registry::MENU_THINKING,
@@ -161,6 +164,7 @@ impl MenuProvider for Provider {
             Self::OnboardModel => onboarding_model_menu(ctx),
             Self::OnboardRoute => onboarding_route_menu(ctx),
             Self::OnboardWorkspace => onboarding_workspace_menu(ctx),
+            Self::OnboardDone => onboarding_done_menu(ctx),
             Self::Login => login_menu(ctx),
             Self::Theme => MenuBuildResult::Ready(theme_menu(ctx)),
             Self::Thinking => MenuBuildResult::Ready(thinking_menu(ctx)),
@@ -1495,6 +1499,51 @@ fn launch_prompt_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     })
 }
 
+/// Terminal onboarding screen on a launch-flow server (Model A). The profile and
+/// its LLM provider are already set up, so onboarding ends here with launch
+/// instructions instead of staging a workspace or opening a session —
+/// launch-time activation (`launch/resolve`) opens the session on the next
+/// start. Renders an Exit row to leave the wizard. Reached only when
+/// [`launch_flow_supported`] (older servers keep the workspace/Activate step).
+fn onboarding_done_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let profile = ctx
+        .app
+        .onboarding
+        .and_then(|onboarding| onboarding.effective_profile_id(ctx.app.current_profile))
+        .unwrap_or_default();
+    let subtitle = if profile.is_empty() {
+        t!("menu.onboard_done.subtitle_generic").into_owned()
+    } else {
+        t!("menu.onboard_done.subtitle", profile = profile).into_owned()
+    };
+    let items = vec![
+        MenuItem::new(
+            "onboard.done.status",
+            t!("menu.onboard_done.item.ready.label"),
+            MenuAction::Noop,
+        )
+        .with_description(t!("menu.onboard_done.item.ready.desc")),
+        MenuItem::new(
+            "onboard.done.exit",
+            t!("menu.onboard_done.item.exit.label"),
+            MenuAction::Local(LocalAction::Exit),
+        )
+        .with_description(t!("menu.onboard_done.item.exit.desc")),
+    ];
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_ONBOARD_DONE),
+        title: t!("menu.onboard_done.title").into_owned(),
+        subtitle: Some(subtitle),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.onboard_done.footer").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
 fn onboarding_provider_setup_menu(
     ctx: &MenuContext<'_>,
     state: &OnboardingWizardState,
@@ -1635,24 +1684,38 @@ fn onboarding_provider_setup_menu(
             state,
             APPUI_METHOD_PROFILE_LLM_UPSERT,
         )),
-        // UX2 B.2: workspace staging + validation moved to its OWN step screen
-        // (`MENU_ONBOARD_WORKSPACE`). This provider menu now configures the LLM
-        // provider/model only; the user continues to the workspace screen,
-        // which also owns the final Activate action. Disabled until a provider
-        // is saved so the steps stay ordered.
+        // Terminal step. On a launch-flow server (Model A) the provider step
+        // ends at the launch-instructions screen (`MENU_ONBOARD_DONE`) — the
+        // redundant workspace/Activate screen is skipped and launch-time
+        // activation opens the session on the next start. Older servers keep the
+        // workspace step (`MENU_ONBOARD_WORKSPACE`), which owns the final
+        // Activate. Either way it is disabled until a provider is saved so the
+        // steps stay ordered.
         {
             let blocked = (!onboarding_has_saved_primary_provider(ctx, state, current_profile))
                 .then(|| t!("onboarding.wizard.workspace_locked_reason").into_owned());
-            MenuItem::new(
-                "onboard.workspace.open",
-                t!("onboarding.wizard.workspace_open_label"),
-                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_WORKSPACE)),
-            )
-            .with_description(t!("onboarding.wizard.workspace_open_description"))
-            .with_state(MenuItemState::required(
-                state.workspace_validation.is_valid(),
-            ))
-            .maybe_disabled(blocked)
+            if launch_flow_supported(ctx) {
+                MenuItem::new(
+                    "onboard.done.open",
+                    t!("onboarding.wizard.finish_label"),
+                    MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_DONE)),
+                )
+                .with_description(t!("onboarding.wizard.finish_description"))
+                .maybe_disabled(blocked)
+            } else {
+                MenuItem::new(
+                    "onboard.workspace.open",
+                    t!("onboarding.wizard.workspace_open_label"),
+                    MenuAction::OpenMenu(MenuId::from(
+                        crate::menu::registry::MENU_ONBOARD_WORKSPACE,
+                    )),
+                )
+                .with_description(t!("onboarding.wizard.workspace_open_description"))
+                .with_state(MenuItemState::required(
+                    state.workspace_validation.is_valid(),
+                ))
+                .maybe_disabled(blocked)
+            }
         },
     ]);
 
@@ -4405,6 +4468,19 @@ fn local_profile_make_default_supported(ctx: &MenuContext<'_>) -> bool {
         .supports_feature(crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1)
 }
 
+/// True when the backend advertises the per-project launch flow
+/// (`session.workspace_cwd.v1` + `launch/resolve`), so onboarding can end at the
+/// launch-instructions screen and defer session activation to launch time.
+/// Backward compatible: `false` against older servers, which keep the in-wizard
+/// workspace/Activate step.
+fn launch_flow_supported(ctx: &MenuContext<'_>) -> bool {
+    ctx.availability
+        .supports_feature(crate::model::APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1)
+        && ctx
+            .availability
+            .supports_method(crate::model::APPUI_METHOD_LAUNCH_RESOLVE)
+}
+
 fn action_missing_reason(ctx: &MenuContext<'_>, method: &'static str) -> Option<String> {
     (!ctx.availability.supports_method(method)).then(|| method_missing_reason(ctx, method))
 }
@@ -6020,6 +6096,93 @@ mod tests {
         // Unsupported server → the row is hidden entirely.
         let unsupported = ready_spec(onboarding_local_profile_menu(&state, true, true, false));
         assert!(!has_row(&unsupported, "onboard.local.make_default"));
+    }
+
+    #[test]
+    fn provider_step_ends_at_done_screen_on_launch_flow_server() {
+        let onboarding = OnboardingWizardState {
+            profile_id: Some("glm".into()),
+            local_profile_created: true,
+            ..OnboardingWizardState::default()
+        };
+
+        // Launch-flow server (feature + method): the terminal row is the done
+        // screen, and the redundant workspace step is skipped.
+        let launch_caps = CapabilitySet::from_methods_and_features(
+            [
+                crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
+                crate::model::APPUI_METHOD_LAUNCH_RESOLVE,
+            ],
+            [crate::model::APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1],
+        );
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&launch_caps),
+            app: MenuAppSnapshot {
+                current_profile: Some("glm"),
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(onboarding_provider_setup_menu(&ctx, &onboarding, Some("glm")));
+        assert!(
+            has_row(&spec, "onboard.done.open"),
+            "launch-flow onboarding ends at the done screen"
+        );
+        assert!(
+            !has_row(&spec, "onboard.workspace.open"),
+            "the redundant workspace step is skipped"
+        );
+
+        // Older server (no launch flow): keep the workspace/Activate step so the
+        // user is never stranded without a way to start a session.
+        let legacy_caps =
+            CapabilitySet::from_methods([crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT]);
+        let legacy_ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&legacy_caps),
+            app: MenuAppSnapshot {
+                current_profile: Some("glm"),
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let legacy =
+            ready_spec(onboarding_provider_setup_menu(&legacy_ctx, &onboarding, Some("glm")));
+        assert!(has_row(&legacy, "onboard.workspace.open"));
+        assert!(!has_row(&legacy, "onboard.done.open"));
+    }
+
+    #[test]
+    fn onboard_done_menu_shows_launch_instructions_and_exit() {
+        let onboarding = OnboardingWizardState {
+            profile_id: Some("glm".into()),
+            ..OnboardingWizardState::default()
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(onboarding_done_menu(&ctx));
+        assert!(has_row(&spec, "onboard.done.status"), "shows the ready line");
+        assert!(has_row(&spec, "onboard.done.exit"), "offers a way out");
+        assert!(
+            spec.subtitle
+                .as_deref()
+                .unwrap_or_default()
+                .contains("glm"),
+            "names the created brain in the subtitle"
+        );
     }
 
     #[test]

@@ -369,6 +369,8 @@ onboarding:
     workspace_open_label: "继续到工作区 →"
     workspace_open_description: "选择并验证 Octos 将要编码的项目文件夹，然后激活。"
     workspace_locked_reason: "请先保存一个供应商"
+    finish_label: "完成 —— 大脑就绪 →"
+    finish_description: "大脑已配置好。在此重新启动 Octos 即可开始会话。"
     activate_ready_label: "▶ 激活工作区 — 打开编码会话（回车）"
     activate_blocked_label: "激活工作区 — 打开编码会话"
     activate_ready_description: "已就绪。在此按回车打开会话并开始编码。"
@@ -619,6 +621,18 @@ menu:
     search: 筛选模型
     subtitle: 服务器返回的档案 LLM 模型。
     title: 模型
+  onboard_done:
+    title: "一切就绪"
+    subtitle: "大脑 \"%{profile}\" 已就绪。"
+    subtitle_generic: "你的大脑已就绪。"
+    footer: "回车选择 | Esc 关闭"
+    item:
+      ready:
+        label: "在此重新启动 Octos 以开始会话"
+        desc: "下次启动时，此文件夹将为你的大脑激活。"
+      exit:
+        label: "关闭"
+        desc: "退出引导。"
   launch_prompt:
     unavailable: "没有待处理的启动决策。"
     footer: "Enter 选择 | 上/下 移动 | Esc 取消"
