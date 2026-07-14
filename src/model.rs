@@ -8351,6 +8351,40 @@ mod tests {
         UiGitStatusItem, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
     };
 
+    /// The client's LOCAL launch/resolve types (octos-tui pins an older
+    /// octos-core, so `LaunchResolveResult`/`LaunchDecisionKind` are hand
+    /// mirrored) must decode the EXACT bytes a live `octos serve` emits —
+    /// including the omitted `resolved_profile`/`existing_profiles` on the
+    /// leaner decisions. Payloads captured verbatim from the launch-flow soak
+    /// against a real server; a drift here silently breaks the launch UX.
+    #[test]
+    fn launch_resolve_result_decodes_real_server_wire() {
+        let no_profile: LaunchResolveResult =
+            serde_json::from_str(r#"{"decision":"no_profile"}"#).unwrap();
+        assert_eq!(no_profile.decision, LaunchDecisionKind::NoProfile);
+        assert_eq!(no_profile.resolved_profile, None);
+        assert!(no_profile.existing_profiles.is_empty());
+
+        let activate: LaunchResolveResult =
+            serde_json::from_str(r#"{"decision":"activate","resolved_profile":"alpha"}"#).unwrap();
+        assert_eq!(activate.decision, LaunchDecisionKind::Activate);
+        assert_eq!(activate.resolved_profile.as_deref(), Some("alpha"));
+        assert!(activate.existing_profiles.is_empty());
+
+        let resume: LaunchResolveResult =
+            serde_json::from_str(r#"{"decision":"resume","resolved_profile":"alpha"}"#).unwrap();
+        assert_eq!(resume.decision, LaunchDecisionKind::Resume);
+        assert_eq!(resume.resolved_profile.as_deref(), Some("alpha"));
+
+        let cross: LaunchResolveResult = serde_json::from_str(
+            r#"{"decision":"cross_profile","resolved_profile":"alpha","existing_profiles":["beta"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cross.decision, LaunchDecisionKind::CrossProfile);
+        assert_eq!(cross.resolved_profile.as_deref(), Some("alpha"));
+        assert_eq!(cross.existing_profiles, vec!["beta".to_string()]);
+    }
+
     fn state_with_task(task: TaskView) -> AppState {
         AppState::new(
             vec![SessionView {
