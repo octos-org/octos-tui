@@ -6318,10 +6318,9 @@ impl Store {
         // there is no per-project decision to make — let onboarding handle it.
         let cwd = onboarding_workspace_cwd(&self.state.workspace.root)?;
         let profile_id = self.state.onboarding.launch_profile_id.clone();
-        Some(AppUiCommand::LaunchResolve(crate::model::LaunchResolveParams {
-            cwd,
-            profile_id,
-        }))
+        Some(AppUiCommand::LaunchResolve(
+            crate::model::LaunchResolveParams { cwd, profile_id },
+        ))
     }
 
     fn maybe_open_onboarding_on_first_launch(&mut self) {
@@ -6443,8 +6442,11 @@ impl Store {
     fn open_resolved_launch_session(&mut self, profile_id: String) -> Option<AppUiCommand> {
         let session_id =
             octos_core::SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding");
-        self.state.status =
-            t!("status.opening_coding_session", profile = profile_id.clone()).into_owned();
+        self.state.status = t!(
+            "status.opening_coding_session",
+            profile = profile_id.clone()
+        )
+        .into_owned();
         Some(AppUiCommand::OpenSession(
             octos_core::ui_protocol::SessionOpenParams {
                 session_id,
@@ -16274,10 +16276,8 @@ mod tests {
         store.state.onboarding.requested_id = "glm".into();
 
         // The toggle action flips the onboarding flag.
-        store.dispatch_onboarding_action(
-            crate::model::OnboardingAction::SetMakeDefault(true),
-            None,
-        );
+        store
+            .dispatch_onboarding_action(crate::model::OnboardingAction::SetMakeDefault(true), None);
         assert!(store.state.onboarding.make_default);
 
         let command = store
@@ -16293,14 +16293,13 @@ mod tests {
     fn create_local_profile_omits_make_default_when_off_or_unsupported() {
         // Feature advertised but the toggle is off → omit `make_default`.
         let mut supported = store_with_empty_session();
-        supported.state.capabilities =
-            Some(crate::menu::CapabilitySet::from_methods_and_features(
-                [crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
-                [
-                    crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1,
-                    crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1,
-                ],
-            ));
+        supported.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            [
+                crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1,
+                crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1,
+            ],
+        ));
         supported.state.onboarding.requested_id = "glm".into();
         let AppUiCommand::ProfileLocalCreate(off) = supported
             .dispatch_onboarding_action(crate::model::OnboardingAction::CreateLocalProfile, None)

@@ -1470,7 +1470,11 @@ fn launch_prompt_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             }
             (
                 t!("menu.launch_prompt.cross.title").into_owned(),
-                t!("menu.launch_prompt.cross.subtitle", cwd = prompt.cwd.clone()).into_owned(),
+                t!(
+                    "menu.launch_prompt.cross.subtitle",
+                    cwd = prompt.cwd.clone()
+                )
+                .into_owned(),
                 items,
             )
         }
@@ -6072,7 +6076,9 @@ mod tests {
         assert!(
             matches!(
                 &row.action,
-                MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SetMakeDefault(true)))
+                MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SetMakeDefault(
+                    true
+                )))
             ),
             "an off toggle flips ON when activated"
         );
@@ -6090,7 +6096,9 @@ mod tests {
             .unwrap();
         assert!(matches!(
             &row_on.action,
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SetMakeDefault(false)))
+            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SetMakeDefault(
+                false
+            )))
         ));
 
         // Unsupported server → the row is hidden entirely.
@@ -6126,7 +6134,11 @@ mod tests {
             theme_name: None,
             selected_path: &[],
         };
-        let spec = ready_spec(onboarding_provider_setup_menu(&ctx, &onboarding, Some("glm")));
+        let spec = ready_spec(onboarding_provider_setup_menu(
+            &ctx,
+            &onboarding,
+            Some("glm"),
+        ));
         assert!(
             has_row(&spec, "onboard.done.open"),
             "launch-flow onboarding ends at the done screen"
@@ -6151,8 +6163,11 @@ mod tests {
             theme_name: None,
             selected_path: &[],
         };
-        let legacy =
-            ready_spec(onboarding_provider_setup_menu(&legacy_ctx, &onboarding, Some("glm")));
+        let legacy = ready_spec(onboarding_provider_setup_menu(
+            &legacy_ctx,
+            &onboarding,
+            Some("glm"),
+        ));
         assert!(has_row(&legacy, "onboard.workspace.open"));
         assert!(!has_row(&legacy, "onboard.done.open"));
     }
@@ -6174,13 +6189,13 @@ mod tests {
             selected_path: &[],
         };
         let spec = ready_spec(onboarding_done_menu(&ctx));
-        assert!(has_row(&spec, "onboard.done.status"), "shows the ready line");
+        assert!(
+            has_row(&spec, "onboard.done.status"),
+            "shows the ready line"
+        );
         assert!(has_row(&spec, "onboard.done.exit"), "offers a way out");
         assert!(
-            spec.subtitle
-                .as_deref()
-                .unwrap_or_default()
-                .contains("glm"),
+            spec.subtitle.as_deref().unwrap_or_default().contains("glm"),
             "names the created brain in the subtitle"
         );
     }
