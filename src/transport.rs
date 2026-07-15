@@ -24,7 +24,7 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
     UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
     UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
     UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_V1,
 };
@@ -1697,13 +1697,8 @@ impl ProtocolAppUiBackend {
     /// this layer — the transport does not track the negotiated capability
     /// set (the store does), and sending an ignored `cwd` is harmless.
     fn fill_session_list_cwd(&self, command: AppUiCommand) -> AppUiCommand {
-        let AppUiCommand::ListSessions(mut params) = command else {
-            return command;
-        };
-        if params.cwd.is_none() {
-            params.cwd = self.launch.cwd.clone();
-        }
-        AppUiCommand::ListSessions(params)
+        // SessionListParams no longer carries a `cwd` field; return unchanged.
+        command
     }
 
     fn decode_rpc_text(&mut self, text: &str) -> Result<Option<ClientEvent>> {
@@ -2392,7 +2387,7 @@ fn appui_feature_header_for(old_server: bool) -> String {
         );
     }
     format!(
-        "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1}, {UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1}, {UI_PROTOCOL_FEATURE_USER_QUESTION_V1}, {UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1}, {UI_PROTOCOL_FEATURE_PLAN_TODOS_V1}"
+        "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1}, {UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1}, {UI_PROTOCOL_FEATURE_USER_QUESTION_V1}, {UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1}"
     )
 }
 
@@ -2840,8 +2835,8 @@ fn success_response_to_app_event(
                 )),
             }
         }
-        octos_core::ui_protocol::methods::SESSION_BTW => {
-            match serde_json::from_value::<octos_core::ui_protocol::SessionBtwResult>(result) {
+        crate::model::SESSION_BTW => {
+            match serde_json::from_value::<crate::model::SessionBtwResult>(result) {
                 Ok(result) => Ok(Some(ClientEvent::SessionBtw(SessionBtwClientEvent {
                     result,
                 }))),
@@ -2850,7 +2845,7 @@ fn success_response_to_app_event(
                         "invalid_result",
                         format!(
                             "failed to decode UI protocol result for {}: {err}",
-                            octos_core::ui_protocol::methods::SESSION_BTW
+                            crate::model::SESSION_BTW
                         ),
                     )
                     .into(),
@@ -4306,7 +4301,7 @@ impl AppUiBackend for MockAppUiBackend {
             AppUiCommand::SessionBtw(params) => {
                 self.queue
                     .push_back(ClientEvent::SessionBtw(SessionBtwClientEvent {
-                        result: octos_core::ui_protocol::SessionBtwResult {
+                        result: crate::model::SessionBtwResult {
                             session_id: params.session_id,
                             answer: "Mock aside answer — the prototype backend has no LLM, \
                                      but the /btw card, busy gate, and dismissal all work."
@@ -4778,7 +4773,6 @@ impl AppUiBackend for MockAppUiBackend {
                             },
                             context: None,
                             context_state: None,
-                            replayed_tool_envelopes: None,
                             messages: Some(vec![HydratedMessage {
                                 seq: 1,
                                 role: "user".into(),
@@ -4787,7 +4781,6 @@ impl AppUiBackend for MockAppUiBackend {
                                 thread_id: None,
                                 client_message_id: None,
                                 persisted_at: Utc::now(),
-                                reasoning_content: None,
                                 message_id: None,
                                 source: None,
                                 media: Vec::new(),
@@ -5403,11 +5396,6 @@ mod tests {
         assert!(modern.contains(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1));
         assert!(modern.contains(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1));
         assert!(modern.contains(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
-        // Modern advertises the plan/todo checklist so the server streams
-        // `plan/updated`; old-server mode drops it.
-        assert!(modern.contains(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1));
-        assert!(!appui_feature_header_for(true).contains(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1));
-
         // Old-server mode drops autonomy/agent-control/goal/loop/task-control
         // so the backend behaves as a pre-autonomy server and the TUI hides
         // supervised-task inspection controls.
@@ -6806,7 +6794,7 @@ mod tests {
                 after: None,
                 include: Vec::new(),
             }),
-            AppUiCommand::ListSessions(octos_core::ui_protocol::SessionListParams { cwd: None }),
+            AppUiCommand::ListSessions(octos_core::ui_protocol::SessionListParams {}),
             AppUiCommand::GetThreadGraph(ThreadGraphGetParams {
                 session_id: session_id.clone(),
                 at: None,
@@ -9077,35 +9065,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_session_list_request_includes_workspace_cwd_when_launch_has_one() {
-        // `session/list` carries the SAME launch workspace cwd the client
-        // already sends on `session/open` (see `fill_session_list_cwd`), so a
-        // server with per-project session storage lists THIS project's
-        // sessions. The store constructs the command with `cwd: None`; the
-        // transport stamps `launch.cwd`.
-        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
-            endpoint: Some(AppUiEndpoint::websocket(
-                "wss://example.test/ui-protocol",
-                None,
-            )),
-            cwd: Some("/tmp/project".into()),
-            ..AppUiLaunch::default()
-        });
-        let request = backend
-            .build_tracked_request(AppUiCommand::ListSessions(
-                octos_core::ui_protocol::SessionListParams { cwd: None },
-            ))
-            .expect("request builds");
-
-        assert_eq!(request.method, methods::SESSION_LIST);
-        assert_eq!(request.params["cwd"], json!("/tmp/project"));
-    }
-
-    #[test]
-    fn protocol_session_list_request_is_empty_object_when_launch_has_no_cwd() {
-        // Backward compat: with no launch cwd the `session/list` request
-        // serializes to the historical empty object `{}` (no `cwd` key), so an
-        // old server deserializes it unchanged.
+    fn protocol_session_list_request_is_empty_object() {
+        // Wire-compat: `session/list` must serialize to the historical empty
+        // object `{}` (no `cwd` key), so old servers deserialize it unchanged.
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
             endpoint: Some(AppUiEndpoint::websocket(
                 "wss://example.test/ui-protocol",
@@ -9116,7 +9078,7 @@ mod tests {
         });
         let request = backend
             .build_tracked_request(AppUiCommand::ListSessions(
-                octos_core::ui_protocol::SessionListParams { cwd: None },
+                octos_core::ui_protocol::SessionListParams {},
             ))
             .expect("request builds");
 

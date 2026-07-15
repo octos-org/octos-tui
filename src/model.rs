@@ -28,6 +28,55 @@ pub type LiveReply = AppUiLiveReply;
 pub type SessionView = AppUiSession;
 pub type TaskView = AppUiTask;
 
+// Session/btw types removed from octos-core — defined locally so the /btw
+// feature continues to work with servers that still support the method.
+pub const SESSION_BTW: &str = "session/btw";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBtwParams {
+    pub session_id: octos_core::SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub question: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBtwResult {
+    pub session_id: octos_core::SessionKey,
+    pub answer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+// Plan/todo types removed from octos-core — kept locally so the plan panel
+// rendering in app.rs and the plan state in the session model continue to work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlanItemStatus {
+    #[serde(rename = "completed")]
+    Completed,
+    #[serde(rename = "in_progress")]
+    InProgress,
+    #[serde(rename = "pending")]
+    Pending,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiPlanItem {
+    pub id: String,
+    pub title: String,
+    pub status: PlanItemStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiPlanRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub updated_at_ms: i64,
+    pub items: Vec<UiPlanItem>,
+}
+
 pub const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str = "config/capabilities/list";
 pub const APPUI_METHOD_SESSION_STATUS_READ: &str = "session/status/read";
 pub const APPUI_METHOD_SESSION_COMPACT: &str = "session/compact";
@@ -547,7 +596,7 @@ pub struct SessionAutonomyState {
     pub loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
     /// Latest model-authored plan/todo checklist (`plan/updated`). `None` until
     /// the agent calls `update_plan` this session.
-    pub plan: Option<octos_core::ui_protocol::UiPlanRecord>,
+    pub plan: Option<UiPlanRecord>,
     /// Turn that authored the current `plan`, when known. The plan is per-turn
     /// working state, so it is cleared when this turn completes.
     pub plan_turn_id: Option<TurnId>,
@@ -663,7 +712,7 @@ pub enum AppUiCommand {
     StartReview(ReviewStartParams),
     ListConfigCapabilities(ConfigCapabilitiesListParams),
     ReadSessionStatus(SessionStatusReadParams),
-    SessionBtw(octos_core::ui_protocol::SessionBtwParams),
+    SessionBtw(SessionBtwParams),
     CompactContext(SessionCompactParams),
     ListModels(ModelListParams),
     SelectModel(ModelSelectParams),
@@ -754,7 +803,7 @@ impl AppUiCommand {
             Self::StartReview(_) => APPUI_METHOD_REVIEW_START,
             Self::ListConfigCapabilities(_) => APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
             Self::ReadSessionStatus(_) => APPUI_METHOD_SESSION_STATUS_READ,
-            Self::SessionBtw(_) => octos_core::ui_protocol::methods::SESSION_BTW,
+            Self::SessionBtw(_) => SESSION_BTW,
             Self::CompactContext(_) => APPUI_METHOD_SESSION_COMPACT,
             Self::ListModels(_) | Self::ProfileLlmList(_) => APPUI_METHOD_MODEL_LIST,
             Self::SelectModel(_) | Self::ProfileLlmSelect(_) => APPUI_METHOD_MODEL_SELECT,
@@ -5922,7 +5971,7 @@ impl AppState {
     pub fn set_session_plan(
         &mut self,
         session_id: &SessionKey,
-        plan: Option<octos_core::ui_protocol::UiPlanRecord>,
+        plan: Option<UiPlanRecord>,
         turn_id: Option<TurnId>,
     ) {
         let entry = self.session_autonomy_mut(session_id);
@@ -9443,25 +9492,11 @@ mod tests {
 
     #[test]
     fn should_serialize_to_empty_object_when_session_list_params_has_no_cwd() {
-        // Wire-compat: a no-cwd `session/list` request must serialize to the
+        // Wire-compat: `session/list` request must serialize to the
         // historical empty object `{}`, byte-identical to what old clients
-        // sent, so an OLD server (no per-project session storage) still
-        // deserializes it unchanged (`cwd: None` -> legacy global listing).
-        let params = SessionListParams { cwd: None };
+        // sent, so an OLD server still deserializes it unchanged.
+        let params = SessionListParams {};
         let wire = serde_json::to_value(&params).expect("SessionListParams serializes");
         assert_eq!(wire, serde_json::json!({}));
-    }
-
-    #[test]
-    fn should_serialize_cwd_field_when_session_list_params_has_cwd() {
-        // With a workspace cwd present the request carries `{"cwd": "..."}`,
-        // which a server with `appui.sessions_in_cwd` (and the negotiated
-        // `session.workspace_cwd.v1` feature) honors to scope the listing to
-        // the project rooted at that path.
-        let params = SessionListParams {
-            cwd: Some("/tmp/project".into()),
-        };
-        let wire = serde_json::to_value(&params).expect("SessionListParams serializes");
-        assert_eq!(wire, serde_json::json!({ "cwd": "/tmp/project" }));
     }
 }

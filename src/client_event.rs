@@ -217,7 +217,7 @@ pub struct SessionStatusClientEvent {
 /// question asked while the session's turn keeps running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionBtwClientEvent {
-    pub result: octos_core::ui_protocol::SessionBtwResult,
+    pub result: crate::model::SessionBtwResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

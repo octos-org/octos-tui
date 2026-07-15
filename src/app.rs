@@ -7743,7 +7743,7 @@ const PLAN_PANEL_MAX_ITEMS: usize = 8;
 
 /// Rows the plan checklist adds to the sticky panel: a header line plus one
 /// row per shown item (capped), plus a `+N more` line when truncated.
-fn plan_panel_rows(plan: &octos_core::ui_protocol::UiPlanRecord) -> u16 {
+fn plan_panel_rows(plan: &crate::model::UiPlanRecord) -> u16 {
     if plan.items.is_empty() {
         return 0;
     }
@@ -7922,10 +7922,10 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
 /// (`✶ <activity> (done/total)`) plus a `⎿`-anchored tree of items with a
 /// per-status glyph. Mirrors the sub-agent task-group tree visual.
 fn plan_indicator_lines(
-    plan: &octos_core::ui_protocol::UiPlanRecord,
+    plan: &crate::model::UiPlanRecord,
     palette: Palette,
 ) -> Vec<Line<'static>> {
-    use octos_core::ui_protocol::PlanItemStatus;
+    use crate::model::PlanItemStatus;
     if plan.items.is_empty() {
         return Vec::new();
     }
@@ -16180,7 +16180,7 @@ mod tests {
 
     #[test]
     fn plan_indicator_renders_checklist_tree_with_glyphs() {
-        use octos_core::ui_protocol::{PlanItemStatus, UiPlanItem, UiPlanRecord};
+        use crate::model::{PlanItemStatus, UiPlanItem, UiPlanRecord};
         let mut app = autonomy_app_state();
         let session_id = SessionKey("local:test".into());
         app.set_session_plan(
@@ -16232,7 +16232,7 @@ mod tests {
 
     #[test]
     fn plan_cleared_only_when_its_authoring_turn_completes() {
-        use octos_core::ui_protocol::{PlanItemStatus, UiPlanItem, UiPlanRecord};
+        use crate::model::{PlanItemStatus, UiPlanItem, UiPlanRecord};
         let mut app = autonomy_app_state();
         let session_id = SessionKey("local:test".into());
         let turn = TurnId::new();
@@ -16261,7 +16261,7 @@ mod tests {
 
     #[test]
     fn plan_indicator_truncates_long_checklist() {
-        use octos_core::ui_protocol::{PlanItemStatus, UiPlanItem, UiPlanRecord};
+        use crate::model::{PlanItemStatus, UiPlanItem, UiPlanRecord};
         let mut app = autonomy_app_state();
         let items: Vec<_> = (0..12)
             .map(|i| UiPlanItem {

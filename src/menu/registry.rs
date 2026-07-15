@@ -182,7 +182,7 @@ pub const APPUI_RESUME_MENU_METHODS_ALL: &[&str] =
     &[methods::SESSION_LIST, methods::SESSION_HYDRATE];
 /// `/btw` is gated on the server advertising `session/btw` — the out-of-band
 /// aside answer; older servers hide the command instead of erroring on send.
-pub const APPUI_BTW_METHODS_ALL: &[&str] = &[methods::SESSION_BTW];
+pub const APPUI_BTW_METHODS_ALL: &[&str] = &[crate::model::SESSION_BTW];
 /// `/rewind` is gated on the server advertising `session/rollback`; without it
 /// there is no way to drop the later turns, so the command hides.
 pub const APPUI_REWIND_MENU_METHODS_ANY: &[&str] =
