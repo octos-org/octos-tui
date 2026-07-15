@@ -647,8 +647,10 @@ menu:
     footer: "回车选择 | Esc 关闭"
     item:
       ready:
-        label: "下一步：在此重新启动 Octos 以开始会话"
-        desc: "下次启动时，此文件夹将为你的大脑激活。"
+        label: "下一步：开始使用“%{profile}”的会话"
+        desc: "在此运行 `octos-tui`（此文件夹已为“%{profile}”激活），或在其他文件夹运行 `octos-tui --profile-id %{profile}`。"
+        label_generic: "下一步：开始一个会话"
+        desc_generic: "在此运行 `octos-tui` —— 此文件夹现已为你的大脑激活。"
       exit:
         label: "关闭"
         desc: "退出引导。"

@@ -1060,8 +1060,10 @@ menu:
     footer: "Enter select | Esc close"
     item:
       ready:
-        label: "Next: relaunch Octos here to start a session"
-        desc: "This folder activates for your brain on the next launch."
+        label: "Next: start a session with “%{profile}”"
+        desc: "Run `octos-tui` here (this folder is activated for “%{profile}”), or `octos-tui --profile-id %{profile}` from another folder."
+        label_generic: "Next: start a session"
+        desc_generic: "Run `octos-tui` here — this folder is now activated for your brain."
       exit:
         label: "Close"
         desc: "Leave onboarding."

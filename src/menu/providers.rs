@@ -1483,7 +1483,10 @@ fn launch_prompt_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 ),
                 open_session(&prompt.resolved_profile),
             )
-            .with_description(t!("menu.launch_prompt.activate.item.activate.desc"));
+            .with_description(t!(
+                "menu.launch_prompt.activate.item.activate.desc",
+                profile = prompt.resolved_profile.clone()
+            ));
             if let Some(shortcut) = numeric_shortcut(0) {
                 activate = activate.with_shortcut(shortcut);
             }
@@ -1510,7 +1513,10 @@ fn launch_prompt_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                     ),
                     open_session(&prompt.resolved_profile),
                 )
-                .with_description(t!("menu.launch_prompt.cross.item.start.desc")),
+                .with_description(t!(
+                    "menu.launch_prompt.cross.item.start.desc",
+                    profile = prompt.resolved_profile.clone()
+                )),
             ];
             for (index, existing) in prompt.existing_profiles.iter().enumerate() {
                 let mut item = MenuItem::new(
@@ -1521,7 +1527,10 @@ fn launch_prompt_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                     ),
                     open_session(existing),
                 )
-                .with_description(t!("menu.launch_prompt.cross.item.switch.desc"));
+                .with_description(t!(
+                    "menu.launch_prompt.cross.item.switch.desc",
+                    profile = existing.clone()
+                ));
                 // Reserve shortcut 1 for "start here"; switch rows follow.
                 if let Some(shortcut) = numeric_shortcut(index + 1) {
                     item = item.with_shortcut(shortcut);
@@ -1580,19 +1589,28 @@ fn onboarding_done_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     } else {
         t!("menu.onboard_done.subtitle", profile = profile).into_owned()
     };
-    let items = vec![
-        MenuItem::new(
-            "onboard.done.status",
-            t!("menu.onboard_done.item.ready.label"),
-            MenuAction::Noop,
+    // Name the concrete command to start a session with this profile, rather
+    // than a vague "relaunch Octos here" (user feedback).
+    let (ready_label, ready_desc) = if profile.is_empty() {
+        (
+            t!("menu.onboard_done.item.ready.label_generic").into_owned(),
+            t!("menu.onboard_done.item.ready.desc_generic").into_owned(),
         )
-        .with_description(t!("menu.onboard_done.item.ready.desc"))
-        // A read-only "what's next" instruction, not an action: mark it
-        // non-selectable so the cursor skips it (only Close acts here).
-        .with_state(MenuItemState {
-            non_selectable: true,
-            ..MenuItemState::default()
-        }),
+    } else {
+        (
+            t!("menu.onboard_done.item.ready.label", profile = &profile).into_owned(),
+            t!("menu.onboard_done.item.ready.desc", profile = &profile).into_owned(),
+        )
+    };
+    let items = vec![
+        MenuItem::new("onboard.done.status", ready_label, MenuAction::Noop)
+            .with_description(ready_desc)
+            // A read-only "what's next" instruction, not an action: mark it
+            // non-selectable so the cursor skips it (only Close acts here).
+            .with_state(MenuItemState {
+                non_selectable: true,
+                ..MenuItemState::default()
+            }),
         MenuItem::new(
             "onboard.done.exit",
             t!("menu.onboard_done.item.exit.label"),
@@ -1792,29 +1810,10 @@ fn onboarding_provider_setup_menu(
                 APPUI_METHOD_PROFILE_LLM_UPSERT,
             )),
         ]);
-
-        // "Add as fallback" only makes sense once a PRIMARY provider exists —
-        // during first-model setup there is nothing to fall back from, so the
-        // row is confusing there (user feedback). Show it only after a primary
-        // is saved, when appending an alternate route is a real choice.
-        if onboarding_has_saved_primary_provider(ctx, state, current_profile) {
-            items.push(
-                MenuItem::new(
-                    "onboard.provider.fallback",
-                    onboarding_provider_fallback_label(state),
-                    MenuAction::Local(LocalAction::Onboarding(
-                        OnboardingAction::SaveProviderFallback,
-                    )),
-                )
-                .with_description(t!("menu.onboard.item.fallback_provider.desc"))
-                .with_state(onboarding_provider_save_state(state))
-                .maybe_disabled(onboarding_provider_disabled_reason(
-                    ctx,
-                    state,
-                    APPUI_METHOD_PROFILE_LLM_UPSERT,
-                )),
-            );
-        }
+        // NOTE: onboarding no longer surfaces "Add as fallback" — first-run is
+        // about getting ONE model working, and the fallback concept confused
+        // users here. Fallbacks remain available post-onboarding via
+        // `/add-model` (the MENU_PROVIDER surface).
     }
 
     // Terminal step (always shown — collapsed or expanded). On a launch-flow
@@ -2207,24 +2206,18 @@ fn onboarding_local_profile_menu(
         }),
     );
 
-    items.extend([
-        // Escape hatches (issue: the wizard auto-opens and swallows Esc, so it
-        // MUST offer visible ways out). An existing profile id routes the
-        // wizard straight to provider setup via the same `/onboard profile`
-        // path; Exit quits without creating anything.
-        onboarding_edit_item(
-            "onboard.local.profile_id",
-            t!("onboarding.field.existing_profile"),
-            state.profile_id.as_deref(),
-            "/onboard profile ",
-        ),
+    items.push(
+        // Escape hatch: the wizard auto-opens and swallows Esc, so it MUST offer
+        // a visible way out. (Choosing an existing profile is the startup
+        // picker's job — this create step is only ever reached to make a NEW
+        // one — so the confusing "use existing profile (ID)" row is gone.)
         MenuItem::new(
             "onboard.local.exit",
             t!("menu.onboard.item.exit.label"),
             MenuAction::Local(LocalAction::Exit),
         )
         .with_description(t!("menu.onboard.item.exit.desc")),
-    ]);
+    );
 
     // Wizard framing: the language step is already satisfied by the default
     // English locale, so this screen is the first required profile input step.
@@ -6482,6 +6475,21 @@ mod tests {
         assert_eq!(params.profile_id.as_deref(), Some("glm"));
         // Activate is a single-profile confirm — no switch rows.
         assert!(!has_row(&spec, "launch.switch.0"));
+        // Both the label AND description must interpolate the profile, not leave
+        // a literal "%{profile}" placeholder (regression: the desc dropped the arg).
+        assert!(
+            activate.label.contains("glm") && !activate.label.contains("%{profile}"),
+            "activate label: {:?}",
+            activate.label
+        );
+        assert!(
+            activate
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("glm") && !d.contains("%{profile}")),
+            "activate desc must name the profile: {:?}",
+            activate.description
+        );
     }
 
     fn runtime_status(session_id: &SessionKey) -> SessionRuntimeStatus {
@@ -6893,11 +6901,11 @@ mod tests {
             !has_row(&expanded, "onboard.provider.add_model"),
             "the collapsed entry is replaced while actively configuring"
         );
-        // "Add as fallback" is confusing during FIRST-model setup (nothing to
-        // fall back from), so it is hidden until a primary provider is saved.
+        // Onboarding never surfaces "Add as fallback" — first-run is about one
+        // model; fallbacks live behind `/add-model` (MENU_PROVIDER).
         assert!(
             !has_row(&expanded, "onboard.provider.fallback"),
-            "the fallback row is hidden while no primary is saved yet"
+            "onboarding does not offer the fallback save"
         );
 
         // Once the staged selection has been SAVED as the primary (session
@@ -6918,15 +6926,15 @@ mod tests {
             "the raw config rows are hidden once the primary is saved"
         );
 
-        // Staging a DIFFERENT model than the saved primary re-expands (to add a
-        // fallback or replace), and the fallback row is now a real choice.
+        // Staging a DIFFERENT model than the saved primary re-expands (to
+        // replace it) — but still without a fallback row (that's `/add-model`).
         let mut adding_second = saved.clone();
         adding_second.provider.model_id = "glm-4.7".into();
         let second = build(&adding_second);
         assert!(
             has_row(&second, "onboard.provider.family")
-                && has_row(&second, "onboard.provider.fallback"),
-            "staging a different model re-expands and offers the fallback save"
+                && !has_row(&second, "onboard.provider.fallback"),
+            "staging a different model re-expands, still with no fallback row"
         );
     }
 
