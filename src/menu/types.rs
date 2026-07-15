@@ -376,6 +376,9 @@ pub enum LocalAction {
     SelectProfileForActions(String),
     /// Set the given profile as the machine default (writes `default-profile`).
     SetProfileDefault(String),
+    /// "Use this profile" from the profiles surface: switch the active session to
+    /// this profile by opening (or resuming) its session in the current folder.
+    SwitchToProfile(String),
     /// Open the Yes/No delete confirm for the given profile id.
     RequestDeleteProfile(String),
     /// Confirmed: delete the given profile (descriptor + data dir) from disk.

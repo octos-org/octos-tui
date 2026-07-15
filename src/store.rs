@@ -1265,6 +1265,7 @@ impl Store {
                 self.dispatch_set_profile_default(&id);
                 None
             }
+            LocalAction::SwitchToProfile(id) => self.dispatch_switch_to_profile(&id),
             LocalAction::RequestDeleteProfile(id) => {
                 self.state.onboarding.selected_profile = Some(id);
                 self.open_menu(MenuId::from(
@@ -1433,6 +1434,40 @@ impl Store {
         self.state.onboarding.available_profiles =
             crate::profiles::enumerate_profile_ids(&data_dir.join("profiles"));
         self.state.onboarding.default_profile = crate::profiles::read_default_profile(data_dir);
+    }
+
+    /// "Use this profile" from the profiles surface: switch the active session to
+    /// `id` by opening (or resuming) its session in the current folder. Sessions
+    /// are keyed per-profile, so this makes that profile's session active; the
+    /// previous profile's session is left intact. `None` cwd (remote launch)
+    /// still opens the session — the server resolves the folder.
+    fn dispatch_switch_to_profile(&mut self, id: &str) -> Option<AppUiCommand> {
+        self.close_all_menus();
+        self.state.onboarding.selected_profile = None;
+        let cwd = self.current_switch_cwd();
+        let session_id = octos_core::SessionKey::with_profile_topic(id, "local", "tui", "coding");
+        self.state.status = t!("status.switching_profile", profile = id.to_string()).into_owned();
+        Some(AppUiCommand::OpenSession(
+            octos_core::ui_protocol::SessionOpenParams {
+                session_id,
+                topic: None,
+                profile_id: Some(id.to_owned()),
+                cwd,
+                sandbox: None,
+                after: None,
+            },
+        ))
+    }
+
+    /// The folder to open a switched-to profile's session in: the active
+    /// session's workspace, falling back to the launch cwd.
+    fn current_switch_cwd(&self) -> Option<String> {
+        self.active_session()
+            .and_then(|session| self.state.runtime_status_for(&session.id))
+            .and_then(|status| status.workspace_root.as_deref().or(status.cwd.as_deref()))
+            .filter(|cwd| !cwd.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| self.launch_workspace_cwd())
     }
 
     /// Set the given profile as the machine default (writes the `default-profile`

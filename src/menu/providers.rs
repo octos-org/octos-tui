@@ -1483,9 +1483,7 @@ fn profile_actions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         MenuItem::new(
             "profile.action.use",
             t!("menu.profiles.actions.use"),
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SetProfileId(
-                profile.clone(),
-            ))),
+            MenuAction::Local(LocalAction::SwitchToProfile(profile.clone())),
         )
         .with_description(t!("menu.profiles.actions.use_desc")),
     ];
