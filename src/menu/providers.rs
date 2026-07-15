@@ -1773,22 +1773,37 @@ fn onboarding_done_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             t!("menu.onboard_done.item.ready.desc", profile = &profile).into_owned(),
         )
     };
-    let items = vec![
+    let mut items = vec![
         MenuItem::new("onboard.done.status", ready_label, MenuAction::Noop)
             .with_description(ready_desc)
             // A read-only "what's next" instruction, not an action: mark it
-            // non-selectable so the cursor skips it (only Close acts here).
+            // non-selectable so the cursor skips it (the action rows below act).
             .with_state(MenuItemState {
                 non_selectable: true,
                 ..MenuItemState::default()
             }),
+    ];
+    // Skip the relaunch: open a session on the just-created profile in this
+    // folder right now (the cursor lands here — the primary next step). Same
+    // `session/open` the launch-time "Activate this folder?" prompt does.
+    if !profile.is_empty() {
+        items.push(
+            MenuItem::new(
+                "onboard.done.open_session",
+                t!("menu.onboard_done.item.open.label"),
+                MenuAction::Local(LocalAction::SwitchToProfile(profile.clone())),
+            )
+            .with_description(t!("menu.onboard_done.item.open.desc", profile = &profile)),
+        );
+    }
+    items.push(
         MenuItem::new(
             "onboard.done.exit",
             t!("menu.onboard_done.item.exit.label"),
             MenuAction::Local(LocalAction::Exit),
         )
         .with_description(t!("menu.onboard_done.item.exit.desc")),
-    ];
+    );
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(crate::menu::registry::MENU_ONBOARD_DONE),
         title: t!("menu.onboard_done.title").into_owned(),

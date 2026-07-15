@@ -653,6 +653,9 @@ menu:
         desc: "在此运行 `octos-tui`（此文件夹已为“%{profile}”激活），或在其他文件夹运行 `octos-tui --profile-id %{profile}`。"
         label_generic: "下一步：开始一个会话"
         desc_generic: "在此运行 `octos-tui` —— 此文件夹现已为你的大脑激活。"
+      open:
+        label: "立即在此打开会话"
+        desc: "立即在此文件夹使用“%{profile}”开始工作——无需重启。"
       exit:
         label: "关闭"
         desc: "退出引导。"
@@ -706,8 +709,8 @@ menu:
       title_named: "档案：%{profile}"
       subtitle: "使用此档案、设为默认或删除。"
       none: "未选择档案。"
-      use: "使用此档案"
-      use_desc: "使用此档案开始会话。"
+      use: "在此打开会话"
+      use_desc: "切换到此档案——在当前文件夹打开（或恢复）其会话。"
       set_default: "设为默认"
       set_default_desc: "将其设为直接启动时打开的档案。"
       already_default: "已是默认"

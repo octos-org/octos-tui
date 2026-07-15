@@ -1073,6 +1073,9 @@ menu:
         desc: "Run `octos-tui` here (this folder is activated for “%{profile}”), or `octos-tui --profile-id %{profile}` from another folder."
         label_generic: "Next: start a session"
         desc_generic: "Run `octos-tui` here — this folder is now activated for your brain."
+      open:
+        label: "Open a session here now"
+        desc: "Start working with “%{profile}” in this folder right now — no relaunch needed."
       exit:
         label: "Close"
         desc: "Leave onboarding."
@@ -1126,8 +1129,8 @@ menu:
       title_named: "Profile: %{profile}"
       subtitle: "Use this profile, make it the default, or delete it."
       none: "No profile selected."
-      use: "Use this profile"
-      use_desc: "Start a session with this profile."
+      use: "Open a session here"
+      use_desc: "Switch to this profile — open (or resume) its session in the current folder."
       set_default: "Set as default"
       set_default_desc: "Make this the profile a bare launch opens."
       already_default: "Already the default"
