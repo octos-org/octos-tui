@@ -32,6 +32,12 @@ pub fn render(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
     if app.activity_navigator.active {
         render_activity_navigator_overlay(frame, app, palette);
         return;
+    } else if agent_view_active(app) {
+        // Peeking a sub-agent: the whole screen becomes that agent's output
+        // (full-screen, like the transcript pager) so the native scrollback that
+        // holds the real chat is never touched. Tab/Shift+Tab/Esc restore it.
+        render_agent_overlay(frame, app, palette);
+        return;
     } else if inspector_visible(app) {
         render_inspector_layout(frame, app, palette);
     } else {
@@ -70,6 +76,41 @@ fn inspector_visible(app: &AppState) -> bool {
     )
 }
 
+/// Modal/overlay surfaces that must own the keyboard and the screen over a
+/// sub-agent peek. Mirrors `event_loop::modal_owns_keyboard` (kept in sync): the
+/// peek yields BOTH its rendering and its input while one of these is up, so an
+/// approval / question / detail modal that arrives mid-peek renders visibly and
+/// its keys aren't consumed behind an opaque overlay.
+fn peek_yields_to_modal(app: &AppState) -> bool {
+    app.activity_navigator.active
+        || app
+            .approval
+            .as_ref()
+            .is_some_and(|approval| approval.visible)
+        || app
+            .user_question
+            .as_ref()
+            .is_some_and(|picker| picker.visible)
+        || app.task_output.active
+        || app.artifact_detail.active
+        || app.thread_graph_detail.active
+        || app.turn_state_detail.active
+}
+
+/// True when the main pane is peeking a still-present sub-agent AND no modal is
+/// up — the state that swaps the inline chat for the full-screen agent-output
+/// overlay and gives that overlay the keyboard. A selection pointing at a
+/// vanished agent is NOT active (so the inline composer stays editable), and a
+/// modal takes precedence (so it renders and receives keys). The event loop
+/// gates the peek's keyboard ownership on this same predicate.
+pub fn agent_view_active(app: &AppState) -> bool {
+    !peek_yields_to_modal(app)
+        && matches!(
+            &app.chat_view,
+            crate::model::ChatViewTarget::Agent(id) if app.active_agent_record(id).is_some()
+        )
+}
+
 // ===========================================================================
 // Inline-viewport rendering (codex-style scrollback model).
 //
@@ -91,6 +132,7 @@ fn inspector_visible(app: &AppState) -> bool {
 /// alt-screen only for transient overlays (transcript pager, resume picker).
 pub fn wants_fullscreen_overlay(app: &AppState) -> bool {
     app.activity_navigator.active
+        || agent_view_active(app)
         || inspector_visible(app)
         || onboarding_first_launch_active(app)
         || app.transcript_pager_active
@@ -100,13 +142,30 @@ pub fn wants_fullscreen_overlay(app: &AppState) -> bool {
         || app.turn_state_detail.active
 }
 
+/// The detail overlays that render full-screen (alt-screen, no native scrollback
+/// behind them) and that `scroll_current_surface_*` routes the wheel to. Capture
+/// must stay on while one is up so the wheel actually scrolls it: a detail modal
+/// opening over a peek flips `agent_view_active` false, and without this the
+/// capture would drop even though the modal is a full-screen wheel target.
+fn scrollable_detail_modal_active(app: &AppState) -> bool {
+    app.task_output.active
+        || app.artifact_detail.active
+        || app.thread_graph_detail.active
+        || app.turn_state_detail.active
+}
+
 /// Mouse capture policy. In the default `native` scroll-mode, capture is on
-/// ONLY while the transcript pager is up, so the wheel scrolls the pager and
-/// the inline chat flow keeps native terminal selection/copy untouched. In
-/// `pinned` scroll-mode the user explicitly trades native selection for a
-/// wheel that always scrolls the app (composer pinned), so capture stays on.
+/// ONLY while a full-screen overlay is up — the transcript pager, a sub-agent
+/// peek, or a detail modal — so the wheel scrolls that overlay while the inline
+/// chat flow keeps native terminal selection/copy untouched (these overlays are
+/// alt-screen, with no native scrollback behind them to preserve). In `pinned`
+/// scroll-mode the user explicitly trades native selection for a wheel that
+/// always scrolls the app (composer pinned), so capture stays on.
 pub fn wants_mouse_capture(app: &AppState) -> bool {
-    app.transcript_pager_active || app.pinned_scroll
+    app.transcript_pager_active
+        || app.pinned_scroll
+        || agent_view_active(app)
+        || scrollable_detail_modal_active(app)
 }
 
 /// Watermarks for active-turn content that has already been written into native
@@ -165,7 +224,14 @@ pub fn live_ui_height_with_finalization(
     let menu_height = menu_height_hint(active_menu.as_ref(), width, height);
     let autonomy_height = autonomy_indicator_height(app);
     let harness_height = harness_status_height(app);
-    let chrome = menu_height + autonomy_height + harness_height + composer_height + 1; // +1 status
+    // The sub-agent selector strip renders between the composer and the status
+    // row (see `render_viewport_with_finalization`); reserve its row here too or
+    // the live viewport is oversubscribed by one row whenever agents exist and
+    // Ratatui compresses a fixed row at the tail floor. Height-gated on the same
+    // `height` the render pass uses, so reservation and layout never disagree.
+    let agent_strip_height = agent_strip_height(app, height);
+    let chrome =
+        menu_height + autonomy_height + harness_height + agent_strip_height + composer_height + 1; // +1 status
 
     let tail_height = live_tail_height_with_finalization(app, width, height, live_finalization);
     // The live-tail pane is laid out with `Constraint::Min(1)`, so it always
@@ -283,14 +349,27 @@ pub fn render_viewport_with_finalization(
     // reserved (cap floors at 3), clipping multi-line input. Everything else
     // legitimately lays out within `area`.
     let composer_height = composer_height_for_size(app, area.width, terminal_height);
-    let active_menu = active_menu_surface(app);
-    let menu_height = menu_height_for_viewport(
-        active_menu.as_ref(),
-        area.width,
-        area.height.saturating_sub(composer_height + 1),
-    );
     let autonomy_height = autonomy_indicator_height(app);
     let harness_height = harness_status_height(app);
+    // Height-gated on `terminal_height` — the SAME basis `live_ui_height` used to
+    // reserve the row — so the reservation and this layout always agree.
+    let agent_strip_height = agent_strip_height(app, terminal_height);
+    let active_menu = active_menu_surface(app);
+    // Budget the menu against the room left AFTER every OTHER row in the root
+    // layout: the `Min(1)` live-tail floor, composer, status, the
+    // autonomy/harness indicators, and the selector strip. Omitting any of them
+    // (originally composer+status only) let a tall slash menu overcommit the
+    // layout, so Ratatui compressed a fixed row — the tail floor included, since
+    // `Min(1)` yields before a `Length` when space is short.
+    let menu_available = area.height.saturating_sub(
+        1 // Min(1) live-tail floor
+            + composer_height
+            + 1 // status
+            + autonomy_height
+            + harness_height
+            + agent_strip_height,
+    );
+    let menu_height = menu_height_for_viewport(active_menu.as_ref(), area.width, menu_available);
 
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -300,6 +379,7 @@ pub fn render_viewport_with_finalization(
             Constraint::Length(autonomy_height),
             Constraint::Length(harness_height),
             Constraint::Length(composer_height),
+            Constraint::Length(agent_strip_height),
             Constraint::Length(1),
         ])
         .split(area);
@@ -326,7 +406,10 @@ pub fn render_viewport_with_finalization(
     }
     frame.render_widget(render_composer(app, palette, root[4]), root[4]);
     set_composer_cursor(frame, app, root[4]);
-    frame.render_widget(render_status(app, palette), root[5]);
+    if agent_strip_height > 0 {
+        frame.render_widget(render_agent_strip(app, palette), root[5]);
+    }
+    frame.render_widget(render_status(app, palette), root[6]);
 }
 
 /// The live (uncommitted / in-flight) transcript tail rendered inside the
@@ -1367,6 +1450,9 @@ fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palet
         areas.composer,
     );
     set_composer_cursor(frame, app, areas.composer);
+    if areas.agent_strip.height > 0 {
+        frame.render_widget(render_agent_strip(app, palette), areas.agent_strip);
+    }
     frame.render_widget(render_status(app, palette), areas.status);
 }
 
@@ -1377,6 +1463,9 @@ pub struct ChatLayoutAreas {
     pub autonomy: Rect,
     pub harness: Rect,
     pub composer: Rect,
+    /// Sub-agent selector strip, directly under the composer (0-height when the
+    /// session has no sub-agents).
+    pub agent_strip: Rect,
     pub status: Rect,
 }
 
@@ -2053,8 +2142,14 @@ fn chat_layout_areas_for_menu(
     let desired_menu_height = menu_height_hint(active_menu, area.width, area.height);
     let autonomy_height = autonomy_indicator_height(app);
     let harness_height = harness_status_height(app);
+    let agent_strip_height = agent_strip_height(app, area.height);
     let surface_budget = area.height.saturating_sub(
-        min_transcript_height(area.height) + composer_height + autonomy_height + harness_height + 1,
+        min_transcript_height(area.height)
+            + composer_height
+            + autonomy_height
+            + harness_height
+            + agent_strip_height
+            + 1,
     );
     let menu_height = desired_menu_height.min(surface_budget);
     let root = Layout::default()
@@ -2065,6 +2160,7 @@ fn chat_layout_areas_for_menu(
             Constraint::Length(autonomy_height),
             Constraint::Length(harness_height),
             Constraint::Length(composer_height),
+            Constraint::Length(agent_strip_height),
             Constraint::Length(1),
         ])
         .split(area);
@@ -2075,7 +2171,8 @@ fn chat_layout_areas_for_menu(
         autonomy: root[2],
         harness: root[3],
         composer: root[4],
-        status: root[5],
+        agent_strip: root[5],
+        status: root[6],
     }
 }
 
@@ -2349,6 +2446,133 @@ pub fn activity_navigator_areas(area: Rect) -> ActivityNavigatorAreas {
         detail: body[1],
         hint: vertical[2],
     }
+}
+
+/// Full-screen overlay shown when the main pane is peeking a sub-agent
+/// (`chat_view == Agent(id)`). Renders that agent's streamed output over the
+/// whole terminal — the native scrollback holding the real chat is left
+/// untouched — with the selector strip and a key hint pinned at the bottom.
+fn render_agent_overlay(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
+    let crate::model::ChatViewTarget::Agent(agent_id) = &app.chat_view else {
+        return;
+    };
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+
+    // The peek is full-screen, so `area.height` is the whole terminal — the same
+    // basis the inline strip uses, keeping the affordance consistent.
+    let strip_height = agent_strip_height(app, area.height);
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(strip_height),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    frame.render_widget(
+        render_agent_overlay_body(app, palette, root[0], agent_id),
+        root[0],
+    );
+    if strip_height > 0 {
+        frame.render_widget(render_agent_strip(app, palette), root[1]);
+    }
+    frame.render_widget(render_agent_overlay_hint(palette), root[2]);
+}
+
+/// The scrollable body of the agent peek: an identity/status header followed by
+/// the agent's streamed output log, anchored to the bottom via the shared
+/// `transcript_scroll` (rows-from-bottom) so freshly streamed output stays in
+/// view.
+fn render_agent_overlay_body(
+    app: &AppState,
+    palette: Palette,
+    area: Rect,
+    agent_id: &str,
+) -> Paragraph<'static> {
+    let wrap_width = transcript_wrap_width(area);
+    let lines = agent_overlay_lines(app, palette, agent_id);
+
+    // Inner height excludes the 2 border rows drawn by the block below.
+    let visible_height = transcript_visible_height(area).saturating_sub(2).max(1);
+    let total_rows = transcript_visual_rows(&lines, wrap_width);
+    let max_scroll = total_rows.saturating_sub(visible_height);
+    // Feed the true maximum back so `scroll_agent_view_up`/Home clamp to it
+    // instead of overshooting with a sentinel (see `agent_view_scroll_max`).
+    app.record_agent_view_scroll_max(max_scroll);
+    let scroll_from_bottom = app.agent_view_scroll.min(max_scroll);
+    let scroll_top =
+        u16::try_from(max_scroll.saturating_sub(scroll_from_bottom)).unwrap_or(u16::MAX);
+
+    Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .style(Style::default().fg(palette.text).bg(palette.surface_alt))
+                .border_style(palette.border()),
+        )
+        .scroll((scroll_top, 0))
+        .wrap(Wrap { trim: false })
+}
+
+/// Build the agent-peek body lines: an identity/status/task header, a blank
+/// separator, then the streamed output (or a placeholder until any arrives).
+/// The sub-agent has no turn-by-turn transcript — only this streamed log — so
+/// the header supplies the context a chat transcript otherwise would.
+fn agent_overlay_lines(app: &AppState, palette: Palette, agent_id: &str) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(agent) = app.active_agent_record(agent_id) {
+        let name = if agent.nickname.trim().is_empty() {
+            agent.role.clone()
+        } else {
+            agent.nickname.clone()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} {name}", agent_status_glyph(&agent.status)),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  ·  {}", agent.status), palette.muted()),
+        ]));
+        let task = agent
+            .last_task
+            .as_deref()
+            .or(agent.title.as_deref())
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        if let Some(task) = task {
+            lines.push(Line::from(Span::styled(
+                t!("app.hint.agent_task_prefix", task = task).into_owned(),
+                palette.muted(),
+            )));
+        }
+        lines.push(Line::from(String::new()));
+    }
+    match app.active_agent_output_or_tail(agent_id) {
+        Some(text) if !text.trim().is_empty() => {
+            for raw in text.lines() {
+                lines.push(Line::from(raw.to_string()));
+            }
+        }
+        _ => lines.push(Line::from(Span::styled(
+            t!("app.hint.agent_no_output").into_owned(),
+            palette.muted(),
+        ))),
+    }
+    lines
+}
+
+/// Bottom hint row for the agent peek: the keys that move between agents / the
+/// main chat and scroll the output.
+fn render_agent_overlay_hint(palette: Palette) -> Paragraph<'static> {
+    Paragraph::new(Line::from(Span::styled(
+        t!("app.hint.agent_peek_keys").into_owned(),
+        palette.muted().bg(palette.surface),
+    )))
+    .style(Style::default().bg(palette.surface))
 }
 
 fn render_activity_navigator_overlay(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
@@ -8013,6 +8237,103 @@ fn render_autonomy_indicator(app: &AppState, palette: Palette) -> Paragraph<'sta
     Paragraph::new(Text::from(lines)).style(Style::default().fg(palette.text).bg(palette.surface))
 }
 
+/// Status glyph for a sub-agent chip in the agent strip.
+fn agent_status_glyph(status: &str) -> &'static str {
+    match status.to_ascii_lowercase().as_str() {
+        "running" | "spawned" | "in_progress" => "⏵",
+        "completed" | "complete" | "done" | "ready" => "✔",
+        "failed" | "error" => "✖",
+        "cancelled" | "canceled" | "interrupted" => "⊘",
+        _ => "•",
+    }
+}
+
+/// Logical chips for the agent strip: `(glyph, label, selected)`. `main` first,
+/// then one chip per active-session sub-agent. Empty when the session has no
+/// sub-agents (the strip is then hidden). Split from rendering so the
+/// selection/labeling logic is unit-testable without a frame.
+fn agent_strip_chips(app: &AppState) -> Vec<(&'static str, String, bool)> {
+    let agents = app.active_session_agents();
+    if agents.is_empty() {
+        return Vec::new();
+    }
+    let mut chips = vec![(
+        "⌂",
+        t!("app.hint.agent_strip_main").into_owned(),
+        matches!(app.chat_view, crate::model::ChatViewTarget::Main),
+    )];
+    for agent in agents {
+        let selected = matches!(
+            &app.chat_view,
+            crate::model::ChatViewTarget::Agent(id) if id == &agent.agent_id
+        );
+        let label = if agent.nickname.trim().is_empty() {
+            agent.role.clone()
+        } else {
+            agent.nickname.clone()
+        };
+        chips.push((agent_status_glyph(&agent.status), label, selected));
+    }
+    chips
+}
+
+/// Minimum terminal rows before the selector strip claims its row. Below this a
+/// full composer + status + the `Min(1)` tail + the reserved scrollback already
+/// fill the screen, so adding the strip would force Ratatui to collapse a fixed
+/// row (clipping the composer or status). The Tab switcher still works without
+/// the strip — it is a visual aid, not the control surface — so on a tiny
+/// terminal we drop it rather than corrupt the layout.
+const AGENT_STRIP_MIN_TERMINAL_ROWS: u16 = 12;
+
+/// Rows the agent strip occupies under the composer: 1 when the active session
+/// has sub-agents AND the terminal is tall enough to afford the row, else 0
+/// (hidden). Height-gated so a constrained terminal never oversubscribes the
+/// live layout. Both the height reservation (`live_ui_height`) and the render
+/// pass call this with the same terminal height, so they always agree.
+///
+/// Also hidden while the transcript pager is up: the strip switches views via
+/// Tab, but Tab is disabled in the pager (it never enters a peek), so the strip
+/// is non-interactive there — and the pager's `Min(8)` transcript floor makes
+/// its extra row overcommit sooner than the inline flow's `Min(1)` tail.
+fn agent_strip_height(app: &AppState, terminal_height: u16) -> u16 {
+    if app.transcript_pager_active
+        || terminal_height < AGENT_STRIP_MIN_TERMINAL_ROWS
+        || app.active_session_agents().is_empty()
+    {
+        0
+    } else {
+        1
+    }
+}
+
+/// Render the sub-agent selector strip shown under the composer: `main` plus a
+/// chip per sub-agent, the selected target highlighted. Selection is moved in
+/// the event loop; selecting an agent redirects the main pane to its live
+/// output.
+fn render_agent_strip(app: &AppState, palette: Palette) -> Paragraph<'static> {
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(
+        t!("app.hint.agent_strip_title").into_owned(),
+        palette.muted().bg(palette.surface),
+    )];
+    for (glyph, label, selected) in agent_strip_chips(app) {
+        let chip = format!(" {glyph} {label} ");
+        let style = if selected {
+            Style::default()
+                .fg(palette.surface)
+                .bg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            palette.text().bg(palette.surface)
+        };
+        spans.push(Span::styled(chip, style));
+        spans.push(Span::styled(
+            "  ".to_string(),
+            Style::default().bg(palette.surface),
+        ));
+    }
+    Paragraph::new(Line::from(spans)).style(Style::default().bg(palette.surface))
+}
+
 /// Fallback context-window denominator for `ctx N%`, used only until a cost
 /// update carries the real per-model window (`token_cost.context_window`, stored
 /// in `AppState::session_context_window`). Surfaces the inspector-only
@@ -10992,7 +11313,7 @@ mod tests {
         assert!(!text.contains("ws://"));
         assert!(!text.contains("Transcript"));
         assert!(text.contains("Composer"));
-        assert!(text.contains("Tab inspector"));
+        assert!(text.contains("Tab agents"));
         assert!(!text.contains("Current Tasks"));
         assert!(!text.contains("tasks/status"));
         assert!(!text.contains("Sessions"));
@@ -16135,6 +16456,427 @@ mod tests {
         )
     }
 
+    fn sample_agent(id: &str, status: &str) -> octos_core::ui_protocol::UiAgentRecord {
+        octos_core::ui_protocol::UiAgentRecord {
+            agent_id: id.into(),
+            parent_agent_id: None,
+            session_id: SessionKey("local:test".into()),
+            task_id: None,
+            path: "/root".into(),
+            role: "worker".into(),
+            nickname: id.into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: status.into(),
+            last_task: None,
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    #[test]
+    fn chat_view_selector_cycles_main_then_agents() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        app.upsert_session_agent(&sid, sample_agent("ag-1", "running"));
+        app.upsert_session_agent(&sid, sample_agent("ag-2", "running"));
+
+        assert_eq!(app.chat_view, ChatViewTarget::Main, "defaults to Main");
+
+        // next: Main -> ag-1 -> ag-2 -> Main (wrap)
+        app.select_next_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Agent("ag-1".into()));
+        app.select_next_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Agent("ag-2".into()));
+        app.select_next_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Main);
+
+        // prev from Main wraps back to the last agent
+        app.select_prev_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Agent("ag-2".into()));
+    }
+
+    #[test]
+    fn chat_view_selector_is_noop_without_agents() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        app.select_next_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Main);
+        app.select_prev_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Main);
+    }
+
+    #[test]
+    fn chat_view_normalizes_to_main_when_selected_agent_disappears() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        app.upsert_session_agent(&sid, sample_agent("ag-1", "running"));
+        app.select_next_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Agent("ag-1".into()));
+
+        // The agent completes and is pruned from the session.
+        app.session_autonomy_mut(&sid).agents.clear();
+        app.normalize_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Main);
+    }
+
+    #[test]
+    fn chat_view_resets_to_main_on_session_switch() {
+        use crate::model::ChatViewTarget;
+        let mut app = AppState::new(
+            vec![
+                SessionView {
+                    id: SessionKey("local:a".into()),
+                    title: "a".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+                SessionView {
+                    id: SessionKey("local:b".into()),
+                    title: "b".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+            ],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.upsert_session_agent(
+            &SessionKey("local:a".into()),
+            sample_agent("ag-1", "running"),
+        );
+        app.select_next_chat_view();
+        assert_eq!(app.chat_view, ChatViewTarget::Agent("ag-1".into()));
+
+        app.switch_selected_session(1);
+        assert_eq!(
+            app.chat_view,
+            ChatViewTarget::Main,
+            "agent selection must not carry across sessions"
+        );
+    }
+
+    #[test]
+    fn agent_view_overlay_renders_selected_agent_output() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+        app.upsert_session_agent(&sid, sample_agent("researcher", "running"));
+        app.set_agent_output(
+            &sid,
+            "researcher",
+            "Investigating the corpus\nFound 12 candidate sources".into(),
+            octos_core::ui_protocol::OutputCursor { offset: 0 },
+        );
+
+        // Main view: the inline chat is shown, NOT the agent's output.
+        assert!(!agent_view_active(&app));
+        let main_text = rendered_text(&app);
+        assert!(!main_text.contains("candidate sources"));
+
+        // Peeking the agent: the overlay takes over and shows its output + hint.
+        app.set_chat_view(ChatViewTarget::Agent("researcher".into()));
+        assert!(agent_view_active(&app));
+        assert!(wants_fullscreen_overlay(&app));
+        let peek_text = rendered_text(&app);
+        assert!(
+            peek_text.contains("Investigating the corpus"),
+            "overlay shows the agent's streamed output"
+        );
+        assert!(peek_text.contains("candidate sources"));
+        assert!(
+            peek_text.contains("Esc back to chat"),
+            "overlay shows the navigation hint"
+        );
+    }
+
+    #[test]
+    fn agent_view_inactive_when_selected_agent_absent() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        // A selection pointing at a non-existent agent must not trigger the
+        // full-screen takeover (the switcher normalizes such stragglers to Main).
+        app.set_chat_view(ChatViewTarget::Agent("ghost".into()));
+        assert!(!agent_view_active(&app));
+        assert!(!wants_fullscreen_overlay(&app));
+    }
+
+    #[test]
+    fn agent_view_yields_to_modal() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+        app.upsert_session_agent(&sid, sample_agent("worker", "running"));
+        app.set_chat_view(ChatViewTarget::Agent("worker".into()));
+        assert!(agent_view_active(&app), "peek active with no modal");
+
+        // A modal must take the screen and keyboard back from the peek, else it
+        // renders behind the opaque overlay while still consuming keys.
+        app.task_output.active = true;
+        assert!(!agent_view_active(&app), "peek yields while a modal is up");
+
+        app.task_output.active = false;
+        assert!(
+            agent_view_active(&app),
+            "peek resumes after the modal closes"
+        );
+    }
+
+    #[test]
+    fn agent_roster_refresh_drops_peek_of_vanished_agent() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+        app.upsert_session_agent(&sid, sample_agent("worker", "running"));
+        app.set_chat_view(ChatViewTarget::Agent("worker".into()));
+        assert!(agent_view_active(&app));
+
+        // A refresh that no longer lists "worker" (completed and pruned by the
+        // backend) must fall the peek back to the main chat.
+        app.set_session_agents(&sid, vec![]);
+        assert_eq!(app.chat_view, ChatViewTarget::Main);
+        assert!(!agent_view_active(&app));
+    }
+
+    #[test]
+    fn explicit_output_read_overwrites_the_cache_then_deltas_resume() {
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+        // `set_agent_output` backs only the explicit `/agents output <id>`
+        // command (peeking no longer auto-reads), so a user-requested snapshot
+        // is authoritative: it replaces whatever the cache held and re-seeds the
+        // cursor. Live deltas then resume appending from that cursor.
+        app.append_agent_output(
+            &sid,
+            "worker",
+            octos_core::ui_protocol::OutputCursor { offset: 10 },
+            "partial streamed output\n",
+        );
+        app.set_agent_output(
+            &sid,
+            "worker",
+            "full snapshot up to here\n".into(),
+            octos_core::ui_protocol::OutputCursor { offset: 24 },
+        );
+        assert_eq!(
+            app.active_agent_output("worker"),
+            Some("full snapshot up to here\n"),
+            "an explicit read replaces the cache with the fetched snapshot"
+        );
+
+        // A delta past the snapshot's cursor appends cleanly (shared offset space).
+        app.append_agent_output(
+            &sid,
+            "worker",
+            octos_core::ui_protocol::OutputCursor { offset: 33 },
+            "next chunk\n",
+        );
+        assert_eq!(
+            app.active_agent_output("worker"),
+            Some("full snapshot up to here\nnext chunk\n")
+        );
+
+        // Into an empty cache the read simply fills it (e.g. a completed agent).
+        app.set_agent_output(
+            &sid,
+            "idle",
+            "final output of a completed agent".into(),
+            octos_core::ui_protocol::OutputCursor { offset: 5 },
+        );
+        assert_eq!(
+            app.active_agent_output("idle"),
+            Some("final output of a completed agent")
+        );
+    }
+
+    #[test]
+    fn live_ui_height_reserves_agent_strip_row() {
+        let mut app = autonomy_app_state();
+        let without = live_ui_height(&app, 80, 40);
+        let sid = app.active_session().unwrap().id.clone();
+        app.upsert_session_agent(&sid, sample_agent("worker", "running"));
+        let with = live_ui_height(&app, 80, 40);
+        assert_eq!(
+            with,
+            without + 1,
+            "the strip row must be reserved once agents exist"
+        );
+    }
+
+    #[test]
+    fn agent_strip_height_reflects_agent_presence() {
+        let mut app = autonomy_app_state();
+        assert_eq!(agent_strip_height(&app, 40), 0, "hidden with no agents");
+        app.upsert_session_agent(
+            &SessionKey("local:test".into()),
+            sample_agent("ag-1", "running"),
+        );
+        assert_eq!(
+            agent_strip_height(&app, 40),
+            1,
+            "one row once agents exist on a normal terminal"
+        );
+    }
+
+    #[test]
+    fn peek_output_falls_back_to_the_record_tail_when_cache_is_empty() {
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+        let mut rec = sample_agent("worker", "done");
+        rec.output_tail = Some("tail snapshot from agent/list\n".into());
+        app.upsert_session_agent(&sid, rec);
+
+        // No live delta yet (e.g. a completed agent, or just after a reconnect):
+        // the peek shows the record's `output_tail` instead of the placeholder.
+        assert_eq!(
+            app.active_agent_output_or_tail("worker"),
+            Some("tail snapshot from agent/list\n")
+        );
+
+        // A live delta is strictly fresher and supersedes the snapshot.
+        app.append_agent_output(
+            &sid,
+            "worker",
+            octos_core::ui_protocol::OutputCursor { offset: 5 },
+            "live delta wins\n",
+        );
+        assert_eq!(
+            app.active_agent_output_or_tail("worker"),
+            Some("live delta wins\n")
+        );
+    }
+
+    #[test]
+    fn home_clamps_to_measured_max_so_down_is_not_stuck() {
+        let mut app = autonomy_app_state();
+        // The overlay renderer measured a 20-row maximum on the last frame.
+        app.record_agent_view_scroll_max(20);
+
+        app.scroll_agent_view_up(usize::MAX); // Home
+        assert_eq!(app.agent_view_scroll, 20, "Home lands exactly at the top");
+
+        // Down moves the view immediately — there is no huge sentinel to unwind.
+        app.scroll_agent_view_down(1);
+        assert_eq!(app.agent_view_scroll, 19);
+
+        // Selecting a new target relaxes the clamp to "unmeasured" so the next
+        // frame's real bound applies rather than the previous agent's.
+        app.set_chat_view(crate::model::ChatViewTarget::Agent("worker".into()));
+        assert_eq!(app.agent_view_scroll_max.get(), usize::MAX);
+    }
+
+    #[test]
+    fn down_recovers_when_home_ran_before_the_bound_was_measured() {
+        // codex round-6 case: Tab then Home batched before the peek's first draw,
+        // so the bound is still `usize::MAX` when Home stores its jump.
+        let mut app = autonomy_app_state();
+        app.scroll_agent_view_up(usize::MAX); // Home, unmeasured
+        assert_eq!(app.agent_view_scroll, usize::MAX);
+
+        // The first draw measures the real maximum...
+        app.record_agent_view_scroll_max(12);
+        // ...and Down snaps the stale over-shoot down before moving — not stuck
+        // decrementing the sentinel.
+        app.scroll_agent_view_down(1);
+        assert_eq!(app.agent_view_scroll, 11);
+    }
+
+    #[test]
+    fn wants_mouse_capture_stays_on_for_a_detail_modal_over_a_peek() {
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+        app.upsert_session_agent(&sid, sample_agent("worker", "running"));
+        app.set_chat_view(crate::model::ChatViewTarget::Agent("worker".into()));
+        assert!(wants_mouse_capture(&app), "the peek captures the wheel");
+
+        // A detail modal opens over the peek: it now owns the screen (the peek
+        // yields), but it is still a full-screen wheel target, so capture must
+        // stay on or the wheel would be silently dead over it.
+        app.task_output.active = true;
+        assert!(!agent_view_active(&app), "the peek yields to the modal");
+        assert!(
+            wants_mouse_capture(&app),
+            "capture stays on so the wheel scrolls the detail modal"
+        );
+    }
+
+    #[test]
+    fn agent_strip_hidden_on_a_constrained_terminal() {
+        let mut app = autonomy_app_state();
+        app.upsert_session_agent(
+            &SessionKey("local:test".into()),
+            sample_agent("ag-1", "running"),
+        );
+        // Below the floor the strip would force Ratatui to collapse a fixed row,
+        // so it is dropped (Tab still switches views without it).
+        assert_eq!(
+            agent_strip_height(&app, AGENT_STRIP_MIN_TERMINAL_ROWS - 1),
+            0,
+            "dropped when the terminal can't afford the row"
+        );
+        assert_eq!(
+            agent_strip_height(&app, AGENT_STRIP_MIN_TERMINAL_ROWS),
+            1,
+            "restored at the floor"
+        );
+    }
+
+    #[test]
+    fn agent_strip_hidden_while_transcript_pager_open() {
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+        app.upsert_session_agent(&sid, sample_agent("worker", "running"));
+        assert_eq!(agent_strip_height(&app, 40), 1, "shown in the inline flow");
+
+        // In the pager the strip's Tab control is disabled and its extra row
+        // overcommits the `Min(8)` transcript layout, so it is dropped.
+        app.transcript_pager_active = true;
+        assert_eq!(agent_strip_height(&app, 40), 0, "hidden under the pager");
+    }
+
+    #[test]
+    fn agent_status_glyph_maps_states() {
+        assert_eq!(agent_status_glyph("running"), "⏵");
+        assert_eq!(agent_status_glyph("completed"), "✔");
+        assert_eq!(agent_status_glyph("failed"), "✖");
+        assert_eq!(agent_status_glyph("cancelled"), "⊘");
+        assert_eq!(agent_status_glyph("mystery"), "•");
+    }
+
+    #[test]
+    fn agent_strip_chips_lists_main_and_marks_selection() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        app.upsert_session_agent(&sid, sample_agent("weather", "running"));
+        app.upsert_session_agent(&sid, sample_agent("news", "completed"));
+        app.chat_view = ChatViewTarget::Agent("news".into());
+
+        let chips = agent_strip_chips(&app);
+        assert_eq!(chips.len(), 3, "main + two agents");
+        assert_eq!(chips[0].1, "main");
+        assert!(!chips[0].2, "main not selected");
+        assert_eq!(chips[1].1, "weather");
+        assert_eq!(chips[2].1, "news");
+        assert!(chips[2].2, "selected agent marked");
+        assert_eq!(chips[2].0, "✔", "completed glyph");
+    }
+
     fn sample_loop(
         loop_id: &str,
         prompt: &str,
@@ -16613,7 +17355,7 @@ mod tests {
             "composer chrome intact: {rendered:?}"
         );
         assert!(
-            rendered.contains("Tab inspector"),
+            rendered.contains("Tab agents"),
             "composer hint not clobbered: {rendered:?}"
         );
         // Regression (duplicate ctx%): on a wide terminal (rendered_text uses
@@ -16707,14 +17449,14 @@ mod tests {
     #[test]
     fn harness_status_row_does_not_collide_with_composer_when_idle() {
         // Idle render: the dedicated harness row takes height 0, so the
-        // composer's top-border chrome ("Composer  Enter send | Tab inspector")
+        // composer's top-border chrome ("Composer  Enter send | Tab agents")
         // is fully intact — the collision that caused the prior revert
         // (249fe652) cannot recur because the indicator is never on the border.
         let app = autonomy_app_state();
         assert_eq!(harness_status_height(&app), 0);
         let text = rendered_text(&app);
         assert!(text.contains("Composer"), "{text:?}");
-        assert!(text.contains("Tab inspector"), "{text:?}");
+        assert!(text.contains("Tab agents"), "{text:?}");
         assert!(
             !text.contains("Orchestrating"),
             "idle harness row must be absent: {text:?}"

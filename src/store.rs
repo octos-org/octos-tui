@@ -3476,6 +3476,9 @@ impl Store {
         false
     }
 
+    /// Gate a capability-negotiated AppUI *feature* (vs. a JSON-RPC method).
+    /// Returns `true` when the backend advertised it; otherwise sets a status
+    /// line explaining it isn't available and returns `false`.
     fn require_appui_feature(&mut self, feature: &'static str) -> bool {
         if self
             .state

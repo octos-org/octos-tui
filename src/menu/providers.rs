@@ -1485,7 +1485,10 @@ fn launch_prompt_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 ),
                 open_session(&prompt.resolved_profile),
             )
-            .with_description(t!("menu.launch_prompt.activate.item.activate.desc"));
+            .with_description(t!(
+                "menu.launch_prompt.activate.item.activate.desc",
+                profile = prompt.resolved_profile.clone()
+            ));
             if let Some(shortcut) = numeric_shortcut(0) {
                 activate = activate.with_shortcut(shortcut);
             }
