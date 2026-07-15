@@ -134,6 +134,17 @@ pub fn run(cli: Cli) -> Result<()> {
                 crate::profiles::discover_local_profile_ids(Some(stdio_command));
         }
     }
+    // In-TUI profiles surface (`/profiles`): resolve the on-disk data dir once so
+    // set-default / delete can operate on it, and seed the current default so the
+    // list can mark it. Local-solo only (a remote launch has no local data dir).
+    if let Some(data_dir) = cli
+        .stdio_command
+        .as_deref()
+        .and_then(|command| crate::profiles::solo_data_dir(Some(command)))
+    {
+        store.state.onboarding.default_profile = crate::profiles::read_default_profile(&data_dir);
+        store.state.onboarding.profiles_data_dir = Some(data_dir.to_string_lossy().into_owned());
+    }
     // `octos-tui new <name>`: remember the requested profile id so the first
     // capabilities event force-opens create-a-new-profile onboarding with it
     // pre-seeded (see `maybe_open_new_profile_on_first_launch`).

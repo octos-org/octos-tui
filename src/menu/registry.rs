@@ -32,6 +32,11 @@ pub const MENU_ONBOARD_DONE: &str = "onboard-done";
 /// Phase 3 startup picker: "attach which profile?" shown at launch when more
 /// than one local profile exists and no `--profile-id` was pinned.
 pub const MENU_PROFILE_PICKER: &str = "profile-picker";
+/// Per-profile action drill-in from the profiles surface: use / set-default /
+/// delete for the profile the user selected.
+pub const MENU_PROFILE_ACTIONS: &str = "profile-actions";
+/// Yes/No confirm for the destructive profile delete.
+pub const MENU_PROFILE_DELETE_CONFIRM: &str = "profile-delete-confirm";
 /// Per-project launch prompt (Model A): the Activate / CrossProfile choice
 /// raised from a `launch/resolve` decision. See `launch_prompt_menu`.
 pub const MENU_LAUNCH_PROMPT: &str = "launch-prompt";
@@ -649,6 +654,17 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             availability: CommandAvailability::app_ui_read(APPUI_BTW_METHODS_ALL),
             inline_args: InlineArgMode::Required,
             entry: CommandEntry::LocalAction(LocalAction::Btw),
+        },
+        CommandSpec {
+            name: "profiles",
+            aliases: &["profile"],
+            description: "command.profiles.desc",
+            category: CommandCategory::Session,
+            // Local-solo only: managing on-disk profiles (list/default/delete)
+            // makes sense where the client can see the data dir.
+            availability: CommandAvailability::app_ui_read(&[APPUI_METHOD_PROFILE_LOCAL_CREATE]),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::LocalAction(LocalAction::OpenProfilesSurface),
         },
         CommandSpec {
             name: "resume",

@@ -560,6 +560,12 @@ status:
   make_default_updated: "Default-brain preference updated"
   attached_profile: "Attached profile %{profile}"
   new_profile_launch: "Creating a new profile — name it, then set its AI model"
+  profiles_no_data_dir: "Can't manage profiles here — no local data directory is known for this launch."
+  profile_default_set: "Default profile is now %{profile}"
+  profile_default_failed: "Couldn't set the default profile: %{error}"
+  profile_deleted: "Deleted profile %{profile}"
+  profile_delete_failed: "Couldn't delete the profile: %{error}"
+  profile_delete_active_blocked: "Can't delete %{profile} — it's the profile this session is using. Switch to another profile first."
   provider_route_selected: "Provider route selected; enter API key"
   provider_family_updated: "Provider family updated"
   provider_model_updated: "Provider model updated"
@@ -827,6 +833,8 @@ command:
     desc: Show server-reported token and cost usage.
   exit:
     desc: Quit the TUI.
+  profiles:
+    desc: Manage local profiles — list, set the default, delete, or create one.
   goal:
     desc: View, set, pause, resume, or clear the persisted session goal.
   help:
@@ -1102,6 +1110,43 @@ menu:
       create:
         label: "Create a new profile"
         desc: "Start onboarding to create a fresh local profile instead."
+  profiles:
+    title: "Profiles"
+    subtitle: "Manage your local profiles — set the default, delete, or create one."
+    footer: "Enter manage | Up/Down move | Esc close"
+    default_marker: "*default"
+    preview_title: "Profiles"
+    preview_hint: "Pick a profile to see its model and set it as default or delete it. Use “Create a new profile” to add one."
+    item:
+      manage:
+        desc: "Open this profile — use it, set default, or delete."
+    actions:
+      title: "Profile"
+      title_named: "Profile: %{profile}"
+      subtitle: "Use this profile, make it the default, or delete it."
+      none: "No profile selected."
+      use: "Use this profile"
+      use_desc: "Start a session with this profile."
+      set_default: "Set as default"
+      set_default_desc: "Make this the profile a bare launch opens."
+      already_default: "Already the default"
+      delete: "Delete"
+      delete_desc: "Remove this profile's config and data (asks to confirm)."
+      back: "Back"
+    info:
+      title: "About this profile"
+      name: "Profile: %{profile}"
+      model: "Model: %{model}"
+      no_model: "Model: not configured yet"
+      is_default: "Default: yes — a bare launch opens this"
+      not_default: "Default: no"
+    delete:
+      title: "Delete profile?"
+      title_named: "Delete “%{profile}”?"
+      subtitle: "Removes this profile's config and all its data. Cannot be undone."
+      yes: "Yes, delete %{profile}"
+      yes_desc: "Permanently remove this profile and its data."
+      no: "No, keep it"
   onboard:
     family:
       footer: Enter choose family | Esc back

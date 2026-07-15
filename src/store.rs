@@ -1246,6 +1246,31 @@ impl Store {
             LocalAction::SetLanguageCode(lang) => self.dispatch_set_language_code(lang),
             LocalAction::SetThinking => self.dispatch_set_thinking(inline_args.unwrap_or_default()),
             LocalAction::Btw => self.dispatch_btw(inline_args.unwrap_or_default()),
+            LocalAction::OpenProfilesSurface => {
+                self.refresh_profiles();
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER));
+                None
+            }
+            LocalAction::SelectProfileForActions(id) => {
+                self.state.onboarding.selected_profile = Some(id);
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_ACTIONS));
+                None
+            }
+            LocalAction::SetProfileDefault(id) => {
+                self.dispatch_set_profile_default(&id);
+                None
+            }
+            LocalAction::RequestDeleteProfile(id) => {
+                self.state.onboarding.selected_profile = Some(id);
+                self.open_menu(MenuId::from(
+                    crate::menu::registry::MENU_PROFILE_DELETE_CONFIRM,
+                ));
+                None
+            }
+            LocalAction::ConfirmDeleteProfile(id) => {
+                self.dispatch_delete_profile(&id);
+                None
+            }
             LocalAction::SetScrollMode => {
                 self.dispatch_set_scrollmode(inline_args.unwrap_or_default());
                 // Executing from the slash popup must close it: the toggle's
@@ -1363,6 +1388,79 @@ impl Store {
         // Every non-`/stop` local action ran (the dispatcher accepted it),
         // regardless of whether it produced a backend command.
         SlashDispatchOutcome::accepted(command)
+    }
+
+    /// Re-read the on-disk profile ids + `default-profile` pointer into state so
+    /// the profiles surface renders current truth (on open, and after a
+    /// set-default / delete). No-op for a remote launch (no local data dir).
+    fn refresh_profiles(&mut self) {
+        let Some(data_dir) = self.state.onboarding.profiles_data_dir.clone() else {
+            return;
+        };
+        let data_dir = std::path::Path::new(&data_dir);
+        self.state.onboarding.available_profiles =
+            crate::profiles::enumerate_profile_ids(&data_dir.join("profiles"));
+        self.state.onboarding.default_profile = crate::profiles::read_default_profile(data_dir);
+    }
+
+    /// Set the given profile as the machine default (writes the `default-profile`
+    /// pointer), refreshes, and returns to the profiles list.
+    fn dispatch_set_profile_default(&mut self, id: &str) {
+        let Some(data_dir) = self.state.onboarding.profiles_data_dir.clone() else {
+            self.state.status = t!("status.profiles_no_data_dir").into_owned();
+            return;
+        };
+        match crate::profiles::set_default_profile(std::path::Path::new(&data_dir), id) {
+            Ok(()) => {
+                self.state.status =
+                    t!("status.profile_default_set", profile = id.to_string()).into_owned();
+            }
+            Err(error) => {
+                self.state.status =
+                    t!("status.profile_default_failed", error = error.to_string()).into_owned();
+            }
+        }
+        self.refresh_profiles();
+        self.state.onboarding.selected_profile = None;
+        self.close_all_menus();
+        self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER));
+    }
+
+    /// Delete the given profile from disk (guarding the profile the current
+    /// session is using), refresh, and return to the profiles list.
+    fn dispatch_delete_profile(&mut self, id: &str) {
+        // Never delete the profile the current session is running on — the
+        // backend has it loaded, and removing its files under a live session is
+        // unsafe. Switch away first.
+        if self.current_profile_for_onboarding().as_deref() == Some(id) {
+            self.state.status = t!(
+                "status.profile_delete_active_blocked",
+                profile = id.to_string()
+            )
+            .into_owned();
+            self.state.onboarding.selected_profile = None;
+            self.close_all_menus();
+            self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER));
+            return;
+        }
+        let Some(data_dir) = self.state.onboarding.profiles_data_dir.clone() else {
+            self.state.status = t!("status.profiles_no_data_dir").into_owned();
+            return;
+        };
+        match crate::profiles::delete_profile(std::path::Path::new(&data_dir), id) {
+            Ok(()) => {
+                self.state.status =
+                    t!("status.profile_deleted", profile = id.to_string()).into_owned();
+            }
+            Err(error) => {
+                self.state.status =
+                    t!("status.profile_delete_failed", error = error.to_string()).into_owned();
+            }
+        }
+        self.refresh_profiles();
+        self.state.onboarding.selected_profile = None;
+        self.close_all_menus();
+        self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER));
     }
 
     /// Resolve a `/resume <query>` argument to a known session id, in priority

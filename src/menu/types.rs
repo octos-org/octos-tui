@@ -365,6 +365,17 @@ pub enum LocalAction {
     /// current turn keeps working (no tools, ephemeral). The question is taken
     /// from the command's inline args.
     Btw,
+    /// `/profiles` — refresh the on-disk profile list + default pointer into
+    /// state and open the profiles surface (the picker, now a manager).
+    OpenProfilesSurface,
+    /// Drill into the per-profile action menu for the given profile id.
+    SelectProfileForActions(String),
+    /// Set the given profile as the machine default (writes `default-profile`).
+    SetProfileDefault(String),
+    /// Open the Yes/No delete confirm for the given profile id.
+    RequestDeleteProfile(String),
+    /// Confirmed: delete the given profile (descriptor + data dir) from disk.
+    ConfirmDeleteProfile(String),
     Custom(&'static str),
 }
 

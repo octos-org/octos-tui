@@ -65,6 +65,8 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::OnboardWorkspace,
         Provider::OnboardDone,
         Provider::ProfilePicker,
+        Provider::ProfileActions,
+        Provider::ProfileDeleteConfirm,
         Provider::LaunchPrompt,
         Provider::Login,
         Provider::Theme,
@@ -97,6 +99,8 @@ enum Provider {
     Help,
     Onboard,
     ProfilePicker,
+    ProfileActions,
+    ProfileDeleteConfirm,
     LaunchPrompt,
     OnboardLanguage,
     OnboardFamily,
@@ -130,6 +134,8 @@ impl MenuProvider for Provider {
             Self::Help => MENU_HELP,
             Self::Onboard => MENU_ONBOARD,
             Self::ProfilePicker => crate::menu::registry::MENU_PROFILE_PICKER,
+            Self::ProfileActions => crate::menu::registry::MENU_PROFILE_ACTIONS,
+            Self::ProfileDeleteConfirm => crate::menu::registry::MENU_PROFILE_DELETE_CONFIRM,
             Self::LaunchPrompt => crate::menu::registry::MENU_LAUNCH_PROMPT,
             Self::OnboardLanguage => MENU_ONBOARD_LANGUAGE,
             Self::OnboardFamily => crate::menu::registry::MENU_ONBOARD_FAMILY,
@@ -163,6 +169,8 @@ impl MenuProvider for Provider {
             Self::Help => MenuBuildResult::Ready(help_menu(ctx)),
             Self::Onboard => onboarding_menu(ctx),
             Self::ProfilePicker => profile_picker_menu(ctx),
+            Self::ProfileActions => profile_actions_menu(ctx),
+            Self::ProfileDeleteConfirm => profile_delete_confirm_menu(ctx),
             Self::LaunchPrompt => launch_prompt_menu(ctx),
             Self::OnboardLanguage => MenuBuildResult::Ready(onboarding_language_menu()),
             Self::OnboardFamily => onboarding_family_menu(ctx),
@@ -1380,24 +1388,30 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 /// profile exists and no `--profile-id` was pinned (see
 /// `maybe_open_onboarding_on_first_launch`).
 fn profile_picker_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
-    let profiles = ctx
-        .app
-        .onboarding
+    let onboarding = ctx.app.onboarding;
+    let profiles = onboarding
         .map(|onboarding| onboarding.available_profiles.as_slice())
         .unwrap_or(&[]);
+    let default = onboarding.and_then(|onboarding| onboarding.default_profile.as_deref());
 
     let mut items: Vec<MenuItem> = profiles
         .iter()
         .enumerate()
         .map(|(index, profile)| {
+            // Mark the machine default with a trailing `*default`.
+            let label = if default == Some(profile.as_str()) {
+                format!("{profile}  {}", t!("menu.profiles.default_marker"))
+            } else {
+                profile.clone()
+            };
+            // Selecting a profile drills into its per-profile action menu (info
+            // in the right pane + set-default / delete); "use it" is a row there.
             let mut item = MenuItem::new(
                 format!("profile.pick.{index}"),
-                profile.clone(),
-                MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SetProfileId(
-                    profile.clone(),
-                ))),
+                label,
+                MenuAction::Local(LocalAction::SelectProfileForActions(profile.clone())),
             )
-            .with_description(t!("menu.profile_picker.item.attach.desc"));
+            .with_description(t!("menu.profiles.item.manage.desc"));
             if let Some(shortcut) = numeric_shortcut(index) {
                 item = item.with_shortcut(shortcut);
             }
@@ -1426,13 +1440,164 @@ fn profile_picker_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER),
-        title: t!("menu.profile_picker.title").into_owned(),
-        subtitle: Some(t!("menu.profile_picker.subtitle").into_owned()),
+        title: t!("menu.profiles.title").into_owned(),
+        subtitle: Some(t!("menu.profiles.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: profiles.len() > 8,
         search_placeholder: Some(t!("menu.profile_picker.search").into_owned()),
-        footer_hint: Some(t!("menu.profile_picker.footer").into_owned()),
+        footer_hint: Some(t!("menu.profiles.footer").into_owned()),
+        preview: Some(MenuPreview::Text {
+            title: Some(t!("menu.profiles.preview_title").into_owned()),
+            body: t!("menu.profiles.preview_hint").into_owned(),
+        }),
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Per-profile action drill-in: shows the selected profile's info in the right
+/// pane and offers Use / Set-default / Delete. Reached from the profiles list.
+fn profile_actions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let onboarding = ctx.app.onboarding;
+    let Some(profile) = onboarding.and_then(|onboarding| onboarding.selected_profile.clone())
+    else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(crate::menu::registry::MENU_PROFILE_ACTIONS),
+            title: t!("menu.profiles.actions.title").into_owned(),
+            message: t!("menu.profiles.actions.none").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        });
+    };
+    let is_default =
+        onboarding.and_then(|o| o.default_profile.as_deref()) == Some(profile.as_str());
+
+    let mut items = vec![
+        MenuItem::new(
+            "profile.action.use",
+            t!("menu.profiles.actions.use"),
+            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SetProfileId(
+                profile.clone(),
+            ))),
+        )
+        .with_description(t!("menu.profiles.actions.use_desc")),
+    ];
+    let set_default = MenuItem::new(
+        "profile.action.default",
+        t!("menu.profiles.actions.set_default"),
+        MenuAction::Local(LocalAction::SetProfileDefault(profile.clone())),
+    )
+    .with_description(t!("menu.profiles.actions.set_default_desc"));
+    items.push(if is_default {
+        set_default.maybe_disabled(Some(
+            t!("menu.profiles.actions.already_default").into_owned(),
+        ))
+    } else {
+        set_default
+    });
+    items.push(
+        MenuItem::new(
+            "profile.action.delete",
+            t!("menu.profiles.actions.delete"),
+            MenuAction::Local(LocalAction::RequestDeleteProfile(profile.clone())),
+        )
+        .with_description(t!("menu.profiles.actions.delete_desc")),
+    );
+    items.push(MenuItem::new(
+        "profile.action.back",
+        t!("menu.profiles.actions.back"),
+        MenuAction::Close,
+    ));
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_PROFILE_ACTIONS),
+        title: t!(
+            "menu.profiles.actions.title_named",
+            profile = profile.clone()
+        )
+        .into_owned(),
+        subtitle: Some(t!("menu.profiles.actions.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        preview: Some(profile_info_preview(onboarding, &profile, is_default)),
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Right-pane info for a profile: its model summary + default status.
+fn profile_info_preview(
+    onboarding: Option<&OnboardingWizardState>,
+    profile: &str,
+    is_default: bool,
+) -> MenuPreview {
+    let mut body = t!("menu.profiles.info.name", profile = profile.to_string()).into_owned();
+    let model = onboarding
+        .and_then(|o| o.profiles_data_dir.as_deref())
+        .and_then(|dir| {
+            crate::profiles::profile_llm_summary(
+                &std::path::Path::new(dir).join("profiles"),
+                profile,
+            )
+        });
+    body.push('\n');
+    match model {
+        Some(model) => body.push_str(&t!("menu.profiles.info.model", model = model)),
+        None => body.push_str(&t!("menu.profiles.info.no_model")),
+    }
+    body.push('\n');
+    body.push_str(&if is_default {
+        t!("menu.profiles.info.is_default")
+    } else {
+        t!("menu.profiles.info.not_default")
+    });
+    MenuPreview::Text {
+        title: Some(t!("menu.profiles.info.title").into_owned()),
+        body,
+    }
+}
+
+/// Yes/No confirm for deleting the selected profile (destructive).
+fn profile_delete_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let Some(profile) = ctx
+        .app
+        .onboarding
+        .and_then(|onboarding| onboarding.selected_profile.clone())
+    else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(crate::menu::registry::MENU_PROFILE_DELETE_CONFIRM),
+            title: t!("menu.profiles.delete.title").into_owned(),
+            message: t!("menu.profiles.actions.none").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        });
+    };
+    let items = vec![
+        MenuItem::new(
+            "profile.delete.yes",
+            t!("menu.profiles.delete.yes", profile = profile.clone()),
+            MenuAction::Local(LocalAction::ConfirmDeleteProfile(profile.clone())),
+        )
+        .with_description(t!("menu.profiles.delete.yes_desc")),
+        MenuItem::new(
+            "profile.delete.no",
+            t!("menu.profiles.delete.no"),
+            MenuAction::Close,
+        ),
+    ];
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_PROFILE_DELETE_CONFIRM),
+        title: t!(
+            "menu.profiles.delete.title_named",
+            profile = profile.clone()
+        )
+        .into_owned(),
+        subtitle: Some(t!("menu.profiles.delete.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
         preview: None,
         mode: MenuMode::SingleSelect,
     })
@@ -6360,9 +6525,10 @@ mod tests {
     }
 
     #[test]
-    fn profile_picker_lists_profiles_with_attach_and_create_rows() {
+    fn profile_picker_lists_profiles_marks_default_and_offers_create() {
         let onboarding = OnboardingWizardState {
             available_profiles: vec!["glm".into(), "deepseek".into()],
+            default_profile: Some("glm".into()),
             ..OnboardingWizardState::default()
         };
         let ctx = MenuContext {
@@ -6377,20 +6543,30 @@ mod tests {
         };
         let spec = ready_spec(profile_picker_menu(&ctx));
 
-        // One attach row per profile carrying a SetProfileId action + a
-        // trailing "create new" row.
+        // Each profile row now drills into its action menu (info + set-default /
+        // delete), rather than attaching directly.
         let glm = spec
             .items
             .iter()
-            .find(|item| item.label == "glm")
+            .find(|item| item.id == "profile.pick.0")
             .expect("glm row present");
+        assert!(
+            glm.label.contains("glm") && glm.label.contains("default"),
+            "the default profile is marked: {:?}",
+            glm.label
+        );
         assert!(matches!(
             &glm.action,
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SetProfileId(id)))
-                if id == "glm"
+            MenuAction::Local(LocalAction::SelectProfileForActions(id)) if id == "glm"
         ));
-        assert!(spec.items.iter().any(|item| item.label == "deepseek"));
-        assert!(has_row(&spec, "profile.pick.new"), "offers a create escape");
+        // The non-default profile is listed without the marker.
+        let deepseek = spec
+            .items
+            .iter()
+            .find(|item| item.id == "profile.pick.1")
+            .expect("deepseek row present");
+        assert_eq!(deepseek.label, "deepseek");
+        assert!(has_row(&spec, "profile.pick.new"), "offers a create row");
     }
 
     #[test]

@@ -410,6 +410,8 @@ command:
     desc: 显示服务器报告的 token 和费用用量
   exit:
     desc: 退出 TUI
+  profiles:
+    desc: 管理本地档案——列出、设为默认、删除或新建。
   goal:
     desc: 查看、设置、暂停/恢复或清除持久化的会话目标
   help:
@@ -689,6 +691,43 @@ menu:
       create:
         label: "创建新档案"
         desc: "改为开始引导以创建全新的本地档案。"
+  profiles:
+    title: "档案"
+    subtitle: "管理你的本地档案——设为默认、删除或新建。"
+    footer: "回车 管理 | 上/下 移动 | Esc 关闭"
+    default_marker: "*默认"
+    preview_title: "档案"
+    preview_hint: "选择一个档案以查看其模型，并将其设为默认或删除。使用“创建新档案”来添加。"
+    item:
+      manage:
+        desc: "打开此档案——使用、设为默认或删除。"
+    actions:
+      title: "档案"
+      title_named: "档案：%{profile}"
+      subtitle: "使用此档案、设为默认或删除。"
+      none: "未选择档案。"
+      use: "使用此档案"
+      use_desc: "使用此档案开始会话。"
+      set_default: "设为默认"
+      set_default_desc: "将其设为直接启动时打开的档案。"
+      already_default: "已是默认"
+      delete: "删除"
+      delete_desc: "删除此档案的配置和数据（会要求确认）。"
+      back: "返回"
+    info:
+      title: "关于此档案"
+      name: "档案：%{profile}"
+      model: "模型：%{model}"
+      no_model: "模型：尚未配置"
+      is_default: "默认：是——直接启动会打开它"
+      not_default: "默认：否"
+    delete:
+      title: "删除档案？"
+      title_named: "删除“%{profile}”？"
+      subtitle: "将删除此档案的配置及其所有数据，此操作无法撤销。"
+      yes: "是，删除 %{profile}"
+      yes_desc: "永久删除此档案及其数据。"
+      no: "否，保留"
   onboard:
     family:
       footer: 回车 选择系列 | Esc 返回
@@ -1113,6 +1152,12 @@ status:
   make_default_updated: "默认大脑偏好已更新"
   attached_profile: "已附加档案 %{profile}"
   new_profile_launch: "正在创建新档案——先命名，再设置其 AI 模型"
+  profiles_no_data_dir: "无法在此管理档案——本次启动未知本地数据目录。"
+  profile_default_set: "默认档案现为 %{profile}"
+  profile_default_failed: "无法设置默认档案：%{error}"
+  profile_deleted: "已删除档案 %{profile}"
+  profile_delete_failed: "无法删除档案：%{error}"
+  profile_delete_active_blocked: "无法删除 %{profile}——这是当前会话正在使用的档案。请先切换到其他档案。"
   provider_route_selected: "已选择供应商线路；请输入 API 密钥"
   provider_family_updated: "供应商模型系列已更新"
   provider_model_updated: "供应商模型已更新"
