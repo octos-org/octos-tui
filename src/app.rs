@@ -8259,7 +8259,7 @@ fn agent_strip_chips(app: &AppState) -> Vec<(&'static str, String, bool)> {
     }
     let mut chips = vec![(
         "⌂",
-        "main".to_string(),
+        t!("app.hint.agent_strip_main").into_owned(),
         matches!(app.chat_view, crate::model::ChatViewTarget::Main),
     )];
     for agent in agents {
@@ -8312,7 +8312,7 @@ fn agent_strip_height(app: &AppState, terminal_height: u16) -> u16 {
 /// output.
 fn render_agent_strip(app: &AppState, palette: Palette) -> Paragraph<'static> {
     let mut spans: Vec<Span<'static>> = vec![Span::styled(
-        " agents ".to_string(),
+        t!("app.hint.agent_strip_title").into_owned(),
         palette.muted().bg(palette.surface),
     )];
     for (glyph, label, selected) in agent_strip_chips(app) {

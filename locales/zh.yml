@@ -136,6 +136,8 @@ app:
     statusbar_keys: "Tab 智能体 | Ctrl+O 展开"
     agent_peek_keys: " Tab 下一个 · Shift+Tab 上一个 · ↑/↓ 滚动 · Esc 返回聊天 "
     agent_task_prefix: "任务：%{task}"
+    agent_strip_main: "主对话"
+    agent_strip_title: " 智能体 "
     agent_no_output: "（暂无输出 —— 该智能体工作时会在此处流式输出结果）"
     menu: "菜单 | j/k 移动 | Enter 确认 | Esc 关闭"
     onboarding: "引导 | Enter 继续 | 输入可编辑字段"

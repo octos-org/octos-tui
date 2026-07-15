@@ -1070,6 +1070,14 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::Esc if store.state.transcript_pager_active => {
             store.state.exit_transcript_pager();
         }
+        // Side-pane focus (only reachable via `/ps` / `!cmd` now that Tab no
+        // longer cycles panes): Esc simply returns focus to the composer.
+        // Without this arm the plain-Esc handler below would fire and
+        // INTERRUPT a running turn — a destructive exit from a read-only
+        // inspection pane (codex final-gate P2).
+        KeyCode::Esc if store.state.focus != FocusPane::Composer => {
+            store.state.focus = FocusPane::Composer;
+        }
         KeyCode::Esc => {
             if store.state.active_turn().is_some() {
                 let command = if store.state.has_pending_messages() {

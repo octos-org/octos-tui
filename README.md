@@ -341,7 +341,7 @@ q          quit
 
 ```text
 /help       local slash-command help
-/ps         show local task/process status and focus the Tasks pane
+/ps         show local task/process status and focus the Tasks pane (Esc returns to the composer)
 /stop       interrupt the active turn (or report locally if none is active)
 /setup      reopen the onboarding wizard
 /model      browse the server-returned profile models / catalog
