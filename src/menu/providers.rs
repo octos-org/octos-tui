@@ -1139,7 +1139,14 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     };
     let current_profile = ctx.app.current_profile;
     let local_profile_create = local_profile_create_supported(ctx);
-    if local_profile_create && state.effective_profile_id(current_profile).is_none() {
+    // "Create a new profile" forces the create step even mid-session, where the
+    // active session's profile would otherwise route the wizard to provider
+    // setup. (Cleared once the profile is created, so the wizard then advances
+    // to setting up the new profile's model.)
+    let force_create = state.creating_new_profile && local_profile_create;
+    if force_create
+        || (local_profile_create && state.effective_profile_id(current_profile).is_none())
+    {
         return onboarding_local_profile_menu(
             state,
             local_profile_requested_id_supported(ctx),
@@ -1423,9 +1430,10 @@ fn profile_picker_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         MenuItem::new(
             "profile.pick.new",
             t!("menu.profile_picker.item.create.label"),
-            // Open the onboarding create step (Name-this-profile) rather than
-            // creating immediately — the user still names the new profile.
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::Open)),
+            // Reset the wizard to a clean slate, then open the create step
+            // (Name-this-profile) — so it starts FRESH rather than resuming the
+            // active profile's already-configured setup.
+            MenuAction::Local(LocalAction::CreateNewProfile),
         )
         .with_description(t!("menu.profile_picker.item.create.desc")),
     );

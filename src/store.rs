@@ -1251,6 +1251,11 @@ impl Store {
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER));
                 None
             }
+            LocalAction::CreateNewProfile => {
+                self.reset_onboarding_for_new_profile();
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                None
+            }
             LocalAction::SelectProfileForActions(id) => {
                 self.state.onboarding.selected_profile = Some(id);
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_ACTIONS));
@@ -1390,10 +1395,37 @@ impl Store {
         SlashDispatchOutcome::accepted(command)
     }
 
+    /// Reset the onboarding wizard to a clean create slate for "Create a new
+    /// profile": clears the create/provider fields (so it opens at "Name this
+    /// profile" instead of resuming the ACTIVE profile's already-configured
+    /// setup mid-session), while preserving the profiles-surface data and the
+    /// validated workspace so the fresh profile can still activate this folder.
+    fn reset_onboarding_for_new_profile(&mut self) {
+        let available = std::mem::take(&mut self.state.onboarding.available_profiles);
+        let default_profile = self.state.onboarding.default_profile.take();
+        let data_dir = self.state.onboarding.profiles_data_dir.take();
+        let workspace = self.state.onboarding.workspace_candidate.take();
+        let validation = self.state.onboarding.workspace_validation.clone();
+        let auth = self.state.onboarding.auth_email_enabled;
+        self.state.onboarding = crate::model::OnboardingWizardState {
+            available_profiles: available,
+            default_profile,
+            profiles_data_dir: data_dir,
+            workspace_candidate: workspace,
+            workspace_validation: validation,
+            auth_email_enabled: auth,
+            // Force the create step even though a session may be active.
+            creating_new_profile: true,
+            ..crate::model::OnboardingWizardState::default()
+        };
+    }
+
     /// Re-read the on-disk profile ids + `default-profile` pointer into state so
     /// the profiles surface renders current truth (on open, and after a
     /// set-default / delete). No-op for a remote launch (no local data dir).
     fn refresh_profiles(&mut self) {
+        // Reopening the surface ends any in-progress "create new" intent.
+        self.state.onboarding.creating_new_profile = false;
         let Some(data_dir) = self.state.onboarding.profiles_data_dir.clone() else {
             return;
         };
@@ -1431,8 +1463,11 @@ impl Store {
     fn dispatch_delete_profile(&mut self, id: &str) {
         // Never delete the profile the current session is running on — the
         // backend has it loaded, and removing its files under a live session is
-        // unsafe. Switch away first.
-        if self.current_profile_for_onboarding().as_deref() == Some(id) {
+        // unsafe. Switch away first. Use the NARROW active-session profile here,
+        // not `current_profile_for_onboarding` (which falls back through
+        // profile_llm_state / skills and would wrongly block a profile whose
+        // data merely happens to be loaded, e.g. after viewing it).
+        if self.active_session_profile().as_deref() == Some(id) {
             self.state.status = t!(
                 "status.profile_delete_active_blocked",
                 profile = id.to_string()
@@ -3432,6 +3467,21 @@ impl Store {
         )
         .into_owned();
         self.refresh_active_menu_if_open();
+    }
+
+    /// The profile the ACTIVE session is running on — its runtime status,
+    /// falling back to the session's own profile id. Narrow: unlike
+    /// [`Self::current_profile_for_onboarding`] it does NOT reach into loaded
+    /// `profile_llm_state` / skills, so it answers "what is this session using?"
+    /// rather than "what profile data is loaded?". `None` when no session.
+    fn active_session_profile(&self) -> Option<String> {
+        self.active_session().and_then(|session| {
+            self.state
+                .runtime_status_for(&session.id)
+                .and_then(|status| status.profile_id.as_deref())
+                .or(session.profile_id.as_deref())
+                .map(str::to_owned)
+        })
     }
 
     fn current_profile_for_onboarding(&self) -> Option<String> {
@@ -5436,6 +5486,9 @@ impl Store {
                 self.state
                     .onboarding
                     .apply_profile_local_create(&event.result);
+                // The new profile now exists, so the wizard should advance to
+                // setting up its model — clear the force-create intent.
+                self.state.onboarding.creating_new_profile = false;
                 let open_session = self.state.onboarding.open_session_after_profile_create;
                 self.state.onboarding.open_session_after_profile_create = false;
                 self.state.onboarding.last_message = Some(event.message.clone());

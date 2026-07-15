@@ -368,6 +368,10 @@ pub enum LocalAction {
     /// `/profiles` — refresh the on-disk profile list + default pointer into
     /// state and open the profiles surface (the picker, now a manager).
     OpenProfilesSurface,
+    /// "Create a new profile" from the profiles surface: reset the create/wizard
+    /// state to a clean slate (so it doesn't resume the ACTIVE profile's setup
+    /// mid-session) and open onboarding at the "Name this profile" step.
+    CreateNewProfile,
     /// Drill into the per-profile action menu for the given profile id.
     SelectProfileForActions(String),
     /// Set the given profile as the machine default (writes `default-profile`).

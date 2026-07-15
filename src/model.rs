@@ -2299,6 +2299,12 @@ pub struct OnboardingWizardState {
     /// its delete confirm) is scoped to — set when the user picks a row in the
     /// profiles list. `None` outside that drill-in.
     pub selected_profile: Option<String>,
+    /// "Create a new profile" was chosen from the profiles surface: force the
+    /// onboarding wizard to the "Name this profile" create step even when a
+    /// session is active (whose profile would otherwise route the wizard to
+    /// provider-setup). Cleared once the new profile is created or the profiles
+    /// surface reopens.
+    pub creating_new_profile: bool,
     /// `octos-tui new <name>`: the profile id the process launched to create.
     /// Seeded once at launch from `Cli::new_profile`; consumed by the first
     /// capabilities event, which force-opens create-a-new-profile onboarding
@@ -2386,6 +2392,7 @@ impl Default for OnboardingWizardState {
             default_profile: None,
             profiles_data_dir: None,
             selected_profile: None,
+            creating_new_profile: false,
             launch_new_profile_id: None,
             launch_prompt: None,
             profile_id: None,
