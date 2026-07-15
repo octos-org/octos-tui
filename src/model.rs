@@ -30,6 +30,7 @@ pub type TaskView = AppUiTask;
 
 pub const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str = "config/capabilities/list";
 pub const APPUI_METHOD_SESSION_STATUS_READ: &str = "session/status/read";
+pub const APPUI_METHOD_SESSION_COMPACT: &str = "session/compact";
 pub const APPUI_METHOD_MODEL_LIST: &str = "profile/llm/list";
 pub const APPUI_METHOD_MODEL_SELECT: &str = "profile/llm/select";
 pub const APPUI_METHOD_MCP_STATUS_LIST: &str = "mcp/status/list";
@@ -663,6 +664,7 @@ pub enum AppUiCommand {
     ListConfigCapabilities(ConfigCapabilitiesListParams),
     ReadSessionStatus(SessionStatusReadParams),
     SessionBtw(octos_core::ui_protocol::SessionBtwParams),
+    CompactContext(SessionCompactParams),
     ListModels(ModelListParams),
     SelectModel(ModelSelectParams),
     ListPermissionProfiles(PermissionProfileListParams),
@@ -753,6 +755,7 @@ impl AppUiCommand {
             Self::ListConfigCapabilities(_) => APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
             Self::ReadSessionStatus(_) => APPUI_METHOD_SESSION_STATUS_READ,
             Self::SessionBtw(_) => octos_core::ui_protocol::methods::SESSION_BTW,
+            Self::CompactContext(_) => APPUI_METHOD_SESSION_COMPACT,
             Self::ListModels(_) | Self::ProfileLlmList(_) => APPUI_METHOD_MODEL_LIST,
             Self::SelectModel(_) | Self::ProfileLlmSelect(_) => APPUI_METHOD_MODEL_SELECT,
             Self::ListPermissionProfiles(_) => {
@@ -867,6 +870,12 @@ pub struct ConfigCapabilitiesListResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionStatusReadParams {
+    pub session_id: SessionKey,
+}
+
+/// Params for `session/compact` — force a context-compaction pass now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCompactParams {
     pub session_id: SessionKey,
 }
 

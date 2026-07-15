@@ -28,15 +28,16 @@ use crate::menu::{
         APPUI_METHOD_PROFILE_LLM_TEST, APPUI_METHOD_PROFILE_LLM_UPSERT,
         APPUI_METHOD_PROFILE_LOCAL_CREATE, APPUI_METHOD_PROFILE_SKILLS_INSTALL,
         APPUI_METHOD_PROFILE_SKILLS_LIST, APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
-        APPUI_METHOD_PROFILE_SKILLS_REMOVE, APPUI_METHOD_TOOL_CONFIG_DELETE,
-        APPUI_METHOD_TOOL_CONFIG_LIST, APPUI_METHOD_TOOL_CONFIG_SET_ENABLED,
-        APPUI_METHOD_TOOL_CONFIG_TEST, APPUI_METHOD_TOOL_CONFIG_UPSERT,
-        APPUI_METHOD_TOOL_STATUS_LIST, APPUI_ONBOARDING_METHODS_ANY,
-        APPUI_PERMISSION_MENU_METHODS_ANY, APPUI_PROVIDER_MENU_METHODS_ANY,
-        APPUI_TOOL_SETTINGS_MENU_METHODS_ANY, MENU_COST, MENU_HELP, MENU_KEYMAP, MENU_LOGIN,
-        MENU_MCP, MENU_MODEL, MENU_ONBOARD, MENU_ONBOARD_LANGUAGE, MENU_PERMISSIONS, MENU_PROVIDER,
-        MENU_RESUME, MENU_REWIND, MENU_SKILLS, MENU_STATUS, MENU_STATUS_LINE, MENU_THEME,
-        MENU_TITLE, MENU_TOOL_SETTINGS,
+        APPUI_METHOD_PROFILE_SKILLS_REMOVE, APPUI_METHOD_SESSION_COMPACT,
+        APPUI_METHOD_TOOL_CONFIG_DELETE, APPUI_METHOD_TOOL_CONFIG_LIST,
+        APPUI_METHOD_TOOL_CONFIG_SET_ENABLED, APPUI_METHOD_TOOL_CONFIG_TEST,
+        APPUI_METHOD_TOOL_CONFIG_UPSERT, APPUI_METHOD_TOOL_STATUS_LIST,
+        APPUI_ONBOARDING_METHODS_ANY, APPUI_PERMISSION_MENU_METHODS_ANY,
+        APPUI_PROVIDER_MENU_METHODS_ANY, APPUI_TOOL_SETTINGS_MENU_METHODS_ANY,
+        MENU_COMPACT_CONFIRM, MENU_COST, MENU_HELP, MENU_KEYMAP, MENU_LOGIN, MENU_MCP, MENU_MODEL,
+        MENU_ONBOARD, MENU_ONBOARD_LANGUAGE, MENU_PERMISSIONS, MENU_PROVIDER, MENU_RESUME,
+        MENU_REWIND, MENU_SKILLS, MENU_STATUS, MENU_STATUS_LINE, MENU_THEME, MENU_TITLE,
+        MENU_TOOL_SETTINGS,
     },
 };
 use crate::model::{
@@ -47,8 +48,9 @@ use crate::model::{
     OnboardingProviderStatus, OnboardingWizardState, ProfileLlmCatalogParams, ProfileLlmListParams,
     ProfileLlmSelectParams, ProfileLlmTestParams, ProfileSkillsInstallParams,
     ProfileSkillsListParams, ProfileSkillsRemoveParams, RuntimePolicyMcpServer,
-    SessionStatusReadParams, ToolConfigDeleteParams, ToolConfigEntry, ToolConfigListParams,
-    ToolConfigSetEnabledParams, ToolConfigTestParams, ToolStatus, ToolStatusListParams,
+    SessionCompactParams, SessionStatusReadParams, ToolConfigDeleteParams, ToolConfigEntry,
+    ToolConfigListParams, ToolConfigSetEnabledParams, ToolConfigTestParams, ToolStatus,
+    ToolStatusListParams,
 };
 
 pub fn core_menu_registry() -> MenuRegistry {
@@ -73,6 +75,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::Keymap,
         Provider::Status,
         Provider::Cost,
+        Provider::CompactConfirm,
         Provider::Resume,
         Provider::Rewind,
         Provider::Model,
@@ -110,6 +113,7 @@ enum Provider {
     Keymap,
     Status,
     Cost,
+    CompactConfirm,
     Resume,
     Rewind,
     Model,
@@ -142,6 +146,7 @@ impl MenuProvider for Provider {
             Self::Keymap => MENU_KEYMAP,
             Self::Status => MENU_STATUS,
             Self::Cost => MENU_COST,
+            Self::CompactConfirm => MENU_COMPACT_CONFIRM,
             Self::Resume => MENU_RESUME,
             Self::Rewind => MENU_REWIND,
             Self::Model => MENU_MODEL,
@@ -174,6 +179,7 @@ impl MenuProvider for Provider {
             Self::Keymap => MenuBuildResult::Ready(keymap_menu()),
             Self::Status => MenuBuildResult::Ready(status_menu(ctx)),
             Self::Cost => cost_menu(ctx),
+            Self::CompactConfirm => compact_confirm_menu(ctx),
             Self::Resume => resume_menu(ctx),
             Self::Rewind => rewind_menu(ctx),
             Self::Model => model_menu(ctx),
@@ -850,6 +856,62 @@ fn cost_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             title: Some(t!("menu.runtime_preview_title").into_owned()),
             rows: status_preview_rows(ctx),
         }),
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// A 2-item Yes/No confirm for `/compact`. "Yes" sends `session/compact`
+/// (force-compact the current session); "No" closes the menu. Modeled on
+/// [`cost_menu`]; gated on the server advertising `session/compact` and on a
+/// session being selected.
+fn compact_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let Some(session_id) = ctx.app.selected_session_id.cloned() else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(MENU_COMPACT_CONFIRM),
+            title: t!("menu.compact.unavailable_title").into_owned(),
+            message: t!("menu.compact.unavailable_no_session").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        });
+    };
+
+    if !ctx
+        .availability
+        .supports_method(APPUI_METHOD_SESSION_COMPACT)
+    {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(MENU_COMPACT_CONFIRM),
+            title: t!("menu.compact.unavailable_title").into_owned(),
+            message: method_missing_reason(ctx, APPUI_METHOD_SESSION_COMPACT),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        });
+    }
+
+    let items = vec![
+        MenuItem::new(
+            "compact.confirm",
+            t!("menu.compact.item.confirm.label"),
+            MenuAction::send_appui(AppUiCommand::CompactContext(SessionCompactParams {
+                session_id,
+            })),
+        )
+        .with_description(t!("menu.compact.item.confirm.desc").into_owned()),
+        MenuItem::new(
+            "compact.cancel",
+            t!("menu.compact.item.cancel.label"),
+            MenuAction::Close,
+        ),
+    ];
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(MENU_COMPACT_CONFIRM),
+        title: t!("menu.compact.title").into_owned(),
+        subtitle: Some(t!("menu.compact.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        preview: None,
         mode: MenuMode::SingleSelect,
     })
 }

@@ -396,6 +396,8 @@ command:
   agents:
     desc: 查看或中断后端智能体
   aliases_label: 别名：
+  compact:
+    desc: 立即压缩上下文（跳过自动压缩阈值）。
   copy:
     desc: 将最近一条助手回复复制到剪贴板（支持 SSH 环境）。
   cost:
@@ -482,6 +484,17 @@ menu:
     footer: 空格 切换 | 回车 保存 | Esc 关闭
     preview_title: 预览
     search: 筛选组件
+  compact:
+    item:
+      cancel:
+        label: 否，保留上下文
+      confirm:
+        desc: 立即执行 session/compact。
+        label: 是，立即压缩
+    subtitle: 总结较早的消息以释放上下文窗口。
+    title: 立即压缩上下文？
+    unavailable_no_session: 压缩需要已打开的 Octos UI 会话。
+    unavailable_title: 压缩不可用
   cost:
     footer: 回车 刷新 | Esc 关闭
     item:

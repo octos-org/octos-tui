@@ -812,6 +812,8 @@ command:
   agents:
     desc: Inspect or interrupt backend-owned subagents.
   aliases_label: 'Aliases:'
+  compact:
+    desc: Force context compaction now (bypasses the auto-compaction threshold).
   copy:
     desc: Copy the last assistant reply to your clipboard (works over SSH).
   cost:
@@ -894,6 +896,17 @@ menu:
     footer: Space toggle | Enter save | Esc close
     preview_title: Preview
     search: Filter components
+  compact:
+    item:
+      cancel:
+        label: 'No, keep context'
+      confirm:
+        desc: Runs session/compact now.
+        label: 'Yes, compact now'
+    subtitle: Summarize older messages to free up the context window.
+    title: Compact context now?
+    unavailable_no_session: Compaction requires an open Octos UI session.
+    unavailable_title: Compaction unavailable
   cost:
     footer: Enter refresh | Esc close
     item:
