@@ -41,6 +41,41 @@ const MIN_OCTOS_VERSION: &str = "1.1.0";
 /// Set to any value to disable auto-install (a missing backend then errors).
 const OPT_OUT_ENV: &str = "OCTOS_TUI_NO_AUTO_INSTALL";
 
+/// Default Homebrew formula for the octos server, as `<user>/<tap>/<formula>`.
+/// This MUST reference the PUBLIC tap `octos-org/tap` (→ `github.com/octos-org/
+/// homebrew-tap`). The shorthand `octos-org/octos` instead makes brew auto-tap
+/// the PRIVATE `octos-org/homebrew-octos`, whose non-interactive clone dies with
+/// `could not read Username`. Override with [`BREW_FORMULA_ENV`].
+const DEFAULT_BREW_FORMULA: &str = "octos-org/tap/octos";
+/// Env var overriding the Homebrew formula (to install a fork or a local tap).
+const BREW_FORMULA_ENV: &str = "OCTOS_TUI_BREW_FORMULA";
+
+/// Default npm package for the octos server. Override with [`NPM_PACKAGE_ENV`].
+const DEFAULT_NPM_PACKAGE: &str = "@octos-org/octos";
+/// Env var overriding the npm package (to install a fork or from a private registry).
+const NPM_PACKAGE_ENV: &str = "OCTOS_TUI_NPM_PACKAGE";
+
+/// The Homebrew formula to install, from [`BREW_FORMULA_ENV`] or the default.
+fn brew_formula() -> String {
+    env_or(BREW_FORMULA_ENV, DEFAULT_BREW_FORMULA)
+}
+
+/// The npm package to install, from [`NPM_PACKAGE_ENV`] or the default.
+fn npm_package() -> String {
+    env_or(NPM_PACKAGE_ENV, DEFAULT_NPM_PACKAGE)
+}
+
+/// A trimmed, non-empty value of env var `key`, else `default`. Keeps the
+/// install source out of compiled-in string literals (decoupled) while a
+/// blank/whitespace override can't silently break the command.
+fn env_or(key: &str, default: &'static str) -> String {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_owned())
+}
+
 /// Ensure the `octos` backend is present for a stdio launch, rewriting
 /// `cli.stdio_command` to an explicit path when octos is usable only in its
 /// install dir. Call this BEFORE entering raw mode so installer output prints
@@ -153,8 +188,10 @@ fn resolve_backend(program: &str) -> Result<Resolved> {
     if opted_out() {
         return Err(eyre!(
             "octos backend not found and auto-install is disabled ({OPT_OUT_ENV} is set). \
-             Install the octos server: `brew install octos-org/octos/octos` or \
-             `npm install -g @octos-org/octos`, or point --endpoint at a running server."
+             Install the octos server: `brew install {}` or `npm install -g {}`, or point \
+             --endpoint at a running server.",
+            brew_formula(),
+            npm_package()
         ));
     }
     run_installer()?;
@@ -182,8 +219,10 @@ fn resolve_backend(program: &str) -> Result<Resolved> {
 fn outdated_error(found: &str) -> eyre::Report {
     eyre!(
         "octos {found} is older than the {MIN_OCTOS_VERSION} this octos-tui needs. \
-         Update the octos server (`brew upgrade octos-org/octos/octos` or \
-         `npm install -g @octos-org/octos@latest`), then relaunch."
+         Update the octos server (`brew upgrade {}` or `npm install -g {}@latest`), \
+         then relaunch.",
+        brew_formula(),
+        npm_package()
     )
 }
 
@@ -390,46 +429,83 @@ fn version_lt(a: &str, b: &str) -> bool {
     false
 }
 
-/// Install octos **binary-only** via a package manager (never `install.sh`,
-/// which sets up a system service). Prefers `brew` (auto-taps
-/// `octos-org/homebrew-tap`), then `npm`. Errors with actionable guidance when
-/// neither is available. Inherits stdio so progress prints (called pre-raw-mode).
-fn run_installer() -> Result<()> {
-    let plan: Option<(&str, &[&str], &str)> = if have("brew") {
-        Some(("brew", &["install", "octos-org/octos/octos"], "brew"))
-    } else if have("npm") {
-        Some(("npm", &["install", "-g", "@octos-org/octos"], "npm"))
+/// A package-manager install command: `program` + `args`, with `how` naming the
+/// manager for user-facing messages.
+struct InstallPlan {
+    program: &'static str,
+    args: Vec<String>,
+    how: &'static str,
+}
+
+/// Choose the install command from package-manager availability and the
+/// (possibly overridden) identifiers. Pure — takes availability + identifiers as
+/// args, reading no env and probing nothing — so tests can assert the exact
+/// command without brew/npm installed. `brew` is preferred; `None` means neither
+/// manager is available.
+fn installer_plan(
+    has_brew: bool,
+    has_npm: bool,
+    brew_formula: &str,
+    npm_package: &str,
+) -> Option<InstallPlan> {
+    if has_brew {
+        Some(InstallPlan {
+            program: "brew",
+            args: vec!["install".to_owned(), brew_formula.to_owned()],
+            how: "brew",
+        })
+    } else if has_npm {
+        Some(InstallPlan {
+            program: "npm",
+            args: vec![
+                "install".to_owned(),
+                "-g".to_owned(),
+                npm_package.to_owned(),
+            ],
+            how: "npm",
+        })
     } else {
         None
-    };
-    let Some((program, args, how)) = plan else {
+    }
+}
+
+/// Install octos **binary-only** via a package manager (never `install.sh`,
+/// which sets up a system service). Prefers `brew` (the [`DEFAULT_BREW_FORMULA`]
+/// tap), then `npm` ([`DEFAULT_NPM_PACKAGE`]) — both env-overridable. Errors with
+/// actionable guidance when neither is available. Inherits stdio so progress
+/// prints (called pre-raw-mode).
+fn run_installer() -> Result<()> {
+    let (brew, npm) = (brew_formula(), npm_package());
+    let Some(plan) = installer_plan(have("brew"), have("npm"), &brew, &npm) else {
         return Err(eyre!(
             "octos server not found and no supported installer (brew or npm) is available. \
              Install octos (binary only, no service) with one of:\n  \
-             brew install octos-org/octos/octos\n  npm install -g @octos-org/octos\n\
+             brew install {brew}\n  npm install -g {npm}\n\
              then relaunch octos-tui (or set --endpoint to a running server)."
         ));
     };
     eprintln!(
-        "octos-tui: octos backend not found; installing the octos server via {how} \
-         (set {OPT_OUT_ENV}=1 to skip)..."
+        "octos-tui: octos backend not found; installing the octos server via {} \
+         (set {OPT_OUT_ENV}=1 to skip)...",
+        plan.how
     );
     // On Windows `brew`/`npm` are `.cmd` shims, which a direct spawn can't
     // execute; run them through `cmd /C` like the stdio transport does (codex).
     let status = if cfg!(windows) {
         Command::new("cmd")
             .arg("/C")
-            .arg(program)
-            .args(args)
+            .arg(plan.program)
+            .args(&plan.args)
             .status()
     } else {
-        Command::new(program).args(args).status()
+        Command::new(plan.program).args(&plan.args).status()
     }
-    .map_err(|err| eyre!("failed to launch {program}: {err}"))?;
+    .map_err(|err| eyre!("failed to launch {}: {err}", plan.program))?;
     if !status.success() {
         return Err(eyre!(
-            "{program} could not install octos ({status}). Install the octos server manually \
-             (https://github.com/octos-org/octos) and relaunch."
+            "{} could not install octos ({status}). Install the octos server manually \
+             (https://github.com/octos-org/octos) and relaunch.",
+            plan.program
         ));
     }
     Ok(())
@@ -576,5 +652,53 @@ mod tests {
         assert!(!version_lt("1.1.0", "1.1.0"));
         assert!(!version_lt("2.0.0", "1.9.9"));
         assert!(!version_lt("1.1.0", "1.1")); // 1.1.0 == 1.1(.0)
+    }
+
+    #[test]
+    fn installer_plan_brew_uses_the_public_tap_not_the_private_repo() {
+        // The default brew formula MUST be the PUBLIC octos-org/tap: the
+        // shorthand octos-org/octos auto-taps the PRIVATE homebrew-octos, whose
+        // non-interactive clone fails with `could not read Username`.
+        let plan = installer_plan(true, false, DEFAULT_BREW_FORMULA, DEFAULT_NPM_PACKAGE)
+            .expect("brew available → a plan");
+        assert_eq!(plan.program, "brew");
+        assert_eq!(plan.args, ["install", "octos-org/tap/octos"]);
+        assert_eq!(plan.how, "brew");
+    }
+
+    #[test]
+    fn installer_plan_prefers_brew_then_npm_then_none() {
+        // npm fallback when brew is absent.
+        let plan = installer_plan(false, true, DEFAULT_BREW_FORMULA, DEFAULT_NPM_PACKAGE)
+            .expect("npm available → a plan");
+        assert_eq!(plan.program, "npm");
+        assert_eq!(plan.args, ["install", "-g", "@octos-org/octos"]);
+        assert_eq!(plan.how, "npm");
+        // brew wins when both are present.
+        let both = installer_plan(true, true, DEFAULT_BREW_FORMULA, DEFAULT_NPM_PACKAGE).unwrap();
+        assert_eq!(both.program, "brew");
+        // Neither manager → no plan (caller prints manual-install guidance).
+        assert!(installer_plan(false, false, DEFAULT_BREW_FORMULA, DEFAULT_NPM_PACKAGE).is_none());
+    }
+
+    #[test]
+    fn installer_plan_threads_overridden_identifiers_into_the_command() {
+        // Decoupled identifiers flow straight into the command, so an operator
+        // can retarget a fork/local tap or registry without a rebuild.
+        let brew = installer_plan(true, false, "acme/tap/octos", "@acme/octos").unwrap();
+        assert_eq!(brew.args, ["install", "acme/tap/octos"]);
+        let npm = installer_plan(false, true, "acme/tap/octos", "@acme/octos").unwrap();
+        assert_eq!(npm.args, ["install", "-g", "@acme/octos"]);
+    }
+
+    #[test]
+    fn env_or_falls_back_to_default_when_unset() {
+        // An env var we never set → the baked-in default. (Read-only: octos-tui
+        // forbids `unsafe`, so tests can't set_var to exercise the override; the
+        // override path is covered via installer_plan's identifier params above.)
+        assert_eq!(
+            env_or("OCTOS_TUI_UNSET_ENV_XYZZY_12345", "the-default"),
+            "the-default"
+        );
     }
 }
