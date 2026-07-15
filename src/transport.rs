@@ -1968,7 +1968,8 @@ impl ProtocolAppUiBackend {
             | AppUiCommand::PauseLoop(_)
             | AppUiCommand::ResumeLoop(_)
             | AppUiCommand::FireLoopNow(_)
-            | AppUiCommand::CompactContext(_) => {
+            | AppUiCommand::CompactContext(_)
+            | AppUiCommand::SetCompactionMode(_) => {
                 self.queue.push_back(
                     AppUiEvent::Error(AppUiError {
                         code: "readonly".into(),
@@ -2539,6 +2540,7 @@ fn rpc_request_from_command(
         AppUiCommand::ReadSessionStatus(params) => serde_json::to_value(params),
         AppUiCommand::SessionBtw(params) => serde_json::to_value(params),
         AppUiCommand::CompactContext(params) => serde_json::to_value(params),
+        AppUiCommand::SetCompactionMode(params) => serde_json::to_value(params),
         AppUiCommand::SubmitPrompt(params) => serde_json::to_value(params),
         AppUiCommand::InterruptTurn(params) => serde_json::to_value(params),
         AppUiCommand::ListModels(params) => serde_json::to_value(params),

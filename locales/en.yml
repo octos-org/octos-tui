@@ -812,8 +812,8 @@ command:
   agents:
     desc: Inspect or interrupt backend-owned subagents.
   aliases_label: 'Aliases:'
-  compact:
-    desc: Force context compaction now (bypasses the auto-compaction threshold).
+  context:
+    desc: Context-window controls — compact now, and choose LLM vs heuristic summarization.
   copy:
     desc: Copy the last assistant reply to your clipboard (works over SSH).
   cost:
@@ -907,6 +907,21 @@ menu:
     title: Compact context now?
     unavailable_no_session: Compaction requires an open Octos UI session.
     unavailable_title: Compaction unavailable
+  context:
+    item:
+      compact:
+        desc: Summarize older messages now to free up the context window.
+        label: Compact now
+      heuristic:
+        desc: Strip tool args and keep first lines — fast, no model call.
+        label: Summarize with heuristic
+      llm:
+        desc: Summarize with the model for a higher-quality checkpoint.
+        label: Summarize with LLM
+    subtitle: Manage the context window for this session.
+    title: Context
+    unavailable_no_session: Context controls require an open Octos UI session.
+    unavailable_title: Context unavailable
   cost:
     footer: Enter refresh | Esc close
     item:
