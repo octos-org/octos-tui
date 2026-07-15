@@ -13,6 +13,9 @@
 //!   shadowing installs.
 //! - **Terminal**: TERM/terminfo, UTF-8 locale, CJK width, color support.
 //! - **Config & data**: config dir + data dir writability.
+//! - **Profiles & sessions**: on-disk profiles, the default (`*`), the LLM each
+//!   is configured for, and an on-disk session count. Per-session *folders*
+//!   need a live `session/list` (the session→cwd map is in-process only).
 //! - **Backend**: stdio-command resolves (+ `octos --version`); configured WS
 //!   endpoints are probed with `config/capabilities/list`, falling back to a
 //!   structural protocol-skew check against the compiled-in `octos-core`.
@@ -292,6 +295,7 @@ pub fn run(args: DoctorArgs) -> Result<i32> {
     checks.extend(binary_checks(&args));
     checks.extend(terminal_checks());
     checks.extend(config_checks(&args));
+    checks.extend(profiles_checks(&args));
     checks.extend(backend_checks(&args));
     checks.extend(network_checks());
 
@@ -796,6 +800,182 @@ fn is_writable(dir: &Path) -> bool {
         }
         Err(_) => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Profiles & sessions
+// ---------------------------------------------------------------------------
+
+const CAT_PROFILES: &str = "Profiles & sessions";
+
+/// Inventory of on-disk profiles — every `<data_dir>/profiles/<id>.json`, the
+/// default marked `*`, and the LLM each is configured for — plus an on-disk
+/// session count. The data dir is resolved the same way as the `octos data dir`
+/// check. Secrets (`config.env_vars`) are never surfaced; only family/model/
+/// route. Per-session *folders* are intentionally not read: the session→cwd map
+/// is an in-process registry (`session_workspaces()`), so folder attribution
+/// needs a live `session/list` rather than the on-disk stores (hashed by design).
+fn profiles_checks(args: &DoctorArgs) -> Vec<Check> {
+    let data_dir = data_dir_from_env(
+        args.data_dir.clone(),
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+    );
+    profiles_checks_in(&data_dir)
+}
+
+/// Testable core of [`profiles_checks`]: build the inventory from a resolved
+/// data dir.
+fn profiles_checks_in(data_dir: &Path) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let profiles_dir = data_dir.join("profiles");
+    let ids = crate::profiles::enumerate_profile_ids(&profiles_dir);
+    let default = read_default_profile(data_dir);
+
+    if ids.is_empty() {
+        checks.push(Check::warn(
+            CAT_PROFILES,
+            "profiles",
+            "no profiles found",
+            format!(
+                "run onboarding (launch octos-tui in a folder) — expected under {}",
+                profiles_dir.display()
+            ),
+        ));
+        return checks;
+    }
+
+    // Summary: count + default-pointer health.
+    checks.push(match &default {
+        Some(d) if ids.iter().any(|id| id == d) => Check::pass(
+            CAT_PROFILES,
+            "profiles",
+            format!("{} found; default: {d}", ids.len()),
+        ),
+        Some(d) => Check::warn(
+            CAT_PROFILES,
+            "profiles",
+            format!(
+                "{} found; default pointer → '{d}' has no matching profile",
+                ids.len()
+            ),
+            format!(
+                "fix {}/default-profile, or create profile '{d}'",
+                data_dir.display()
+            ),
+        ),
+        None => Check::warn(
+            CAT_PROFILES,
+            "profiles",
+            format!("{} found; no default set", ids.len()),
+            "set a default during onboarding (make-default) so a bare launch can resume it",
+        ),
+    });
+
+    // One line per profile: the default gets a `*`, the detail is its LLM.
+    for id in &ids {
+        let name = if default.as_deref() == Some(id.as_str()) {
+            format!("{id} *")
+        } else {
+            id.clone()
+        };
+        let detail =
+            read_profile_llm(&profiles_dir, id).unwrap_or_else(|| "LLM not configured".to_string());
+        checks.push(Check::pass(CAT_PROFILES, name, detail));
+    }
+
+    // Sessions: on-disk count only. The session→folder map lives in an
+    // in-process registry, so per-folder attribution needs a live `session/list`.
+    let sessions = count_on_disk_sessions(data_dir);
+    checks.push(if sessions == 0 {
+        Check::pass(CAT_PROFILES, "sessions", "none on disk yet")
+    } else {
+        Check::pass(
+            CAT_PROFILES,
+            "sessions",
+            format!("{sessions} on disk; per-folder mapping needs a live `session/list`"),
+        )
+    });
+
+    checks
+}
+
+/// Read the `default-profile` pointer (a bare profile id), trimmed; `None` when
+/// the file is absent or empty.
+fn read_default_profile(data_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(data_dir.join("default-profile")).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Summarize a profile's primary LLM as `family/model via route (api_type)`
+/// (plus a fallback count), from `<profiles_dir>/<id>.json`. Deliberately reads
+/// only `config.llm` — never `config.env_vars`, which holds API-key secrets.
+/// `None` when the descriptor is unreadable or has no primary LLM.
+fn read_profile_llm(profiles_dir: &Path, id: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(profiles_dir.join(format!("{id}.json"))).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let llm = value.get("config")?.get("llm")?;
+    let primary = llm.get("primary")?;
+    let family = primary
+        .get("family_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let model = primary
+        .get("model_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let mut detail = format!("{family}/{model}");
+    if let Some(route) = primary.get("route") {
+        let route_id = route.get("route_id").and_then(serde_json::Value::as_str);
+        let api_type = route.get("api_type").and_then(serde_json::Value::as_str);
+        match (route_id, api_type) {
+            (Some(r), Some(a)) => detail.push_str(&format!(" via {r} ({a})")),
+            (Some(r), None) => detail.push_str(&format!(" via {r}")),
+            _ => {}
+        }
+    }
+    let fallbacks = llm
+        .get("fallbacks")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    if fallbacks > 0 {
+        detail.push_str(&format!("; {fallbacks} fallback(s)"));
+    }
+    Some(detail)
+}
+
+/// Count session JSONL descriptors across both on-disk layouts the server
+/// writes: the legacy flat `<data_dir>/sessions/*.jsonl` and the per-user
+/// `<data_dir>/users/<base_key>/sessions/*.jsonl`. `.tasks.jsonl` sidecars are
+/// excluded. Best-effort — unreadable dirs count as zero.
+fn count_on_disk_sessions(data_dir: &Path) -> usize {
+    let mut count = count_session_jsonl(&data_dir.join("sessions"));
+    if let Ok(users) = std::fs::read_dir(data_dir.join("users")) {
+        for user in users.flatten() {
+            count += count_session_jsonl(&user.path().join("sessions"));
+        }
+    }
+    count
+}
+
+/// Count `*.jsonl` files in `dir`, excluding `*.tasks.jsonl` sidecars.
+fn count_session_jsonl(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return false;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name.ends_with(".jsonl") && !name.ends_with(".tasks.jsonl")
+        })
+        .count()
 }
 
 // ---------------------------------------------------------------------------
@@ -1891,5 +2071,178 @@ mod tests {
         let fix = check.fix.unwrap();
         assert!(fix.contains("remove the file"));
         assert!(!fix.contains("mkdir -p"));
+    }
+
+    // --- Profiles & sessions -------------------------------------------------
+
+    /// Minimal self-cleaning temp dir for the profile-inventory tests.
+    struct DoctorTempDir(PathBuf);
+
+    impl DoctorTempDir {
+        fn new(tag: &str) -> Self {
+            let mut dir = std::env::temp_dir();
+            dir.push(format!(
+                "octos-tui-doctor-{tag}-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for DoctorTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Seed `<data_dir>/profiles/<id>.json` with a glm-like descriptor carrying
+    /// a primary LLM, an empty fallback list, and a secret in `env_vars`.
+    fn seed_profile(
+        data_dir: &Path,
+        id: &str,
+        family: &str,
+        model: &str,
+        route: &str,
+        secret: &str,
+    ) {
+        let profiles = data_dir.join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        let body = serde_json::json!({
+            "id": id,
+            "config": {
+                "llm": {
+                    "primary": {
+                        "family_id": family,
+                        "model_id": model,
+                        "route": {
+                            "route_id": route,
+                            "api_type": "openai",
+                            "api_key_env": "ZAI_API_KEY"
+                        }
+                    },
+                    "fallbacks": []
+                },
+                "env_vars": { "ZAI_API_KEY": secret }
+            }
+        });
+        std::fs::write(
+            profiles.join(format!("{id}.json")),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn find_check<'a>(checks: &'a [Check], name: &str) -> &'a Check {
+        checks.iter().find(|c| c.name == name).unwrap_or_else(|| {
+            let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
+            panic!("no check named `{name}` in {names:?}")
+        })
+    }
+
+    #[test]
+    fn profiles_inventory_lists_profiles_marks_default_and_shows_llm() {
+        let tmp = DoctorTempDir::new("inv");
+        seed_profile(tmp.path(), "glm", "zai", "glm-5.2", "zai", "SECRET-A");
+        seed_profile(
+            tmp.path(),
+            "deepseek",
+            "deepseek",
+            "deepseek-chat",
+            "deepseek",
+            "SECRET-B",
+        );
+        std::fs::write(tmp.path().join("default-profile"), "glm\n").unwrap();
+
+        let checks = profiles_checks_in(tmp.path());
+
+        let summary = find_check(&checks, "profiles");
+        assert_eq!(summary.status, CheckStatus::Pass);
+        assert!(summary.detail.contains("2 found"), "{}", summary.detail);
+        assert!(
+            summary.detail.contains("default: glm"),
+            "{}",
+            summary.detail
+        );
+
+        // The default profile carries the `*` marker and its LLM detail.
+        let glm = find_check(&checks, "glm *");
+        assert_eq!(glm.detail, "zai/glm-5.2 via zai (openai)");
+        // Non-default profile: no star, still shows its LLM.
+        let ds = find_check(&checks, "deepseek");
+        assert!(
+            ds.detail.contains("deepseek/deepseek-chat"),
+            "{}",
+            ds.detail
+        );
+    }
+
+    #[test]
+    fn profiles_inventory_never_leaks_api_key_secret() {
+        let tmp = DoctorTempDir::new("secret");
+        seed_profile(
+            tmp.path(),
+            "glm",
+            "zai",
+            "glm-5.2",
+            "zai",
+            "SUPER-SECRET-TOKEN",
+        );
+        std::fs::write(tmp.path().join("default-profile"), "glm").unwrap();
+
+        let rendered = Report::new(profiles_checks_in(tmp.path())).render(true, false);
+        assert!(
+            !rendered.contains("SUPER-SECRET-TOKEN"),
+            "doctor must never print API-key secrets:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn profiles_inventory_warns_when_no_profiles() {
+        let tmp = DoctorTempDir::new("empty");
+        let checks = profiles_checks_in(tmp.path());
+        let summary = find_check(&checks, "profiles");
+        assert_eq!(summary.status, CheckStatus::Warn);
+        assert!(summary.detail.contains("no profiles"), "{}", summary.detail);
+    }
+
+    #[test]
+    fn profiles_inventory_warns_on_dangling_default_pointer() {
+        let tmp = DoctorTempDir::new("dangling");
+        seed_profile(tmp.path(), "glm", "zai", "glm-5.2", "zai", "s");
+        std::fs::write(tmp.path().join("default-profile"), "ghost").unwrap();
+
+        let checks = profiles_checks_in(tmp.path());
+        let summary = find_check(&checks, "profiles");
+        assert_eq!(summary.status, CheckStatus::Warn);
+        assert!(summary.detail.contains("ghost"), "{}", summary.detail);
+    }
+
+    #[test]
+    fn on_disk_sessions_counted_across_both_layouts_excluding_task_sidecars() {
+        let tmp = DoctorTempDir::new("sessions");
+        // Legacy flat layout.
+        let flat = tmp.path().join("sessions");
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(flat.join("a.jsonl"), "").unwrap();
+        std::fs::write(flat.join("a.tasks.jsonl"), "").unwrap(); // sidecar → excluded
+        // Per-user layout.
+        let user = tmp
+            .path()
+            .join("users")
+            .join("glm%3Alocal%3Atui")
+            .join("sessions");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join("coding.jsonl"), "").unwrap();
+
+        assert_eq!(count_on_disk_sessions(tmp.path()), 2);
     }
 }
