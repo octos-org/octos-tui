@@ -1053,7 +1053,7 @@ menu:
     footer: "Enter select | Esc close"
     item:
       ready:
-        label: "Relaunch Octos here to start a session"
+        label: "Next: relaunch Octos here to start a session"
         desc: "This folder activates for your brain on the next launch."
       exit:
         label: "Close"

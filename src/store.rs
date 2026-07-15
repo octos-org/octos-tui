@@ -3501,6 +3501,20 @@ impl Store {
     pub fn open_menu(&mut self, id: MenuId) {
         self.state.menu_stack.open(id);
         self.refresh_active_menu();
+        // A freshly opened menu defaults its cursor to index 0, but that row can
+        // be a non-selectable status/instruction line (e.g. the onboarding
+        // "done" screen leads with a relaunch hint). Advance to the first
+        // selectable row so the cursor never starts parked on a dead row.
+        let len = active_menu_item_len(self.state.active_menu.as_ref());
+        if len > 0 && !active_menu_index_selectable(self.state.active_menu.as_ref(), 0) {
+            if let Some(first) =
+                (0..len).find(|&i| active_menu_index_selectable(self.state.active_menu.as_ref(), i))
+            {
+                if let Some(frame) = self.state.menu_stack.active_mut() {
+                    frame.selected_index = first;
+                }
+            }
+        }
         if let Some(frame) = self.state.menu_stack.active() {
             self.state.status = format!("Menu: {}", frame.id);
         }
@@ -11039,6 +11053,29 @@ mod tests {
             row_checked(&store),
             Some(true),
             "the open menu row's checkbox must flip on immediately"
+        );
+    }
+
+    #[test]
+    fn onboard_done_cursor_skips_relaunch_hint_and_lands_on_close() {
+        // Regression: the "You're all set" done screen leads with a read-only
+        // "relaunch here to start a session" instruction (Noop). It must be
+        // non-selectable so the cursor never parks on a dead row — opening the
+        // menu lands focus on Close (the only actionable row).
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_DONE));
+        assert!(
+            !active_menu_index_selectable(store.state.active_menu.as_ref(), 0),
+            "the relaunch instruction row must be non-selectable"
+        );
+        assert!(
+            active_menu_index_selectable(store.state.active_menu.as_ref(), 1),
+            "Close must be selectable"
+        );
+        let frame = store.state.menu_stack.active().expect("done menu is open");
+        assert_eq!(
+            frame.selected_index, 1,
+            "cursor should default to Close, not the non-actionable relaunch hint"
         );
     }
 

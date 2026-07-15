@@ -641,7 +641,7 @@ menu:
     footer: "回车选择 | Esc 关闭"
     item:
       ready:
-        label: "在此重新启动 Octos 以开始会话"
+        label: "下一步：在此重新启动 Octos 以开始会话"
         desc: "下次启动时，此文件夹将为你的大脑激活。"
       exit:
         label: "关闭"

@@ -1588,7 +1588,13 @@ fn onboarding_done_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             t!("menu.onboard_done.item.ready.label"),
             MenuAction::Noop,
         )
-        .with_description(t!("menu.onboard_done.item.ready.desc")),
+        .with_description(t!("menu.onboard_done.item.ready.desc"))
+        // A read-only "what's next" instruction, not an action: mark it
+        // non-selectable so the cursor skips it (only Close acts here).
+        .with_state(MenuItemState {
+            non_selectable: true,
+            ..MenuItemState::default()
+        }),
         MenuItem::new(
             "onboard.done.exit",
             t!("menu.onboard_done.item.exit.label"),
