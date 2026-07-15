@@ -1277,7 +1277,12 @@ impl Store {
                     // and fetch the session list; the `SessionList` result
                     // refreshes the open menu into `Ready` rows.
                     self.open_menu(MenuId::from(crate::menu::registry::MENU_RESUME));
-                    Some(AppUiCommand::ListSessions(SessionListParams {}))
+                    // `cwd: None` here; the transport stamps the launch
+                    // workspace cwd onto the request (see
+                    // `ProtocolAppUiBackend::fill_session_list_cwd`) so a
+                    // server with per-project session storage scopes the
+                    // listing to this project.
+                    Some(AppUiCommand::ListSessions(SessionListParams { cwd: None }))
                 } else if !self.state.resume_list_loaded {
                     // `/resume <query>` before the list ever loaded: the local
                     // resolve below would ALWAYS fail (`resume_sessions` is only
@@ -1290,7 +1295,12 @@ impl Store {
                         frame.search_query = arg.to_owned();
                     }
                     self.refresh_active_menu();
-                    Some(AppUiCommand::ListSessions(SessionListParams {}))
+                    // `cwd: None` here; the transport stamps the launch
+                    // workspace cwd onto the request (see
+                    // `ProtocolAppUiBackend::fill_session_list_cwd`) so a
+                    // server with per-project session storage scopes the
+                    // listing to this project.
+                    Some(AppUiCommand::ListSessions(SessionListParams { cwd: None }))
                 } else {
                     // `/resume <query>` shortcut: resolve to a session id
                     // (exact / prefix / substring) and switch directly, reusing
@@ -2229,6 +2239,11 @@ impl Store {
 
         match action {
             OnboardingAction::Open => {
+                // From the Phase 3 startup picker's "Create a new profile" row,
+                // replace the picker rather than stacking onboarding over it.
+                if self.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER) {
+                    self.close_all_menus();
+                }
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
                 // A profile that already has a saved provider must not read as
                 // "not set" — fetch the server-saved LLM state for display.
@@ -2289,6 +2304,26 @@ impl Store {
                 self.refresh_active_menu_and_advance();
                 None
             }
+            OnboardingAction::SetRequestedId(requested_id) => {
+                self.state.onboarding.requested_id = requested_id.trim().to_owned();
+                self.state.onboarding.local_profile_created = false;
+                self.state.onboarding.clear_local_profile_recovery();
+                self.state.onboarding.last_message =
+                    Some(t!("status.profile_name_updated").into_owned());
+                self.state.status = t!("status.onboarding_profile_name_updated").into_owned();
+                self.refresh_active_menu_and_advance();
+                None
+            }
+            OnboardingAction::SetMakeDefault(make_default) => {
+                self.state.onboarding.make_default = make_default;
+                self.state.onboarding.last_message =
+                    Some(t!("status.make_default_updated").into_owned());
+                self.state.status = t!("status.make_default_updated").into_owned();
+                // A toggle stays on the same step — refresh in place, don't
+                // advance the wizard.
+                self.refresh_active_menu_if_open();
+                None
+            }
             OnboardingAction::SetProfileId(profile_id) => {
                 self.state.onboarding.profile_id = non_empty_string(profile_id);
                 self.state.onboarding.last_message =
@@ -2303,7 +2338,15 @@ impl Store {
                 // provider start row like that path does; when the rebuilt
                 // menu has no provider rows (no step swap happened), keep the
                 // wizard's usual advance-to-next-row behavior.
-                if self.state.menu_stack.is_active() {
+                if self.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER) {
+                    // Attaching from the Phase 3 startup picker: leave the
+                    // picker entirely and enter that profile's onboarding
+                    // (provider setup), so Esc does not fall back into the
+                    // picker mid-setup.
+                    self.close_all_menus();
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                    self.focus_provider_start_row();
+                } else if self.state.menu_stack.is_active() {
                     self.refresh_active_menu();
                     if !self.focus_provider_start_row() {
                         self.advance_active_menu_selection();
@@ -2345,7 +2388,18 @@ impl Store {
                     t!("status.provider_family_updated").into_owned(),
                 );
                 if from_family_menu {
-                    self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
+                    if self.current_profile_for_onboarding().is_none() {
+                        // Phase 2 nameable flow: no profile exists yet, so the
+                        // family was chosen only to seed the "Name this profile"
+                        // suggestion — return to the profile step (with the
+                        // suggestion now reflecting the family) rather than
+                        // diving into model/route setup, which belongs to
+                        // post-create provider configuration.
+                        self.close_all_menus();
+                        self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                    } else {
+                        self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
+                    }
                 }
                 None
             }
@@ -2544,6 +2598,10 @@ impl Store {
             "code" | "otp" => {
                 self.dispatch_onboarding_action(OnboardingAction::SetOtpCode(rest.to_owned()), None)
             }
+            "profile-name" | "name-profile" | "id" => self.dispatch_onboarding_action(
+                OnboardingAction::SetRequestedId(rest.to_owned()),
+                None,
+            ),
             "profile" | "profile-id" => self
                 .dispatch_onboarding_action(OnboardingAction::SetProfileId(rest.to_owned()), None),
             "family" | "family-id" => self
@@ -2842,10 +2900,20 @@ impl Store {
             self.state.status = t!("status.local_profile_create_in_progress").into_owned();
             return None;
         }
-        // M22-B: client-side pre-flight validation catches obvious
-        // bad fields before a backend round-trip; surfaces typed
-        // recovery instead of a generic "incomplete" status.
-        if let Err(recovery) = self.state.onboarding.validate_local_profile() {
+        // Phase 2: when the server advertises nameable profiles, the Profile
+        // step is a single "Name this profile" prompt sent as `requested_id`;
+        // otherwise fall back to the legacy name/username/email create so the
+        // TUI keeps working against older servers.
+        let use_requested_id = self.local_profile_requested_id_supported();
+        // Client-side pre-flight validation catches obvious bad fields before a
+        // backend round-trip; surfaces typed recovery instead of a generic
+        // "incomplete" status. Each flow validates only the fields it sends.
+        let validation = if use_requested_id {
+            self.state.onboarding.validate_local_profile_requested_id()
+        } else {
+            self.state.onboarding.validate_local_profile()
+        };
+        if let Err(recovery) = validation {
             self.state.status = recovery.message.clone();
             self.state.onboarding.last_message = Some(recovery.message.clone());
             let focus_field = recovery.focus_field;
@@ -2859,15 +2927,37 @@ impl Store {
         }
         self.state.onboarding.open_session_after_profile_create = open_session_after_create;
         self.state.onboarding.local_profile_create_pending = true;
-        self.state.onboarding.local_profile_create_pending_username =
-            Some(self.state.onboarding.username.clone());
+        // The collision-recovery snapshot names whichever id was submitted:
+        // the requested profile id in the nameable flow, the username legacy.
+        self.state.onboarding.local_profile_create_pending_username = Some(if use_requested_id {
+            self.state.onboarding.effective_requested_id()
+        } else {
+            self.state.onboarding.username.clone()
+        });
         self.state.onboarding.local_profile_recovery = None;
         self.state.onboarding.last_message = Some(t!("status.creating_local_profile").into_owned());
-        Some(AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
-            name: self.state.onboarding.name.clone(),
-            username: self.state.onboarding.username.clone(),
-            email: self.state.onboarding.email.clone(),
-        }))
+        // Only send `make_default` when the server advertises the feature and
+        // the user toggled it on; otherwise omit it (older-server-compatible).
+        let make_default = self.onboarding_make_default_flag();
+        let params = if use_requested_id {
+            // Send ONLY requested_id; leave name/username/email empty so the
+            // server derives display metadata from the id. `skip_serializing_if`
+            // keeps the other fields out of the way of the server's defaults.
+            ProfileLocalCreateParams {
+                requested_id: Some(self.state.onboarding.effective_requested_id()),
+                make_default,
+                ..ProfileLocalCreateParams::default()
+            }
+        } else {
+            ProfileLocalCreateParams {
+                requested_id: None,
+                name: self.state.onboarding.name.clone(),
+                username: self.state.onboarding.username.clone(),
+                email: self.state.onboarding.email.clone(),
+                make_default,
+            }
+        };
+        Some(AppUiCommand::ProfileLocalCreate(params))
     }
 
     fn onboarding_refresh_catalog_command(&mut self) -> Option<AppUiCommand> {
@@ -3300,6 +3390,39 @@ impl Store {
             })
     }
 
+    /// Phase 2 capability negotiation: `true` only when the connected server
+    /// advertises the nameable-profiles feature. Gates the slimmed single-prompt
+    /// Profile step + the `requested_id` wire field; when `false` the TUI keeps
+    /// the legacy name/username/email create so it works against older servers.
+    fn local_profile_requested_id_supported(&self) -> bool {
+        self.state
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                capabilities.supports_feature(
+                    crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1,
+                )
+            })
+    }
+
+    fn local_profile_make_default_supported(&self) -> bool {
+        self.state
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                capabilities
+                    .supports_feature(crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1)
+            })
+    }
+
+    /// The `make_default` flag to send on `profile/local/create`: `Some(true)`
+    /// only when the server supports the feature AND the user toggled it on;
+    /// `None` otherwise so the wire stays minimal and older-server-compatible.
+    fn onboarding_make_default_flag(&self) -> Option<bool> {
+        (self.local_profile_make_default_supported() && self.state.onboarding.make_default)
+            .then_some(true)
+    }
+
     fn profile_llm_catalog_supported(&self) -> bool {
         self.state
             .capabilities
@@ -3324,6 +3447,7 @@ impl Store {
             matches!(
                 frame.id.as_str(),
                 crate::menu::registry::MENU_ONBOARD
+                    | crate::menu::registry::MENU_PROFILE_PICKER
                     | crate::menu::registry::MENU_ONBOARD_FAMILY
                     | crate::menu::registry::MENU_ONBOARD_MODEL
                     | crate::menu::registry::MENU_ONBOARD_ROUTE
@@ -3332,6 +3456,9 @@ impl Store {
                     // the user into the coding surface), not leave the workspace
                     // menu stacked over the chat.
                     | crate::menu::registry::MENU_ONBOARD_WORKSPACE
+                    // Model A launch-flow terminal screen (launch instructions):
+                    // treated as onboarding so Esc/Exit tears the wizard down.
+                    | crate::menu::registry::MENU_ONBOARD_DONE
             )
         })
     }
@@ -3410,9 +3537,12 @@ impl Store {
     /// was actually closed.
     pub fn handle_menu_escape(&mut self) -> bool {
         if self.onboarding_in_progress()
-            && self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD)
+            && (self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD)
+                || self.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER))
         {
-            // No-op: keep the root onboarding wizard open.
+            // No-op: keep the root onboarding wizard / startup profile picker
+            // open. Both auto-open on first launch, so closing them would strand
+            // the user on a blank screen; each offers explicit Exit rows.
             return false;
         }
         self.close_menu()
@@ -3761,6 +3891,7 @@ impl Store {
             crate::model::OnboardingLocalProfileField::Name => "onboard.local.name",
             crate::model::OnboardingLocalProfileField::Username => "onboard.local.username",
             crate::model::OnboardingLocalProfileField::Email => "onboard.local.email",
+            crate::model::OnboardingLocalProfileField::RequestedId => "onboard.local.requested_id",
         };
         self.select_active_menu_item_by_id(row_id)
     }
@@ -5028,6 +5159,11 @@ impl Store {
                 self.refresh_active_menu_if_open();
                 follow_up
             }
+            ClientEvent::LaunchResolve(result) => {
+                let follow_up = self.apply_launch_resolve_event(result);
+                self.refresh_active_menu_if_open();
+                follow_up
+            }
             ClientEvent::DiffPreview(result) => {
                 self.apply_diff_preview_result(result);
                 None
@@ -6141,6 +6277,15 @@ impl Store {
             event.message.clone(),
         ));
         self.state.status = event.message;
+        // Per-project launch decision (Model A). When the backend advertises
+        // `session.workspace_cwd.v1` + `launch/resolve` and this is a clean
+        // first launch, resolve the folder's brain BEFORE falling into
+        // onboarding: `launch/resolve` tells us whether to resume the sticky
+        // profile, prompt to activate an empty folder, offer a cross-profile
+        // switch, or onboard. Older servers (no feature) fall through unchanged.
+        if let Some(command) = self.maybe_resolve_launch_on_first_launch() {
+            return Some(command);
+        }
         self.maybe_open_onboarding_on_first_launch();
         // When the wizard auto-opened (e.g. launched with --profile-id but no
         // session yet), hydrate the saved provider for the resolved profile so
@@ -6150,6 +6295,32 @@ impl Store {
         } else {
             None
         }
+    }
+
+    /// First-launch hook for the per-project launch flow. Emits `launch/resolve`
+    /// to learn the folder's launch decision when the backend supports it and we
+    /// are on a clean first launch (no session, no menu, a local cwd). Returns
+    /// `None` to fall through to the legacy onboarding path — for an older
+    /// server, a remote transport with no local cwd, or a launch that already
+    /// has a session or an open menu.
+    fn maybe_resolve_launch_on_first_launch(&mut self) -> Option<AppUiCommand> {
+        if !self.state.sessions.is_empty() || self.state.menu_stack.is_active() {
+            return None;
+        }
+        let supports = self.state.capabilities.as_ref().is_some_and(|caps| {
+            caps.supports_feature(crate::model::APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1)
+                && caps.supports_method(crate::model::APPUI_METHOD_LAUNCH_RESOLVE)
+        });
+        if !supports {
+            return None;
+        }
+        // No resolvable local cwd (remote-only transport, `unknown`, …) means
+        // there is no per-project decision to make — let onboarding handle it.
+        let cwd = onboarding_workspace_cwd(&self.state.workspace.root)?;
+        let profile_id = self.state.onboarding.launch_profile_id.clone();
+        Some(AppUiCommand::LaunchResolve(
+            crate::model::LaunchResolveParams { cwd, profile_id },
+        ))
     }
 
     fn maybe_open_onboarding_on_first_launch(&mut self) {
@@ -6170,9 +6341,122 @@ impl Store {
         let supports_legacy_auth = crate::menu::registry::APPUI_FIRST_LAUNCH_LEGACY_AUTH_METHODS
             .iter()
             .all(|method| capabilities.supports_method(method));
-        if supports_local_solo || supports_legacy_auth {
-            self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        if !(supports_local_solo || supports_legacy_auth) {
+            return;
         }
+
+        // Phase 3 startup picker. Only a local-solo backend has nameable
+        // on-disk profiles to attach, so the picker/attach branches are gated on
+        // that; a pinned `--profile-id`, a first-ever run, or a legacy-auth
+        // server all fall through to the pre-existing single onboarding entry.
+        let decision = crate::model::StartupProfileDecision::decide(
+            self.state.onboarding.launch_profile_id.as_deref(),
+            &self.state.onboarding.available_profiles,
+        );
+        match decision {
+            // >1 profile, nothing pinned: let the user choose which to attach.
+            crate::model::StartupProfileDecision::Pick(_) if supports_local_solo => {
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER));
+            }
+            // Exactly one profile, nothing pinned: attach it silently and drop
+            // into that profile's setup instead of re-running create.
+            crate::model::StartupProfileDecision::Attach(profile_id) if supports_local_solo => {
+                self.state.status =
+                    t!("status.attached_profile", profile = profile_id.clone()).into_owned();
+                self.state.onboarding.profile_id = Some(profile_id);
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+            }
+            // Pinned `--profile-id` on a LOCAL-SOLO server: honor it. This
+            // launch has no snapshot session or resolved current profile yet, so
+            // WITHOUT attaching the wizard would route to `profile/local/create`
+            // and ignore the pin. Seed the pinned id as the resolved profile so
+            // the wizard scopes to it (provider setup + hydration) instead of
+            // creating a new one. Gated on local-solo (same surface as the picker
+            // / requested_id path): on a legacy OTP server, pre-resolving the
+            // profile would make `onboarding_menu` render provider setup and skip
+            // the send_code/verify rows, leaving no way to authenticate — so a
+            // legacy `--profile-id` launch falls through to the OTP path below.
+            crate::model::StartupProfileDecision::Pinned(profile_id) if supports_local_solo => {
+                if self.state.onboarding.effective_profile_id(None).is_none() {
+                    self.state.onboarding.profile_id = Some(profile_id);
+                }
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+            }
+            // A first-ever run with no profiles, a legacy-auth server (incl. a
+            // legacy `--profile-id` launch), or a non-solo Pick/Attach:
+            // unchanged behavior — open onboarding (OTP path intact).
+            _ => {
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+            }
+        }
+    }
+
+    /// Apply a `launch/resolve` decision (Model A). Resume opens the folder's
+    /// resolved brain straight away — a bare launch resumes the profile last
+    /// used in this folder. Activate ("this folder has no conversation yet") and
+    /// CrossProfile ("this folder belongs to another brain") stage the launch
+    /// prompt and open its menu, whose items emit the `session/open` follow-up.
+    /// NoProfile (or a decision with no resolvable profile / cwd) falls through
+    /// to the legacy onboarding path.
+    fn apply_launch_resolve_event(
+        &mut self,
+        result: crate::model::LaunchResolveResult,
+    ) -> Option<AppUiCommand> {
+        use crate::model::{LaunchDecisionKind, LaunchPromptState};
+        match result.decision {
+            LaunchDecisionKind::Resume => match result.resolved_profile {
+                Some(profile_id) => self.open_resolved_launch_session(profile_id),
+                None => {
+                    self.maybe_open_onboarding_on_first_launch();
+                    None
+                }
+            },
+            LaunchDecisionKind::Activate | LaunchDecisionKind::CrossProfile => {
+                let (Some(resolved_profile), Some(cwd)) = (
+                    result.resolved_profile,
+                    onboarding_workspace_cwd(&self.state.workspace.root),
+                ) else {
+                    // No resolvable profile or local cwd — fall back to
+                    // onboarding rather than opening an empty prompt.
+                    self.maybe_open_onboarding_on_first_launch();
+                    return None;
+                };
+                self.state.onboarding.launch_prompt = Some(LaunchPromptState {
+                    decision: result.decision,
+                    resolved_profile,
+                    existing_profiles: result.existing_profiles,
+                    cwd,
+                });
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_LAUNCH_PROMPT));
+                None
+            }
+            LaunchDecisionKind::NoProfile => {
+                self.maybe_open_onboarding_on_first_launch();
+                None
+            }
+        }
+    }
+
+    /// Build the `session/open` command for a launch-resolved profile, attaching
+    /// the workspace cwd so the session lands in this folder's per-project store.
+    fn open_resolved_launch_session(&mut self, profile_id: String) -> Option<AppUiCommand> {
+        let session_id =
+            octos_core::SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding");
+        self.state.status = t!(
+            "status.opening_coding_session",
+            profile = profile_id.clone()
+        )
+        .into_owned();
+        Some(AppUiCommand::OpenSession(
+            octos_core::ui_protocol::SessionOpenParams {
+                session_id,
+                topic: None,
+                profile_id: Some(profile_id),
+                cwd: onboarding_workspace_cwd(&self.state.workspace.root),
+                sandbox: None,
+                after: None,
+            },
+        ))
     }
 
     fn apply_model_list_event(&mut self, event: ModelListClientEvent) {
@@ -6933,17 +7217,60 @@ impl Store {
         self.state.status = event.message;
     }
 
-    fn apply_profile_llm_list_event(&mut self, event: ProfileLlmListClientEvent) {
-        if self.state.onboarding.profile_id.is_none() {
-            if let Some(profile_id) = event
-                .result
-                .profile_id
-                .as_deref()
-                .and_then(|profile_id| non_empty_string(profile_id.to_owned()))
-            {
-                self.state.onboarding.profile_id = Some(profile_id);
-            }
+    /// True while first-launch onboarding is resolving the profile through
+    /// legacy email-OTP (`send_code`/`verify`/`me`) and auth is NOT yet done:
+    /// no session, no local-solo support, legacy auth advertised, and the
+    /// profile still unresolved (auth not verified). While this holds, a
+    /// pre-auth startup reply (`profile/llm/list` / skills) must be IGNORED —
+    /// not just for the `onboarding.profile_id` seed but for `profile_llm_state`
+    /// / `profile_skills` too, since `current_profile_for_onboarding` derives the
+    /// resolved profile from any of them and would flip the menu to provider
+    /// setup, dropping the OTP rows. Once OTP auth resolves the profile
+    /// (`apply_auth_me` sets `profile_id` + `auth_verified`), this is false and
+    /// hydration proceeds normally.
+    fn legacy_otp_first_launch_active(&self) -> bool {
+        if !self.state.sessions.is_empty()
+            || self.local_profile_create_supported()
+            || self.state.onboarding.profile_id.is_some()
+            || self.state.onboarding.auth_verified
+        {
+            return false;
         }
+        self.state
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                crate::menu::registry::APPUI_FIRST_LAUNCH_LEGACY_AUTH_METHODS
+                    .iter()
+                    .all(|method| capabilities.supports_method(method))
+            })
+    }
+
+    /// Pre-resolve `onboarding.profile_id` from a startup reply that echoes a
+    /// profile id (e.g. a `--profile-id` launch's bootstrap `profile/llm/list`),
+    /// when it is not already resolved. Callers gate the legacy-OTP case via
+    /// [`Self::legacy_otp_first_launch_active`] before invoking this.
+    fn maybe_seed_onboarding_profile_id(&mut self, reply_profile_id: Option<&str>) {
+        if self.state.onboarding.profile_id.is_some() {
+            return;
+        }
+        if let Some(profile_id) =
+            reply_profile_id.and_then(|profile_id| non_empty_string(profile_id.to_owned()))
+        {
+            self.state.onboarding.profile_id = Some(profile_id);
+        }
+    }
+
+    fn apply_profile_llm_list_event(&mut self, event: ProfileLlmListClientEvent) {
+        // Legacy email-OTP first-launch: ignore a pre-auth reply entirely so the
+        // profile stays unresolved (both the seed AND profile_llm_state, which
+        // resolves it via current_profile_for_onboarding) and the OTP rows
+        // survive until auth completes. Re-fetched post-auth via the hydrate
+        // command once the profile legitimately resolves.
+        if self.legacy_otp_first_launch_active() {
+            return;
+        }
+        self.maybe_seed_onboarding_profile_id(event.result.profile_id.as_deref());
         self.state.profile_llm_state = Some(event.result.clone());
         if let Some(session_id) = self.active_session().map(|session| session.id.clone()) {
             self.state.set_model_catalog(SessionModelCatalog {
@@ -7047,16 +7374,13 @@ impl Store {
     }
 
     fn apply_profile_skills_list_event(&mut self, event: ProfileSkillsListClientEvent) {
-        if self.state.onboarding.profile_id.is_none() {
-            if let Some(profile_id) = event
-                .result
-                .profile_id
-                .as_deref()
-                .and_then(|profile_id| non_empty_string(profile_id.to_owned()))
-            {
-                self.state.onboarding.profile_id = Some(profile_id);
-            }
+        // See `apply_profile_llm_list_event`: ignore a pre-auth reply during
+        // legacy email-OTP first-launch so it does not resolve the profile
+        // (`profile_skills` also feeds `current_profile_for_onboarding`).
+        if self.legacy_otp_first_launch_active() {
+            return;
         }
+        self.maybe_seed_onboarding_profile_id(event.result.profile_id.as_deref());
         self.state.profile_skills = Some(event.result);
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
@@ -7070,16 +7394,13 @@ impl Store {
         &mut self,
         event: ProfileSkillsRegistrySearchClientEvent,
     ) {
-        if self.state.onboarding.profile_id.is_none() {
-            if let Some(profile_id) = event
-                .result
-                .profile_id
-                .as_deref()
-                .and_then(|profile_id| non_empty_string(profile_id.to_owned()))
-            {
-                self.state.onboarding.profile_id = Some(profile_id);
-            }
+        // See `apply_profile_llm_list_event`: ignore a pre-auth reply during
+        // legacy email-OTP first-launch (it also feeds
+        // `current_profile_for_onboarding` via `profile_skill_registry`).
+        if self.legacy_otp_first_launch_active() {
+            return;
         }
+        self.maybe_seed_onboarding_profile_id(event.result.profile_id.as_deref());
         self.state.profile_skill_registry = Some(event.result);
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
@@ -15502,6 +15823,120 @@ mod tests {
         );
     }
 
+    /// Model A launch flow: on a clean first launch, a backend advertising
+    /// `launch/resolve` + `session.workspace_cwd.v1` makes the client request
+    /// the per-project launch decision (carrying this folder's cwd and the
+    /// requested profile) BEFORE opening onboarding.
+    #[test]
+    fn first_launch_requests_launch_resolve_when_workspace_cwd_advertised() {
+        let mut store = protocol_store_without_sessions();
+        store.state.workspace.root = "/tmp/launch-project".into();
+        store.state.onboarding.launch_profile_id = Some("dev".into());
+
+        let follow_up =
+            store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+                result: crate::model::ConfigCapabilitiesListResult {
+                    capabilities: UiProtocolCapabilities::new(
+                        &[crate::model::APPUI_METHOD_LAUNCH_RESOLVE],
+                        &[],
+                    )
+                    .with_supported_features([
+                        crate::model::APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1,
+                    ]),
+                },
+                message: "Octos UI capabilities refreshed".into(),
+            }));
+
+        let Some(AppUiCommand::LaunchResolve(params)) = follow_up else {
+            panic!("first launch must request launch/resolve, got: {follow_up:?}");
+        };
+        assert_eq!(params.cwd, "/tmp/launch-project");
+        assert_eq!(params.profile_id.as_deref(), Some("dev"));
+        assert!(
+            store.state.active_menu.is_none(),
+            "launch/resolve defers onboarding until the decision lands"
+        );
+    }
+
+    /// The launch/resolve probe is gated on `session.workspace_cwd.v1`: an older
+    /// server that advertises the method but not the feature must fall through
+    /// to the legacy onboarding path, never emitting `launch/resolve`.
+    #[test]
+    fn first_launch_skips_launch_resolve_without_workspace_cwd_feature() {
+        let mut store = protocol_store_without_sessions();
+        store.state.workspace.root = "/tmp/launch-project".into();
+
+        let follow_up =
+            store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+                result: crate::model::ConfigCapabilitiesListResult {
+                    capabilities: UiProtocolCapabilities::new(
+                        &[crate::model::APPUI_METHOD_LAUNCH_RESOLVE],
+                        &[],
+                    ),
+                },
+                message: "Octos UI capabilities refreshed".into(),
+            }));
+
+        assert!(
+            !matches!(follow_up, Some(AppUiCommand::LaunchResolve(_))),
+            "launch/resolve must be gated on session.workspace_cwd.v1"
+        );
+    }
+
+    /// A `Resume` decision opens the folder's resolved brain straight away —
+    /// the sticky bare-launch path — attaching the workspace cwd so the session
+    /// lands in this folder's per-project store.
+    #[test]
+    fn launch_resolve_resume_opens_folder_session() {
+        let mut store = protocol_store_without_sessions();
+        store.state.workspace.root = "/tmp/launch-project".into();
+
+        let follow_up = store.apply_client_event(ClientEvent::LaunchResolve(
+            crate::model::LaunchResolveResult {
+                decision: crate::model::LaunchDecisionKind::Resume,
+                resolved_profile: Some("dev".into()),
+                existing_profiles: Vec::new(),
+            },
+        ));
+
+        let Some(AppUiCommand::OpenSession(params)) = follow_up else {
+            panic!("resume must open the folder session, got: {follow_up:?}");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("dev"));
+        assert_eq!(params.cwd.as_deref(), Some("/tmp/launch-project"));
+    }
+
+    /// An `Activate` decision (this folder has no conversation yet) stages the
+    /// launch prompt and opens its menu rather than opening a session directly —
+    /// the user confirms activating the space first.
+    #[test]
+    fn launch_resolve_activate_opens_prompt_menu() {
+        let mut store = protocol_store_without_sessions();
+        store.state.workspace.root = "/tmp/launch-project".into();
+
+        let follow_up = store.apply_client_event(ClientEvent::LaunchResolve(
+            crate::model::LaunchResolveResult {
+                decision: crate::model::LaunchDecisionKind::Activate,
+                resolved_profile: Some("dev".into()),
+                existing_profiles: Vec::new(),
+            },
+        ));
+
+        assert!(
+            follow_up.is_none(),
+            "activate opens a prompt, it must not emit a command directly"
+        );
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_LAUNCH_PROMPT));
+        let prompt = store
+            .state
+            .onboarding
+            .launch_prompt
+            .as_ref()
+            .expect("activate stages the launch prompt");
+        assert_eq!(prompt.resolved_profile, "dev");
+        assert_eq!(prompt.cwd, "/tmp/launch-project");
+    }
+
     /// M22-A: legacy email-OTP onboarding triggers first-launch flow
     /// only when `auth/send_code`, `auth/verify`, AND `auth/me` are
     /// advertised. `auth/me` is required because the wizard auto-issues
@@ -15599,6 +16034,391 @@ mod tests {
             store.state.active_menu.is_none(),
             "no capabilities means no auto-open of onboarding"
         );
+    }
+
+    // ---- Phase 3: startup profile picker wiring ----
+
+    fn local_solo_capabilities_event() -> ClientEvent {
+        ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+                    &[],
+                ),
+            },
+            message: "Octos UI capabilities refreshed: 1 method".into(),
+        })
+    }
+
+    /// Capabilities for a LEGACY email-OTP backend: advertises the auth OTP
+    /// methods but NOT `profile/local/create`.
+    fn legacy_auth_capabilities_event() -> ClientEvent {
+        ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[
+                        crate::model::APPUI_METHOD_AUTH_STATUS,
+                        crate::model::APPUI_METHOD_AUTH_SEND_CODE,
+                        crate::model::APPUI_METHOD_AUTH_VERIFY,
+                        crate::model::APPUI_METHOD_AUTH_ME,
+                    ],
+                    &[],
+                ),
+            },
+            message: "Octos UI capabilities refreshed: 4 methods".into(),
+        })
+    }
+
+    fn assert_active_menu_has_row(store: &Store, row_id: &str) {
+        let menu = store
+            .state
+            .active_menu
+            .as_ref()
+            .expect("an onboarding menu is built");
+        let MenuBuildResult::Ready(spec) = menu else {
+            panic!("expected a ready menu, got {menu:?}");
+        };
+        assert!(
+            spec.items.iter().any(|item| item.id == row_id),
+            "active menu is missing row `{row_id}`"
+        );
+    }
+
+    #[test]
+    fn first_launch_opens_picker_when_multiple_profiles_and_no_pin() {
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.available_profiles = vec!["glm".into(), "deepseek".into()];
+
+        store.apply_client_event(local_solo_capabilities_event());
+
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER),
+            "more than one profile must open the attach picker"
+        );
+    }
+
+    #[test]
+    fn first_launch_attaches_single_profile_silently() {
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.available_profiles = vec!["glm".into()];
+
+        store.apply_client_event(local_solo_capabilities_event());
+
+        // Exactly one profile is attached (no picker) and the wizard opens
+        // straight into that profile's setup rather than the create step.
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+        assert_eq!(store.state.onboarding.profile_id.as_deref(), Some("glm"));
+    }
+
+    #[test]
+    fn first_launch_pin_attaches_pinned_profile_and_skips_picker() {
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.launch_profile_id = Some("coding".into());
+        store.state.onboarding.available_profiles = vec!["glm".into(), "deepseek".into()];
+
+        store.apply_client_event(local_solo_capabilities_event());
+
+        // A pinned --profile-id is honored: never the picker, and the pin is
+        // attached as the resolved profile so the wizard scopes to it (provider
+        // setup) instead of routing to profile/local/create for a new profile.
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+        assert_eq!(store.state.onboarding.profile_id.as_deref(), Some("coding"));
+    }
+
+    #[test]
+    fn first_launch_legacy_pin_keeps_otp_surface_and_does_not_pre_resolve() {
+        // A LEGACY email-OTP server (send_code/verify/me, NO profile/local/create)
+        // launched with --profile-id must NOT pre-resolve the profile via the
+        // decision arm: doing so would make onboarding_menu render provider setup
+        // and skip the OTP rows, leaving the menu with no way to authenticate.
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.launch_profile_id = Some("coding".into());
+
+        store.apply_client_event(legacy_auth_capabilities_event());
+
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+        assert!(
+            store.state.onboarding.profile_id.is_none(),
+            "legacy pin must not pre-resolve the profile before OTP completes"
+        );
+        // The rendered onboarding surface still offers the OTP auth path.
+        assert_active_menu_has_row(&store, "onboard.auth.send");
+    }
+
+    #[test]
+    fn legacy_profile_llm_list_during_onboarding_keeps_otp_surface() {
+        // The SECOND path: a `--profile-id` protocol launch's bootstrap requests
+        // `profile/llm/list`; on a legacy server that reply must NOT pre-resolve
+        // the profile (which would flip the open first-launch menu to provider
+        // setup and drop the OTP rows). Reproduce the ordering: legacy caps open
+        // OTP onboarding, THEN the pre-auth list reply lands.
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.launch_profile_id = Some("coding".into());
+        store.apply_client_event(legacy_auth_capabilities_event());
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+
+        store.apply_client_event(ClientEvent::ProfileLlmList(ProfileLlmListClientEvent {
+            result: crate::model::ProfileLlmListResult {
+                profile_id: Some("coding".into()),
+                primary: None,
+                fallbacks: Vec::new(),
+                llm: None,
+                runtime_policy_stamp: None,
+            },
+            message: "Loaded profile LLM settings".into(),
+        }));
+
+        assert!(
+            store.state.onboarding.profile_id.is_none(),
+            "pre-auth profile/llm/list must not pre-resolve the profile on legacy"
+        );
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+        assert_active_menu_has_row(&store, "onboard.auth.send");
+    }
+
+    #[test]
+    fn first_launch_onboards_when_no_profiles_exist() {
+        let mut store = protocol_store_without_sessions();
+
+        store.apply_client_event(local_solo_capabilities_event());
+
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+        assert!(store.state.onboarding.profile_id.is_none());
+    }
+
+    #[test]
+    fn picker_select_attaches_profile_and_leaves_picker_for_onboarding() {
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.available_profiles = vec!["glm".into(), "deepseek".into()];
+        store.apply_client_event(local_solo_capabilities_event());
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER));
+
+        // The picker's row dispatches SetProfileId for the chosen profile.
+        store.dispatch_onboarding_action(
+            crate::model::OnboardingAction::SetProfileId("glm".into()),
+            None,
+        );
+
+        assert_eq!(store.state.onboarding.profile_id.as_deref(), Some("glm"));
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
+            "selecting a profile leaves the picker for that profile's setup"
+        );
+        assert!(!store.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER));
+    }
+
+    #[test]
+    fn picker_create_new_replaces_picker_with_onboarding() {
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.available_profiles = vec!["glm".into(), "deepseek".into()];
+        store.apply_client_event(local_solo_capabilities_event());
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER));
+
+        // The picker's "Create a new profile" row opens the onboarding create
+        // step (no profile pinned) in place of the picker.
+        store.dispatch_onboarding_action(crate::model::OnboardingAction::Open, None);
+
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+        assert!(store.state.onboarding.profile_id.is_none());
+        // Replaced, not stacked: closing onboarding must not reveal the picker.
+        store.close_all_menus();
+        assert!(!store.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER));
+    }
+
+    #[test]
+    fn escape_keeps_startup_picker_open() {
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.available_profiles = vec!["glm".into(), "deepseek".into()];
+        store.apply_client_event(local_solo_capabilities_event());
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER));
+
+        let closed = store.handle_menu_escape();
+        assert!(
+            !closed,
+            "Esc must not strand the user by closing the picker"
+        );
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER));
+    }
+
+    // ---- Phase 2: nameable-profiles create-command negotiation ----
+
+    #[test]
+    fn create_local_profile_sends_requested_id_when_feature_advertised() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            [crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1],
+        ));
+        store.state.onboarding.requested_id = "glm".into();
+
+        let command = store
+            .dispatch_onboarding_action(crate::model::OnboardingAction::CreateLocalProfile, None)
+            .expect("nameable create emits profile/local/create");
+        let AppUiCommand::ProfileLocalCreate(params) = command else {
+            panic!("expected profile/local/create, got {command:?}");
+        };
+        assert_eq!(params.requested_id.as_deref(), Some("glm"));
+        assert!(params.name.is_empty());
+        assert!(params.username.is_empty());
+        assert!(params.email.is_empty());
+    }
+
+    #[test]
+    fn create_local_profile_sends_make_default_when_toggled_and_supported() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            [
+                crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1,
+                crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1,
+            ],
+        ));
+        store.state.onboarding.requested_id = "glm".into();
+
+        // The toggle action flips the onboarding flag.
+        store
+            .dispatch_onboarding_action(crate::model::OnboardingAction::SetMakeDefault(true), None);
+        assert!(store.state.onboarding.make_default);
+
+        let command = store
+            .dispatch_onboarding_action(crate::model::OnboardingAction::CreateLocalProfile, None)
+            .expect("create emits profile/local/create");
+        let AppUiCommand::ProfileLocalCreate(params) = command else {
+            panic!("expected profile/local/create, got {command:?}");
+        };
+        assert_eq!(params.make_default, Some(true));
+    }
+
+    #[test]
+    fn create_local_profile_omits_make_default_when_off_or_unsupported() {
+        // Feature advertised but the toggle is off → omit `make_default`.
+        let mut supported = store_with_empty_session();
+        supported.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            [
+                crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1,
+                crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1,
+            ],
+        ));
+        supported.state.onboarding.requested_id = "glm".into();
+        let AppUiCommand::ProfileLocalCreate(off) = supported
+            .dispatch_onboarding_action(crate::model::OnboardingAction::CreateLocalProfile, None)
+            .expect("create")
+        else {
+            panic!("expected profile/local/create");
+        };
+        assert_eq!(off.make_default, None);
+
+        // Toggle on but the server does NOT advertise the feature → still
+        // omitted, so an older server gets the unchanged create shape.
+        let mut unsupported = store_with_empty_session();
+        unsupported.state.capabilities =
+            Some(crate::menu::CapabilitySet::from_methods_and_features(
+                [crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+                [crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1],
+            ));
+        unsupported.state.onboarding.requested_id = "glm".into();
+        unsupported.state.onboarding.make_default = true;
+        let AppUiCommand::ProfileLocalCreate(gated) = unsupported
+            .dispatch_onboarding_action(crate::model::OnboardingAction::CreateLocalProfile, None)
+            .expect("create")
+        else {
+            panic!("expected profile/local/create");
+        };
+        assert_eq!(gated.make_default, None);
+    }
+
+    #[test]
+    fn create_local_profile_uses_family_suggestion_when_id_untyped() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            [crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1],
+        ));
+        // No typed id, but a chosen family → suggestion is sent.
+        store.state.onboarding.provider.family_id = "glm-4.6".into();
+
+        let command = store
+            .dispatch_onboarding_action(crate::model::OnboardingAction::CreateLocalProfile, None)
+            .expect("suggestion drives the create");
+        let AppUiCommand::ProfileLocalCreate(params) = command else {
+            panic!("expected profile/local/create");
+        };
+        assert_eq!(params.requested_id.as_deref(), Some("glm"));
+    }
+
+    #[test]
+    fn selecting_family_pre_profile_seeds_suggestion_and_returns_to_profile_step() {
+        // Nameable flow, no profile yet: picking a family from the profile step
+        // seeds the name suggestion (glm, not the empty→octos default) and
+        // returns to the profile step — NOT into model/route setup.
+        let mut store = protocol_store_without_sessions();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY));
+        assert!(store.state.onboarding.effective_profile_id(None).is_none());
+
+        store.dispatch_onboarding_action(
+            crate::model::OnboardingAction::SetFamilyId("glm-4.6".into()),
+            None,
+        );
+
+        assert_eq!(store.state.onboarding.provider.family_id, "glm-4.6");
+        assert_eq!(store.state.onboarding.suggested_profile_id(), "glm");
+        assert_eq!(store.state.onboarding.effective_requested_id(), "glm");
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
+            "pre-profile family choice returns to the profile step"
+        );
+        assert!(!store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_MODEL));
+    }
+
+    #[test]
+    fn selecting_family_post_profile_still_advances_to_model_step() {
+        // Regression: once a profile exists, choosing a family advances into
+        // provider setup (model step) as before.
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.profile_id = Some("glm".into());
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY));
+
+        store.dispatch_onboarding_action(
+            crate::model::OnboardingAction::SetFamilyId("gpt-4o".into()),
+            None,
+        );
+
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_MODEL));
+    }
+
+    #[test]
+    fn create_local_profile_falls_back_to_legacy_shape_without_feature() {
+        // Older server: method advertised, feature NOT advertised → legacy
+        // name/username/email create with no requested_id.
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.onboarding.name = "Ada Lovelace".into();
+        store.state.onboarding.username = "ada".into();
+        store.state.onboarding.email = "ada@example.com".into();
+
+        let command = store
+            .dispatch_onboarding_action(crate::model::OnboardingAction::CreateLocalProfile, None)
+            .expect("legacy create emits profile/local/create");
+        let AppUiCommand::ProfileLocalCreate(params) = command else {
+            panic!("expected profile/local/create");
+        };
+        assert!(
+            params.requested_id.is_none(),
+            "legacy shape omits requested_id"
+        );
+        assert_eq!(params.name, "Ada Lovelace");
+        assert_eq!(params.username, "ada");
+        assert_eq!(params.email, "ada@example.com");
+    }
+
+    #[test]
+    fn onboard_profile_name_command_sets_requested_id() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        store.state.composer = "/onboard profile-name glm".into();
+        assert!(store.compose_command().is_none());
+        assert_eq!(store.state.onboarding.requested_id, "glm");
     }
 
     /// M22-A: `/setup` is an alias of `/onboard`, so typing either

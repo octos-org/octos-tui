@@ -20,6 +20,7 @@ pub mod insert_history;
 pub mod keymap;
 pub mod menu;
 pub mod model;
+pub mod profiles;
 pub mod sanitize;
 pub mod store;
 pub mod theme;
@@ -77,6 +78,15 @@ mod i18n_tests {
             "onboarding.preview.workspace.staged_title",
             "menu.lang.item.en.label",
             "menu.lang.item.zh.label",
+            // Phase 2 nameable-profiles + Phase 3 startup picker keys.
+            "onboarding.field.profile_name",
+            "onboarding.field.profile_name_desc",
+            "onboarding.value_suggested",
+            "menu.profile_picker.title",
+            "menu.profile_picker.subtitle",
+            "menu.profile_picker.item.attach.desc",
+            "menu.profile_picker.item.create.label",
+            "menu.profile_picker.item.create.desc",
         ];
         for key in keys {
             for locale in ["en", "zh"] {

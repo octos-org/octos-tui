@@ -227,11 +227,11 @@ mod tests {
     }
 
     #[test]
-    fn route_recognizes_config_and_defaults_to_wizard() {
-        // Bare `config` → wizard action.
+    fn route_recognizes_config_and_defaults_to_show() {
+        // Bare `config` → show action (the interactive wizard was removed).
         match route(&argv(&["octos-tui", "config"])) {
             Some(Route::Config(args)) => {
-                assert!(matches!(args.action, config::ConfigAction::Wizard));
+                assert!(matches!(args.action, config::ConfigAction::Show));
             }
             other => panic!("expected Route::Config, got {other:?}"),
         }

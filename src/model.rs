@@ -30,6 +30,7 @@ pub type TaskView = AppUiTask;
 
 pub const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str = "config/capabilities/list";
 pub const APPUI_METHOD_SESSION_STATUS_READ: &str = "session/status/read";
+pub const APPUI_METHOD_SESSION_COMPACT: &str = "session/compact";
 pub const APPUI_METHOD_MODEL_LIST: &str = "profile/llm/list";
 pub const APPUI_METHOD_MODEL_SELECT: &str = "profile/llm/select";
 pub const APPUI_METHOD_MCP_STATUS_LIST: &str = "mcp/status/list";
@@ -59,6 +60,12 @@ pub const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 pub const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 pub const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
 pub const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str = "profile/skills/remove";
+/// Per-project launch decision (`launch/resolve`). The TUI calls this on first
+/// launch to learn whether to resume the folder's sticky brain, prompt to
+/// activate an empty folder, offer a cross-profile switch, or fall through to
+/// onboarding. Defined locally because the pinned octos-core rev predates the
+/// method; gated on [`APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1`].
+pub const APPUI_METHOD_LAUNCH_RESOLVE: &str = "launch/resolve";
 
 /// M12-E feature flag for per-session workspace cwd requests
 /// (`session.workspace_cwd.v1`, UPCR-2026-003). The TUI must NOT
@@ -168,6 +175,23 @@ pub const APPUI_FEATURE_CODING_AUTONOMY_V1: &str = "coding.autonomy.v1";
 pub const APPUI_FEATURE_CODING_AGENT_CONTROL_V1: &str = "coding.agent_control.v1";
 pub const APPUI_FEATURE_CODING_GOAL_RUNTIME_V1: &str = "coding.goal_runtime.v1";
 pub const APPUI_FEATURE_CODING_LOOP_RUNTIME_V1: &str = "coding.loop_runtime.v1";
+
+/// Additive `profile/local/create` capability: the server honors an optional
+/// `requested_id` (the meaningful profile name the user types, e.g. `glm`) and
+/// treats `name`/`username`/`email` as optional. Advertised by servers that
+/// support nameable solo profiles. When negotiated, the onboarding Profile step
+/// collapses to a single "Name this profile" prompt and sends `requested_id`;
+/// when ABSENT the TUI falls back to the legacy `{name, username, email}` flow
+/// so it keeps working against older servers.
+pub const APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1: &str =
+    "profile.local_create.requested_id.v1";
+
+/// The server honors the optional `make_default` field on
+/// `profile/local/create`, recording the created profile as the machine's
+/// global default. When ABSENT the onboarding "Make this your default brain?"
+/// toggle is hidden and `make_default` is never sent, so older servers get the
+/// unchanged create shape.
+pub const APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1: &str = "profile.local_create.default.v1";
 
 /// M15-E backend-owned agent inspection methods (UPCR-2026-021).
 pub const APPUI_METHOD_AGENT_LIST: &str = "agent/list";
@@ -622,6 +646,12 @@ pub enum AppUiCommand {
     /// `/resume` picker. A READ (non-mutating) method (see
     /// [`ProtocolAppUiBackend::readonly_allows_command`]).
     ListSessions(SessionListParams),
+    /// `launch/resolve` — per-project launch decision (Model A). Sent on first
+    /// launch to resolve requested→sticky→default and learn whether to resume
+    /// the folder's brain, prompt to activate an empty folder, offer a
+    /// cross-profile switch, or open onboarding. A READ (non-mutating) method;
+    /// gated on `session.workspace_cwd.v1`.
+    LaunchResolve(LaunchResolveParams),
     /// `session/rollback` — conversation-only rewind for `/rewind`. Drops the
     /// last `num_turns` user turns from the active session and returns the
     /// trimmed transcript. A MUTATING method: intentionally NOT listed in
@@ -634,6 +664,7 @@ pub enum AppUiCommand {
     ListConfigCapabilities(ConfigCapabilitiesListParams),
     ReadSessionStatus(SessionStatusReadParams),
     SessionBtw(octos_core::ui_protocol::SessionBtwParams),
+    CompactContext(SessionCompactParams),
     ListModels(ModelListParams),
     SelectModel(ModelSelectParams),
     ListPermissionProfiles(PermissionProfileListParams),
@@ -716,6 +747,7 @@ impl AppUiCommand {
             Self::ReadTaskArtifact(_) => APPUI_METHOD_TASK_ARTIFACT_READ,
             Self::HydrateSession(_) => APPUI_METHOD_SESSION_HYDRATE,
             Self::ListSessions(_) => octos_core::ui_protocol::methods::SESSION_LIST,
+            Self::LaunchResolve(_) => APPUI_METHOD_LAUNCH_RESOLVE,
             Self::SessionRollback(_) => octos_core::ui_protocol::methods::SESSION_ROLLBACK,
             Self::GetThreadGraph(_) => APPUI_METHOD_THREAD_GRAPH_GET,
             Self::GetTurnState(_) => APPUI_METHOD_TURN_STATE_GET,
@@ -723,6 +755,7 @@ impl AppUiCommand {
             Self::ListConfigCapabilities(_) => APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
             Self::ReadSessionStatus(_) => APPUI_METHOD_SESSION_STATUS_READ,
             Self::SessionBtw(_) => octos_core::ui_protocol::methods::SESSION_BTW,
+            Self::CompactContext(_) => APPUI_METHOD_SESSION_COMPACT,
             Self::ListModels(_) | Self::ProfileLlmList(_) => APPUI_METHOD_MODEL_LIST,
             Self::SelectModel(_) | Self::ProfileLlmSelect(_) => APPUI_METHOD_MODEL_SELECT,
             Self::ListPermissionProfiles(_) => {
@@ -837,6 +870,12 @@ pub struct ConfigCapabilitiesListResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionStatusReadParams {
+    pub session_id: SessionKey,
+}
+
+/// Params for `session/compact` — force a context-compaction pass now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCompactParams {
     pub session_id: SessionKey,
 }
 
@@ -1891,11 +1930,28 @@ pub struct AuthLogoutResult {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileLocalCreateParams {
+    /// Meaningful profile id the user typed during onboarding (nameable-profiles
+    /// flow, e.g. `glm`). Omitted from the wire when `None` so an older server
+    /// receives exactly the legacy `{name, username, email}` shape and derives
+    /// the id from `username` as before. Only sent when the server advertises
+    /// [`APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_id: Option<String>,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub username: String,
+    #[serde(default)]
     pub email: String,
+    /// When `Some(true)`, ask the server to record the created profile as the
+    /// machine's global default (the brain a bare launch resolves to in a folder
+    /// with no sticky profile). Omitted from the wire when `None` so older
+    /// servers get the unchanged shape. Only sent when the server advertises
+    /// [`APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub make_default: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1910,6 +1966,66 @@ pub struct ProfileLocalCreateResult {
     pub runtime_mode: String,
 }
 
+/// Parameters for `launch/resolve` — the per-project launch decision. `cwd` is
+/// the folder the user launched in; `profile_id` is the explicitly requested
+/// brain (`--profile`), omitted for a bare launch so the server falls back to
+/// the folder's sticky profile then the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchResolveParams {
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+/// The server's per-project launch decision. Mirrors the server-side
+/// `LaunchDecisionKind`; snake_case on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchDecisionKind {
+    /// The resolved profile already has an activated store in this folder —
+    /// resume its conversation.
+    Resume,
+    /// The resolved profile exists but this folder has no store yet — prompt to
+    /// activate the space before opening.
+    Activate,
+    /// The launching profile differs from the profile(s) already used in this
+    /// folder — offer to switch or start fresh.
+    CrossProfile,
+    /// No profile could be resolved (none requested, no sticky, no default) —
+    /// fall through to onboarding.
+    NoProfile,
+}
+
+/// Result of `launch/resolve`. `resolved_profile` is the brain the decision
+/// points at (set for Resume/Activate/CrossProfile); `existing_profiles` lists
+/// the other profiles already used in this folder (populated for CrossProfile).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchResolveResult {
+    pub decision: LaunchDecisionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub existing_profiles: Vec<String>,
+}
+
+/// Transient state for an open launch prompt (Activate / CrossProfile). Stashed
+/// on the onboarding wizard state so the `launch_prompt` menu provider can
+/// render the decision. Only raised for decisions that carry a resolved profile
+/// — Resume opens straight through and NoProfile routes to onboarding, so
+/// neither ever populates this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchPromptState {
+    pub decision: LaunchDecisionKind,
+    /// The brain the launch resolved to (the launching profile for
+    /// CrossProfile, the sticky/default for Activate).
+    pub resolved_profile: String,
+    /// Other profiles already used in this folder (CrossProfile only).
+    pub existing_profiles: Vec<String>,
+    /// The folder the prompt is deciding for; attached to `session/open` so the
+    /// session lands in this folder's per-project store.
+    pub cwd: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum OnboardingAction {
     Open,
@@ -1919,6 +2035,11 @@ pub enum OnboardingAction {
     SetUsername(String),
     SetEmail(String),
     SetOtpCode(String),
+    /// Nameable-profiles flow: set the single "Name this profile" value.
+    SetRequestedId(String),
+    /// Nameable-profiles flow: toggle whether the created profile becomes the
+    /// machine's global default (sends `make_default` on create).
+    SetMakeDefault(bool),
     SetProfileId(String),
     SetProviderSelection(Box<LlmSelectionConfig>),
     SetFamilyId(String),
@@ -2120,6 +2241,10 @@ pub enum OnboardingLocalProfileField {
     Name,
     Username,
     Email,
+    /// Nameable-profiles flow: the single "Name this profile" prompt
+    /// (the requested profile id). Focused when that flow's validation
+    /// rejects an (effectively) empty id.
+    RequestedId,
 }
 
 impl OnboardingLocalProfileField {
@@ -2128,6 +2253,7 @@ impl OnboardingLocalProfileField {
             Self::Name => "name",
             Self::Username => "username",
             Self::Email => "email",
+            Self::RequestedId => "profile-name",
         }
     }
 }
@@ -2138,6 +2264,31 @@ pub struct OnboardingWizardState {
     pub username: String,
     pub email: String,
     pub otp_code: String,
+    /// Nameable-profiles flow (Phase 2): the single profile id the user types at
+    /// the "Name this profile" prompt (e.g. `glm`). Sent as `requested_id` when
+    /// the server advertises
+    /// [`APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1`]. Empty until the
+    /// user edits it, in which case a provider-derived suggestion is used.
+    pub requested_id: String,
+    /// Nameable-profiles flow: when true, the create sends `make_default` so the
+    /// server records this profile as the machine's global default (the brain a
+    /// bare launch resolves to in a fresh folder). Toggled by the onboarding
+    /// "Make this your default brain?" row; only surfaced/sent when the server
+    /// advertises [`APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1`].
+    pub make_default: bool,
+    /// Phase 3 startup picker: the `--profile-id` the process launched with, if
+    /// any. Seeded once at launch. Drives [`StartupProfileDecision`]; a pinned
+    /// id is honored unchanged and never triggers the picker.
+    pub launch_profile_id: Option<String>,
+    /// Phase 3 startup picker: existing local profile ids discovered at launch
+    /// (solo servers store them on disk). Empty on legacy/remote servers or a
+    /// first-ever run. Drives the 0/1/N [`StartupProfileDecision`] and populates
+    /// the picker menu.
+    pub available_profiles: Vec<String>,
+    /// Per-project launch flow: the pending Activate / CrossProfile prompt for
+    /// the `launch_prompt` menu, stashed when a `launch/resolve` decision needs
+    /// the user to choose. `None` outside that prompt. See [`LaunchPromptState`].
+    pub launch_prompt: Option<LaunchPromptState>,
     pub profile_id: Option<String>,
     pub local_profile_created: bool,
     pub open_session_after_profile_create: bool,
@@ -2208,6 +2359,11 @@ impl Default for OnboardingWizardState {
             username: String::new(),
             email: String::new(),
             otp_code: String::new(),
+            requested_id: String::new(),
+            make_default: false,
+            launch_profile_id: None,
+            available_profiles: Vec::new(),
+            launch_prompt: None,
             profile_id: None,
             local_profile_created: false,
             open_session_after_profile_create: false,
@@ -2282,6 +2438,49 @@ impl OnboardingWizardState {
         // that, the TUI must keep email required so the menu does
         // not invite the user into a guaranteed-failure submission.
         self.has_name() && self.has_username() && self.has_email()
+    }
+
+    /// Nameable-profiles flow: `true` when the user has typed a profile id.
+    pub fn has_requested_id(&self) -> bool {
+        !self.requested_id.trim().is_empty()
+    }
+
+    /// The profile id suggested by default at the "Name this profile" prompt,
+    /// derived from the chosen provider/model family (e.g. the zai/glm family
+    /// suggests `glm`). Falls back to a neutral id when no family is picked yet.
+    pub fn suggested_profile_id(&self) -> String {
+        suggest_profile_id_for_family(&self.provider.family_id)
+    }
+
+    /// The id the nameable-profiles create actually sends: the user's typed
+    /// value when present, otherwise the provider-derived suggestion. Always
+    /// non-empty, so the "Continue" action never dead-ends on a blank field —
+    /// the user can accept the suggestion with a single keypress. The server
+    /// normalizes and collision-suffixes it, returning the final id.
+    pub fn effective_requested_id(&self) -> String {
+        let typed = self.requested_id.trim();
+        if typed.is_empty() {
+            self.suggested_profile_id()
+        } else {
+            typed.to_owned()
+        }
+    }
+
+    /// Nameable-profiles pre-flight: the effective id is always non-empty, so
+    /// this normally succeeds. It still guards defensively (an all-whitespace
+    /// suggestion should never happen) so the create path has one validation
+    /// entry point mirroring [`Self::validate_local_profile`].
+    pub fn validate_local_profile_requested_id(
+        &self,
+    ) -> Result<(), OnboardingLocalProfileRecovery> {
+        if self.effective_requested_id().trim().is_empty() {
+            return Err(OnboardingLocalProfileRecovery {
+                kind: OnboardingLocalProfileErrorKind::InvalidField,
+                focus_field: OnboardingLocalProfileField::RequestedId,
+                message: "Name this profile first. Use /onboard profile-name <id>.".into(),
+            });
+        }
+        Ok(())
     }
 
     /// M22-C: the path the user wants to use for the session. Falls
@@ -2731,6 +2930,116 @@ fn looks_like_email(value: &str) -> bool {
         && !domain.trim().is_empty()
         && !domain.starts_with('.')
         && !domain.ends_with('.')
+}
+
+/// Normalize a free-form string into a profile-id-safe slug: lowercase ASCII,
+/// `[a-z0-9]` kept, every other run collapsed to a single `-`, edges trimmed.
+/// Mirrors the server's normalization closely enough that the suggested id we
+/// show usually equals the id the server assigns (before any collision suffix).
+pub fn slugify_profile_id(value: &str) -> String {
+    let mut slug = String::with_capacity(value.len());
+    let mut pending_dash = false;
+    for ch in value.trim().chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.push(lower);
+        } else {
+            pending_dash = true;
+        }
+    }
+    slug
+}
+
+/// Suggest a default profile id from the chosen model/provider family. Known
+/// families map to a short, friendly handle (the zai/glm family suggests `glm`,
+/// deepseek suggests `deepseek`, …); an unrecognized-but-present family is
+/// slugified; an empty family falls back to a neutral `octos`. Pure and
+/// deterministic so onboarding UX can test the mapping directly.
+pub fn suggest_profile_id_for_family(family_id: &str) -> String {
+    let normalized = family_id.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return "octos".to_owned();
+    }
+    // Substring match: catalog family ids vary (`glm`, `glm-4`, `zai/glm`,
+    // `openai/gpt-4o`), so match on the recognizable brand token.
+    const KNOWN: &[(&str, &str)] = &[
+        ("glm", "glm"),
+        ("zai", "glm"),
+        ("deepseek", "deepseek"),
+        ("claude", "claude"),
+        ("anthropic", "claude"),
+        ("gpt", "openai"),
+        ("openai", "openai"),
+        ("o1", "openai"),
+        ("gemini", "gemini"),
+        ("google", "gemini"),
+        ("qwen", "qwen"),
+        ("llama", "llama"),
+        ("mistral", "mistral"),
+        ("grok", "grok"),
+        ("xai", "grok"),
+        ("kimi", "kimi"),
+        ("moonshot", "kimi"),
+    ];
+    for (needle, suggestion) in KNOWN {
+        if normalized.contains(needle) {
+            return (*suggestion).to_owned();
+        }
+    }
+    let slug = slugify_profile_id(&normalized);
+    if slug.is_empty() {
+        "octos".to_owned()
+    } else {
+        slug
+    }
+}
+
+/// The launch-time decision for which local profile to attach (Phase 3).
+/// Computed from the `--profile-id` flag and the set of existing profiles so
+/// the wiring stays a pure, testable function of its two inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupProfileDecision {
+    /// `--profile-id` was passed: honor it unchanged, never prompt.
+    Pinned(String),
+    /// Exactly one profile exists and none was pinned: attach it silently.
+    Attach(String),
+    /// More than one profile exists and none was pinned: show the picker.
+    Pick(Vec<String>),
+    /// No profiles exist (and none pinned): run first-launch onboarding.
+    Onboard,
+}
+
+impl StartupProfileDecision {
+    /// Decide from the pinned `--profile-id` (if any) and the discovered
+    /// profile ids. A pinned id always wins (`Pinned`); otherwise the count of
+    /// distinct, non-empty profiles chooses `Onboard` (0), `Attach` (1), or
+    /// `Pick` (N>1). Blank entries are ignored and duplicates collapsed so the
+    /// count reflects real, attachable profiles.
+    pub fn decide(cli_profile_id: Option<&str>, available: &[String]) -> Self {
+        if let Some(pinned) = cli_profile_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Self::Pinned(pinned.to_owned());
+        }
+        let mut profiles: Vec<String> = available
+            .iter()
+            .map(|profile| profile.trim())
+            .filter(|profile| !profile.is_empty())
+            .map(str::to_owned)
+            .collect();
+        profiles.sort();
+        profiles.dedup();
+        match profiles.len() {
+            0 => Self::Onboard,
+            1 => Self::Attach(profiles.remove(0)),
+            _ => Self::Pick(profiles),
+        }
+    }
 }
 
 pub fn auth_me_email(result: &AuthMeResult) -> Option<&str> {
@@ -8051,6 +8360,40 @@ mod tests {
         UiGitStatusItem, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
     };
 
+    /// The client's LOCAL launch/resolve types (octos-tui pins an older
+    /// octos-core, so `LaunchResolveResult`/`LaunchDecisionKind` are hand
+    /// mirrored) must decode the EXACT bytes a live `octos serve` emits —
+    /// including the omitted `resolved_profile`/`existing_profiles` on the
+    /// leaner decisions. Payloads captured verbatim from the launch-flow soak
+    /// against a real server; a drift here silently breaks the launch UX.
+    #[test]
+    fn launch_resolve_result_decodes_real_server_wire() {
+        let no_profile: LaunchResolveResult =
+            serde_json::from_str(r#"{"decision":"no_profile"}"#).unwrap();
+        assert_eq!(no_profile.decision, LaunchDecisionKind::NoProfile);
+        assert_eq!(no_profile.resolved_profile, None);
+        assert!(no_profile.existing_profiles.is_empty());
+
+        let activate: LaunchResolveResult =
+            serde_json::from_str(r#"{"decision":"activate","resolved_profile":"alpha"}"#).unwrap();
+        assert_eq!(activate.decision, LaunchDecisionKind::Activate);
+        assert_eq!(activate.resolved_profile.as_deref(), Some("alpha"));
+        assert!(activate.existing_profiles.is_empty());
+
+        let resume: LaunchResolveResult =
+            serde_json::from_str(r#"{"decision":"resume","resolved_profile":"alpha"}"#).unwrap();
+        assert_eq!(resume.decision, LaunchDecisionKind::Resume);
+        assert_eq!(resume.resolved_profile.as_deref(), Some("alpha"));
+
+        let cross: LaunchResolveResult = serde_json::from_str(
+            r#"{"decision":"cross_profile","resolved_profile":"alpha","existing_profiles":["beta"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cross.decision, LaunchDecisionKind::CrossProfile);
+        assert_eq!(cross.resolved_profile.as_deref(), Some("alpha"));
+        assert_eq!(cross.existing_profiles, vec!["beta".to_string()]);
+    }
+
     fn state_with_task(task: TaskView) -> AppState {
         AppState::new(
             vec![SessionView {
@@ -8888,6 +9231,129 @@ mod tests {
         assert_eq!(err.focus_field, OnboardingLocalProfileField::Email);
     }
 
+    // ---- Phase 2: nameable-profiles (requested_id) flow ----
+
+    fn state_with_family(family: &str) -> OnboardingWizardState {
+        let mut state = OnboardingWizardState::default();
+        state.provider.family_id = family.into();
+        state
+    }
+
+    #[test]
+    fn should_suggest_glm_when_family_is_zai_glm() {
+        assert_eq!(suggest_profile_id_for_family("glm-4.6"), "glm");
+        assert_eq!(suggest_profile_id_for_family("zai/glm"), "glm");
+        assert_eq!(suggest_profile_id_for_family("GLM"), "glm");
+    }
+
+    #[test]
+    fn should_suggest_known_family_handles() {
+        assert_eq!(suggest_profile_id_for_family("deepseek-v4"), "deepseek");
+        assert_eq!(suggest_profile_id_for_family("gpt-4o"), "openai");
+        assert_eq!(suggest_profile_id_for_family("claude-sonnet"), "claude");
+        assert_eq!(suggest_profile_id_for_family("gemini-2.5"), "gemini");
+    }
+
+    #[test]
+    fn should_slugify_unknown_family_when_not_recognized() {
+        assert_eq!(
+            suggest_profile_id_for_family("Acme Model X"),
+            "acme-model-x"
+        );
+    }
+
+    #[test]
+    fn should_suggest_octos_when_family_is_empty() {
+        assert_eq!(suggest_profile_id_for_family(""), "octos");
+        assert_eq!(suggest_profile_id_for_family("   "), "octos");
+    }
+
+    #[test]
+    fn slugify_collapses_separators_and_trims_edges() {
+        assert_eq!(slugify_profile_id("  My Profile!!  "), "my-profile");
+        assert_eq!(slugify_profile_id("a__b--c"), "a-b-c");
+        assert_eq!(slugify_profile_id("---"), "");
+    }
+
+    #[test]
+    fn effective_requested_id_prefers_typed_over_suggestion() {
+        let mut state = state_with_family("glm-4.6");
+        assert_eq!(
+            state.effective_requested_id(),
+            "glm",
+            "falls back to family"
+        );
+        state.requested_id = "  my-glm ".into();
+        assert_eq!(state.effective_requested_id(), "my-glm", "typed id wins");
+    }
+
+    #[test]
+    fn validate_requested_id_ok_when_suggestion_available() {
+        // Even with no typed id, the family-derived suggestion is non-empty,
+        // so the nameable-flow pre-flight passes (Continue is never blocked).
+        let state = state_with_family("deepseek");
+        assert!(state.validate_local_profile_requested_id().is_ok());
+        assert!(!state.has_requested_id());
+    }
+
+    // ---- Phase 3: startup profile decision (0/1/N) ----
+
+    fn profiles(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    #[test]
+    fn should_pin_when_profile_id_flag_is_present() {
+        let decision = StartupProfileDecision::decide(Some("coding"), &profiles(&["a", "b"]));
+        assert_eq!(decision, StartupProfileDecision::Pinned("coding".into()));
+    }
+
+    #[test]
+    fn should_pin_and_trim_whitespace_flag() {
+        let decision = StartupProfileDecision::decide(Some("  glm  "), &[]);
+        assert_eq!(decision, StartupProfileDecision::Pinned("glm".into()));
+    }
+
+    #[test]
+    fn should_onboard_when_zero_profiles_and_no_flag() {
+        assert_eq!(
+            StartupProfileDecision::decide(None, &[]),
+            StartupProfileDecision::Onboard
+        );
+        // A blank/whitespace flag is treated as absent.
+        assert_eq!(
+            StartupProfileDecision::decide(Some("   "), &[]),
+            StartupProfileDecision::Onboard
+        );
+    }
+
+    #[test]
+    fn should_attach_when_exactly_one_profile_and_no_flag() {
+        assert_eq!(
+            StartupProfileDecision::decide(None, &profiles(&["glm"])),
+            StartupProfileDecision::Attach("glm".into())
+        );
+    }
+
+    #[test]
+    fn should_pick_when_more_than_one_profile_and_no_flag() {
+        let decision = StartupProfileDecision::decide(None, &profiles(&["glm", "deepseek"]));
+        assert_eq!(
+            decision,
+            StartupProfileDecision::Pick(profiles(&["deepseek", "glm"])),
+            "picker list is sorted and complete"
+        );
+    }
+
+    #[test]
+    fn should_ignore_blank_and_duplicate_profiles_when_counting() {
+        // Blanks dropped, duplicates collapsed → one real profile → Attach.
+        assert_eq!(
+            StartupProfileDecision::decide(None, &profiles(&["glm", "", "glm", "  "])),
+            StartupProfileDecision::Attach("glm".into())
+        );
+    }
+
     #[test]
     fn apply_local_profile_error_routes_collision_to_username() {
         let mut state = OnboardingWizardState {
@@ -8973,5 +9439,29 @@ mod tests {
         assert!(state.local_profile_created);
         assert!(!state.local_profile_create_pending);
         assert!(state.local_profile_recovery.is_none());
+    }
+
+    #[test]
+    fn should_serialize_to_empty_object_when_session_list_params_has_no_cwd() {
+        // Wire-compat: a no-cwd `session/list` request must serialize to the
+        // historical empty object `{}`, byte-identical to what old clients
+        // sent, so an OLD server (no per-project session storage) still
+        // deserializes it unchanged (`cwd: None` -> legacy global listing).
+        let params = SessionListParams { cwd: None };
+        let wire = serde_json::to_value(&params).expect("SessionListParams serializes");
+        assert_eq!(wire, serde_json::json!({}));
+    }
+
+    #[test]
+    fn should_serialize_cwd_field_when_session_list_params_has_cwd() {
+        // With a workspace cwd present the request carries `{"cwd": "..."}`,
+        // which a server with `appui.sessions_in_cwd` (and the negotiated
+        // `session.workspace_cwd.v1` feature) honors to scope the listing to
+        // the project rooted at that path.
+        let params = SessionListParams {
+            cwd: Some("/tmp/project".into()),
+        };
+        let wire = serde_json::to_value(&params).expect("SessionListParams serializes");
+        assert_eq!(wire, serde_json::json!({ "cwd": "/tmp/project" }));
     }
 }

@@ -20,9 +20,24 @@ pub const MENU_ONBOARD_MODEL: &str = "onboard-model";
 pub const MENU_ONBOARD_ROUTE: &str = "onboard-route";
 /// UX2 B.2: workspace staging + validation lives on its OWN onboarding step
 /// screen (the "Set Up LLM Provider" menu now configures provider/model only).
+/// Retained for older servers without the launch flow; on a launch-flow server
+/// the provider step ends at [`MENU_ONBOARD_DONE`] instead.
 pub const MENU_ONBOARD_WORKSPACE: &str = "onboard-workspace";
+/// Terminal onboarding screen on a launch-flow server (Model A): the profile +
+/// provider are set, so onboarding ends here with launch instructions instead
+/// of staging a workspace / opening a session — launch-time activation
+/// (`launch/resolve`) opens the session on the next start. See
+/// `onboarding_done_menu`.
+pub const MENU_ONBOARD_DONE: &str = "onboard-done";
+/// Phase 3 startup picker: "attach which profile?" shown at launch when more
+/// than one local profile exists and no `--profile-id` was pinned.
+pub const MENU_PROFILE_PICKER: &str = "profile-picker";
+/// Per-project launch prompt (Model A): the Activate / CrossProfile choice
+/// raised from a `launch/resolve` decision. See `launch_prompt_menu`.
+pub const MENU_LAUNCH_PROMPT: &str = "launch-prompt";
 pub const MENU_LOGIN: &str = "login";
 pub const MENU_PROVIDER: &str = "provider";
+pub const MENU_COMPACT_CONFIRM: &str = "compact-confirm";
 pub const MENU_MODEL: &str = "model";
 pub const MENU_COST: &str = "cost";
 /// `/resume` session picker menu.
@@ -46,6 +61,7 @@ pub const MENU_SKILLS: &str = "skills";
 pub const APPUI_METHOD_MODEL_LIST: &str = crate::model::APPUI_METHOD_MODEL_LIST;
 pub const APPUI_METHOD_MODEL_SELECT: &str = crate::model::APPUI_METHOD_MODEL_SELECT;
 pub const APPUI_METHOD_SESSION_STATUS_READ: &str = crate::model::APPUI_METHOD_SESSION_STATUS_READ;
+pub const APPUI_METHOD_SESSION_COMPACT: &str = crate::model::APPUI_METHOD_SESSION_COMPACT;
 pub const APPUI_METHOD_PERMISSION_PROFILE_LIST: &str = "permission/profile/list";
 pub const APPUI_METHOD_PERMISSION_PROFILE_SET: &str = "permission/profile/set";
 pub const APPUI_METHOD_APPROVAL_SCOPES_CLEAR: &str = "approval/scopes/clear";
@@ -601,6 +617,15 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             availability: CommandAvailability::app_ui_read(&[APPUI_METHOD_SESSION_STATUS_READ]),
             inline_args: InlineArgMode::None,
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_COST)),
+        },
+        CommandSpec {
+            name: "compact",
+            aliases: &["compress"],
+            description: "command.compact.desc",
+            category: CommandCategory::Session,
+            availability: CommandAvailability::app_ui_mutating(&[APPUI_METHOD_SESSION_COMPACT]),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::OpenMenu(MenuId::from(MENU_COMPACT_CONFIRM)),
         },
         CommandSpec {
             name: "btw",

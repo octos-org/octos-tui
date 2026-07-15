@@ -18,7 +18,12 @@ path = "src/main.rs"
 # add a gitignored `.cargo/config.toml` (see `.cargo/config.toml.example`) that
 # patches it to a sibling path — no need to edit this file.
 [dependencies]
-octos-core = { git = "https://github.com/octos-org/octos", rev = "c72a4472037055ac94eded2079c6e230f38ee8b1" }
+# NOTE: temporarily pinned to the `feat/sessions-in-cwd` branch tip (octos
+# PR #1662), which adds the optional `SessionListParams.cwd` field used by the
+# per-project `session/list` scoping below. This rev is a clean 1-commit
+# superset of the previous main pin `82b1abf11148`. RE-PIN to the merged main
+# rev once #1662 lands on octos `main`.
+octos-core = { git = "https://github.com/octos-org/octos", rev = "1b19df9b633d" }
 clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
 color-eyre = "0.6"
