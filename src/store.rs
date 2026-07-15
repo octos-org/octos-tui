@@ -1643,11 +1643,22 @@ impl Store {
     /// and the `/lang` selection menu.
     fn dispatch_set_language_code(&mut self, lang: crate::cli::Lang) -> Option<AppUiCommand> {
         rust_i18n::set_locale(lang.code());
-        // Rebuild any open menu so it repaints in the new language now; the
-        // cached `active_menu` spec was built under the old locale. (The status
-        // line + composer placeholder are rebuilt every frame, so they switch
-        // without this.)
-        self.refresh_active_menu_if_open();
+        // A language pick is a confirmation: hop back to the parent rather than
+        // stranding the user on the language list needing an extra Esc. Inside
+        // the onboarding wizard the language list is a CHILD of the wizard step,
+        // and the wizard is exempt from the caller's dismiss-on-select collapse
+        // (it owns its own flow), so pop the child here to return to the wizard
+        // — mirroring how the family/model/route leaves hand control back.
+        // `close_menu` refreshes the now-active parent, so it repaints in the
+        // new language. The standalone `/lang` menu is collapsed by the caller's
+        // dismiss-on-select path, and an inline `/lang <code>` has no menu open;
+        // both are handled by the `else` refresh (rebuild so the open menu — if
+        // any — repaints under the new locale).
+        if self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_LANGUAGE) {
+            self.close_menu();
+        } else {
+            self.refresh_active_menu_if_open();
+        }
         self.state.status = t!("lang.switched").to_string();
         None
     }
@@ -3911,7 +3922,13 @@ impl Store {
     }
 
     fn focus_provider_start_row(&mut self) -> bool {
-        self.select_active_menu_item_by_id("onboard.provider.family")
+        // The provider step is collapsed to a single "Add a model" entry until a
+        // model is being configured, when it expands to the Model family row.
+        // Anchor the cursor on whichever is the current start row so a stale
+        // index carried over from the local-profile step's Continue button never
+        // lands on a destructive row (API key / Save).
+        self.select_active_menu_item_by_id("onboard.provider.add_model")
+            || self.select_active_menu_item_by_id("onboard.provider.family")
             || self.select_active_menu_item_by_id("provider.current")
     }
 
@@ -6291,6 +6308,12 @@ impl Store {
             event.message.clone(),
         ));
         self.state.status = event.message;
+        // `octos-tui new <name>`: an explicit create-a-new-profile launch wins
+        // over BOTH launch/resolve and the startup picker — the user asked to
+        // make a new brain, not resume or attach an existing one.
+        if let Some(command) = self.maybe_open_new_profile_on_first_launch() {
+            return Some(command);
+        }
         // Per-project launch decision (Model A). When the backend advertises
         // `session.workspace_cwd.v1` + `launch/resolve` and this is a clean
         // first launch, resolve the folder's brain BEFORE falling into
@@ -6311,6 +6334,67 @@ impl Store {
         }
     }
 
+    /// Resolve the cwd for the per-project launch flow — the `launch/resolve`
+    /// probe and the session/prompt its decision drives. Prefers the seeded
+    /// `workspace_candidate` (the launch `--cwd`, or the process working
+    /// directory for a transport-local launch) over the plain-path
+    /// `workspace.root`: a stdio launch's root is the spawn command
+    /// ("stdio:octos serve …"), which carries no cwd, so relying on it alone
+    /// dead-ends the flow into the onboarding wizard even though the real cwd
+    /// was captured at startup by `seed_onboarding_workspace_cwd`. Every launch
+    /// consumer (resolve probe, Activate/CrossProfile prompt, Resume open) must
+    /// route through this so they agree on the folder. `None` for a remote/ws
+    /// launch with no local cwd.
+    fn launch_workspace_cwd(&self) -> Option<String> {
+        self.state
+            .onboarding
+            .workspace_candidate
+            .clone()
+            .or_else(|| onboarding_workspace_cwd(&self.state.workspace.root))
+    }
+
+    /// First-launch hook for `octos-tui new <name>`. When the launch carried an
+    /// explicit new-profile id, force the create-a-new-profile onboarding with
+    /// that id pre-seeded as the profile name, bypassing launch/resolve and the
+    /// startup picker (the user asked to create a brain, not resume/attach one).
+    ///
+    /// Best-effort and self-consuming: the intent is [`Option::take`]n only once
+    /// a backend that can actually create local profiles is confirmed, so a
+    /// provider-only / legacy-auth server drops the intent and the normal launch
+    /// flow runs. Returns the provider-hydration command (or `None`) when it
+    /// opens the wizard; `None` without consuming when it does not apply yet.
+    fn maybe_open_new_profile_on_first_launch(&mut self) -> Option<AppUiCommand> {
+        // Fast-out on the common path (no `new <name>` intent) before the
+        // capability scan below.
+        self.state.onboarding.launch_new_profile_id.as_ref()?;
+        // Only meaningful on a backend that can create a local profile; on a
+        // provider-only or legacy-auth server there is nothing to name. Leave
+        // the intent in place (don't `take`) so a later capabilities wave that
+        // advertises the create surface can still honor it.
+        let supports_local_solo = self.state.capabilities.as_ref().is_some_and(|caps| {
+            crate::menu::registry::APPUI_FIRST_LAUNCH_LOCAL_SOLO_METHODS
+                .iter()
+                .any(|method| caps.supports_method(method))
+        });
+        if !supports_local_solo {
+            return None;
+        }
+        // Consume the intent so a later capabilities refresh doesn't re-force
+        // the wizard over the user's in-progress work, and seed the typed name
+        // as the profile's requested id (the "Name this profile" prompt value).
+        let requested = self.state.onboarding.launch_new_profile_id.take()?;
+        // Replace an already-open menu (e.g. the picker) rather than stacking.
+        if self.state.menu_stack.is_active() {
+            self.close_all_menus();
+        }
+        self.state.onboarding.requested_id = requested;
+        self.state.status = t!("status.new_profile_launch").into_owned();
+        self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        // Fresh create, but hydrate in case the id collides with a saved profile
+        // so the provider rows show server truth rather than "not set".
+        self.onboarding_hydrate_saved_provider_command()
+    }
+
     /// First-launch hook for the per-project launch flow. Emits `launch/resolve`
     /// to learn the folder's launch decision when the backend supports it and we
     /// are on a clean first launch (no session, no menu, a local cwd). Returns
@@ -6328,9 +6412,9 @@ impl Store {
         if !supports {
             return None;
         }
-        // No resolvable local cwd (remote-only transport, `unknown`, …) means
-        // there is no per-project decision to make — let onboarding handle it.
-        let cwd = onboarding_workspace_cwd(&self.state.workspace.root)?;
+        // None → remote launch with no local cwd, so there is no per-project
+        // decision to make; fall through to the legacy onboarding path.
+        let cwd = self.launch_workspace_cwd()?;
         let profile_id = self.state.onboarding.launch_profile_id.clone();
         Some(AppUiCommand::LaunchResolve(
             crate::model::LaunchResolveParams { cwd, profile_id },
@@ -6426,10 +6510,9 @@ impl Store {
                 }
             },
             LaunchDecisionKind::Activate | LaunchDecisionKind::CrossProfile => {
-                let (Some(resolved_profile), Some(cwd)) = (
-                    result.resolved_profile,
-                    onboarding_workspace_cwd(&self.state.workspace.root),
-                ) else {
+                let (Some(resolved_profile), Some(cwd)) =
+                    (result.resolved_profile, self.launch_workspace_cwd())
+                else {
                     // No resolvable profile or local cwd — fall back to
                     // onboarding rather than opening an empty prompt.
                     self.maybe_open_onboarding_on_first_launch();
@@ -6466,7 +6549,7 @@ impl Store {
                 session_id,
                 topic: None,
                 profile_id: Some(profile_id),
-                cwd: onboarding_workspace_cwd(&self.state.workspace.root),
+                cwd: self.launch_workspace_cwd(),
                 sandbox: None,
                 after: None,
             },
@@ -14937,11 +15020,14 @@ mod tests {
             panic!("expected provider setup menu after local profile create");
         };
         // Sanity: this really is the provider step, not the local-profile step.
+        // The model config is collapsed behind a single "Add a model" entry
+        // (nothing configured yet), so that — not the Model family row — is the
+        // provider step's start row now.
         assert!(
             spec.items
                 .iter()
-                .any(|item| item.id == "onboard.provider.family"),
-            "expected provider step with the Model family row"
+                .any(|item| item.id == "onboard.provider.add_model"),
+            "expected the collapsed provider step with the Add-a-model row"
         );
         let selected = store
             .state
@@ -14950,8 +15036,8 @@ mod tests {
             .expect("active menu")
             .selected_index;
         assert_eq!(
-            spec.items[selected].id, "onboard.provider.family",
-            "fresh provider step must land on Model family, not the stale row carried over from the local-profile Continue button"
+            spec.items[selected].id, "onboard.provider.add_model",
+            "fresh provider step must land on Add-a-model, not the stale row carried over from the local-profile Continue button"
         );
     }
 
@@ -14997,11 +15083,13 @@ mod tests {
         let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
             panic!("expected provider setup menu after profile id set");
         };
+        // Model config is collapsed behind "Add a model" until one is being set
+        // up, so that is the provider step's start row.
         assert!(
             spec.items
                 .iter()
-                .any(|item| item.id == "onboard.provider.family"),
-            "expected provider step with the Model family row"
+                .any(|item| item.id == "onboard.provider.add_model"),
+            "expected the collapsed provider step with the Add-a-model row"
         );
         let selected = store
             .state
@@ -15010,8 +15098,8 @@ mod tests {
             .expect("active menu")
             .selected_index;
         assert_eq!(
-            spec.items[selected].id, "onboard.provider.family",
-            "the provider step must land on Model family, not a stale/advanced index"
+            spec.items[selected].id, "onboard.provider.add_model",
+            "the provider step must land on Add-a-model, not a stale/advanced index"
         );
     }
 
@@ -15895,6 +15983,169 @@ mod tests {
         );
     }
 
+    /// `octos-tui new <name>`: an explicit create-a-new-profile launch wins over
+    /// the Model A launch/resolve probe — even when the backend advertises
+    /// `launch/resolve` + `session.workspace_cwd.v1`, the first capabilities
+    /// event opens create-a-new-profile onboarding with the typed id pre-seeded
+    /// as the profile name, and consumes the one-shot intent.
+    #[test]
+    fn new_profile_launch_forces_onboarding_over_launch_resolve() {
+        let mut store = protocol_store_without_sessions();
+        store.state.workspace.root = "stdio:octos serve --stdio --solo".into();
+        store.state.onboarding.workspace_candidate = Some("/tmp/fresh-folder".into());
+        // The `new work` launch intent.
+        store.state.onboarding.launch_new_profile_id = Some("work".into());
+
+        let follow_up =
+            store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+                result: crate::model::ConfigCapabilitiesListResult {
+                    // Advertise BOTH the launch/resolve surface (which would
+                    // otherwise win) AND the local-solo create surface.
+                    capabilities: UiProtocolCapabilities::new(
+                        &[
+                            crate::model::APPUI_METHOD_LAUNCH_RESOLVE,
+                            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+                        ],
+                        &[],
+                    )
+                    .with_supported_features([
+                        crate::model::APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1,
+                    ]),
+                },
+                message: "Octos UI capabilities refreshed".into(),
+            }));
+
+        assert!(
+            !matches!(follow_up, Some(AppUiCommand::LaunchResolve(_))),
+            "`new <name>` must bypass launch/resolve, got: {follow_up:?}"
+        );
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
+            "`new <name>` opens create-a-new-profile onboarding"
+        );
+        assert_eq!(
+            store.state.onboarding.requested_id, "work",
+            "the typed name pre-seeds the profile id"
+        );
+        assert!(
+            store.state.onboarding.launch_new_profile_id.is_none(),
+            "the one-shot intent is consumed so a later refresh does not re-force it"
+        );
+    }
+
+    /// `octos-tui new` with no name (an empty seed) still forces the
+    /// create-a-new-profile wizard — the user types the name at the "Name this
+    /// profile" step — rather than resuming/attaching an existing profile. The
+    /// seeded `requested_id` is left empty for the wizard to collect.
+    #[test]
+    fn new_profile_launch_with_empty_name_still_forces_onboarding() {
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.workspace_candidate = Some("/tmp/fresh-folder".into());
+        // Bare `octos-tui new` → empty seed (Some(""), not None).
+        store.state.onboarding.launch_new_profile_id = Some(String::new());
+
+        let follow_up =
+            store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+                result: crate::model::ConfigCapabilitiesListResult {
+                    capabilities: UiProtocolCapabilities::new(
+                        &[
+                            crate::model::APPUI_METHOD_LAUNCH_RESOLVE,
+                            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+                        ],
+                        &[],
+                    )
+                    .with_supported_features([
+                        crate::model::APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1,
+                    ]),
+                },
+                message: "Octos UI capabilities refreshed".into(),
+            }));
+
+        assert!(
+            !matches!(follow_up, Some(AppUiCommand::LaunchResolve(_))),
+            "empty-name `new` must still bypass launch/resolve, got: {follow_up:?}"
+        );
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
+            "empty-name `new` opens the create-a-new-profile wizard"
+        );
+        assert_eq!(
+            store.state.onboarding.requested_id, "",
+            "the name is left empty for the wizard's Name step to collect"
+        );
+        assert!(store.state.onboarding.launch_new_profile_id.is_none());
+    }
+
+    /// `octos-tui new <name>` against a provider-only backend (no local-profile
+    /// creation method) drops the intent and runs the normal flow rather than
+    /// opening an onboarding wizard it cannot complete.
+    #[test]
+    fn new_profile_launch_is_a_noop_without_a_create_surface() {
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding.launch_new_profile_id = Some("work".into());
+
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG],
+                    &[],
+                ),
+            },
+            message: "Octos UI capabilities refreshed".into(),
+        }));
+
+        assert!(
+            store.state.active_menu.is_none(),
+            "no create surface → no forced wizard"
+        );
+        // Intent is left intact (not consumed) so a later capabilities wave that
+        // advertises the create surface can still honor it.
+        assert_eq!(
+            store.state.onboarding.launch_new_profile_id.as_deref(),
+            Some("work")
+        );
+    }
+
+    /// Regression: a real stdio launch sets `workspace.root` to the transport
+    /// label ("stdio:octos serve --stdio --solo"), which carries no cwd. The
+    /// launch cwd must come from the seeded `workspace_candidate` (the process
+    /// cwd / `--cwd`), so a bare launch in a fresh folder still requests
+    /// `launch/resolve` instead of dead-ending into the onboarding wizard. The
+    /// sibling test above uses a plain-path root and so never covered this.
+    #[test]
+    fn first_launch_uses_seeded_cwd_when_root_is_stdio_transport_label() {
+        let mut store = protocol_store_without_sessions();
+        // Real launch: the root is the spawn command, not a filesystem path.
+        store.state.workspace.root = "stdio:octos serve --stdio --solo".into();
+        // Startup seeded the process cwd into the workspace candidate.
+        store.state.onboarding.workspace_candidate = Some("/tmp/fresh-folder".into());
+        store.state.onboarding.launch_profile_id = None; // bare launch, no --profile-id
+
+        let follow_up =
+            store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+                result: crate::model::ConfigCapabilitiesListResult {
+                    capabilities: UiProtocolCapabilities::new(
+                        &[crate::model::APPUI_METHOD_LAUNCH_RESOLVE],
+                        &[],
+                    )
+                    .with_supported_features([
+                        crate::model::APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1,
+                    ]),
+                },
+                message: "Octos UI capabilities refreshed".into(),
+            }));
+
+        let Some(AppUiCommand::LaunchResolve(params)) = follow_up else {
+            panic!("bare stdio launch must still request launch/resolve, got: {follow_up:?}");
+        };
+        assert_eq!(params.cwd, "/tmp/fresh-folder");
+        assert_eq!(params.profile_id, None);
+        assert!(
+            store.state.active_menu.is_none(),
+            "launch/resolve must defer the wizard, not open it"
+        );
+    }
+
     /// The launch/resolve probe is gated on `session.workspace_cwd.v1`: an older
     /// server that advertises the method but not the feature must fall through
     /// to the legacy onboarding path, never emitting `launch/resolve`.
@@ -15972,6 +16223,69 @@ mod tests {
             .expect("activate stages the launch prompt");
         assert_eq!(prompt.resolved_profile, "dev");
         assert_eq!(prompt.cwd, "/tmp/launch-project");
+    }
+
+    /// Regression: on a bare stdio launch the workspace root is the transport
+    /// label (`stdio:octos serve …`, no `--cwd`), so `onboarding_workspace_cwd`
+    /// yields None — the real folder lives only in the seeded
+    /// `workspace_candidate`. A `Resume` decision must still open the session in
+    /// that seeded cwd, not drop it (which stranded the launch in onboarding).
+    #[test]
+    fn launch_resolve_resume_uses_seeded_cwd_when_root_is_transport_label() {
+        let mut store = protocol_store_without_sessions();
+        store.state.workspace.root = "stdio:octos serve --stdio --solo".into();
+        store.state.onboarding.workspace_candidate = Some("/tmp/fresh-folder".into());
+
+        let follow_up = store.apply_client_event(ClientEvent::LaunchResolve(
+            crate::model::LaunchResolveResult {
+                decision: crate::model::LaunchDecisionKind::Resume,
+                resolved_profile: Some("dev".into()),
+                existing_profiles: Vec::new(),
+            },
+        ));
+
+        let Some(AppUiCommand::OpenSession(params)) = follow_up else {
+            panic!("resume must open the folder session, got: {follow_up:?}");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("dev"));
+        assert_eq!(params.cwd.as_deref(), Some("/tmp/fresh-folder"));
+    }
+
+    /// Regression companion to the Resume case: an `Activate` decision on a bare
+    /// stdio launch must stage the launch prompt using the seeded
+    /// `workspace_candidate`. The old code read the transport-label root, got
+    /// None, fell through the `else`, and showed the full onboarding wizard —
+    /// the exact "fresh folder shows the whole wizard" bug.
+    #[test]
+    fn launch_resolve_activate_uses_seeded_cwd_when_root_is_transport_label() {
+        let mut store = protocol_store_without_sessions();
+        store.state.workspace.root = "stdio:octos serve --stdio --solo".into();
+        store.state.onboarding.workspace_candidate = Some("/tmp/fresh-folder".into());
+
+        let follow_up = store.apply_client_event(ClientEvent::LaunchResolve(
+            crate::model::LaunchResolveResult {
+                decision: crate::model::LaunchDecisionKind::Activate,
+                resolved_profile: Some("dev".into()),
+                existing_profiles: Vec::new(),
+            },
+        ));
+
+        assert!(
+            follow_up.is_none(),
+            "activate opens a prompt, it must not emit a command directly"
+        );
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_LAUNCH_PROMPT),
+            "activate on a fresh folder must open the yes/no launch prompt, not the wizard"
+        );
+        let prompt = store
+            .state
+            .onboarding
+            .launch_prompt
+            .as_ref()
+            .expect("activate stages the launch prompt");
+        assert_eq!(prompt.resolved_profile, "dev");
+        assert_eq!(prompt.cwd, "/tmp/fresh-folder");
     }
 
     /// M22-A: legacy email-OTP onboarding triggers first-launch flow
@@ -16479,6 +16793,54 @@ mod tests {
             .active()
             .map(|frame| frame.id.as_str().to_owned())
             .expect("/setup must open the onboarding menu");
+        assert_eq!(active_id, crate::menu::registry::MENU_ONBOARD);
+    }
+
+    /// `/add-model` (and its `provider` alias) open the model-adding flow — the
+    /// provider family -> model -> route surface lifted out of the full wizard.
+    #[test]
+    fn add_model_command_opens_provider_surface() {
+        for cmd in ["/add-model", "/provider"] {
+            let mut store =
+                protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG]);
+            store.close_all_menus();
+            store.state.composer = cmd.into();
+            let command = store.compose_command();
+            assert!(command.is_none(), "{cmd} opens a menu, not a wire command");
+            let active_id = store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str().to_owned())
+                .unwrap_or_else(|| panic!("{cmd} must open the provider menu"));
+            assert_eq!(active_id, crate::menu::registry::MENU_PROVIDER, "for {cmd}");
+        }
+    }
+
+    /// The onboarding wizard is hidden from the normal-session `/` menu but stays
+    /// dispatchable by name — first-launch and the `/onboard <field>` inline
+    /// forms (and its `setup`/`wizard` aliases) still resolve.
+    #[test]
+    fn onboard_is_hidden_from_menu_but_still_dispatchable() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        // Not listed in the `/` menu...
+        let listed = store.slash_command_matches("/onboard");
+        assert!(
+            !listed.iter().any(|m| m.name == "/onboard"),
+            "onboard must not appear in the slash menu; got: {:?}",
+            listed.iter().map(|m| m.name.clone()).collect::<Vec<_>>()
+        );
+        // ...but typing it still resolves and opens the wizard.
+        store.close_all_menus();
+        store.state.composer = "/onboard".into();
+        let _ = store.compose_command();
+        let active_id = store
+            .state
+            .menu_stack
+            .active()
+            .map(|frame| frame.id.as_str().to_owned())
+            .expect("/onboard must still open the wizard even though it's hidden");
         assert_eq!(active_id, crate::menu::registry::MENU_ONBOARD);
     }
 
@@ -17693,12 +18055,18 @@ mod tests {
         assert_eq!(store.state.theme.as_str(), "slate");
     }
 
-    /// The onboarding wizard owns its own flow: a leaf pick inside it (the
-    /// language step reuses the SetLanguageCode leaf) must NOT nuke the stack.
+    /// Picking a language in the onboarding wizard's language sub-list is a
+    /// confirmation: it pops back to the wizard step automatically (no extra
+    /// Esc), while keeping the wizard itself open (the wizard owns its flow and
+    /// is exempt from the whole-stack dismiss). The language list is a CHILD of
+    /// the wizard, so the realistic stack is [onboard, onboard-language].
     #[test]
-    fn onboarding_leaf_selection_keeps_wizard_open() {
+    fn onboarding_language_pick_returns_to_wizard() {
         let mut store = store_with_empty_session();
+        // Realistic nesting: the wizard step, then its language sub-list.
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
         store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_LANGUAGE));
+        assert_eq!(store.state.menu_stack.path().len(), 2);
         let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
             panic!("expected onboarding language menu");
         };
@@ -17716,9 +18084,47 @@ mod tests {
             .expect("active frame")
             .selected_index = idx;
         assert!(store.accept_active_menu_item().is_none());
+        // The language sub-list is popped (returned to the wizard), but the
+        // wizard itself stays open — one level, not zero, and it is MENU_ONBOARD.
+        assert_eq!(
+            store.state.menu_stack.path().len(),
+            1,
+            "language pick pops back to the wizard, no extra Esc needed"
+        );
         assert!(
-            !store.state.menu_stack.path().is_empty(),
-            "wizard-scoped selection must keep the wizard flow open"
+            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
+            "the wizard step is the active menu after the language pick"
+        );
+    }
+
+    /// The standalone `/lang` menu (NOT inside the wizard) still collapses the
+    /// whole stack on a language pick — the dismiss-on-select behavior is
+    /// unchanged for it; only the wizard-nested language list pops one level.
+    #[test]
+    fn standalone_lang_menu_pick_dismisses_the_menu() {
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_LANG));
+        assert_eq!(store.state.menu_stack.path().len(), 1);
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected the language menu");
+        };
+        // Pick the CURRENT locale (en) so the global locale is untouched for
+        // parallel tests.
+        let idx = spec
+            .items
+            .iter()
+            .position(|item| item.id.ends_with(".en"))
+            .expect("en language row");
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("active frame")
+            .selected_index = idx;
+        assert!(store.accept_active_menu_item().is_none());
+        assert!(
+            store.state.menu_stack.path().is_empty(),
+            "a standalone /lang pick dismisses the menu (no lingering list)"
         );
     }
 

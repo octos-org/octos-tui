@@ -303,6 +303,10 @@ onboarding:
     status_ok: "Status: OK (%{writable}%{toml})"
     status_invalid: "Status: INVALID — %{reason}"
   provider:
+    add_model_label: "Add a model"
+    add_model_desc: "Set up the AI model for this profile: family, model, provider route, and API key."
+    add_another_model_label: "Add another model"
+    add_another_model_desc: "Add a fallback or a different model: family, model, provider route, and API key."
     test: "Test connection"
     test_testing: "Testing connection..."
     test_unavailable_saving: "Test unavailable while saving"
@@ -378,7 +382,7 @@ onboarding:
     explain_now: "Now: %{title}"
     explain:
       language: "Choose the language Octos uses while you finish setup.\nEnglish is selected by default. Pick 中文 if you want the rest of onboarding and the app to switch immediately.\nYou can change this later with `/lang`."
-      profile: "Octos needs a local profile to attach your settings, providers, and history to.\nName this profile with a short id (like glm or deepseek) and continue — you can accept the suggested name with one keypress. (Older servers ask for name, username, and email instead.)\nThis profile stays on this machine; nothing is sent."
+      profile: "Octos needs a local profile to attach your settings, providers, and history to.\nGive it a short name (like work or research) and continue. The name is just a label — it has nothing to do with which model you run; you choose that next, and can add or change models anytime with /add-model. (Older servers ask for name, username, and email instead.)\nThis profile stays on this machine; nothing is sent."
       provider: "Choose which AI model powers Octos.\nPick a model family (e.g. GPT, Claude), then a specific model, then the provider route that serves it (official or an alternative).\nThis decides who Octos talks to and how good the coding help is — you can change it later."
       connect: "Prove the model actually answers before you rely on it.\nPaste your provider API key, then run the live test. Octos sends one small request and reports success or the exact error.\nThis catches a bad key or wrong route now, not mid-task."
       save: "Persist the verified provider into your profile JSON so it survives restarts.\nSave it as your primary provider (or add it as a fallback). Until you save, the route lives only in this session.\nAfter saving, the workspace step unlocks."
@@ -555,6 +559,7 @@ status:
   onboarding_profile_name_updated: "Onboarding profile name updated"
   make_default_updated: "Default-brain preference updated"
   attached_profile: "Attached profile %{profile}"
+  new_profile_launch: "Creating a new profile — name it, then set its AI model"
   provider_route_selected: "Provider route selected; enter API key"
   provider_family_updated: "Provider family updated"
   provider_model_updated: "Provider model updated"
@@ -809,6 +814,8 @@ status:
 command:
   activity:
     desc: Search and filter sessions, tasks, and activity.
+  add_model:
+    desc: Add or change the profile's AI model (family, model, and provider route).
   agents:
     desc: Inspect or interrupt backend-owned subagents.
   aliases_label: 'Aliases:'

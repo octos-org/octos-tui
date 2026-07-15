@@ -2285,6 +2285,12 @@ pub struct OnboardingWizardState {
     /// first-ever run. Drives the 0/1/N [`StartupProfileDecision`] and populates
     /// the picker menu.
     pub available_profiles: Vec<String>,
+    /// `octos-tui new <name>`: the profile id the process launched to create.
+    /// Seeded once at launch from `Cli::new_profile`; consumed by the first
+    /// capabilities event, which force-opens create-a-new-profile onboarding
+    /// with this id pre-seeded (bypassing launch/resolve + the startup picker).
+    /// `None` for an ordinary launch.
+    pub launch_new_profile_id: Option<String>,
     /// Per-project launch flow: the pending Activate / CrossProfile prompt for
     /// the `launch_prompt` menu, stashed when a `launch/resolve` decision needs
     /// the user to choose. `None` outside that prompt. See [`LaunchPromptState`].
@@ -2363,6 +2369,7 @@ impl Default for OnboardingWizardState {
             make_default: false,
             launch_profile_id: None,
             available_profiles: Vec::new(),
+            launch_new_profile_id: None,
             launch_prompt: None,
             profile_id: None,
             local_profile_created: false,

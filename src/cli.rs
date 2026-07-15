@@ -145,13 +145,25 @@ pub struct Cli {
     pub scroll_mode: ScrollMode,
     /// Vim modal editing for the composer (opt-in; default off).
     pub vim_mode: bool,
+    /// `octos-tui new <name>`: launch straight into the create-a-new-profile
+    /// onboarding with this id pre-seeded, bypassing launch/resolve and the
+    /// startup picker. `None` for an ordinary launch. CLI-only (never from
+    /// config), stripped from the args clap parses (see [`extract_new_subcommand`]).
+    pub new_profile: Option<String>,
 }
 
 #[derive(Debug, Parser)]
 #[command(
     name = "octos-tui",
     version = env!("CARGO_PKG_VERSION"),
-    about = "Mock-backed Octos TUI prototype on the Octos UI Protocol boundary"
+    about = "Mock-backed Octos TUI prototype on the Octos UI Protocol boundary",
+    // These leading positionals are handled before clap (see `cmd::dispatch`
+    // and `Cli::parse`), so they don't appear as clap subcommands above.
+    after_help = "Subcommands:\n  \
+        new [name]   Create a new profile (launches setup; pre-fills the name if given)\n  \
+        doctor       Diagnose octos-tui's environment, install, and connectivity\n  \
+        update       Update octos-tui in place (or print the upgrade command)\n  \
+        config       Show or locate the TUI config file"
 )]
 struct CliArgs {
     /// JSON config file used as launch defaults. CLI flags override config values.
@@ -265,10 +277,18 @@ pub struct CliFileConfig {
 
 impl Cli {
     pub fn parse() -> Result<Self> {
-        let args = CliArgs::parse();
+        // Strip a leading `new <name>` positional before clap sees the args
+        // (clap has no `new` subcommand), then re-attach it as `new_profile`.
+        let raw: Vec<String> = std::env::args().collect();
+        let (new_profile, filtered) = extract_new_subcommand(&raw);
+        // `parse_from` preserves clap's `--help`/`--version`/usage-error UX
+        // (process exit) exactly as `parse()` would.
+        let args = CliArgs::parse_from(filtered);
         // Production launch reads the default config when no `--config` is
         // given, so `/saveconfig` settings round-trip on the next plain launch.
-        Self::from_args(args, true)
+        let mut cli = Self::from_args(args, true)?;
+        cli.new_profile = new_profile;
+        Ok(cli)
     }
 
     #[cfg(test)]
@@ -277,11 +297,21 @@ impl Cli {
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
-        let args = CliArgs::try_parse_from(itr)?;
+        // Mirror `parse()`: honor a leading `new <name>` positional so tests can
+        // exercise it without spawning a process. `OsString` → `String` lossily,
+        // which is fine for the ASCII subcommand/name tokens tests use.
+        let raw: Vec<String> = itr
+            .into_iter()
+            .map(|item| item.into().to_string_lossy().into_owned())
+            .collect();
+        let (new_profile, filtered) = extract_new_subcommand(&raw);
+        let args = CliArgs::try_parse_from(filtered)?;
         // Tests stay deterministic: don't read the ambient `$HOME` default
         // config (the default-read path is covered by `load_config_file_if_present`
         // tests, which inject a path instead of mutating `$HOME`).
-        Self::from_args(args, false)
+        let mut cli = Self::from_args(args, false)?;
+        cli.new_profile = new_profile;
+        Ok(cli)
     }
 
     fn from_args(args: CliArgs, use_default_config: bool) -> Result<Self> {
@@ -373,8 +403,45 @@ impl Cli {
             // "false"), so the CLI flag only force-enables; the config provides
             // the default when the flag is absent.
             vim_mode: args.vim_mode || file_config.vim_mode.unwrap_or(false),
+            // Set only by `parse()`/`try_parse_from` after they strip the
+            // `new <name>` positional; `from_args` never sees it.
+            new_profile: None,
         })
     }
+}
+
+/// Detect a leading `new [name]` positional and split it out of the args clap
+/// will see. `octos-tui new` launches the TUI straight into the
+/// create-a-new-profile flow (forcing a new profile even when others exist,
+/// bypassing resume/pick); a leading non-flag token pre-seeds it as the profile
+/// id (`octos-tui new work`), and its absence (bare `new`, or `new --flag`)
+/// seeds an empty name for the user to type at the wizard's "Name this profile"
+/// step. Either way the `new`/`<name>` tokens are removed so clap (which has no
+/// `new` subcommand) doesn't reject them; trailing flags survive
+/// (`octos-tui new work --lang zh`, `octos-tui new --lang zh`).
+///
+/// Returns `(Some(name), filtered_args)` for a `new` launch (name may be empty),
+/// or `(None, unchanged_args)` otherwise. Only a *leading* bare `new` counts
+/// (mirroring [`crate::cmd`] routing), so `--session new`, `--profile-id new`,
+/// and a config value of "new" are never misread.
+///
+/// `raw` is the full argv including the program name at index 0.
+fn extract_new_subcommand(raw: &[String]) -> (Option<String>, Vec<String>) {
+    if raw.get(1).map(String::as_str) != Some("new") {
+        return (None, raw.to_vec());
+    }
+    // A leading non-flag token is the profile name; its absence (bare `new`, or
+    // a flag immediately after) means "create a new profile, name it in the
+    // wizard" → an empty seed. `skip` is how many argv slots `new [name]` ate.
+    let (name, skip): (String, usize) = match raw.get(2) {
+        Some(token) if !token.starts_with('-') => (token.trim().to_string(), 3),
+        _ => (String::new(), 2),
+    };
+    // Keep the program name + everything after what `new [name]` consumed.
+    let mut rest = Vec::with_capacity(raw.len().saturating_sub(skip.saturating_sub(1)));
+    rest.push(raw[0].clone());
+    rest.extend(raw.iter().skip(skip).cloned());
+    (Some(name), rest)
 }
 
 pub fn load_config_file(path: &Path) -> Result<CliFileConfig> {
@@ -749,6 +816,48 @@ mod tests {
         );
         assert_eq!(cli.auth_token.as_deref(), Some("secret-token"));
         assert!(cli.readonly);
+    }
+
+    #[test]
+    fn new_subcommand_seeds_new_profile_and_strips_the_positional() {
+        // `octos-tui new work` sets `new_profile` and does NOT leave `new`/`work`
+        // for clap to choke on. Trailing flags after the name still parse.
+        let cli = Cli::try_parse_from(["octos-tui", "new", "work", "--lang", "zh"])
+            .expect("`new <name>` parses");
+        assert_eq!(cli.new_profile.as_deref(), Some("work"));
+        assert_eq!(cli.lang, super::Lang::Zh);
+        // A plain launch leaves it unset.
+        let plain = Cli::try_parse_from(["octos-tui"]).expect("plain parses");
+        assert!(plain.new_profile.is_none());
+    }
+
+    #[test]
+    fn new_subcommand_without_a_name_launches_with_an_empty_seed() {
+        // Bare `new` (or `new` followed only by a flag, or a whitespace-only
+        // name) still forces the create-a-new-profile flow — the wizard collects
+        // the name — so `new_profile` is `Some("")`, not `None` and not an error.
+        let bare = Cli::try_parse_from(["octos-tui", "new"]).expect("bare `new` launches");
+        assert_eq!(bare.new_profile.as_deref(), Some(""));
+
+        // A flag right after `new` is the no-name form; the flag still applies.
+        let with_flag =
+            Cli::try_parse_from(["octos-tui", "new", "--lang", "zh"]).expect("`new --lang zh`");
+        assert_eq!(with_flag.new_profile.as_deref(), Some(""));
+        assert_eq!(with_flag.lang, super::Lang::Zh);
+
+        // Whitespace-only name trims to empty → same no-name form.
+        let blank = Cli::try_parse_from(["octos-tui", "new", "   "]).expect("`new '   '`");
+        assert_eq!(blank.new_profile.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn new_is_only_a_leading_subcommand() {
+        // `new` as a flag *value* (not the leading positional) is untouched: it
+        // must not be misread as the create-a-profile subcommand.
+        let cli = Cli::try_parse_from(["octos-tui", "--profile-id", "new"])
+            .expect("`--profile-id new` parses");
+        assert!(cli.new_profile.is_none());
+        assert_eq!(cli.profile_id.as_deref(), Some("new"));
     }
 
     #[test]

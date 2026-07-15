@@ -134,6 +134,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 crate::profiles::discover_local_profile_ids(Some(stdio_command));
         }
     }
+    // `octos-tui new <name>`: remember the requested profile id so the first
+    // capabilities event force-opens create-a-new-profile onboarding with it
+    // pre-seeded (see `maybe_open_new_profile_on_first_launch`).
+    store.state.onboarding.launch_new_profile_id = cli.new_profile.clone();
     let mut input_state = TerminalInputState::default();
     let mut scrollback = ScrollbackTracker::new();
     // Force a draw on the first iteration.

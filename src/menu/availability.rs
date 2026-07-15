@@ -16,6 +16,12 @@ pub struct CommandAvailability {
     pub required_features: &'static [&'static str],
     pub required_feature_flags: &'static [&'static str],
     pub unavailable: UnavailablePolicy,
+    /// When `true`, the command is still fully dispatchable (typed by name,
+    /// resolved via `find`) but is omitted from the `/` slash-menu listing.
+    /// Used for commands whose inline sub-forms are internal plumbing (e.g.
+    /// `/onboard <field>` driving the first-launch wizard) that shouldn't
+    /// clutter a normal session's menu.
+    pub menu_hidden: bool,
 }
 
 impl CommandAvailability {
@@ -33,7 +39,14 @@ impl CommandAvailability {
             required_features: &[],
             required_feature_flags: &[],
             unavailable: UnavailablePolicy::Hide,
+            menu_hidden: false,
         }
+    }
+
+    /// Keep the command dispatchable but drop it from the `/` slash-menu list.
+    pub fn hidden_from_menu(mut self) -> Self {
+        self.menu_hidden = true;
+        self
     }
 
     pub fn local_mutating() -> Self {

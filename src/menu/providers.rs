@@ -1135,8 +1135,6 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         return onboarding_local_profile_menu(
             state,
             local_profile_requested_id_supported(ctx),
-            ctx.availability
-                .supports_method(APPUI_METHOD_PROFILE_LLM_CATALOG),
             local_profile_make_default_supported(ctx),
         );
     }
@@ -1625,171 +1623,231 @@ fn onboarding_provider_setup_menu(
     // provider) are `Noop` — the user can't act on them by selecting — so they
     // move to the right info pane (`onboarding_provider_preview`) and the left
     // list holds only the actionable provider-config rows.
-    let mut items = vec![
-        MenuItem::new(
-            "onboard.catalog.refresh",
-            if ctx.app.profile_llm_catalog.is_some() {
-                t!("menu.onboard.item.catalog_reload.label")
-            } else {
-                t!("menu.onboard.item.catalog_load.label")
-            },
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::RefreshCatalog)),
-        )
-        .with_description(t!("menu.onboard.item.catalog_load.desc"))
-        .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG)),
-    ];
-
     let saved_primary = onboarding_saved_primary(ctx, state, current_profile);
 
-    items.extend([
-        MenuItem::new(
-            "onboard.provider.family",
-            format!(
-                "{}: {}",
-                t!("menu.onboard.item.family.label"),
-                onboarding_family_label(state, saved_primary)
-            ),
-            MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY)),
-        )
-        .with_description(t!("menu.onboard.item.family.desc"))
-        .with_state(MenuItemState::required(
-            !state.provider.family_id.trim().is_empty(),
-        )),
-        MenuItem::new(
-            "onboard.provider.model",
-            format!(
-                "{}: {}",
-                t!("menu.onboard.item.model.label"),
-                onboarding_model_label(state, saved_primary)
-            ),
-            MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL)),
-        )
-        .with_description(t!("menu.onboard.item.model.desc"))
-        .with_state(MenuItemState::required(
-            !state.provider.model_id.trim().is_empty(),
-        ))
-        .maybe_disabled({
-            state
-                .provider
-                .family_id
-                .trim()
-                .is_empty()
-                .then(|| t!("onboarding.disabled.choose_family_first").into_owned())
-        }),
-        MenuItem::new(
-            "onboard.provider.route",
-            format!(
-                "{}: {}",
-                t!("menu.onboard.item.route.label"),
-                onboarding_route_label(state, saved_primary)
-            ),
-            MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE)),
-        )
-        .with_description(t!("menu.onboard.item.route.desc"))
-        .with_state(MenuItemState::required(
-            !state.provider.route.route_id.trim().is_empty(),
-        ))
-        .maybe_disabled(
-            (!onboarding_model_selected(state))
-                .then(|| t!("onboarding.disabled.choose_family_model_first").into_owned()),
-        ),
-    ]);
+    // Profile↔model decoupling (user feedback: "collapse to one Add model").
+    // The detailed model config stays behind a single "Add a model" entry. It
+    // expands to the family/model/route/key/save rows ONLY while the user is
+    // actively setting up a model — i.e. a staged selection that is NOT yet the
+    // saved primary. A profile whose provider is already saved (or freshly
+    // saved, or resumed) collapses back to "Add another model" + Finish, rather
+    // than dumping the raw form (which reads as "no Add-a-model option").
+    let has_staged = !state.provider.family_id.trim().is_empty();
+    // The staged selection has already been saved as this profile's primary
+    // when EITHER: the session just saved this exact selection (its label
+    // matches `saved_primary_provider_label`, set only on a primary save and
+    // never reset by re-staging), OR the server reports a matching saved
+    // primary (a resumed/hydrated profile). Comparing labels/ids — not just a
+    // "was anything ever saved" flag — is what lets staging a DIFFERENT model
+    // still expand (add another / fallback).
+    let staged_label = state.provider_label();
+    let staged_is_saved_primary = has_staged
+        && (state.saved_primary_provider_label.as_deref() == Some(staged_label.as_str())
+            || saved_primary.is_some_and(|saved| {
+                saved.family_id.as_deref() == Some(state.provider.family_id.trim())
+                    && saved.model_id.as_deref() == Some(state.provider.model_id.trim())
+            }));
+    let configuring = has_staged && !staged_is_saved_primary;
 
-    // Draft-first, saved-fallback for the API key row: a key already saved in
-    // the profile (server-confirmed `has_api_key`) must not read as "not set".
-    let api_key_display = if state.has_api_key() {
-        Some(state.api_key_label().to_string())
-    } else if saved_primary.is_some_and(|provider| provider.has_api_key) {
-        Some(t!("onboarding.api_key_saved").into_owned())
-    } else {
-        None
-    };
-    let api_key_present = api_key_display.is_some();
+    let mut items: Vec<MenuItem> = Vec::new();
+    if !configuring {
+        // "Add another model" once a primary exists (you can add a fallback or
+        // replace it); plain "Add a model" on a fresh profile.
+        let (label, desc) = if saved_primary.is_some() {
+            (
+                t!("onboarding.provider.add_another_model_label"),
+                t!("onboarding.provider.add_another_model_desc"),
+            )
+        } else {
+            (
+                t!("onboarding.provider.add_model_label"),
+                t!("onboarding.provider.add_model_desc"),
+            )
+        };
+        items.push(
+            MenuItem::new(
+                "onboard.provider.add_model",
+                label,
+                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY)),
+            )
+            .with_description(desc)
+            .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG)),
+        );
+    }
 
-    items.extend([
-        onboarding_edit_item(
-            "onboard.provider.key",
-            t!("menu.onboard.item.api_key.label").as_ref(),
-            api_key_display.as_deref(),
-            "/onboard key ",
-        )
-        .with_state(MenuItemState::required(api_key_present))
-        .maybe_disabled(
-            (!state.selection_ready())
-                .then(|| t!("onboarding.disabled.choose_provider_first").into_owned()),
-        ),
-        MenuItem::new(
-            "onboard.provider.test",
-            onboarding_provider_test_label(state),
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::TestProvider)),
-        )
-        .with_description(t!("menu.onboard.item.verify_provider.desc"))
-        .with_state(onboarding_provider_test_state(state))
-        .maybe_disabled(onboarding_provider_disabled_reason(
-            ctx,
-            state,
-            APPUI_METHOD_PROFILE_LLM_TEST,
-        )),
-        MenuItem::new(
-            "onboard.provider.save",
-            onboarding_provider_save_label(state),
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SaveProvider)),
-        )
-        .with_description(t!("menu.onboard.item.persist_provider.desc"))
-        .with_state(onboarding_provider_save_state(state))
-        .maybe_disabled(onboarding_provider_disabled_reason(
-            ctx,
-            state,
-            APPUI_METHOD_PROFILE_LLM_UPSERT,
-        )),
-        MenuItem::new(
-            "onboard.provider.fallback",
-            onboarding_provider_fallback_label(state),
-            MenuAction::Local(LocalAction::Onboarding(
-                OnboardingAction::SaveProviderFallback,
+    if configuring {
+        items.push(
+            MenuItem::new(
+                "onboard.catalog.refresh",
+                if ctx.app.profile_llm_catalog.is_some() {
+                    t!("menu.onboard.item.catalog_reload.label")
+                } else {
+                    t!("menu.onboard.item.catalog_load.label")
+                },
+                MenuAction::Local(LocalAction::Onboarding(OnboardingAction::RefreshCatalog)),
+            )
+            .with_description(t!("menu.onboard.item.catalog_load.desc"))
+            .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG)),
+        );
+
+        items.extend([
+            MenuItem::new(
+                "onboard.provider.family",
+                format!(
+                    "{}: {}",
+                    t!("menu.onboard.item.family.label"),
+                    onboarding_family_label(state, saved_primary)
+                ),
+                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY)),
+            )
+            .with_description(t!("menu.onboard.item.family.desc"))
+            .with_state(MenuItemState::required(
+                !state.provider.family_id.trim().is_empty(),
             )),
-        )
-        .with_description(t!("menu.onboard.item.fallback_provider.desc"))
-        .with_state(onboarding_provider_save_state(state))
-        .maybe_disabled(onboarding_provider_disabled_reason(
-            ctx,
-            state,
-            APPUI_METHOD_PROFILE_LLM_UPSERT,
-        )),
-        // Terminal step. On a launch-flow server (Model A) the provider step
-        // ends at the launch-instructions screen (`MENU_ONBOARD_DONE`) — the
-        // redundant workspace/Activate screen is skipped and launch-time
-        // activation opens the session on the next start. Older servers keep the
-        // workspace step (`MENU_ONBOARD_WORKSPACE`), which owns the final
-        // Activate. Either way it is disabled until a provider is saved so the
-        // steps stay ordered.
-        {
-            let blocked = (!onboarding_has_saved_primary_provider(ctx, state, current_profile))
-                .then(|| t!("onboarding.wizard.workspace_locked_reason").into_owned());
-            if launch_flow_supported(ctx) {
+            MenuItem::new(
+                "onboard.provider.model",
+                format!(
+                    "{}: {}",
+                    t!("menu.onboard.item.model.label"),
+                    onboarding_model_label(state, saved_primary)
+                ),
+                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL)),
+            )
+            .with_description(t!("menu.onboard.item.model.desc"))
+            .with_state(MenuItemState::required(
+                !state.provider.model_id.trim().is_empty(),
+            ))
+            .maybe_disabled({
+                state
+                    .provider
+                    .family_id
+                    .trim()
+                    .is_empty()
+                    .then(|| t!("onboarding.disabled.choose_family_first").into_owned())
+            }),
+            MenuItem::new(
+                "onboard.provider.route",
+                format!(
+                    "{}: {}",
+                    t!("menu.onboard.item.route.label"),
+                    onboarding_route_label(state, saved_primary)
+                ),
+                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE)),
+            )
+            .with_description(t!("menu.onboard.item.route.desc"))
+            .with_state(MenuItemState::required(
+                !state.provider.route.route_id.trim().is_empty(),
+            ))
+            .maybe_disabled(
+                (!onboarding_model_selected(state))
+                    .then(|| t!("onboarding.disabled.choose_family_model_first").into_owned()),
+            ),
+        ]);
+
+        // Draft-first, saved-fallback for the API key row: a key already saved in
+        // the profile (server-confirmed `has_api_key`) must not read as "not set".
+        let api_key_display = if state.has_api_key() {
+            Some(state.api_key_label().to_string())
+        } else if saved_primary.is_some_and(|provider| provider.has_api_key) {
+            Some(t!("onboarding.api_key_saved").into_owned())
+        } else {
+            None
+        };
+        let api_key_present = api_key_display.is_some();
+
+        items.extend([
+            onboarding_edit_item(
+                "onboard.provider.key",
+                t!("menu.onboard.item.api_key.label").as_ref(),
+                api_key_display.as_deref(),
+                "/onboard key ",
+            )
+            .with_state(MenuItemState::required(api_key_present))
+            .maybe_disabled(
+                (!state.selection_ready())
+                    .then(|| t!("onboarding.disabled.choose_provider_first").into_owned()),
+            ),
+            MenuItem::new(
+                "onboard.provider.test",
+                onboarding_provider_test_label(state),
+                MenuAction::Local(LocalAction::Onboarding(OnboardingAction::TestProvider)),
+            )
+            .with_description(t!("menu.onboard.item.verify_provider.desc"))
+            .with_state(onboarding_provider_test_state(state))
+            .maybe_disabled(onboarding_provider_disabled_reason(
+                ctx,
+                state,
+                APPUI_METHOD_PROFILE_LLM_TEST,
+            )),
+            MenuItem::new(
+                "onboard.provider.save",
+                onboarding_provider_save_label(state),
+                MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SaveProvider)),
+            )
+            .with_description(t!("menu.onboard.item.persist_provider.desc"))
+            .with_state(onboarding_provider_save_state(state))
+            .maybe_disabled(onboarding_provider_disabled_reason(
+                ctx,
+                state,
+                APPUI_METHOD_PROFILE_LLM_UPSERT,
+            )),
+        ]);
+
+        // "Add as fallback" only makes sense once a PRIMARY provider exists —
+        // during first-model setup there is nothing to fall back from, so the
+        // row is confusing there (user feedback). Show it only after a primary
+        // is saved, when appending an alternate route is a real choice.
+        if onboarding_has_saved_primary_provider(ctx, state, current_profile) {
+            items.push(
                 MenuItem::new(
-                    "onboard.done.open",
-                    t!("onboarding.wizard.finish_label"),
-                    MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_DONE)),
-                )
-                .with_description(t!("onboarding.wizard.finish_description"))
-                .maybe_disabled(blocked)
-            } else {
-                MenuItem::new(
-                    "onboard.workspace.open",
-                    t!("onboarding.wizard.workspace_open_label"),
-                    MenuAction::OpenMenu(MenuId::from(
-                        crate::menu::registry::MENU_ONBOARD_WORKSPACE,
+                    "onboard.provider.fallback",
+                    onboarding_provider_fallback_label(state),
+                    MenuAction::Local(LocalAction::Onboarding(
+                        OnboardingAction::SaveProviderFallback,
                     )),
                 )
-                .with_description(t!("onboarding.wizard.workspace_open_description"))
-                .with_state(MenuItemState::required(
-                    state.workspace_validation.is_valid(),
-                ))
-                .maybe_disabled(blocked)
-            }
-        },
-    ]);
+                .with_description(t!("menu.onboard.item.fallback_provider.desc"))
+                .with_state(onboarding_provider_save_state(state))
+                .maybe_disabled(onboarding_provider_disabled_reason(
+                    ctx,
+                    state,
+                    APPUI_METHOD_PROFILE_LLM_UPSERT,
+                )),
+            );
+        }
+    }
+
+    // Terminal step (always shown — collapsed or expanded). On a launch-flow
+    // server (Model A) the provider step ends at the launch-instructions screen
+    // (`MENU_ONBOARD_DONE`) — the redundant workspace/Activate screen is skipped
+    // and launch-time activation opens the session on the next start. Older
+    // servers keep the workspace step (`MENU_ONBOARD_WORKSPACE`), which owns the
+    // final Activate. Either way it is disabled until a provider is saved so the
+    // steps stay ordered.
+    items.push({
+        let blocked = (!onboarding_has_saved_primary_provider(ctx, state, current_profile))
+            .then(|| t!("onboarding.wizard.workspace_locked_reason").into_owned());
+        if launch_flow_supported(ctx) {
+            MenuItem::new(
+                "onboard.done.open",
+                t!("onboarding.wizard.finish_label"),
+                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_DONE)),
+            )
+            .with_description(t!("onboarding.wizard.finish_description"))
+            .maybe_disabled(blocked)
+        } else {
+            MenuItem::new(
+                "onboard.workspace.open",
+                t!("onboarding.wizard.workspace_open_label"),
+                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_WORKSPACE)),
+            )
+            .with_description(t!("onboarding.wizard.workspace_open_description"))
+            .with_state(MenuItemState::required(
+                state.workspace_validation.is_valid(),
+            ))
+            .maybe_disabled(blocked)
+        }
+    });
 
     // Same escape hatch as the create-profile step: this menu also lives under
     // the root MENU_ONBOARD id, where Esc is swallowed while no session is
@@ -2078,44 +2136,23 @@ fn onboarding_next_action_hint(
 fn onboarding_local_profile_menu(
     state: &OnboardingWizardState,
     requested_id_supported: bool,
-    catalog_supported: bool,
     make_default_supported: bool,
 ) -> MenuBuildResult {
-    let mut items = vec![
-        onboarding_language_row(),
-        MenuItem::new(
-            "onboard.local.status",
-            t!("onboarding.local.title"),
-            MenuAction::Noop,
-        )
-        .with_description(t!("onboarding.local.description")),
-    ];
+    // The "Create your local Octos profile / stays on this machine, no OTP"
+    // framing is NOT a menu row — it is non-actionable info, so it lives in the
+    // right-hand teaching panel (`WizardProgress::explanation_preview`) instead
+    // of taking a dead `Noop` slot in the action list.
+    let mut items = vec![onboarding_language_row()];
 
     if requested_id_supported {
         // Phase 2: a solo local tool does not need a full identity. Collapse the
-        // step to ONE prompt — "Name this profile" — pre-suggesting a value from
-        // the chosen provider/model family. The user accepts the suggestion with
-        // a single keypress on Continue, or edits it first.
+        // step to ONE prompt — "Name this profile".
         //
-        // The suggestion is only meaningful once a family is picked, and the
-        // profile step runs BEFORE provider setup — so offer the family choice
-        // here (when the catalog is available). Picking `glm` here makes the
-        // name row suggest `glm`; selecting the family returns to this step
-        // (see `SetFamilyId`) rather than diving into model/route setup.
-        if catalog_supported {
-            items.push(
-                MenuItem::new(
-                    "onboard.local.family",
-                    format!(
-                        "{}: {}",
-                        t!("menu.onboard.item.family.label"),
-                        onboarding_family_label(state, None)
-                    ),
-                    MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY)),
-                )
-                .with_description(t!("onboarding.local.family_desc")),
-            );
-        }
+        // Profile identity is DECOUPLED from the model: naming a profile has
+        // nothing to do with which model family it will run, so the profile step
+        // no longer offers a family picker (which also derived the name). The
+        // model is chosen separately in provider setup after the profile exists
+        // (and added/changed anytime via `/add-model`).
         items.push(onboarding_requested_id_row(state));
         // Decision #3: let the user mark this new brain as the machine default —
         // the one a bare launch opens in a folder it hasn't seen before. Only
@@ -6117,11 +6154,21 @@ mod tests {
     #[test]
     fn profile_step_shows_single_name_prompt_when_requested_id_supported() {
         let state = OnboardingWizardState::default();
-        let spec = ready_spec(onboarding_local_profile_menu(&state, true, false, false));
+        let spec = ready_spec(onboarding_local_profile_menu(&state, true, false));
 
         assert!(
             has_row(&spec, "onboard.local.requested_id"),
             "nameable flow shows the single Name-this-profile row"
+        );
+        // Profile identity is decoupled from the model — no family picker here.
+        assert!(
+            !has_row(&spec, "onboard.local.family"),
+            "the profile step never offers a model-family choice"
+        );
+        // And the non-actionable "stays local" blurb is not a dead menu row.
+        assert!(
+            !has_row(&spec, "onboard.local.status"),
+            "the info blurb lives in the right panel, not the action list"
         );
         assert!(
             !has_row(&spec, "onboard.local.name")
@@ -6145,7 +6192,7 @@ mod tests {
     fn profile_step_shows_make_default_toggle_only_when_supported() {
         // Off by default: the row flips the toggle ON when activated.
         let state = OnboardingWizardState::default();
-        let spec = ready_spec(onboarding_local_profile_menu(&state, true, true, true));
+        let spec = ready_spec(onboarding_local_profile_menu(&state, true, true));
         let row = spec
             .items
             .iter()
@@ -6166,7 +6213,7 @@ mod tests {
             make_default: true,
             ..OnboardingWizardState::default()
         };
-        let spec_on = ready_spec(onboarding_local_profile_menu(&on, true, true, true));
+        let spec_on = ready_spec(onboarding_local_profile_menu(&on, true, true));
         let row_on = spec_on
             .items
             .iter()
@@ -6180,7 +6227,7 @@ mod tests {
         ));
 
         // Unsupported server → the row is hidden entirely.
-        let unsupported = ready_spec(onboarding_local_profile_menu(&state, true, true, false));
+        let unsupported = ready_spec(onboarding_local_profile_menu(&state, true, false));
         assert!(!has_row(&unsupported, "onboard.local.make_default"));
     }
 
@@ -6279,52 +6326,9 @@ mod tests {
     }
 
     #[test]
-    fn profile_step_offers_family_choice_when_catalog_supported() {
-        // With the catalog available, the nameable step offers a family choice
-        // BEFORE the name prompt so the suggested id can derive from it.
-        let state = OnboardingWizardState::default();
-        let spec = ready_spec(onboarding_local_profile_menu(&state, true, true, false));
-
-        let family_pos = spec
-            .items
-            .iter()
-            .position(|i| i.id == "onboard.local.family");
-        let name_pos = spec
-            .items
-            .iter()
-            .position(|i| i.id == "onboard.local.requested_id");
-        assert!(family_pos.is_some(), "family choice row present");
-        assert!(
-            family_pos < name_pos,
-            "family is chosen before the name is prompted"
-        );
-        // No catalog → no family row (falls back to the plain name prompt).
-        let no_catalog = ready_spec(onboarding_local_profile_menu(&state, true, false, false));
-        assert!(!has_row(&no_catalog, "onboard.local.family"));
-    }
-
-    #[test]
-    fn profile_step_name_row_reflects_chosen_family_suggestion() {
-        // After a family is staged, the Name row pre-fills `/onboard
-        // profile-name <suggestion>` derived from it (glm, not octos).
-        let mut state = OnboardingWizardState::default();
-        state.provider.family_id = "glm-4.6".into();
-        let spec = ready_spec(onboarding_local_profile_menu(&state, true, true, false));
-        let name_row = spec
-            .items
-            .iter()
-            .find(|i| i.id == "onboard.local.requested_id")
-            .expect("name row present");
-        let MenuAction::Local(LocalAction::EditComposer(draft)) = &name_row.action else {
-            panic!("name row edits the composer");
-        };
-        assert_eq!(draft, "/onboard profile-name glm");
-    }
-
-    #[test]
     fn profile_step_falls_back_to_full_fields_without_feature() {
         let state = OnboardingWizardState::default();
-        let spec = ready_spec(onboarding_local_profile_menu(&state, false, true, false));
+        let spec = ready_spec(onboarding_local_profile_menu(&state, false, false));
 
         assert!(
             has_row(&spec, "onboard.local.name")
@@ -6648,7 +6652,16 @@ mod tests {
             APPUI_METHOD_PROFILE_LLM_CATALOG,
             APPUI_METHOD_PROFILE_LLM_UPSERT,
         ]);
-        let onboarding = OnboardingWizardState::default();
+        // Stage a model family so the provider step renders its expanded config
+        // rows (family/model/route/key). Without a staged model the step is
+        // collapsed to a single "Add a model" entry, which hides those rows.
+        let onboarding = OnboardingWizardState {
+            provider: LlmSelectionConfig {
+                family_id: "moonshot".into(),
+                ..LlmSelectionConfig::default()
+            },
+            ..OnboardingWizardState::default()
+        };
         let mut families = serde_json::Map::new();
         families.insert(
             "moonshot".into(),
@@ -6804,6 +6817,116 @@ mod tests {
         assert_eq!(
             selection.route.api_key_env.as_deref(),
             Some("AUTODL_API_KEY")
+        );
+    }
+
+    /// Profile↔model decoupling: after naming a profile, the provider step is
+    /// collapsed to a single "Add a model" entry — the family/model/route/key
+    /// config rows are hidden until a model is actually being set up. Once a
+    /// family is staged the step expands to those rows. Either way the terminal
+    /// (finish/workspace) row stays, so onboarding can always progress.
+    #[test]
+    fn provider_step_collapses_model_config_behind_add_a_model() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            APPUI_METHOD_AUTH_STATUS,
+            APPUI_METHOD_PROFILE_LLM_CATALOG,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+        ]);
+        let build = |onboarding: &OnboardingWizardState| {
+            let ctx = MenuContext {
+                availability: AvailabilityContext::protocol(&capabilities),
+                app: MenuAppSnapshot {
+                    current_profile: Some("coding"),
+                    onboarding: Some(onboarding),
+                    ..MenuAppSnapshot::default()
+                },
+                terminal: TerminalSize::default(),
+                theme_name: None,
+                selected_path: &[],
+            };
+            let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_ONBOARD), &ctx)
+            else {
+                panic!("expected provider setup menu");
+            };
+            spec
+        };
+
+        // Nothing configured yet → collapsed.
+        let collapsed = build(&OnboardingWizardState::default());
+        assert!(
+            has_row(&collapsed, "onboard.provider.add_model"),
+            "collapsed step offers a single Add-a-model entry"
+        );
+        assert!(
+            !has_row(&collapsed, "onboard.provider.family")
+                && !has_row(&collapsed, "onboard.provider.key"),
+            "the inline model config rows are hidden until setup begins"
+        );
+        assert!(
+            has_row(&collapsed, "onboard.workspace.open")
+                || has_row(&collapsed, "onboard.done.open"),
+            "the terminal (finish/workspace) row still lets onboarding progress"
+        );
+
+        // A staged, UNSAVED selection means the user is actively setting up a
+        // model → expanded config rows.
+        let configuring = OnboardingWizardState {
+            provider: LlmSelectionConfig {
+                family_id: "glm-4.6".into(),
+                model_id: "glm-5.2".into(),
+                route: LlmRouteConfig {
+                    route_id: "zai".into(),
+                    ..LlmRouteConfig::default()
+                },
+                ..LlmSelectionConfig::default()
+            },
+            ..OnboardingWizardState::default()
+        };
+        let expanded = build(&configuring);
+        assert!(
+            has_row(&expanded, "onboard.provider.family")
+                && has_row(&expanded, "onboard.provider.key"),
+            "an unsaved staged selection expands to the detailed model rows"
+        );
+        assert!(
+            !has_row(&expanded, "onboard.provider.add_model"),
+            "the collapsed entry is replaced while actively configuring"
+        );
+        // "Add as fallback" is confusing during FIRST-model setup (nothing to
+        // fall back from), so it is hidden until a primary provider is saved.
+        assert!(
+            !has_row(&expanded, "onboard.provider.fallback"),
+            "the fallback row is hidden while no primary is saved yet"
+        );
+
+        // Once the staged selection has been SAVED as the primary (session
+        // label matches), the step collapses back to "Add another model" — it
+        // must NOT dump the raw form (the user's "still no add_model option"
+        // report). The saved model shows via the right-pane summary.
+        let mut saved = configuring.clone();
+        saved.provider_saved = true;
+        saved.saved_primary_provider_label = Some(saved.provider_label());
+        let after_save = build(&saved);
+        assert!(
+            has_row(&after_save, "onboard.provider.add_model"),
+            "a saved primary collapses back to the Add-another-model entry"
+        );
+        assert!(
+            !has_row(&after_save, "onboard.provider.family")
+                && !has_row(&after_save, "onboard.provider.key"),
+            "the raw config rows are hidden once the primary is saved"
+        );
+
+        // Staging a DIFFERENT model than the saved primary re-expands (to add a
+        // fallback or replace), and the fallback row is now a real choice.
+        let mut adding_second = saved.clone();
+        adding_second.provider.model_id = "glm-4.7".into();
+        let second = build(&adding_second);
+        assert!(
+            has_row(&second, "onboard.provider.family")
+                && has_row(&second, "onboard.provider.fallback"),
+            "staging a different model re-expands and offers the fallback save"
         );
     }
 
