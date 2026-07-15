@@ -2545,7 +2545,7 @@ fn agent_overlay_lines(app: &AppState, palette: Palette, agent_id: &str) -> Vec<
             .filter(|t| !t.is_empty());
         if let Some(task) = task {
             lines.push(Line::from(Span::styled(
-                format!("task: {task}"),
+                t!("app.hint.agent_task_prefix", task = task).into_owned(),
                 palette.muted(),
             )));
         }
@@ -2558,7 +2558,7 @@ fn agent_overlay_lines(app: &AppState, palette: Palette, agent_id: &str) -> Vec<
             }
         }
         _ => lines.push(Line::from(Span::styled(
-            "(no output captured yet — this agent streams its result here as it works)".to_string(),
+            t!("app.hint.agent_no_output").into_owned(),
             palette.muted(),
         ))),
     }
@@ -2569,7 +2569,7 @@ fn agent_overlay_lines(app: &AppState, palette: Palette, agent_id: &str) -> Vec<
 /// main chat and scroll the output.
 fn render_agent_overlay_hint(palette: Palette) -> Paragraph<'static> {
     Paragraph::new(Line::from(Span::styled(
-        " Tab next · Shift+Tab prev · ↑/↓ scroll · Esc back to chat ".to_string(),
+        t!("app.hint.agent_peek_keys").into_owned(),
         palette.muted().bg(palette.surface),
     )))
     .style(Style::default().bg(palette.surface))
