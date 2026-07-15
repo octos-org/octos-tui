@@ -31,6 +31,7 @@ pub type TaskView = AppUiTask;
 pub const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str = "config/capabilities/list";
 pub const APPUI_METHOD_SESSION_STATUS_READ: &str = "session/status/read";
 pub const APPUI_METHOD_SESSION_COMPACT: &str = "session/compact";
+pub const APPUI_METHOD_SESSION_COMPACT_MODE_SET: &str = "session/compact/mode/set";
 pub const APPUI_METHOD_MODEL_LIST: &str = "profile/llm/list";
 pub const APPUI_METHOD_MODEL_SELECT: &str = "profile/llm/select";
 pub const APPUI_METHOD_MCP_STATUS_LIST: &str = "mcp/status/list";
@@ -665,6 +666,7 @@ pub enum AppUiCommand {
     ReadSessionStatus(SessionStatusReadParams),
     SessionBtw(octos_core::ui_protocol::SessionBtwParams),
     CompactContext(SessionCompactParams),
+    SetCompactionMode(SessionCompactModeParams),
     ListModels(ModelListParams),
     SelectModel(ModelSelectParams),
     ListPermissionProfiles(PermissionProfileListParams),
@@ -756,6 +758,7 @@ impl AppUiCommand {
             Self::ReadSessionStatus(_) => APPUI_METHOD_SESSION_STATUS_READ,
             Self::SessionBtw(_) => octos_core::ui_protocol::methods::SESSION_BTW,
             Self::CompactContext(_) => APPUI_METHOD_SESSION_COMPACT,
+            Self::SetCompactionMode(_) => APPUI_METHOD_SESSION_COMPACT_MODE_SET,
             Self::ListModels(_) | Self::ProfileLlmList(_) => APPUI_METHOD_MODEL_LIST,
             Self::SelectModel(_) | Self::ProfileLlmSelect(_) => APPUI_METHOD_MODEL_SELECT,
             Self::ListPermissionProfiles(_) => {
@@ -877,6 +880,14 @@ pub struct SessionStatusReadParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCompactParams {
     pub session_id: SessionKey,
+}
+
+/// Params for `session/compact/mode/set` — pick LLM vs heuristic compaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCompactModeParams {
+    pub session_id: SessionKey,
+    /// `"llm"` or `"heuristic"`.
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

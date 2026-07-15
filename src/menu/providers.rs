@@ -29,15 +29,15 @@ use crate::menu::{
         APPUI_METHOD_PROFILE_LOCAL_CREATE, APPUI_METHOD_PROFILE_SKILLS_INSTALL,
         APPUI_METHOD_PROFILE_SKILLS_LIST, APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
         APPUI_METHOD_PROFILE_SKILLS_REMOVE, APPUI_METHOD_SESSION_COMPACT,
-        APPUI_METHOD_TOOL_CONFIG_DELETE, APPUI_METHOD_TOOL_CONFIG_LIST,
-        APPUI_METHOD_TOOL_CONFIG_SET_ENABLED, APPUI_METHOD_TOOL_CONFIG_TEST,
-        APPUI_METHOD_TOOL_CONFIG_UPSERT, APPUI_METHOD_TOOL_STATUS_LIST,
-        APPUI_ONBOARDING_METHODS_ANY, APPUI_PERMISSION_MENU_METHODS_ANY,
-        APPUI_PROVIDER_MENU_METHODS_ANY, APPUI_TOOL_SETTINGS_MENU_METHODS_ANY,
-        MENU_COMPACT_CONFIRM, MENU_COST, MENU_HELP, MENU_KEYMAP, MENU_LOGIN, MENU_MCP, MENU_MODEL,
-        MENU_ONBOARD, MENU_ONBOARD_LANGUAGE, MENU_PERMISSIONS, MENU_PROVIDER, MENU_RESUME,
-        MENU_REWIND, MENU_SKILLS, MENU_STATUS, MENU_STATUS_LINE, MENU_THEME, MENU_TITLE,
-        MENU_TOOL_SETTINGS,
+        APPUI_METHOD_SESSION_COMPACT_MODE_SET, APPUI_METHOD_TOOL_CONFIG_DELETE,
+        APPUI_METHOD_TOOL_CONFIG_LIST, APPUI_METHOD_TOOL_CONFIG_SET_ENABLED,
+        APPUI_METHOD_TOOL_CONFIG_TEST, APPUI_METHOD_TOOL_CONFIG_UPSERT,
+        APPUI_METHOD_TOOL_STATUS_LIST, APPUI_ONBOARDING_METHODS_ANY,
+        APPUI_PERMISSION_MENU_METHODS_ANY, APPUI_PROVIDER_MENU_METHODS_ANY,
+        APPUI_TOOL_SETTINGS_MENU_METHODS_ANY, MENU_COMPACT_CONFIRM, MENU_CONTEXT, MENU_COST,
+        MENU_HELP, MENU_KEYMAP, MENU_LOGIN, MENU_MCP, MENU_MODEL, MENU_ONBOARD,
+        MENU_ONBOARD_LANGUAGE, MENU_PERMISSIONS, MENU_PROVIDER, MENU_RESUME, MENU_REWIND,
+        MENU_SKILLS, MENU_STATUS, MENU_STATUS_LINE, MENU_THEME, MENU_TITLE, MENU_TOOL_SETTINGS,
     },
 };
 use crate::model::{
@@ -48,9 +48,9 @@ use crate::model::{
     OnboardingProviderStatus, OnboardingWizardState, ProfileLlmCatalogParams, ProfileLlmListParams,
     ProfileLlmSelectParams, ProfileLlmTestParams, ProfileSkillsInstallParams,
     ProfileSkillsListParams, ProfileSkillsRemoveParams, RuntimePolicyMcpServer,
-    SessionCompactParams, SessionStatusReadParams, ToolConfigDeleteParams, ToolConfigEntry,
-    ToolConfigListParams, ToolConfigSetEnabledParams, ToolConfigTestParams, ToolStatus,
-    ToolStatusListParams,
+    SessionCompactModeParams, SessionCompactParams, SessionStatusReadParams,
+    ToolConfigDeleteParams, ToolConfigEntry, ToolConfigListParams, ToolConfigSetEnabledParams,
+    ToolConfigTestParams, ToolStatus, ToolStatusListParams,
 };
 
 pub fn core_menu_registry() -> MenuRegistry {
@@ -76,6 +76,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::Status,
         Provider::Cost,
         Provider::CompactConfirm,
+        Provider::Context,
         Provider::Resume,
         Provider::Rewind,
         Provider::Model,
@@ -114,6 +115,7 @@ enum Provider {
     Status,
     Cost,
     CompactConfirm,
+    Context,
     Resume,
     Rewind,
     Model,
@@ -147,6 +149,7 @@ impl MenuProvider for Provider {
             Self::Status => MENU_STATUS,
             Self::Cost => MENU_COST,
             Self::CompactConfirm => MENU_COMPACT_CONFIRM,
+            Self::Context => MENU_CONTEXT,
             Self::Resume => MENU_RESUME,
             Self::Rewind => MENU_REWIND,
             Self::Model => MENU_MODEL,
@@ -180,6 +183,7 @@ impl MenuProvider for Provider {
             Self::Status => MenuBuildResult::Ready(status_menu(ctx)),
             Self::Cost => cost_menu(ctx),
             Self::CompactConfirm => compact_confirm_menu(ctx),
+            Self::Context => context_menu(ctx),
             Self::Resume => resume_menu(ctx),
             Self::Rewind => rewind_menu(ctx),
             Self::Model => model_menu(ctx),
@@ -906,6 +910,88 @@ fn compact_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         id: MenuId::from(MENU_COMPACT_CONFIRM),
         title: t!("menu.compact.title").into_owned(),
         subtitle: Some(t!("menu.compact.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// `/context` — context-window controls. Folds in the former `/compact`
+/// command (now the "Compact now" row, which opens the [`compact_confirm_menu`]
+/// confirm) and adds a session-wide toggle for how compaction summarizes: an
+/// LLM summary vs the heuristic first-lines strip. The chosen mode persists for
+/// the session — auto *and* manual compaction — via `session/compact/mode/set`,
+/// taking precedence over the serve `--llm-compaction` flag.
+fn context_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let Some(session_id) = ctx.app.selected_session_id.cloned() else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(MENU_CONTEXT),
+            title: t!("menu.context.unavailable_title").into_owned(),
+            message: t!("menu.context.unavailable_no_session").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        });
+    };
+
+    if !ctx
+        .availability
+        .supports_method(APPUI_METHOD_SESSION_COMPACT)
+    {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(MENU_CONTEXT),
+            title: t!("menu.context.unavailable_title").into_owned(),
+            message: method_missing_reason(ctx, APPUI_METHOD_SESSION_COMPACT),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        });
+    }
+
+    // "Compact now" is always offered (folds in the former `/compact`). The
+    // mode toggle needs `session/compact/mode/set`; older backends that only
+    // advertise `session/compact` still get a usable menu without dead rows.
+    let mut items = vec![
+        MenuItem::new(
+            "context.compact",
+            t!("menu.context.item.compact.label"),
+            MenuAction::OpenMenu(MenuId::from(MENU_COMPACT_CONFIRM)),
+        )
+        .with_description(t!("menu.context.item.compact.desc").into_owned()),
+    ];
+
+    if ctx
+        .availability
+        .supports_method(APPUI_METHOD_SESSION_COMPACT_MODE_SET)
+    {
+        items.push(
+            MenuItem::new(
+                "context.mode.llm",
+                t!("menu.context.item.llm.label"),
+                MenuAction::send_appui(AppUiCommand::SetCompactionMode(SessionCompactModeParams {
+                    session_id: session_id.clone(),
+                    mode: "llm".to_string(),
+                })),
+            )
+            .with_description(t!("menu.context.item.llm.desc").into_owned()),
+        );
+        items.push(
+            MenuItem::new(
+                "context.mode.heuristic",
+                t!("menu.context.item.heuristic.label"),
+                MenuAction::send_appui(AppUiCommand::SetCompactionMode(SessionCompactModeParams {
+                    session_id,
+                    mode: "heuristic".to_string(),
+                })),
+            )
+            .with_description(t!("menu.context.item.heuristic.desc").into_owned()),
+        );
+    }
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(MENU_CONTEXT),
+        title: t!("menu.context.title").into_owned(),
+        subtitle: Some(t!("menu.context.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: false,
