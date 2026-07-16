@@ -407,7 +407,10 @@ pub fn render_viewport_with_finalization(
     frame.render_widget(render_composer(app, palette, root[4]), root[4]);
     set_composer_cursor(frame, app, root[4]);
     if agent_strip_height > 0 {
-        frame.render_widget(render_agent_strip(app, palette), root[5]);
+        frame.render_widget(
+            render_agent_strip(app, palette, root[5].height.saturating_sub(1)),
+            root[5],
+        );
     }
     frame.render_widget(render_status(app, palette), root[6]);
 }
@@ -1451,7 +1454,10 @@ fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palet
     );
     set_composer_cursor(frame, app, areas.composer);
     if areas.agent_strip.height > 0 {
-        frame.render_widget(render_agent_strip(app, palette), areas.agent_strip);
+        frame.render_widget(
+            render_agent_strip(app, palette, areas.agent_strip.height.saturating_sub(1)),
+            areas.agent_strip,
+        );
     }
     frame.render_widget(render_status(app, palette), areas.status);
 }
@@ -2476,7 +2482,10 @@ fn render_agent_overlay(frame: &mut impl FrameLike, app: &AppState, palette: Pal
         root[0],
     );
     if strip_height > 0 {
-        frame.render_widget(render_agent_strip(app, palette), root[1]);
+        frame.render_widget(
+            render_agent_strip(app, palette, root[1].height.saturating_sub(1)),
+            root[1],
+        );
     }
     frame.render_widget(render_agent_overlay_hint(palette), root[2]);
 }
@@ -8054,6 +8063,23 @@ fn format_tokens_k(tokens: u64) -> String {
     format!("{k}K")
 }
 
+/// Human-readable token count for context-window display: `128K`, `256K`,
+/// `1M`, `1.5M`. Reuses [`format_tokens_k`] below 1M; switches to `M` above so
+/// a 1,000,000-token window renders `1M` rather than `1000K`.
+pub(crate) fn format_tokens_human(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        let millions = tokens as f64 / 1_000_000.0;
+        let rendered = format!("{millions:.1}");
+        let rendered = rendered
+            .strip_suffix(".0")
+            .map(str::to_owned)
+            .unwrap_or(rendered);
+        format!("{rendered}M")
+    } else {
+        format_tokens_k(tokens)
+    }
+}
+
 fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> {
     let Some(state) = active_session_autonomy(app) else {
         return Vec::new();
@@ -8248,21 +8274,134 @@ fn agent_status_glyph(status: &str) -> &'static str {
     }
 }
 
-/// Logical chips for the agent strip: `(glyph, label, selected)`. `main` first,
-/// then one chip per active-session sub-agent. Empty when the session has no
-/// sub-agents (the strip is then hidden). Split from rendering so the
-/// selection/labeling logic is unit-testable without a frame.
-fn agent_strip_chips(app: &AppState) -> Vec<(&'static str, String, bool)> {
-    let agents = app.active_session_agents();
-    if agents.is_empty() {
-        return Vec::new();
+/// Minimum terminal rows before the selector strip claims its row. Below this a
+/// full composer + status + the `Min(1)` tail + the reserved scrollback already
+/// fill the screen, so adding the strip would force Ratatui to collapse a fixed
+/// row (clipping the composer or status). The Tab switcher still works without
+/// the strip — it is a visual aid, not the control surface — so on a tiny
+/// terminal we drop it rather than corrupt the layout.
+const AGENT_STRIP_MIN_TERMINAL_ROWS: u16 = 12;
+
+/// Maximum sub-agent rows the vertical strip may claim below its title row.
+/// Larger rosters stay fully reachable via Tab; the title row carries a `+N`
+/// overflow marker and the visible window shifts to keep the selection shown.
+const AGENT_STRIP_MAX_AGENT_ROWS: u16 = 4;
+
+/// Rows the agent strip occupies under the composer: a title row (with the
+/// `main` chip) plus ONE ROW PER SUB-AGENT — vertical so each agent gets a
+/// full line of status/task visibility instead of an abbreviated chip. Agent
+/// rows are capped by [`AGENT_STRIP_MAX_AGENT_ROWS`] and by what the terminal
+/// can spare beyond the minimum layout, so a constrained terminal never
+/// oversubscribes the live layout. Both the height reservation
+/// (`live_ui_height`) and the render pass call this with the same terminal
+/// height, so they always agree.
+///
+/// Also hidden while the transcript pager is up: the strip switches views via
+/// Tab, but Tab is disabled in the pager (it never enters a peek), so the strip
+/// is non-interactive there — and the pager's `Min(8)` transcript floor makes
+/// its extra rows overcommit sooner than the inline flow's `Min(1)` tail.
+fn agent_strip_height(app: &AppState, terminal_height: u16) -> u16 {
+    if app.transcript_pager_active
+        || terminal_height < AGENT_STRIP_MIN_TERMINAL_ROWS
+        || app.active_session_agents().is_empty()
+    {
+        0
+    } else {
+        1 + agent_strip_agent_rows(app, terminal_height)
     }
-    let mut chips = vec![(
-        "⌂",
-        t!("app.hint.agent_strip_main").into_owned(),
-        matches!(app.chat_view, crate::model::ChatViewTarget::Main),
+}
+
+/// Sub-agent rows shown below the strip's title row: one line per agent,
+/// capped by [`AGENT_STRIP_MAX_AGENT_ROWS`] and by the rows the terminal has
+/// to spare beyond [`AGENT_STRIP_MIN_TERMINAL_ROWS`] (at exactly the minimum
+/// height the strip degrades to the title row alone — the `+N` marker and Tab
+/// keep every agent reachable).
+fn agent_strip_agent_rows(app: &AppState, terminal_height: u16) -> u16 {
+    let roster = app.active_session_agents().len().min(u16::MAX as usize) as u16;
+    roster
+        .min(AGENT_STRIP_MAX_AGENT_ROWS)
+        .min(terminal_height.saturating_sub(AGENT_STRIP_MIN_TERMINAL_ROWS))
+}
+
+/// Visible window of the agent roster for the vertical strip: the range of
+/// indices into `active_session_agents()` to render, plus how many agents are
+/// left out. The window starts at the top of the roster and shifts down just
+/// enough to keep the selected agent visible.
+fn agent_strip_window(app: &AppState, rows: usize) -> (std::ops::Range<usize>, usize) {
+    let agents = app.active_session_agents();
+    let len = agents.len();
+    if rows == 0 || len == 0 {
+        return (0..0, len);
+    }
+    let rows = rows.min(len);
+    let selected = match &app.chat_view {
+        crate::model::ChatViewTarget::Agent(id) => agents
+            .iter()
+            .position(|agent| &agent.agent_id == id)
+            .unwrap_or(0),
+        _ => 0,
+    };
+    let start = selected.saturating_sub(rows - 1).min(len - rows);
+    (start..start + rows, len - rows)
+}
+
+/// One-line task/status detail for an agent row: the last task if the server
+/// reported one, else the summary, else the tail of its streamed output —
+/// flattened to a single line (the row must never wrap).
+fn agent_strip_detail(agent: &octos_core::ui_protocol::UiAgentRecord) -> Option<String> {
+    [
+        agent.last_task.as_deref(),
+        agent.summary.as_deref(),
+        agent.output_tail.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|text| text.lines())
+    .map(str::trim)
+    .find(|line| !line.is_empty())
+    .map(str::to_owned)
+}
+
+/// Logical lines for the vertical agent strip. Row 0 is the title row: strip
+/// title + the `main` chip + a muted `+N` marker when the roster overflows the
+/// visible window. Each following row is one sub-agent — glyph, name, raw
+/// status, and a muted task/output detail — with the selected target
+/// highlighted. Split from rendering so the layout logic is unit-testable
+/// without a frame; `agent_rows` must be the value the height reservation was
+/// computed with (`agent_strip_height` - 1).
+fn agent_strip_lines(app: &AppState, palette: Palette, agent_rows: u16) -> Vec<Line<'static>> {
+    let agents = app.active_session_agents();
+    let (window, hidden) = agent_strip_window(app, agent_rows as usize);
+    let selected_style = Style::default()
+        .fg(palette.surface)
+        .bg(palette.accent)
+        .add_modifier(Modifier::BOLD);
+
+    let mut title_spans: Vec<Span<'static>> = vec![Span::styled(
+        t!("app.hint.agent_strip_title").into_owned(),
+        palette.muted().bg(palette.surface),
     )];
-    for agent in agents {
+    let main_selected = matches!(app.chat_view, crate::model::ChatViewTarget::Main);
+    title_spans.push(Span::styled(
+        format!(" ⌂ {} ", t!("app.hint.agent_strip_main")),
+        if main_selected {
+            selected_style
+        } else {
+            palette.text().bg(palette.surface)
+        },
+    ));
+    if hidden > 0 {
+        title_spans.push(Span::styled(
+            format!(
+                "  {}",
+                t!("app.hint.agent_strip_more", count = hidden.to_string())
+            ),
+            palette.muted().bg(palette.surface),
+        ));
+    }
+    let mut lines = vec![Line::from(title_spans)];
+
+    for agent in &agents[window] {
         let selected = matches!(
             &app.chat_view,
             crate::model::ChatViewTarget::Agent(id) if id == &agent.agent_id
@@ -8272,66 +8411,38 @@ fn agent_strip_chips(app: &AppState) -> Vec<(&'static str, String, bool)> {
         } else {
             agent.nickname.clone()
         };
-        chips.push((agent_status_glyph(&agent.status), label, selected));
+        let mut spans = vec![Span::styled(
+            format!(
+                " {} {label} · {} ",
+                agent_status_glyph(&agent.status),
+                agent.status
+            ),
+            if selected {
+                selected_style
+            } else {
+                palette.text().bg(palette.surface)
+            },
+        )];
+        if let Some(detail) = agent_strip_detail(agent) {
+            spans.push(Span::styled(
+                format!(" — {detail}"),
+                palette.muted().bg(palette.surface),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
-    chips
+    lines
 }
 
-/// Minimum terminal rows before the selector strip claims its row. Below this a
-/// full composer + status + the `Min(1)` tail + the reserved scrollback already
-/// fill the screen, so adding the strip would force Ratatui to collapse a fixed
-/// row (clipping the composer or status). The Tab switcher still works without
-/// the strip — it is a visual aid, not the control surface — so on a tiny
-/// terminal we drop it rather than corrupt the layout.
-const AGENT_STRIP_MIN_TERMINAL_ROWS: u16 = 12;
-
-/// Rows the agent strip occupies under the composer: 1 when the active session
-/// has sub-agents AND the terminal is tall enough to afford the row, else 0
-/// (hidden). Height-gated so a constrained terminal never oversubscribes the
-/// live layout. Both the height reservation (`live_ui_height`) and the render
-/// pass call this with the same terminal height, so they always agree.
-///
-/// Also hidden while the transcript pager is up: the strip switches views via
-/// Tab, but Tab is disabled in the pager (it never enters a peek), so the strip
-/// is non-interactive there — and the pager's `Min(8)` transcript floor makes
-/// its extra row overcommit sooner than the inline flow's `Min(1)` tail.
-fn agent_strip_height(app: &AppState, terminal_height: u16) -> u16 {
-    if app.transcript_pager_active
-        || terminal_height < AGENT_STRIP_MIN_TERMINAL_ROWS
-        || app.active_session_agents().is_empty()
-    {
-        0
-    } else {
-        1
-    }
-}
-
-/// Render the sub-agent selector strip shown under the composer: `main` plus a
-/// chip per sub-agent, the selected target highlighted. Selection is moved in
-/// the event loop; selecting an agent redirects the main pane to its live
-/// output.
-fn render_agent_strip(app: &AppState, palette: Palette) -> Paragraph<'static> {
-    let mut spans: Vec<Span<'static>> = vec![Span::styled(
-        t!("app.hint.agent_strip_title").into_owned(),
-        palette.muted().bg(palette.surface),
-    )];
-    for (glyph, label, selected) in agent_strip_chips(app) {
-        let chip = format!(" {glyph} {label} ");
-        let style = if selected {
-            Style::default()
-                .fg(palette.surface)
-                .bg(palette.accent)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            palette.text().bg(palette.surface)
-        };
-        spans.push(Span::styled(chip, style));
-        spans.push(Span::styled(
-            "  ".to_string(),
-            Style::default().bg(palette.surface),
-        ));
-    }
-    Paragraph::new(Line::from(spans)).style(Style::default().bg(palette.surface))
+/// Render the sub-agent selector strip shown under the composer: a title row
+/// with the `main` chip, then one line per visible sub-agent (vertical for
+/// glanceable status/task detail), the selected target highlighted. Selection
+/// is moved in the event loop; selecting an agent redirects the main pane to
+/// its live output. `agent_rows` is the row budget the layout reserved beyond
+/// the title row (`area.height - 1`).
+fn render_agent_strip(app: &AppState, palette: Palette, agent_rows: u16) -> Paragraph<'static> {
+    Paragraph::new(agent_strip_lines(app, palette, agent_rows))
+        .style(Style::default().bg(palette.surface))
 }
 
 /// Fallback context-window denominator for `ctx N%`, used only until a cost
@@ -8367,6 +8478,26 @@ fn harness_status_height(app: &AppState) -> u16 {
     if harness_status_active(app) { 1 } else { 0 }
 }
 
+/// `(used_tokens, window_tokens)` for `session_id`, for the `/context` menu's
+/// live usage line. `None` until a token estimate is known for the session.
+/// Window resolution mirrors [`harness_context_ratio`]: the real per-model
+/// window (`session_context_window`, from `metadata.token_cost.context_window`)
+/// when known, else the fixed default until the first cost update arrives.
+pub(crate) fn context_window_usage(app: &AppState, session_id: &SessionKey) -> Option<(u64, u64)> {
+    let used = app
+        .context_lifecycle_for(session_id)?
+        .state
+        .as_ref()?
+        .token_estimate as u64;
+    let window = app
+        .session_context_window
+        .get(session_id)
+        .copied()
+        .filter(|w| *w > 0)
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS as u64);
+    Some((used, window))
+}
+
 /// Context-window fill ratio (0.0..=1.0) for the harness row `LineGauge`, or
 /// `None` when no `token_estimate` is known for the active session yet.
 fn harness_context_ratio(app: &AppState) -> Option<f64> {
@@ -8395,6 +8526,23 @@ fn harness_context_ratio(app: &AppState) -> Option<f64> {
 /// Integer context-window percent (0..=100) for the `ctx N%` label.
 fn harness_context_percent(app: &AppState) -> Option<u16> {
     harness_context_ratio(app).map(|ratio| (ratio * 100.0).round() as u16)
+}
+
+/// Full context-window label for the harness gauge/row: `ctx 128K/1M ~13%`.
+/// Pairs the used/max token counts (see [`context_window_usage`]) with the
+/// estimate percent so the always-on row shows the raw numbers, not just a
+/// bare percentage. The `~` marks it an estimate: the numerator is the harness
+/// `token_estimate` and the denominator falls back to the fixed default until a
+/// real per-model window arrives. `None` until an estimate is known.
+fn harness_context_label(app: &AppState) -> Option<String> {
+    let session = app.active_session()?;
+    let (used, window) = context_window_usage(app, &session.id)?;
+    let percent = harness_context_percent(app)?;
+    Some(format!(
+        "ctx {}/{} ~{percent}%",
+        format_tokens_human(used),
+        format_tokens_human(window),
+    ))
 }
 
 /// Build the harness status line(s): spinner + phase + agent count +
@@ -8529,13 +8677,14 @@ fn harness_status_lines(
     // right (the duplicate-`ctx ~N%` bug). Kept (and unit-tested) for narrow
     // terminals where the gauge column is dropped.
     if include_ctx_text {
-        if let Some(percent) = harness_context_percent(app) {
-            // `~` marks this as an estimate: the numerator is the harness
-            // `token_estimate`. The denominator is the real per-model context
-            // window once a cost update carries it (`token_cost.context_window`),
-            // falling back to `DEFAULT_CONTEXT_WINDOW_TOKENS` until then.
+        // `ctx {used}/{max} ~{pct}%` — the raw token counts plus the estimate
+        // percent. `~` marks it an estimate: the numerator is the harness
+        // `token_estimate`. The denominator is the real per-model context
+        // window once a cost update carries it (`token_cost.context_window`),
+        // falling back to `DEFAULT_CONTEXT_WINDOW_TOKENS` until then.
+        if let Some(label) = harness_context_label(app) {
             spans.push(Span::styled(
-                format!(" · ctx ~{percent}%"),
+                format!(" · {label}"),
                 palette.muted().bg(palette.surface),
             ));
         }
@@ -8555,38 +8704,46 @@ fn render_harness_status_row(
     area: Rect,
 ) {
     let ratio = harness_context_ratio(app);
-    // Reserve a fixed-width column for the context gauge only when we have a
-    // ratio to show AND the row is wide enough for both the text and the gauge.
-    const GAUGE_WIDTH: u16 = 18;
-    let show_gauge = ratio.is_some() && area.width > GAUGE_WIDTH + 12;
-    // Suppress the textual `· ctx ~N%` label when the gauge will be drawn —
-    // otherwise the percent renders twice on the same row (text on the left and
-    // gauge on the right). The gauge is canonical on a wide terminal; the text
-    // is the narrow-terminal fallback.
+    let ctx_label = harness_context_label(app);
+    // Size the gauge column to its label plus a short bar. The label now
+    // carries the used/max token counts (`ctx 128K/1M ~13%`), so a fixed
+    // 18-cell column would truncate it — derive the width from the label, and
+    // only draw the gauge when the row is wide enough for both text and gauge.
+    let gauge_width = ctx_label
+        .as_deref()
+        .map(|label| label.chars().count() as u16 + 6)
+        .unwrap_or(18);
+    let show_gauge = ratio.is_some() && ctx_label.is_some() && area.width > gauge_width + 12;
+    // Suppress the textual `· ctx …` label when the gauge will be drawn —
+    // otherwise the context readout renders twice on the same row (text on the
+    // left and gauge on the right). The gauge is canonical on a wide terminal;
+    // the text is the narrow-terminal fallback.
     let lines = harness_status_lines(app, palette, !show_gauge);
     if lines.is_empty() {
         return;
     }
-    if let Some(ratio) = ratio.filter(|_| show_gauge) {
+    if let (Some(ratio), Some(label)) = (
+        ratio.filter(|_| show_gauge),
+        ctx_label.filter(|_| show_gauge),
+    ) {
         let split = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(12), Constraint::Length(GAUGE_WIDTH)])
+            .constraints([Constraint::Min(12), Constraint::Length(gauge_width)])
             .split(area);
         frame.render_widget(
             Paragraph::new(Text::from(lines))
                 .style(Style::default().fg(palette.text).bg(palette.surface)),
             split[0],
         );
-        let percent = (ratio * 100.0).round() as u16;
         let gauge = LineGauge::default()
             .ratio(ratio)
             // Base style backs the label cells: `LineGauge` paints the whole
             // area with `self.style` before writing the (unstyled) label, so
-            // without a surface bg here the `ctx ~N%` label renders on the raw
+            // without a surface bg here the `ctx …` label renders on the raw
             // terminal background — a mismatched block to the right of the
             // harness row, just above the composer. Keep it on `surface`.
             .style(Style::default().fg(palette.muted).bg(palette.surface))
-            .label(format!("ctx ~{percent}%"))
+            .label(label)
             .filled_style(Style::default().fg(palette.accent).bg(palette.surface))
             .unfilled_style(Style::default().fg(palette.frame).bg(palette.surface));
         frame.render_widget(gauge, split[1]);
@@ -12722,7 +12879,11 @@ mod tests {
         let text = rendered_text(&store.state);
 
         assert!(text.contains("Welcome to Octos"));
-        assert!(text.contains("Create your local Octos profile"));
+        // The "stays local, no OTP" framing is no longer a dead menu row — it
+        // moved to the right-hand teaching pane ("About this step"), and the
+        // profile step is identified by its purpose line.
+        assert!(text.contains("About this step"));
+        assert!(text.contains("Create a local identity for Octos"));
         assert!(text.contains("Onboarding setup"));
         assert!(!text.contains("No session selected"));
         assert!(!text.contains("Work  sticky"));
@@ -13013,8 +13174,8 @@ mod tests {
         );
     }
 
-    /// Regression: the harness-row context `LineGauge` label (`ctx ~N%`) must
-    /// inherit the theme `surface` background. `LineGauge` paints its whole
+    /// Regression: the harness-row context `LineGauge` label (`ctx …/… ~N%`)
+    /// must inherit the theme `surface` background. `LineGauge` paints its whole
     /// area with the widget base style *before* writing the (unstyled) label,
     /// so without `.style(bg: surface)` the label cells fall back to the raw
     /// terminal background — a mismatched solid block on the right of the
@@ -13048,8 +13209,8 @@ mod tests {
         let palette = Palette::for_theme(ThemeName::Codex);
         let buffer = rendered_buffer_with_size(&app, palette, 120, 42);
 
-        // The gauge label is rendered on the harness row (the `ctx ~N%` text).
-        let label_style = style_for_text(&buffer, "ctx ~").expect("gauge label rendered");
+        // The gauge label is rendered on the harness row (the `ctx …` text).
+        let label_style = style_for_text(&buffer, "ctx ").expect("gauge label rendered");
         assert_eq!(
             label_style.bg,
             Some(palette.surface),
@@ -13059,10 +13220,10 @@ mod tests {
         // The whole gauge column (label + filled/unfilled line) must be a single
         // contiguous surface-backed band — no stray bg=Reset cells.
         let rows = rendered_rows(&buffer);
-        let gauge_row = row_index_containing(&rows, "ctx ~");
+        let gauge_row = row_index_containing(&rows, "ctx ");
         let width = usize::from(buffer.area.width);
         let row_start = gauge_row * width;
-        let first_label_col = rows[gauge_row].find("ctx ~").expect("label col");
+        let first_label_col = rows[gauge_row].find("ctx ").expect("label col");
         for x in first_label_col..width {
             let cell = &buffer.content[row_start + x];
             assert_eq!(
@@ -16713,8 +16874,8 @@ mod tests {
         let with = live_ui_height(&app, 80, 40);
         assert_eq!(
             with,
-            without + 1,
-            "the strip row must be reserved once agents exist"
+            without + 2,
+            "the vertical strip reserves a title row plus one row per agent"
         );
     }
 
@@ -16728,8 +16889,8 @@ mod tests {
         );
         assert_eq!(
             agent_strip_height(&app, 40),
-            1,
-            "one row once agents exist on a normal terminal"
+            2,
+            "title row + one agent row once agents exist on a normal terminal"
         );
     }
 
@@ -16841,10 +17002,10 @@ mod tests {
         let mut app = autonomy_app_state();
         let sid = app.active_session().unwrap().id.clone();
         app.upsert_session_agent(&sid, sample_agent("worker", "running"));
-        assert_eq!(agent_strip_height(&app, 40), 1, "shown in the inline flow");
+        assert_eq!(agent_strip_height(&app, 40), 2, "shown in the inline flow");
 
-        // In the pager the strip's Tab control is disabled and its extra row
-        // overcommits the `Min(8)` transcript layout, so it is dropped.
+        // In the pager the strip's Tab control is disabled and its extra rows
+        // overcommit the `Min(8)` transcript layout, so it is dropped.
         app.transcript_pager_active = true;
         assert_eq!(agent_strip_height(&app, 40), 0, "hidden under the pager");
     }
@@ -16859,22 +17020,113 @@ mod tests {
     }
 
     #[test]
-    fn agent_strip_chips_lists_main_and_marks_selection() {
+    fn agent_strip_height_scales_vertically_with_agents() {
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        app.upsert_session_agent(&sid, sample_agent("edison", "running"));
+        app.upsert_session_agent(&sid, sample_agent("thomas", "running"));
+        assert_eq!(
+            agent_strip_height(&app, 40),
+            3,
+            "title row + one row per agent"
+        );
+
+        for idx in 0..4 {
+            app.upsert_session_agent(&sid, sample_agent(&format!("extra-{idx}"), "running"));
+        }
+        assert_eq!(
+            agent_strip_height(&app, 40),
+            1 + AGENT_STRIP_MAX_AGENT_ROWS,
+            "agent rows are capped"
+        );
+
+        assert_eq!(
+            agent_strip_height(&app, AGENT_STRIP_MIN_TERMINAL_ROWS),
+            1,
+            "at the minimum height the strip degrades to the title row alone"
+        );
+        assert_eq!(
+            agent_strip_height(&app, AGENT_STRIP_MIN_TERMINAL_ROWS - 1),
+            0,
+            "below the minimum the strip stays hidden"
+        );
+
+        app.transcript_pager_active = true;
+        assert_eq!(agent_strip_height(&app, 40), 0, "hidden in the pager");
+    }
+
+    #[test]
+    fn agent_strip_window_keeps_selection_visible() {
         use crate::model::ChatViewTarget;
         let mut app = autonomy_app_state();
         let sid = SessionKey("local:test".into());
-        app.upsert_session_agent(&sid, sample_agent("weather", "running"));
-        app.upsert_session_agent(&sid, sample_agent("news", "completed"));
-        app.chat_view = ChatViewTarget::Agent("news".into());
+        for idx in 0..6 {
+            app.upsert_session_agent(&sid, sample_agent(&format!("ag-{idx}"), "running"));
+        }
 
-        let chips = agent_strip_chips(&app);
-        assert_eq!(chips.len(), 3, "main + two agents");
-        assert_eq!(chips[0].1, "main");
-        assert!(!chips[0].2, "main not selected");
-        assert_eq!(chips[1].1, "weather");
-        assert_eq!(chips[2].1, "news");
-        assert!(chips[2].2, "selected agent marked");
-        assert_eq!(chips[2].0, "✔", "completed glyph");
+        let (window, hidden) = agent_strip_window(&app, 4);
+        assert_eq!(window, 0..4, "main view shows the top of the roster");
+        assert_eq!(hidden, 2);
+
+        app.chat_view = ChatViewTarget::Agent("ag-5".into());
+        let (window, hidden) = agent_strip_window(&app, 4);
+        assert_eq!(window, 2..6, "window shifts to keep the selection visible");
+        assert_eq!(hidden, 2);
+    }
+
+    #[test]
+    fn agent_strip_lines_render_vertical_rows_with_detail() {
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        let mut edison = sample_agent("edison", "running");
+        edison.nickname = "Edison".into();
+        edison.last_task = Some("clone the repo\nsecond line ignored".into());
+        app.upsert_session_agent(&sid, edison);
+        app.upsert_session_agent(&sid, sample_agent("thomas", "completed"));
+
+        let lines = agent_strip_lines(&app, Palette::for_theme(ThemeName::Codex), 2);
+        let flat: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(flat.len(), 3, "title row + one row per agent");
+        assert!(flat[0].contains("main"), "title row carries the main chip");
+        assert!(
+            flat[1].contains("Edison") && flat[1].contains("running"),
+            "agent row shows name and raw status: {}",
+            flat[1]
+        );
+        assert!(
+            flat[1].contains("clone the repo") && !flat[1].contains("second line"),
+            "detail is the first non-empty line of the last task: {}",
+            flat[1]
+        );
+        assert!(
+            flat[2].contains("thomas") && flat[2].contains("completed"),
+            "second agent row present: {}",
+            flat[2]
+        );
+
+        // Overflow: six agents, four visible -> the title row carries +2.
+        for idx in 0..4 {
+            app.upsert_session_agent(&sid, sample_agent(&format!("extra-{idx}"), "running"));
+        }
+        let lines = agent_strip_lines(&app, Palette::for_theme(ThemeName::Codex), 4);
+        let title: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            title.contains("+2") || title.contains("2 个"),
+            "overflow marker names the hidden count: {title}"
+        );
+        assert_eq!(lines.len(), 5, "title + capped agent rows");
     }
 
     fn sample_loop(
@@ -17037,6 +17289,67 @@ mod tests {
         assert_eq!(format_tokens_k(2_000_000), "2000K");
         // No overflow / correct rounding at the u64 ceiling.
         assert_eq!(format_tokens_k(u64::MAX), "18446744073709552K");
+    }
+
+    #[test]
+    fn format_tokens_human_switches_to_millions_above_1m() {
+        // Below 1M it delegates to the K formatter, so a 128k/256k window in
+        // the `/context` subtitle reads the same way as the goal chip.
+        assert_eq!(format_tokens_human(0), "0K");
+        assert_eq!(format_tokens_human(45_231), "45K");
+        assert_eq!(format_tokens_human(128_000), "128K");
+        assert_eq!(format_tokens_human(256_000), "256K");
+        // The switch is on the raw value, not the rounded-K value, so a hair
+        // under 1M still renders in K (rounding up to `1000K`).
+        assert_eq!(format_tokens_human(999_999), "1000K");
+        // At/above 1M it switches to millions and drops a trailing `.0` so a
+        // 1,000,000-token window reads `1M`, not `1000K` or `1.0M`.
+        assert_eq!(format_tokens_human(1_000_000), "1M");
+        assert_eq!(format_tokens_human(1_500_000), "1.5M");
+        assert_eq!(format_tokens_human(2_000_000), "2M");
+    }
+
+    #[test]
+    fn context_window_usage_pairs_estimate_with_real_or_default_window() {
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+
+        // No token estimate for the session yet → nothing to render.
+        assert_eq!(context_window_usage(&app, &session_id), None);
+
+        app.context_lifecycle_mut(&session_id).state = Some(crate::model::ContextLifecycleState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: String::new(),
+            item_count: 10,
+            token_estimate: 64_000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        });
+
+        // No per-model window on the wire yet → pair the estimate with the
+        // fixed default so the subtitle still shows an honest fraction.
+        assert_eq!(
+            context_window_usage(&app, &session_id),
+            Some((64_000, DEFAULT_CONTEXT_WINDOW_TOKENS as u64)),
+        );
+
+        // Once the real window arrives it wins over the default.
+        app.session_context_window
+            .insert(session_id.clone(), 1_000_000);
+        assert_eq!(
+            context_window_usage(&app, &session_id),
+            Some((64_000, 1_000_000)),
+        );
+
+        // A zero window is treated as unknown and falls back to the default.
+        app.session_context_window.insert(session_id.clone(), 0);
+        assert_eq!(
+            context_window_usage(&app, &session_id),
+            Some((64_000, DEFAULT_CONTEXT_WINDOW_TOKENS as u64)),
+        );
     }
 
     #[test]
@@ -17336,8 +17649,8 @@ mod tests {
         assert!(text.contains("↓374"), "{text:?}");
         assert!(text.contains("$0.0123"), "{text:?}");
         assert!(
-            text.contains("ctx ~50%"),
-            "ctx % from token_estimate (approximate marker): {text:?}"
+            text.contains("ctx 64K/128K ~50%"),
+            "ctx used/max token counts + estimate percent: {text:?}"
         );
         // Context ratio drives the LineGauge (64000 / 128000 = 0.5).
         assert_eq!(harness_context_ratio(&app), Some(0.5));
@@ -17358,15 +17671,15 @@ mod tests {
             rendered.contains("Tab agents"),
             "composer hint not clobbered: {rendered:?}"
         );
-        // Regression (duplicate ctx%): on a wide terminal (rendered_text uses
-        // 120 cols, so the gauge column is drawn) the percent must render ONCE —
-        // as the LineGauge on the right, NOT also as the textual `· ctx ~N%`
-        // label on the left. Pre-fix this row showed both "· ctx ~50%" and
-        // "ctx ~50% ───" on the same line.
+        // Regression (duplicate ctx readout): on a wide terminal (rendered_text
+        // uses 120 cols, so the gauge column is drawn) the context label must
+        // render ONCE — as the LineGauge on the right, NOT also as the textual
+        // `· ctx …` label on the left. Pre-fix this row showed both "· ctx ~50%"
+        // and "ctx ~50% ───" on the same line.
         assert_eq!(
-            rendered.matches("ctx ~").count(),
+            rendered.matches("64K/128K").count(),
             1,
-            "ctx% must render exactly once (gauge only) on a wide terminal: {rendered:?}"
+            "ctx readout must render exactly once (gauge only) on a wide terminal: {rendered:?}"
         );
     }
 
@@ -17407,8 +17720,58 @@ mod tests {
             .map(|span| span.content.to_string())
             .collect();
         assert!(
-            text.contains("ctx ~25%"),
-            "ctx label must carry the approximate marker: {text:?}"
+            text.contains("ctx 32K/128K ~25%"),
+            "ctx label must carry the used/max counts and the approximate marker: {text:?}"
+        );
+    }
+
+    #[test]
+    fn harness_status_row_shows_used_over_max_against_real_window() {
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 0,
+                pending_continuations: 0,
+                phase: Some("working".into()),
+            },
+        );
+        app.context_lifecycle_mut(&session_id).state = Some(crate::model::ContextLifecycleState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: String::new(),
+            item_count: 10,
+            token_estimate: 128_000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        });
+        // Real per-model window on the wire → used/max reads against it, not the
+        // fixed default: 128K of a 1M window is an honest ~13%.
+        app.session_context_window
+            .insert(session_id.clone(), 1_000_000);
+
+        // Narrow terminal (text fallback) carries the full readout.
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex), true)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(
+            text.contains("ctx 128K/1M ~13%"),
+            "harness row shows used/max token counts + estimate percent: {text:?}"
+        );
+
+        // Wide terminal draws the same numbers in the gauge label.
+        let rendered = rendered_text(&app);
+        assert!(
+            rendered.contains("128K/1M"),
+            "wide gauge label carries the used/max counts: {rendered:?}"
         );
     }
 

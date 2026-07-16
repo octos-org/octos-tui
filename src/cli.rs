@@ -151,7 +151,14 @@ pub struct Cli {
 #[command(
     name = "octos-tui",
     version = env!("CARGO_PKG_VERSION"),
-    about = "Mock-backed Octos TUI prototype on the Octos UI Protocol boundary"
+    about = "Mock-backed Octos TUI prototype on the Octos UI Protocol boundary",
+    // These leading positionals are handled before clap (see `cmd::dispatch`),
+    // so they don't appear as clap subcommands above. (Profiles are created in
+    // the TUI — first-launch onboarding, or `/profiles` → "Create a new profile".)
+    after_help = "Subcommands:\n  \
+        doctor   Diagnose octos-tui's environment, install, and connectivity\n  \
+        update   Update octos-tui in place (or print the upgrade command)\n  \
+        config   Show or locate the TUI config file"
 )]
 struct CliArgs {
     /// JSON config file used as launch defaults. CLI flags override config values.

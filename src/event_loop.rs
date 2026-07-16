@@ -134,6 +134,17 @@ pub fn run(cli: Cli) -> Result<()> {
                 crate::profiles::discover_local_profile_ids(Some(stdio_command));
         }
     }
+    // In-TUI profiles surface (`/profiles`): resolve the on-disk data dir once so
+    // set-default / delete can operate on it, and seed the current default so the
+    // list can mark it. Local-solo only (a remote launch has no local data dir).
+    if let Some(data_dir) = cli
+        .stdio_command
+        .as_deref()
+        .and_then(|command| crate::profiles::solo_data_dir(Some(command)))
+    {
+        store.state.onboarding.default_profile = crate::profiles::read_default_profile(&data_dir);
+        store.state.onboarding.profiles_data_dir = Some(data_dir.to_string_lossy().into_owned());
+    }
     let mut input_state = TerminalInputState::default();
     let mut scrollback = ScrollbackTracker::new();
     // Force a draw on the first iteration.

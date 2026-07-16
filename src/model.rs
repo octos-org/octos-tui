@@ -2296,6 +2296,26 @@ pub struct OnboardingWizardState {
     /// first-ever run. Drives the 0/1/N [`StartupProfileDecision`] and populates
     /// the picker menu.
     pub available_profiles: Vec<String>,
+    /// In-TUI profiles surface: the machine default profile id (from the
+    /// `default-profile` pointer on disk), so the picker can mark it `*` and the
+    /// per-profile action menu can grey out "set default" for the current one.
+    /// Refreshed whenever the surface opens or a set-default/delete lands.
+    pub default_profile: Option<String>,
+    /// In-TUI profiles surface: the server data dir (parent of `profiles/`),
+    /// resolved once at launch from the stdio command. `None` for a remote
+    /// launch — set-default/delete are on-disk local-solo operations, so the
+    /// surface offers them only when this is known.
+    pub profiles_data_dir: Option<String>,
+    /// In-TUI profiles surface: the profile id the per-profile action menu (and
+    /// its delete confirm) is scoped to — set when the user picks a row in the
+    /// profiles list. `None` outside that drill-in.
+    pub selected_profile: Option<String>,
+    /// "Create a new profile" was chosen from the profiles surface: force the
+    /// onboarding wizard to the "Name this profile" create step even when a
+    /// session is active (whose profile would otherwise route the wizard to
+    /// provider-setup). Cleared once the new profile is created or the profiles
+    /// surface reopens.
+    pub creating_new_profile: bool,
     /// Per-project launch flow: the pending Activate / CrossProfile prompt for
     /// the `launch_prompt` menu, stashed when a `launch/resolve` decision needs
     /// the user to choose. `None` outside that prompt. See [`LaunchPromptState`].
@@ -2374,6 +2394,10 @@ impl Default for OnboardingWizardState {
             make_default: false,
             launch_profile_id: None,
             available_profiles: Vec::new(),
+            default_profile: None,
+            profiles_data_dir: None,
+            selected_profile: None,
+            creating_new_profile: false,
             launch_prompt: None,
             profile_id: None,
             local_profile_created: false,

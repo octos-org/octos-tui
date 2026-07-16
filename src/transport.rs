@@ -198,6 +198,18 @@ fn clean_auth_token(token: String) -> Option<String> {
     (!token.is_empty()).then(|| token.to_owned())
 }
 
+/// Stable marker the `octos serve` backend prints to stderr when it refuses to
+/// start because another serve already owns the data directory (redb is
+/// single-writer-single-process). We spawn `octos serve --stdio` as a child; on
+/// its exit we grep the captured stderr for this token to recognize the conflict
+/// and STOP relaunching — instead of respawning it in a silent crash-loop. MUST
+/// match the server verbatim (octos `commands/serve.rs` DATA_DIR_LOCKED_MARKER).
+const DATA_DIR_LOCKED_MARKER: &str = "OCTOS_DATA_DIR_LOCKED";
+
+/// User-facing explanation shown (once, as an error) when [`DATA_DIR_LOCKED_MARKER`]
+/// is seen — and the code the store keys on to render it terminally.
+const DATA_DIR_LOCKED_CODE: &str = "data_dir_locked";
+
 pub struct ProtocolAppUiBackend {
     launch: AppUiLaunch,
     runtime: Option<Runtime>,
@@ -206,6 +218,11 @@ pub struct ProtocolAppUiBackend {
     connection_state: ProtocolConnectionState,
     reconnect: ReconnectBackoff,
     disconnected_status_reported: bool,
+    /// Latched when the spawned backend refuses to start because another serve
+    /// owns the data dir ([`DATA_DIR_LOCKED_MARKER`]). While set, reconnect is
+    /// suppressed so we don't respawn a backend that will only crash again —
+    /// the fix for the "two octos-tui competing for the DB" silent crash-loop.
+    fatal_error: Option<String>,
     /// The session to re-open after a reconnect: the MOST RECENTLY opened
     /// session, which tracks the user's current selection (set by `/resume`, a
     /// tab-switch, or the initial launch open) — NOT the fixed launch
@@ -1410,6 +1427,7 @@ impl ProtocolAppUiBackend {
             connection_state: ProtocolConnectionState::Disconnected,
             reconnect: ReconnectBackoff::default(),
             disconnected_status_reported: false,
+            fatal_error: None,
             reopen_session: None,
             refresh_capabilities_on_reconnect: false,
             queue: VecDeque::new(),
@@ -1485,6 +1503,14 @@ impl ProtocolAppUiBackend {
             .is_some_and(ProtocolTransportDriver::is_connected)
         {
             return Ok(());
+        }
+
+        // Fatal, non-retryable: the backend refused to start because another
+        // serve owns the data dir. Never respawn — that was the crash-loop. The
+        // user-facing error was already emitted once in `mark_disconnected`; keep
+        // this return quiet (like the backoff gate below).
+        if let Some(reason) = &self.fatal_error {
+            return Err(eyre!("{reason}"));
         }
 
         // Backoff gate: `ensure_connected` runs on every event-loop tick and
@@ -1565,6 +1591,32 @@ impl ProtocolAppUiBackend {
 
     fn mark_disconnected(&mut self, message: impl Into<String>) {
         let message = message.into();
+
+        // The backend refused to start because another octos serve already owns
+        // this data directory (redb single-writer). Respawning it would only
+        // crash again — the silent ~5s loop the user hit with two octos-tui
+        // windows. Latch a fatal state (suppresses reconnect in
+        // `ensure_connected`) and surface one clear, terminal error INSTEAD OF
+        // the raw stderr status (suppressed below). Latch once so a
+        // backoff-driven repeat is quiet.
+        let is_fatal_conflict = message.contains(DATA_DIR_LOCKED_MARKER);
+        if is_fatal_conflict && self.fatal_error.is_none() {
+            let explanation =
+                "Another octos-tui is already running and using this data directory, so this \
+                 window can't start its own backend (the database allows only one at a time). \
+                 Close the other octos-tui window (or any `octos serve`), then restart this one. \
+                 To run two at once, start this one in a workspace with its own data directory."
+                    .to_string();
+            self.fatal_error = Some(explanation.clone());
+            self.queue.push_back(
+                AppUiEvent::Error(AppUiError {
+                    code: DATA_DIR_LOCKED_CODE.to_string(),
+                    message: explanation,
+                })
+                .into(),
+            );
+        }
+
         if let Some(driver) = self.driver.as_mut() {
             driver.disconnect();
         }
@@ -1580,8 +1632,13 @@ impl ProtocolAppUiBackend {
         self.connection_state = ProtocolConnectionState::Disconnected;
 
         if should_report {
-            self.queue
-                .push_back(AppUiEvent::Status(AppUiStatus { message }).into());
+            // Suppress the raw stderr-tail status for the fatal-conflict case:
+            // the clean, actionable error above is what the user should read, and
+            // a following Status would overwrite it in the status line.
+            if !is_fatal_conflict {
+                self.queue
+                    .push_back(AppUiEvent::Status(AppUiStatus { message }).into());
+            }
             self.disconnected_status_reported = true;
         }
         self.queue
@@ -7659,6 +7716,25 @@ mod tests {
         );
     }
 
+    /// End-to-end (real child process): when the spawned `octos serve` refuses to
+    /// start because another serve owns the data dir, it prints
+    /// `DATA_DIR_LOCKED_MARKER` to stderr and exits nonzero. That marker must
+    /// survive into the Disconnected message so `mark_disconnected` can latch the
+    /// fatal, no-reconnect state — this pins the driver→message seam that the
+    /// `mark_disconnected` unit test then keys on.
+    #[cfg(unix)]
+    #[test]
+    fn stdio_child_exit_preserves_data_dir_locked_marker() {
+        let (_frames, _errors, message) = drive_stdio_until_disconnect(&format!(
+            "echo '{DATA_DIR_LOCKED_MARKER}: another octos server already owns data directory /x' \
+             >&2; exit 1"
+        ));
+        assert!(
+            message.contains(DATA_DIR_LOCKED_MARKER),
+            "the data-dir-lock marker must reach the disconnect message: {message}"
+        );
+    }
+
     /// An oversized stdout line must surface as a non-fatal frame_too_large
     /// error and the stream must keep delivering subsequent lines.
     #[cfg(unix)]
@@ -8073,6 +8149,80 @@ mod tests {
         assert!(error.message.contains(methods::DIFF_PREVIEW_GET));
         assert!(error.message.contains(&request.id));
         assert!(error.message.contains("transport closed for test"));
+    }
+
+    /// Two octos-tui competing for the DB: the spawned backend refuses to start
+    /// (its stderr tail carries `DATA_DIR_LOCKED_MARKER`). The client must latch
+    /// a fatal state — surface ONE clean terminal error (not the raw stderr
+    /// status) and suppress reconnect so it stops the silent respawn crash-loop.
+    #[test]
+    fn data_dir_lock_conflict_latches_fatal_and_stops_reconnect() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        backend.mark_connected("wss://example.test/ui-protocol");
+
+        // The stdio child died at startup; its exit message carries the server's
+        // stable marker in the stderr tail.
+        backend.mark_disconnected(format!(
+            "UI protocol stdio child exited with exit status: 1; reconnect will relaunch on next \
+             send/read.\nstderr tail:\n{DATA_DIR_LOCKED_MARKER}: another octos server is already \
+             running for this data directory (/tmp/x)."
+        ));
+
+        // Exactly one user-facing event: the clean, actionable terminal error —
+        // the raw stderr Status is suppressed so it can't overwrite it.
+        let event = unwrap_app_event(backend.queue.pop_front().expect("a surfaced event"));
+        let AppUiEvent::Error(error) = event else {
+            panic!("data-dir conflict must surface as an Error, got: {event:?}");
+        };
+        assert_eq!(error.code, DATA_DIR_LOCKED_CODE);
+        assert!(
+            error.message.contains("Close the other octos-tui"),
+            "message must be the actionable explanation; got: {}",
+            error.message
+        );
+        assert!(
+            backend.queue.is_empty(),
+            "only the clean error should surface; the raw stderr Status must be suppressed",
+        );
+
+        // Latched fatal → reconnect refuses (no respawn = the loop is broken).
+        assert!(backend.fatal_error.is_some(), "fatal state must latch");
+        assert!(
+            backend.ensure_connected().is_err(),
+            "a latched data-dir conflict must never attempt to reconnect",
+        );
+    }
+
+    /// Regression guard: an ordinary transport disconnect (no marker) must NOT
+    /// latch fatal — it still reports a status and stays retryable, or a healthy
+    /// server restart would never reconnect.
+    #[test]
+    fn ordinary_disconnect_does_not_latch_fatal() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        backend.mark_connected("wss://example.test/ui-protocol");
+        backend.mark_disconnected("UI protocol stdio child exited with exit status: 0");
+
+        assert!(
+            backend.fatal_error.is_none(),
+            "a normal disconnect must stay retryable",
+        );
+        let event = unwrap_app_event(backend.queue.pop_front().expect("a status event"));
+        assert!(
+            matches!(event, AppUiEvent::Status(_)),
+            "a normal disconnect still reports its raw status",
+        );
     }
 
     #[test]

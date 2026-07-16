@@ -32,6 +32,11 @@ pub const MENU_ONBOARD_DONE: &str = "onboard-done";
 /// Phase 3 startup picker: "attach which profile?" shown at launch when more
 /// than one local profile exists and no `--profile-id` was pinned.
 pub const MENU_PROFILE_PICKER: &str = "profile-picker";
+/// Per-profile action drill-in from the profiles surface: use / set-default /
+/// delete for the profile the user selected.
+pub const MENU_PROFILE_ACTIONS: &str = "profile-actions";
+/// Yes/No confirm for the destructive profile delete.
+pub const MENU_PROFILE_DELETE_CONFIRM: &str = "profile-delete-confirm";
 /// Per-project launch prompt (Model A): the Activate / CrossProfile choice
 /// raised from a `launch/resolve` decision. See `launch_prompt_menu`.
 pub const MENU_LAUNCH_PROMPT: &str = "launch-prompt";
@@ -332,6 +337,11 @@ impl CommandRegistry {
         self.commands
             .iter()
             .filter_map(|command| {
+                // `menu_hidden` commands stay dispatchable (resolved by name) but
+                // are omitted from the `/` menu listing.
+                if command.availability.menu_hidden {
+                    return None;
+                }
                 let availability = self.evaluate(command, ctx);
                 availability.is_visible().then_some(VisibleCommand {
                     command,
@@ -553,6 +563,10 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             inline_args: InlineArgMode::None,
             entry: CommandEntry::LocalAction(LocalAction::Exit),
         },
+        // The full onboarding wizard stays dispatchable (first-launch drives it,
+        // and `/onboard <field>` inline sub-forms still resolve by name) but is
+        // hidden from a normal session's `/` menu — model changes go through the
+        // focused `/add-model` command below instead.
         CommandSpec {
             name: "onboard",
             aliases: &["setup", "wizard"],
@@ -560,7 +574,8 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             category: CommandCategory::Settings,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_session(SessionRequirement::Any)
-                .with_required_methods_any(APPUI_ONBOARDING_METHODS_ANY),
+                .with_required_methods_any(APPUI_ONBOARDING_METHODS_ANY)
+                .hidden_from_menu(),
             inline_args: InlineArgMode::Optional,
             entry: CommandEntry::LocalAction(LocalAction::Onboarding(
                 crate::model::OnboardingAction::Open,
@@ -579,10 +594,14 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
                 crate::model::OnboardingAction::OpenLogin,
             )),
         },
+        // The focused "add / change the profile's model" flow — the model-adding
+        // part of onboarding (provider family -> model -> route -> save), lifted
+        // out of the wizard. `provider`/`providers` remain aliases so existing
+        // muscle memory and `/provider <sub>` inline forms keep working.
         CommandSpec {
-            name: "provider",
-            aliases: &["providers"],
-            description: "command.provider.desc",
+            name: "add-model",
+            aliases: &["provider", "providers", "add_model"],
+            description: "command.add_model.desc",
             category: CommandCategory::Settings,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_session(SessionRequirement::Any)
@@ -638,6 +657,17 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             availability: CommandAvailability::app_ui_read(APPUI_BTW_METHODS_ALL),
             inline_args: InlineArgMode::Required,
             entry: CommandEntry::LocalAction(LocalAction::Btw),
+        },
+        CommandSpec {
+            name: "profiles",
+            aliases: &["profile"],
+            description: "command.profiles.desc",
+            category: CommandCategory::Session,
+            // Local-solo only: managing on-disk profiles (list/default/delete)
+            // makes sense where the client can see the data dir.
+            availability: CommandAvailability::app_ui_read(&[APPUI_METHOD_PROFILE_LOCAL_CREATE]),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::LocalAction(LocalAction::OpenProfilesSurface),
         },
         CommandSpec {
             name: "resume",
@@ -1238,11 +1268,14 @@ mod tests {
 
         assert!(visible.contains(&"status"));
         assert!(visible.contains(&"login"));
-        assert!(visible.contains(&"provider"));
+        assert!(visible.contains(&"add-model"));
         assert!(visible.contains(&"model"));
         assert!(visible.contains(&"skills"));
         assert!(!visible.contains(&"permissions"));
         assert!(!visible.contains(&"mcp"));
+        // The full onboarding wizard is dispatchable but hidden from the menu;
+        // model changes go through `/add-model` instead.
+        assert!(!visible.contains(&"onboard"));
     }
 
     #[test]

@@ -138,6 +138,7 @@ app:
     agent_task_prefix: "任务：%{task}"
     agent_strip_main: "主对话"
     agent_strip_title: " 智能体 "
+    agent_strip_more: "还有 %{count} 个（Tab 切换）"
     agent_no_output: "（暂无输出 —— 该智能体工作时会在此处流式输出结果）"
     menu: "菜单 | j/k 移动 | Enter 确认 | Esc 关闭"
     onboarding: "引导 | Enter 继续 | 输入可编辑字段"
@@ -296,6 +297,10 @@ onboarding:
     status_ok: "状态：正常（%{writable}%{toml}）"
     status_invalid: "状态：无效 — %{reason}"
   provider:
+    add_model_label: "添加模型"
+    add_model_desc: "为此档案配置 AI 模型：模型系列、模型、供应商线路和 API 密钥。"
+    add_another_model_label: "添加其他模型"
+    add_another_model_desc: "添加备用或其他模型：模型系列、模型、供应商线路和 API 密钥。"
     test: "测试连接"
     test_testing: "正在测试连接……"
     test_unavailable_saving: "保存期间无法测试"
@@ -364,7 +369,7 @@ onboarding:
     explain_now: "当前：%{title}"
     explain:
       language: "选择完成设置时 Octos 使用的语言。\n默认已选择 English。如果想让后续引导流程和应用立即切换为中文，请选择 中文。\n之后也可以使用 `/lang` 更改。"
-      profile: "Octos 需要一个本地档案，用于关联你的设置、供应商和历史记录。\n为此档案取一个简短的 ID（例如 glm 或 deepseek）后继续 —— 只需一次按键即可采用建议名称。（较旧的服务器会改为要求填写姓名、用户名和邮箱。）\n该档案仅保存在本机，不会发送任何信息。"
+      profile: "Octos 需要一个本地档案，用于关联你的设置、供应商和历史记录。\n为它取一个简短的名称（例如 work 或 research）后继续。名称只是一个标签——与你使用哪个模型无关；模型在下一步选择，也可随时通过 /add-model 添加或更改。（较旧的服务器会改为要求填写姓名、用户名和邮箱。）\n该档案仅保存在本机，不会发送任何信息。"
       provider: "选择驱动 Octos 的 AI 模型。\n先选模型系列（如 GPT、Claude），再选具体模型，最后选择提供该模型的供应商线路（官方或替代线路）。\n这决定了 Octos 与谁通信以及编码辅助的质量——之后可随时更改。"
       connect: "在依赖该模型之前，先确认它确实能够响应。\n粘贴你的供应商 API 密钥，然后运行实时测试。Octos 会发送一个小请求并报告成功或具体错误。\n这样能在此刻发现密钥错误或线路不对，而不是任务进行中才发现。"
       save: "将验证通过的供应商持久化到档案 JSON 中，以便重启后仍然可用。\n可将其保存为主供应商（或添加为备用）。保存前，该线路仅存在于当前会话中。\n保存后，工作区步骤即可解锁。"
@@ -398,6 +403,8 @@ onboarding:
 command:
   activity:
     desc: 搜索并过滤会话、任务和活动
+  add_model:
+    desc: 为档案添加或更改 AI 模型（模型系列、模型和供应商路由）。
   agents:
     desc: 查看或中断后端智能体
   aliases_label: 别名：
@@ -409,6 +416,8 @@ command:
     desc: 显示服务器报告的 token 和费用用量
   exit:
     desc: 退出 TUI
+  profiles:
+    desc: 管理本地档案——列出、设为默认、删除或新建。
   goal:
     desc: 查看、设置、暂停/恢复或清除持久化的会话目标
   help:
@@ -512,6 +521,7 @@ menu:
         desc: 使用模型生成更高质量的检查点摘要。
         label: 使用 LLM 摘要
     subtitle: 管理此会话的上下文窗口。
+    subtitle_usage: "%{used} / %{max} — 已用上下文窗口 %{pct}%"
     title: 上下文
     unavailable_no_session: 上下文控制需要已打开的 Octos UI 会话。
     unavailable_title: 上下文不可用
@@ -661,8 +671,13 @@ menu:
     footer: "回车选择 | Esc 关闭"
     item:
       ready:
-        label: "在此重新启动 Octos 以开始会话"
-        desc: "下次启动时，此文件夹将为你的大脑激活。"
+        label: "下一步：开始使用“%{profile}”的会话"
+        desc: "在此运行 `octos-tui`（此文件夹已为“%{profile}”激活），或在其他文件夹运行 `octos-tui --profile-id %{profile}`。"
+        label_generic: "下一步：开始一个会话"
+        desc_generic: "在此运行 `octos-tui` —— 此文件夹现已为你的大脑激活。"
+      open:
+        label: "立即在此打开会话"
+        desc: "立即在此文件夹使用“%{profile}”开始工作——无需重启。"
       exit:
         label: "关闭"
         desc: "退出引导。"
@@ -701,6 +716,43 @@ menu:
       create:
         label: "创建新档案"
         desc: "改为开始引导以创建全新的本地档案。"
+  profiles:
+    title: "档案"
+    subtitle: "管理你的本地档案——设为默认、删除或新建。"
+    footer: "回车 管理 | 上/下 移动 | Esc 关闭"
+    default_marker: "*默认"
+    preview_title: "档案"
+    preview_hint: "选择一个档案以查看其模型，并将其设为默认或删除。使用“创建新档案”来添加。"
+    item:
+      manage:
+        desc: "打开此档案——使用、设为默认或删除。"
+    actions:
+      title: "档案"
+      title_named: "档案：%{profile}"
+      subtitle: "使用此档案、设为默认或删除。"
+      none: "未选择档案。"
+      use: "在此打开会话"
+      use_desc: "切换到此档案——在当前文件夹打开（或恢复）其会话。"
+      set_default: "设为默认"
+      set_default_desc: "将其设为直接启动时打开的档案。"
+      already_default: "已是默认"
+      delete: "删除"
+      delete_desc: "删除此档案的配置和数据（会要求确认）。"
+      back: "返回"
+    info:
+      title: "关于此档案"
+      name: "档案：%{profile}"
+      model: "模型：%{model}"
+      no_model: "模型：尚未配置"
+      is_default: "默认：是——直接启动会打开它"
+      not_default: "默认：否"
+    delete:
+      title: "删除档案？"
+      title_named: "删除“%{profile}”？"
+      subtitle: "将删除此档案的配置及其所有数据，此操作无法撤销。"
+      yes: "是，删除 %{profile}"
+      yes_desc: "永久删除此档案及其数据。"
+      no: "否，保留"
   onboard:
     family:
       footer: 回车 选择系列 | Esc 返回
@@ -1124,6 +1176,14 @@ status:
   onboarding_profile_name_updated: "已更新引导档案名称"
   make_default_updated: "默认大脑偏好已更新"
   attached_profile: "已附加档案 %{profile}"
+  new_profile_launch: "正在创建新档案——先命名，再设置其 AI 模型"
+  profiles_no_data_dir: "无法在此管理档案——本次启动未知本地数据目录。"
+  profile_default_set: "默认档案现为 %{profile}"
+  profile_default_failed: "无法设置默认档案：%{error}"
+  profile_deleted: "已删除档案 %{profile}"
+  profile_delete_failed: "无法删除档案：%{error}"
+  profile_delete_active_blocked: "无法删除 %{profile}——这是当前会话正在使用的档案。请先切换到其他档案。"
+  switching_profile: "正在切换到档案 %{profile}……"
   provider_route_selected: "已选择供应商线路；请输入 API 密钥"
   provider_family_updated: "供应商模型系列已更新"
   provider_model_updated: "供应商模型已更新"
