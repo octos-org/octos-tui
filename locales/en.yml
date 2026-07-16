@@ -574,6 +574,8 @@ status:
   profile_delete_active_blocked: "Can't delete %{profile} — it's the profile this session is using. Switch to another profile first."
   switching_profile: "Switching to profile %{profile}…"
   provider_route_selected: "Provider route selected; enter API key"
+  provider_request_failed: "Provider request failed: %{message}"
+  provider_request_timeout: "Provider request timed out with no response — try again"
   provider_family_updated: "Provider family updated"
   provider_model_updated: "Provider model updated"
   provider_route_updated: "Provider route updated"

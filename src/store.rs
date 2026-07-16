@@ -56,6 +56,12 @@ const TASK_ARTIFACT_READ_LIMIT_BYTES: u64 = 4096;
 /// Long enough to read the outcome; short enough not to clutter idle
 /// sessions. See `Store::sweep_terminal_agents`.
 const AGENT_TERMINAL_LINGER: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a staged provider Test/Save/Fetch may stay pending with no
+/// response before the tick sweep clears it. A lost/withheld RPC response
+/// used to leave `provider_pending` set FOREVER — the staged model-config
+/// surface froze on "Testing connection…" with every edit and re-dispatch
+/// blocked. Generous: a real `profile/llm/test` does one provider roundtrip.
+const PROVIDER_PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long a staged-submit FIFO gate stays authoritative without its
 /// turn/started or terminal arriving. Past this, `submit_next_pending_if_idle`
 /// treats the marker as stale (the in-flight turn/start died in some way the
@@ -3695,8 +3701,20 @@ impl Store {
     /// model-config]` so Esc pops back to the `/model` list. Entry point for
     /// the (menu-hidden) `/add-model` command and its inline open/unknown
     /// verbs; the `/model` → "Add a model" row reaches the same surface via
-    /// the family→model→route chain instead.
+    /// the family→model→route chain (whose route pick also lands here).
     fn open_model_config_surface(&mut self) {
+        // The mid-session surface operates on the ACTIVE session's profile. A
+        // staged wizard `profile_id` left over from an earlier create/onboard
+        // outranks `current_profile` in `effective_profile_id`, so Test/Save
+        // would carry a profile the connection is NOT authenticated for and
+        // the server rejects with `auth_scope_violation` ("profile_id is
+        // outside the authenticated profile" — mini4). Align it on entry.
+        if let Some(active) = self.active_session_profile_id() {
+            let staged = self.state.onboarding.profile_id.as_deref();
+            if staged.is_some_and(|staged| staged != active.as_str()) {
+                self.state.onboarding.profile_id = Some(active);
+            }
+        }
         self.close_all_menus();
         self.open_menu(MenuId::from(crate::menu::registry::MENU_MODEL));
         self.open_menu(MenuId::from(crate::menu::registry::MENU_MODEL_CONFIG));
@@ -6442,6 +6460,35 @@ impl Store {
                     error.code.as_str(),
                     "transport_read" | "transport_send" | "malformed_frame"
                 );
+                // Same attribution scheme for the staged provider RPCs
+                // (Test / Save / Fetch models): the error format is
+                // "{method} request tui-N failed: …", so a message naming
+                // the method positively identifies the dead request; a
+                // wire-level break kills every in-flight request including
+                // this one. Clearing `provider_pending` here is what
+                // un-wedges the staged model-config surface — the flag gates
+                // re-dispatch AND every staged edit, so a failed test used
+                // to freeze the whole menu on "Testing connection…" forever
+                // (mini4: profile/llm/test rejected with auth_scope_violation
+                // → stuck spinner + "provider test already in progress").
+                let names_provider_rpc = [
+                    crate::model::APPUI_METHOD_PROFILE_LLM_TEST,
+                    crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
+                    crate::model::APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+                ]
+                .iter()
+                .any(|method| error.message.contains(method));
+                let cancels_in_flight_provider = self.state.onboarding.provider_pending.is_some()
+                    && (names_provider_rpc
+                        || matches!(error.code.as_str(), "transport_read" | "transport_send"));
+                if cancels_in_flight_provider {
+                    self.state.onboarding.provider_pending = None;
+                    self.state.onboarding.provider_pending_since = None;
+                    self.state.onboarding.last_message = Some(
+                        t!("status.provider_request_failed", message = error.message).into_owned(),
+                    );
+                    self.refresh_active_menu_if_open();
+                }
                 if cancels_in_flight_create && self.state.onboarding.local_profile_create_pending {
                     self.state.onboarding.local_profile_create_pending = false;
                     self.state.onboarding.local_profile_create_pending_username = None;
@@ -10007,6 +10054,35 @@ impl Store {
                 .prune_session_agents_by_ids(&session_id, &agent_ids);
         }
         pruned
+    }
+
+    /// Tick-driven timeout for the staged provider RPCs: when Test/Save/Fetch
+    /// stays pending past [`PROVIDER_PENDING_TIMEOUT`] with no response (lost
+    /// frame, hung provider, silently dropped request), clear the flag so the
+    /// staged surface un-freezes. The stamp is LOCAL and owned entirely by
+    /// this sweep — recorded the first tick the pending flag is observed,
+    /// dropped whenever the flag clears through any normal path (result,
+    /// error attribution). Returns true when it cleared a stuck flag.
+    pub fn sweep_provider_pending(&mut self, now: std::time::Instant) -> bool {
+        if self.state.onboarding.provider_pending.is_none() {
+            self.state.onboarding.provider_pending_since = None;
+            return false;
+        }
+        let since = *self
+            .state
+            .onboarding
+            .provider_pending_since
+            .get_or_insert(now);
+        if now.duration_since(since) < PROVIDER_PENDING_TIMEOUT {
+            return false;
+        }
+        self.state.onboarding.provider_pending = None;
+        self.state.onboarding.provider_pending_since = None;
+        self.state.onboarding.last_message =
+            Some(t!("status.provider_request_timeout").into_owned());
+        self.state.status = t!("status.provider_request_timeout").into_owned();
+        self.refresh_active_menu_if_open();
+        true
     }
 
     /// A new submit means the user moved on: drop the submitting session's
@@ -17185,6 +17261,138 @@ mod tests {
             "route pick outside the wizard lands on model-config over /model"
         );
         assert_eq!(store.state.onboarding.provider.family_id, "deepseek");
+    }
+
+    /// The mini4 wedge: `profile/llm/test` failed with an RPC error
+    /// (`auth_scope_violation`) but nothing cleared `provider_pending`, so the
+    /// staged surface froze on "Testing connection…" and blocked every retry
+    /// ("provider test already in progress"). A failure whose message names
+    /// the provider RPC must clear the pending flag.
+    #[test]
+    fn provider_rpc_error_clears_pending_flag() {
+        use octos_core::app_ui::AppUiError;
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_TEST]);
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Test);
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "permission_denied".into(),
+            message: "profile/llm/test request tui-15 failed: profile_id is outside the \
+                      authenticated profile"
+                .into(),
+        }));
+
+        assert_eq!(
+            store.state.onboarding.provider_pending, None,
+            "a failed provider RPC must un-wedge the staged surface"
+        );
+
+        // A retry can now dispatch (previously blocked by the stale flag).
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Save);
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "transport_read".into(),
+            message: "connection reset".into(),
+        }));
+        assert_eq!(
+            store.state.onboarding.provider_pending, None,
+            "a wire break kills every in-flight request — including the save"
+        );
+    }
+
+    /// Unrelated errors must NOT clear the flag while a response can still
+    /// arrive (mirrors the local-create attribution rule).
+    #[test]
+    fn unrelated_rpc_error_keeps_provider_pending() {
+        use octos_core::app_ui::AppUiError;
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_TEST]);
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Test);
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "malformed_frame".into(),
+            message: "UI protocol frame was not valid JSON".into(),
+        }));
+
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Test),
+            "recoverable noise must not misattribute to the provider RPC"
+        );
+    }
+
+    /// A provider RPC whose response never arrives at all (lost frame, hung
+    /// provider) times out via the tick sweep instead of pending forever.
+    #[test]
+    fn provider_pending_times_out_without_a_response() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_TEST]);
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Test);
+
+        let t0 = std::time::Instant::now();
+        assert!(!store.sweep_provider_pending(t0), "first sight only stamps");
+        assert!(
+            !store.sweep_provider_pending(
+                t0 + PROVIDER_PENDING_TIMEOUT - std::time::Duration::from_secs(1)
+            ),
+            "still inside the window"
+        );
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Test)
+        );
+
+        assert!(
+            store.sweep_provider_pending(
+                t0 + PROVIDER_PENDING_TIMEOUT + std::time::Duration::from_secs(1)
+            ),
+            "timeout elapsed -> cleared"
+        );
+        assert_eq!(store.state.onboarding.provider_pending, None);
+        assert!(
+            store.state.status.contains(
+                t!("status.provider_request_timeout")
+                    .split('%')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+            ) || !store.state.status.is_empty(),
+            "timeout surfaces a status"
+        );
+
+        // The stamp died with the flag: a NEW pending gets a fresh window.
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Test);
+        assert!(
+            !store.sweep_provider_pending(
+                t0 + PROVIDER_PENDING_TIMEOUT + std::time::Duration::from_secs(2)
+            ),
+            "fresh pending restamps instead of inheriting the expired window"
+        );
+    }
+
+    /// Entering the mid-session surface aligns a stale staged wizard
+    /// profile_id with the ACTIVE session's profile — otherwise Test/Save
+    /// carry a profile the connection is not authenticated for and the server
+    /// rejects with auth_scope_violation (the mini4 stuck-test root cause).
+    #[test]
+    fn model_config_entry_aligns_staged_profile_with_active_session() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.target = Some("ws://example.test/ui-protocol".into());
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+        ]));
+        // Stale wizard leftovers from an earlier /profiles create.
+        store.state.onboarding.profile_id = Some("freshly-created".into());
+
+        store.state.composer = "/add-model".into();
+        let _ = store.compose_command();
+
+        assert_eq!(
+            store.state.onboarding.profile_id.as_deref(),
+            Some("coding"),
+            "staged profile must follow the active session's profile"
+        );
     }
 
     /// The same route pick made INSIDE the wizard (wizard root in the stack)

@@ -2395,6 +2395,12 @@ pub struct OnboardingWizardState {
     pub provider_saved: bool,
     pub provider_tested: bool,
     pub provider_pending: Option<OnboardingProviderPending>,
+    /// When the in-flight Test/Save/Fetch was first OBSERVED pending — a LOCAL
+    /// `Instant` stamped lazily by `Store::sweep_provider_pending` (nothing
+    /// else writes it). Backs the no-response timeout: a lost RPC response
+    /// used to leave `provider_pending` set forever, freezing the staged
+    /// surface on "Testing connection…" with every edit blocked.
+    pub provider_pending_since: Option<std::time::Instant>,
     pub provider_save_target: Option<OnboardingProviderSaveTarget>,
     pub last_saved_provider_label: Option<String>,
     pub last_saved_provider_target: Option<OnboardingProviderSaveTarget>,
@@ -2444,6 +2450,7 @@ impl Default for OnboardingWizardState {
             provider_saved: false,
             provider_tested: false,
             provider_pending: None,
+            provider_pending_since: None,
             provider_save_target: None,
             last_saved_provider_label: None,
             last_saved_provider_target: None,
