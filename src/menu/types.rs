@@ -383,6 +383,10 @@ pub enum LocalAction {
     RequestDeleteProfile(String),
     /// Confirmed: delete the given profile (descriptor + data dir) from disk.
     ConfirmDeleteProfile(String),
+    /// Stage a configured model for removal and open its Yes/No confirm
+    /// (`/model` → "Remove a model…" picker row). The confirmed Yes row sends
+    /// `profile/llm/delete`.
+    RequestRemoveModel(Box<crate::model::ModelRemovalRequest>),
     Custom(&'static str),
 }
 

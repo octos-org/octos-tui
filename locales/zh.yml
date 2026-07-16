@@ -658,6 +658,9 @@ menu:
       add:
         label: "添加模型…"
         desc: "选择模型系列、模型和供应商路由，再粘贴 API 密钥 —— 与引导流程相同的分步配置。"
+      remove:
+        label: "移除模型…"
+        desc: "删除该档案已配置的某个模型（密钥失效或模型下线时）—— 若这是唯一模型，请先添加替代模型。"
       cached:
         label: 服务器模型列表
       empty:
@@ -667,6 +670,19 @@ menu:
     search: 筛选模型
     subtitle: 服务器返回的档案 LLM 模型。
     title: 模型
+  model_remove:
+    title: "移除模型"
+    subtitle: "选择要从该档案移除的已配置模型。"
+    item:
+      empty:
+        label: "没有已配置的模型"
+        desc: "请先在 /model 中刷新模型 —— 只能移除已配置的模型。"
+    confirm:
+      title: "移除 %{model}？"
+      subtitle: "从档案的 LLM 配置中删除该条目。此操作无法撤销。"
+      yes: "是，移除 %{model}"
+      yes_desc: "使用 profile/llm/delete；完成后模型列表会刷新。"
+      no: "否，保留"
   model_config:
     title: "添加模型"
     subtitle: "为该档案暂存一个模型：系列、模型、路由、API 密钥 —— 然后测试并保存。"

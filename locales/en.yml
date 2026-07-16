@@ -1080,6 +1080,9 @@ menu:
       add:
         label: "Add a model…"
         desc: "Pick a model family, model, and provider route, then paste an API key — the same staged flow as onboarding."
+      remove:
+        label: "Remove a model…"
+        desc: "Delete one of this profile's configured models (a broken key or retired model) — add a replacement first if it's the only one."
       cached:
         label: Server model list
       empty:
@@ -1089,6 +1092,19 @@ menu:
     search: Filter models
     subtitle: Server-returned profile LLM models.
     title: Model
+  model_remove:
+    title: "Remove a model"
+    subtitle: "Pick a configured model to remove from this profile."
+    item:
+      empty:
+        label: "No configured models"
+        desc: "Refresh models in /model first — only configured models can be removed."
+    confirm:
+      title: "Remove %{model}?"
+      subtitle: "Deletes this entry from the profile's LLM config. Cannot be undone."
+      yes: "Yes, remove %{model}"
+      yes_desc: "Uses profile/llm/delete; the model list refreshes when it completes."
+      no: "No, keep it"
   model_config:
     title: "Add a model"
     subtitle: "Stage a model for this profile: family, model, route, API key — then Test and Save."
