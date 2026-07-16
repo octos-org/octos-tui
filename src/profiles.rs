@@ -206,6 +206,12 @@ pub fn set_default_profile(data_dir: &Path, id: &str) -> std::io::Result<()> {
 /// (idempotent); a real removal error propagates.
 pub fn delete_profile(data_dir: &Path, id: &str) -> std::io::Result<()> {
     let profiles_dir = data_dir.join("profiles");
+    // Clear the machine default FIRST when it points at this profile, so a later
+    // failure removing the data dir can never leave a dangling `default-profile`
+    // pointing at a half-deleted (or gone) profile.
+    if read_default_profile(data_dir).as_deref() == Some(id) {
+        let _ = std::fs::remove_file(data_dir.join("default-profile"));
+    }
     let json = profiles_dir.join(format!("{id}.json"));
     match std::fs::remove_file(&json) {
         Ok(()) => {}
@@ -215,9 +221,6 @@ pub fn delete_profile(data_dir: &Path, id: &str) -> std::io::Result<()> {
     let dir = profiles_dir.join(id);
     if dir.is_dir() {
         std::fs::remove_dir_all(&dir)?;
-    }
-    if read_default_profile(data_dir).as_deref() == Some(id) {
-        let _ = std::fs::remove_file(data_dir.join("default-profile"));
     }
     Ok(())
 }

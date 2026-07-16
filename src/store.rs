@@ -1477,7 +1477,24 @@ impl Store {
             self.state.status = t!("status.profiles_no_data_dir").into_owned();
             return;
         };
-        match crate::profiles::set_default_profile(std::path::Path::new(&data_dir), id) {
+        let data_dir_path = std::path::Path::new(&data_dir);
+        // Guard against a stale menu (or a concurrent instance) making a
+        // since-deleted profile the machine default: only write the pointer to a
+        // profile that still exists on disk. On a miss, refresh so the surface
+        // reflects reality.
+        if !crate::profiles::enumerate_profile_ids(&data_dir_path.join("profiles"))
+            .iter()
+            .any(|existing| existing == id)
+        {
+            self.state.status =
+                t!("status.profile_default_failed", error = id.to_string()).into_owned();
+            self.refresh_profiles();
+            self.state.onboarding.selected_profile = None;
+            self.close_all_menus();
+            self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER));
+            return;
+        }
+        match crate::profiles::set_default_profile(data_dir_path, id) {
             Ok(()) => {
                 self.state.status =
                     t!("status.profile_default_set", profile = id.to_string()).into_owned();
@@ -1496,13 +1513,13 @@ impl Store {
     /// Delete the given profile from disk (guarding the profile the current
     /// session is using), refresh, and return to the profiles list.
     fn dispatch_delete_profile(&mut self, id: &str) {
-        // Never delete the profile the current session is running on — the
-        // backend has it loaded, and removing its files under a live session is
-        // unsafe. Switch away first. Use the NARROW active-session profile here,
-        // not `current_profile_for_onboarding` (which falls back through
-        // profile_llm_state / skills and would wrongly block a profile whose
-        // data merely happens to be loaded, e.g. after viewing it).
-        if self.active_session_profile().as_deref() == Some(id) {
+        // Never delete a profile that ANY open session is running on — the
+        // backend may have it loaded and removing its files under a live session
+        // is unsafe. Checks every open session (they accumulate across switches),
+        // by each session's runtime/own profile — NOT `current_profile_for_
+        // onboarding` (which falls back through loaded llm/skills state and would
+        // wrongly block a profile whose data merely happens to be loaded).
+        if self.profile_has_open_session(id) {
             self.state.status = t!(
                 "status.profile_delete_active_blocked",
                 profile = id.to_string()
@@ -2418,6 +2435,12 @@ impl Store {
 
         match action {
             OnboardingAction::Open => {
+                // Any onboarding open that is NOT the profiles-surface "Create a
+                // new profile" path (which sets this flag then opens the wizard
+                // directly, bypassing this handler) must clear a stale force-
+                // create intent — otherwise `/onboard` after Esc-ing out of a
+                // create wizard would wrongly render the create step.
+                self.state.onboarding.creating_new_profile = false;
                 // From the Phase 3 startup picker's "Create a new profile" row,
                 // replace the picker rather than stacking onboarding over it.
                 if self.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER) {
@@ -3504,18 +3527,21 @@ impl Store {
         self.refresh_active_menu_if_open();
     }
 
-    /// The profile the ACTIVE session is running on — its runtime status,
-    /// falling back to the session's own profile id. Narrow: unlike
-    /// [`Self::current_profile_for_onboarding`] it does NOT reach into loaded
-    /// `profile_llm_state` / skills, so it answers "what is this session using?"
-    /// rather than "what profile data is loaded?". `None` when no session.
-    fn active_session_profile(&self) -> Option<String> {
-        self.active_session().and_then(|session| {
-            self.state
+    /// True when `id` is the profile of ANY open session — not just the active
+    /// one. Sessions accumulate across profile switches ("Open a session here"
+    /// pushes a new one and leaves the previous open), and the backend may still
+    /// have them loaded, so deleting the profile of ANY of them would pull its
+    /// on-disk data out from under a live session. Narrow per session: the
+    /// runtime status's profile, falling back to the session's own profile id
+    /// (NOT the broad loaded-data resolver).
+    fn profile_has_open_session(&self, id: &str) -> bool {
+        self.state.sessions.iter().any(|session| {
+            let profile = self
+                .state
                 .runtime_status_for(&session.id)
                 .and_then(|status| status.profile_id.as_deref())
-                .or(session.profile_id.as_deref())
-                .map(str::to_owned)
+                .or(session.profile_id.as_deref());
+            profile == Some(id)
         })
     }
 
@@ -11273,6 +11299,59 @@ mod tests {
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
         }
+    }
+
+    fn open_session_on(profile: &str) -> SessionView {
+        SessionView {
+            id: SessionKey(format!("local:{profile}")),
+            title: profile.into(),
+            profile_id: Some(profile.into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        }
+    }
+
+    /// Regression (review #1): the delete guard must protect EVERY open session's
+    /// profile, not just the selected one — sessions accumulate across switches.
+    #[test]
+    fn profile_has_open_session_covers_non_active_sessions() {
+        // Two open sessions (work, glm); glm is the SELECTED (active) one.
+        let store = Store {
+            state: AppState::new(
+                vec![open_session_on("work"), open_session_on("glm")],
+                1,
+                "ready".into(),
+                None,
+                false,
+            ),
+        };
+        assert!(
+            store.profile_has_open_session("glm"),
+            "active session's profile"
+        );
+        assert!(
+            store.profile_has_open_session("work"),
+            "a NON-active but still-open session's profile is in use → must block delete"
+        );
+        assert!(
+            !store.profile_has_open_session("research"),
+            "a profile with no open session is deletable"
+        );
+    }
+
+    /// Regression (review #2): a stale `creating_new_profile` (set by "Create a
+    /// new profile", then the user Escapes out) must not force the create step
+    /// when onboarding is later opened via `/onboard` (OnboardingAction::Open).
+    #[test]
+    fn onboarding_open_clears_stuck_creating_new_profile() {
+        let mut store = store_with_empty_session();
+        store.state.onboarding.creating_new_profile = true; // simulate the stuck flag
+        store.dispatch_onboarding_action(crate::model::OnboardingAction::Open, None);
+        assert!(
+            !store.state.onboarding.creating_new_profile,
+            "opening onboarding via Open clears the stale force-create intent"
+        );
     }
 
     fn store_with_task(task_id: TaskId) -> Store {
