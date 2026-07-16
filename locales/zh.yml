@@ -139,6 +139,9 @@ app:
     agent_strip_main: "主对话"
     agent_strip_title: " 智能体 "
     agent_strip_more: "还有 %{count} 个（Tab 切换）"
+    agent_dock_pill: "🐙 %{count} 个智能体 · %{running} 运行中"
+    agent_dock_pill_unread: " · %{count}● 未读"
+    agent_dock_toggle_hint: "Alt+G"
     agent_no_output: "（暂无输出 —— 该智能体工作时会在此处流式输出结果）"
     menu: "菜单 | j/k 移动 | Enter 确认 | Esc 关闭"
     onboarding: "引导 | Enter 继续 | 输入可编辑字段"
@@ -414,6 +417,8 @@ command:
     desc: 将最近一条助手回复复制到剪贴板（支持 SSH 环境）。
   cost:
     desc: 显示服务器报告的 token 和费用用量
+  dock:
+    desc: 子智能体停靠栏——切换视图、查看未读结果、折叠或展开。
   exit:
     desc: 退出 TUI
   profiles:
@@ -477,6 +482,22 @@ lang:
   unknown: 未知语言 '%{value}'。可选：en、zh。
   usage: 当前语言：%{current}。用法：/lang <en|zh>。
 menu:
+  agents:
+    item:
+      dock_collapse:
+        label: 折叠为摘要条
+      dock_expand:
+        label: 展开为逐个智能体行
+      dock_toggle:
+        desc: 等同于 Alt+G。
+      main:
+        desc: 在主窗格显示会话记录。
+        label: 主会话
+      viewing_marker: （正在查看）
+    subtitle: "%{count} 个智能体 · %{running} 运行中 · %{unread} 未读"
+    title: 子智能体
+    unavailable_empty: 本会话还没有子智能体——当模型派生工作智能体时会出现在这里。
+    unavailable_title: 子智能体停靠栏
   availability:
     approval_has_focus: 审批弹窗正占用键盘焦点
     blocked_read_only: 只读模式下已阻止

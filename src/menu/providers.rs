@@ -79,6 +79,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::CompactConfirm,
         Provider::Context,
         Provider::Resume,
+        Provider::Agents,
         Provider::Rewind,
         Provider::Model,
         Provider::ModelConfig,
@@ -122,6 +123,7 @@ enum Provider {
     CompactConfirm,
     Context,
     Resume,
+    Agents,
     Rewind,
     Model,
     ModelConfig,
@@ -160,6 +162,7 @@ impl MenuProvider for Provider {
             Self::CompactConfirm => MENU_COMPACT_CONFIRM,
             Self::Context => MENU_CONTEXT,
             Self::Resume => MENU_RESUME,
+            Self::Agents => crate::menu::registry::MENU_AGENTS,
             Self::Rewind => MENU_REWIND,
             Self::Model => MENU_MODEL,
             Self::ModelConfig => MENU_MODEL_CONFIG,
@@ -198,6 +201,7 @@ impl MenuProvider for Provider {
             Self::CompactConfirm => compact_confirm_menu(ctx),
             Self::Context => context_menu(ctx),
             Self::Resume => resume_menu(ctx),
+            Self::Agents => agents_menu(ctx),
             Self::Rewind => rewind_menu(ctx),
             Self::Model => model_menu(ctx),
             Self::ModelConfig => model_config_menu(ctx),
@@ -1040,6 +1044,114 @@ fn context_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 /// then one selectable row per prior session — picking a row switches to it and
 /// hydrates its transcript. Modeled on `cost_menu`'s fetch-then-refresh async
 /// pattern; strings are plain English (no new i18n keys), mirroring `/copy`.
+/// `/agents` picker (#323): one row per sub-agent in the active session's
+/// roster — status glyph, name, status, unread dot — Enter switches the main
+/// pane to that agent's live view. Plus a "back to session" row and the Agent
+/// Dock collapse/expand toggle. Purely local: reads the client-side roster
+/// mirror, no AppUI round-trip.
+fn agents_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    if ctx.app.agents.is_empty() {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(crate::menu::registry::MENU_AGENTS),
+            title: t!("menu.agents.unavailable_title").into_owned(),
+            message: t!("menu.agents.unavailable_empty").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        });
+    }
+
+    let mut items = vec![
+        MenuItem::new(
+            "agents.main",
+            format!("⌂ {}", t!("menu.agents.item.main.label")),
+            MenuAction::Local(LocalAction::SwitchChatView(None)),
+        )
+        .with_description(t!("menu.agents.item.main.desc").into_owned()),
+    ];
+    for agent in ctx.app.agents {
+        let name = if agent.nickname.trim().is_empty() {
+            agent.role.clone()
+        } else {
+            agent.nickname.clone()
+        };
+        let unseen = ctx
+            .app
+            .unseen_agent_ids
+            .iter()
+            .any(|id| id == &agent.agent_id);
+        let viewing = ctx.app.chat_view_agent_id == Some(agent.agent_id.as_str());
+        let mut label = format!(
+            "{} {name} — {}",
+            crate::app::agent_status_glyph(&agent.status),
+            agent.status
+        );
+        if unseen {
+            label.push_str(" ●");
+        }
+        if viewing {
+            label.push_str(&format!(" {}", t!("menu.agents.item.viewing_marker")));
+        }
+        let description = [
+            agent.last_task.as_deref(),
+            agent.summary.as_deref(),
+            Some(agent.role.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|text| text.lines())
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string();
+        items.push(
+            MenuItem::new(
+                format!("agents.switch.{}", agent.agent_id),
+                label,
+                MenuAction::Local(LocalAction::SwitchChatView(Some(agent.agent_id.clone()))),
+            )
+            .with_description(description),
+        );
+    }
+    items.push(
+        MenuItem::new(
+            "agents.dock.toggle",
+            if ctx.app.agent_dock_collapsed {
+                t!("menu.agents.item.dock_expand.label").into_owned()
+            } else {
+                t!("menu.agents.item.dock_collapse.label").into_owned()
+            },
+            MenuAction::Local(LocalAction::ToggleAgentDock),
+        )
+        .with_description(t!("menu.agents.item.dock_toggle.desc").into_owned()),
+    );
+
+    let running = ctx
+        .app
+        .agents
+        .iter()
+        .filter(|agent| !crate::model::agent_status_is_terminal(&agent.status))
+        .count();
+    let subtitle = t!(
+        "menu.agents.subtitle",
+        count = ctx.app.agents.len().to_string(),
+        running = running.to_string(),
+        unread = ctx.app.unseen_agent_ids.len().to_string(),
+    )
+    .into_owned();
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_AGENTS),
+        title: t!("menu.agents.title").into_owned(),
+        subtitle: Some(subtitle),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
 fn resume_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     if ctx.app.resume_sessions.is_empty() {
         // Distinguish "the fetch already returned zero sessions" from "the fetch
@@ -8240,6 +8352,111 @@ mod tests {
             .find(|item| item.id == "cost.estimated")
             .expect("cost item");
         assert_eq!(cost.description.as_deref(), Some("$0.0025"));
+    }
+
+    fn dock_agent(id: &str, status: &str) -> octos_core::ui_protocol::UiAgentRecord {
+        octos_core::ui_protocol::UiAgentRecord {
+            agent_id: id.into(),
+            parent_agent_id: None,
+            session_id: octos_core::SessionKey("local:test".into()),
+            task_id: None,
+            path: "/root".into(),
+            role: "worker".into(),
+            nickname: id.into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: status.into(),
+            last_task: Some("review the repo".into()),
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    /// `/dock` picker (#323): a row per roster agent with a SwitchChatView
+    /// action, a back-to-main row, the dock toggle, and unread/viewing
+    /// markers; Unavailable when the roster is empty.
+    #[test]
+    fn agents_menu_lists_roster_with_switch_and_toggle() {
+        let agents = vec![
+            dock_agent("edison", "running"),
+            dock_agent("thomas", "completed"),
+        ];
+        let unseen = vec!["thomas".to_string()];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                agents: &agents,
+                unseen_agent_ids: &unseen,
+                chat_view_agent_id: Some("edison"),
+                agent_dock_collapsed: false,
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(agents_menu(&ctx));
+
+        assert!(spec.items.iter().any(|item| item.id == "agents.main"));
+        let edison = spec
+            .items
+            .iter()
+            .find(|item| item.id == "agents.switch.edison")
+            .expect("edison row");
+        assert!(
+            matches!(
+                &edison.action,
+                MenuAction::Local(LocalAction::SwitchChatView(Some(id))) if id == "edison"
+            ),
+            "row action switches the chat view"
+        );
+        assert!(
+            edison.label.contains("（正在查看）") || edison.label.contains("(viewing)"),
+            "current view row is marked: {}",
+            edison.label
+        );
+        let thomas = spec
+            .items
+            .iter()
+            .find(|item| item.id == "agents.switch.thomas")
+            .expect("thomas row");
+        assert!(
+            thomas.label.contains('●'),
+            "unread row dotted: {}",
+            thomas.label
+        );
+        assert!(
+            spec.items.iter().any(|item| item.id == "agents.dock.toggle"
+                && matches!(item.action, MenuAction::Local(LocalAction::ToggleAgentDock))),
+            "dock toggle row present"
+        );
+        let subtitle = spec.subtitle.expect("subtitle");
+        assert!(
+            subtitle.contains('2') && subtitle.contains('1'),
+            "subtitle carries counts: {subtitle}"
+        );
+    }
+
+    #[test]
+    fn agents_menu_unavailable_when_roster_empty() {
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot::default(),
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        assert!(
+            matches!(agents_menu(&ctx), MenuBuildResult::Unavailable(_)),
+            "empty roster renders the placeholder"
+        );
     }
 
     #[test]

@@ -55,6 +55,7 @@ pub const MENU_MODEL: &str = "model";
 pub const MENU_COST: &str = "cost";
 /// `/resume` session picker menu.
 pub const MENU_RESUME: &str = "resume";
+pub const MENU_AGENTS: &str = "agents";
 /// `/rewind` turn picker menu.
 pub const MENU_REWIND: &str = "rewind";
 pub const MENU_STATUS: &str = "status";
@@ -682,6 +683,22 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             entry: CommandEntry::LocalAction(LocalAction::OpenProfilesSurface),
         },
         CommandSpec {
+            // `/agents` is taken by the M15-E autonomy command below (server
+            // `agent/*` RPCs, feature-gated); the DOCK picker is the local
+            // roster surface, so it gets its own name.
+            name: "dock",
+            aliases: &["ag"],
+            description: "command.dock.desc",
+            category: CommandCategory::Session,
+            // Purely local: the picker reads the client-side roster mirror
+            // (agent/updated upserts) and switches the main-pane view; no
+            // AppUI method is invoked, so it is available everywhere. The
+            // menu itself renders Unavailable when the roster is empty.
+            availability: CommandAvailability::always(),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::OpenMenu(MenuId::from(MENU_AGENTS)),
+        },
+        CommandSpec {
             name: "resume",
             aliases: &["sessions"],
             description: "Switch to a prior session and reload its transcript.",
@@ -977,6 +994,13 @@ mod tests {
 
         // Name + alias resolve, and the verb is history-safe (recorded for
         // Up-recall, checked on the canonical name so `/sessions` is covered).
+        let dock = registry.find("dock").expect("/dock is registered");
+        assert_eq!(dock.name, "dock");
+        assert_eq!(
+            registry.find("ag").map(|command| command.name),
+            Some("dock"),
+            "/ag aliases the dock picker"
+        );
         let resume = registry.find("resume").expect("/resume is registered");
         assert_eq!(resume.name, "resume");
         assert!(resume.history_safe(), "/resume must be history-safe");

@@ -280,6 +280,13 @@ impl AppUiActionKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocalAction {
+    /// Switch the main pane to a sub-agent's live view (`Some(agent_id)`) or
+    /// back to the session transcript (`None`) — the `/agents` picker's row
+    /// action (#323).
+    SwitchChatView(Option<String>),
+    /// Toggle the Agent Dock between the summary pill and per-agent rows
+    /// (#323); same effect as Alt+D.
+    ToggleAgentDock,
     ShowProcessStatus,
     ActivityNavigator,
     StopActiveTurn,
@@ -718,6 +725,17 @@ pub struct MenuAppSnapshot<'a> {
     /// the live `used / max (pct%)` context-window usage. `None` until a token
     /// estimate is known for the session.
     pub context_window_usage: Option<(u64, u64)>,
+    /// Active-session sub-agent roster for the `/agents` picker (#323),
+    /// mirrored from `AppState::active_session_agents`.
+    pub agents: &'a [octos_core::ui_protocol::UiAgentRecord],
+    /// Agent ids with unread terminal outcomes (Agent Dock badges, #323).
+    pub unseen_agent_ids: &'a [String],
+    /// The agent currently shown in the main pane, when peeking one —
+    /// lets the picker mark the active row.
+    pub chat_view_agent_id: Option<&'a str>,
+    /// Whether the Agent Dock is collapsed to its summary pill, so the
+    /// picker's toggle row can label itself expand vs collapse.
+    pub agent_dock_collapsed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
