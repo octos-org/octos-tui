@@ -396,6 +396,9 @@ pub enum SessionGoalSetAction {
     Pause,
     /// `/goal resume` — resume a paused goal.
     Resume,
+    /// `/goal stop` — mark the goal complete (user-owned terminal
+    /// transition; autonomous continuations end).
+    Stop,
 }
 
 /// `session/goal/set` wire shape (UPCR-2026-021 §"Goal Runtime Surface").

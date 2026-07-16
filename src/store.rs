@@ -904,6 +904,13 @@ impl Store {
                 crate::model::SessionGoalSetAction::Resume,
                 "resume",
             ),
+            GoalCommand::Stop => self.start_goal_transition(
+                session_id,
+                profile_id,
+                "complete",
+                crate::model::SessionGoalSetAction::Stop,
+                "stop",
+            ),
             GoalCommand::Clear => {
                 if !self
                     .require_mutating_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_CLEAR)
@@ -1040,7 +1047,9 @@ impl Store {
             .ok_or(None)?
             .clone();
         match goal.status.as_str() {
-            "active" | "paused" | "budget_limited" => Ok(goal),
+            // `blocked` (#1693 circuit breaker) is user-recoverable:
+            // resume forgives the failure streak, stop completes it.
+            "active" | "paused" | "budget_limited" | "blocked" => Ok(goal),
             other => Err(Some(other.to_string())),
         }
     }
@@ -6025,7 +6034,10 @@ impl Store {
                 return None;
             }
         };
-        if !matches!(goal.status.as_str(), "active" | "paused" | "budget_limited") {
+        if !matches!(
+            goal.status.as_str(),
+            "active" | "paused" | "budget_limited" | "blocked"
+        ) {
             self.state.status =
                 t!("status.cannot_transition_goal_state", state = goal.status).into_owned();
             return None;
@@ -6033,9 +6045,23 @@ impl Store {
         let verb = match pending.action {
             crate::model::SessionGoalSetAction::Pause => t!("status.goal_verb_pausing"),
             crate::model::SessionGoalSetAction::Resume => t!("status.goal_verb_resuming"),
+            crate::model::SessionGoalSetAction::Stop => t!("status.goal_verb_stopping"),
             crate::model::SessionGoalSetAction::Set => t!("status.goal_verb_updating"),
         };
         self.state.status = t!("status.verb_goal", verb = verb).into_owned();
+        // Resuming a goal that is still over its budget re-activates it but
+        // the scheduler will never fire (token gate) — tell the user how to
+        // actually un-freeze it instead of leaving a silently idle goal.
+        if matches!(pending.action, crate::model::SessionGoalSetAction::Resume)
+            && goal.token_budget > 0
+            && goal.tokens_used >= goal.token_budget
+        {
+            self.state.status = t!(
+                "status.goal_resume_over_budget",
+                objective = goal.objective.clone()
+            )
+            .into_owned();
+        }
         Some(AppUiCommand::SetSessionGoal(
             crate::model::SessionGoalSetParams {
                 session_id: pending.session_id,
@@ -8604,6 +8630,14 @@ impl Store {
             UiNotification::SessionGoalUpdated(event) => {
                 let objective = event.goal.objective.clone();
                 let status_label = event.goal.status.clone();
+                // Toast every STATUS TRANSITION distinctly — the chip
+                // repaints silently, so without this the user never learns
+                // the goal was frozen/blocked until they look (#329).
+                let previous_status = self
+                    .state
+                    .session_autonomy_for(&event.session_id)
+                    .and_then(|entry| entry.goal.as_ref())
+                    .map(|goal| goal.status.clone());
                 self.state.set_session_goal(
                     &event.session_id,
                     Some(event.goal.clone()),
@@ -8612,9 +8646,23 @@ impl Store {
                 self.state.push_activity(ActivityItem::new(
                     ActivityKind::Progress,
                     t!("status.activity_session_goal").into_owned(),
-                    status_label,
+                    status_label.clone(),
                 ));
-                self.state.status = format!("Goal updated: {objective}");
+                let transitioned = previous_status.as_deref() != Some(status_label.as_str());
+                self.state.status = if transitioned {
+                    match status_label.as_str() {
+                        "blocked" => t!("status.goal_now_blocked").into_owned(),
+                        "budget_limited" => {
+                            t!("status.goal_now_budget_limited", objective = objective).into_owned()
+                        }
+                        "paused" => t!("status.goal_now_paused").into_owned(),
+                        "complete" => t!("status.goal_now_complete").into_owned(),
+                        "active" => t!("status.goal_now_active").into_owned(),
+                        other => t!("status.goal_now_status", status = other).into_owned(),
+                    }
+                } else {
+                    format!("Goal updated: {objective}")
+                };
                 None
             }
             UiNotification::SessionGoalCleared(event) => {
@@ -27487,6 +27535,160 @@ mod tests {
             .expect("resume stages a transition");
         assert_eq!(pending.status, "active");
         assert_eq!(pending.action, crate::model::SessionGoalSetAction::Resume);
+    }
+
+    /// `/goal stop` stages a user-owned terminal transition to `complete`
+    /// through the same get-then-set dance as pause/resume, and works from
+    /// `blocked` (the #1693 circuit-breaker state).
+    #[test]
+    fn goal_stop_stages_complete_transition_from_blocked() {
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.state.set_session_goal(
+            &session_id,
+            Some(octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some("coding".into()),
+                goal_id: "goal_01".into(),
+                objective: "stuck work".into(),
+                status: "blocked".into(),
+                token_budget: 1000,
+                tokens_used: 10,
+                time_used_seconds: 5,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }),
+            Some("backend".into()),
+        );
+        store.state.composer = "/goal stop".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::GetSessionGoal(params) => {
+                assert_eq!(params.session_id, session_id);
+            }
+            other => panic!("expected GetSessionGoal, got {other:?}"),
+        }
+        let pending = store
+            .state
+            .pending_goal_transition
+            .as_ref()
+            .expect("stop stages a transition");
+        assert_eq!(pending.status, "complete");
+        assert_eq!(pending.action, crate::model::SessionGoalSetAction::Stop);
+
+        // The refreshed goal (still blocked) must yield the follow-up set
+        // with status=complete and the SERVER objective.
+        let command = store.consume_pending_goal_transition(
+            &session_id,
+            Some(&octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some("coding".into()),
+                goal_id: "goal_01".into(),
+                objective: "server truth".into(),
+                status: "blocked".into(),
+                token_budget: 1000,
+                tokens_used: 10,
+                time_used_seconds: 5,
+                created_at_ms: 1,
+                updated_at_ms: 3,
+            }),
+        );
+        match command.expect("set dispatched") {
+            AppUiCommand::SetSessionGoal(params) => {
+                assert_eq!(params.status.as_deref(), Some("complete"));
+                assert_eq!(params.objective, "server truth");
+                assert_eq!(params.action, crate::model::SessionGoalSetAction::Stop);
+            }
+            other => panic!("expected SetSessionGoal, got {other:?}"),
+        }
+    }
+
+    /// Resuming a goal that is still over budget re-activates it server-side
+    /// but the scheduler will never fire — the status line must say how to
+    /// actually un-freeze it (raise the budget), not read as a silent no-op.
+    #[test]
+    fn goal_resume_over_budget_hints_budget_raise() {
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        let over_budget = octos_core::ui_protocol::UiGoalRecord {
+            profile_id: Some("coding".into()),
+            goal_id: "goal_01".into(),
+            objective: "big refactor".into(),
+            status: "budget_limited".into(),
+            token_budget: 1000,
+            tokens_used: 1200,
+            time_used_seconds: 60,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        store.state.set_session_goal(
+            &session_id,
+            Some(over_budget.clone()),
+            Some("backend".into()),
+        );
+        store.state.composer = "/goal resume".into();
+        let _ = store.compose_command().expect("stages the transition");
+        let command = store.consume_pending_goal_transition(&session_id, Some(&over_budget));
+        assert!(command.is_some(), "resume still dispatches the set");
+        assert!(
+            store.state.status.contains("--budget"),
+            "over-budget resume must hint the budget raise: {}",
+            store.state.status
+        );
+    }
+
+    /// Every goal STATUS TRANSITION surfaces a status-line toast (#329) —
+    /// the chip repaints silently, so a frozen/blocked goal used to go
+    /// unnoticed. Same-status updates keep the generic message.
+    #[test]
+    fn goal_status_transitions_toast_distinctly() {
+        use octos_core::ui_protocol::{SessionGoalUpdatedEvent, UiGoalRecord};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        let goal = |status: &str| UiGoalRecord {
+            profile_id: Some("coding".into()),
+            goal_id: "goal_01".into(),
+            objective: "long task".into(),
+            status: status.into(),
+            token_budget: 1000,
+            tokens_used: 100,
+            time_used_seconds: 10,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionGoalUpdated(
+            SessionGoalUpdatedEvent {
+                session_id: session_id.clone(),
+                profile_id: Some("coding".into()),
+                goal: goal("active"),
+                transition_actor: "user".into(),
+            },
+        )));
+        // active -> blocked: distinct toast with the recovery hint.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionGoalUpdated(
+            SessionGoalUpdatedEvent {
+                session_id: session_id.clone(),
+                profile_id: Some("coding".into()),
+                goal: goal("blocked"),
+                transition_actor: "backend".into(),
+            },
+        )));
+        assert!(
+            store.state.status.contains("/goal resume"),
+            "blocked toast must carry the recovery hint: {}",
+            store.state.status
+        );
+        // blocked -> blocked (same status): generic update message.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionGoalUpdated(
+            SessionGoalUpdatedEvent {
+                session_id: session_id.clone(),
+                profile_id: Some("coding".into()),
+                goal: goal("blocked"),
+                transition_actor: "backend".into(),
+            },
+        )));
+        assert!(
+            store.state.status.starts_with("Goal updated:"),
+            "same-status update keeps the generic message: {}",
+            store.state.status
+        );
     }
 
     #[test]

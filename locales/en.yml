@@ -91,6 +91,11 @@ app:
     loops_running: "Loops: %{count} active"
     loops_paused_suffix: " · %{count} paused"
     goal_meta: " (%{status} · %{used}/%{budget} tokens)"
+    status_active: "active"
+    status_paused: "paused"
+    status_budget_limited: "budget limited"
+    status_blocked: "blocked"
+    status_complete: "complete"
   statusbar:
     agents: "%{count} agents"
     re_entering: "re-entering"
@@ -747,7 +752,15 @@ status:
   cannot_transition_goal_state: "Cannot transition goal in `%{state}` state (model-owned)."
   goal_verb_pausing: "Pausing"
   goal_verb_resuming: "Resuming"
+  goal_verb_stopping: "Stopping"
   goal_verb_updating: "Updating"
+  goal_resume_over_budget: "Goal resumed but still over budget — it will not fire until you raise it: /goal %{objective} --budget <N>"
+  goal_now_active: "Goal active — autonomous continuations resume"
+  goal_now_paused: "Goal paused — no autonomous continuations until /goal resume"
+  goal_now_blocked: "Goal blocked after repeated failed turns — /goal resume to retry, /goal stop to end it"
+  goal_now_budget_limited: "Goal budget exhausted — wrapping up; raise with /goal %{objective} --budget <N>"
+  goal_now_complete: "Goal complete"
+  goal_now_status: "Goal status: %{status}"
   verb_goal: "%{verb} goal"
   local_create_cancelled_transport: "Local profile create cancelled by transport error [%{code}]: %{message}"
   local_create_cancelled: "Local profile create cancelled [%{code}]: %{message}"
@@ -850,7 +863,7 @@ command:
   profiles:
     desc: Manage local profiles — list, set the default, delete, or create one.
   goal:
-    desc: View, set, pause, resume, or clear the persisted session goal.
+    desc: View, set, pause, resume, stop, or clear the persisted session goal.
   help:
     desc: Show available commands.
   keymap:

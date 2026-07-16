@@ -82,6 +82,11 @@ app:
     loops_running: "循环：%{count} 个活动中"
     loops_paused_suffix: " · %{count} 个已暂停"
     goal_meta: " (%{status} · %{used}/%{budget} Token)"
+    status_active: "进行中"
+    status_paused: "已暂停"
+    status_budget_limited: "预算已用尽"
+    status_blocked: "已阻塞"
+    status_complete: "已完成"
   statusbar:
     agents: "%{count} 个智能体"
     re_entering: "重新进入中"
@@ -424,7 +429,7 @@ command:
   profiles:
     desc: 管理本地档案——列出、设为默认、删除或新建。
   goal:
-    desc: 查看、设置、暂停/恢复或清除持久化的会话目标
+    desc: 查看、设置、暂停/恢复、停止或清除持久化的会话目标
   help:
     desc: 显示可用命令
   keymap:
@@ -1384,7 +1389,15 @@ status:
   cannot_transition_goal_state: "无法在 `%{state}` 状态下转换目标（由模型管控）。"
   goal_verb_pausing: "正在暂停"
   goal_verb_resuming: "正在恢复"
+  goal_verb_stopping: "正在停止"
   goal_verb_updating: "正在更新"
+  goal_resume_over_budget: "目标已恢复但仍超出预算 —— 提高预算后才会继续：/goal %{objective} --budget <N>"
+  goal_now_active: "目标进行中 —— 自主推进已恢复"
+  goal_now_paused: "目标已暂停 —— 使用 /goal resume 恢复自主推进"
+  goal_now_blocked: "目标因连续失败已阻塞 —— /goal resume 重试，/goal stop 结束"
+  goal_now_budget_limited: "目标预算已用尽 —— 正在收尾；用 /goal %{objective} --budget <N> 提高预算"
+  goal_now_complete: "目标已完成"
+  goal_now_status: "目标状态：%{status}"
   verb_goal: "%{verb}目标"
   local_create_cancelled_transport: "本地档案创建因传输错误而取消 [%{code}]：%{message}"
   local_create_cancelled: "本地档案创建已取消 [%{code}]：%{message}"
