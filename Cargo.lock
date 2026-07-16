@@ -1557,7 +1557,7 @@ dependencies = [
 
 [[package]]
 name = "octos-tui"
-version = "0.2.2-rc.2"
+version = "0.2.2-rc.3"
 dependencies = [
  "axoupdater",
  "chrono",
