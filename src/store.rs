@@ -6520,12 +6520,6 @@ impl Store {
             event.message.clone(),
         ));
         self.state.status = event.message;
-        // `octos-tui new <name>`: an explicit create-a-new-profile launch wins
-        // over BOTH launch/resolve and the startup picker — the user asked to
-        // make a new brain, not resume or attach an existing one.
-        if let Some(command) = self.maybe_open_new_profile_on_first_launch() {
-            return Some(command);
-        }
         // Per-project launch decision (Model A). When the backend advertises
         // `session.workspace_cwd.v1` + `launch/resolve` and this is a clean
         // first launch, resolve the folder's brain BEFORE falling into
@@ -6563,48 +6557,6 @@ impl Store {
             .workspace_candidate
             .clone()
             .or_else(|| onboarding_workspace_cwd(&self.state.workspace.root))
-    }
-
-    /// First-launch hook for `octos-tui new <name>`. When the launch carried an
-    /// explicit new-profile id, force the create-a-new-profile onboarding with
-    /// that id pre-seeded as the profile name, bypassing launch/resolve and the
-    /// startup picker (the user asked to create a brain, not resume/attach one).
-    ///
-    /// Best-effort and self-consuming: the intent is [`Option::take`]n only once
-    /// a backend that can actually create local profiles is confirmed, so a
-    /// provider-only / legacy-auth server drops the intent and the normal launch
-    /// flow runs. Returns the provider-hydration command (or `None`) when it
-    /// opens the wizard; `None` without consuming when it does not apply yet.
-    fn maybe_open_new_profile_on_first_launch(&mut self) -> Option<AppUiCommand> {
-        // Fast-out on the common path (no `new <name>` intent) before the
-        // capability scan below.
-        self.state.onboarding.launch_new_profile_id.as_ref()?;
-        // Only meaningful on a backend that can create a local profile; on a
-        // provider-only or legacy-auth server there is nothing to name. Leave
-        // the intent in place (don't `take`) so a later capabilities wave that
-        // advertises the create surface can still honor it.
-        let supports_local_solo = self.state.capabilities.as_ref().is_some_and(|caps| {
-            crate::menu::registry::APPUI_FIRST_LAUNCH_LOCAL_SOLO_METHODS
-                .iter()
-                .any(|method| caps.supports_method(method))
-        });
-        if !supports_local_solo {
-            return None;
-        }
-        // Consume the intent so a later capabilities refresh doesn't re-force
-        // the wizard over the user's in-progress work, and seed the typed name
-        // as the profile's requested id (the "Name this profile" prompt value).
-        let requested = self.state.onboarding.launch_new_profile_id.take()?;
-        // Replace an already-open menu (e.g. the picker) rather than stacking.
-        if self.state.menu_stack.is_active() {
-            self.close_all_menus();
-        }
-        self.state.onboarding.requested_id = requested;
-        self.state.status = t!("status.new_profile_launch").into_owned();
-        self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
-        // Fresh create, but hydrate in case the id collides with a saved profile
-        // so the provider rows show server truth rather than "not set".
-        self.onboarding_hydrate_saved_provider_command()
     }
 
     /// First-launch hook for the per-project launch flow. Emits `launch/resolve`
@@ -16245,129 +16197,6 @@ mod tests {
         assert!(
             store.state.active_menu.is_none(),
             "launch/resolve defers onboarding until the decision lands"
-        );
-    }
-
-    /// `octos-tui new <name>`: an explicit create-a-new-profile launch wins over
-    /// the Model A launch/resolve probe — even when the backend advertises
-    /// `launch/resolve` + `session.workspace_cwd.v1`, the first capabilities
-    /// event opens create-a-new-profile onboarding with the typed id pre-seeded
-    /// as the profile name, and consumes the one-shot intent.
-    #[test]
-    fn new_profile_launch_forces_onboarding_over_launch_resolve() {
-        let mut store = protocol_store_without_sessions();
-        store.state.workspace.root = "stdio:octos serve --stdio --solo".into();
-        store.state.onboarding.workspace_candidate = Some("/tmp/fresh-folder".into());
-        // The `new work` launch intent.
-        store.state.onboarding.launch_new_profile_id = Some("work".into());
-
-        let follow_up =
-            store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
-                result: crate::model::ConfigCapabilitiesListResult {
-                    // Advertise BOTH the launch/resolve surface (which would
-                    // otherwise win) AND the local-solo create surface.
-                    capabilities: UiProtocolCapabilities::new(
-                        &[
-                            crate::model::APPUI_METHOD_LAUNCH_RESOLVE,
-                            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
-                        ],
-                        &[],
-                    )
-                    .with_supported_features([
-                        crate::model::APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1,
-                    ]),
-                },
-                message: "Octos UI capabilities refreshed".into(),
-            }));
-
-        assert!(
-            !matches!(follow_up, Some(AppUiCommand::LaunchResolve(_))),
-            "`new <name>` must bypass launch/resolve, got: {follow_up:?}"
-        );
-        assert!(
-            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
-            "`new <name>` opens create-a-new-profile onboarding"
-        );
-        assert_eq!(
-            store.state.onboarding.requested_id, "work",
-            "the typed name pre-seeds the profile id"
-        );
-        assert!(
-            store.state.onboarding.launch_new_profile_id.is_none(),
-            "the one-shot intent is consumed so a later refresh does not re-force it"
-        );
-    }
-
-    /// `octos-tui new` with no name (an empty seed) still forces the
-    /// create-a-new-profile wizard — the user types the name at the "Name this
-    /// profile" step — rather than resuming/attaching an existing profile. The
-    /// seeded `requested_id` is left empty for the wizard to collect.
-    #[test]
-    fn new_profile_launch_with_empty_name_still_forces_onboarding() {
-        let mut store = protocol_store_without_sessions();
-        store.state.onboarding.workspace_candidate = Some("/tmp/fresh-folder".into());
-        // Bare `octos-tui new` → empty seed (Some(""), not None).
-        store.state.onboarding.launch_new_profile_id = Some(String::new());
-
-        let follow_up =
-            store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
-                result: crate::model::ConfigCapabilitiesListResult {
-                    capabilities: UiProtocolCapabilities::new(
-                        &[
-                            crate::model::APPUI_METHOD_LAUNCH_RESOLVE,
-                            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
-                        ],
-                        &[],
-                    )
-                    .with_supported_features([
-                        crate::model::APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1,
-                    ]),
-                },
-                message: "Octos UI capabilities refreshed".into(),
-            }));
-
-        assert!(
-            !matches!(follow_up, Some(AppUiCommand::LaunchResolve(_))),
-            "empty-name `new` must still bypass launch/resolve, got: {follow_up:?}"
-        );
-        assert!(
-            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
-            "empty-name `new` opens the create-a-new-profile wizard"
-        );
-        assert_eq!(
-            store.state.onboarding.requested_id, "",
-            "the name is left empty for the wizard's Name step to collect"
-        );
-        assert!(store.state.onboarding.launch_new_profile_id.is_none());
-    }
-
-    /// `octos-tui new <name>` against a provider-only backend (no local-profile
-    /// creation method) drops the intent and runs the normal flow rather than
-    /// opening an onboarding wizard it cannot complete.
-    #[test]
-    fn new_profile_launch_is_a_noop_without_a_create_surface() {
-        let mut store = protocol_store_without_sessions();
-        store.state.onboarding.launch_new_profile_id = Some("work".into());
-
-        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
-            result: crate::model::ConfigCapabilitiesListResult {
-                capabilities: UiProtocolCapabilities::new(
-                    &[crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG],
-                    &[],
-                ),
-            },
-            message: "Octos UI capabilities refreshed".into(),
-        }));
-
-        assert!(
-            store.state.active_menu.is_none(),
-            "no create surface → no forced wizard"
-        );
-        // Intent is left intact (not consumed) so a later capabilities wave that
-        // advertises the create surface can still honor it.
-        assert_eq!(
-            store.state.onboarding.launch_new_profile_id.as_deref(),
-            Some("work")
         );
     }
 

@@ -2305,12 +2305,6 @@ pub struct OnboardingWizardState {
     /// provider-setup). Cleared once the new profile is created or the profiles
     /// surface reopens.
     pub creating_new_profile: bool,
-    /// `octos-tui new <name>`: the profile id the process launched to create.
-    /// Seeded once at launch from `Cli::new_profile`; consumed by the first
-    /// capabilities event, which force-opens create-a-new-profile onboarding
-    /// with this id pre-seeded (bypassing launch/resolve + the startup picker).
-    /// `None` for an ordinary launch.
-    pub launch_new_profile_id: Option<String>,
     /// Per-project launch flow: the pending Activate / CrossProfile prompt for
     /// the `launch_prompt` menu, stashed when a `launch/resolve` decision needs
     /// the user to choose. `None` outside that prompt. See [`LaunchPromptState`].
@@ -2393,7 +2387,6 @@ impl Default for OnboardingWizardState {
             profiles_data_dir: None,
             selected_profile: None,
             creating_new_profile: false,
-            launch_new_profile_id: None,
             launch_prompt: None,
             profile_id: None,
             local_profile_created: false,

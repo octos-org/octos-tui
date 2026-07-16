@@ -7789,7 +7789,6 @@ mod tests {
             lang: crate::cli::Lang::En,
             scroll_mode: crate::cli::ScrollMode::Native,
             vim_mode: false,
-            new_profile: None,
         };
 
         let launch = launch_from_cli(&cli);
@@ -9188,7 +9187,6 @@ mod tests {
             lang: crate::cli::Lang::En,
             scroll_mode: crate::cli::ScrollMode::Native,
             vim_mode: false,
-            new_profile: None,
         };
 
         let launch = launch_from_cli(&cli);
