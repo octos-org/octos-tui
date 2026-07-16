@@ -8434,6 +8434,23 @@ fn harness_context_percent(app: &AppState) -> Option<u16> {
     harness_context_ratio(app).map(|ratio| (ratio * 100.0).round() as u16)
 }
 
+/// Full context-window label for the harness gauge/row: `ctx 128K/1M ~13%`.
+/// Pairs the used/max token counts (see [`context_window_usage`]) with the
+/// estimate percent so the always-on row shows the raw numbers, not just a
+/// bare percentage. The `~` marks it an estimate: the numerator is the harness
+/// `token_estimate` and the denominator falls back to the fixed default until a
+/// real per-model window arrives. `None` until an estimate is known.
+fn harness_context_label(app: &AppState) -> Option<String> {
+    let session = app.active_session()?;
+    let (used, window) = context_window_usage(app, &session.id)?;
+    let percent = harness_context_percent(app)?;
+    Some(format!(
+        "ctx {}/{} ~{percent}%",
+        format_tokens_human(used),
+        format_tokens_human(window),
+    ))
+}
+
 /// Build the harness status line(s): spinner + phase + agent count +
 /// re-entering + token in/out + cost + retry + ctx %. Empty when idle.
 fn harness_status_lines(
@@ -8566,13 +8583,14 @@ fn harness_status_lines(
     // right (the duplicate-`ctx ~N%` bug). Kept (and unit-tested) for narrow
     // terminals where the gauge column is dropped.
     if include_ctx_text {
-        if let Some(percent) = harness_context_percent(app) {
-            // `~` marks this as an estimate: the numerator is the harness
-            // `token_estimate`. The denominator is the real per-model context
-            // window once a cost update carries it (`token_cost.context_window`),
-            // falling back to `DEFAULT_CONTEXT_WINDOW_TOKENS` until then.
+        // `ctx {used}/{max} ~{pct}%` — the raw token counts plus the estimate
+        // percent. `~` marks it an estimate: the numerator is the harness
+        // `token_estimate`. The denominator is the real per-model context
+        // window once a cost update carries it (`token_cost.context_window`),
+        // falling back to `DEFAULT_CONTEXT_WINDOW_TOKENS` until then.
+        if let Some(label) = harness_context_label(app) {
             spans.push(Span::styled(
-                format!(" · ctx ~{percent}%"),
+                format!(" · {label}"),
                 palette.muted().bg(palette.surface),
             ));
         }
@@ -8592,38 +8610,46 @@ fn render_harness_status_row(
     area: Rect,
 ) {
     let ratio = harness_context_ratio(app);
-    // Reserve a fixed-width column for the context gauge only when we have a
-    // ratio to show AND the row is wide enough for both the text and the gauge.
-    const GAUGE_WIDTH: u16 = 18;
-    let show_gauge = ratio.is_some() && area.width > GAUGE_WIDTH + 12;
-    // Suppress the textual `· ctx ~N%` label when the gauge will be drawn —
-    // otherwise the percent renders twice on the same row (text on the left and
-    // gauge on the right). The gauge is canonical on a wide terminal; the text
-    // is the narrow-terminal fallback.
+    let ctx_label = harness_context_label(app);
+    // Size the gauge column to its label plus a short bar. The label now
+    // carries the used/max token counts (`ctx 128K/1M ~13%`), so a fixed
+    // 18-cell column would truncate it — derive the width from the label, and
+    // only draw the gauge when the row is wide enough for both text and gauge.
+    let gauge_width = ctx_label
+        .as_deref()
+        .map(|label| label.chars().count() as u16 + 6)
+        .unwrap_or(18);
+    let show_gauge = ratio.is_some() && ctx_label.is_some() && area.width > gauge_width + 12;
+    // Suppress the textual `· ctx …` label when the gauge will be drawn —
+    // otherwise the context readout renders twice on the same row (text on the
+    // left and gauge on the right). The gauge is canonical on a wide terminal;
+    // the text is the narrow-terminal fallback.
     let lines = harness_status_lines(app, palette, !show_gauge);
     if lines.is_empty() {
         return;
     }
-    if let Some(ratio) = ratio.filter(|_| show_gauge) {
+    if let (Some(ratio), Some(label)) = (
+        ratio.filter(|_| show_gauge),
+        ctx_label.filter(|_| show_gauge),
+    ) {
         let split = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(12), Constraint::Length(GAUGE_WIDTH)])
+            .constraints([Constraint::Min(12), Constraint::Length(gauge_width)])
             .split(area);
         frame.render_widget(
             Paragraph::new(Text::from(lines))
                 .style(Style::default().fg(palette.text).bg(palette.surface)),
             split[0],
         );
-        let percent = (ratio * 100.0).round() as u16;
         let gauge = LineGauge::default()
             .ratio(ratio)
             // Base style backs the label cells: `LineGauge` paints the whole
             // area with `self.style` before writing the (unstyled) label, so
-            // without a surface bg here the `ctx ~N%` label renders on the raw
+            // without a surface bg here the `ctx …` label renders on the raw
             // terminal background — a mismatched block to the right of the
             // harness row, just above the composer. Keep it on `surface`.
             .style(Style::default().fg(palette.muted).bg(palette.surface))
-            .label(format!("ctx ~{percent}%"))
+            .label(label)
             .filled_style(Style::default().fg(palette.accent).bg(palette.surface))
             .unfilled_style(Style::default().fg(palette.frame).bg(palette.surface));
         frame.render_widget(gauge, split[1]);
@@ -13050,8 +13076,8 @@ mod tests {
         );
     }
 
-    /// Regression: the harness-row context `LineGauge` label (`ctx ~N%`) must
-    /// inherit the theme `surface` background. `LineGauge` paints its whole
+    /// Regression: the harness-row context `LineGauge` label (`ctx …/… ~N%`)
+    /// must inherit the theme `surface` background. `LineGauge` paints its whole
     /// area with the widget base style *before* writing the (unstyled) label,
     /// so without `.style(bg: surface)` the label cells fall back to the raw
     /// terminal background — a mismatched solid block on the right of the
@@ -13085,8 +13111,8 @@ mod tests {
         let palette = Palette::for_theme(ThemeName::Codex);
         let buffer = rendered_buffer_with_size(&app, palette, 120, 42);
 
-        // The gauge label is rendered on the harness row (the `ctx ~N%` text).
-        let label_style = style_for_text(&buffer, "ctx ~").expect("gauge label rendered");
+        // The gauge label is rendered on the harness row (the `ctx …` text).
+        let label_style = style_for_text(&buffer, "ctx ").expect("gauge label rendered");
         assert_eq!(
             label_style.bg,
             Some(palette.surface),
@@ -13096,10 +13122,10 @@ mod tests {
         // The whole gauge column (label + filled/unfilled line) must be a single
         // contiguous surface-backed band — no stray bg=Reset cells.
         let rows = rendered_rows(&buffer);
-        let gauge_row = row_index_containing(&rows, "ctx ~");
+        let gauge_row = row_index_containing(&rows, "ctx ");
         let width = usize::from(buffer.area.width);
         let row_start = gauge_row * width;
-        let first_label_col = rows[gauge_row].find("ctx ~").expect("label col");
+        let first_label_col = rows[gauge_row].find("ctx ").expect("label col");
         for x in first_label_col..width {
             let cell = &buffer.content[row_start + x];
             assert_eq!(
@@ -17434,8 +17460,8 @@ mod tests {
         assert!(text.contains("↓374"), "{text:?}");
         assert!(text.contains("$0.0123"), "{text:?}");
         assert!(
-            text.contains("ctx ~50%"),
-            "ctx % from token_estimate (approximate marker): {text:?}"
+            text.contains("ctx 64K/128K ~50%"),
+            "ctx used/max token counts + estimate percent: {text:?}"
         );
         // Context ratio drives the LineGauge (64000 / 128000 = 0.5).
         assert_eq!(harness_context_ratio(&app), Some(0.5));
@@ -17456,15 +17482,15 @@ mod tests {
             rendered.contains("Tab agents"),
             "composer hint not clobbered: {rendered:?}"
         );
-        // Regression (duplicate ctx%): on a wide terminal (rendered_text uses
-        // 120 cols, so the gauge column is drawn) the percent must render ONCE —
-        // as the LineGauge on the right, NOT also as the textual `· ctx ~N%`
-        // label on the left. Pre-fix this row showed both "· ctx ~50%" and
-        // "ctx ~50% ───" on the same line.
+        // Regression (duplicate ctx readout): on a wide terminal (rendered_text
+        // uses 120 cols, so the gauge column is drawn) the context label must
+        // render ONCE — as the LineGauge on the right, NOT also as the textual
+        // `· ctx …` label on the left. Pre-fix this row showed both "· ctx ~50%"
+        // and "ctx ~50% ───" on the same line.
         assert_eq!(
-            rendered.matches("ctx ~").count(),
+            rendered.matches("64K/128K").count(),
             1,
-            "ctx% must render exactly once (gauge only) on a wide terminal: {rendered:?}"
+            "ctx readout must render exactly once (gauge only) on a wide terminal: {rendered:?}"
         );
     }
 
@@ -17505,8 +17531,58 @@ mod tests {
             .map(|span| span.content.to_string())
             .collect();
         assert!(
-            text.contains("ctx ~25%"),
-            "ctx label must carry the approximate marker: {text:?}"
+            text.contains("ctx 32K/128K ~25%"),
+            "ctx label must carry the used/max counts and the approximate marker: {text:?}"
+        );
+    }
+
+    #[test]
+    fn harness_status_row_shows_used_over_max_against_real_window() {
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 0,
+                pending_continuations: 0,
+                phase: Some("working".into()),
+            },
+        );
+        app.context_lifecycle_mut(&session_id).state = Some(crate::model::ContextLifecycleState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: String::new(),
+            item_count: 10,
+            token_estimate: 128_000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        });
+        // Real per-model window on the wire → used/max reads against it, not the
+        // fixed default: 128K of a 1M window is an honest ~13%.
+        app.session_context_window
+            .insert(session_id.clone(), 1_000_000);
+
+        // Narrow terminal (text fallback) carries the full readout.
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex), true)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(
+            text.contains("ctx 128K/1M ~13%"),
+            "harness row shows used/max token counts + estimate percent: {text:?}"
+        );
+
+        // Wide terminal draws the same numbers in the gauge label.
+        let rendered = rendered_text(&app);
+        assert!(
+            rendered.contains("128K/1M"),
+            "wide gauge label carries the used/max counts: {rendered:?}"
         );
     }
 
