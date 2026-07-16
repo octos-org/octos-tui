@@ -1191,6 +1191,19 @@ impl Store {
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
                 None
             }
+            LocalAction::SwitchChatView(target) => {
+                // `/agents` picker row (#323): jump the main pane to a
+                // sub-agent's live view, or back to the session transcript.
+                self.state.set_chat_view(match target {
+                    Some(agent_id) => crate::model::ChatViewTarget::Agent(agent_id),
+                    None => crate::model::ChatViewTarget::Main,
+                });
+                None
+            }
+            LocalAction::ToggleAgentDock => {
+                self.state.agent_dock_collapsed = !self.state.agent_dock_collapsed;
+                None
+            }
             LocalAction::SetTheme(theme) => {
                 match crate::cli::ThemeName::from_id(&theme) {
                     Some(name) => {
@@ -4469,6 +4482,13 @@ impl Store {
             rewind_turns: &self.state.rewind_turns,
             context_window_usage: selected_session
                 .and_then(|session| crate::app::context_window_usage(&self.state, &session.id)),
+            agents: self.state.active_session_agents(),
+            unseen_agent_ids: self.state.active_session_unseen_agents(),
+            chat_view_agent_id: match &self.state.chat_view {
+                crate::model::ChatViewTarget::Agent(id) => Some(id.as_str()),
+                _ => None,
+            },
+            agent_dock_collapsed: self.state.agent_dock_collapsed,
         }
     }
 
@@ -9993,6 +10013,12 @@ impl Store {
                 .filter(|(agent_id, seen)| {
                     now.duration_since(*seen) >= AGENT_TERMINAL_LINGER
                         && protect.as_deref() != Some(agent_id.as_str())
+                        // Agent Dock unread (#323): a result nobody looked at
+                        // must not silently vanish on the timer. Peeking it
+                        // clears the badge (and the peek itself protects it);
+                        // once seen and tabbed away, the normal linger prune
+                        // applies — and the next submit prunes regardless.
+                        && !autonomy.unseen.iter().any(|id| id == agent_id)
                 })
                 .map(|(agent_id, _)| agent_id.clone())
                 .collect();
@@ -17290,6 +17316,14 @@ mod tests {
         let mut store = store_with_two_sessions("local:a", "local:b");
         seed_strip_agent(&mut store, "edison", "completed");
         seed_strip_agent(&mut store, "worker", "running");
+        // Mark edison SEEN (peek + back): only seen terminal chips are
+        // subject to the timed linger — unread ones wait for the user (#323).
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Agent("edison".into()));
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Main);
 
         let t0 = std::time::Instant::now();
         assert!(!store.sweep_terminal_agents(t0), "first sight only stamps");
@@ -17320,7 +17354,9 @@ mod tests {
     fn peeked_terminal_agent_survives_sweep() {
         let mut store = store_with_two_sessions("local:a", "local:b");
         seed_strip_agent(&mut store, "edison", "completed");
-        store.state.chat_view = crate::model::ChatViewTarget::Agent("edison".into());
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Agent("edison".into()));
 
         let t0 = std::time::Instant::now();
         let _ = store.sweep_terminal_agents(t0);
@@ -17332,12 +17368,103 @@ mod tests {
         );
         assert_eq!(strip_agent_ids(&store), vec!["edison".to_owned()]);
 
-        store.state.chat_view = crate::model::ChatViewTarget::Main;
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Main);
         assert!(
             store.sweep_terminal_agents(
                 t0 + AGENT_TERMINAL_LINGER + std::time::Duration::from_secs(6)
             ),
             "prunes on the next sweep after tabbing away"
+        );
+        assert!(strip_agent_ids(&store).is_empty());
+    }
+
+    /// Agent Dock unread (#323): a terminal transition that lands while the
+    /// user is NOT viewing the agent badges it unseen; the badge is exempt
+    /// from the timed linger sweep until the user peeks it, then the normal
+    /// prune applies.
+    #[test]
+    fn unseen_terminal_agent_survives_sweep_until_viewed() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        seed_strip_agent(&mut store, "edison", "running");
+        assert!(
+            !store.state.is_agent_unseen("edison"),
+            "running agents never badge"
+        );
+        seed_strip_agent(&mut store, "edison", "completed");
+        assert!(
+            store.state.is_agent_unseen("edison"),
+            "terminal transition while viewing Main badges unseen"
+        );
+
+        // Way past the linger: still protected — nobody has looked at it.
+        let t0 = std::time::Instant::now();
+        let _ = store.sweep_terminal_agents(t0);
+        assert!(
+            !store.sweep_terminal_agents(
+                t0 + AGENT_TERMINAL_LINGER + std::time::Duration::from_secs(60)
+            ),
+            "unread terminal chip must not vanish on the timer"
+        );
+        assert_eq!(strip_agent_ids(&store), vec!["edison".to_owned()]);
+
+        // Peek clears the badge; tabbing away re-exposes it to the linger.
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Agent("edison".into()));
+        assert!(!store.state.is_agent_unseen("edison"), "peek marks seen");
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Main);
+        assert!(
+            store.sweep_terminal_agents(
+                t0 + AGENT_TERMINAL_LINGER + std::time::Duration::from_secs(61)
+            ),
+            "seen chip prunes on the next sweep"
+        );
+        assert!(strip_agent_ids(&store).is_empty());
+    }
+
+    /// The unseen badge follows the agent's life: viewing at transition time
+    /// suppresses it, resurrecting clears it, pruning clears it, and the
+    /// next submit still clears the chip (badge and all) — the user is at
+    /// the keyboard.
+    #[test]
+    fn unseen_badge_lifecycle_suppress_resurrect_and_submit_prune() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+
+        // Terminal transition while the user is ALREADY viewing the agent —
+        // no badge (they watched it finish).
+        seed_strip_agent(&mut store, "edison", "running");
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Agent("edison".into()));
+        seed_strip_agent(&mut store, "edison", "completed");
+        assert!(
+            !store.state.is_agent_unseen("edison"),
+            "watching the finish must not badge"
+        );
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Main);
+
+        // Resurrection clears a stale badge.
+        seed_strip_agent(&mut store, "thomas", "failed");
+        assert!(store.state.is_agent_unseen("thomas"));
+        seed_strip_agent(&mut store, "thomas", "running");
+        assert!(
+            !store.state.is_agent_unseen("thomas"),
+            "resurrected agents drop the stale badge"
+        );
+
+        // Submit prunes terminal chips, badges included.
+        seed_strip_agent(&mut store, "thomas", "failed");
+        assert!(store.state.is_agent_unseen("thomas"));
+        store.prune_terminal_agents_on_submit(&SessionKey("local:a".into()));
+        assert!(
+            !store.state.is_agent_unseen("thomas"),
+            "submit-prune clears the badge with the chip"
         );
         assert!(strip_agent_ids(&store).is_empty());
     }

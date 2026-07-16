@@ -558,6 +558,15 @@ pub struct SessionAutonomyState {
     /// "finished/failed chips leave the strip after a linger" policy. A stamp
     /// is dropped if its agent resurrects (non-terminal again) or vanishes.
     pub terminal_seen: Vec<(String, std::time::Instant)>,
+    /// Agent Dock unread badges (#323): agents that reached a TERMINAL status
+    /// via a live `agent/updated` while the user was NOT viewing them
+    /// (octos-one's `has_updates` semantics, one level down). Cleared when the
+    /// user peeks/switches to the agent ([`AppState::set_chat_view`]), when
+    /// the agent resurrects non-terminal, or when its chip is pruned. Unseen
+    /// chips are exempt from the timed linger sweep so a result can't vanish
+    /// before it was ever looked at (the next submit still clears them — the
+    /// user is demonstrably at the keyboard).
+    pub unseen: Vec<String>,
 }
 
 impl SessionAutonomyState {
@@ -573,6 +582,7 @@ impl SessionAutonomyState {
             plan: None,
             plan_turn_id: None,
             terminal_seen: Vec::new(),
+            unseen: Vec::new(),
         }
     }
 }
@@ -3812,6 +3822,11 @@ pub struct AppState {
     /// pinned to the bottom row — the inline chat flow cannot offer that
     /// because committed history lives in the terminal's own scrollback.
     pub transcript_pager_active: bool,
+    /// Agent Dock (#323): collapse the sub-agent strip to a one-line summary
+    /// pill (`🐙 N agents · R running · U● unread`) instead of the per-agent
+    /// rows. Toggled by Alt+D or the `/agents` menu; a UI preference, not
+    /// per-session state.
+    pub agent_dock_collapsed: bool,
     /// `--scroll-mode pinned`: capture the mouse in the chat flow so wheel-up
     /// auto-enters the pager (composer stays pinned) and wheel-down at the
     /// pager bottom drops back to the inline tail. False = `native` (default):
@@ -5746,6 +5761,7 @@ impl AppState {
             agent_view_scroll: 0,
             agent_view_scroll_max: std::cell::Cell::new(usize::MAX),
             transcript_pager_active: false,
+            agent_dock_collapsed: false,
             pinned_scroll: false,
             vim_mode: false,
             composer_mode: ComposerMode::Insert,
@@ -5926,7 +5942,28 @@ impl AppState {
         session_id: &SessionKey,
         agent: octos_core::ui_protocol::UiAgentRecord,
     ) {
+        // Agent Dock unread (#323): a LIVE transition into a terminal status
+        // while the user is not viewing this agent marks it unseen — the
+        // "finished while you weren't looking" badge. Only this live upsert
+        // path badges; bulk hydration (`set_session_agents`) replays known
+        // state and must not invent unread work.
+        let viewing = matches!(
+            &self.chat_view,
+            ChatViewTarget::Agent(id) if id == &agent.agent_id
+        );
+        let now_terminal = agent_status_is_terminal(&agent.status);
         let entry = self.session_autonomy_mut(session_id);
+        let was_terminal = entry
+            .agents
+            .iter()
+            .find(|a| a.agent_id == agent.agent_id)
+            .is_some_and(|a| agent_status_is_terminal(&a.status));
+        if !now_terminal {
+            // Resurrected (or still running): any stale badge is moot.
+            entry.unseen.retain(|id| id != &agent.agent_id);
+        } else if !was_terminal && !viewing && !entry.unseen.contains(&agent.agent_id) {
+            entry.unseen.push(agent.agent_id.clone());
+        }
         if let Some(pos) = entry
             .agents
             .iter()
@@ -5969,6 +6006,9 @@ impl AppState {
             entry
                 .terminal_seen
                 .retain(|(agent_id, _)| !agent_ids.contains(agent_id));
+            entry
+                .unseen
+                .retain(|agent_id| !agent_ids.contains(agent_id));
             self.normalize_chat_view();
         }
         removed
@@ -7339,6 +7379,25 @@ impl AppState {
             .unwrap_or(&[])
     }
 
+    /// Agent ids with unread terminal outcomes in the active session — the
+    /// Agent Dock badge set (#323). Empty when there is no active session.
+    pub fn active_session_unseen_agents(&self) -> &[String] {
+        let Some(session) = self.active_session() else {
+            return &[];
+        };
+        self.session_autonomy_for(&session.id)
+            .map(|state| state.unseen.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// True when `agent_id` (in the active session) finished while the user
+    /// wasn't viewing it and has not been peeked since.
+    pub fn is_agent_unseen(&self, agent_id: &str) -> bool {
+        self.active_session_unseen_agents()
+            .iter()
+            .any(|id| id == agent_id)
+    }
+
     /// The cached streamed output for a sub-agent of the active session, if
     /// any has arrived. This is the flat text the backend exposes for a worker
     /// (`agent/output/*`) — a running log, not a turn-by-turn transcript, since
@@ -7396,6 +7455,19 @@ impl AppState {
     /// untouched, so returning to `Main` restores the chat where it was.
     pub fn set_chat_view(&mut self, target: ChatViewTarget) {
         if self.chat_view != target {
+            // Peeking/switching to an agent is the "I've seen it" moment for
+            // its Agent Dock unread badge (#323).
+            if let ChatViewTarget::Agent(agent_id) = &target {
+                let agent_id = agent_id.clone();
+                if let Some(session_id) = self.active_session().map(|s| s.id.clone())
+                    && let Some(autonomy) = self
+                        .session_autonomy
+                        .iter_mut()
+                        .find(|autonomy| autonomy.session_id == session_id)
+                {
+                    autonomy.unseen.retain(|id| id != &agent_id);
+                }
+            }
             self.chat_view = target;
             self.agent_view_scroll = 0;
             // The old target's row count is meaningless for the new one; reset to

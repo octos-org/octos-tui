@@ -149,6 +149,9 @@ app:
     agent_strip_main: "main"
     agent_strip_title: " agents "
     agent_strip_more: "+%{count} more (Tab)"
+    agent_dock_pill: "🐙 %{count} agents · %{running} running"
+    agent_dock_pill_unread: " · %{count}● unread"
+    agent_dock_toggle_hint: "Alt+D"
     agent_no_output: "(no output captured yet — this agent streams its result here as it works)"
     menu: "Menu | j/k move | Enter accept | Esc close"
     onboarding: "Onboarding | Enter continue | type to edit fields"
@@ -838,6 +841,8 @@ command:
     desc: Copy the last assistant reply to your clipboard (works over SSH).
   cost:
     desc: Show server-reported token and cost usage.
+  dock:
+    desc: Sub-agent dock — switch views, unread results, collapse or expand the strip.
   exit:
     desc: Quit the TUI.
   profiles:
@@ -897,6 +902,22 @@ command:
   turn:
     desc: Inspect backend turn lifecycle state.
 menu:
+  agents:
+    item:
+      dock_collapse:
+        label: Collapse the dock to a summary pill
+      dock_expand:
+        label: Expand the dock to per-agent rows
+      dock_toggle:
+        desc: Same as Alt+D.
+      main:
+        desc: Show the session transcript in the main pane.
+        label: main session
+      viewing_marker: (viewing)
+    subtitle: "%{count} agents · %{running} running · %{unread} unread"
+    title: Sub-agents
+    unavailable_empty: No sub-agents in this session yet — they appear here when the model spawns workers.
+    unavailable_title: Sub-agent dock
   availability:
     approval_has_focus: approval modal has keyboard focus
     blocked_read_only: blocked in read-only mode
