@@ -24506,6 +24506,8 @@ mod tests {
                 threshold_tokens: 96_000,
                 trigger: "preflight".into(),
                 turn_id: Some(owner_turn.clone()),
+                completed_at: None,
+                token_estimate_after: None,
             },
         );
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(

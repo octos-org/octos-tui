@@ -407,7 +407,7 @@ pub fn render_viewport_with_finalization(
     frame.render_widget(render_composer(app, palette, root[4]), root[4]);
     set_composer_cursor(frame, app, root[4]);
     if agent_strip_height > 0 {
-        frame.render_widget(render_agent_strip(app, palette), root[5]);
+        frame.render_widget(render_agent_strip(app, palette, root[5].width), root[5]);
     }
     frame.render_widget(render_status(app, palette), root[6]);
 }
@@ -1451,7 +1451,7 @@ fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palet
     );
     set_composer_cursor(frame, app, areas.composer);
     if areas.agent_strip.height > 0 {
-        frame.render_widget(render_agent_strip(app, palette), areas.agent_strip);
+        frame.render_widget(render_agent_strip(app, palette, areas.agent_strip.width), areas.agent_strip);
     }
     frame.render_widget(render_status(app, palette), areas.status);
 }
@@ -2476,7 +2476,7 @@ fn render_agent_overlay(frame: &mut impl FrameLike, app: &AppState, palette: Pal
         root[0],
     );
     if strip_height > 0 {
-        frame.render_widget(render_agent_strip(app, palette), root[1]);
+        frame.render_widget(render_agent_strip(app, palette, root[1].width), root[1]);
     }
     frame.render_widget(render_agent_overlay_hint(palette), root[2]);
 }
@@ -2516,10 +2516,9 @@ fn render_agent_overlay_body(
         .wrap(Wrap { trim: false })
 }
 
-/// Build the agent-peek body lines: an identity/status/task header, a blank
-/// separator, then the streamed output (or a placeholder until any arrives).
-/// The sub-agent has no turn-by-turn transcript — only this streamed log — so
-/// the header supplies the context a chat transcript otherwise would.
+/// Build the agent-peek body lines: an identity/status header, a task history
+/// section (all past tasks + current last_task), a blank separator, then the
+/// streamed output log (or a placeholder until any arrives).
 fn agent_overlay_lines(app: &AppState, palette: Palette, agent_id: &str) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if let Some(agent) = app.active_agent_record(agent_id) {
@@ -2537,17 +2536,37 @@ fn agent_overlay_lines(app: &AppState, palette: Palette, agent_id: &str) -> Vec<
             ),
             Span::styled(format!("  ·  {}", agent.status), palette.muted()),
         ]));
-        let task = agent
+
+        // Build the full task list: history (completed) + current last_task.
+        let history = app.active_agent_task_history(agent_id);
+        let current_task = agent
             .last_task
             .as_deref()
             .or(agent.title.as_deref())
             .map(str::trim)
             .filter(|t| !t.is_empty());
-        if let Some(task) = task {
-            lines.push(Line::from(Span::styled(
-                t!("app.hint.agent_task_prefix", task = task).into_owned(),
-                palette.muted(),
-            )));
+
+        if !history.is_empty() || current_task.is_some() {
+            for (i, past) in history.iter().enumerate() {
+                let prefix = format!("  {}. ", i + 1);
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, palette.muted()),
+                    Span::styled(past.clone(), palette.muted()),
+                    Span::styled(" ✓".to_string(), palette.muted()),
+                ]));
+            }
+            if let Some(task) = current_task {
+                let idx = history.len() + 1;
+                let prefix = if history.is_empty() {
+                    t!("app.hint.agent_task_prefix", task = task).into_owned()
+                } else {
+                    format!("  {idx}. {task}")
+                };
+                lines.push(Line::from(Span::styled(
+                    prefix,
+                    Style::default().fg(palette.accent),
+                )));
+            }
         }
         lines.push(Line::from(String::new()));
     }
@@ -8307,17 +8326,91 @@ fn agent_strip_height(app: &AppState, terminal_height: u16) -> u16 {
 }
 
 /// Render the sub-agent selector strip shown under the composer: `main` plus a
-/// chip per sub-agent, the selected target highlighted. Selection is moved in
-/// the event loop; selecting an agent redirects the main pane to its live
-/// output.
-fn render_agent_strip(app: &AppState, palette: Palette) -> Paragraph<'static> {
+/// chip per sub-agent, the selected target highlighted. Applies a sliding
+/// window so the selected chip is always visible when there are more chips than
+/// fit in `width`. Overflow is signalled with `‹` / `›` indicators.
+fn render_agent_strip(app: &AppState, palette: Palette, width: u16) -> Paragraph<'static> {
+    let title = t!("app.hint.agent_strip_title").into_owned();
+    let title_width = title.chars().count() as u16;
+    // Reserve 2 cols for each overflow indicator (`‹ ` / ` ›`).
+    const INDICATOR_WIDTH: u16 = 2;
+
+    let chips = agent_strip_chips(app);
+    // Chip text and width for each entry (glyph + label + surrounding spaces).
+    let chip_strings: Vec<String> = chips
+        .iter()
+        .map(|(glyph, label, _)| format!(" {glyph} {label} "))
+        .collect();
+    let chip_widths: Vec<u16> = chip_strings
+        .iter()
+        .map(|s| s.chars().count() as u16 + 2) // +2 for the gap after each chip
+        .collect();
+
+    let selected_idx = chips.iter().position(|(_, _, sel)| *sel).unwrap_or(0);
+
+    // Determine which chips to render via a greedy window centred on the
+    // selected chip, expanding outward while budget allows.
+    let available = width.saturating_sub(title_width);
+    let (start, end) = if chip_widths.iter().map(|w| *w).sum::<u16>() <= available {
+        (0, chips.len())
+    } else {
+        // Budget for indicators we may need.
+        let mut budget = available;
+        let mut lo = selected_idx;
+        let mut hi = selected_idx + 1; // exclusive
+        // Seed with the selected chip.
+        if let Some(w) = chip_widths.get(selected_idx) {
+            budget = budget.saturating_sub(*w);
+        }
+        // Expand greedily alternating left / right.
+        loop {
+            let expanded = {
+                let left = lo
+                    .checked_sub(1)
+                    .and_then(|i| chip_widths.get(i))
+                    .copied()
+                    .unwrap_or(0);
+                let right = chip_widths.get(hi).copied().unwrap_or(0);
+                let need_left_ind = if lo > 0 { INDICATOR_WIDTH } else { 0 };
+                let need_right_ind = if hi < chips.len() { INDICATOR_WIDTH } else { 0 };
+                // Try left
+                if lo > 0 && left + need_left_ind <= budget {
+                    budget -= left;
+                    lo -= 1;
+                    true
+                // Try right
+                } else if hi < chips.len() && right + need_right_ind <= budget {
+                    budget -= right;
+                    hi += 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if !expanded {
+                break;
+            }
+        }
+        (lo, hi)
+    };
+
+    let show_left = start > 0;
+    let show_right = end < chips.len();
+
     let mut spans: Vec<Span<'static>> = vec![Span::styled(
-        t!("app.hint.agent_strip_title").into_owned(),
+        title,
         palette.muted().bg(palette.surface),
     )];
-    for (glyph, label, selected) in agent_strip_chips(app) {
-        let chip = format!(" {glyph} {label} ");
-        let style = if selected {
+    if show_left {
+        spans.push(Span::styled(
+            "‹ ".to_string(),
+            palette.muted().bg(palette.surface),
+        ));
+    }
+    for idx in start..end {
+        let (_, _, selected) = &chips[idx];
+        let chip = chip_strings[idx].clone();
+        let style = if *selected {
             Style::default()
                 .fg(palette.surface)
                 .bg(palette.accent)
@@ -8329,6 +8422,12 @@ fn render_agent_strip(app: &AppState, palette: Palette) -> Paragraph<'static> {
         spans.push(Span::styled(
             "  ".to_string(),
             Style::default().bg(palette.surface),
+        ));
+    }
+    if show_right {
+        spans.push(Span::styled(
+            " ›".to_string(),
+            palette.muted().bg(palette.surface),
         ));
     }
     Paragraph::new(Line::from(spans)).style(Style::default().bg(palette.surface))
@@ -16603,6 +16702,58 @@ mod tests {
             peek_text.contains("Esc back to chat"),
             "overlay shows the navigation hint"
         );
+    }
+
+    /// Simulate an agent that works through three sequential tasks.
+    /// Each `upsert_session_agent` call with a new `last_task` triggers the
+    /// history accumulation in `upsert_session_agent`, so the peek overlay
+    /// should list all three tasks numbered, making the view scrollable.
+    #[test]
+    fn agent_view_overlay_lists_multiple_tasks_in_history() {
+        use crate::model::ChatViewTarget;
+        let mut app = autonomy_app_state();
+        let sid = app.active_session().unwrap().id.clone();
+
+        // Spawn the agent with its first task.
+        let mut agent = sample_agent("coder", "running");
+        agent.last_task = Some("analyse existing tests".into());
+        app.upsert_session_agent(&sid, agent.clone());
+
+        // Agent moves to a second task — previous one should be pushed to history.
+        agent.last_task = Some("write new unit tests".into());
+        app.upsert_session_agent(&sid, agent.clone());
+
+        // Agent moves to a third task.
+        agent.last_task = Some("run cargo test and fix failures".into());
+        app.upsert_session_agent(&sid, agent.clone());
+
+        app.set_agent_output(
+            &sid,
+            "coder",
+            "running cargo test...\nall 42 tests passed".into(),
+            octos_core::ui_protocol::OutputCursor { offset: 0 },
+        );
+
+        app.set_chat_view(ChatViewTarget::Agent("coder".into()));
+        assert!(agent_view_active(&app));
+
+        let text = rendered_text(&app);
+
+        // All three tasks must appear (numbered list in the header).
+        assert!(
+            text.contains("analyse existing tests"),
+            "first task visible: {text}"
+        );
+        assert!(
+            text.contains("write new unit tests"),
+            "second task visible: {text}"
+        );
+        assert!(
+            text.contains("run cargo test and fix failures"),
+            "current task visible: {text}"
+        );
+        // The streamed output is also present.
+        assert!(text.contains("all 42 tests passed"), "output visible: {text}");
     }
 
     #[test]

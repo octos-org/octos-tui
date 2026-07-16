@@ -543,6 +543,11 @@ pub struct SessionAutonomyState {
     pub agents: Vec<octos_core::ui_protocol::UiAgentRecord>,
     pub agent_outputs: Vec<AutonomyAgentOutputCache>,
     pub agent_artifacts: Vec<AutonomyAgentArtifactCache>,
+    /// Accumulated history of `last_task` values per agent, in chronological
+    /// order. Each time `last_task` changes on an `agent/updated` event the
+    /// previous value is pushed here so the peek can show all tasks the agent
+    /// has worked on — not just the most-recent one.
+    pub agent_task_history: std::collections::HashMap<String, Vec<String>>,
     pub goal: Option<octos_core::ui_protocol::UiGoalRecord>,
     pub goal_transition_actor: Option<String>,
     pub loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
@@ -561,6 +566,7 @@ impl SessionAutonomyState {
             agents: Vec::new(),
             agent_outputs: Vec::new(),
             agent_artifacts: Vec::new(),
+            agent_task_history: std::collections::HashMap::new(),
             goal: None,
             goal_transition_actor: None,
             loops: Vec::new(),
@@ -5870,7 +5876,8 @@ impl AppState {
 
     /// Upsert one agent record by `agent_id`. The wire schema may
     /// arrive via `agent/updated` or as part of an `agent/list`
-    /// response.
+    /// response. When `last_task` changes, the previous non-empty value
+    /// is pushed to `agent_task_history` so the peek can show all tasks.
     pub fn upsert_session_agent(
         &mut self,
         session_id: &SessionKey,
@@ -5882,6 +5889,16 @@ impl AppState {
             .iter()
             .position(|a| a.agent_id == agent.agent_id)
         {
+            let prev_task = entry.agents[pos].last_task.clone();
+            let new_task = agent.last_task.as_deref().unwrap_or("").trim().to_owned();
+            let prev_task_str = prev_task.as_deref().unwrap_or("").trim().to_owned();
+            if !prev_task_str.is_empty() && prev_task_str != new_task {
+                entry
+                    .agent_task_history
+                    .entry(agent.agent_id.clone())
+                    .or_default()
+                    .push(prev_task_str);
+            }
             entry.agents[pos] = agent;
         } else {
             entry.agents.push(agent);
@@ -7280,6 +7297,21 @@ impl AppState {
         }
         self.active_agent_record(agent_id)
             .and_then(|agent| agent.output_tail.as_deref())
+    }
+
+    /// The accumulated task history for a sub-agent of the active session.
+    /// Returns completed past tasks in chronological order (oldest first). The
+    /// current `last_task` from the agent record is NOT included — the caller
+    /// appends it separately.
+    pub fn active_agent_task_history(&self, agent_id: &str) -> &[String] {
+        let session = match self.active_session() {
+            Some(s) => s,
+            None => return &[],
+        };
+        self.session_autonomy_for(&session.id)
+            .and_then(|s| s.agent_task_history.get(agent_id))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// The record for a sub-agent of the active session, by id.
