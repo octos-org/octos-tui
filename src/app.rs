@@ -8080,6 +8080,22 @@ pub(crate) fn format_tokens_human(tokens: u64) -> String {
     }
 }
 
+/// Per-status glyph + localized label for the goal chip: every status the
+/// server can report renders distinctly (#329) — active ◆, paused ⏸,
+/// budget-limited ⚠, blocked ⛔ (the #1693 circuit breaker), complete ✔.
+/// Unknown statuses fall back to the raw string so a newer server never
+/// renders blank.
+fn goal_status_display(status: &str) -> (&'static str, String) {
+    match status {
+        "active" => ("◆", t!("app.autonomy.status_active").into_owned()),
+        "paused" => ("⏸", t!("app.autonomy.status_paused").into_owned()),
+        "budget_limited" => ("⚠", t!("app.autonomy.status_budget_limited").into_owned()),
+        "blocked" => ("⛔", t!("app.autonomy.status_blocked").into_owned()),
+        "complete" => ("✔", t!("app.autonomy.status_complete").into_owned()),
+        other => ("◆", other.to_owned()),
+    }
+}
+
 fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> {
     let Some(state) = active_session_autonomy(app) else {
         return Vec::new();
@@ -8091,16 +8107,17 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
         } else {
             goal.objective.clone()
         };
+        let (glyph, status_label) = goal_status_display(&goal.status);
         let parenthetical = t!(
             "app.autonomy.goal_meta",
-            status = goal.status,
+            status = status_label,
             used = format_tokens_k(goal.tokens_used),
             budget = format_tokens_k(goal.token_budget)
         )
         .into_owned();
         lines.push(Line::from(vec![
             Span::styled(
-                "◆ ",
+                format!("{glyph} "),
                 Style::default()
                     .fg(palette.accent)
                     .add_modifier(Modifier::BOLD)
