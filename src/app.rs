@@ -407,7 +407,10 @@ pub fn render_viewport_with_finalization(
     frame.render_widget(render_composer(app, palette, root[4]), root[4]);
     set_composer_cursor(frame, app, root[4]);
     if agent_strip_height > 0 {
-        frame.render_widget(render_agent_strip(app, palette), root[5]);
+        frame.render_widget(
+            render_agent_strip(app, palette, root[5].height.saturating_sub(1)),
+            root[5],
+        );
     }
     frame.render_widget(render_status(app, palette), root[6]);
 }
@@ -1451,7 +1454,10 @@ fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palet
     );
     set_composer_cursor(frame, app, areas.composer);
     if areas.agent_strip.height > 0 {
-        frame.render_widget(render_agent_strip(app, palette), areas.agent_strip);
+        frame.render_widget(
+            render_agent_strip(app, palette, areas.agent_strip.height.saturating_sub(1)),
+            areas.agent_strip,
+        );
     }
     frame.render_widget(render_status(app, palette), areas.status);
 }
@@ -2476,7 +2482,10 @@ fn render_agent_overlay(frame: &mut impl FrameLike, app: &AppState, palette: Pal
         root[0],
     );
     if strip_height > 0 {
-        frame.render_widget(render_agent_strip(app, palette), root[1]);
+        frame.render_widget(
+            render_agent_strip(app, palette, root[1].height.saturating_sub(1)),
+            root[1],
+        );
     }
     frame.render_widget(render_agent_overlay_hint(palette), root[2]);
 }
@@ -8265,21 +8274,134 @@ fn agent_status_glyph(status: &str) -> &'static str {
     }
 }
 
-/// Logical chips for the agent strip: `(glyph, label, selected)`. `main` first,
-/// then one chip per active-session sub-agent. Empty when the session has no
-/// sub-agents (the strip is then hidden). Split from rendering so the
-/// selection/labeling logic is unit-testable without a frame.
-fn agent_strip_chips(app: &AppState) -> Vec<(&'static str, String, bool)> {
-    let agents = app.active_session_agents();
-    if agents.is_empty() {
-        return Vec::new();
+/// Minimum terminal rows before the selector strip claims its row. Below this a
+/// full composer + status + the `Min(1)` tail + the reserved scrollback already
+/// fill the screen, so adding the strip would force Ratatui to collapse a fixed
+/// row (clipping the composer or status). The Tab switcher still works without
+/// the strip — it is a visual aid, not the control surface — so on a tiny
+/// terminal we drop it rather than corrupt the layout.
+const AGENT_STRIP_MIN_TERMINAL_ROWS: u16 = 12;
+
+/// Maximum sub-agent rows the vertical strip may claim below its title row.
+/// Larger rosters stay fully reachable via Tab; the title row carries a `+N`
+/// overflow marker and the visible window shifts to keep the selection shown.
+const AGENT_STRIP_MAX_AGENT_ROWS: u16 = 4;
+
+/// Rows the agent strip occupies under the composer: a title row (with the
+/// `main` chip) plus ONE ROW PER SUB-AGENT — vertical so each agent gets a
+/// full line of status/task visibility instead of an abbreviated chip. Agent
+/// rows are capped by [`AGENT_STRIP_MAX_AGENT_ROWS`] and by what the terminal
+/// can spare beyond the minimum layout, so a constrained terminal never
+/// oversubscribes the live layout. Both the height reservation
+/// (`live_ui_height`) and the render pass call this with the same terminal
+/// height, so they always agree.
+///
+/// Also hidden while the transcript pager is up: the strip switches views via
+/// Tab, but Tab is disabled in the pager (it never enters a peek), so the strip
+/// is non-interactive there — and the pager's `Min(8)` transcript floor makes
+/// its extra rows overcommit sooner than the inline flow's `Min(1)` tail.
+fn agent_strip_height(app: &AppState, terminal_height: u16) -> u16 {
+    if app.transcript_pager_active
+        || terminal_height < AGENT_STRIP_MIN_TERMINAL_ROWS
+        || app.active_session_agents().is_empty()
+    {
+        0
+    } else {
+        1 + agent_strip_agent_rows(app, terminal_height)
     }
-    let mut chips = vec![(
-        "⌂",
-        t!("app.hint.agent_strip_main").into_owned(),
-        matches!(app.chat_view, crate::model::ChatViewTarget::Main),
+}
+
+/// Sub-agent rows shown below the strip's title row: one line per agent,
+/// capped by [`AGENT_STRIP_MAX_AGENT_ROWS`] and by the rows the terminal has
+/// to spare beyond [`AGENT_STRIP_MIN_TERMINAL_ROWS`] (at exactly the minimum
+/// height the strip degrades to the title row alone — the `+N` marker and Tab
+/// keep every agent reachable).
+fn agent_strip_agent_rows(app: &AppState, terminal_height: u16) -> u16 {
+    let roster = app.active_session_agents().len().min(u16::MAX as usize) as u16;
+    roster
+        .min(AGENT_STRIP_MAX_AGENT_ROWS)
+        .min(terminal_height.saturating_sub(AGENT_STRIP_MIN_TERMINAL_ROWS))
+}
+
+/// Visible window of the agent roster for the vertical strip: the range of
+/// indices into `active_session_agents()` to render, plus how many agents are
+/// left out. The window starts at the top of the roster and shifts down just
+/// enough to keep the selected agent visible.
+fn agent_strip_window(app: &AppState, rows: usize) -> (std::ops::Range<usize>, usize) {
+    let agents = app.active_session_agents();
+    let len = agents.len();
+    if rows == 0 || len == 0 {
+        return (0..0, len);
+    }
+    let rows = rows.min(len);
+    let selected = match &app.chat_view {
+        crate::model::ChatViewTarget::Agent(id) => agents
+            .iter()
+            .position(|agent| &agent.agent_id == id)
+            .unwrap_or(0),
+        _ => 0,
+    };
+    let start = selected.saturating_sub(rows - 1).min(len - rows);
+    (start..start + rows, len - rows)
+}
+
+/// One-line task/status detail for an agent row: the last task if the server
+/// reported one, else the summary, else the tail of its streamed output —
+/// flattened to a single line (the row must never wrap).
+fn agent_strip_detail(agent: &octos_core::ui_protocol::UiAgentRecord) -> Option<String> {
+    [
+        agent.last_task.as_deref(),
+        agent.summary.as_deref(),
+        agent.output_tail.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|text| text.lines())
+    .map(str::trim)
+    .find(|line| !line.is_empty())
+    .map(str::to_owned)
+}
+
+/// Logical lines for the vertical agent strip. Row 0 is the title row: strip
+/// title + the `main` chip + a muted `+N` marker when the roster overflows the
+/// visible window. Each following row is one sub-agent — glyph, name, raw
+/// status, and a muted task/output detail — with the selected target
+/// highlighted. Split from rendering so the layout logic is unit-testable
+/// without a frame; `agent_rows` must be the value the height reservation was
+/// computed with (`agent_strip_height` - 1).
+fn agent_strip_lines(app: &AppState, palette: Palette, agent_rows: u16) -> Vec<Line<'static>> {
+    let agents = app.active_session_agents();
+    let (window, hidden) = agent_strip_window(app, agent_rows as usize);
+    let selected_style = Style::default()
+        .fg(palette.surface)
+        .bg(palette.accent)
+        .add_modifier(Modifier::BOLD);
+
+    let mut title_spans: Vec<Span<'static>> = vec![Span::styled(
+        t!("app.hint.agent_strip_title").into_owned(),
+        palette.muted().bg(palette.surface),
     )];
-    for agent in agents {
+    let main_selected = matches!(app.chat_view, crate::model::ChatViewTarget::Main);
+    title_spans.push(Span::styled(
+        format!(" ⌂ {} ", t!("app.hint.agent_strip_main")),
+        if main_selected {
+            selected_style
+        } else {
+            palette.text().bg(palette.surface)
+        },
+    ));
+    if hidden > 0 {
+        title_spans.push(Span::styled(
+            format!(
+                "  {}",
+                t!("app.hint.agent_strip_more", count = hidden.to_string())
+            ),
+            palette.muted().bg(palette.surface),
+        ));
+    }
+    let mut lines = vec![Line::from(title_spans)];
+
+    for agent in &agents[window] {
         let selected = matches!(
             &app.chat_view,
             crate::model::ChatViewTarget::Agent(id) if id == &agent.agent_id
@@ -8289,66 +8411,38 @@ fn agent_strip_chips(app: &AppState) -> Vec<(&'static str, String, bool)> {
         } else {
             agent.nickname.clone()
         };
-        chips.push((agent_status_glyph(&agent.status), label, selected));
+        let mut spans = vec![Span::styled(
+            format!(
+                " {} {label} · {} ",
+                agent_status_glyph(&agent.status),
+                agent.status
+            ),
+            if selected {
+                selected_style
+            } else {
+                palette.text().bg(palette.surface)
+            },
+        )];
+        if let Some(detail) = agent_strip_detail(agent) {
+            spans.push(Span::styled(
+                format!(" — {detail}"),
+                palette.muted().bg(palette.surface),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
-    chips
+    lines
 }
 
-/// Minimum terminal rows before the selector strip claims its row. Below this a
-/// full composer + status + the `Min(1)` tail + the reserved scrollback already
-/// fill the screen, so adding the strip would force Ratatui to collapse a fixed
-/// row (clipping the composer or status). The Tab switcher still works without
-/// the strip — it is a visual aid, not the control surface — so on a tiny
-/// terminal we drop it rather than corrupt the layout.
-const AGENT_STRIP_MIN_TERMINAL_ROWS: u16 = 12;
-
-/// Rows the agent strip occupies under the composer: 1 when the active session
-/// has sub-agents AND the terminal is tall enough to afford the row, else 0
-/// (hidden). Height-gated so a constrained terminal never oversubscribes the
-/// live layout. Both the height reservation (`live_ui_height`) and the render
-/// pass call this with the same terminal height, so they always agree.
-///
-/// Also hidden while the transcript pager is up: the strip switches views via
-/// Tab, but Tab is disabled in the pager (it never enters a peek), so the strip
-/// is non-interactive there — and the pager's `Min(8)` transcript floor makes
-/// its extra row overcommit sooner than the inline flow's `Min(1)` tail.
-fn agent_strip_height(app: &AppState, terminal_height: u16) -> u16 {
-    if app.transcript_pager_active
-        || terminal_height < AGENT_STRIP_MIN_TERMINAL_ROWS
-        || app.active_session_agents().is_empty()
-    {
-        0
-    } else {
-        1
-    }
-}
-
-/// Render the sub-agent selector strip shown under the composer: `main` plus a
-/// chip per sub-agent, the selected target highlighted. Selection is moved in
-/// the event loop; selecting an agent redirects the main pane to its live
-/// output.
-fn render_agent_strip(app: &AppState, palette: Palette) -> Paragraph<'static> {
-    let mut spans: Vec<Span<'static>> = vec![Span::styled(
-        t!("app.hint.agent_strip_title").into_owned(),
-        palette.muted().bg(palette.surface),
-    )];
-    for (glyph, label, selected) in agent_strip_chips(app) {
-        let chip = format!(" {glyph} {label} ");
-        let style = if selected {
-            Style::default()
-                .fg(palette.surface)
-                .bg(palette.accent)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            palette.text().bg(palette.surface)
-        };
-        spans.push(Span::styled(chip, style));
-        spans.push(Span::styled(
-            "  ".to_string(),
-            Style::default().bg(palette.surface),
-        ));
-    }
-    Paragraph::new(Line::from(spans)).style(Style::default().bg(palette.surface))
+/// Render the sub-agent selector strip shown under the composer: a title row
+/// with the `main` chip, then one line per visible sub-agent (vertical for
+/// glanceable status/task detail), the selected target highlighted. Selection
+/// is moved in the event loop; selecting an agent redirects the main pane to
+/// its live output. `agent_rows` is the row budget the layout reserved beyond
+/// the title row (`area.height - 1`).
+fn render_agent_strip(app: &AppState, palette: Palette, agent_rows: u16) -> Paragraph<'static> {
+    Paragraph::new(agent_strip_lines(app, palette, agent_rows))
+        .style(Style::default().bg(palette.surface))
 }
 
 /// Fallback context-window denominator for `ctx N%`, used only until a cost
@@ -16780,8 +16874,8 @@ mod tests {
         let with = live_ui_height(&app, 80, 40);
         assert_eq!(
             with,
-            without + 1,
-            "the strip row must be reserved once agents exist"
+            without + 2,
+            "the vertical strip reserves a title row plus one row per agent"
         );
     }
 
@@ -16795,8 +16889,8 @@ mod tests {
         );
         assert_eq!(
             agent_strip_height(&app, 40),
-            1,
-            "one row once agents exist on a normal terminal"
+            2,
+            "title row + one agent row once agents exist on a normal terminal"
         );
     }
 
@@ -16908,10 +17002,10 @@ mod tests {
         let mut app = autonomy_app_state();
         let sid = app.active_session().unwrap().id.clone();
         app.upsert_session_agent(&sid, sample_agent("worker", "running"));
-        assert_eq!(agent_strip_height(&app, 40), 1, "shown in the inline flow");
+        assert_eq!(agent_strip_height(&app, 40), 2, "shown in the inline flow");
 
-        // In the pager the strip's Tab control is disabled and its extra row
-        // overcommits the `Min(8)` transcript layout, so it is dropped.
+        // In the pager the strip's Tab control is disabled and its extra rows
+        // overcommit the `Min(8)` transcript layout, so it is dropped.
         app.transcript_pager_active = true;
         assert_eq!(agent_strip_height(&app, 40), 0, "hidden under the pager");
     }
@@ -16926,22 +17020,113 @@ mod tests {
     }
 
     #[test]
-    fn agent_strip_chips_lists_main_and_marks_selection() {
+    fn agent_strip_height_scales_vertically_with_agents() {
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        app.upsert_session_agent(&sid, sample_agent("edison", "running"));
+        app.upsert_session_agent(&sid, sample_agent("thomas", "running"));
+        assert_eq!(
+            agent_strip_height(&app, 40),
+            3,
+            "title row + one row per agent"
+        );
+
+        for idx in 0..4 {
+            app.upsert_session_agent(&sid, sample_agent(&format!("extra-{idx}"), "running"));
+        }
+        assert_eq!(
+            agent_strip_height(&app, 40),
+            1 + AGENT_STRIP_MAX_AGENT_ROWS,
+            "agent rows are capped"
+        );
+
+        assert_eq!(
+            agent_strip_height(&app, AGENT_STRIP_MIN_TERMINAL_ROWS),
+            1,
+            "at the minimum height the strip degrades to the title row alone"
+        );
+        assert_eq!(
+            agent_strip_height(&app, AGENT_STRIP_MIN_TERMINAL_ROWS - 1),
+            0,
+            "below the minimum the strip stays hidden"
+        );
+
+        app.transcript_pager_active = true;
+        assert_eq!(agent_strip_height(&app, 40), 0, "hidden in the pager");
+    }
+
+    #[test]
+    fn agent_strip_window_keeps_selection_visible() {
         use crate::model::ChatViewTarget;
         let mut app = autonomy_app_state();
         let sid = SessionKey("local:test".into());
-        app.upsert_session_agent(&sid, sample_agent("weather", "running"));
-        app.upsert_session_agent(&sid, sample_agent("news", "completed"));
-        app.chat_view = ChatViewTarget::Agent("news".into());
+        for idx in 0..6 {
+            app.upsert_session_agent(&sid, sample_agent(&format!("ag-{idx}"), "running"));
+        }
 
-        let chips = agent_strip_chips(&app);
-        assert_eq!(chips.len(), 3, "main + two agents");
-        assert_eq!(chips[0].1, "main");
-        assert!(!chips[0].2, "main not selected");
-        assert_eq!(chips[1].1, "weather");
-        assert_eq!(chips[2].1, "news");
-        assert!(chips[2].2, "selected agent marked");
-        assert_eq!(chips[2].0, "✔", "completed glyph");
+        let (window, hidden) = agent_strip_window(&app, 4);
+        assert_eq!(window, 0..4, "main view shows the top of the roster");
+        assert_eq!(hidden, 2);
+
+        app.chat_view = ChatViewTarget::Agent("ag-5".into());
+        let (window, hidden) = agent_strip_window(&app, 4);
+        assert_eq!(window, 2..6, "window shifts to keep the selection visible");
+        assert_eq!(hidden, 2);
+    }
+
+    #[test]
+    fn agent_strip_lines_render_vertical_rows_with_detail() {
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        let mut edison = sample_agent("edison", "running");
+        edison.nickname = "Edison".into();
+        edison.last_task = Some("clone the repo\nsecond line ignored".into());
+        app.upsert_session_agent(&sid, edison);
+        app.upsert_session_agent(&sid, sample_agent("thomas", "completed"));
+
+        let lines = agent_strip_lines(&app, Palette::for_theme(ThemeName::Codex), 2);
+        let flat: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(flat.len(), 3, "title row + one row per agent");
+        assert!(flat[0].contains("main"), "title row carries the main chip");
+        assert!(
+            flat[1].contains("Edison") && flat[1].contains("running"),
+            "agent row shows name and raw status: {}",
+            flat[1]
+        );
+        assert!(
+            flat[1].contains("clone the repo") && !flat[1].contains("second line"),
+            "detail is the first non-empty line of the last task: {}",
+            flat[1]
+        );
+        assert!(
+            flat[2].contains("thomas") && flat[2].contains("completed"),
+            "second agent row present: {}",
+            flat[2]
+        );
+
+        // Overflow: six agents, four visible -> the title row carries +2.
+        for idx in 0..4 {
+            app.upsert_session_agent(&sid, sample_agent(&format!("extra-{idx}"), "running"));
+        }
+        let lines = agent_strip_lines(&app, Palette::for_theme(ThemeName::Codex), 4);
+        let title: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            title.contains("+2") || title.contains("2 个"),
+            "overflow marker names the hidden count: {title}"
+        );
+        assert_eq!(lines.len(), 5, "title + capped agent rows");
     }
 
     fn sample_loop(
