@@ -12785,7 +12785,11 @@ mod tests {
         let text = rendered_text(&store.state);
 
         assert!(text.contains("Welcome to Octos"));
-        assert!(text.contains("Create your local Octos profile"));
+        // The "stays local, no OTP" framing is no longer a dead menu row — it
+        // moved to the right-hand teaching pane ("About this step"), and the
+        // profile step is identified by its purpose line.
+        assert!(text.contains("About this step"));
+        assert!(text.contains("Create a local identity for Octos"));
         assert!(text.contains("Onboarding setup"));
         assert!(!text.contains("No session selected"));
         assert!(!text.contains("Work  sticky"));

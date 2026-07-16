@@ -365,6 +365,24 @@ pub enum LocalAction {
     /// current turn keeps working (no tools, ephemeral). The question is taken
     /// from the command's inline args.
     Btw,
+    /// `/profiles` — refresh the on-disk profile list + default pointer into
+    /// state and open the profiles surface (the picker, now a manager).
+    OpenProfilesSurface,
+    /// "Create a new profile" from the profiles surface: reset the create/wizard
+    /// state to a clean slate (so it doesn't resume the ACTIVE profile's setup
+    /// mid-session) and open onboarding at the "Name this profile" step.
+    CreateNewProfile,
+    /// Drill into the per-profile action menu for the given profile id.
+    SelectProfileForActions(String),
+    /// Set the given profile as the machine default (writes `default-profile`).
+    SetProfileDefault(String),
+    /// "Use this profile" from the profiles surface: switch the active session to
+    /// this profile by opening (or resuming) its session in the current folder.
+    SwitchToProfile(String),
+    /// Open the Yes/No delete confirm for the given profile id.
+    RequestDeleteProfile(String),
+    /// Confirmed: delete the given profile (descriptor + data dir) from disk.
+    ConfirmDeleteProfile(String),
     Custom(&'static str),
 }
 

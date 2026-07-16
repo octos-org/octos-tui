@@ -148,6 +148,83 @@ pub fn enumerate_profile_ids(profiles_dir: &Path) -> Vec<String> {
     ids
 }
 
+/// Resolve the server data dir (the parent of `profiles/`) from the launch
+/// command — the same resolution as [`solo_profiles_dir`], one level up. Used by
+/// the in-TUI profiles surface to read the `default-profile` pointer and to do
+/// set-default / delete on disk. `None` when it can't be resolved (remote launch
+/// or an unresolvable `--data-dir`).
+pub fn solo_data_dir(stdio_command: Option<&str>) -> Option<PathBuf> {
+    solo_profiles_dir(stdio_command).and_then(|dir| dir.parent().map(Path::to_path_buf))
+}
+
+/// Read the `default-profile` pointer (a bare profile id), trimmed; `None` when
+/// the file is absent or empty.
+pub fn read_default_profile(data_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(data_dir.join("default-profile")).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// A one-line LLM summary for a profile (`family/model via route`), read only
+/// from `config.llm.primary` — never `config.env_vars` (which holds secrets).
+/// `None` when the descriptor is unreadable or has no primary LLM configured.
+pub fn profile_llm_summary(profiles_dir: &Path, id: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(profiles_dir.join(format!("{id}.json"))).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let primary = value.get("config")?.get("llm")?.get("primary")?;
+    let family = primary
+        .get("family_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let model = primary
+        .get("model_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let mut detail = format!("{family}/{model}");
+    if let Some(route) = primary
+        .get("route")
+        .and_then(|route| route.get("route_id"))
+        .and_then(serde_json::Value::as_str)
+    {
+        detail.push_str(&format!(" via {route}"));
+    }
+    Some(detail)
+}
+
+/// Set an existing profile as the machine default by atomically writing the
+/// `default-profile` pointer (temp file + rename, so a crash never tears it).
+pub fn set_default_profile(data_dir: &Path, id: &str) -> std::io::Result<()> {
+    let pointer = data_dir.join("default-profile");
+    let tmp = data_dir.join(".default-profile.tmp");
+    std::fs::write(&tmp, id.as_bytes())?;
+    std::fs::rename(&tmp, &pointer)
+}
+
+/// Delete a profile: its `<id>.json` descriptor and its `<id>/` data dir (which
+/// holds that profile's sessions/episodes). If it was the machine default, the
+/// pointer is cleared so nothing points at a ghost. Missing pieces are ignored
+/// (idempotent); a real removal error propagates.
+pub fn delete_profile(data_dir: &Path, id: &str) -> std::io::Result<()> {
+    let profiles_dir = data_dir.join("profiles");
+    // Clear the machine default FIRST when it points at this profile, so a later
+    // failure removing the data dir can never leave a dangling `default-profile`
+    // pointing at a half-deleted (or gone) profile.
+    if read_default_profile(data_dir).as_deref() == Some(id) {
+        let _ = std::fs::remove_file(data_dir.join("default-profile"));
+    }
+    let json = profiles_dir.join(format!("{id}.json"));
+    match std::fs::remove_file(&json) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let dir = profiles_dir.join(id);
+    if dir.is_dir() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    Ok(())
+}
+
 fn default_octos_home() -> Option<PathBuf> {
     home_dir().map(|home| home.join(".octos"))
 }
@@ -300,5 +377,76 @@ mod tests {
         );
         let ids = discover_local_profile_ids(Some(&command));
         assert_eq!(ids, vec!["glm".to_owned(), "openai".to_owned()]);
+    }
+
+    /// Seed a data dir with `<id>.json` + `<id>/` per profile and an optional
+    /// default pointer.
+    fn seed_data_dir(tag: &str, profiles: &[&str], default: Option<&str>) -> TempDir {
+        let tmp = TempDir::new(tag);
+        let profiles_dir = tmp.path().join("profiles");
+        fs::create_dir_all(&profiles_dir).unwrap();
+        for id in profiles {
+            fs::write(profiles_dir.join(format!("{id}.json")), "{}").unwrap();
+            fs::create_dir_all(profiles_dir.join(id)).unwrap();
+        }
+        if let Some(default) = default {
+            fs::write(tmp.path().join("default-profile"), default).unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn set_default_profile_writes_the_pointer() {
+        let tmp = seed_data_dir("set-default", &["glm", "work"], None);
+        set_default_profile(tmp.path(), "work").unwrap();
+        assert_eq!(read_default_profile(tmp.path()).as_deref(), Some("work"));
+        // Overwriting is fine.
+        set_default_profile(tmp.path(), "glm").unwrap();
+        assert_eq!(read_default_profile(tmp.path()).as_deref(), Some("glm"));
+    }
+
+    #[test]
+    fn delete_profile_removes_descriptor_data_and_clears_default() {
+        let tmp = seed_data_dir("delete-default", &["glm", "work"], Some("work"));
+        delete_profile(tmp.path(), "work").unwrap();
+        let profiles_dir = tmp.path().join("profiles");
+        assert!(!profiles_dir.join("work.json").exists());
+        assert!(!profiles_dir.join("work").exists());
+        assert!(profiles_dir.join("glm.json").exists(), "others untouched");
+        assert!(
+            read_default_profile(tmp.path()).is_none(),
+            "deleting the default clears the pointer"
+        );
+    }
+
+    #[test]
+    fn delete_a_non_default_profile_keeps_the_pointer() {
+        let tmp = seed_data_dir("delete-nondefault", &["glm", "work"], Some("glm"));
+        delete_profile(tmp.path(), "work").unwrap();
+        assert_eq!(read_default_profile(tmp.path()).as_deref(), Some("glm"));
+    }
+
+    #[test]
+    fn profile_llm_summary_reads_primary_without_secrets() {
+        let tmp = seed_data_dir("summary", &[], None);
+        let profiles_dir = tmp.path().join("profiles");
+        fs::create_dir_all(&profiles_dir).unwrap();
+        fs::write(
+            profiles_dir.join("glm.json"),
+            r#"{"config":{"llm":{"primary":{"family_id":"zai","model_id":"glm-5.2","route":{"route_id":"zai"}}},"env_vars":{"ZAI_API_KEY":"sk-secret"}}}"#,
+        )
+        .unwrap();
+        let summary = profile_llm_summary(&profiles_dir, "glm").expect("summary");
+        assert_eq!(summary, "zai/glm-5.2 via zai");
+        assert!(!summary.contains("sk-secret"), "never leaks the API key");
+    }
+
+    #[test]
+    fn solo_data_dir_is_the_parent_of_the_profiles_dir() {
+        let command = "octos serve --stdio --solo --data-dir /tmp/xyz";
+        assert_eq!(
+            solo_data_dir(Some(command)),
+            Some(PathBuf::from("/tmp/xyz"))
+        );
     }
 }

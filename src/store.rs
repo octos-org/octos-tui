@@ -1246,6 +1246,37 @@ impl Store {
             LocalAction::SetLanguageCode(lang) => self.dispatch_set_language_code(lang),
             LocalAction::SetThinking => self.dispatch_set_thinking(inline_args.unwrap_or_default()),
             LocalAction::Btw => self.dispatch_btw(inline_args.unwrap_or_default()),
+            LocalAction::OpenProfilesSurface => {
+                self.refresh_profiles();
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER));
+                None
+            }
+            LocalAction::CreateNewProfile => {
+                self.reset_onboarding_for_new_profile();
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                None
+            }
+            LocalAction::SelectProfileForActions(id) => {
+                self.state.onboarding.selected_profile = Some(id);
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_ACTIONS));
+                None
+            }
+            LocalAction::SetProfileDefault(id) => {
+                self.dispatch_set_profile_default(&id);
+                None
+            }
+            LocalAction::SwitchToProfile(id) => self.dispatch_switch_to_profile(&id),
+            LocalAction::RequestDeleteProfile(id) => {
+                self.state.onboarding.selected_profile = Some(id);
+                self.open_menu(MenuId::from(
+                    crate::menu::registry::MENU_PROFILE_DELETE_CONFIRM,
+                ));
+                None
+            }
+            LocalAction::ConfirmDeleteProfile(id) => {
+                self.dispatch_delete_profile(&id);
+                None
+            }
             LocalAction::SetScrollMode => {
                 self.dispatch_set_scrollmode(inline_args.unwrap_or_default());
                 // Executing from the slash popup must close it: the toggle's
@@ -1363,6 +1394,160 @@ impl Store {
         // Every non-`/stop` local action ran (the dispatcher accepted it),
         // regardless of whether it produced a backend command.
         SlashDispatchOutcome::accepted(command)
+    }
+
+    /// Reset the onboarding wizard to a clean create slate for "Create a new
+    /// profile": clears the create/provider fields (so it opens at "Name this
+    /// profile" instead of resuming the ACTIVE profile's already-configured
+    /// setup mid-session), while preserving the profiles-surface data and the
+    /// validated workspace so the fresh profile can still activate this folder.
+    fn reset_onboarding_for_new_profile(&mut self) {
+        let available = std::mem::take(&mut self.state.onboarding.available_profiles);
+        let default_profile = self.state.onboarding.default_profile.take();
+        let data_dir = self.state.onboarding.profiles_data_dir.take();
+        let workspace = self.state.onboarding.workspace_candidate.take();
+        let validation = self.state.onboarding.workspace_validation.clone();
+        let auth = self.state.onboarding.auth_email_enabled;
+        self.state.onboarding = crate::model::OnboardingWizardState {
+            available_profiles: available,
+            default_profile,
+            profiles_data_dir: data_dir,
+            workspace_candidate: workspace,
+            workspace_validation: validation,
+            auth_email_enabled: auth,
+            // Force the create step even though a session may be active.
+            creating_new_profile: true,
+            ..crate::model::OnboardingWizardState::default()
+        };
+    }
+
+    /// Re-read the on-disk profile ids + `default-profile` pointer into state so
+    /// the profiles surface renders current truth (on open, and after a
+    /// set-default / delete). No-op for a remote launch (no local data dir).
+    fn refresh_profiles(&mut self) {
+        // Reopening the surface ends any in-progress "create new" intent.
+        self.state.onboarding.creating_new_profile = false;
+        let Some(data_dir) = self.state.onboarding.profiles_data_dir.clone() else {
+            return;
+        };
+        let data_dir = std::path::Path::new(&data_dir);
+        self.state.onboarding.available_profiles =
+            crate::profiles::enumerate_profile_ids(&data_dir.join("profiles"));
+        self.state.onboarding.default_profile = crate::profiles::read_default_profile(data_dir);
+    }
+
+    /// "Use this profile" from the profiles surface: switch the active session to
+    /// `id` by opening (or resuming) its session in the current folder. Sessions
+    /// are keyed per-profile, so this makes that profile's session active; the
+    /// previous profile's session is left intact. `None` cwd (remote launch)
+    /// still opens the session — the server resolves the folder.
+    fn dispatch_switch_to_profile(&mut self, id: &str) -> Option<AppUiCommand> {
+        self.close_all_menus();
+        self.state.onboarding.selected_profile = None;
+        let cwd = self.current_switch_cwd();
+        let session_id = octos_core::SessionKey::with_profile_topic(id, "local", "tui", "coding");
+        self.state.status = t!("status.switching_profile", profile = id.to_string()).into_owned();
+        Some(AppUiCommand::OpenSession(
+            octos_core::ui_protocol::SessionOpenParams {
+                session_id,
+                topic: None,
+                profile_id: Some(id.to_owned()),
+                cwd,
+                sandbox: None,
+                after: None,
+            },
+        ))
+    }
+
+    /// The folder to open a switched-to profile's session in: the active
+    /// session's workspace, falling back to the launch cwd.
+    fn current_switch_cwd(&self) -> Option<String> {
+        self.active_session()
+            .and_then(|session| self.state.runtime_status_for(&session.id))
+            .and_then(|status| status.workspace_root.as_deref().or(status.cwd.as_deref()))
+            .filter(|cwd| !cwd.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| self.launch_workspace_cwd())
+    }
+
+    /// Set the given profile as the machine default (writes the `default-profile`
+    /// pointer), refreshes, and returns to the profiles list.
+    fn dispatch_set_profile_default(&mut self, id: &str) {
+        let Some(data_dir) = self.state.onboarding.profiles_data_dir.clone() else {
+            self.state.status = t!("status.profiles_no_data_dir").into_owned();
+            return;
+        };
+        let data_dir_path = std::path::Path::new(&data_dir);
+        // Guard against a stale menu (or a concurrent instance) making a
+        // since-deleted profile the machine default: only write the pointer to a
+        // profile that still exists on disk. On a miss, refresh so the surface
+        // reflects reality.
+        if !crate::profiles::enumerate_profile_ids(&data_dir_path.join("profiles"))
+            .iter()
+            .any(|existing| existing == id)
+        {
+            self.state.status =
+                t!("status.profile_default_failed", error = id.to_string()).into_owned();
+            self.refresh_profiles();
+            self.state.onboarding.selected_profile = None;
+            self.close_all_menus();
+            self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER));
+            return;
+        }
+        match crate::profiles::set_default_profile(data_dir_path, id) {
+            Ok(()) => {
+                self.state.status =
+                    t!("status.profile_default_set", profile = id.to_string()).into_owned();
+            }
+            Err(error) => {
+                self.state.status =
+                    t!("status.profile_default_failed", error = error.to_string()).into_owned();
+            }
+        }
+        self.refresh_profiles();
+        self.state.onboarding.selected_profile = None;
+        self.close_all_menus();
+        self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER));
+    }
+
+    /// Delete the given profile from disk (guarding the profile the current
+    /// session is using), refresh, and return to the profiles list.
+    fn dispatch_delete_profile(&mut self, id: &str) {
+        // Never delete a profile that ANY open session is running on — the
+        // backend may have it loaded and removing its files under a live session
+        // is unsafe. Checks every open session (they accumulate across switches),
+        // by each session's runtime/own profile — NOT `current_profile_for_
+        // onboarding` (which falls back through loaded llm/skills state and would
+        // wrongly block a profile whose data merely happens to be loaded).
+        if self.profile_has_open_session(id) {
+            self.state.status = t!(
+                "status.profile_delete_active_blocked",
+                profile = id.to_string()
+            )
+            .into_owned();
+            self.state.onboarding.selected_profile = None;
+            self.close_all_menus();
+            self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER));
+            return;
+        }
+        let Some(data_dir) = self.state.onboarding.profiles_data_dir.clone() else {
+            self.state.status = t!("status.profiles_no_data_dir").into_owned();
+            return;
+        };
+        match crate::profiles::delete_profile(std::path::Path::new(&data_dir), id) {
+            Ok(()) => {
+                self.state.status =
+                    t!("status.profile_deleted", profile = id.to_string()).into_owned();
+            }
+            Err(error) => {
+                self.state.status =
+                    t!("status.profile_delete_failed", error = error.to_string()).into_owned();
+            }
+        }
+        self.refresh_profiles();
+        self.state.onboarding.selected_profile = None;
+        self.close_all_menus();
+        self.open_menu(MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER));
     }
 
     /// Resolve a `/resume <query>` argument to a known session id, in priority
@@ -1643,11 +1828,22 @@ impl Store {
     /// and the `/lang` selection menu.
     fn dispatch_set_language_code(&mut self, lang: crate::cli::Lang) -> Option<AppUiCommand> {
         rust_i18n::set_locale(lang.code());
-        // Rebuild any open menu so it repaints in the new language now; the
-        // cached `active_menu` spec was built under the old locale. (The status
-        // line + composer placeholder are rebuilt every frame, so they switch
-        // without this.)
-        self.refresh_active_menu_if_open();
+        // A language pick is a confirmation: hop back to the parent rather than
+        // stranding the user on the language list needing an extra Esc. Inside
+        // the onboarding wizard the language list is a CHILD of the wizard step,
+        // and the wizard is exempt from the caller's dismiss-on-select collapse
+        // (it owns its own flow), so pop the child here to return to the wizard
+        // — mirroring how the family/model/route leaves hand control back.
+        // `close_menu` refreshes the now-active parent, so it repaints in the
+        // new language. The standalone `/lang` menu is collapsed by the caller's
+        // dismiss-on-select path, and an inline `/lang <code>` has no menu open;
+        // both are handled by the `else` refresh (rebuild so the open menu — if
+        // any — repaints under the new locale).
+        if self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_LANGUAGE) {
+            self.close_menu();
+        } else {
+            self.refresh_active_menu_if_open();
+        }
         self.state.status = t!("lang.switched").to_string();
         None
     }
@@ -2239,6 +2435,12 @@ impl Store {
 
         match action {
             OnboardingAction::Open => {
+                // Any onboarding open that is NOT the profiles-surface "Create a
+                // new profile" path (which sets this flag then opens the wizard
+                // directly, bypassing this handler) must clear a stale force-
+                // create intent — otherwise `/onboard` after Esc-ing out of a
+                // create wizard would wrongly render the create step.
+                self.state.onboarding.creating_new_profile = false;
                 // From the Phase 3 startup picker's "Create a new profile" row,
                 // replace the picker rather than stacking onboarding over it.
                 if self.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER) {
@@ -3325,6 +3527,24 @@ impl Store {
         self.refresh_active_menu_if_open();
     }
 
+    /// True when `id` is the profile of ANY open session — not just the active
+    /// one. Sessions accumulate across profile switches ("Open a session here"
+    /// pushes a new one and leaves the previous open), and the backend may still
+    /// have them loaded, so deleting the profile of ANY of them would pull its
+    /// on-disk data out from under a live session. Narrow per session: the
+    /// runtime status's profile, falling back to the session's own profile id
+    /// (NOT the broad loaded-data resolver).
+    fn profile_has_open_session(&self, id: &str) -> bool {
+        self.state.sessions.iter().any(|session| {
+            let profile = self
+                .state
+                .runtime_status_for(&session.id)
+                .and_then(|status| status.profile_id.as_deref())
+                .or(session.profile_id.as_deref());
+            profile == Some(id)
+        })
+    }
+
     fn current_profile_for_onboarding(&self) -> Option<String> {
         let runtime_profile = self.active_session().and_then(|session| {
             self.state
@@ -3504,6 +3724,20 @@ impl Store {
     pub fn open_menu(&mut self, id: MenuId) {
         self.state.menu_stack.open(id);
         self.refresh_active_menu();
+        // A freshly opened menu defaults its cursor to index 0, but that row can
+        // be a non-selectable status/instruction line (e.g. the onboarding
+        // "done" screen leads with a relaunch hint). Advance to the first
+        // selectable row so the cursor never starts parked on a dead row.
+        let len = active_menu_item_len(self.state.active_menu.as_ref());
+        if len > 0 && !active_menu_index_selectable(self.state.active_menu.as_ref(), 0) {
+            if let Some(first) =
+                (0..len).find(|&i| active_menu_index_selectable(self.state.active_menu.as_ref(), i))
+            {
+                if let Some(frame) = self.state.menu_stack.active_mut() {
+                    frame.selected_index = first;
+                }
+            }
+        }
         if let Some(frame) = self.state.menu_stack.active() {
             self.state.status = format!("Menu: {}", frame.id);
         }
@@ -3900,7 +4134,13 @@ impl Store {
     }
 
     fn focus_provider_start_row(&mut self) -> bool {
-        self.select_active_menu_item_by_id("onboard.provider.family")
+        // The provider step is collapsed to a single "Add a model" entry until a
+        // model is being configured, when it expands to the Model family row.
+        // Anchor the cursor on whichever is the current start row so a stale
+        // index carried over from the local-profile step's Continue button never
+        // lands on a destructive row (API key / Save).
+        self.select_active_menu_item_by_id("onboard.provider.add_model")
+            || self.select_active_menu_item_by_id("onboard.provider.family")
             || self.select_active_menu_item_by_id("provider.current")
     }
 
@@ -5312,6 +5552,9 @@ impl Store {
                 self.state
                     .onboarding
                     .apply_profile_local_create(&event.result);
+                // The new profile now exists, so the wizard should advance to
+                // setting up its model — clear the force-create intent.
+                self.state.onboarding.creating_new_profile = false;
                 let open_session = self.state.onboarding.open_session_after_profile_create;
                 self.state.onboarding.open_session_after_profile_create = false;
                 self.state.onboarding.last_message = Some(event.message.clone());
@@ -6302,6 +6545,25 @@ impl Store {
         }
     }
 
+    /// Resolve the cwd for the per-project launch flow — the `launch/resolve`
+    /// probe and the session/prompt its decision drives. Prefers the seeded
+    /// `workspace_candidate` (the launch `--cwd`, or the process working
+    /// directory for a transport-local launch) over the plain-path
+    /// `workspace.root`: a stdio launch's root is the spawn command
+    /// ("stdio:octos serve …"), which carries no cwd, so relying on it alone
+    /// dead-ends the flow into the onboarding wizard even though the real cwd
+    /// was captured at startup by `seed_onboarding_workspace_cwd`. Every launch
+    /// consumer (resolve probe, Activate/CrossProfile prompt, Resume open) must
+    /// route through this so they agree on the folder. `None` for a remote/ws
+    /// launch with no local cwd.
+    fn launch_workspace_cwd(&self) -> Option<String> {
+        self.state
+            .onboarding
+            .workspace_candidate
+            .clone()
+            .or_else(|| onboarding_workspace_cwd(&self.state.workspace.root))
+    }
+
     /// First-launch hook for the per-project launch flow. Emits `launch/resolve`
     /// to learn the folder's launch decision when the backend supports it and we
     /// are on a clean first launch (no session, no menu, a local cwd). Returns
@@ -6319,9 +6581,9 @@ impl Store {
         if !supports {
             return None;
         }
-        // No resolvable local cwd (remote-only transport, `unknown`, …) means
-        // there is no per-project decision to make — let onboarding handle it.
-        let cwd = onboarding_workspace_cwd(&self.state.workspace.root)?;
+        // None → remote launch with no local cwd, so there is no per-project
+        // decision to make; fall through to the legacy onboarding path.
+        let cwd = self.launch_workspace_cwd()?;
         let profile_id = self.state.onboarding.launch_profile_id.clone();
         Some(AppUiCommand::LaunchResolve(
             crate::model::LaunchResolveParams { cwd, profile_id },
@@ -6417,10 +6679,9 @@ impl Store {
                 }
             },
             LaunchDecisionKind::Activate | LaunchDecisionKind::CrossProfile => {
-                let (Some(resolved_profile), Some(cwd)) = (
-                    result.resolved_profile,
-                    onboarding_workspace_cwd(&self.state.workspace.root),
-                ) else {
+                let (Some(resolved_profile), Some(cwd)) =
+                    (result.resolved_profile, self.launch_workspace_cwd())
+                else {
                     // No resolvable profile or local cwd — fall back to
                     // onboarding rather than opening an empty prompt.
                     self.maybe_open_onboarding_on_first_launch();
@@ -6457,7 +6718,7 @@ impl Store {
                 session_id,
                 topic: None,
                 profile_id: Some(profile_id),
-                cwd: onboarding_workspace_cwd(&self.state.workspace.root),
+                cwd: self.launch_workspace_cwd(),
                 sandbox: None,
                 after: None,
             },
@@ -10997,6 +11258,59 @@ mod tests {
         }
     }
 
+    fn open_session_on(profile: &str) -> SessionView {
+        SessionView {
+            id: SessionKey(format!("local:{profile}")),
+            title: profile.into(),
+            profile_id: Some(profile.into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        }
+    }
+
+    /// Regression (review #1): the delete guard must protect EVERY open session's
+    /// profile, not just the selected one — sessions accumulate across switches.
+    #[test]
+    fn profile_has_open_session_covers_non_active_sessions() {
+        // Two open sessions (work, glm); glm is the SELECTED (active) one.
+        let store = Store {
+            state: AppState::new(
+                vec![open_session_on("work"), open_session_on("glm")],
+                1,
+                "ready".into(),
+                None,
+                false,
+            ),
+        };
+        assert!(
+            store.profile_has_open_session("glm"),
+            "active session's profile"
+        );
+        assert!(
+            store.profile_has_open_session("work"),
+            "a NON-active but still-open session's profile is in use → must block delete"
+        );
+        assert!(
+            !store.profile_has_open_session("research"),
+            "a profile with no open session is deletable"
+        );
+    }
+
+    /// Regression (review #2): a stale `creating_new_profile` (set by "Create a
+    /// new profile", then the user Escapes out) must not force the create step
+    /// when onboarding is later opened via `/onboard` (OnboardingAction::Open).
+    #[test]
+    fn onboarding_open_clears_stuck_creating_new_profile() {
+        let mut store = store_with_empty_session();
+        store.state.onboarding.creating_new_profile = true; // simulate the stuck flag
+        store.dispatch_onboarding_action(crate::model::OnboardingAction::Open, None);
+        assert!(
+            !store.state.onboarding.creating_new_profile,
+            "opening onboarding via Open clears the stale force-create intent"
+        );
+    }
+
     fn store_with_task(task_id: TaskId) -> Store {
         let session = SessionView {
             id: SessionKey("local:test".into()),
@@ -11044,6 +11358,29 @@ mod tests {
             row_checked(&store),
             Some(true),
             "the open menu row's checkbox must flip on immediately"
+        );
+    }
+
+    #[test]
+    fn onboard_done_cursor_skips_relaunch_hint_and_lands_on_close() {
+        // Regression: the "You're all set" done screen leads with a read-only
+        // "relaunch here to start a session" instruction (Noop). It must be
+        // non-selectable so the cursor never parks on a dead row — opening the
+        // menu lands focus on Close (the only actionable row).
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_DONE));
+        assert!(
+            !active_menu_index_selectable(store.state.active_menu.as_ref(), 0),
+            "the relaunch instruction row must be non-selectable"
+        );
+        assert!(
+            active_menu_index_selectable(store.state.active_menu.as_ref(), 1),
+            "Close must be selectable"
+        );
+        let frame = store.state.menu_stack.active().expect("done menu is open");
+        assert_eq!(
+            frame.selected_index, 1,
+            "cursor should default to Close, not the non-actionable relaunch hint"
         );
     }
 
@@ -14905,11 +15242,14 @@ mod tests {
             panic!("expected provider setup menu after local profile create");
         };
         // Sanity: this really is the provider step, not the local-profile step.
+        // The model config is collapsed behind a single "Add a model" entry
+        // (nothing configured yet), so that — not the Model family row — is the
+        // provider step's start row now.
         assert!(
             spec.items
                 .iter()
-                .any(|item| item.id == "onboard.provider.family"),
-            "expected provider step with the Model family row"
+                .any(|item| item.id == "onboard.provider.add_model"),
+            "expected the collapsed provider step with the Add-a-model row"
         );
         let selected = store
             .state
@@ -14918,8 +15258,8 @@ mod tests {
             .expect("active menu")
             .selected_index;
         assert_eq!(
-            spec.items[selected].id, "onboard.provider.family",
-            "fresh provider step must land on Model family, not the stale row carried over from the local-profile Continue button"
+            spec.items[selected].id, "onboard.provider.add_model",
+            "fresh provider step must land on Add-a-model, not the stale row carried over from the local-profile Continue button"
         );
     }
 
@@ -14965,11 +15305,13 @@ mod tests {
         let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
             panic!("expected provider setup menu after profile id set");
         };
+        // Model config is collapsed behind "Add a model" until one is being set
+        // up, so that is the provider step's start row.
         assert!(
             spec.items
                 .iter()
-                .any(|item| item.id == "onboard.provider.family"),
-            "expected provider step with the Model family row"
+                .any(|item| item.id == "onboard.provider.add_model"),
+            "expected the collapsed provider step with the Add-a-model row"
         );
         let selected = store
             .state
@@ -14978,8 +15320,8 @@ mod tests {
             .expect("active menu")
             .selected_index;
         assert_eq!(
-            spec.items[selected].id, "onboard.provider.family",
-            "the provider step must land on Model family, not a stale/advanced index"
+            spec.items[selected].id, "onboard.provider.add_model",
+            "the provider step must land on Add-a-model, not a stale/advanced index"
         );
     }
 
@@ -15863,6 +16205,46 @@ mod tests {
         );
     }
 
+    /// Regression: a real stdio launch sets `workspace.root` to the transport
+    /// label ("stdio:octos serve --stdio --solo"), which carries no cwd. The
+    /// launch cwd must come from the seeded `workspace_candidate` (the process
+    /// cwd / `--cwd`), so a bare launch in a fresh folder still requests
+    /// `launch/resolve` instead of dead-ending into the onboarding wizard. The
+    /// sibling test above uses a plain-path root and so never covered this.
+    #[test]
+    fn first_launch_uses_seeded_cwd_when_root_is_stdio_transport_label() {
+        let mut store = protocol_store_without_sessions();
+        // Real launch: the root is the spawn command, not a filesystem path.
+        store.state.workspace.root = "stdio:octos serve --stdio --solo".into();
+        // Startup seeded the process cwd into the workspace candidate.
+        store.state.onboarding.workspace_candidate = Some("/tmp/fresh-folder".into());
+        store.state.onboarding.launch_profile_id = None; // bare launch, no --profile-id
+
+        let follow_up =
+            store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+                result: crate::model::ConfigCapabilitiesListResult {
+                    capabilities: UiProtocolCapabilities::new(
+                        &[crate::model::APPUI_METHOD_LAUNCH_RESOLVE],
+                        &[],
+                    )
+                    .with_supported_features([
+                        crate::model::APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1,
+                    ]),
+                },
+                message: "Octos UI capabilities refreshed".into(),
+            }));
+
+        let Some(AppUiCommand::LaunchResolve(params)) = follow_up else {
+            panic!("bare stdio launch must still request launch/resolve, got: {follow_up:?}");
+        };
+        assert_eq!(params.cwd, "/tmp/fresh-folder");
+        assert_eq!(params.profile_id, None);
+        assert!(
+            store.state.active_menu.is_none(),
+            "launch/resolve must defer the wizard, not open it"
+        );
+    }
+
     /// The launch/resolve probe is gated on `session.workspace_cwd.v1`: an older
     /// server that advertises the method but not the feature must fall through
     /// to the legacy onboarding path, never emitting `launch/resolve`.
@@ -15940,6 +16322,69 @@ mod tests {
             .expect("activate stages the launch prompt");
         assert_eq!(prompt.resolved_profile, "dev");
         assert_eq!(prompt.cwd, "/tmp/launch-project");
+    }
+
+    /// Regression: on a bare stdio launch the workspace root is the transport
+    /// label (`stdio:octos serve …`, no `--cwd`), so `onboarding_workspace_cwd`
+    /// yields None — the real folder lives only in the seeded
+    /// `workspace_candidate`. A `Resume` decision must still open the session in
+    /// that seeded cwd, not drop it (which stranded the launch in onboarding).
+    #[test]
+    fn launch_resolve_resume_uses_seeded_cwd_when_root_is_transport_label() {
+        let mut store = protocol_store_without_sessions();
+        store.state.workspace.root = "stdio:octos serve --stdio --solo".into();
+        store.state.onboarding.workspace_candidate = Some("/tmp/fresh-folder".into());
+
+        let follow_up = store.apply_client_event(ClientEvent::LaunchResolve(
+            crate::model::LaunchResolveResult {
+                decision: crate::model::LaunchDecisionKind::Resume,
+                resolved_profile: Some("dev".into()),
+                existing_profiles: Vec::new(),
+            },
+        ));
+
+        let Some(AppUiCommand::OpenSession(params)) = follow_up else {
+            panic!("resume must open the folder session, got: {follow_up:?}");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("dev"));
+        assert_eq!(params.cwd.as_deref(), Some("/tmp/fresh-folder"));
+    }
+
+    /// Regression companion to the Resume case: an `Activate` decision on a bare
+    /// stdio launch must stage the launch prompt using the seeded
+    /// `workspace_candidate`. The old code read the transport-label root, got
+    /// None, fell through the `else`, and showed the full onboarding wizard —
+    /// the exact "fresh folder shows the whole wizard" bug.
+    #[test]
+    fn launch_resolve_activate_uses_seeded_cwd_when_root_is_transport_label() {
+        let mut store = protocol_store_without_sessions();
+        store.state.workspace.root = "stdio:octos serve --stdio --solo".into();
+        store.state.onboarding.workspace_candidate = Some("/tmp/fresh-folder".into());
+
+        let follow_up = store.apply_client_event(ClientEvent::LaunchResolve(
+            crate::model::LaunchResolveResult {
+                decision: crate::model::LaunchDecisionKind::Activate,
+                resolved_profile: Some("dev".into()),
+                existing_profiles: Vec::new(),
+            },
+        ));
+
+        assert!(
+            follow_up.is_none(),
+            "activate opens a prompt, it must not emit a command directly"
+        );
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_LAUNCH_PROMPT),
+            "activate on a fresh folder must open the yes/no launch prompt, not the wizard"
+        );
+        let prompt = store
+            .state
+            .onboarding
+            .launch_prompt
+            .as_ref()
+            .expect("activate stages the launch prompt");
+        assert_eq!(prompt.resolved_profile, "dev");
+        assert_eq!(prompt.cwd, "/tmp/fresh-folder");
     }
 
     /// M22-A: legacy email-OTP onboarding triggers first-launch flow
@@ -16447,6 +16892,54 @@ mod tests {
             .active()
             .map(|frame| frame.id.as_str().to_owned())
             .expect("/setup must open the onboarding menu");
+        assert_eq!(active_id, crate::menu::registry::MENU_ONBOARD);
+    }
+
+    /// `/add-model` (and its `provider` alias) open the model-adding flow — the
+    /// provider family -> model -> route surface lifted out of the full wizard.
+    #[test]
+    fn add_model_command_opens_provider_surface() {
+        for cmd in ["/add-model", "/provider"] {
+            let mut store =
+                protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG]);
+            store.close_all_menus();
+            store.state.composer = cmd.into();
+            let command = store.compose_command();
+            assert!(command.is_none(), "{cmd} opens a menu, not a wire command");
+            let active_id = store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str().to_owned())
+                .unwrap_or_else(|| panic!("{cmd} must open the provider menu"));
+            assert_eq!(active_id, crate::menu::registry::MENU_PROVIDER, "for {cmd}");
+        }
+    }
+
+    /// The onboarding wizard is hidden from the normal-session `/` menu but stays
+    /// dispatchable by name — first-launch and the `/onboard <field>` inline
+    /// forms (and its `setup`/`wizard` aliases) still resolve.
+    #[test]
+    fn onboard_is_hidden_from_menu_but_still_dispatchable() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE]);
+        // Not listed in the `/` menu...
+        let listed = store.slash_command_matches("/onboard");
+        assert!(
+            !listed.iter().any(|m| m.name == "/onboard"),
+            "onboard must not appear in the slash menu; got: {:?}",
+            listed.iter().map(|m| m.name.clone()).collect::<Vec<_>>()
+        );
+        // ...but typing it still resolves and opens the wizard.
+        store.close_all_menus();
+        store.state.composer = "/onboard".into();
+        let _ = store.compose_command();
+        let active_id = store
+            .state
+            .menu_stack
+            .active()
+            .map(|frame| frame.id.as_str().to_owned())
+            .expect("/onboard must still open the wizard even though it's hidden");
         assert_eq!(active_id, crate::menu::registry::MENU_ONBOARD);
     }
 
@@ -17661,12 +18154,18 @@ mod tests {
         assert_eq!(store.state.theme.as_str(), "slate");
     }
 
-    /// The onboarding wizard owns its own flow: a leaf pick inside it (the
-    /// language step reuses the SetLanguageCode leaf) must NOT nuke the stack.
+    /// Picking a language in the onboarding wizard's language sub-list is a
+    /// confirmation: it pops back to the wizard step automatically (no extra
+    /// Esc), while keeping the wizard itself open (the wizard owns its flow and
+    /// is exempt from the whole-stack dismiss). The language list is a CHILD of
+    /// the wizard, so the realistic stack is [onboard, onboard-language].
     #[test]
-    fn onboarding_leaf_selection_keeps_wizard_open() {
+    fn onboarding_language_pick_returns_to_wizard() {
         let mut store = store_with_empty_session();
+        // Realistic nesting: the wizard step, then its language sub-list.
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
         store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_LANGUAGE));
+        assert_eq!(store.state.menu_stack.path().len(), 2);
         let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
             panic!("expected onboarding language menu");
         };
@@ -17684,9 +18183,47 @@ mod tests {
             .expect("active frame")
             .selected_index = idx;
         assert!(store.accept_active_menu_item().is_none());
+        // The language sub-list is popped (returned to the wizard), but the
+        // wizard itself stays open — one level, not zero, and it is MENU_ONBOARD.
+        assert_eq!(
+            store.state.menu_stack.path().len(),
+            1,
+            "language pick pops back to the wizard, no extra Esc needed"
+        );
         assert!(
-            !store.state.menu_stack.path().is_empty(),
-            "wizard-scoped selection must keep the wizard flow open"
+            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
+            "the wizard step is the active menu after the language pick"
+        );
+    }
+
+    /// The standalone `/lang` menu (NOT inside the wizard) still collapses the
+    /// whole stack on a language pick — the dismiss-on-select behavior is
+    /// unchanged for it; only the wizard-nested language list pops one level.
+    #[test]
+    fn standalone_lang_menu_pick_dismisses_the_menu() {
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_LANG));
+        assert_eq!(store.state.menu_stack.path().len(), 1);
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected the language menu");
+        };
+        // Pick the CURRENT locale (en) so the global locale is untouched for
+        // parallel tests.
+        let idx = spec
+            .items
+            .iter()
+            .position(|item| item.id.ends_with(".en"))
+            .expect("en language row");
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("active frame")
+            .selected_index = idx;
+        assert!(store.accept_active_menu_item().is_none());
+        assert!(
+            store.state.menu_stack.path().is_empty(),
+            "a standalone /lang pick dismisses the menu (no lingering list)"
         );
     }
 

@@ -308,6 +308,10 @@ onboarding:
     status_ok: "Status: OK (%{writable}%{toml})"
     status_invalid: "Status: INVALID — %{reason}"
   provider:
+    add_model_label: "Add a model"
+    add_model_desc: "Set up the AI model for this profile: family, model, provider route, and API key."
+    add_another_model_label: "Add another model"
+    add_another_model_desc: "Add a fallback or a different model: family, model, provider route, and API key."
     test: "Test connection"
     test_testing: "Testing connection..."
     test_unavailable_saving: "Test unavailable while saving"
@@ -383,7 +387,7 @@ onboarding:
     explain_now: "Now: %{title}"
     explain:
       language: "Choose the language Octos uses while you finish setup.\nEnglish is selected by default. Pick 中文 if you want the rest of onboarding and the app to switch immediately.\nYou can change this later with `/lang`."
-      profile: "Octos needs a local profile to attach your settings, providers, and history to.\nName this profile with a short id (like glm or deepseek) and continue — you can accept the suggested name with one keypress. (Older servers ask for name, username, and email instead.)\nThis profile stays on this machine; nothing is sent."
+      profile: "Octos needs a local profile to attach your settings, providers, and history to.\nGive it a short name (like work or research) and continue. The name is just a label — it has nothing to do with which model you run; you choose that next, and can add or change models anytime with /add-model. (Older servers ask for name, username, and email instead.)\nThis profile stays on this machine; nothing is sent."
       provider: "Choose which AI model powers Octos.\nPick a model family (e.g. GPT, Claude), then a specific model, then the provider route that serves it (official or an alternative).\nThis decides who Octos talks to and how good the coding help is — you can change it later."
       connect: "Prove the model actually answers before you rely on it.\nPaste your provider API key, then run the live test. Octos sends one small request and reports success or the exact error.\nThis catches a bad key or wrong route now, not mid-task."
       save: "Persist the verified provider into your profile JSON so it survives restarts.\nSave it as your primary provider (or add it as a fallback). Until you save, the route lives only in this session.\nAfter saving, the workspace step unlocks."
@@ -560,6 +564,14 @@ status:
   onboarding_profile_name_updated: "Onboarding profile name updated"
   make_default_updated: "Default-brain preference updated"
   attached_profile: "Attached profile %{profile}"
+  new_profile_launch: "Creating a new profile — name it, then set its AI model"
+  profiles_no_data_dir: "Can't manage profiles here — no local data directory is known for this launch."
+  profile_default_set: "Default profile is now %{profile}"
+  profile_default_failed: "Couldn't set the default profile: %{error}"
+  profile_deleted: "Deleted profile %{profile}"
+  profile_delete_failed: "Couldn't delete the profile: %{error}"
+  profile_delete_active_blocked: "Can't delete %{profile} — it's the profile this session is using. Switch to another profile first."
+  switching_profile: "Switching to profile %{profile}…"
   provider_route_selected: "Provider route selected; enter API key"
   provider_family_updated: "Provider family updated"
   provider_model_updated: "Provider model updated"
@@ -814,6 +826,8 @@ status:
 command:
   activity:
     desc: Search and filter sessions, tasks, and activity.
+  add_model:
+    desc: Add or change the profile's AI model (family, model, and provider route).
   agents:
     desc: Inspect or interrupt backend-owned subagents.
   aliases_label: 'Aliases:'
@@ -825,6 +839,8 @@ command:
     desc: Show server-reported token and cost usage.
   exit:
     desc: Quit the TUI.
+  profiles:
+    desc: Manage local profiles — list, set the default, delete, or create one.
   goal:
     desc: View, set, pause, resume, or clear the persisted session goal.
   help:
@@ -1074,8 +1090,13 @@ menu:
     footer: "Enter select | Esc close"
     item:
       ready:
-        label: "Relaunch Octos here to start a session"
-        desc: "This folder activates for your brain on the next launch."
+        label: "Next: start a session with “%{profile}”"
+        desc: "Run `octos-tui` here (this folder is activated for “%{profile}”), or `octos-tui --profile-id %{profile}` from another folder."
+        label_generic: "Next: start a session"
+        desc_generic: "Run `octos-tui` here — this folder is now activated for your brain."
+      open:
+        label: "Open a session here now"
+        desc: "Start working with “%{profile}” in this folder right now — no relaunch needed."
       exit:
         label: "Close"
         desc: "Leave onboarding."
@@ -1114,6 +1135,43 @@ menu:
       create:
         label: "Create a new profile"
         desc: "Start onboarding to create a fresh local profile instead."
+  profiles:
+    title: "Profiles"
+    subtitle: "Manage your local profiles — set the default, delete, or create one."
+    footer: "Enter manage | Up/Down move | Esc close"
+    default_marker: "*default"
+    preview_title: "Profiles"
+    preview_hint: "Pick a profile to see its model and set it as default or delete it. Use “Create a new profile” to add one."
+    item:
+      manage:
+        desc: "Open this profile — use it, set default, or delete."
+    actions:
+      title: "Profile"
+      title_named: "Profile: %{profile}"
+      subtitle: "Use this profile, make it the default, or delete it."
+      none: "No profile selected."
+      use: "Open a session here"
+      use_desc: "Switch to this profile — open (or resume) its session in the current folder."
+      set_default: "Set as default"
+      set_default_desc: "Make this the profile a bare launch opens."
+      already_default: "Already the default"
+      delete: "Delete"
+      delete_desc: "Remove this profile's config and data (asks to confirm)."
+      back: "Back"
+    info:
+      title: "About this profile"
+      name: "Profile: %{profile}"
+      model: "Model: %{model}"
+      no_model: "Model: not configured yet"
+      is_default: "Default: yes — a bare launch opens this"
+      not_default: "Default: no"
+    delete:
+      title: "Delete profile?"
+      title_named: "Delete “%{profile}”?"
+      subtitle: "Removes this profile's config and all its data. Cannot be undone."
+      yes: "Yes, delete %{profile}"
+      yes_desc: "Permanently remove this profile and its data."
+      no: "No, keep it"
   onboard:
     family:
       footer: Enter choose family | Esc back
