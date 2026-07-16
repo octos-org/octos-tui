@@ -712,6 +712,14 @@ menu:
     item:
       fallback:
         desc: "将暂存的供应商追加或替换到 config.llm.fallbacks。"
+    preview:
+      title: "已保存模型"
+      profile: "档案"
+      primary: "主模型"
+      fallbacks: "备用"
+      fallback_n: "备用 %{n}"
+      none: "无"
+      not_loaded: "未加载 —— 请在 /model 中刷新模型"
   onboard_done:
     title: "一切就绪"
     subtitle: "大脑 \"%{profile}\" 已就绪。"
@@ -949,33 +957,6 @@ menu:
     title: 更新模型权限
     unavailable_no_session: 权限功能需要一个打开的 Octos UI 会话。
     unavailable_title: 权限不可用
-  provider:
-    item:
-      catalog_refresh:
-        label: 刷新供应商目录
-      list_refresh:
-        label: 刷新已配置供应商
-      saved_fallback:
-        prefix: 已保存备用供应商 %{n}
-      saved_fallback_empty:
-        desc: 使用添加备用模型持久化备用线路。
-        label: 已保存备用供应商：无
-      saved_primary:
-        prefix: 已保存主要供应商
-      saved_primary_empty:
-        desc: 在打开编码会话前，请先将测试通过的供应商保存为主要供应商。
-        label: 已保存主要供应商：未设置
-      saved_unloaded:
-        desc: 请运行刷新已配置供应商以读取 profile/llm/list。
-        label: 已保存供应商：未加载
-      staged:
-        desc: 使用 /provider select 命令或在目录中选择行。
-        label: 暂存供应商
-    preview_title: 供应商状态
-    search: 筛选供应商
-    subtitle: 档案级 LLM 配置；目录和状态来自 Octos UI。
-    title: 供应商
-    unavailable_title: 供应商不可用
   runtime_preview_title: 运行时
   search:
     label: "搜索 "
