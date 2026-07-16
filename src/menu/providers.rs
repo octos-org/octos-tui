@@ -24,20 +24,20 @@ use crate::menu::{
         APPUI_METHOD_MCP_CONFIG_UPSERT, APPUI_METHOD_MCP_STATUS_LIST, APPUI_METHOD_MODEL_LIST,
         APPUI_METHOD_MODEL_SELECT, APPUI_METHOD_PERMISSION_PROFILE_LIST,
         APPUI_METHOD_PERMISSION_PROFILE_SET, APPUI_METHOD_PROFILE_LLM_CATALOG,
-        APPUI_METHOD_PROFILE_LLM_DELETE, APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
-        APPUI_METHOD_PROFILE_LLM_TEST, APPUI_METHOD_PROFILE_LLM_UPSERT,
-        APPUI_METHOD_PROFILE_LOCAL_CREATE, APPUI_METHOD_PROFILE_SKILLS_INSTALL,
-        APPUI_METHOD_PROFILE_SKILLS_LIST, APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
-        APPUI_METHOD_PROFILE_SKILLS_REMOVE, APPUI_METHOD_SESSION_COMPACT,
-        APPUI_METHOD_SESSION_COMPACT_MODE_SET, APPUI_METHOD_TOOL_CONFIG_DELETE,
-        APPUI_METHOD_TOOL_CONFIG_LIST, APPUI_METHOD_TOOL_CONFIG_SET_ENABLED,
-        APPUI_METHOD_TOOL_CONFIG_TEST, APPUI_METHOD_TOOL_CONFIG_UPSERT,
-        APPUI_METHOD_TOOL_STATUS_LIST, APPUI_ONBOARDING_METHODS_ANY,
-        APPUI_PERMISSION_MENU_METHODS_ANY, APPUI_PROVIDER_MENU_METHODS_ANY,
-        APPUI_TOOL_SETTINGS_MENU_METHODS_ANY, MENU_COMPACT_CONFIRM, MENU_CONTEXT, MENU_COST,
-        MENU_HELP, MENU_KEYMAP, MENU_LOGIN, MENU_MCP, MENU_MODEL, MENU_ONBOARD,
-        MENU_ONBOARD_LANGUAGE, MENU_PERMISSIONS, MENU_PROVIDER, MENU_RESUME, MENU_REWIND,
-        MENU_SKILLS, MENU_STATUS, MENU_STATUS_LINE, MENU_THEME, MENU_TITLE, MENU_TOOL_SETTINGS,
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS, APPUI_METHOD_PROFILE_LLM_TEST,
+        APPUI_METHOD_PROFILE_LLM_UPSERT, APPUI_METHOD_PROFILE_LOCAL_CREATE,
+        APPUI_METHOD_PROFILE_SKILLS_INSTALL, APPUI_METHOD_PROFILE_SKILLS_LIST,
+        APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH, APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+        APPUI_METHOD_SESSION_COMPACT, APPUI_METHOD_SESSION_COMPACT_MODE_SET,
+        APPUI_METHOD_TOOL_CONFIG_DELETE, APPUI_METHOD_TOOL_CONFIG_LIST,
+        APPUI_METHOD_TOOL_CONFIG_SET_ENABLED, APPUI_METHOD_TOOL_CONFIG_TEST,
+        APPUI_METHOD_TOOL_CONFIG_UPSERT, APPUI_METHOD_TOOL_STATUS_LIST,
+        APPUI_ONBOARDING_METHODS_ANY, APPUI_PERMISSION_MENU_METHODS_ANY,
+        APPUI_PROVIDER_MENU_METHODS_ANY, APPUI_TOOL_SETTINGS_MENU_METHODS_ANY,
+        MENU_COMPACT_CONFIRM, MENU_CONTEXT, MENU_COST, MENU_HELP, MENU_KEYMAP, MENU_LOGIN,
+        MENU_MCP, MENU_MODEL, MENU_MODEL_CONFIG, MENU_ONBOARD, MENU_ONBOARD_LANGUAGE,
+        MENU_PERMISSIONS, MENU_RESUME, MENU_REWIND, MENU_SKILLS, MENU_STATUS, MENU_STATUS_LINE,
+        MENU_THEME, MENU_TITLE, MENU_TOOL_SETTINGS,
     },
 };
 use crate::model::{
@@ -45,12 +45,11 @@ use crate::model::{
     LlmRouteConfig, LlmSelectionConfig, McpConfigDeleteParams, McpConfigEntry, McpConfigListParams,
     McpConfigSetEnabledParams, McpConfigTestParams, McpStatus, McpStatusListParams, ModelStatus,
     OnboardingAction, OnboardingProviderPending, OnboardingProviderSaveTarget,
-    OnboardingProviderStatus, OnboardingWizardState, ProfileLlmCatalogParams, ProfileLlmListParams,
-    ProfileLlmSelectParams, ProfileLlmTestParams, ProfileSkillsInstallParams,
-    ProfileSkillsListParams, ProfileSkillsRemoveParams, RuntimePolicyMcpServer,
-    SessionCompactModeParams, SessionCompactParams, SessionStatusReadParams,
-    ToolConfigDeleteParams, ToolConfigEntry, ToolConfigListParams, ToolConfigSetEnabledParams,
-    ToolConfigTestParams, ToolStatus, ToolStatusListParams,
+    OnboardingProviderStatus, OnboardingWizardState, ProfileLlmListParams, ProfileLlmSelectParams,
+    ProfileSkillsInstallParams, ProfileSkillsListParams, ProfileSkillsRemoveParams,
+    RuntimePolicyMcpServer, SessionCompactModeParams, SessionCompactParams,
+    SessionStatusReadParams, ToolConfigDeleteParams, ToolConfigEntry, ToolConfigListParams,
+    ToolConfigSetEnabledParams, ToolConfigTestParams, ToolStatus, ToolStatusListParams,
 };
 
 pub fn core_menu_registry() -> MenuRegistry {
@@ -82,7 +81,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::Resume,
         Provider::Rewind,
         Provider::Model,
-        Provider::Llm,
+        Provider::ModelConfig,
         Provider::Permissions,
         Provider::Mcp,
         Provider::ToolSettings,
@@ -123,7 +122,7 @@ enum Provider {
     Resume,
     Rewind,
     Model,
-    Llm,
+    ModelConfig,
     Permissions,
     Mcp,
     ToolSettings,
@@ -159,7 +158,7 @@ impl MenuProvider for Provider {
             Self::Resume => MENU_RESUME,
             Self::Rewind => MENU_REWIND,
             Self::Model => MENU_MODEL,
-            Self::Llm => MENU_PROVIDER,
+            Self::ModelConfig => MENU_MODEL_CONFIG,
             Self::Permissions => MENU_PERMISSIONS,
             Self::Mcp => MENU_MCP,
             Self::ToolSettings => MENU_TOOL_SETTINGS,
@@ -195,7 +194,7 @@ impl MenuProvider for Provider {
             Self::Resume => resume_menu(ctx),
             Self::Rewind => rewind_menu(ctx),
             Self::Model => model_menu(ctx),
-            Self::Llm => provider_menu(ctx),
+            Self::ModelConfig => model_config_menu(ctx),
             Self::Permissions => permissions_menu(ctx),
             Self::Mcp => mcp_menu(ctx),
             Self::ToolSettings => tool_settings_menu(ctx),
@@ -1931,6 +1930,130 @@ fn onboarding_provider_setup_menu(
     // provider) are `Noop` — the user can't act on them by selecting — so they
     // move to the right info pane (`onboarding_provider_preview`) and the left
     // list holds only the actionable provider-config rows.
+    //
+    // The staged rows themselves are shared with the mid-session
+    // `MENU_MODEL_CONFIG` surface (`/model` → "Add a model"). Onboarding hides
+    // the fallback save: first-run is about getting ONE model working, and the
+    // fallback concept confused users here — fallbacks live on the mid-session
+    // surface.
+    let mut items = provider_config_rows(
+        ctx,
+        state,
+        current_profile,
+        ProviderConfigRowOpts {
+            include_fallback: false,
+            api_key_edit_prefix: "/onboard key ",
+        },
+    );
+
+    // Terminal step (always shown — collapsed or expanded). On a launch-flow
+    // server (Model A) the provider step ends at the launch-instructions screen
+    // (`MENU_ONBOARD_DONE`) — the redundant workspace/Activate screen is skipped
+    // and launch-time activation opens the session on the next start. Older
+    // servers keep the workspace step (`MENU_ONBOARD_WORKSPACE`), which owns the
+    // final Activate. Either way it is disabled until a provider is saved so the
+    // steps stay ordered.
+    items.push({
+        let blocked = (!onboarding_has_saved_primary_provider(ctx, state, current_profile))
+            .then(|| t!("onboarding.wizard.workspace_locked_reason").into_owned());
+        if launch_flow_supported(ctx) {
+            MenuItem::new(
+                "onboard.done.open",
+                t!("onboarding.wizard.finish_label"),
+                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_DONE)),
+            )
+            .with_description(t!("onboarding.wizard.finish_description"))
+            .maybe_disabled(blocked)
+        } else {
+            MenuItem::new(
+                "onboard.workspace.open",
+                t!("onboarding.wizard.workspace_open_label"),
+                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_WORKSPACE)),
+            )
+            .with_description(t!("onboarding.wizard.workspace_open_description"))
+            .with_state(MenuItemState::required(
+                state.workspace_validation.is_valid(),
+            ))
+            .maybe_disabled(blocked)
+        }
+    });
+
+    // Same escape hatch as the create-profile step: this menu also lives under
+    // the root MENU_ONBOARD id, where Esc is swallowed while no session is
+    // open — without a visible Exit row the user would be trapped here.
+    items.push(
+        MenuItem::new(
+            "onboard.local.exit",
+            t!("menu.onboard.item.exit.label"),
+            MenuAction::Local(LocalAction::Exit),
+        )
+        .with_description(t!("menu.onboard.item.exit.desc")),
+    );
+
+    for (idx, item) in items.iter_mut().enumerate() {
+        if let Some(shortcut) = numeric_shortcut(idx) {
+            item.shortcut = Some(shortcut);
+        }
+    }
+
+    // Wizard framing: compute the coarse step (Provider → Connect → Save →
+    // Workspace → Activate) so the subtitle, footer, and right-side teaching
+    // panel all stay in lock-step with the granular rows above.
+    let progress = crate::menu::wizard::WizardProgress::from_state(
+        state,
+        current_profile,
+        local_profile_create_supported(ctx),
+        onboarding_saved_guidance_ready(ctx, state, current_profile),
+    );
+    let next_action = onboarding_next_action_hint(ctx, state, current_profile);
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(MENU_ONBOARD),
+        title: t!("onboarding.wizard.setup_title").into_owned(),
+        subtitle: Some(progress.subtitle()),
+        items,
+        tabs: Vec::new(),
+        searchable: true,
+        search_placeholder: Some(t!("menu.onboard.search").into_owned()),
+        footer_hint: Some(progress.footer_hint(&next_action)),
+        preview: Some(onboarding_provider_preview(
+            &progress,
+            state,
+            current_profile,
+        )),
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Options for the shared staged model-config rows ([`provider_config_rows`]).
+struct ProviderConfigRowOpts {
+    /// Show the "Save as fallback" row. Only the mid-session surface sets this
+    /// — onboarding deliberately hides fallbacks (first-run is about ONE
+    /// working model).
+    include_fallback: bool,
+    /// Composer draft prefix for the API-key edit row (`"/onboard key "` in
+    /// the wizard, `"/add-model key "` mid-session — both inline forms route
+    /// to `OnboardingAction::SetApiKey`).
+    api_key_edit_prefix: &'static str,
+}
+
+/// The staged model-config rows shared by the onboarding wizard's provider
+/// step and the mid-session `MENU_MODEL_CONFIG` surface: a collapsed
+/// "Add a model"/"Add another model" entry that expands — while a not-yet-saved
+/// selection is staged — into family/model/route pickers plus API key / Test /
+/// Save (and optionally Save-as-fallback).
+///
+/// Row ids stay `onboard.provider.*` VERBATIM under BOTH menus:
+/// `focus_provider_api_key_row` / `focus_provider_start_row` and the post-save
+/// collapse/refocus in `apply_profile_llm_mutation_event` key on these ids
+/// regardless of which surface is active, so the whole save flow works
+/// unchanged wherever the rows are rendered.
+fn provider_config_rows(
+    ctx: &MenuContext<'_>,
+    state: &OnboardingWizardState,
+    current_profile: Option<&str>,
+    opts: ProviderConfigRowOpts,
+) -> Vec<MenuItem> {
     let saved_primary = onboarding_saved_primary(ctx, state, current_profile);
 
     // Profile↔model decoupling (user feedback: "collapse to one Add model").
@@ -1938,8 +2061,8 @@ fn onboarding_provider_setup_menu(
     // expands to the family/model/route/key/save rows ONLY while the user is
     // actively setting up a model — i.e. a staged selection that is NOT yet the
     // saved primary. A profile whose provider is already saved (or freshly
-    // saved, or resumed) collapses back to "Add another model" + Finish, rather
-    // than dumping the raw form (which reads as "no Add-a-model option").
+    // saved, or resumed) collapses back to "Add another model", rather than
+    // dumping the raw form (which reads as "no Add-a-model option").
     let has_staged = !state.provider.family_id.trim().is_empty();
     // The staged selection has already been saved as this profile's primary
     // when EITHER: the session just saved this exact selection (its label
@@ -2068,7 +2191,7 @@ fn onboarding_provider_setup_menu(
                 "onboard.provider.key",
                 t!("menu.onboard.item.api_key.label").as_ref(),
                 api_key_display.as_deref(),
-                "/onboard key ",
+                opts.api_key_edit_prefix,
             )
             .with_state(MenuItemState::required(api_key_present))
             .maybe_disabled(
@@ -2100,55 +2223,77 @@ fn onboarding_provider_setup_menu(
                 APPUI_METHOD_PROFILE_LLM_UPSERT,
             )),
         ]);
-        // NOTE: onboarding no longer surfaces "Add as fallback" — first-run is
-        // about getting ONE model working, and the fallback concept confused
-        // users here. Fallbacks remain available post-onboarding via
-        // `/add-model` (the MENU_PROVIDER surface).
+
+        if opts.include_fallback {
+            items.push(
+                MenuItem::new(
+                    "onboard.provider.fallback",
+                    onboarding_provider_fallback_label(state),
+                    MenuAction::Local(LocalAction::Onboarding(
+                        OnboardingAction::SaveProviderFallback,
+                    )),
+                )
+                .with_description(t!("menu.model_config.item.fallback.desc"))
+                .with_state(onboarding_provider_save_state(state))
+                .maybe_disabled(onboarding_provider_disabled_reason(
+                    ctx,
+                    state,
+                    APPUI_METHOD_PROFILE_LLM_UPSERT,
+                )),
+            );
+        }
     }
 
-    // Terminal step (always shown — collapsed or expanded). On a launch-flow
-    // server (Model A) the provider step ends at the launch-instructions screen
-    // (`MENU_ONBOARD_DONE`) — the redundant workspace/Activate screen is skipped
-    // and launch-time activation opens the session on the next start. Older
-    // servers keep the workspace step (`MENU_ONBOARD_WORKSPACE`), which owns the
-    // final Activate. Either way it is disabled until a provider is saved so the
-    // steps stay ordered.
-    items.push({
-        let blocked = (!onboarding_has_saved_primary_provider(ctx, state, current_profile))
-            .then(|| t!("onboarding.wizard.workspace_locked_reason").into_owned());
-        if launch_flow_supported(ctx) {
-            MenuItem::new(
-                "onboard.done.open",
-                t!("onboarding.wizard.finish_label"),
-                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_DONE)),
-            )
-            .with_description(t!("onboarding.wizard.finish_description"))
-            .maybe_disabled(blocked)
-        } else {
-            MenuItem::new(
-                "onboard.workspace.open",
-                t!("onboarding.wizard.workspace_open_label"),
-                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_WORKSPACE)),
-            )
-            .with_description(t!("onboarding.wizard.workspace_open_description"))
-            .with_state(MenuItemState::required(
-                state.workspace_validation.is_valid(),
-            ))
-            .maybe_disabled(blocked)
-        }
-    });
+    items
+}
 
-    // Same escape hatch as the create-profile step: this menu also lives under
-    // the root MENU_ONBOARD id, where Esc is swallowed while no session is
-    // open — without a visible Exit row the user would be trapped here.
-    items.push(
-        MenuItem::new(
-            "onboard.local.exit",
-            t!("menu.onboard.item.exit.label"),
-            MenuAction::Local(LocalAction::Exit),
-        )
-        .with_description(t!("menu.onboard.item.exit.desc")),
+/// Mid-session staged model config (`MENU_MODEL_CONFIG`): the `/model` →
+/// "Add a model" flow and the (menu-hidden) `/add-model` command. Renders the
+/// same staged rows as the wizard's provider step (shared
+/// [`provider_config_rows`]) plus the fallback save and a read-only summary of
+/// what the profile already has — deliberately NO catalog enumeration (the
+/// retired `MENU_PROVIDER` dashboard listed every family×model×route choice
+/// plus a test row per catalog model).
+fn model_config_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    if !supports_any_method(ctx, APPUI_PROVIDER_MENU_METHODS_ANY) {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(MENU_MODEL_CONFIG),
+            title: t!("menu.model_config.unavailable_title").into_owned(),
+            message: method_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        });
+    }
+
+    let current_profile = ctx.app.current_profile;
+    let default_state;
+    let state = if let Some(state) = ctx.app.onboarding {
+        state
+    } else {
+        default_state = OnboardingWizardState::default();
+        &default_state
+    };
+
+    let saved_primary_exists = ctx
+        .app
+        .profile_llm_state
+        .is_some_and(|profile_llm| profile_llm.primary_provider().is_some())
+        || onboarding_saved_primary(ctx, state, current_profile).is_some();
+
+    let mut items = provider_config_rows(
+        ctx,
+        state,
+        current_profile,
+        ProviderConfigRowOpts {
+            // F3b rule carried over: fallback is only a meaningful choice once
+            // a primary exists.
+            include_fallback: saved_primary_exists,
+            api_key_edit_prefix: "/add-model key ",
+        },
     );
+
+    // Read-only summary of what the profile already has (primary + fallbacks)
+    // — the informational remainder of the old dashboard, no actions.
+    items.extend(provider_saved_items(ctx));
 
     for (idx, item) in items.iter_mut().enumerate() {
         if let Some(shortcut) = numeric_shortcut(idx) {
@@ -2156,31 +2301,16 @@ fn onboarding_provider_setup_menu(
         }
     }
 
-    // Wizard framing: compute the coarse step (Provider → Connect → Save →
-    // Workspace → Activate) so the subtitle, footer, and right-side teaching
-    // panel all stay in lock-step with the granular rows above.
-    let progress = crate::menu::wizard::WizardProgress::from_state(
-        state,
-        current_profile,
-        local_profile_create_supported(ctx),
-        onboarding_saved_guidance_ready(ctx, state, current_profile),
-    );
-    let next_action = onboarding_next_action_hint(ctx, state, current_profile);
-
     MenuBuildResult::Ready(MenuSpec {
-        id: MenuId::from(MENU_ONBOARD),
-        title: t!("onboarding.wizard.setup_title").into_owned(),
-        subtitle: Some(progress.subtitle()),
+        id: MenuId::from(MENU_MODEL_CONFIG),
+        title: t!("menu.model_config.title").into_owned(),
+        subtitle: Some(t!("menu.model_config.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: true,
-        search_placeholder: Some(t!("menu.onboard.search").into_owned()),
-        footer_hint: Some(progress.footer_hint(&next_action)),
-        preview: Some(onboarding_provider_preview(
-            &progress,
-            state,
-            current_profile,
-        )),
+        search_placeholder: Some(t!("menu.model_config.search").into_owned()),
+        footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        preview: None,
         mode: MenuMode::SingleSelect,
     })
 }
@@ -3268,14 +3398,6 @@ fn onboarding_provider_saved_status_label(state: &OnboardingWizardState) -> Stri
     }
 }
 
-fn onboarding_provider_saved_status_state(state: &OnboardingWizardState) -> MenuItemState {
-    MenuItemState {
-        checked: state.last_saved_provider_label.is_some().then_some(true),
-        required_valid: state.last_saved_provider_label.as_ref().map(|_| true),
-        ..MenuItemState::default()
-    }
-}
-
 fn save_target_label(target: OnboardingProviderSaveTarget) -> String {
     match target {
         OnboardingProviderSaveTarget::Primary => t!("onboarding.provider.primary").into_owned(),
@@ -3397,15 +3519,6 @@ fn onboarding_catalog_items(ctx: &MenuContext<'_>, state: &OnboardingWizardState
         state,
         "onboard.catalog",
         "run Refresh dashboard provider catalog first",
-    )
-}
-
-fn provider_catalog_items(ctx: &MenuContext<'_>, state: &OnboardingWizardState) -> Vec<MenuItem> {
-    catalog_menu_items(
-        ctx,
-        state,
-        "provider.catalog.choice",
-        "run Refresh provider catalog first",
     )
 }
 
@@ -3849,6 +3962,22 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         );
     }
 
+    // The staged add-model entry (absorbed from the retired `/add-model`
+    // dashboard): opens the same family→model→route chain the onboarding
+    // wizard uses; the route pick lands on `MENU_MODEL_CONFIG` (API key /
+    // Test / Save) because this stack does not contain `MENU_ONBOARD` — see
+    // `OnboardingAction::SetProviderSelection` in store.rs. Plain OpenMenu so
+    // the catalog auto-fetch hook (`auto_fetch_for_menu`) keeps firing.
+    items.push(
+        MenuItem::new(
+            "model.add",
+            t!("menu.model.item.add.label"),
+            MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY)),
+        )
+        .with_description(t!("menu.model.item.add.desc"))
+        .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG)),
+    );
+
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_MODEL),
         title: t!("menu.model.title").into_owned(),
@@ -3861,204 +3990,6 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         preview: Some(MenuPreview::KeyValues {
             title: Some(t!("menu.runtime_preview_title").into_owned()),
             rows: model_preview_rows(ctx),
-        }),
-        mode: MenuMode::SingleSelect,
-    })
-}
-
-fn provider_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
-    if !supports_any_method(ctx, APPUI_PROVIDER_MENU_METHODS_ANY) {
-        return MenuBuildResult::Unavailable(MenuStatusSpec {
-            id: MenuId::from(MENU_PROVIDER),
-            title: t!("menu.provider.unavailable_title").into_owned(),
-            message: method_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG),
-            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
-        });
-    }
-
-    let profile_id = ctx.app.current_profile.map(str::to_owned);
-    let default_state;
-    let state = if let Some(state) = ctx.app.onboarding {
-        state
-    } else {
-        default_state = OnboardingWizardState::default();
-        &default_state
-    };
-    let mut items = vec![
-        MenuItem::new(
-            "provider.catalog",
-            t!("menu.provider.item.catalog_refresh.label"),
-            MenuAction::send_appui(AppUiCommand::ProfileLlmCatalog(
-                ProfileLlmCatalogParams::default(),
-            )),
-        )
-        .with_description("Uses profile/llm/catalog.")
-        .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG)),
-        MenuItem::new(
-            "provider.list",
-            t!("menu.provider.item.list_refresh.label"),
-            MenuAction::send_appui(AppUiCommand::ProfileLlmList(ProfileLlmListParams {
-                profile_id: profile_id.clone(),
-            })),
-        )
-        .with_description("Uses profile/llm/list.")
-        .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_MODEL_LIST)),
-    ];
-
-    items.extend(provider_saved_items(ctx));
-    items.extend(provider_catalog_items(ctx, state));
-    items.extend([
-        MenuItem::new(
-            "provider.current",
-            format!("Staged provider: {}", state.provider_label()),
-            MenuAction::Noop,
-        )
-        .with_description(t!("menu.provider.item.staged.desc"))
-        .with_state(MenuItemState::required(state.selection_ready())),
-        MenuItem::new(
-            "provider.saved",
-            onboarding_provider_saved_status_label(state),
-            MenuAction::Noop,
-        )
-        .with_description(t!("menu.onboard.item.saved_provider.desc"))
-        .with_state(onboarding_provider_saved_status_state(state)),
-        MenuItem::new(
-            "provider.key",
-            if state.has_api_key() {
-                format!("API key: {}", state.api_key_label())
-            } else {
-                "API key: not set".into()
-            },
-            MenuAction::Noop,
-        )
-        .with_description(
-            "Use /provider key <secret>. The secret is masked in state, logs, and snapshots.",
-        )
-        .with_state(MenuItemState::required(state.has_api_key())),
-        MenuItem::new(
-            "provider.fetch",
-            t!("menu.onboard.item.fetch_models.label"),
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::FetchModels)),
-        )
-        .with_description(t!("menu.onboard.item.fetch_models.desc"))
-        .maybe_disabled(onboarding_fetch_models_disabled_reason(ctx, state)),
-        MenuItem::new(
-            "provider.test",
-            onboarding_provider_test_label(state),
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::TestProvider)),
-        )
-        .with_description("Uses profile/llm/test with the dashboard-shaped selection.")
-        .with_state(onboarding_provider_test_state(state))
-        .maybe_disabled(onboarding_provider_disabled_reason(
-            ctx,
-            state,
-            APPUI_METHOD_PROFILE_LLM_TEST,
-        )),
-        MenuItem::new(
-            "provider.save",
-            onboarding_provider_save_label(state),
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SaveProvider)),
-        )
-        .with_description(t!("menu.onboard.item.save_provider.desc"))
-        .with_state(onboarding_provider_save_state(state))
-        .maybe_disabled(onboarding_provider_disabled_reason(
-            ctx,
-            state,
-            APPUI_METHOD_PROFILE_LLM_UPSERT,
-        )),
-        MenuItem::new(
-            "provider.fallback",
-            onboarding_provider_fallback_label(state),
-            MenuAction::Local(LocalAction::Onboarding(
-                OnboardingAction::SaveProviderFallback,
-            )),
-        )
-        .with_description("Append or replace the staged provider under config.llm.fallbacks.")
-        .with_state(onboarding_provider_save_state(state))
-        .maybe_disabled(onboarding_provider_disabled_reason(
-            ctx,
-            state,
-            APPUI_METHOD_PROFILE_LLM_UPSERT,
-        )),
-    ]);
-
-    if let Some(catalog) = ctx.app.model_catalog {
-        for model in &catalog.models {
-            let family_id = model
-                .family
-                .clone()
-                .unwrap_or_else(|| model.provider.clone());
-            let route_id = model.route.clone().unwrap_or_else(|| "official".into());
-            items.push(
-                MenuItem::new(
-                    format!("provider.test.{family_id}.{}.{}", model.model, route_id),
-                    format!("Test {} / {}", model.provider, model.model),
-                    MenuAction::send_appui(AppUiCommand::ProfileLlmTest(ProfileLlmTestParams {
-                        profile_id: profile_id.clone(),
-                        selection: LlmSelectionConfig {
-                            family_id: family_id.clone(),
-                            model_id: model.model.clone(),
-                            route: LlmRouteConfig {
-                                route_id,
-                                label: None,
-                                base_url: None,
-                                api_key_env: None,
-                                api_type: Some("openai".into()),
-                            },
-                            ..LlmSelectionConfig::default()
-                        },
-                        api_key: None,
-                    })),
-                )
-                .with_description("Uses profile/llm/test; API key is never rendered.")
-                .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_TEST)),
-            );
-        }
-    }
-
-    MenuBuildResult::Ready(MenuSpec {
-        id: MenuId::from(MENU_PROVIDER),
-        title: t!("menu.provider.title").into_owned(),
-        subtitle: Some(t!("menu.provider.subtitle").into_owned()),
-        items,
-        tabs: Vec::new(),
-        searchable: true,
-        search_placeholder: Some(t!("menu.provider.search").into_owned()),
-        footer_hint: Some(t!("menu.footer.enter_run_esc_close").into_owned()),
-        preview: Some(MenuPreview::KeyValues {
-            title: Some(t!("menu.provider.preview_title").into_owned()),
-            rows: [
-                MenuPreviewRow {
-                    label: "profile".into(),
-                    value: state.profile_label(ctx.app.current_profile),
-                },
-                MenuPreviewRow {
-                    label: "staged".into(),
-                    value: state.provider_label(),
-                },
-                MenuPreviewRow {
-                    label: "api_key".into(),
-                    value: if state.has_api_key() {
-                        state.api_key_label().into()
-                    } else {
-                        "<unset>".into()
-                    },
-                },
-            ]
-            .into_iter()
-            .chain(
-                [
-                    APPUI_METHOD_PROFILE_LLM_CATALOG,
-                    APPUI_METHOD_MODEL_LIST,
-                    APPUI_METHOD_PROFILE_LLM_UPSERT,
-                    APPUI_METHOD_PROFILE_LLM_DELETE,
-                    APPUI_METHOD_MODEL_SELECT,
-                    APPUI_METHOD_PROFILE_LLM_TEST,
-                ]
-                .into_iter()
-                .map(|method| permission_method_row(ctx, method)),
-            )
-            .collect(),
         }),
         mode: MenuMode::SingleSelect,
     })
@@ -7451,7 +7382,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_menu_shows_api_test_progress() {
+    fn model_config_menu_shows_api_test_progress() {
         let registry = core_menu_registry();
         let capabilities = CapabilitySet::from_methods([
             APPUI_METHOD_PROFILE_LLM_TEST,
@@ -7485,50 +7416,74 @@ mod tests {
             selected_path: &[],
         };
 
-        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_PROVIDER), &ctx)
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL_CONFIG), &ctx)
         else {
-            panic!("expected provider menu");
+            panic!("expected model-config menu");
         };
         let test_item = spec
             .items
             .iter()
-            .find(|item| item.id == "provider.test")
-            .expect("provider test row");
+            .find(|item| item.id == "onboard.provider.test")
+            .expect("staged test row");
         assert_eq!(
             test_item.label,
             t!("onboarding.provider.test_testing").into_owned()
         );
         assert!(test_item.state.loading);
         assert_eq!(test_item.disabled_reason, None);
-        let fallback_item = spec
-            .items
-            .iter()
-            .find(|item| item.id == "provider.fallback")
-            .expect("provider fallback row");
-        assert_eq!(
-            fallback_item.label,
-            t!("onboarding.provider.fallback_unavailable_testing").into_owned()
+        // No saved primary anywhere -> the fallback save is not a meaningful
+        // choice yet, so the row is absent (F3b rule carried to this surface).
+        assert!(
+            !spec
+                .items
+                .iter()
+                .any(|item| item.id == "onboard.provider.fallback"),
+            "fallback row must be hidden until a primary exists"
         );
-        assert_eq!(fallback_item.disabled_reason, None);
     }
 
     #[test]
-    fn provider_menu_shows_last_saved_provider_status() {
+    fn model_config_menu_offers_fallback_save_once_primary_exists() {
         let registry = core_menu_registry();
-        let capabilities = CapabilitySet::from_methods([APPUI_METHOD_PROFILE_LLM_CATALOG]);
+        let capabilities = CapabilitySet::from_methods([
+            APPUI_METHOD_PROFILE_LLM_TEST,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+        ]);
+        // Staged selection differs from the saved primary -> expanded form.
         let onboarding = OnboardingWizardState {
-            last_saved_provider_label: Some(
-                "minimax / MiniMax-M2.5-highspeed via wisemodel".into(),
-            ),
-            last_saved_provider_target: Some(OnboardingProviderSaveTarget::Fallback),
-            saved_primary_provider_label: Some("moonshot / kimi-k2.5 via autodl".into()),
+            provider: LlmSelectionConfig {
+                family_id: "deepseek".into(),
+                model_id: "deepseek-reasoner".into(),
+                route: LlmRouteConfig {
+                    route_id: "deepseek".into(),
+                    api_type: Some("openai".into()),
+                    ..LlmRouteConfig::default()
+                },
+                ..LlmSelectionConfig::default()
+            },
+            api_key: Some(crate::model::SecretString::new("sk-test-secret")),
             ..OnboardingWizardState::default()
+        };
+        let llm_state = crate::model::ProfileLlmListResult {
+            profile_id: Some("coding".into()),
+            primary: Some(LlmConfiguredProvider {
+                family_id: Some("moonshot".into()),
+                model_id: Some("kimi-k2.5".into()),
+                route_id: Some("autodl".into()),
+                has_api_key: true,
+                selected: true,
+                ..configured_provider_for_test()
+            }),
+            fallbacks: Vec::new(),
+            llm: None,
+            runtime_policy_stamp: None,
         };
         let ctx = MenuContext {
             availability: AvailabilityContext::protocol(&capabilities),
             app: MenuAppSnapshot {
                 current_profile: Some("coding"),
                 onboarding: Some(&onboarding),
+                profile_llm_state: Some(&llm_state),
                 ..MenuAppSnapshot::default()
             },
             terminal: TerminalSize::default(),
@@ -7536,26 +7491,85 @@ mod tests {
             selected_path: &[],
         };
 
-        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_PROVIDER), &ctx)
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL_CONFIG), &ctx)
         else {
-            panic!("expected provider menu");
+            panic!("expected model-config menu");
         };
-        let saved_item = spec
+        let fallback_item = spec
             .items
             .iter()
-            .find(|item| item.id == "provider.saved")
-            .expect("saved provider row");
-
+            .find(|item| item.id == "onboard.provider.fallback")
+            .expect("fallback row once a primary exists");
         assert_eq!(
-            saved_item.label,
-            onboarding_provider_saved_status_label(&onboarding)
+            fallback_item.label,
+            onboarding_provider_fallback_label(&onboarding)
         );
-        assert_eq!(saved_item.state.checked, Some(true));
-        assert_eq!(saved_item.state.required_valid, Some(true));
+        assert_eq!(fallback_item.disabled_reason, None);
+    }
+
+    /// The mid-session surface mirrors the wizard's collapse rule: with a
+    /// saved primary and nothing (new) staged it collapses to a single
+    /// "Add another model" entry — never the raw expanded form.
+    #[test]
+    fn model_config_matches_wizard_collapse_when_primary_saved() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            APPUI_METHOD_PROFILE_LLM_CATALOG,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+        ]);
+        let llm_state = crate::model::ProfileLlmListResult {
+            profile_id: Some("coding".into()),
+            primary: Some(LlmConfiguredProvider {
+                family_id: Some("moonshot".into()),
+                model_id: Some("kimi-k2.5".into()),
+                route_id: Some("autodl".into()),
+                has_api_key: true,
+                selected: true,
+                ..configured_provider_for_test()
+            }),
+            fallbacks: Vec::new(),
+            llm: None,
+            runtime_policy_stamp: None,
+        };
+        let onboarding = OnboardingWizardState::default();
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                onboarding: Some(&onboarding),
+                profile_llm_state: Some(&llm_state),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL_CONFIG), &ctx)
+        else {
+            panic!("expected model-config menu");
+        };
+        let add_row = spec
+            .items
+            .iter()
+            .find(|item| item.id == "onboard.provider.add_model")
+            .expect("collapsed add-model entry");
+        assert_eq!(
+            add_row.label,
+            t!("onboarding.provider.add_another_model_label").into_owned(),
+            "a saved primary relabels the entry to add-another"
+        );
+        assert!(
+            !spec
+                .items
+                .iter()
+                .any(|item| item.id == "onboard.provider.family"),
+            "collapsed surface must not dump the raw expanded form"
+        );
     }
 
     #[test]
-    fn provider_menu_shows_configured_provider_list_from_appui() {
+    fn model_config_menu_shows_configured_provider_list_from_appui() {
         let registry = core_menu_registry();
         let capabilities = CapabilitySet::from_methods([APPUI_METHOD_MODEL_LIST]);
         let llm_state = crate::model::ProfileLlmListResult {
@@ -7597,9 +7611,9 @@ mod tests {
             selected_path: &[],
         };
 
-        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_PROVIDER), &ctx)
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL_CONFIG), &ctx)
         else {
-            panic!("expected provider menu");
+            panic!("expected model-config menu");
         };
         let rendered = rendered_menu_text(&spec);
 
@@ -8693,7 +8707,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_menu_uses_dashboard_catalog_and_has_no_hardcoded_shortcuts() {
+    fn model_config_has_no_catalog_enumeration_and_never_leaks_secrets() {
         let registry = core_menu_registry();
         let capabilities = CapabilitySet::from_methods([
             APPUI_METHOD_PROFILE_LLM_CATALOG,
@@ -8736,40 +8750,105 @@ mod tests {
             selected_path: &[],
         };
 
-        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_PROVIDER), &ctx)
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL_CONFIG), &ctx)
         else {
-            panic!("expected provider menu");
+            panic!("expected model-config menu");
         };
         let rendered = rendered_menu_text(&spec);
         assert!(!rendered.contains("top-secret"));
+        // The retired MENU_PROVIDER dashboard flat-enumerated the catalog
+        // (family×model×route choice rows) plus a test row per catalog model.
+        // The staged surface must never enumerate — choices live behind the
+        // family→model→route chain.
         assert!(
             !spec
                 .items
                 .iter()
-                .any(|item| item.id == "provider.add.moonshot.autodl")
+                .any(|item| item.id.starts_with("provider.catalog.choice")
+                    || item.id.starts_with("provider.test.")
+                    || item.id.starts_with("provider.add.")),
+            "model-config must not enumerate catalog/test rows: {:?}",
+            spec.items.iter().map(|item| &item.id).collect::<Vec<_>>()
         );
-        let wisemodel = spec
+        // Nothing staged and no saved primary -> collapsed to the single
+        // add-model entry, exactly like the wizard's provider step.
+        let add_row = spec
             .items
             .iter()
-            .find(|item| item.label.contains("WiseModel"))
-            .expect("WiseModel endpoint from catalog");
-        let MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SetProviderSelection(
-            selection,
-        ))) = &wisemodel.action
-        else {
-            panic!("expected catalog selection action");
+            .find(|item| item.id == "onboard.provider.add_model")
+            .expect("collapsed add-model entry");
+        assert!(matches!(
+            &add_row.action,
+            MenuAction::OpenMenu(id)
+                if id.as_str() == crate::menu::registry::MENU_ONBOARD_FAMILY
+        ));
+
+        // The catalog data itself still drives the CHAIN: the route step keeps
+        // carrying the full endpoint config (covered by the onboarding chain
+        // tests); the WiseModel endpoint must therefore NOT be a row here.
+        assert!(
+            !rendered.contains("WiseModel"),
+            "endpoint choices belong to the route step, not the config surface"
+        );
+    }
+
+    /// `/model` absorbed the add-model flow: a trailing "Add a model…" row
+    /// opens the staged family→model→route chain (same entry the wizard's
+    /// collapsed row uses).
+    #[test]
+    fn model_menu_offers_add_model_entry() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            APPUI_METHOD_MODEL_LIST,
+            APPUI_METHOD_PROFILE_LLM_CATALOG,
+        ]);
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
         };
-        assert_eq!(selection.family_id, "minimax");
-        assert_eq!(selection.model_id, "MiniMax-M2.5-highspeed");
-        assert_eq!(selection.route.route_id, "wisemodel");
-        assert_eq!(
-            selection.route.base_url.as_deref(),
-            Some("https://open.ospreyai.cn/v1")
-        );
-        assert_eq!(
-            selection.route.api_key_env.as_deref(),
-            Some("WISEMODEL_API_KEY")
-        );
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL), &ctx) else {
+            panic!("expected model menu");
+        };
+        let add_row = spec
+            .items
+            .iter()
+            .find(|item| item.id == "model.add")
+            .expect("model menu carries the add-model entry");
+        assert!(matches!(
+            &add_row.action,
+            MenuAction::OpenMenu(id)
+                if id.as_str() == crate::menu::registry::MENU_ONBOARD_FAMILY
+        ));
+        assert_eq!(add_row.disabled_reason, None);
+
+        // Without the catalog capability the row stays visible but disabled
+        // with a reason (capability-stripped servers).
+        let capabilities = CapabilitySet::from_methods([APPUI_METHOD_MODEL_LIST]);
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL), &ctx) else {
+            panic!("expected model menu");
+        };
+        let add_row = spec
+            .items
+            .iter()
+            .find(|item| item.id == "model.add")
+            .expect("add-model entry present");
+        assert!(add_row.disabled_reason.is_some());
     }
 
     #[test]

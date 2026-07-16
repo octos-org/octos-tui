@@ -552,6 +552,12 @@ pub struct SessionAutonomyState {
     /// Turn that authored the current `plan`, when known. The plan is per-turn
     /// working state, so it is cleared when this turn completes.
     pub plan_turn_id: Option<TurnId>,
+    /// When each TERMINAL agent was first observed terminal, by agent id —
+    /// LOCAL `Instant`s stamped lazily by the strip's linger sweep (never the
+    /// server's `updated_at_ms`; a remote server's clock can skew). Drives the
+    /// "finished/failed chips leave the strip after a linger" policy. A stamp
+    /// is dropped if its agent resurrects (non-terminal again) or vanishes.
+    pub terminal_seen: Vec<(String, std::time::Instant)>,
 }
 
 impl SessionAutonomyState {
@@ -566,8 +572,28 @@ impl SessionAutonomyState {
             loops: Vec::new(),
             plan: None,
             plan_turn_id: None,
+            terminal_seen: Vec::new(),
         }
     }
+}
+
+/// True when an agent status string is terminal — the agent can never emit
+/// again. Superset of the strip's glyph terminal set (`agent_status_glyph`)
+/// plus `closed` (set by `agent/close`); case-insensitive like the glyph map.
+pub fn agent_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "completed"
+            | "complete"
+            | "done"
+            | "ready"
+            | "failed"
+            | "error"
+            | "cancelled"
+            | "canceled"
+            | "interrupted"
+            | "closed"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5910,6 +5936,42 @@ impl AppState {
         } else {
             entry.agents.push(agent);
         }
+    }
+
+    /// Remove the given sub-agents from a session's roster along with their
+    /// streamed-output/artifact caches and linger stamps, then normalize the
+    /// chat view (a peeked pruned agent falls back to `Main`). Backs the
+    /// "finished/failed chips leave the strip" policy — callers decide WHICH
+    /// terminal agents to drop (all of them on the next submit; only
+    /// linger-expired ones in the periodic sweep). Returns true when anything
+    /// was removed.
+    pub fn prune_session_agents_by_ids(
+        &mut self,
+        session_id: &SessionKey,
+        agent_ids: &[String],
+    ) -> bool {
+        if agent_ids.is_empty() {
+            return false;
+        }
+        let entry = self.session_autonomy_mut(session_id);
+        let before = entry.agents.len();
+        entry
+            .agents
+            .retain(|agent| !agent_ids.contains(&agent.agent_id));
+        let removed = entry.agents.len() != before;
+        if removed {
+            entry
+                .agent_outputs
+                .retain(|cache| !agent_ids.contains(&cache.agent_id));
+            entry
+                .agent_artifacts
+                .retain(|cache| !agent_ids.contains(&cache.agent_id));
+            entry
+                .terminal_seen
+                .retain(|(agent_id, _)| !agent_ids.contains(agent_id));
+            self.normalize_chat_view();
+        }
+        removed
     }
 
     /// Replace the loop list for a session, dropping tombstones.

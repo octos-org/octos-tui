@@ -51,6 +51,11 @@ use crate::{
 const TASK_OUTPUT_TAIL_BYTES: usize = 600;
 const TASK_OUTPUT_READ_LIMIT_BYTES: u64 = 4096;
 const TASK_ARTIFACT_READ_LIMIT_BYTES: u64 = 4096;
+/// How long a finished/failed sub-agent chip lingers in the agent strip
+/// before the tick sweep removes it (the next submit removes it sooner).
+/// Long enough to read the outcome; short enough not to clutter idle
+/// sessions. See `Store::sweep_terminal_agents`.
+const AGENT_TERMINAL_LINGER: std::time::Duration = std::time::Duration::from_secs(60);
 /// How long a staged-submit FIFO gate stays authoritative without its
 /// turn/started or terminal arriving. Past this, `submit_next_pending_if_idle`
 /// treats the marker as stale (the in-flight turn/start died in some way the
@@ -2463,7 +2468,7 @@ impl Store {
                 if inline_args.is_some_and(|args| !args.trim().is_empty()) {
                     self.dispatch_provider_inline(inline_args.unwrap_or_default())
                 } else {
-                    self.open_menu(MenuId::from(crate::menu::registry::MENU_PROVIDER));
+                    self.open_model_config_surface();
                     None
                 }
             }
@@ -2565,8 +2570,18 @@ impl Store {
                 self.state.onboarding.apply_selection(*selection);
                 self.state.status = t!("status.provider_route_selected").into_owned();
                 if self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_ROUTE) {
-                    self.close_all_menus();
-                    self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                    // Route picked from the staged chain: land on whichever
+                    // config surface the chain was entered from. A stack that
+                    // contains the wizard root returns to the wizard's
+                    // provider step; otherwise the chain was entered from
+                    // `/model` → "Add a model" (or `/add-model`) and lands on
+                    // the mid-session model-config surface.
+                    if self.menu_stack_contains_onboard() {
+                        self.close_all_menus();
+                        self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                    } else {
+                        self.open_model_config_surface();
+                    }
                     self.focus_provider_api_key_row();
                 } else {
                     self.refresh_active_menu_if_open();
@@ -2590,13 +2605,17 @@ impl Store {
                     t!("status.provider_family_updated").into_owned(),
                 );
                 if from_family_menu {
-                    if self.current_profile_for_onboarding().is_none() {
+                    if self.current_profile_for_onboarding().is_none()
+                        && self.menu_stack_contains_onboard()
+                    {
                         // Phase 2 nameable flow: no profile exists yet, so the
                         // family was chosen only to seed the "Name this profile"
                         // suggestion — return to the profile step (with the
                         // suggestion now reflecting the family) rather than
                         // diving into model/route setup, which belongs to
-                        // post-create provider configuration.
+                        // post-create provider configuration. Only applies
+                        // inside the wizard: entered from `/model` → "Add a
+                        // model" the chain always advances to the model step.
                         self.close_all_menus();
                         self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
                     } else {
@@ -2945,7 +2964,7 @@ impl Store {
         let rest = rest.trim();
         match verb {
             "" | "open" => {
-                self.open_menu(MenuId::from(crate::menu::registry::MENU_PROVIDER));
+                self.open_model_config_surface();
                 None
             }
             "catalog" | "refresh-catalog" => {
@@ -2992,7 +3011,7 @@ impl Store {
                     t!("status.unknown_provider_command").into_owned(),
                     Some(provider_usage()),
                 );
-                self.open_menu(MenuId::from(crate::menu::registry::MENU_PROVIDER));
+                self.open_model_config_surface();
                 None
             }
         }
@@ -3657,6 +3676,30 @@ impl Store {
             .menu_stack
             .active()
             .is_some_and(|frame| frame.id.as_str() == id)
+    }
+
+    /// True when the onboarding wizard root is anywhere on the menu stack —
+    /// the family/model/route chain uses this to decide where a route pick
+    /// should land: back on the wizard's provider step (`MENU_ONBOARD`), or on
+    /// the mid-session `MENU_MODEL_CONFIG` surface when the chain was entered
+    /// from `/model` → "Add a model" (no wizard beneath it).
+    fn menu_stack_contains_onboard(&self) -> bool {
+        self.state
+            .menu_stack
+            .path()
+            .iter()
+            .any(|id| id.as_str() == crate::menu::registry::MENU_ONBOARD)
+    }
+
+    /// Open the mid-session staged model-config surface as `[model,
+    /// model-config]` so Esc pops back to the `/model` list. Entry point for
+    /// the (menu-hidden) `/add-model` command and its inline open/unknown
+    /// verbs; the `/model` → "Add a model" row reaches the same surface via
+    /// the family→model→route chain instead.
+    fn open_model_config_surface(&mut self) {
+        self.close_all_menus();
+        self.open_menu(MenuId::from(crate::menu::registry::MENU_MODEL));
+        self.open_menu(MenuId::from(crate::menu::registry::MENU_MODEL_CONFIG));
     }
 
     /// True when any onboarding wizard menu (welcome / provider setup / its
@@ -4614,6 +4657,10 @@ impl Store {
         self.state
             .pending_interrupt_restores
             .retain(|pending| pending.session_id != session_id);
+        // Same "the user moved on" signal clears the previous task's
+        // finished/failed sub-agent chips right away (the linger sweep would
+        // get them within AGENT_TERMINAL_LINGER anyway).
+        self.prune_terminal_agents_on_submit(&session_id);
         let turn_id = octos_core::ui_protocol::TurnId::new();
         self.state.record_submitted_user_prompt(
             session_id.clone(),
@@ -9900,6 +9947,92 @@ impl Store {
         false
     }
 
+    /// The currently peeked sub-agent, if the main pane is showing one. Both
+    /// terminal-chip prune paths protect it — yanking the pane out from under
+    /// the user mid-read would be hostile; it goes on the next sweep/submit
+    /// after they tab away.
+    fn peeked_agent_id(&self) -> Option<String> {
+        match &self.state.chat_view {
+            crate::model::ChatViewTarget::Agent(id) => Some(id.clone()),
+            _ => None,
+        }
+    }
+
+    /// Tick-driven linger sweep for the agent strip: a finished/failed/
+    /// interrupted sub-agent chip stays readable for
+    /// [`AGENT_TERMINAL_LINGER`], then leaves the strip (roster + output/
+    /// artifact caches). Stamps are LOCAL `Instant`s recorded lazily here the
+    /// first time an agent is observed terminal — never the server's
+    /// `updated_at_ms` (remote clock skew) — and self-heal: a stamp is dropped
+    /// when its agent resurrects or vanishes. Returns true when anything was
+    /// pruned (the caller marks the frame dirty).
+    pub fn sweep_terminal_agents(&mut self, now: std::time::Instant) -> bool {
+        let protect = self.peeked_agent_id();
+        let mut to_prune: Vec<(SessionKey, Vec<String>)> = Vec::new();
+        for autonomy in &mut self.state.session_autonomy {
+            let agents = &autonomy.agents;
+            autonomy.terminal_seen.retain(|(agent_id, _)| {
+                agents.iter().any(|agent| {
+                    agent.agent_id == *agent_id
+                        && crate::model::agent_status_is_terminal(&agent.status)
+                })
+            });
+            for agent in &autonomy.agents {
+                if crate::model::agent_status_is_terminal(&agent.status)
+                    && !autonomy
+                        .terminal_seen
+                        .iter()
+                        .any(|(agent_id, _)| agent_id == &agent.agent_id)
+                {
+                    autonomy.terminal_seen.push((agent.agent_id.clone(), now));
+                }
+            }
+            let expired: Vec<String> = autonomy
+                .terminal_seen
+                .iter()
+                .filter(|(agent_id, seen)| {
+                    now.duration_since(*seen) >= AGENT_TERMINAL_LINGER
+                        && protect.as_deref() != Some(agent_id.as_str())
+                })
+                .map(|(agent_id, _)| agent_id.clone())
+                .collect();
+            if !expired.is_empty() {
+                to_prune.push((autonomy.session_id.clone(), expired));
+            }
+        }
+        let mut pruned = false;
+        for (session_id, agent_ids) in to_prune {
+            pruned |= self
+                .state
+                .prune_session_agents_by_ids(&session_id, &agent_ids);
+        }
+        pruned
+    }
+
+    /// A new submit means the user moved on: drop the submitting session's
+    /// terminal sub-agent chips immediately instead of waiting out the linger
+    /// sweep. Running agents and the currently peeked one are untouched.
+    fn prune_terminal_agents_on_submit(&mut self, session_id: &SessionKey) {
+        let protect = self.peeked_agent_id();
+        let Some(autonomy) = self
+            .state
+            .session_autonomy
+            .iter()
+            .find(|autonomy| &autonomy.session_id == session_id)
+        else {
+            return;
+        };
+        let agent_ids: Vec<String> = autonomy
+            .agents
+            .iter()
+            .filter(|agent| crate::model::agent_status_is_terminal(&agent.status))
+            .filter(|agent| protect.as_deref() != Some(agent.agent_id.as_str()))
+            .map(|agent| agent.agent_id.clone())
+            .collect();
+        self.state
+            .prune_session_agents_by_ids(session_id, &agent_ids);
+    }
+
     /// The stdio transport relaunched its `serve --stdio` child. The new
     /// process has no in-flight turns, so any `live_reply` still latched
     /// belongs to the dead child and its terminal event will never arrive.
@@ -9929,6 +10062,7 @@ impl Store {
             autonomy.agents.clear();
             autonomy.agent_outputs.clear();
             autonomy.agent_artifacts.clear();
+            autonomy.terminal_seen.clear();
         }
         self.state.normalize_chat_view();
         let latched: Vec<(octos_core::SessionKey, TurnId)> = self
@@ -16873,7 +17007,12 @@ mod tests {
         // Nameable flow, no profile yet: picking a family from the profile step
         // seeds the name suggestion (glm, not the empty→octos default) and
         // returns to the profile step — NOT into model/route setup.
+        // Drive the REAL wizard stack ([onboard, onboard-family]) — the
+        // profile-step reroute is wizard-owned, keyed on the wizard root
+        // being in the stack (the same family menu opened from `/model` →
+        // "Add a model" advances to the model step instead).
         let mut store = protocol_store_without_sessions();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
         store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY));
         assert!(store.state.onboarding.effective_profile_id(None).is_none());
 
@@ -16966,8 +17105,9 @@ mod tests {
         assert_eq!(active_id, crate::menu::registry::MENU_ONBOARD);
     }
 
-    /// `/add-model` (and its `provider` alias) open the model-adding flow — the
-    /// provider family -> model -> route surface lifted out of the full wizard.
+    /// `/add-model` (and its `provider` alias) open the staged model-config
+    /// surface as `[model, model-config]` — the same structure the onboarding
+    /// wizard uses, stacked over `/model` so Esc pops back to the model list.
     #[test]
     fn add_model_command_opens_provider_surface() {
         for cmd in ["/add-model", "/provider"] {
@@ -16977,14 +17117,255 @@ mod tests {
             store.state.composer = cmd.into();
             let command = store.compose_command();
             assert!(command.is_none(), "{cmd} opens a menu, not a wire command");
-            let active_id = store
+            let path: Vec<String> = store
                 .state
                 .menu_stack
-                .active()
-                .map(|frame| frame.id.as_str().to_owned())
-                .unwrap_or_else(|| panic!("{cmd} must open the provider menu"));
-            assert_eq!(active_id, crate::menu::registry::MENU_PROVIDER, "for {cmd}");
+                .path()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect();
+            assert_eq!(
+                path,
+                vec![
+                    crate::menu::registry::MENU_MODEL.to_owned(),
+                    crate::menu::registry::MENU_MODEL_CONFIG.to_owned(),
+                ],
+                "{cmd} must open model-config stacked over the model list"
+            );
         }
+    }
+
+    fn sample_selection(family: &str, model: &str) -> crate::model::LlmSelectionConfig {
+        crate::model::LlmSelectionConfig {
+            family_id: family.into(),
+            model_id: model.into(),
+            route: crate::model::LlmRouteConfig {
+                route_id: "official".into(),
+                api_type: Some("openai".into()),
+                ..crate::model::LlmRouteConfig::default()
+            },
+            ..crate::model::LlmSelectionConfig::default()
+        }
+    }
+
+    /// A route picked from the `/model` → "Add a model" chain (no wizard root
+    /// in the stack) lands on the mid-session model-config surface, stacked
+    /// over the model list so Esc pops back to `/model`.
+    #[test]
+    fn route_pick_from_model_menu_returns_to_model_config() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG]);
+        store.close_all_menus();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_MODEL));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE));
+
+        store.dispatch_onboarding_action(
+            crate::model::OnboardingAction::SetProviderSelection(Box::new(sample_selection(
+                "deepseek",
+                "deepseek-reasoner",
+            ))),
+            None,
+        );
+
+        let path: Vec<String> = store
+            .state
+            .menu_stack
+            .path()
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        assert_eq!(
+            path,
+            vec![
+                crate::menu::registry::MENU_MODEL.to_owned(),
+                crate::menu::registry::MENU_MODEL_CONFIG.to_owned(),
+            ],
+            "route pick outside the wizard lands on model-config over /model"
+        );
+        assert_eq!(store.state.onboarding.provider.family_id, "deepseek");
+    }
+
+    /// The same route pick made INSIDE the wizard (wizard root in the stack)
+    /// keeps its original return target: the wizard's provider step.
+    #[test]
+    fn route_pick_from_wizard_still_returns_to_onboard() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG]);
+        store.close_all_menus();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE));
+
+        store.dispatch_onboarding_action(
+            crate::model::OnboardingAction::SetProviderSelection(Box::new(sample_selection(
+                "deepseek",
+                "deepseek-reasoner",
+            ))),
+            None,
+        );
+
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
+            "route pick inside the wizard returns to the provider step"
+        );
+        assert!(!store.active_menu_id_is(crate::menu::registry::MENU_MODEL_CONFIG));
+    }
+
+    fn terminal_strip_agent(id: &str, status: &str) -> octos_core::ui_protocol::UiAgentRecord {
+        octos_core::ui_protocol::UiAgentRecord {
+            agent_id: id.into(),
+            parent_agent_id: None,
+            session_id: SessionKey("local:a".into()),
+            task_id: None,
+            path: format!("master/{id}"),
+            role: "worker".into(),
+            nickname: id.into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: status.into(),
+            last_task: None,
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    fn seed_strip_agent(store: &mut Store, id: &str, status: &str) {
+        let session_id = SessionKey("local:a".into());
+        store.apply_event(AppUiEvent::Protocol(UiNotification::AgentUpdated(
+            octos_core::ui_protocol::AgentUpdatedEvent {
+                session_id,
+                agent: terminal_strip_agent(id, status),
+            },
+        )));
+    }
+
+    fn strip_agent_ids(store: &Store) -> Vec<String> {
+        store
+            .state
+            .session_autonomy_for(&SessionKey("local:a".into()))
+            .map(|autonomy| {
+                autonomy
+                    .agents
+                    .iter()
+                    .map(|agent| agent.agent_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A new submit means the user moved on: the submitting session's
+    /// finished/failed sub-agent chips clear immediately; running ones stay.
+    #[test]
+    fn next_submit_prunes_terminal_agents() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        seed_strip_agent(&mut store, "edison", "completed");
+        seed_strip_agent(&mut store, "thomas", "failed");
+        seed_strip_agent(&mut store, "worker", "running");
+
+        store.state.composer = "next task please".into();
+        let _ = store.compose_command();
+
+        assert_eq!(
+            strip_agent_ids(&store),
+            vec!["worker".to_owned()],
+            "terminal chips clear on submit; running agents survive"
+        );
+    }
+
+    /// The tick sweep stamps terminal agents on first sight and prunes them
+    /// once (and only once) the linger elapses; running agents are never
+    /// stamped or pruned.
+    #[test]
+    fn linger_sweep_prunes_after_linger_but_not_before() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        seed_strip_agent(&mut store, "edison", "completed");
+        seed_strip_agent(&mut store, "worker", "running");
+
+        let t0 = std::time::Instant::now();
+        assert!(!store.sweep_terminal_agents(t0), "first sight only stamps");
+        assert!(
+            !store.sweep_terminal_agents(
+                t0 + AGENT_TERMINAL_LINGER - std::time::Duration::from_secs(1)
+            ),
+            "still inside the linger window"
+        );
+        assert_eq!(strip_agent_ids(&store), vec!["edison", "worker"]);
+
+        assert!(
+            store.sweep_terminal_agents(
+                t0 + AGENT_TERMINAL_LINGER + std::time::Duration::from_secs(1)
+            ),
+            "linger elapsed -> pruned"
+        );
+        assert_eq!(
+            strip_agent_ids(&store),
+            vec!["worker".to_owned()],
+            "only the terminal agent ages out"
+        );
+    }
+
+    /// The currently peeked agent is never yanked out from under the user —
+    /// it goes on the next sweep after they tab away.
+    #[test]
+    fn peeked_terminal_agent_survives_sweep() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        seed_strip_agent(&mut store, "edison", "completed");
+        store.state.chat_view = crate::model::ChatViewTarget::Agent("edison".into());
+
+        let t0 = std::time::Instant::now();
+        let _ = store.sweep_terminal_agents(t0);
+        assert!(
+            !store.sweep_terminal_agents(
+                t0 + AGENT_TERMINAL_LINGER + std::time::Duration::from_secs(5)
+            ),
+            "peeked agent is protected"
+        );
+        assert_eq!(strip_agent_ids(&store), vec!["edison".to_owned()]);
+
+        store.state.chat_view = crate::model::ChatViewTarget::Main;
+        assert!(
+            store.sweep_terminal_agents(
+                t0 + AGENT_TERMINAL_LINGER + std::time::Duration::from_secs(6)
+            ),
+            "prunes on the next sweep after tabbing away"
+        );
+        assert!(strip_agent_ids(&store).is_empty());
+    }
+
+    /// Backend relaunch already drops the roster; the linger stamps must die
+    /// with it so a re-added same-id agent restamps fresh.
+    #[test]
+    fn relaunch_clears_terminal_stamps() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        seed_strip_agent(&mut store, "edison", "completed");
+        let _ = store.sweep_terminal_agents(std::time::Instant::now());
+        assert!(
+            store
+                .state
+                .session_autonomy_for(&SessionKey("local:a".into()))
+                .is_some_and(|autonomy| !autonomy.terminal_seen.is_empty()),
+            "sweep stamped the terminal agent"
+        );
+
+        store.apply_client_event(ClientEvent::BackendRelaunched);
+
+        assert!(
+            store
+                .state
+                .session_autonomy_for(&SessionKey("local:a".into()))
+                .is_some_and(|autonomy| autonomy.terminal_seen.is_empty()),
+            "stamps die with the old child"
+        );
     }
 
     /// The onboarding wizard is hidden from the normal-session `/` menu but stays

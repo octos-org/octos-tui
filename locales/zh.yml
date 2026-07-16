@@ -655,6 +655,9 @@ menu:
   model:
     footer: 回车 选择或刷新 | Esc 关闭
     item:
+      add:
+        label: "添加模型…"
+        desc: "选择模型系列、模型和供应商路由，再粘贴 API 密钥 —— 与引导流程相同的分步配置。"
       cached:
         label: 服务器模型列表
       empty:
@@ -664,6 +667,14 @@ menu:
     search: 筛选模型
     subtitle: 服务器返回的档案 LLM 模型。
     title: 模型
+  model_config:
+    title: "添加模型"
+    subtitle: "为该档案暂存一个模型：系列、模型、路由、API 密钥 —— 然后测试并保存。"
+    search: 筛选步骤
+    unavailable_title: "模型配置不可用"
+    item:
+      fallback:
+        desc: "将暂存的供应商追加或替换到 config.llm.fallbacks。"
   onboard_done:
     title: "一切就绪"
     subtitle: "大脑 \"%{profile}\" 已就绪。"
