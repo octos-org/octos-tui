@@ -45,6 +45,10 @@ pub const MENU_LOGIN: &str = "login";
 /// and the (menu-hidden) `/add-model` command. Replaced the retired
 /// `MENU_PROVIDER` ("provider") dashboard, which flat-enumerated the catalog.
 pub const MENU_MODEL_CONFIG: &str = "model-config";
+/// `/model` → "Remove a model…" picker (configured models only).
+pub const MENU_MODEL_REMOVE: &str = "model-remove";
+/// Yes/No confirm for removing the staged model via `profile/llm/delete`.
+pub const MENU_MODEL_REMOVE_CONFIRM: &str = "model-remove-confirm";
 pub const MENU_COMPACT_CONFIRM: &str = "compact-confirm";
 pub const MENU_CONTEXT: &str = "context";
 pub const MENU_MODEL: &str = "model";

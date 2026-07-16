@@ -2401,6 +2401,10 @@ pub struct OnboardingWizardState {
     /// used to leave `provider_pending` set forever, freezing the staged
     /// surface on "Testing connection…" with every edit blocked.
     pub provider_pending_since: Option<std::time::Instant>,
+    /// The model staged for removal by `/model` → "Remove a model…" — read by
+    /// the confirm menu (`MENU_MODEL_REMOVE_CONFIRM`), whose Yes row sends
+    /// `profile/llm/delete` with these coordinates.
+    pub pending_model_removal: Option<ModelRemovalRequest>,
     pub provider_save_target: Option<OnboardingProviderSaveTarget>,
     pub last_saved_provider_label: Option<String>,
     pub last_saved_provider_target: Option<OnboardingProviderSaveTarget>,
@@ -2451,6 +2455,7 @@ impl Default for OnboardingWizardState {
             provider_tested: false,
             provider_pending: None,
             provider_pending_since: None,
+            pending_model_removal: None,
             provider_save_target: None,
             last_saved_provider_label: None,
             last_saved_provider_target: None,
@@ -3207,6 +3212,17 @@ pub struct ProfileLlmUpsertParams {
     pub api_key: Option<SecretString>,
     #[serde(default)]
     pub set_primary: bool,
+}
+
+/// A configured model staged for removal from the profile (the `/model` →
+/// "Remove a model…" flow). Coordinates mirror `ProfileLlmDeleteParams`;
+/// `label` is the human line shown in the confirm menu.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelRemovalRequest {
+    pub family_id: String,
+    pub model_id: String,
+    pub route_id: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

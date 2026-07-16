@@ -24,20 +24,20 @@ use crate::menu::{
         APPUI_METHOD_MCP_CONFIG_UPSERT, APPUI_METHOD_MCP_STATUS_LIST, APPUI_METHOD_MODEL_LIST,
         APPUI_METHOD_MODEL_SELECT, APPUI_METHOD_PERMISSION_PROFILE_LIST,
         APPUI_METHOD_PERMISSION_PROFILE_SET, APPUI_METHOD_PROFILE_LLM_CATALOG,
-        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS, APPUI_METHOD_PROFILE_LLM_TEST,
-        APPUI_METHOD_PROFILE_LLM_UPSERT, APPUI_METHOD_PROFILE_LOCAL_CREATE,
-        APPUI_METHOD_PROFILE_SKILLS_INSTALL, APPUI_METHOD_PROFILE_SKILLS_LIST,
-        APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH, APPUI_METHOD_PROFILE_SKILLS_REMOVE,
-        APPUI_METHOD_SESSION_COMPACT, APPUI_METHOD_SESSION_COMPACT_MODE_SET,
-        APPUI_METHOD_TOOL_CONFIG_DELETE, APPUI_METHOD_TOOL_CONFIG_LIST,
-        APPUI_METHOD_TOOL_CONFIG_SET_ENABLED, APPUI_METHOD_TOOL_CONFIG_TEST,
-        APPUI_METHOD_TOOL_CONFIG_UPSERT, APPUI_METHOD_TOOL_STATUS_LIST,
-        APPUI_ONBOARDING_METHODS_ANY, APPUI_PERMISSION_MENU_METHODS_ANY,
-        APPUI_PROVIDER_MENU_METHODS_ANY, APPUI_TOOL_SETTINGS_MENU_METHODS_ANY,
-        MENU_COMPACT_CONFIRM, MENU_CONTEXT, MENU_COST, MENU_HELP, MENU_KEYMAP, MENU_LOGIN,
-        MENU_MCP, MENU_MODEL, MENU_MODEL_CONFIG, MENU_ONBOARD, MENU_ONBOARD_LANGUAGE,
-        MENU_PERMISSIONS, MENU_RESUME, MENU_REWIND, MENU_SKILLS, MENU_STATUS, MENU_STATUS_LINE,
-        MENU_THEME, MENU_TITLE, MENU_TOOL_SETTINGS,
+        APPUI_METHOD_PROFILE_LLM_DELETE, APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        APPUI_METHOD_PROFILE_LLM_TEST, APPUI_METHOD_PROFILE_LLM_UPSERT,
+        APPUI_METHOD_PROFILE_LOCAL_CREATE, APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+        APPUI_METHOD_PROFILE_SKILLS_LIST, APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
+        APPUI_METHOD_PROFILE_SKILLS_REMOVE, APPUI_METHOD_SESSION_COMPACT,
+        APPUI_METHOD_SESSION_COMPACT_MODE_SET, APPUI_METHOD_TOOL_CONFIG_DELETE,
+        APPUI_METHOD_TOOL_CONFIG_LIST, APPUI_METHOD_TOOL_CONFIG_SET_ENABLED,
+        APPUI_METHOD_TOOL_CONFIG_TEST, APPUI_METHOD_TOOL_CONFIG_UPSERT,
+        APPUI_METHOD_TOOL_STATUS_LIST, APPUI_ONBOARDING_METHODS_ANY,
+        APPUI_PERMISSION_MENU_METHODS_ANY, APPUI_PROVIDER_MENU_METHODS_ANY,
+        APPUI_TOOL_SETTINGS_MENU_METHODS_ANY, MENU_COMPACT_CONFIRM, MENU_CONTEXT, MENU_COST,
+        MENU_HELP, MENU_KEYMAP, MENU_LOGIN, MENU_MCP, MENU_MODEL, MENU_MODEL_CONFIG, MENU_ONBOARD,
+        MENU_ONBOARD_LANGUAGE, MENU_PERMISSIONS, MENU_RESUME, MENU_REWIND, MENU_SKILLS,
+        MENU_STATUS, MENU_STATUS_LINE, MENU_THEME, MENU_TITLE, MENU_TOOL_SETTINGS,
     },
 };
 use crate::model::{
@@ -82,6 +82,8 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::Rewind,
         Provider::Model,
         Provider::ModelConfig,
+        Provider::ModelRemove,
+        Provider::ModelRemoveConfirm,
         Provider::Permissions,
         Provider::Mcp,
         Provider::ToolSettings,
@@ -123,6 +125,8 @@ enum Provider {
     Rewind,
     Model,
     ModelConfig,
+    ModelRemove,
+    ModelRemoveConfirm,
     Permissions,
     Mcp,
     ToolSettings,
@@ -159,6 +163,8 @@ impl MenuProvider for Provider {
             Self::Rewind => MENU_REWIND,
             Self::Model => MENU_MODEL,
             Self::ModelConfig => MENU_MODEL_CONFIG,
+            Self::ModelRemove => crate::menu::registry::MENU_MODEL_REMOVE,
+            Self::ModelRemoveConfirm => crate::menu::registry::MENU_MODEL_REMOVE_CONFIRM,
             Self::Permissions => MENU_PERMISSIONS,
             Self::Mcp => MENU_MCP,
             Self::ToolSettings => MENU_TOOL_SETTINGS,
@@ -195,6 +201,8 @@ impl MenuProvider for Provider {
             Self::Rewind => rewind_menu(ctx),
             Self::Model => model_menu(ctx),
             Self::ModelConfig => model_config_menu(ctx),
+            Self::ModelRemove => model_remove_menu(ctx),
+            Self::ModelRemoveConfirm => model_remove_confirm_menu(ctx),
             Self::Permissions => permissions_menu(ctx),
             Self::Mcp => mcp_menu(ctx),
             Self::ToolSettings => tool_settings_menu(ctx),
@@ -2315,6 +2323,123 @@ fn model_config_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     })
 }
 
+/// `/model` → "Remove a model…": pick one of the profile's CONFIGURED models
+/// (primary + fallbacks from `profile/llm/list` — never the catalog) to stage
+/// for removal. Selecting a row opens the Yes/No confirm.
+fn model_remove_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let profile_models;
+    let models = if let Some(profile_llm_state) = ctx.app.profile_llm_state {
+        profile_models = profile_llm_state.models();
+        profile_models.as_slice()
+    } else {
+        &[]
+    };
+
+    let mut items: Vec<MenuItem> = Vec::new();
+    if models.is_empty() {
+        items.push(
+            MenuItem::new(
+                "model.remove.empty",
+                t!("menu.model_remove.item.empty.label"),
+                MenuAction::Noop,
+            )
+            .disabled(t!("menu.model_remove.item.empty.desc").into_owned()),
+        );
+    }
+    for (idx, model) in models.iter().enumerate() {
+        let request = crate::model::ModelRemovalRequest {
+            family_id: model
+                .family
+                .clone()
+                .unwrap_or_else(|| model.provider.clone()),
+            model_id: model.model.clone(),
+            route_id: model.route.clone().unwrap_or_else(|| "official".into()),
+            label: model_label(model),
+        };
+        let mut item = MenuItem::new(
+            format!("model.remove.{idx}"),
+            model_label(model),
+            MenuAction::Local(LocalAction::RequestRemoveModel(Box::new(request))),
+        )
+        .with_description(model_description(model))
+        .with_state(MenuItemState {
+            current: model.selected,
+            ..MenuItemState::default()
+        })
+        .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_DELETE));
+        if let Some(shortcut) = numeric_shortcut(idx) {
+            item = item.with_shortcut(shortcut);
+        }
+        items.push(item);
+    }
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_MODEL_REMOVE),
+        title: t!("menu.model_remove.title").into_owned(),
+        subtitle: Some(t!("menu.model_remove.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: true,
+        search_placeholder: Some(t!("menu.model.search").into_owned()),
+        footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Yes/No confirm for removing the staged model. Yes sends
+/// `profile/llm/delete`; the mutation result refreshes the profile LLM state
+/// (and every open model surface) through the standard apply path.
+fn model_remove_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let Some(request) = ctx
+        .app
+        .onboarding
+        .and_then(|onboarding| onboarding.pending_model_removal.clone())
+    else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(crate::menu::registry::MENU_MODEL_REMOVE_CONFIRM),
+            title: t!("menu.model_remove.title").into_owned(),
+            message: t!("menu.model_remove.item.empty.label").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        });
+    };
+    let items = vec![
+        MenuItem::new(
+            "model.remove.yes",
+            t!(
+                "menu.model_remove.confirm.yes",
+                model = request.label.clone()
+            ),
+            MenuAction::send_appui(AppUiCommand::ProfileLlmDelete(
+                crate::model::ProfileLlmDeleteParams {
+                    profile_id: ctx.app.current_profile.map(str::to_owned),
+                    family_id: request.family_id.clone(),
+                    model_id: request.model_id.clone(),
+                    route_id: request.route_id.clone(),
+                },
+            )),
+        )
+        .with_description(t!("menu.model_remove.confirm.yes_desc")),
+        MenuItem::new(
+            "model.remove.no",
+            t!("menu.model_remove.confirm.no"),
+            MenuAction::Close,
+        ),
+    ];
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_MODEL_REMOVE_CONFIRM),
+        title: t!("menu.model_remove.confirm.title", model = request.label).into_owned(),
+        subtitle: Some(t!("menu.model_remove.confirm.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
 /// Right-pane preview for the Provider (LLM config) step. Like the Workspace
 /// step, it surfaces the read-only status the user can't act on by selecting —
 /// the local profile, the currently-selected provider route, and the last
@@ -3976,6 +4101,17 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         )
         .with_description(t!("menu.model.item.add.desc"))
         .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG)),
+    );
+    // Models can go bad (revoked key, retired model id) — the profile keeps
+    // working by adding a replacement and REMOVING the broken entry here.
+    items.push(
+        MenuItem::new(
+            "model.remove",
+            t!("menu.model.item.remove.label"),
+            MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_MODEL_REMOVE)),
+        )
+        .with_description(t!("menu.model.item.remove.desc"))
+        .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_DELETE)),
     );
 
     MenuBuildResult::Ready(MenuSpec {
@@ -8790,6 +8926,77 @@ mod tests {
             !rendered.contains("WiseModel"),
             "endpoint choices belong to the route step, not the config surface"
         );
+    }
+
+    /// The remove picker lists ONLY configured models (never the catalog) and
+    /// each row stages a `RequestRemoveModel` with the model's coordinates.
+    #[test]
+    fn model_remove_picker_stages_configured_models() {
+        let registry = core_menu_registry();
+        let capabilities =
+            CapabilitySet::from_methods([APPUI_METHOD_MODEL_LIST, APPUI_METHOD_PROFILE_LLM_DELETE]);
+        let llm_state = crate::model::ProfileLlmListResult {
+            profile_id: Some("coding".into()),
+            primary: Some(LlmConfiguredProvider {
+                family_id: Some("deepseek".into()),
+                model_id: Some("deepseek-v4-flash".into()),
+                route_id: Some("autodl".into()),
+                has_api_key: true,
+                selected: true,
+                ..configured_provider_for_test()
+            }),
+            fallbacks: vec![LlmConfiguredProvider {
+                family_id: Some("minimax".into()),
+                model_id: Some("MiniMax-M3".into()),
+                route_id: Some("minimax".into()),
+                has_api_key: true,
+                ..configured_provider_for_test()
+            }],
+            llm: None,
+            runtime_policy_stamp: None,
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                profile_llm_state: Some(&llm_state),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+
+        let MenuBuildResult::Ready(spec) = registry.build(
+            &MenuId::from(crate::menu::registry::MENU_MODEL_REMOVE),
+            &ctx,
+        ) else {
+            panic!("expected model-remove menu");
+        };
+        let rows: Vec<_> = spec
+            .items
+            .iter()
+            .filter(|item| item.id.starts_with("model.remove."))
+            .collect();
+        assert_eq!(rows.len(), 2, "one row per configured model");
+        let MenuAction::Local(LocalAction::RequestRemoveModel(request)) = &rows[0].action else {
+            panic!("expected RequestRemoveModel");
+        };
+        assert_eq!(request.family_id, "deepseek");
+        assert_eq!(request.model_id, "deepseek-v4-flash");
+        assert_eq!(request.route_id, "autodl");
+
+        // `/model` itself carries the entry row, gated on profile/llm/delete.
+        let MenuBuildResult::Ready(model_spec) = registry.build(&MenuId::from(MENU_MODEL), &ctx)
+        else {
+            panic!("expected model menu");
+        };
+        let remove_row = model_spec
+            .items
+            .iter()
+            .find(|item| item.id == "model.remove")
+            .expect("remove entry present");
+        assert_eq!(remove_row.disabled_reason, None);
     }
 
     /// `/model` absorbed the add-model flow: a trailing "Add a model…" row

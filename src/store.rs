@@ -1288,6 +1288,13 @@ impl Store {
                 self.dispatch_delete_profile(&id);
                 None
             }
+            LocalAction::RequestRemoveModel(request) => {
+                self.state.onboarding.pending_model_removal = Some(*request);
+                self.open_menu(MenuId::from(
+                    crate::menu::registry::MENU_MODEL_REMOVE_CONFIRM,
+                ));
+                None
+            }
             LocalAction::SetScrollMode => {
                 self.dispatch_set_scrollmode(inline_args.unwrap_or_default());
                 // Executing from the slash popup must close it: the toggle's
@@ -17392,6 +17399,47 @@ mod tests {
             store.state.onboarding.profile_id.as_deref(),
             Some("coding"),
             "staged profile must follow the active session's profile"
+        );
+    }
+
+    /// `/model` -> "Remove a model..." -> pick -> Yes sends profile/llm/delete
+    /// with the picked model's coordinates; the confirm state is staged via
+    /// `pending_model_removal`.
+    #[test]
+    fn remove_model_confirm_sends_profile_llm_delete() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_DELETE]);
+        // Feeds the snapshot's `current_profile` fallback chain.
+        store.state.onboarding.profile_id = Some("coding".into());
+        store.close_all_menus();
+
+        store.dispatch_menu_action(MenuAction::Local(LocalAction::RequestRemoveModel(
+            Box::new(crate::model::ModelRemovalRequest {
+                family_id: "deepseek".into(),
+                model_id: "deepseek-v4-flash".into(),
+                route_id: "autodl".into(),
+                label: "deepseek / deepseek-v4-flash".into(),
+            }),
+        )));
+
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_MODEL_REMOVE_CONFIRM),
+            "request opens the confirm menu"
+        );
+        assert!(store.state.onboarding.pending_model_removal.is_some());
+
+        // Yes row (index 0) sends the delete with the staged coordinates.
+        let command = store.accept_active_menu_item();
+        let Some(AppUiCommand::ProfileLlmDelete(params)) = command else {
+            panic!("expected ProfileLlmDelete, got {command:?}");
+        };
+        assert_eq!(params.family_id, "deepseek");
+        assert_eq!(params.model_id, "deepseek-v4-flash");
+        assert_eq!(params.route_id, "autodl");
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+        assert!(
+            store.state.menu_stack.path().is_empty(),
+            "leaf send dismisses the confirm stack"
         );
     }
 
