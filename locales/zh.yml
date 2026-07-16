@@ -1196,6 +1196,8 @@ status:
   profile_delete_active_blocked: "无法删除 %{profile}——这是当前会话正在使用的档案。请先切换到其他档案。"
   switching_profile: "正在切换到档案 %{profile}……"
   provider_route_selected: "已选择供应商线路；请输入 API 密钥"
+  provider_request_failed: "供应商请求失败：%{message}"
+  provider_request_timeout: "供应商请求超时，未收到响应 —— 请重试"
   provider_family_updated: "供应商模型系列已更新"
   provider_model_updated: "供应商模型已更新"
   provider_route_updated: "供应商线路已更新"

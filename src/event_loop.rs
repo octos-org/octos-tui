@@ -241,6 +241,12 @@ pub fn run(cli: Cli) -> Result<()> {
             dirty = true;
         }
 
+        // A staged provider Test/Save that never receives its response must
+        // not freeze the model-config surface forever — time it out here.
+        if store.sweep_provider_pending(std::time::Instant::now()) {
+            dirty = true;
+        }
+
         if drain_backend_events(backend.as_mut(), &mut store)? {
             dirty = true;
         }
