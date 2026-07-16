@@ -9917,6 +9917,20 @@ impl Store {
         // orchestration tick re-asserts any session that is genuinely active.
         self.state.orchestration.clear();
         self.state.session_retry.clear();
+        // The old child's spawned sub-agents died with it too. The NEW child
+        // will never emit their terminal `agent/updated`, so keeping the
+        // roster would pin dead chips on "running"/"spawned" forever (the
+        // roster is upsert-only — nothing else removes entries). Drop it and
+        // the per-agent streamed-output caches; the `session/opened`
+        // re-hydration fetches a fresh `agent/list` from the new child, which
+        // re-adds anything genuinely alive. Then normalize the chat view so a
+        // peeked dead-agent pane falls back to Main instead of a blank pane.
+        for autonomy in &mut self.state.session_autonomy {
+            autonomy.agents.clear();
+            autonomy.agent_outputs.clear();
+            autonomy.agent_artifacts.clear();
+        }
+        self.state.normalize_chat_view();
         let latched: Vec<(octos_core::SessionKey, TurnId)> = self
             .state
             .sessions
@@ -14416,6 +14430,63 @@ mod tests {
         assert!(
             !store.state.run_state.is_active(),
             "no latched turn + dead child -> the run cannot still be in progress"
+        );
+    }
+
+    /// The spawned-agent roster died with the old child too: the NEW child
+    /// never emits a terminal `agent/updated` for agents it never knew, and
+    /// the roster is upsert-only, so without this clear the dead chips stay
+    /// "running" forever. The relaunch must drop the roster (re-hydration
+    /// re-fetches `agent/list` from the new child) and pull a peeked
+    /// dead-agent view back to Main.
+    #[test]
+    fn backend_relaunch_clears_stale_agent_roster() {
+        use octos_core::ui_protocol::{AgentUpdatedEvent, UiAgentRecord};
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let session_id = SessionKey("local:a".into());
+        let agent = UiAgentRecord {
+            agent_id: "edison".into(),
+            parent_agent_id: None,
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "master/edison".into(),
+            role: "worker".into(),
+            nickname: "Edison".into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: "running".into(),
+            last_task: Some("clone the repo".into()),
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::AgentUpdated(
+            AgentUpdatedEvent {
+                session_id: session_id.clone(),
+                agent,
+            },
+        )));
+        store.state.chat_view = crate::model::ChatViewTarget::Agent("edison".into());
+
+        store.apply_client_event(ClientEvent::BackendRelaunched);
+
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror still present");
+        assert!(
+            mirror.agents.is_empty(),
+            "dead child's agent roster must not survive the relaunch"
+        );
+        assert!(
+            matches!(store.state.chat_view, crate::model::ChatViewTarget::Main),
+            "a peeked dead-agent view must fall back to Main"
         );
     }
 
