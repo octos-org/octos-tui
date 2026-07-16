@@ -924,6 +924,7 @@ menu:
         desc: Summarize with the model for a higher-quality checkpoint.
         label: Summarize with LLM
     subtitle: Manage the context window for this session.
+    subtitle_usage: "%{used} / %{max} — %{pct}% of context window used"
     title: Context
     unavailable_no_session: Context controls require an open Octos UI session.
     unavailable_title: Context unavailable

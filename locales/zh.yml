@@ -512,6 +512,7 @@ menu:
         desc: 使用模型生成更高质量的检查点摘要。
         label: 使用 LLM 摘要
     subtitle: 管理此会话的上下文窗口。
+    subtitle_usage: "%{used} / %{max} — 已用上下文窗口 %{pct}%"
     title: 上下文
     unavailable_no_session: 上下文控制需要已打开的 Octos UI 会话。
     unavailable_title: 上下文不可用
