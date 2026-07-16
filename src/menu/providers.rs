@@ -2411,10 +2411,6 @@ fn model_config_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         },
     );
 
-    // Read-only summary of what the profile already has (primary + fallbacks)
-    // — the informational remainder of the old dashboard, no actions.
-    items.extend(provider_saved_items(ctx));
-
     for (idx, item) in items.iter_mut().enumerate() {
         if let Some(shortcut) = numeric_shortcut(idx) {
             item.shortcut = Some(shortcut);
@@ -2430,9 +2426,72 @@ fn model_config_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         searchable: true,
         search_placeholder: Some(t!("menu.model_config.search").into_owned()),
         footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
-        preview: None,
+        // What the profile already has (primary + fallbacks) is read-only
+        // status — UX2/F1 rule: non-actionable info lives in the right pane,
+        // never as Noop rows in the action list ("Saved fallbacks: none" as a
+        // selectable row was the last remnant of the old dashboard).
+        preview: Some(model_config_saved_preview(ctx)),
         mode: MenuMode::SingleSelect,
     })
+}
+
+/// Right-pane summary for the model-config surface: the profile's saved
+/// primary and fallback models from `profile/llm/list` (server truth), plus
+/// the profile id. Replaces the old dashboard's Noop status rows.
+fn model_config_saved_preview(ctx: &MenuContext<'_>) -> MenuPreview {
+    let mut rows = vec![MenuPreviewRow {
+        label: t!("menu.model_config.preview.profile").into_owned(),
+        value: ctx
+            .app
+            .current_profile
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+    }];
+    let summary = |provider: &LlmConfiguredProvider| {
+        format!(
+            "{} — {}",
+            configured_provider_label(provider),
+            configured_provider_description(provider)
+        )
+    };
+    match ctx.app.profile_llm_state {
+        Some(profile_llm) => {
+            rows.push(MenuPreviewRow {
+                label: t!("menu.model_config.preview.primary").into_owned(),
+                value: profile_llm
+                    .primary_provider()
+                    .map(summary)
+                    .unwrap_or_else(|| t!("menu.model_config.preview.none").into_owned()),
+            });
+            let fallbacks = profile_llm.fallback_providers();
+            if fallbacks.is_empty() {
+                rows.push(MenuPreviewRow {
+                    label: t!("menu.model_config.preview.fallbacks").into_owned(),
+                    value: t!("menu.model_config.preview.none").into_owned(),
+                });
+            } else {
+                rows.extend(
+                    fallbacks
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, provider)| MenuPreviewRow {
+                            label: t!("menu.model_config.preview.fallback_n", n = idx + 1)
+                                .into_owned(),
+                            value: summary(provider),
+                        }),
+                );
+            }
+        }
+        None => rows.push(MenuPreviewRow {
+            label: t!("menu.model_config.preview.primary").into_owned(),
+            value: t!("menu.model_config.preview.not_loaded").into_owned(),
+        }),
+    }
+    MenuPreview::KeyValues {
+        title: Some(t!("menu.model_config.preview.title").into_owned()),
+        rows,
+    }
 }
 
 /// `/model` → "Remove a model…": pick one of the profile's CONFIGURED models
@@ -4240,81 +4299,6 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             rows: model_preview_rows(ctx),
         }),
         mode: MenuMode::SingleSelect,
-    })
-}
-
-fn provider_saved_items(ctx: &MenuContext<'_>) -> Vec<MenuItem> {
-    let Some(profile_llm) = ctx.app.profile_llm_state else {
-        return vec![
-            MenuItem::new(
-                "provider.saved.unloaded",
-                t!("menu.provider.item.saved_unloaded.label"),
-                MenuAction::Noop,
-            )
-            .with_description(t!("menu.provider.item.saved_unloaded.desc"))
-            .disabled("not loaded"),
-        ];
-    };
-
-    let mut items = Vec::new();
-    if let Some(primary) = profile_llm.primary_provider() {
-        items.push(configured_provider_item(
-            "provider.saved.primary",
-            t!("menu.provider.item.saved_primary.prefix").as_ref(),
-            primary,
-        ));
-    } else {
-        items.push(
-            MenuItem::new(
-                "provider.saved.primary.empty",
-                t!("menu.provider.item.saved_primary_empty.label"),
-                MenuAction::Noop,
-            )
-            .with_description(t!("menu.provider.item.saved_primary_empty.desc"))
-            .with_state(MenuItemState::required(false)),
-        );
-    }
-
-    let fallbacks = profile_llm.fallback_providers();
-    if fallbacks.is_empty() {
-        items.push(
-            MenuItem::new(
-                "provider.saved.fallback.empty",
-                t!("menu.provider.item.saved_fallback_empty.label"),
-                MenuAction::Noop,
-            )
-            .with_description(t!("menu.provider.item.saved_fallback_empty.desc"))
-            .with_state(MenuItemState::required(false)),
-        );
-    } else {
-        items.extend(fallbacks.iter().enumerate().map(|(idx, provider)| {
-            configured_provider_item(
-                format!("provider.saved.fallback.{idx}"),
-                t!("menu.provider.item.saved_fallback.prefix", n = idx + 1).as_ref(),
-                provider,
-            )
-        }));
-    }
-
-    items
-}
-
-fn configured_provider_item(
-    id: impl Into<String>,
-    prefix: &str,
-    provider: &LlmConfiguredProvider,
-) -> MenuItem {
-    MenuItem::new(
-        id,
-        format!("{prefix}: {}", configured_provider_label(provider)),
-        MenuAction::Noop,
-    )
-    .with_description(configured_provider_description(provider))
-    .with_state(MenuItemState {
-        current: provider.selected,
-        checked: Some(true),
-        required_valid: Some(provider.has_api_key),
-        ..MenuItemState::default()
     })
 }
 
@@ -7863,21 +7847,36 @@ mod tests {
         else {
             panic!("expected model-config menu");
         };
-        let rendered = rendered_menu_text(&spec);
 
-        assert!(rendered.contains("Saved primary: moonshot / kimi-k2.5 via autodl"));
+        // UX2/F1 rule: the saved primary/fallback summary is read-only status,
+        // so it lives in the right-pane preview — NEVER as Noop rows in the
+        // action list ("Saved fallbacks: none" as a selectable row was the
+        // last remnant of the retired dashboard).
         assert!(
-            rendered.contains("Saved fallback 1: minimax / MiniMax-M2.5-highspeed via wisemodel")
+            !spec
+                .items
+                .iter()
+                .any(|item| item.id.starts_with("provider.saved")),
+            "no Noop saved-status rows in the action list"
         );
-        assert!(rendered.contains("env: AUTODL_API_KEY"));
-        assert!(rendered.contains("env: WISEMODEL_API_KEY"));
-        let primary = spec
-            .items
+        let Some(MenuPreview::KeyValues { rows, .. }) = &spec.preview else {
+            panic!("expected the saved-models preview pane");
+        };
+        let flat: Vec<String> = rows
             .iter()
-            .find(|item| item.id == "provider.saved.primary")
-            .expect("saved primary row");
-        assert!(primary.state.current);
-        assert_eq!(primary.state.required_valid, Some(true));
+            .map(|row| format!("{}: {}", row.label, row.value))
+            .collect();
+        let joined = flat.join("\n");
+        assert!(
+            joined.contains("moonshot / kimi-k2.5 via autodl"),
+            "primary summary in the pane: {joined}"
+        );
+        assert!(
+            joined.contains("minimax / MiniMax-M2.5-highspeed via wisemodel"),
+            "fallback summary in the pane: {joined}"
+        );
+        assert!(joined.contains("env: AUTODL_API_KEY"));
+        assert!(joined.contains("env: WISEMODEL_API_KEY"));
     }
 
     fn configured_provider_for_test() -> LlmConfiguredProvider {

@@ -1134,6 +1134,14 @@ menu:
     item:
       fallback:
         desc: "Append or replace the staged provider under config.llm.fallbacks."
+    preview:
+      title: "Saved models"
+      profile: "profile"
+      primary: "primary"
+      fallbacks: "fallbacks"
+      fallback_n: "fallback %{n}"
+      none: "none"
+      not_loaded: "not loaded — refresh models in /model"
   onboard_done:
     title: "You're all set"
     subtitle: "Brain \"%{profile}\" is ready."
@@ -1371,33 +1379,6 @@ menu:
     title: Update Model Permissions
     unavailable_no_session: Permissions require an open Octos UI session.
     unavailable_title: Permissions unavailable
-  provider:
-    item:
-      catalog_refresh:
-        label: Refresh provider catalog
-      list_refresh:
-        label: Refresh configured providers
-      saved_fallback:
-        prefix: Saved fallback %{n}
-      saved_fallback_empty:
-        desc: Use Add fallback model to persist secondary routes.
-        label: 'Saved fallbacks: none'
-      saved_primary:
-        prefix: Saved primary
-      saved_primary_empty:
-        desc: Save a tested provider as primary before opening a coding session.
-        label: 'Saved primary: not set'
-      saved_unloaded:
-        desc: Run Refresh configured providers to read profile/llm/list.
-        label: 'Saved providers: not loaded'
-      staged:
-        desc: Use /provider select <family> <model> <route> [base_url] [api_key_env], or choose a catalog row.
-        label: Staged provider
-    preview_title: Provider State
-    search: Filter providers
-    subtitle: Profile-owned LLM setup; catalog and state come from Octos UI.
-    title: Provider
-    unavailable_title: Providers unavailable
   runtime_preview_title: Runtime
   search:
     label: "Search "
