@@ -38,6 +38,7 @@ pub const MENU_LAUNCH_PROMPT: &str = "launch-prompt";
 pub const MENU_LOGIN: &str = "login";
 pub const MENU_PROVIDER: &str = "provider";
 pub const MENU_COMPACT_CONFIRM: &str = "compact-confirm";
+pub const MENU_CONTEXT: &str = "context";
 pub const MENU_MODEL: &str = "model";
 pub const MENU_COST: &str = "cost";
 /// `/resume` session picker menu.
@@ -62,6 +63,8 @@ pub const APPUI_METHOD_MODEL_LIST: &str = crate::model::APPUI_METHOD_MODEL_LIST;
 pub const APPUI_METHOD_MODEL_SELECT: &str = crate::model::APPUI_METHOD_MODEL_SELECT;
 pub const APPUI_METHOD_SESSION_STATUS_READ: &str = crate::model::APPUI_METHOD_SESSION_STATUS_READ;
 pub const APPUI_METHOD_SESSION_COMPACT: &str = crate::model::APPUI_METHOD_SESSION_COMPACT;
+pub const APPUI_METHOD_SESSION_COMPACT_MODE_SET: &str =
+    crate::model::APPUI_METHOD_SESSION_COMPACT_MODE_SET;
 pub const APPUI_METHOD_PERMISSION_PROFILE_LIST: &str = "permission/profile/list";
 pub const APPUI_METHOD_PERMISSION_PROFILE_SET: &str = "permission/profile/set";
 pub const APPUI_METHOD_APPROVAL_SCOPES_CLEAR: &str = "approval/scopes/clear";
@@ -619,13 +622,13 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_COST)),
         },
         CommandSpec {
-            name: "compact",
-            aliases: &["compress"],
-            description: "command.compact.desc",
+            name: "context",
+            aliases: &["ctx", "compact", "compress"],
+            description: "command.context.desc",
             category: CommandCategory::Session,
             availability: CommandAvailability::app_ui_mutating(&[APPUI_METHOD_SESSION_COMPACT]),
             inline_args: InlineArgMode::None,
-            entry: CommandEntry::OpenMenu(MenuId::from(MENU_COMPACT_CONFIRM)),
+            entry: CommandEntry::OpenMenu(MenuId::from(MENU_CONTEXT)),
         },
         CommandSpec {
             name: "btw",
