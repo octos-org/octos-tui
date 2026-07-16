@@ -770,11 +770,13 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
-    // Agent Dock (#323): Alt+D toggles the sub-agent strip between the
-    // one-line summary pill and the per-agent rows. Only claimed while a
-    // roster exists — with no agents the strip is height-0 and the key
+    // Agent Dock (#323): Alt+G toggles the sub-agent strip between the
+    // one-line summary pill and the per-agent rows. NOT Alt+D — the composer
+    // claims that as readline delete-word-forward (handle_composer_modified_key
+    // runs first while the composer has focus, mini4 soak catch). Only claimed
+    // while a roster exists — with no agents the strip is height-0 and the key
     // stays free.
-    if is_alt_char(&key, 'd') && !store.state.active_session_agents().is_empty() {
+    if is_alt_char(&key, 'g') && !store.state.active_session_agents().is_empty() {
         store.state.agent_dock_collapsed = !store.state.agent_dock_collapsed;
         return KeyAction::Continue;
     }

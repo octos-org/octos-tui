@@ -151,7 +151,7 @@ app:
     agent_strip_more: "+%{count} more (Tab)"
     agent_dock_pill: "🐙 %{count} agents · %{running} running"
     agent_dock_pill_unread: " · %{count}● unread"
-    agent_dock_toggle_hint: "Alt+D"
+    agent_dock_toggle_hint: "Alt+G"
     agent_no_output: "(no output captured yet — this agent streams its result here as it works)"
     menu: "Menu | j/k move | Enter accept | Esc close"
     onboarding: "Onboarding | Enter continue | type to edit fields"
@@ -909,7 +909,7 @@ menu:
       dock_expand:
         label: Expand the dock to per-agent rows
       dock_toggle:
-        desc: Same as Alt+D.
+        desc: Same as Alt+G.
       main:
         desc: Show the session transcript in the main pane.
         label: main session

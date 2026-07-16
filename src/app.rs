@@ -17295,7 +17295,7 @@ mod tests {
         );
         // thomas transitioned to terminal while viewing Main -> unread.
         assert!(pill.contains("1●"), "pill shows the unread count: {pill}");
-        assert!(pill.contains("Alt+D"), "pill hints the toggle key: {pill}");
+        assert!(pill.contains("Alt+G"), "pill hints the toggle key: {pill}");
 
         // Peeking thomas clears the unread segment.
         app.set_chat_view(crate::model::ChatViewTarget::Agent("thomas".into()));
