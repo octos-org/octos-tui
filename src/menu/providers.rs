@@ -988,10 +988,28 @@ fn context_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         );
     }
 
+    // Live context-window usage in the subtitle: `used / max — pct% …` (e.g.
+    // `128K / 1M — 13% of context window used`), so the operator sees how full
+    // the window is before deciding to compact. Falls back to the static hint
+    // until a token estimate is known for the session.
+    let subtitle = match ctx.app.context_window_usage {
+        Some((used, window)) if window > 0 => {
+            let percent = ((used as f64 / window as f64) * 100.0).round().min(100.0) as u16;
+            t!(
+                "menu.context.subtitle_usage",
+                used = crate::app::format_tokens_human(used),
+                max = crate::app::format_tokens_human(window),
+                pct = percent,
+            )
+            .into_owned()
+        }
+        _ => t!("menu.context.subtitle").into_owned(),
+    };
+
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_CONTEXT),
         title: t!("menu.context.title").into_owned(),
-        subtitle: Some(t!("menu.context.subtitle").into_owned()),
+        subtitle: Some(subtitle),
         items,
         tabs: Vec::new(),
         searchable: false,
@@ -7286,6 +7304,53 @@ mod tests {
             cost_per_m: None,
             strong: None,
         }
+    }
+
+    #[test]
+    fn context_menu_subtitle_shows_live_window_usage() {
+        let capabilities = CapabilitySet::from_methods([APPUI_METHOD_SESSION_COMPACT]);
+        let session_id = SessionKey("local:test".into());
+
+        // With a known estimate + window, the subtitle renders `used / max`
+        // plus the percent (128k of a 1M window → `128K / 1M — 13% …`).
+        let usage_ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                selected_session_id: Some(&session_id),
+                context_window_usage: Some((128_000, 1_000_000)),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(context_menu(&usage_ctx));
+        let subtitle = spec.subtitle.expect("context menu carries a subtitle");
+        assert!(
+            subtitle.contains("128K / 1M"),
+            "subtitle shows used/max in human units: {subtitle:?}"
+        );
+        assert!(
+            subtitle.contains("13%"),
+            "subtitle shows the rounded fill percent: {subtitle:?}"
+        );
+
+        // Before any estimate is known, fall back to the static hint rather
+        // than inventing a `0 / 0` gauge.
+        let empty_ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                selected_session_id: Some(&session_id),
+                context_window_usage: None,
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let fallback = ready_spec(context_menu(&empty_ctx));
+        let expected = t!("menu.context.subtitle").into_owned();
+        assert_eq!(fallback.subtitle.as_deref(), Some(expected.as_str()));
     }
 
     #[test]

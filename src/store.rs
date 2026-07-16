@@ -4184,6 +4184,8 @@ impl Store {
             resume_sessions: &self.state.resume_sessions,
             resume_list_loaded: self.state.resume_list_loaded,
             rewind_turns: &self.state.rewind_turns,
+            context_window_usage: selected_session
+                .and_then(|session| crate::app::context_window_usage(&self.state, &session.id)),
         }
     }
 

@@ -691,6 +691,11 @@ pub struct MenuAppSnapshot<'a> {
     /// Empty when the active session has no user messages (the menu renders
     /// `Unavailable` in that case).
     pub rewind_turns: &'a [crate::model::RewindTurnRow],
+    /// `(used_tokens, window_tokens)` for the selected session — the numbers
+    /// behind the harness `ctx N%` gauge — so the `/context` menu can render
+    /// the live `used / max (pct%)` context-window usage. `None` until a token
+    /// estimate is known for the session.
+    pub context_window_usage: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

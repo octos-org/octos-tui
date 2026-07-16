@@ -8054,6 +8054,23 @@ fn format_tokens_k(tokens: u64) -> String {
     format!("{k}K")
 }
 
+/// Human-readable token count for context-window display: `128K`, `256K`,
+/// `1M`, `1.5M`. Reuses [`format_tokens_k`] below 1M; switches to `M` above so
+/// a 1,000,000-token window renders `1M` rather than `1000K`.
+pub(crate) fn format_tokens_human(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        let millions = tokens as f64 / 1_000_000.0;
+        let rendered = format!("{millions:.1}");
+        let rendered = rendered
+            .strip_suffix(".0")
+            .map(str::to_owned)
+            .unwrap_or(rendered);
+        format!("{rendered}M")
+    } else {
+        format_tokens_k(tokens)
+    }
+}
+
 fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> {
     let Some(state) = active_session_autonomy(app) else {
         return Vec::new();
@@ -8365,6 +8382,26 @@ fn harness_status_active(app: &AppState) -> bool {
 /// Rows the harness status indicator needs: 1 when active, 0 when idle.
 fn harness_status_height(app: &AppState) -> u16 {
     if harness_status_active(app) { 1 } else { 0 }
+}
+
+/// `(used_tokens, window_tokens)` for `session_id`, for the `/context` menu's
+/// live usage line. `None` until a token estimate is known for the session.
+/// Window resolution mirrors [`harness_context_ratio`]: the real per-model
+/// window (`session_context_window`, from `metadata.token_cost.context_window`)
+/// when known, else the fixed default until the first cost update arrives.
+pub(crate) fn context_window_usage(app: &AppState, session_id: &SessionKey) -> Option<(u64, u64)> {
+    let used = app
+        .context_lifecycle_for(session_id)?
+        .state
+        .as_ref()?
+        .token_estimate as u64;
+    let window = app
+        .session_context_window
+        .get(session_id)
+        .copied()
+        .filter(|w| *w > 0)
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS as u64);
+    Some((used, window))
 }
 
 /// Context-window fill ratio (0.0..=1.0) for the harness row `LineGauge`, or
@@ -17037,6 +17074,67 @@ mod tests {
         assert_eq!(format_tokens_k(2_000_000), "2000K");
         // No overflow / correct rounding at the u64 ceiling.
         assert_eq!(format_tokens_k(u64::MAX), "18446744073709552K");
+    }
+
+    #[test]
+    fn format_tokens_human_switches_to_millions_above_1m() {
+        // Below 1M it delegates to the K formatter, so a 128k/256k window in
+        // the `/context` subtitle reads the same way as the goal chip.
+        assert_eq!(format_tokens_human(0), "0K");
+        assert_eq!(format_tokens_human(45_231), "45K");
+        assert_eq!(format_tokens_human(128_000), "128K");
+        assert_eq!(format_tokens_human(256_000), "256K");
+        // The switch is on the raw value, not the rounded-K value, so a hair
+        // under 1M still renders in K (rounding up to `1000K`).
+        assert_eq!(format_tokens_human(999_999), "1000K");
+        // At/above 1M it switches to millions and drops a trailing `.0` so a
+        // 1,000,000-token window reads `1M`, not `1000K` or `1.0M`.
+        assert_eq!(format_tokens_human(1_000_000), "1M");
+        assert_eq!(format_tokens_human(1_500_000), "1.5M");
+        assert_eq!(format_tokens_human(2_000_000), "2M");
+    }
+
+    #[test]
+    fn context_window_usage_pairs_estimate_with_real_or_default_window() {
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+
+        // No token estimate for the session yet → nothing to render.
+        assert_eq!(context_window_usage(&app, &session_id), None);
+
+        app.context_lifecycle_mut(&session_id).state = Some(crate::model::ContextLifecycleState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: String::new(),
+            item_count: 10,
+            token_estimate: 64_000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        });
+
+        // No per-model window on the wire yet → pair the estimate with the
+        // fixed default so the subtitle still shows an honest fraction.
+        assert_eq!(
+            context_window_usage(&app, &session_id),
+            Some((64_000, DEFAULT_CONTEXT_WINDOW_TOKENS as u64)),
+        );
+
+        // Once the real window arrives it wins over the default.
+        app.session_context_window
+            .insert(session_id.clone(), 1_000_000);
+        assert_eq!(
+            context_window_usage(&app, &session_id),
+            Some((64_000, 1_000_000)),
+        );
+
+        // A zero window is treated as unknown and falls back to the default.
+        app.session_context_window.insert(session_id.clone(), 0);
+        assert_eq!(
+            context_window_usage(&app, &session_id),
+            Some((64_000, DEFAULT_CONTEXT_WINDOW_TOKENS as u64)),
+        );
     }
 
     #[test]
