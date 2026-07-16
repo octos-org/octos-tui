@@ -41,7 +41,10 @@ pub const MENU_PROFILE_DELETE_CONFIRM: &str = "profile-delete-confirm";
 /// raised from a `launch/resolve` decision. See `launch_prompt_menu`.
 pub const MENU_LAUNCH_PROMPT: &str = "launch-prompt";
 pub const MENU_LOGIN: &str = "login";
-pub const MENU_PROVIDER: &str = "provider";
+/// Mid-session staged model-config surface: the `/model` → "Add a model" flow
+/// and the (menu-hidden) `/add-model` command. Replaced the retired
+/// `MENU_PROVIDER` ("provider") dashboard, which flat-enumerated the catalog.
+pub const MENU_MODEL_CONFIG: &str = "model-config";
 pub const MENU_COMPACT_CONFIRM: &str = "compact-confirm";
 pub const MENU_CONTEXT: &str = "context";
 pub const MENU_MODEL: &str = "model";
@@ -598,6 +601,10 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         // part of onboarding (provider family -> model -> route -> save), lifted
         // out of the wizard. `provider`/`providers` remain aliases so existing
         // muscle memory and `/provider <sub>` inline forms keep working.
+        // Moved into `/model` as its "Add a model" row: hidden from the `/`
+        // popup (same treatment as `/onboard`) but still dispatchable by name
+        // for muscle memory and the inline verbs (`/add-model key|test|save|
+        // fallback|...`). Opens the staged model-config surface.
         CommandSpec {
             name: "add-model",
             aliases: &["provider", "providers", "add_model"],
@@ -605,7 +612,8 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             category: CommandCategory::Settings,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_session(SessionRequirement::Any)
-                .with_required_methods_any(APPUI_PROVIDER_MENU_METHODS_ANY),
+                .with_required_methods_any(APPUI_PROVIDER_MENU_METHODS_ANY)
+                .hidden_from_menu(),
             inline_args: InlineArgMode::Optional,
             entry: CommandEntry::LocalAction(LocalAction::Onboarding(
                 crate::model::OnboardingAction::OpenProvider,
@@ -1268,14 +1276,15 @@ mod tests {
 
         assert!(visible.contains(&"status"));
         assert!(visible.contains(&"login"));
-        assert!(visible.contains(&"add-model"));
         assert!(visible.contains(&"model"));
         assert!(visible.contains(&"skills"));
         assert!(!visible.contains(&"permissions"));
         assert!(!visible.contains(&"mcp"));
-        // The full onboarding wizard is dispatchable but hidden from the menu;
-        // model changes go through `/add-model` instead.
+        // The full onboarding wizard is dispatchable but hidden from the menu,
+        // and `/add-model` moved into `/model` as its "Add a model" row — also
+        // hidden from the popup while staying dispatchable by name.
         assert!(!visible.contains(&"onboard"));
+        assert!(!visible.contains(&"add-model"));
     }
 
     #[test]

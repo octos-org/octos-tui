@@ -233,6 +233,14 @@ pub fn run(cli: Cli) -> Result<()> {
             dirty = true;
         }
 
+        // Terminal sub-agent chips age out of the strip on this same tick
+        // cadence (the loop already wakes every UI_EVENT_POLL_INTERVAL, so no
+        // dedicated timer): finished/failed agents linger long enough to
+        // read, then leave. O(agents) when nothing expires.
+        if store.sweep_terminal_agents(std::time::Instant::now()) {
+            dirty = true;
+        }
+
         if drain_backend_events(backend.as_mut(), &mut store)? {
             dirty = true;
         }

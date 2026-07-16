@@ -1075,6 +1075,9 @@ menu:
   model:
     footer: Enter select or refresh | Esc close
     item:
+      add:
+        label: "Add a model…"
+        desc: "Pick a model family, model, and provider route, then paste an API key — the same staged flow as onboarding."
       cached:
         label: Server model list
       empty:
@@ -1084,6 +1087,14 @@ menu:
     search: Filter models
     subtitle: Server-returned profile LLM models.
     title: Model
+  model_config:
+    title: "Add a model"
+    subtitle: "Stage a model for this profile: family, model, route, API key — then Test and Save."
+    search: Filter steps
+    unavailable_title: "Model config unavailable"
+    item:
+      fallback:
+        desc: "Append or replace the staged provider under config.llm.fallbacks."
   onboard_done:
     title: "You're all set"
     subtitle: "Brain \"%{profile}\" is ready."
