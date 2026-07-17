@@ -22,6 +22,7 @@ app:
   pane:
     sessions: "Sessions"
     tasks: "Tasks"
+    tasks_subagents: "Sub-agents"
     artifacts: "Artifacts"
     plan: "Plan"
     workspace: "Workspace"

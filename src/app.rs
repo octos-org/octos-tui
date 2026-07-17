@@ -2952,12 +2952,62 @@ fn render_sessions(app: &AppState, palette: Palette) -> List<'static> {
 
 fn render_tasks(app: &AppState, palette: Palette) -> Paragraph<'static> {
     let mut lines = Vec::new();
+
+    // #333 (Phase 1): the pane `/ps` opens must surface the LIVE sub-agent
+    // roster (`session_autonomy[].agents`, kept current by `agent/updated`),
+    // not only the older `session.tasks` cache. A background spawn populates the
+    // roster; rendering it here is what makes `/ps` a live background-task view
+    // instead of a stale side-panel. The roster re-renders every frame from the
+    // roster state, so it updates without a manual refresh.
+    let agents = app.active_session_agents();
+    if !agents.is_empty() {
+        lines.push(Line::from(Span::styled(
+            t!("app.pane.tasks_subagents").to_string(),
+            palette.title(),
+        )));
+        for agent in agents {
+            let glyph = agent_status_glyph(&agent.status);
+            let name = {
+                let n = agent.nickname.trim();
+                if n.is_empty() {
+                    agent.agent_id.clone()
+                } else {
+                    n.to_string()
+                }
+            };
+            let mut spans = vec![
+                Span::styled(format!("  {glyph} "), palette.text()),
+                Span::styled(name, palette.text()),
+                Span::styled(format!("  {}", agent.status), palette.muted()),
+            ];
+            if let Some(elapsed) = agent_elapsed_label(agent) {
+                spans.push(Span::styled(format!("  {elapsed}"), palette.muted()));
+            }
+            lines.push(Line::from(spans));
+            let detail = agent
+                .last_task
+                .as_deref()
+                .or(agent.summary.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if let Some(detail) = detail {
+                lines.push(Line::from(Span::styled(
+                    format!("      {}", truncate_to_display_width(detail, 72)),
+                    palette.muted(),
+                )));
+            }
+        }
+        lines.push(Line::from(Span::raw("")));
+    }
+
     if let Some(session) = app.active_session() {
         if session.tasks.is_empty() {
-            lines.push(Line::from(Span::styled(
-                t!("app.empty.no_tasks").to_string(),
-                palette.muted(),
-            )));
+            if agents.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    t!("app.empty.no_tasks").to_string(),
+                    palette.muted(),
+                )));
+            }
         } else {
             for (idx, task) in session.tasks.iter().enumerate() {
                 let marker = if idx == app.selected_task { "›" } else { " " };
@@ -16794,6 +16844,39 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 2,
         }
+    }
+
+    /// #333 (Phase 1): the Tasks pane that `/ps` opens must surface the LIVE
+    /// sub-agent roster, not only the old `session.tasks` cache. Renders
+    /// `render_tasks` into a buffer and asserts a spawned sub-agent's nickname +
+    /// running glyph appear even though `session.tasks` is empty.
+    #[test]
+    fn tasks_pane_renders_live_subagent_roster() {
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        let mut agent = sample_agent("security-review", "running");
+        agent.nickname = "security-review".into();
+        agent.last_task = Some("Review the octos codebase for SSRF".into());
+        app.upsert_session_agent(&sid, agent);
+
+        // Sanity: the task cache is empty, so pre-#333 this pane showed nothing.
+        assert!(app.active_session().unwrap().tasks.is_empty());
+        assert_eq!(app.active_session_agents().len(), 1);
+
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buffer = Buffer::empty(area);
+        ratatui::widgets::Widget::render(render_tasks(&app, palette), area, &mut buffer);
+        let text = rendered_rows(&buffer).join("\n");
+
+        assert!(
+            text.contains("security-review"),
+            "sub-agent nickname must render in the /ps Tasks pane; got:\n{text}"
+        );
+        assert!(
+            text.contains('⏵'),
+            "running glyph must render for the live sub-agent; got:\n{text}"
+        );
     }
 
     #[test]
