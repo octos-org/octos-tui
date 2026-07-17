@@ -747,6 +747,37 @@ impl Store {
         ))
     }
 
+    /// #335 (Phase 3): cancel the sub-agent currently shown in the detail view
+    /// (peek) via `agent/interrupt`. Returns `None` when the active view is not
+    /// a sub-agent, the agent is already terminal, the mutating method is
+    /// unavailable, or there is no autonomy session — so a stray `x` never
+    /// fires a spurious interrupt.
+    pub(crate) fn interrupt_viewed_agent_command(&mut self) -> Option<AppUiCommand> {
+        let crate::model::ChatViewTarget::Agent(agent_id) = self.state.chat_view.clone() else {
+            return None;
+        };
+        // Only a running child can be interrupted.
+        let is_terminal = self
+            .state
+            .active_agent_record(&agent_id)
+            .map(|agent| crate::model::agent_status_is_terminal(&agent.status))
+            .unwrap_or(true);
+        if is_terminal {
+            return None;
+        }
+        if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_AGENT_INTERRUPT) {
+            return None;
+        }
+        let session_id = self.active_autonomy_session_id()?;
+        self.state.status = t!("status.interrupt_requested_for", id = agent_id).into_owned();
+        Some(AppUiCommand::InterruptAgent(
+            crate::model::AgentInterruptParams {
+                session_id,
+                agent_id,
+            },
+        ))
+    }
+
     fn dispatch_agents_command(
         &mut self,
         cmd: crate::autonomy::AgentsCommand,
@@ -4600,6 +4631,11 @@ impl Store {
         .into_owned();
 
         self.state.focus = FocusPane::Tasks;
+        // #335 (Phase 3): the dock shows every sub-agent's outcome, so opening it
+        // counts as "seen" — clear the unseen set so completed chips that
+        // finished off-screen can be retired by the terminal sweep instead of
+        // lingering until the next Tab.
+        self.state.mark_active_session_agents_seen();
         self.state.status = status.clone();
         self.state.scroll_transcript_to_latest();
         self.push_local_activity(
@@ -27080,6 +27116,60 @@ mod tests {
             }
             other => panic!("expected ReadAgentOutput, got {other:?}"),
         }
+    }
+
+    /// #335 (Phase 3): `x` in the detail view cancels a RUNNING sub-agent via
+    /// `agent/interrupt`, and is a no-op for a terminal one (nothing to cancel).
+    #[test]
+    fn viewed_running_agent_can_be_cancelled_terminal_is_noop() {
+        let mut store = protocol_store_with_autonomy();
+        let sid = SessionKey("local:test".into());
+        store
+            .state
+            .upsert_session_agent(&sid, terminal_strip_agent("ag-run", "running"));
+        store
+            .state
+            .upsert_session_agent(&sid, terminal_strip_agent("ag-done", "completed"));
+
+        // Not viewing any agent → no-op.
+        store.state.chat_view = crate::model::ChatViewTarget::Main;
+        assert!(store.interrupt_viewed_agent_command().is_none());
+
+        // Viewing a running agent → agent/interrupt.
+        store.state.chat_view = crate::model::ChatViewTarget::Agent("ag-run".into());
+        match store
+            .interrupt_viewed_agent_command()
+            .expect("running agent must be interruptible")
+        {
+            AppUiCommand::InterruptAgent(params) => assert_eq!(params.agent_id, "ag-run"),
+            other => panic!("expected InterruptAgent, got {other:?}"),
+        }
+
+        // Viewing a completed agent → no-op (nothing to cancel).
+        store.state.chat_view = crate::model::ChatViewTarget::Agent("ag-done".into());
+        assert!(store.interrupt_viewed_agent_command().is_none());
+    }
+
+    /// #335 (Phase 3): opening `/ps` marks the roster seen so completed chips
+    /// that finished off-screen no longer linger past the terminal sweep.
+    #[test]
+    fn opening_ps_marks_subagents_seen() {
+        let mut store = protocol_store_with_autonomy();
+        let sid = SessionKey("local:test".into());
+        // A completed agent that finished while not viewed becomes unseen.
+        store
+            .state
+            .upsert_session_agent(&sid, terminal_strip_agent("ag-1", "running"));
+        store
+            .state
+            .upsert_session_agent(&sid, terminal_strip_agent("ag-1", "completed"));
+        assert!(store.state.is_agent_unseen("ag-1"), "should start unseen");
+
+        store.show_local_process_status();
+        assert!(
+            !store.state.is_agent_unseen("ag-1"),
+            "opening /ps must mark the roster seen so the chip can be swept"
+        );
     }
 
     #[test]

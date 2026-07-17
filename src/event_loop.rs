@@ -1032,6 +1032,13 @@ fn handle_agent_peek_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::PageDown => store.state.scroll_agent_view_down(8),
         KeyCode::Home => store.state.scroll_agent_view_up(usize::MAX),
         KeyCode::End => store.state.scroll_agent_view_down(usize::MAX),
+        // #335 (Phase 3): cancel the viewed sub-agent (no-op if it is already
+        // terminal or the backend can't interrupt).
+        KeyCode::Char('x') => {
+            if let Some(command) = store.interrupt_viewed_agent_command() {
+                return KeyAction::send(command);
+            }
+        }
         // Everything else (text, Enter, Backspace, `/`, Vim keys, …) is swallowed.
         _ => {}
     }

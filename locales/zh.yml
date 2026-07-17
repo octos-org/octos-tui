@@ -140,7 +140,7 @@ app:
     list_nav: "j/k 或 Up/Down"
     composer_send: "Enter 发送 | Shift+Enter / Ctrl+J 换行 | Tab 智能体"
     statusbar_keys: "Tab 智能体 | Ctrl+O 展开"
-    agent_peek_keys: " Tab 下一个 · Shift+Tab 上一个 · ↑/↓ 滚动 · Esc 返回聊天 "
+    agent_peek_keys: " Tab 下一个 · Shift+Tab 上一个 · ↑/↓ 滚动 · x 取消 · Esc 返回聊天 "
     agent_task_prefix: "任务：%{task}"
     agent_deliverables: "交付物"
     agent_strip_main: "主对话"
