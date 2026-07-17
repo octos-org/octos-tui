@@ -233,6 +233,20 @@ pub fn run(cli: Cli) -> Result<()> {
             dirty = true;
         }
 
+        // Terminal sub-agent chips age out of the strip on this same tick
+        // cadence (the loop already wakes every UI_EVENT_POLL_INTERVAL, so no
+        // dedicated timer): finished/failed agents linger long enough to
+        // read, then leave. O(agents) when nothing expires.
+        if store.sweep_terminal_agents(std::time::Instant::now()) {
+            dirty = true;
+        }
+
+        // A staged provider Test/Save that never receives its response must
+        // not freeze the model-config surface forever — time it out here.
+        if store.sweep_provider_pending(std::time::Instant::now()) {
+            dirty = true;
+        }
+
         if drain_backend_events(backend.as_mut(), &mut store)? {
             dirty = true;
         }
@@ -759,6 +773,17 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
 
     if is_alt_char(&key, 'k') {
         move_up(store);
+        return KeyAction::Continue;
+    }
+
+    // Agent Dock (#323): Alt+G toggles the sub-agent strip between the
+    // one-line summary pill and the per-agent rows. NOT Alt+D — the composer
+    // claims that as readline delete-word-forward (handle_composer_modified_key
+    // runs first while the composer has focus, mini4 soak catch). Only claimed
+    // while a roster exists — with no agents the strip is height-0 and the key
+    // stays free.
+    if is_alt_char(&key, 'g') && !store.state.active_session_agents().is_empty() {
+        store.state.agent_dock_collapsed = !store.state.agent_dock_collapsed;
         return KeyAction::Continue;
     }
 

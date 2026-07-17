@@ -106,6 +106,9 @@ pub enum GoalCommand {
     Pause,
     /// `/goal resume`.
     Resume,
+    /// `/goal stop` — mark the goal complete (stops autonomous
+    /// continuations for good; `clear` additionally forgets the record).
+    Stop,
     /// `/goal clear`.
     Clear,
 }
@@ -405,6 +408,7 @@ fn parse_goal(tail: &str) -> Result<GoalCommand, AutonomyParseError> {
     match trimmed {
         "pause" => return Ok(GoalCommand::Pause),
         "resume" => return Ok(GoalCommand::Resume),
+        "stop" | "complete" | "done" => return Ok(GoalCommand::Stop),
         "clear" => return Ok(GoalCommand::Clear),
         _ => {}
     }
@@ -792,12 +796,13 @@ mod tests {
 
     #[test]
     fn goal_verbs_take_priority_over_text() {
-        for verb in ["pause", "resume", "clear"] {
+        for verb in ["pause", "resume", "clear", "stop", "complete", "done"] {
             let parsed = parse_autonomy_slash(&format!("/goal {verb}")).unwrap();
             let expected = match verb {
                 "pause" => GoalCommand::Pause,
                 "resume" => GoalCommand::Resume,
                 "clear" => GoalCommand::Clear,
+                "stop" | "complete" | "done" => GoalCommand::Stop,
                 _ => unreachable!(),
             };
             assert_eq!(parsed, Some(AutonomyCommand::Goal(expected)));

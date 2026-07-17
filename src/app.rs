@@ -8080,6 +8080,22 @@ pub(crate) fn format_tokens_human(tokens: u64) -> String {
     }
 }
 
+/// Per-status glyph + localized label for the goal chip: every status the
+/// server can report renders distinctly (#329) — active ◆, paused ⏸,
+/// budget-limited ⚠, blocked ⛔ (the #1693 circuit breaker), complete ✔.
+/// Unknown statuses fall back to the raw string so a newer server never
+/// renders blank.
+fn goal_status_display(status: &str) -> (&'static str, String) {
+    match status {
+        "active" => ("◆", t!("app.autonomy.status_active").into_owned()),
+        "paused" => ("⏸", t!("app.autonomy.status_paused").into_owned()),
+        "budget_limited" => ("⚠", t!("app.autonomy.status_budget_limited").into_owned()),
+        "blocked" => ("⛔", t!("app.autonomy.status_blocked").into_owned()),
+        "complete" => ("✔", t!("app.autonomy.status_complete").into_owned()),
+        other => ("◆", other.to_owned()),
+    }
+}
+
 fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> {
     let Some(state) = active_session_autonomy(app) else {
         return Vec::new();
@@ -8091,16 +8107,17 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
         } else {
             goal.objective.clone()
         };
+        let (glyph, status_label) = goal_status_display(&goal.status);
         let parenthetical = t!(
             "app.autonomy.goal_meta",
-            status = goal.status,
+            status = status_label,
             used = format_tokens_k(goal.tokens_used),
             budget = format_tokens_k(goal.token_budget)
         )
         .into_owned();
         lines.push(Line::from(vec![
             Span::styled(
-                "◆ ",
+                format!("{glyph} "),
                 Style::default()
                     .fg(palette.accent)
                     .add_modifier(Modifier::BOLD)
@@ -8264,7 +8281,7 @@ fn render_autonomy_indicator(app: &AppState, palette: Palette) -> Paragraph<'sta
 }
 
 /// Status glyph for a sub-agent chip in the agent strip.
-fn agent_status_glyph(status: &str) -> &'static str {
+pub(crate) fn agent_status_glyph(status: &str) -> &'static str {
     match status.to_ascii_lowercase().as_str() {
         "running" | "spawned" | "in_progress" => "⏵",
         "completed" | "complete" | "done" | "ready" => "✔",
@@ -8306,6 +8323,9 @@ fn agent_strip_height(app: &AppState, terminal_height: u16) -> u16 {
         || app.active_session_agents().is_empty()
     {
         0
+    } else if app.agent_dock_collapsed {
+        // Agent Dock (#323): collapsed mode is a one-line summary pill.
+        1
     } else {
         1 + agent_strip_agent_rows(app, terminal_height)
     }
@@ -8362,6 +8382,104 @@ fn agent_strip_detail(agent: &octos_core::ui_protocol::UiAgentRecord) -> Option<
     .map(str::to_owned)
 }
 
+/// `(total, running, unread)` roster counts for the Agent Dock pill and the
+/// `/agents` menu subtitle. `running` = every non-terminal status (spawned/
+/// pending included — they occupy a concurrency slot either way).
+pub(crate) fn agent_dock_counts(app: &AppState) -> (usize, usize, usize) {
+    let agents = app.active_session_agents();
+    let running = agents
+        .iter()
+        .filter(|agent| !crate::model::agent_status_is_terminal(&agent.status))
+        .count();
+    let unseen = app.active_session_unseen_agents().len();
+    (agents.len(), running, unseen)
+}
+
+/// Spawn depth of `agent` within the visible roster, by walking
+/// `parent_agent_id` links. Bounded so a malformed cycle can't loop; agents
+/// whose parent is not in the roster (or absent) render at depth 0.
+fn agent_depth(agents: &[octos_core::ui_protocol::UiAgentRecord], agent_id: &str) -> usize {
+    let mut depth = 0;
+    let mut current = agent_id;
+    while depth < 4 {
+        let Some(parent) = agents
+            .iter()
+            .find(|a| a.agent_id == current)
+            .and_then(|a| a.parent_agent_id.as_deref())
+        else {
+            break;
+        };
+        if parent == current || !agents.iter().any(|a| a.agent_id == parent) {
+            break;
+        }
+        depth += 1;
+        current = parent;
+    }
+    depth
+}
+
+/// Compact `41s` / `2m14s` / `1h02m` duration label for an agent row.
+fn format_short_duration(ms: i64) -> String {
+    let secs = (ms / 1000).max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Elapsed label for an agent row: run duration so far for a live agent
+/// (local wall clock vs the server's `created_at_ms` — minor skew is
+/// acceptable for a glanceable label, floored at 0), and the final
+/// `updated - created` span (same clock on both ends) once terminal.
+fn agent_elapsed_label(agent: &octos_core::ui_protocol::UiAgentRecord) -> Option<String> {
+    if agent.created_at_ms <= 0 {
+        return None;
+    }
+    let end_ms = if crate::model::agent_status_is_terminal(&agent.status) {
+        agent.updated_at_ms
+    } else {
+        chrono::Utc::now().timestamp_millis()
+    };
+    (end_ms > agent.created_at_ms).then(|| format_short_duration(end_ms - agent.created_at_ms))
+}
+
+/// The collapsed Agent Dock pill (#323): one glanceable line —
+/// `🐙 3 agents · 2 running · 1● unread — Alt+D` — in place of the per-agent
+/// rows. The unread segment only appears when something finished unseen.
+fn agent_dock_pill_line(app: &AppState, palette: Palette) -> Line<'static> {
+    let (total, running, unseen) = agent_dock_counts(app);
+    let mut spans = vec![Span::styled(
+        t!(
+            "app.hint.agent_dock_pill",
+            count = total.to_string(),
+            running = running.to_string()
+        )
+        .into_owned(),
+        palette.text().bg(palette.surface),
+    )];
+    if unseen > 0 {
+        spans.push(Span::styled(
+            t!(
+                "app.hint.agent_dock_pill_unread",
+                count = unseen.to_string()
+            )
+            .into_owned(),
+            Style::default()
+                .fg(palette.highlight)
+                .bg(palette.surface)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(
+        format!("  {}", t!("app.hint.agent_dock_toggle_hint")),
+        palette.muted().bg(palette.surface),
+    ));
+    Line::from(spans)
+}
+
 /// Logical lines for the vertical agent strip. Row 0 is the title row: strip
 /// title + the `main` chip + a muted `+N` marker when the roster overflows the
 /// visible window. Each following row is one sub-agent — glyph, name, raw
@@ -8370,6 +8488,9 @@ fn agent_strip_detail(agent: &octos_core::ui_protocol::UiAgentRecord) -> Option<
 /// without a frame; `agent_rows` must be the value the height reservation was
 /// computed with (`agent_strip_height` - 1).
 fn agent_strip_lines(app: &AppState, palette: Palette, agent_rows: u16) -> Vec<Line<'static>> {
+    if app.agent_dock_collapsed {
+        return vec![agent_dock_pill_line(app, palette)];
+    }
     let agents = app.active_session_agents();
     let (window, hidden) = agent_strip_window(app, agent_rows as usize);
     let selected_style = Style::default()
@@ -8399,6 +8520,22 @@ fn agent_strip_lines(app: &AppState, palette: Palette, agent_rows: u16) -> Vec<L
             palette.muted().bg(palette.surface),
         ));
     }
+    // Unread summary on the title row so overflow-hidden completions still
+    // register at a glance (#323).
+    let unseen_total = app.active_session_unseen_agents().len();
+    if unseen_total > 0 {
+        title_spans.push(Span::styled(
+            t!(
+                "app.hint.agent_dock_pill_unread",
+                count = unseen_total.to_string()
+            )
+            .into_owned(),
+            Style::default()
+                .fg(palette.highlight)
+                .bg(palette.surface)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     let mut lines = vec![Line::from(title_spans)];
 
     for agent in &agents[window] {
@@ -8411,9 +8548,26 @@ fn agent_strip_lines(app: &AppState, palette: Palette, agent_rows: u16) -> Vec<L
         } else {
             agent.nickname.clone()
         };
-        let mut spans = vec![Span::styled(
+        // Depth-indent children under their parent (#323) — nested spawns
+        // read as a tree instead of a flat list.
+        let indent = "  ".repeat(agent_depth(agents, &agent.agent_id));
+        let unseen = app.is_agent_unseen(&agent.agent_id);
+        let mut spans = Vec::new();
+        if unseen {
+            spans.push(Span::styled(
+                "●".to_string(),
+                Style::default()
+                    .fg(palette.highlight)
+                    .bg(palette.surface)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        let elapsed = agent_elapsed_label(agent)
+            .map(|label| format!(" · {label}"))
+            .unwrap_or_default();
+        spans.push(Span::styled(
             format!(
-                " {} {label} · {} ",
+                " {indent}{} {label} · {}{elapsed} ",
                 agent_status_glyph(&agent.status),
                 agent.status
             ),
@@ -8422,7 +8576,7 @@ fn agent_strip_lines(app: &AppState, palette: Palette, agent_rows: u16) -> Vec<L
             } else {
                 palette.text().bg(palette.surface)
             },
-        )];
+        ));
         if let Some(detail) = agent_strip_detail(agent) {
             spans.push(Span::styled(
                 format!(" — {detail}"),
@@ -17127,6 +17281,134 @@ mod tests {
             "overflow marker names the hidden count: {title}"
         );
         assert_eq!(lines.len(), 5, "title + capped agent rows");
+    }
+
+    /// Agent Dock (#323): collapsed mode renders exactly one summary pill
+    /// line with total/running counts, the unread segment only when
+    /// something finished unseen, and reserves a single row of height.
+    #[test]
+    fn agent_dock_collapsed_renders_single_pill_line() {
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        app.upsert_session_agent(&sid, sample_agent("edison", "running"));
+        app.upsert_session_agent(&sid, sample_agent("thomas", "completed"));
+        app.agent_dock_collapsed = true;
+
+        assert_eq!(
+            agent_strip_height(&app, 40),
+            1,
+            "collapsed dock reserves exactly the pill row"
+        );
+        let lines = agent_strip_lines(&app, Palette::for_theme(ThemeName::Codex), 0);
+        assert_eq!(lines.len(), 1, "collapsed dock is a single line");
+        let pill: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            pill.contains('2') && pill.contains('1'),
+            "pill carries total=2 and running=1: {pill}"
+        );
+        // thomas transitioned to terminal while viewing Main -> unread.
+        assert!(pill.contains("1●"), "pill shows the unread count: {pill}");
+        assert!(pill.contains("Alt+G"), "pill hints the toggle key: {pill}");
+
+        // Peeking thomas clears the unread segment.
+        app.set_chat_view(crate::model::ChatViewTarget::Agent("thomas".into()));
+        app.set_chat_view(crate::model::ChatViewTarget::Main);
+        let lines = agent_strip_lines(&app, Palette::for_theme(ThemeName::Codex), 0);
+        let pill: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(!pill.contains('●'), "seen -> no unread segment: {pill}");
+    }
+
+    /// Expanded rows carry the unread dot and depth-indent children under
+    /// their parent (#323).
+    #[test]
+    fn agent_strip_rows_show_unseen_dot_and_depth_indent() {
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        app.upsert_session_agent(&sid, sample_agent("lead", "running"));
+        let mut child = sample_agent("worker", "running");
+        child.parent_agent_id = Some("lead".into());
+        app.upsert_session_agent(&sid, child.clone());
+        // The child finishes while the user is on Main -> unread dot.
+        child.status = "completed".into();
+        app.upsert_session_agent(&sid, child);
+
+        let lines = agent_strip_lines(&app, Palette::for_theme(ThemeName::Codex), 2);
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            rows[0].contains("1●"),
+            "title row unread count: {}",
+            rows[0]
+        );
+        assert!(
+            !rows[1].starts_with('●'),
+            "running parent has no dot: {}",
+            rows[1]
+        );
+        assert!(rows[2].starts_with('●'), "unseen child dotted: {}", rows[2]);
+        let parent_indent = rows[1].chars().take_while(|c| *c == ' ').count();
+        let child_body = rows[2].trim_start_matches('●');
+        let child_indent = child_body.chars().take_while(|c| *c == ' ').count();
+        assert!(
+            child_indent > parent_indent,
+            "child indents deeper than parent: {parent_indent} vs {child_indent}"
+        );
+    }
+
+    #[test]
+    fn agent_depth_walks_parents_and_survives_cycles() {
+        let mut a = sample_agent("a", "running");
+        let mut b = sample_agent("b", "running");
+        let mut c = sample_agent("c", "running");
+        b.parent_agent_id = Some("a".into());
+        c.parent_agent_id = Some("b".into());
+        // a points at c: a cycle — must terminate at the cap, not hang.
+        a.parent_agent_id = Some("c".into());
+        let agents = vec![a, b, c];
+        assert!(agent_depth(&agents, "c") <= 4, "cycle bounded");
+
+        let mut root = sample_agent("root", "running");
+        root.parent_agent_id = None;
+        let mut kid = sample_agent("kid", "running");
+        kid.parent_agent_id = Some("root".into());
+        let mut stranger = sample_agent("stranger", "running");
+        stranger.parent_agent_id = Some("not-in-roster".into());
+        let agents = vec![root, kid, stranger];
+        assert_eq!(agent_depth(&agents, "root"), 0);
+        assert_eq!(agent_depth(&agents, "kid"), 1);
+        assert_eq!(
+            agent_depth(&agents, "stranger"),
+            0,
+            "unknown parent renders flat"
+        );
+    }
+
+    #[test]
+    fn format_short_duration_tiers() {
+        assert_eq!(format_short_duration(0), "0s");
+        assert_eq!(format_short_duration(41_000), "41s");
+        assert_eq!(format_short_duration(134_000), "2m14s");
+        assert_eq!(format_short_duration(3_720_000), "1h02m");
+        assert_eq!(
+            format_short_duration(-5_000),
+            "0s",
+            "clock skew floors at 0"
+        );
     }
 
     fn sample_loop(

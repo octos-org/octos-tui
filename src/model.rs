@@ -396,6 +396,9 @@ pub enum SessionGoalSetAction {
     Pause,
     /// `/goal resume` — resume a paused goal.
     Resume,
+    /// `/goal stop` — mark the goal complete (user-owned terminal
+    /// transition; autonomous continuations end).
+    Stop,
 }
 
 /// `session/goal/set` wire shape (UPCR-2026-021 §"Goal Runtime Surface").
@@ -552,6 +555,21 @@ pub struct SessionAutonomyState {
     /// Turn that authored the current `plan`, when known. The plan is per-turn
     /// working state, so it is cleared when this turn completes.
     pub plan_turn_id: Option<TurnId>,
+    /// When each TERMINAL agent was first observed terminal, by agent id —
+    /// LOCAL `Instant`s stamped lazily by the strip's linger sweep (never the
+    /// server's `updated_at_ms`; a remote server's clock can skew). Drives the
+    /// "finished/failed chips leave the strip after a linger" policy. A stamp
+    /// is dropped if its agent resurrects (non-terminal again) or vanishes.
+    pub terminal_seen: Vec<(String, std::time::Instant)>,
+    /// Agent Dock unread badges (#323): agents that reached a TERMINAL status
+    /// via a live `agent/updated` while the user was NOT viewing them
+    /// (octos-one's `has_updates` semantics, one level down). Cleared when the
+    /// user peeks/switches to the agent ([`AppState::set_chat_view`]), when
+    /// the agent resurrects non-terminal, or when its chip is pruned. Unseen
+    /// chips are exempt from the timed linger sweep so a result can't vanish
+    /// before it was ever looked at (the next submit still clears them — the
+    /// user is demonstrably at the keyboard).
+    pub unseen: Vec<String>,
 }
 
 impl SessionAutonomyState {
@@ -566,8 +584,29 @@ impl SessionAutonomyState {
             loops: Vec::new(),
             plan: None,
             plan_turn_id: None,
+            terminal_seen: Vec::new(),
+            unseen: Vec::new(),
         }
     }
+}
+
+/// True when an agent status string is terminal — the agent can never emit
+/// again. Superset of the strip's glyph terminal set (`agent_status_glyph`)
+/// plus `closed` (set by `agent/close`); case-insensitive like the glyph map.
+pub fn agent_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "completed"
+            | "complete"
+            | "done"
+            | "ready"
+            | "failed"
+            | "error"
+            | "cancelled"
+            | "canceled"
+            | "interrupted"
+            | "closed"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2369,6 +2408,16 @@ pub struct OnboardingWizardState {
     pub provider_saved: bool,
     pub provider_tested: bool,
     pub provider_pending: Option<OnboardingProviderPending>,
+    /// When the in-flight Test/Save/Fetch was first OBSERVED pending — a LOCAL
+    /// `Instant` stamped lazily by `Store::sweep_provider_pending` (nothing
+    /// else writes it). Backs the no-response timeout: a lost RPC response
+    /// used to leave `provider_pending` set forever, freezing the staged
+    /// surface on "Testing connection…" with every edit blocked.
+    pub provider_pending_since: Option<std::time::Instant>,
+    /// The model staged for removal by `/model` → "Remove a model…" — read by
+    /// the confirm menu (`MENU_MODEL_REMOVE_CONFIRM`), whose Yes row sends
+    /// `profile/llm/delete` with these coordinates.
+    pub pending_model_removal: Option<ModelRemovalRequest>,
     pub provider_save_target: Option<OnboardingProviderSaveTarget>,
     pub last_saved_provider_label: Option<String>,
     pub last_saved_provider_target: Option<OnboardingProviderSaveTarget>,
@@ -2418,6 +2467,8 @@ impl Default for OnboardingWizardState {
             provider_saved: false,
             provider_tested: false,
             provider_pending: None,
+            provider_pending_since: None,
+            pending_model_removal: None,
             provider_save_target: None,
             last_saved_provider_label: None,
             last_saved_provider_target: None,
@@ -3176,6 +3227,17 @@ pub struct ProfileLlmUpsertParams {
     pub set_primary: bool,
 }
 
+/// A configured model staged for removal from the profile (the `/model` →
+/// "Remove a model…" flow). Coordinates mirror `ProfileLlmDeleteParams`;
+/// `label` is the human line shown in the confirm menu.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelRemovalRequest {
+    pub family_id: String,
+    pub model_id: String,
+    pub route_id: String,
+    pub label: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProfileLlmDeleteParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3786,6 +3848,11 @@ pub struct AppState {
     /// pinned to the bottom row — the inline chat flow cannot offer that
     /// because committed history lives in the terminal's own scrollback.
     pub transcript_pager_active: bool,
+    /// Agent Dock (#323): collapse the sub-agent strip to a one-line summary
+    /// pill (`🐙 N agents · R running · U● unread`) instead of the per-agent
+    /// rows. Toggled by Alt+D or the `/agents` menu; a UI preference, not
+    /// per-session state.
+    pub agent_dock_collapsed: bool,
     /// `--scroll-mode pinned`: capture the mouse in the chat flow so wheel-up
     /// auto-enters the pager (composer stays pinned) and wheel-down at the
     /// pager bottom drops back to the inline tail. False = `native` (default):
@@ -5720,6 +5787,7 @@ impl AppState {
             agent_view_scroll: 0,
             agent_view_scroll_max: std::cell::Cell::new(usize::MAX),
             transcript_pager_active: false,
+            agent_dock_collapsed: false,
             pinned_scroll: false,
             vim_mode: false,
             composer_mode: ComposerMode::Insert,
@@ -5900,7 +5968,28 @@ impl AppState {
         session_id: &SessionKey,
         agent: octos_core::ui_protocol::UiAgentRecord,
     ) {
+        // Agent Dock unread (#323): a LIVE transition into a terminal status
+        // while the user is not viewing this agent marks it unseen — the
+        // "finished while you weren't looking" badge. Only this live upsert
+        // path badges; bulk hydration (`set_session_agents`) replays known
+        // state and must not invent unread work.
+        let viewing = matches!(
+            &self.chat_view,
+            ChatViewTarget::Agent(id) if id == &agent.agent_id
+        );
+        let now_terminal = agent_status_is_terminal(&agent.status);
         let entry = self.session_autonomy_mut(session_id);
+        let was_terminal = entry
+            .agents
+            .iter()
+            .find(|a| a.agent_id == agent.agent_id)
+            .is_some_and(|a| agent_status_is_terminal(&a.status));
+        if !now_terminal {
+            // Resurrected (or still running): any stale badge is moot.
+            entry.unseen.retain(|id| id != &agent.agent_id);
+        } else if !was_terminal && !viewing && !entry.unseen.contains(&agent.agent_id) {
+            entry.unseen.push(agent.agent_id.clone());
+        }
         if let Some(pos) = entry
             .agents
             .iter()
@@ -5910,6 +5999,45 @@ impl AppState {
         } else {
             entry.agents.push(agent);
         }
+    }
+
+    /// Remove the given sub-agents from a session's roster along with their
+    /// streamed-output/artifact caches and linger stamps, then normalize the
+    /// chat view (a peeked pruned agent falls back to `Main`). Backs the
+    /// "finished/failed chips leave the strip" policy — callers decide WHICH
+    /// terminal agents to drop (all of them on the next submit; only
+    /// linger-expired ones in the periodic sweep). Returns true when anything
+    /// was removed.
+    pub fn prune_session_agents_by_ids(
+        &mut self,
+        session_id: &SessionKey,
+        agent_ids: &[String],
+    ) -> bool {
+        if agent_ids.is_empty() {
+            return false;
+        }
+        let entry = self.session_autonomy_mut(session_id);
+        let before = entry.agents.len();
+        entry
+            .agents
+            .retain(|agent| !agent_ids.contains(&agent.agent_id));
+        let removed = entry.agents.len() != before;
+        if removed {
+            entry
+                .agent_outputs
+                .retain(|cache| !agent_ids.contains(&cache.agent_id));
+            entry
+                .agent_artifacts
+                .retain(|cache| !agent_ids.contains(&cache.agent_id));
+            entry
+                .terminal_seen
+                .retain(|(agent_id, _)| !agent_ids.contains(agent_id));
+            entry
+                .unseen
+                .retain(|agent_id| !agent_ids.contains(agent_id));
+            self.normalize_chat_view();
+        }
+        removed
     }
 
     /// Replace the loop list for a session, dropping tombstones.
@@ -7277,6 +7405,25 @@ impl AppState {
             .unwrap_or(&[])
     }
 
+    /// Agent ids with unread terminal outcomes in the active session — the
+    /// Agent Dock badge set (#323). Empty when there is no active session.
+    pub fn active_session_unseen_agents(&self) -> &[String] {
+        let Some(session) = self.active_session() else {
+            return &[];
+        };
+        self.session_autonomy_for(&session.id)
+            .map(|state| state.unseen.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// True when `agent_id` (in the active session) finished while the user
+    /// wasn't viewing it and has not been peeked since.
+    pub fn is_agent_unseen(&self, agent_id: &str) -> bool {
+        self.active_session_unseen_agents()
+            .iter()
+            .any(|id| id == agent_id)
+    }
+
     /// The cached streamed output for a sub-agent of the active session, if
     /// any has arrived. This is the flat text the backend exposes for a worker
     /// (`agent/output/*`) — a running log, not a turn-by-turn transcript, since
@@ -7334,6 +7481,19 @@ impl AppState {
     /// untouched, so returning to `Main` restores the chat where it was.
     pub fn set_chat_view(&mut self, target: ChatViewTarget) {
         if self.chat_view != target {
+            // Peeking/switching to an agent is the "I've seen it" moment for
+            // its Agent Dock unread badge (#323).
+            if let ChatViewTarget::Agent(agent_id) = &target {
+                let agent_id = agent_id.clone();
+                if let Some(session_id) = self.active_session().map(|s| s.id.clone())
+                    && let Some(autonomy) = self
+                        .session_autonomy
+                        .iter_mut()
+                        .find(|autonomy| autonomy.session_id == session_id)
+                {
+                    autonomy.unseen.retain(|id| id != &agent_id);
+                }
+            }
             self.chat_view = target;
             self.agent_view_scroll = 0;
             // The old target's row count is meaningless for the new one; reset to

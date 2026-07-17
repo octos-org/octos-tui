@@ -91,6 +91,11 @@ app:
     loops_running: "Loops: %{count} active"
     loops_paused_suffix: " · %{count} paused"
     goal_meta: " (%{status} · %{used}/%{budget} tokens)"
+    status_active: "active"
+    status_paused: "paused"
+    status_budget_limited: "budget limited"
+    status_blocked: "blocked"
+    status_complete: "complete"
   statusbar:
     agents: "%{count} agents"
     re_entering: "re-entering"
@@ -149,6 +154,9 @@ app:
     agent_strip_main: "main"
     agent_strip_title: " agents "
     agent_strip_more: "+%{count} more (Tab)"
+    agent_dock_pill: "🐙 %{count} agents · %{running} running"
+    agent_dock_pill_unread: " · %{count}● unread"
+    agent_dock_toggle_hint: "Alt+G"
     agent_no_output: "(no output captured yet — this agent streams its result here as it works)"
     menu: "Menu | j/k move | Enter accept | Esc close"
     onboarding: "Onboarding | Enter continue | type to edit fields"
@@ -574,6 +582,8 @@ status:
   profile_delete_active_blocked: "Can't delete %{profile} — it's the profile this session is using. Switch to another profile first."
   switching_profile: "Switching to profile %{profile}…"
   provider_route_selected: "Provider route selected; enter API key"
+  provider_request_failed: "Provider request failed: %{message}"
+  provider_request_timeout: "Provider request timed out with no response — try again"
   provider_family_updated: "Provider family updated"
   provider_model_updated: "Provider model updated"
   provider_route_updated: "Provider route updated"
@@ -742,7 +752,15 @@ status:
   cannot_transition_goal_state: "Cannot transition goal in `%{state}` state (model-owned)."
   goal_verb_pausing: "Pausing"
   goal_verb_resuming: "Resuming"
+  goal_verb_stopping: "Stopping"
   goal_verb_updating: "Updating"
+  goal_resume_over_budget: "Goal resumed but still over budget — it will not fire until you raise it: /goal %{objective} --budget <N>"
+  goal_now_active: "Goal active — autonomous continuations resume"
+  goal_now_paused: "Goal paused — no autonomous continuations until /goal resume"
+  goal_now_blocked: "Goal blocked after repeated failed turns — /goal resume to retry, /goal stop to end it"
+  goal_now_budget_limited: "Goal budget exhausted — wrapping up; raise with /goal %{objective} --budget <N>"
+  goal_now_complete: "Goal complete"
+  goal_now_status: "Goal status: %{status}"
   verb_goal: "%{verb} goal"
   local_create_cancelled_transport: "Local profile create cancelled by transport error [%{code}]: %{message}"
   local_create_cancelled: "Local profile create cancelled [%{code}]: %{message}"
@@ -838,12 +856,14 @@ command:
     desc: Copy the last assistant reply to your clipboard (works over SSH).
   cost:
     desc: Show server-reported token and cost usage.
+  dock:
+    desc: Sub-agent dock — switch views, unread results, collapse or expand the strip.
   exit:
     desc: Quit the TUI.
   profiles:
     desc: Manage local profiles — list, set the default, delete, or create one.
   goal:
-    desc: View, set, pause, resume, or clear the persisted session goal.
+    desc: View, set, pause, resume, stop, or clear the persisted session goal.
   help:
     desc: Show available commands.
   keymap:
@@ -897,6 +917,22 @@ command:
   turn:
     desc: Inspect backend turn lifecycle state.
 menu:
+  agents:
+    item:
+      dock_collapse:
+        label: Collapse the dock to a summary pill
+      dock_expand:
+        label: Expand the dock to per-agent rows
+      dock_toggle:
+        desc: Same as Alt+G.
+      main:
+        desc: Show the session transcript in the main pane.
+        label: main session
+      viewing_marker: (viewing)
+    subtitle: "%{count} agents · %{running} running · %{unread} unread"
+    title: Sub-agents
+    unavailable_empty: No sub-agents in this session yet — they appear here when the model spawns workers.
+    unavailable_title: Sub-agent dock
   availability:
     approval_has_focus: approval modal has keyboard focus
     blocked_read_only: blocked in read-only mode
@@ -1075,6 +1111,12 @@ menu:
   model:
     footer: Enter select or refresh | Esc close
     item:
+      add:
+        label: "Add a model…"
+        desc: "Pick a model family, model, and provider route, then paste an API key — the same staged flow as onboarding."
+      remove:
+        label: "Remove a model…"
+        desc: "Delete one of this profile's configured models (a broken key or retired model) — add a replacement first if it's the only one."
       cached:
         label: Server model list
       empty:
@@ -1084,6 +1126,35 @@ menu:
     search: Filter models
     subtitle: Server-returned profile LLM models.
     title: Model
+  model_remove:
+    title: "Remove a model"
+    subtitle: "Pick a configured model to remove from this profile."
+    item:
+      empty:
+        label: "No configured models"
+        desc: "Refresh models in /model first — only configured models can be removed."
+    confirm:
+      title: "Remove %{model}?"
+      subtitle: "Deletes this entry from the profile's LLM config. Cannot be undone."
+      yes: "Yes, remove %{model}"
+      yes_desc: "Uses profile/llm/delete; the model list refreshes when it completes."
+      no: "No, keep it"
+  model_config:
+    title: "Add a model"
+    subtitle: "Stage a model for this profile: family, model, route, API key — then Test and Save."
+    search: Filter steps
+    unavailable_title: "Model config unavailable"
+    item:
+      fallback:
+        desc: "Append or replace the staged provider under config.llm.fallbacks."
+    preview:
+      title: "Saved models"
+      profile: "profile"
+      primary: "primary"
+      fallbacks: "fallbacks"
+      fallback_n: "fallback %{n}"
+      none: "none"
+      not_loaded: "not loaded — refresh models in /model"
   onboard_done:
     title: "You're all set"
     subtitle: "Brain \"%{profile}\" is ready."
@@ -1321,33 +1392,6 @@ menu:
     title: Update Model Permissions
     unavailable_no_session: Permissions require an open Octos UI session.
     unavailable_title: Permissions unavailable
-  provider:
-    item:
-      catalog_refresh:
-        label: Refresh provider catalog
-      list_refresh:
-        label: Refresh configured providers
-      saved_fallback:
-        prefix: Saved fallback %{n}
-      saved_fallback_empty:
-        desc: Use Add fallback model to persist secondary routes.
-        label: 'Saved fallbacks: none'
-      saved_primary:
-        prefix: Saved primary
-      saved_primary_empty:
-        desc: Save a tested provider as primary before opening a coding session.
-        label: 'Saved primary: not set'
-      saved_unloaded:
-        desc: Run Refresh configured providers to read profile/llm/list.
-        label: 'Saved providers: not loaded'
-      staged:
-        desc: Use /provider select <family> <model> <route> [base_url] [api_key_env], or choose a catalog row.
-        label: Staged provider
-    preview_title: Provider State
-    search: Filter providers
-    subtitle: Profile-owned LLM setup; catalog and state come from Octos UI.
-    title: Provider
-    unavailable_title: Providers unavailable
   runtime_preview_title: Runtime
   search:
     label: "Search "

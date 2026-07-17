@@ -51,6 +51,17 @@ use crate::{
 const TASK_OUTPUT_TAIL_BYTES: usize = 600;
 const TASK_OUTPUT_READ_LIMIT_BYTES: u64 = 4096;
 const TASK_ARTIFACT_READ_LIMIT_BYTES: u64 = 4096;
+/// How long a finished/failed sub-agent chip lingers in the agent strip
+/// before the tick sweep removes it (the next submit removes it sooner).
+/// Long enough to read the outcome; short enough not to clutter idle
+/// sessions. See `Store::sweep_terminal_agents`.
+const AGENT_TERMINAL_LINGER: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a staged provider Test/Save/Fetch may stay pending with no
+/// response before the tick sweep clears it. A lost/withheld RPC response
+/// used to leave `provider_pending` set FOREVER — the staged model-config
+/// surface froze on "Testing connection…" with every edit and re-dispatch
+/// blocked. Generous: a real `profile/llm/test` does one provider roundtrip.
+const PROVIDER_PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long a staged-submit FIFO gate stays authoritative without its
 /// turn/started or terminal arriving. Past this, `submit_next_pending_if_idle`
 /// treats the marker as stale (the in-flight turn/start died in some way the
@@ -893,6 +904,13 @@ impl Store {
                 crate::model::SessionGoalSetAction::Resume,
                 "resume",
             ),
+            GoalCommand::Stop => self.start_goal_transition(
+                session_id,
+                profile_id,
+                "complete",
+                crate::model::SessionGoalSetAction::Stop,
+                "stop",
+            ),
             GoalCommand::Clear => {
                 if !self
                     .require_mutating_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_CLEAR)
@@ -1029,7 +1047,9 @@ impl Store {
             .ok_or(None)?
             .clone();
         match goal.status.as_str() {
-            "active" | "paused" | "budget_limited" => Ok(goal),
+            // `blocked` (#1693 circuit breaker) is user-recoverable:
+            // resume forgives the failure streak, stop completes it.
+            "active" | "paused" | "budget_limited" | "blocked" => Ok(goal),
             other => Err(Some(other.to_string())),
         }
     }
@@ -1186,6 +1206,19 @@ impl Store {
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
                 None
             }
+            LocalAction::SwitchChatView(target) => {
+                // `/agents` picker row (#323): jump the main pane to a
+                // sub-agent's live view, or back to the session transcript.
+                self.state.set_chat_view(match target {
+                    Some(agent_id) => crate::model::ChatViewTarget::Agent(agent_id),
+                    None => crate::model::ChatViewTarget::Main,
+                });
+                None
+            }
+            LocalAction::ToggleAgentDock => {
+                self.state.agent_dock_collapsed = !self.state.agent_dock_collapsed;
+                None
+            }
             LocalAction::SetTheme(theme) => {
                 match crate::cli::ThemeName::from_id(&theme) {
                     Some(name) => {
@@ -1275,6 +1308,13 @@ impl Store {
             }
             LocalAction::ConfirmDeleteProfile(id) => {
                 self.dispatch_delete_profile(&id);
+                None
+            }
+            LocalAction::RequestRemoveModel(request) => {
+                self.state.onboarding.pending_model_removal = Some(*request);
+                self.open_menu(MenuId::from(
+                    crate::menu::registry::MENU_MODEL_REMOVE_CONFIRM,
+                ));
                 None
             }
             LocalAction::SetScrollMode => {
@@ -2463,7 +2503,7 @@ impl Store {
                 if inline_args.is_some_and(|args| !args.trim().is_empty()) {
                     self.dispatch_provider_inline(inline_args.unwrap_or_default())
                 } else {
-                    self.open_menu(MenuId::from(crate::menu::registry::MENU_PROVIDER));
+                    self.open_model_config_surface();
                     None
                 }
             }
@@ -2565,8 +2605,18 @@ impl Store {
                 self.state.onboarding.apply_selection(*selection);
                 self.state.status = t!("status.provider_route_selected").into_owned();
                 if self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_ROUTE) {
-                    self.close_all_menus();
-                    self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                    // Route picked from the staged chain: land on whichever
+                    // config surface the chain was entered from. A stack that
+                    // contains the wizard root returns to the wizard's
+                    // provider step; otherwise the chain was entered from
+                    // `/model` → "Add a model" (or `/add-model`) and lands on
+                    // the mid-session model-config surface.
+                    if self.menu_stack_contains_onboard() {
+                        self.close_all_menus();
+                        self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                    } else {
+                        self.open_model_config_surface();
+                    }
                     self.focus_provider_api_key_row();
                 } else {
                     self.refresh_active_menu_if_open();
@@ -2590,13 +2640,17 @@ impl Store {
                     t!("status.provider_family_updated").into_owned(),
                 );
                 if from_family_menu {
-                    if self.current_profile_for_onboarding().is_none() {
+                    if self.current_profile_for_onboarding().is_none()
+                        && self.menu_stack_contains_onboard()
+                    {
                         // Phase 2 nameable flow: no profile exists yet, so the
                         // family was chosen only to seed the "Name this profile"
                         // suggestion — return to the profile step (with the
                         // suggestion now reflecting the family) rather than
                         // diving into model/route setup, which belongs to
-                        // post-create provider configuration.
+                        // post-create provider configuration. Only applies
+                        // inside the wizard: entered from `/model` → "Add a
+                        // model" the chain always advances to the model step.
                         self.close_all_menus();
                         self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
                     } else {
@@ -2945,7 +2999,7 @@ impl Store {
         let rest = rest.trim();
         match verb {
             "" | "open" => {
-                self.open_menu(MenuId::from(crate::menu::registry::MENU_PROVIDER));
+                self.open_model_config_surface();
                 None
             }
             "catalog" | "refresh-catalog" => {
@@ -2992,7 +3046,7 @@ impl Store {
                     t!("status.unknown_provider_command").into_owned(),
                     Some(provider_usage()),
                 );
-                self.open_menu(MenuId::from(crate::menu::registry::MENU_PROVIDER));
+                self.open_model_config_surface();
                 None
             }
         }
@@ -3657,6 +3711,42 @@ impl Store {
             .menu_stack
             .active()
             .is_some_and(|frame| frame.id.as_str() == id)
+    }
+
+    /// True when the onboarding wizard root is anywhere on the menu stack —
+    /// the family/model/route chain uses this to decide where a route pick
+    /// should land: back on the wizard's provider step (`MENU_ONBOARD`), or on
+    /// the mid-session `MENU_MODEL_CONFIG` surface when the chain was entered
+    /// from `/model` → "Add a model" (no wizard beneath it).
+    fn menu_stack_contains_onboard(&self) -> bool {
+        self.state
+            .menu_stack
+            .path()
+            .iter()
+            .any(|id| id.as_str() == crate::menu::registry::MENU_ONBOARD)
+    }
+
+    /// Open the mid-session staged model-config surface as `[model,
+    /// model-config]` so Esc pops back to the `/model` list. Entry point for
+    /// the (menu-hidden) `/add-model` command and its inline open/unknown
+    /// verbs; the `/model` → "Add a model" row reaches the same surface via
+    /// the family→model→route chain (whose route pick also lands here).
+    fn open_model_config_surface(&mut self) {
+        // The mid-session surface operates on the ACTIVE session's profile. A
+        // staged wizard `profile_id` left over from an earlier create/onboard
+        // outranks `current_profile` in `effective_profile_id`, so Test/Save
+        // would carry a profile the connection is NOT authenticated for and
+        // the server rejects with `auth_scope_violation` ("profile_id is
+        // outside the authenticated profile" — mini4). Align it on entry.
+        if let Some(active) = self.active_session_profile_id() {
+            let staged = self.state.onboarding.profile_id.as_deref();
+            if staged.is_some_and(|staged| staged != active.as_str()) {
+                self.state.onboarding.profile_id = Some(active);
+            }
+        }
+        self.close_all_menus();
+        self.open_menu(MenuId::from(crate::menu::registry::MENU_MODEL));
+        self.open_menu(MenuId::from(crate::menu::registry::MENU_MODEL_CONFIG));
     }
 
     /// True when any onboarding wizard menu (welcome / provider setup / its
@@ -4426,6 +4516,13 @@ impl Store {
             rewind_turns: &self.state.rewind_turns,
             context_window_usage: selected_session
                 .and_then(|session| crate::app::context_window_usage(&self.state, &session.id)),
+            agents: self.state.active_session_agents(),
+            unseen_agent_ids: self.state.active_session_unseen_agents(),
+            chat_view_agent_id: match &self.state.chat_view {
+                crate::model::ChatViewTarget::Agent(id) => Some(id.as_str()),
+                _ => None,
+            },
+            agent_dock_collapsed: self.state.agent_dock_collapsed,
         }
     }
 
@@ -4614,6 +4711,10 @@ impl Store {
         self.state
             .pending_interrupt_restores
             .retain(|pending| pending.session_id != session_id);
+        // Same "the user moved on" signal clears the previous task's
+        // finished/failed sub-agent chips right away (the linger sweep would
+        // get them within AGENT_TERMINAL_LINGER anyway).
+        self.prune_terminal_agents_on_submit(&session_id);
         let turn_id = octos_core::ui_protocol::TurnId::new();
         self.state.record_submitted_user_prompt(
             session_id.clone(),
@@ -5933,7 +6034,10 @@ impl Store {
                 return None;
             }
         };
-        if !matches!(goal.status.as_str(), "active" | "paused" | "budget_limited") {
+        if !matches!(
+            goal.status.as_str(),
+            "active" | "paused" | "budget_limited" | "blocked"
+        ) {
             self.state.status =
                 t!("status.cannot_transition_goal_state", state = goal.status).into_owned();
             return None;
@@ -5941,9 +6045,23 @@ impl Store {
         let verb = match pending.action {
             crate::model::SessionGoalSetAction::Pause => t!("status.goal_verb_pausing"),
             crate::model::SessionGoalSetAction::Resume => t!("status.goal_verb_resuming"),
+            crate::model::SessionGoalSetAction::Stop => t!("status.goal_verb_stopping"),
             crate::model::SessionGoalSetAction::Set => t!("status.goal_verb_updating"),
         };
         self.state.status = t!("status.verb_goal", verb = verb).into_owned();
+        // Resuming a goal that is still over its budget re-activates it but
+        // the scheduler will never fire (token gate) — tell the user how to
+        // actually un-freeze it instead of leaving a silently idle goal.
+        if matches!(pending.action, crate::model::SessionGoalSetAction::Resume)
+            && goal.token_budget > 0
+            && goal.tokens_used >= goal.token_budget
+        {
+            self.state.status = t!(
+                "status.goal_resume_over_budget",
+                objective = goal.objective.clone()
+            )
+            .into_owned();
+        }
         Some(AppUiCommand::SetSessionGoal(
             crate::model::SessionGoalSetParams {
                 session_id: pending.session_id,
@@ -6395,6 +6513,35 @@ impl Store {
                     error.code.as_str(),
                     "transport_read" | "transport_send" | "malformed_frame"
                 );
+                // Same attribution scheme for the staged provider RPCs
+                // (Test / Save / Fetch models): the error format is
+                // "{method} request tui-N failed: …", so a message naming
+                // the method positively identifies the dead request; a
+                // wire-level break kills every in-flight request including
+                // this one. Clearing `provider_pending` here is what
+                // un-wedges the staged model-config surface — the flag gates
+                // re-dispatch AND every staged edit, so a failed test used
+                // to freeze the whole menu on "Testing connection…" forever
+                // (mini4: profile/llm/test rejected with auth_scope_violation
+                // → stuck spinner + "provider test already in progress").
+                let names_provider_rpc = [
+                    crate::model::APPUI_METHOD_PROFILE_LLM_TEST,
+                    crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
+                    crate::model::APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+                ]
+                .iter()
+                .any(|method| error.message.contains(method));
+                let cancels_in_flight_provider = self.state.onboarding.provider_pending.is_some()
+                    && (names_provider_rpc
+                        || matches!(error.code.as_str(), "transport_read" | "transport_send"));
+                if cancels_in_flight_provider {
+                    self.state.onboarding.provider_pending = None;
+                    self.state.onboarding.provider_pending_since = None;
+                    self.state.onboarding.last_message = Some(
+                        t!("status.provider_request_failed", message = error.message).into_owned(),
+                    );
+                    self.refresh_active_menu_if_open();
+                }
                 if cancels_in_flight_create && self.state.onboarding.local_profile_create_pending {
                     self.state.onboarding.local_profile_create_pending = false;
                     self.state.onboarding.local_profile_create_pending_username = None;
@@ -8483,6 +8630,14 @@ impl Store {
             UiNotification::SessionGoalUpdated(event) => {
                 let objective = event.goal.objective.clone();
                 let status_label = event.goal.status.clone();
+                // Toast every STATUS TRANSITION distinctly — the chip
+                // repaints silently, so without this the user never learns
+                // the goal was frozen/blocked until they look (#329).
+                let previous_status = self
+                    .state
+                    .session_autonomy_for(&event.session_id)
+                    .and_then(|entry| entry.goal.as_ref())
+                    .map(|goal| goal.status.clone());
                 self.state.set_session_goal(
                     &event.session_id,
                     Some(event.goal.clone()),
@@ -8491,9 +8646,23 @@ impl Store {
                 self.state.push_activity(ActivityItem::new(
                     ActivityKind::Progress,
                     t!("status.activity_session_goal").into_owned(),
-                    status_label,
+                    status_label.clone(),
                 ));
-                self.state.status = format!("Goal updated: {objective}");
+                let transitioned = previous_status.as_deref() != Some(status_label.as_str());
+                self.state.status = if transitioned {
+                    match status_label.as_str() {
+                        "blocked" => t!("status.goal_now_blocked").into_owned(),
+                        "budget_limited" => {
+                            t!("status.goal_now_budget_limited", objective = objective).into_owned()
+                        }
+                        "paused" => t!("status.goal_now_paused").into_owned(),
+                        "complete" => t!("status.goal_now_complete").into_owned(),
+                        "active" => t!("status.goal_now_active").into_owned(),
+                        other => t!("status.goal_now_status", status = other).into_owned(),
+                    }
+                } else {
+                    format!("Goal updated: {objective}")
+                };
                 None
             }
             UiNotification::SessionGoalCleared(event) => {
@@ -9900,6 +10069,127 @@ impl Store {
         false
     }
 
+    /// The currently peeked sub-agent, if the main pane is showing one. Both
+    /// terminal-chip prune paths protect it — yanking the pane out from under
+    /// the user mid-read would be hostile; it goes on the next sweep/submit
+    /// after they tab away.
+    fn peeked_agent_id(&self) -> Option<String> {
+        match &self.state.chat_view {
+            crate::model::ChatViewTarget::Agent(id) => Some(id.clone()),
+            _ => None,
+        }
+    }
+
+    /// Tick-driven linger sweep for the agent strip: a finished/failed/
+    /// interrupted sub-agent chip stays readable for
+    /// [`AGENT_TERMINAL_LINGER`], then leaves the strip (roster + output/
+    /// artifact caches). Stamps are LOCAL `Instant`s recorded lazily here the
+    /// first time an agent is observed terminal — never the server's
+    /// `updated_at_ms` (remote clock skew) — and self-heal: a stamp is dropped
+    /// when its agent resurrects or vanishes. Returns true when anything was
+    /// pruned (the caller marks the frame dirty).
+    pub fn sweep_terminal_agents(&mut self, now: std::time::Instant) -> bool {
+        let protect = self.peeked_agent_id();
+        let mut to_prune: Vec<(SessionKey, Vec<String>)> = Vec::new();
+        for autonomy in &mut self.state.session_autonomy {
+            let agents = &autonomy.agents;
+            autonomy.terminal_seen.retain(|(agent_id, _)| {
+                agents.iter().any(|agent| {
+                    agent.agent_id == *agent_id
+                        && crate::model::agent_status_is_terminal(&agent.status)
+                })
+            });
+            for agent in &autonomy.agents {
+                if crate::model::agent_status_is_terminal(&agent.status)
+                    && !autonomy
+                        .terminal_seen
+                        .iter()
+                        .any(|(agent_id, _)| agent_id == &agent.agent_id)
+                {
+                    autonomy.terminal_seen.push((agent.agent_id.clone(), now));
+                }
+            }
+            let expired: Vec<String> = autonomy
+                .terminal_seen
+                .iter()
+                .filter(|(agent_id, seen)| {
+                    now.duration_since(*seen) >= AGENT_TERMINAL_LINGER
+                        && protect.as_deref() != Some(agent_id.as_str())
+                        // Agent Dock unread (#323): a result nobody looked at
+                        // must not silently vanish on the timer. Peeking it
+                        // clears the badge (and the peek itself protects it);
+                        // once seen and tabbed away, the normal linger prune
+                        // applies — and the next submit prunes regardless.
+                        && !autonomy.unseen.iter().any(|id| id == agent_id)
+                })
+                .map(|(agent_id, _)| agent_id.clone())
+                .collect();
+            if !expired.is_empty() {
+                to_prune.push((autonomy.session_id.clone(), expired));
+            }
+        }
+        let mut pruned = false;
+        for (session_id, agent_ids) in to_prune {
+            pruned |= self
+                .state
+                .prune_session_agents_by_ids(&session_id, &agent_ids);
+        }
+        pruned
+    }
+
+    /// Tick-driven timeout for the staged provider RPCs: when Test/Save/Fetch
+    /// stays pending past [`PROVIDER_PENDING_TIMEOUT`] with no response (lost
+    /// frame, hung provider, silently dropped request), clear the flag so the
+    /// staged surface un-freezes. The stamp is LOCAL and owned entirely by
+    /// this sweep — recorded the first tick the pending flag is observed,
+    /// dropped whenever the flag clears through any normal path (result,
+    /// error attribution). Returns true when it cleared a stuck flag.
+    pub fn sweep_provider_pending(&mut self, now: std::time::Instant) -> bool {
+        if self.state.onboarding.provider_pending.is_none() {
+            self.state.onboarding.provider_pending_since = None;
+            return false;
+        }
+        let since = *self
+            .state
+            .onboarding
+            .provider_pending_since
+            .get_or_insert(now);
+        if now.duration_since(since) < PROVIDER_PENDING_TIMEOUT {
+            return false;
+        }
+        self.state.onboarding.provider_pending = None;
+        self.state.onboarding.provider_pending_since = None;
+        self.state.onboarding.last_message =
+            Some(t!("status.provider_request_timeout").into_owned());
+        self.state.status = t!("status.provider_request_timeout").into_owned();
+        self.refresh_active_menu_if_open();
+        true
+    }
+
+    /// A new submit means the user moved on: drop the submitting session's
+    /// terminal sub-agent chips immediately instead of waiting out the linger
+    /// sweep. Running agents and the currently peeked one are untouched.
+    fn prune_terminal_agents_on_submit(&mut self, session_id: &SessionKey) {
+        let protect = self.peeked_agent_id();
+        let Some(autonomy) = self
+            .state
+            .session_autonomy
+            .iter()
+            .find(|autonomy| &autonomy.session_id == session_id)
+        else {
+            return;
+        };
+        let agent_ids: Vec<String> = autonomy
+            .agents
+            .iter()
+            .filter(|agent| crate::model::agent_status_is_terminal(&agent.status))
+            .filter(|agent| protect.as_deref() != Some(agent.agent_id.as_str()))
+            .map(|agent| agent.agent_id.clone())
+            .collect();
+        self.state
+            .prune_session_agents_by_ids(session_id, &agent_ids);
+    }
+
     /// The stdio transport relaunched its `serve --stdio` child. The new
     /// process has no in-flight turns, so any `live_reply` still latched
     /// belongs to the dead child and its terminal event will never arrive.
@@ -9929,6 +10219,7 @@ impl Store {
             autonomy.agents.clear();
             autonomy.agent_outputs.clear();
             autonomy.agent_artifacts.clear();
+            autonomy.terminal_seen.clear();
         }
         self.state.normalize_chat_view();
         let latched: Vec<(octos_core::SessionKey, TurnId)> = self
@@ -16873,7 +17164,12 @@ mod tests {
         // Nameable flow, no profile yet: picking a family from the profile step
         // seeds the name suggestion (glm, not the empty→octos default) and
         // returns to the profile step — NOT into model/route setup.
+        // Drive the REAL wizard stack ([onboard, onboard-family]) — the
+        // profile-step reroute is wizard-owned, keyed on the wizard root
+        // being in the stack (the same family menu opened from `/model` →
+        // "Add a model" advances to the model step instead).
         let mut store = protocol_store_without_sessions();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
         store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY));
         assert!(store.state.onboarding.effective_profile_id(None).is_none());
 
@@ -16966,8 +17262,9 @@ mod tests {
         assert_eq!(active_id, crate::menu::registry::MENU_ONBOARD);
     }
 
-    /// `/add-model` (and its `provider` alias) open the model-adding flow — the
-    /// provider family -> model -> route surface lifted out of the full wizard.
+    /// `/add-model` (and its `provider` alias) open the staged model-config
+    /// surface as `[model, model-config]` — the same structure the onboarding
+    /// wizard uses, stacked over `/model` so Esc pops back to the model list.
     #[test]
     fn add_model_command_opens_provider_surface() {
         for cmd in ["/add-model", "/provider"] {
@@ -16977,14 +17274,529 @@ mod tests {
             store.state.composer = cmd.into();
             let command = store.compose_command();
             assert!(command.is_none(), "{cmd} opens a menu, not a wire command");
-            let active_id = store
+            let path: Vec<String> = store
                 .state
                 .menu_stack
-                .active()
-                .map(|frame| frame.id.as_str().to_owned())
-                .unwrap_or_else(|| panic!("{cmd} must open the provider menu"));
-            assert_eq!(active_id, crate::menu::registry::MENU_PROVIDER, "for {cmd}");
+                .path()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect();
+            assert_eq!(
+                path,
+                vec![
+                    crate::menu::registry::MENU_MODEL.to_owned(),
+                    crate::menu::registry::MENU_MODEL_CONFIG.to_owned(),
+                ],
+                "{cmd} must open model-config stacked over the model list"
+            );
         }
+    }
+
+    fn sample_selection(family: &str, model: &str) -> crate::model::LlmSelectionConfig {
+        crate::model::LlmSelectionConfig {
+            family_id: family.into(),
+            model_id: model.into(),
+            route: crate::model::LlmRouteConfig {
+                route_id: "official".into(),
+                api_type: Some("openai".into()),
+                ..crate::model::LlmRouteConfig::default()
+            },
+            ..crate::model::LlmSelectionConfig::default()
+        }
+    }
+
+    /// A route picked from the `/model` → "Add a model" chain (no wizard root
+    /// in the stack) lands on the mid-session model-config surface, stacked
+    /// over the model list so Esc pops back to `/model`.
+    #[test]
+    fn route_pick_from_model_menu_returns_to_model_config() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG]);
+        store.close_all_menus();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_MODEL));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE));
+
+        store.dispatch_onboarding_action(
+            crate::model::OnboardingAction::SetProviderSelection(Box::new(sample_selection(
+                "deepseek",
+                "deepseek-reasoner",
+            ))),
+            None,
+        );
+
+        let path: Vec<String> = store
+            .state
+            .menu_stack
+            .path()
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        assert_eq!(
+            path,
+            vec![
+                crate::menu::registry::MENU_MODEL.to_owned(),
+                crate::menu::registry::MENU_MODEL_CONFIG.to_owned(),
+            ],
+            "route pick outside the wizard lands on model-config over /model"
+        );
+        assert_eq!(store.state.onboarding.provider.family_id, "deepseek");
+    }
+
+    /// The mini4 wedge: `profile/llm/test` failed with an RPC error
+    /// (`auth_scope_violation`) but nothing cleared `provider_pending`, so the
+    /// staged surface froze on "Testing connection…" and blocked every retry
+    /// ("provider test already in progress"). A failure whose message names
+    /// the provider RPC must clear the pending flag.
+    #[test]
+    fn provider_rpc_error_clears_pending_flag() {
+        use octos_core::app_ui::AppUiError;
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_TEST]);
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Test);
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "permission_denied".into(),
+            message: "profile/llm/test request tui-15 failed: profile_id is outside the \
+                      authenticated profile"
+                .into(),
+        }));
+
+        assert_eq!(
+            store.state.onboarding.provider_pending, None,
+            "a failed provider RPC must un-wedge the staged surface"
+        );
+
+        // A retry can now dispatch (previously blocked by the stale flag).
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Save);
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "transport_read".into(),
+            message: "connection reset".into(),
+        }));
+        assert_eq!(
+            store.state.onboarding.provider_pending, None,
+            "a wire break kills every in-flight request — including the save"
+        );
+    }
+
+    /// Unrelated errors must NOT clear the flag while a response can still
+    /// arrive (mirrors the local-create attribution rule).
+    #[test]
+    fn unrelated_rpc_error_keeps_provider_pending() {
+        use octos_core::app_ui::AppUiError;
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_TEST]);
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Test);
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "malformed_frame".into(),
+            message: "UI protocol frame was not valid JSON".into(),
+        }));
+
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Test),
+            "recoverable noise must not misattribute to the provider RPC"
+        );
+    }
+
+    /// A provider RPC whose response never arrives at all (lost frame, hung
+    /// provider) times out via the tick sweep instead of pending forever.
+    #[test]
+    fn provider_pending_times_out_without_a_response() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_TEST]);
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Test);
+
+        let t0 = std::time::Instant::now();
+        assert!(!store.sweep_provider_pending(t0), "first sight only stamps");
+        assert!(
+            !store.sweep_provider_pending(
+                t0 + PROVIDER_PENDING_TIMEOUT - std::time::Duration::from_secs(1)
+            ),
+            "still inside the window"
+        );
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Test)
+        );
+
+        assert!(
+            store.sweep_provider_pending(
+                t0 + PROVIDER_PENDING_TIMEOUT + std::time::Duration::from_secs(1)
+            ),
+            "timeout elapsed -> cleared"
+        );
+        assert_eq!(store.state.onboarding.provider_pending, None);
+        assert!(
+            store.state.status.contains(
+                t!("status.provider_request_timeout")
+                    .split('%')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+            ) || !store.state.status.is_empty(),
+            "timeout surfaces a status"
+        );
+
+        // The stamp died with the flag: a NEW pending gets a fresh window.
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Test);
+        assert!(
+            !store.sweep_provider_pending(
+                t0 + PROVIDER_PENDING_TIMEOUT + std::time::Duration::from_secs(2)
+            ),
+            "fresh pending restamps instead of inheriting the expired window"
+        );
+    }
+
+    /// Entering the mid-session surface aligns a stale staged wizard
+    /// profile_id with the ACTIVE session's profile — otherwise Test/Save
+    /// carry a profile the connection is not authenticated for and the server
+    /// rejects with auth_scope_violation (the mini4 stuck-test root cause).
+    #[test]
+    fn model_config_entry_aligns_staged_profile_with_active_session() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.target = Some("ws://example.test/ui-protocol".into());
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+        ]));
+        // Stale wizard leftovers from an earlier /profiles create.
+        store.state.onboarding.profile_id = Some("freshly-created".into());
+
+        store.state.composer = "/add-model".into();
+        let _ = store.compose_command();
+
+        assert_eq!(
+            store.state.onboarding.profile_id.as_deref(),
+            Some("coding"),
+            "staged profile must follow the active session's profile"
+        );
+    }
+
+    /// `/model` -> "Remove a model..." -> pick -> Yes sends profile/llm/delete
+    /// with the picked model's coordinates; the confirm state is staged via
+    /// `pending_model_removal`.
+    #[test]
+    fn remove_model_confirm_sends_profile_llm_delete() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_DELETE]);
+        // Feeds the snapshot's `current_profile` fallback chain.
+        store.state.onboarding.profile_id = Some("coding".into());
+        store.close_all_menus();
+
+        store.dispatch_menu_action(MenuAction::Local(LocalAction::RequestRemoveModel(
+            Box::new(crate::model::ModelRemovalRequest {
+                family_id: "deepseek".into(),
+                model_id: "deepseek-v4-flash".into(),
+                route_id: "autodl".into(),
+                label: "deepseek / deepseek-v4-flash".into(),
+            }),
+        )));
+
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_MODEL_REMOVE_CONFIRM),
+            "request opens the confirm menu"
+        );
+        assert!(store.state.onboarding.pending_model_removal.is_some());
+
+        // Yes row (index 0) sends the delete with the staged coordinates.
+        let command = store.accept_active_menu_item();
+        let Some(AppUiCommand::ProfileLlmDelete(params)) = command else {
+            panic!("expected ProfileLlmDelete, got {command:?}");
+        };
+        assert_eq!(params.family_id, "deepseek");
+        assert_eq!(params.model_id, "deepseek-v4-flash");
+        assert_eq!(params.route_id, "autodl");
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+        assert!(
+            store.state.menu_stack.path().is_empty(),
+            "leaf send dismisses the confirm stack"
+        );
+    }
+
+    /// The same route pick made INSIDE the wizard (wizard root in the stack)
+    /// keeps its original return target: the wizard's provider step.
+    #[test]
+    fn route_pick_from_wizard_still_returns_to_onboard() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG]);
+        store.close_all_menus();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE));
+
+        store.dispatch_onboarding_action(
+            crate::model::OnboardingAction::SetProviderSelection(Box::new(sample_selection(
+                "deepseek",
+                "deepseek-reasoner",
+            ))),
+            None,
+        );
+
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
+            "route pick inside the wizard returns to the provider step"
+        );
+        assert!(!store.active_menu_id_is(crate::menu::registry::MENU_MODEL_CONFIG));
+    }
+
+    fn terminal_strip_agent(id: &str, status: &str) -> octos_core::ui_protocol::UiAgentRecord {
+        octos_core::ui_protocol::UiAgentRecord {
+            agent_id: id.into(),
+            parent_agent_id: None,
+            session_id: SessionKey("local:a".into()),
+            task_id: None,
+            path: format!("master/{id}"),
+            role: "worker".into(),
+            nickname: id.into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: status.into(),
+            last_task: None,
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    fn seed_strip_agent(store: &mut Store, id: &str, status: &str) {
+        let session_id = SessionKey("local:a".into());
+        store.apply_event(AppUiEvent::Protocol(UiNotification::AgentUpdated(
+            octos_core::ui_protocol::AgentUpdatedEvent {
+                session_id,
+                agent: terminal_strip_agent(id, status),
+            },
+        )));
+    }
+
+    fn strip_agent_ids(store: &Store) -> Vec<String> {
+        store
+            .state
+            .session_autonomy_for(&SessionKey("local:a".into()))
+            .map(|autonomy| {
+                autonomy
+                    .agents
+                    .iter()
+                    .map(|agent| agent.agent_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A new submit means the user moved on: the submitting session's
+    /// finished/failed sub-agent chips clear immediately; running ones stay.
+    #[test]
+    fn next_submit_prunes_terminal_agents() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        seed_strip_agent(&mut store, "edison", "completed");
+        seed_strip_agent(&mut store, "thomas", "failed");
+        seed_strip_agent(&mut store, "worker", "running");
+
+        store.state.composer = "next task please".into();
+        let _ = store.compose_command();
+
+        assert_eq!(
+            strip_agent_ids(&store),
+            vec!["worker".to_owned()],
+            "terminal chips clear on submit; running agents survive"
+        );
+    }
+
+    /// The tick sweep stamps terminal agents on first sight and prunes them
+    /// once (and only once) the linger elapses; running agents are never
+    /// stamped or pruned.
+    #[test]
+    fn linger_sweep_prunes_after_linger_but_not_before() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        seed_strip_agent(&mut store, "edison", "completed");
+        seed_strip_agent(&mut store, "worker", "running");
+        // Mark edison SEEN (peek + back): only seen terminal chips are
+        // subject to the timed linger — unread ones wait for the user (#323).
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Agent("edison".into()));
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Main);
+
+        let t0 = std::time::Instant::now();
+        assert!(!store.sweep_terminal_agents(t0), "first sight only stamps");
+        assert!(
+            !store.sweep_terminal_agents(
+                t0 + AGENT_TERMINAL_LINGER - std::time::Duration::from_secs(1)
+            ),
+            "still inside the linger window"
+        );
+        assert_eq!(strip_agent_ids(&store), vec!["edison", "worker"]);
+
+        assert!(
+            store.sweep_terminal_agents(
+                t0 + AGENT_TERMINAL_LINGER + std::time::Duration::from_secs(1)
+            ),
+            "linger elapsed -> pruned"
+        );
+        assert_eq!(
+            strip_agent_ids(&store),
+            vec!["worker".to_owned()],
+            "only the terminal agent ages out"
+        );
+    }
+
+    /// The currently peeked agent is never yanked out from under the user —
+    /// it goes on the next sweep after they tab away.
+    #[test]
+    fn peeked_terminal_agent_survives_sweep() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        seed_strip_agent(&mut store, "edison", "completed");
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Agent("edison".into()));
+
+        let t0 = std::time::Instant::now();
+        let _ = store.sweep_terminal_agents(t0);
+        assert!(
+            !store.sweep_terminal_agents(
+                t0 + AGENT_TERMINAL_LINGER + std::time::Duration::from_secs(5)
+            ),
+            "peeked agent is protected"
+        );
+        assert_eq!(strip_agent_ids(&store), vec!["edison".to_owned()]);
+
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Main);
+        assert!(
+            store.sweep_terminal_agents(
+                t0 + AGENT_TERMINAL_LINGER + std::time::Duration::from_secs(6)
+            ),
+            "prunes on the next sweep after tabbing away"
+        );
+        assert!(strip_agent_ids(&store).is_empty());
+    }
+
+    /// Agent Dock unread (#323): a terminal transition that lands while the
+    /// user is NOT viewing the agent badges it unseen; the badge is exempt
+    /// from the timed linger sweep until the user peeks it, then the normal
+    /// prune applies.
+    #[test]
+    fn unseen_terminal_agent_survives_sweep_until_viewed() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        seed_strip_agent(&mut store, "edison", "running");
+        assert!(
+            !store.state.is_agent_unseen("edison"),
+            "running agents never badge"
+        );
+        seed_strip_agent(&mut store, "edison", "completed");
+        assert!(
+            store.state.is_agent_unseen("edison"),
+            "terminal transition while viewing Main badges unseen"
+        );
+
+        // Way past the linger: still protected — nobody has looked at it.
+        let t0 = std::time::Instant::now();
+        let _ = store.sweep_terminal_agents(t0);
+        assert!(
+            !store.sweep_terminal_agents(
+                t0 + AGENT_TERMINAL_LINGER + std::time::Duration::from_secs(60)
+            ),
+            "unread terminal chip must not vanish on the timer"
+        );
+        assert_eq!(strip_agent_ids(&store), vec!["edison".to_owned()]);
+
+        // Peek clears the badge; tabbing away re-exposes it to the linger.
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Agent("edison".into()));
+        assert!(!store.state.is_agent_unseen("edison"), "peek marks seen");
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Main);
+        assert!(
+            store.sweep_terminal_agents(
+                t0 + AGENT_TERMINAL_LINGER + std::time::Duration::from_secs(61)
+            ),
+            "seen chip prunes on the next sweep"
+        );
+        assert!(strip_agent_ids(&store).is_empty());
+    }
+
+    /// The unseen badge follows the agent's life: viewing at transition time
+    /// suppresses it, resurrecting clears it, pruning clears it, and the
+    /// next submit still clears the chip (badge and all) — the user is at
+    /// the keyboard.
+    #[test]
+    fn unseen_badge_lifecycle_suppress_resurrect_and_submit_prune() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+
+        // Terminal transition while the user is ALREADY viewing the agent —
+        // no badge (they watched it finish).
+        seed_strip_agent(&mut store, "edison", "running");
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Agent("edison".into()));
+        seed_strip_agent(&mut store, "edison", "completed");
+        assert!(
+            !store.state.is_agent_unseen("edison"),
+            "watching the finish must not badge"
+        );
+        store
+            .state
+            .set_chat_view(crate::model::ChatViewTarget::Main);
+
+        // Resurrection clears a stale badge.
+        seed_strip_agent(&mut store, "thomas", "failed");
+        assert!(store.state.is_agent_unseen("thomas"));
+        seed_strip_agent(&mut store, "thomas", "running");
+        assert!(
+            !store.state.is_agent_unseen("thomas"),
+            "resurrected agents drop the stale badge"
+        );
+
+        // Submit prunes terminal chips, badges included.
+        seed_strip_agent(&mut store, "thomas", "failed");
+        assert!(store.state.is_agent_unseen("thomas"));
+        store.prune_terminal_agents_on_submit(&SessionKey("local:a".into()));
+        assert!(
+            !store.state.is_agent_unseen("thomas"),
+            "submit-prune clears the badge with the chip"
+        );
+        assert!(strip_agent_ids(&store).is_empty());
+    }
+
+    /// Backend relaunch already drops the roster; the linger stamps must die
+    /// with it so a re-added same-id agent restamps fresh.
+    #[test]
+    fn relaunch_clears_terminal_stamps() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        seed_strip_agent(&mut store, "edison", "completed");
+        let _ = store.sweep_terminal_agents(std::time::Instant::now());
+        assert!(
+            store
+                .state
+                .session_autonomy_for(&SessionKey("local:a".into()))
+                .is_some_and(|autonomy| !autonomy.terminal_seen.is_empty()),
+            "sweep stamped the terminal agent"
+        );
+
+        store.apply_client_event(ClientEvent::BackendRelaunched);
+
+        assert!(
+            store
+                .state
+                .session_autonomy_for(&SessionKey("local:a".into()))
+                .is_some_and(|autonomy| autonomy.terminal_seen.is_empty()),
+            "stamps die with the old child"
+        );
     }
 
     /// The onboarding wizard is hidden from the normal-session `/` menu but stays
@@ -26696,6 +27508,160 @@ mod tests {
             .expect("resume stages a transition");
         assert_eq!(pending.status, "active");
         assert_eq!(pending.action, crate::model::SessionGoalSetAction::Resume);
+    }
+
+    /// `/goal stop` stages a user-owned terminal transition to `complete`
+    /// through the same get-then-set dance as pause/resume, and works from
+    /// `blocked` (the #1693 circuit-breaker state).
+    #[test]
+    fn goal_stop_stages_complete_transition_from_blocked() {
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.state.set_session_goal(
+            &session_id,
+            Some(octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some("coding".into()),
+                goal_id: "goal_01".into(),
+                objective: "stuck work".into(),
+                status: "blocked".into(),
+                token_budget: 1000,
+                tokens_used: 10,
+                time_used_seconds: 5,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }),
+            Some("backend".into()),
+        );
+        store.state.composer = "/goal stop".into();
+        match store.compose_command().expect("dispatch") {
+            AppUiCommand::GetSessionGoal(params) => {
+                assert_eq!(params.session_id, session_id);
+            }
+            other => panic!("expected GetSessionGoal, got {other:?}"),
+        }
+        let pending = store
+            .state
+            .pending_goal_transition
+            .as_ref()
+            .expect("stop stages a transition");
+        assert_eq!(pending.status, "complete");
+        assert_eq!(pending.action, crate::model::SessionGoalSetAction::Stop);
+
+        // The refreshed goal (still blocked) must yield the follow-up set
+        // with status=complete and the SERVER objective.
+        let command = store.consume_pending_goal_transition(
+            &session_id,
+            Some(&octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some("coding".into()),
+                goal_id: "goal_01".into(),
+                objective: "server truth".into(),
+                status: "blocked".into(),
+                token_budget: 1000,
+                tokens_used: 10,
+                time_used_seconds: 5,
+                created_at_ms: 1,
+                updated_at_ms: 3,
+            }),
+        );
+        match command.expect("set dispatched") {
+            AppUiCommand::SetSessionGoal(params) => {
+                assert_eq!(params.status.as_deref(), Some("complete"));
+                assert_eq!(params.objective, "server truth");
+                assert_eq!(params.action, crate::model::SessionGoalSetAction::Stop);
+            }
+            other => panic!("expected SetSessionGoal, got {other:?}"),
+        }
+    }
+
+    /// Resuming a goal that is still over budget re-activates it server-side
+    /// but the scheduler will never fire — the status line must say how to
+    /// actually un-freeze it (raise the budget), not read as a silent no-op.
+    #[test]
+    fn goal_resume_over_budget_hints_budget_raise() {
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        let over_budget = octos_core::ui_protocol::UiGoalRecord {
+            profile_id: Some("coding".into()),
+            goal_id: "goal_01".into(),
+            objective: "big refactor".into(),
+            status: "budget_limited".into(),
+            token_budget: 1000,
+            tokens_used: 1200,
+            time_used_seconds: 60,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        store.state.set_session_goal(
+            &session_id,
+            Some(over_budget.clone()),
+            Some("backend".into()),
+        );
+        store.state.composer = "/goal resume".into();
+        let _ = store.compose_command().expect("stages the transition");
+        let command = store.consume_pending_goal_transition(&session_id, Some(&over_budget));
+        assert!(command.is_some(), "resume still dispatches the set");
+        assert!(
+            store.state.status.contains("--budget"),
+            "over-budget resume must hint the budget raise: {}",
+            store.state.status
+        );
+    }
+
+    /// Every goal STATUS TRANSITION surfaces a status-line toast (#329) —
+    /// the chip repaints silently, so a frozen/blocked goal used to go
+    /// unnoticed. Same-status updates keep the generic message.
+    #[test]
+    fn goal_status_transitions_toast_distinctly() {
+        use octos_core::ui_protocol::{SessionGoalUpdatedEvent, UiGoalRecord};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        let goal = |status: &str| UiGoalRecord {
+            profile_id: Some("coding".into()),
+            goal_id: "goal_01".into(),
+            objective: "long task".into(),
+            status: status.into(),
+            token_budget: 1000,
+            tokens_used: 100,
+            time_used_seconds: 10,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionGoalUpdated(
+            SessionGoalUpdatedEvent {
+                session_id: session_id.clone(),
+                profile_id: Some("coding".into()),
+                goal: goal("active"),
+                transition_actor: "user".into(),
+            },
+        )));
+        // active -> blocked: distinct toast with the recovery hint.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionGoalUpdated(
+            SessionGoalUpdatedEvent {
+                session_id: session_id.clone(),
+                profile_id: Some("coding".into()),
+                goal: goal("blocked"),
+                transition_actor: "backend".into(),
+            },
+        )));
+        assert!(
+            store.state.status.contains("/goal resume"),
+            "blocked toast must carry the recovery hint: {}",
+            store.state.status
+        );
+        // blocked -> blocked (same status): generic update message.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionGoalUpdated(
+            SessionGoalUpdatedEvent {
+                session_id: session_id.clone(),
+                profile_id: Some("coding".into()),
+                goal: goal("blocked"),
+                transition_actor: "backend".into(),
+            },
+        )));
+        assert!(
+            store.state.status.starts_with("Goal updated:"),
+            "same-status update keeps the generic message: {}",
+            store.state.status
+        );
     }
 
     #[test]

@@ -82,6 +82,11 @@ app:
     loops_running: "循环：%{count} 个活动中"
     loops_paused_suffix: " · %{count} 个已暂停"
     goal_meta: " (%{status} · %{used}/%{budget} Token)"
+    status_active: "进行中"
+    status_paused: "已暂停"
+    status_budget_limited: "预算已用尽"
+    status_blocked: "已阻塞"
+    status_complete: "已完成"
   statusbar:
     agents: "%{count} 个智能体"
     re_entering: "重新进入中"
@@ -139,6 +144,9 @@ app:
     agent_strip_main: "主对话"
     agent_strip_title: " 智能体 "
     agent_strip_more: "还有 %{count} 个（Tab 切换）"
+    agent_dock_pill: "🐙 %{count} 个智能体 · %{running} 运行中"
+    agent_dock_pill_unread: " · %{count}● 未读"
+    agent_dock_toggle_hint: "Alt+G"
     agent_no_output: "（暂无输出 —— 该智能体工作时会在此处流式输出结果）"
     menu: "菜单 | j/k 移动 | Enter 确认 | Esc 关闭"
     onboarding: "引导 | Enter 继续 | 输入可编辑字段"
@@ -414,12 +422,14 @@ command:
     desc: 将最近一条助手回复复制到剪贴板（支持 SSH 环境）。
   cost:
     desc: 显示服务器报告的 token 和费用用量
+  dock:
+    desc: 子智能体停靠栏——切换视图、查看未读结果、折叠或展开。
   exit:
     desc: 退出 TUI
   profiles:
     desc: 管理本地档案——列出、设为默认、删除或新建。
   goal:
-    desc: 查看、设置、暂停/恢复或清除持久化的会话目标
+    desc: 查看、设置、暂停/恢复、停止或清除持久化的会话目标
   help:
     desc: 显示可用命令
   keymap:
@@ -477,6 +487,22 @@ lang:
   unknown: 未知语言 '%{value}'。可选：en、zh。
   usage: 当前语言：%{current}。用法：/lang <en|zh>。
 menu:
+  agents:
+    item:
+      dock_collapse:
+        label: 折叠为摘要条
+      dock_expand:
+        label: 展开为逐个智能体行
+      dock_toggle:
+        desc: 等同于 Alt+G。
+      main:
+        desc: 在主窗格显示会话记录。
+        label: 主会话
+      viewing_marker: （正在查看）
+    subtitle: "%{count} 个智能体 · %{running} 运行中 · %{unread} 未读"
+    title: 子智能体
+    unavailable_empty: 本会话还没有子智能体——当模型派生工作智能体时会出现在这里。
+    unavailable_title: 子智能体停靠栏
   availability:
     approval_has_focus: 审批弹窗正占用键盘焦点
     blocked_read_only: 只读模式下已阻止
@@ -655,6 +681,12 @@ menu:
   model:
     footer: 回车 选择或刷新 | Esc 关闭
     item:
+      add:
+        label: "添加模型…"
+        desc: "选择模型系列、模型和供应商路由，再粘贴 API 密钥 —— 与引导流程相同的分步配置。"
+      remove:
+        label: "移除模型…"
+        desc: "删除该档案已配置的某个模型（密钥失效或模型下线时）—— 若这是唯一模型，请先添加替代模型。"
       cached:
         label: 服务器模型列表
       empty:
@@ -664,6 +696,35 @@ menu:
     search: 筛选模型
     subtitle: 服务器返回的档案 LLM 模型。
     title: 模型
+  model_remove:
+    title: "移除模型"
+    subtitle: "选择要从该档案移除的已配置模型。"
+    item:
+      empty:
+        label: "没有已配置的模型"
+        desc: "请先在 /model 中刷新模型 —— 只能移除已配置的模型。"
+    confirm:
+      title: "移除 %{model}？"
+      subtitle: "从档案的 LLM 配置中删除该条目。此操作无法撤销。"
+      yes: "是，移除 %{model}"
+      yes_desc: "使用 profile/llm/delete；完成后模型列表会刷新。"
+      no: "否，保留"
+  model_config:
+    title: "添加模型"
+    subtitle: "为该档案暂存一个模型：系列、模型、路由、API 密钥 —— 然后测试并保存。"
+    search: 筛选步骤
+    unavailable_title: "模型配置不可用"
+    item:
+      fallback:
+        desc: "将暂存的供应商追加或替换到 config.llm.fallbacks。"
+    preview:
+      title: "已保存模型"
+      profile: "档案"
+      primary: "主模型"
+      fallbacks: "备用"
+      fallback_n: "备用 %{n}"
+      none: "无"
+      not_loaded: "未加载 —— 请在 /model 中刷新模型"
   onboard_done:
     title: "一切就绪"
     subtitle: "大脑 \"%{profile}\" 已就绪。"
@@ -901,33 +962,6 @@ menu:
     title: 更新模型权限
     unavailable_no_session: 权限功能需要一个打开的 Octos UI 会话。
     unavailable_title: 权限不可用
-  provider:
-    item:
-      catalog_refresh:
-        label: 刷新供应商目录
-      list_refresh:
-        label: 刷新已配置供应商
-      saved_fallback:
-        prefix: 已保存备用供应商 %{n}
-      saved_fallback_empty:
-        desc: 使用添加备用模型持久化备用线路。
-        label: 已保存备用供应商：无
-      saved_primary:
-        prefix: 已保存主要供应商
-      saved_primary_empty:
-        desc: 在打开编码会话前，请先将测试通过的供应商保存为主要供应商。
-        label: 已保存主要供应商：未设置
-      saved_unloaded:
-        desc: 请运行刷新已配置供应商以读取 profile/llm/list。
-        label: 已保存供应商：未加载
-      staged:
-        desc: 使用 /provider select 命令或在目录中选择行。
-        label: 暂存供应商
-    preview_title: 供应商状态
-    search: 筛选供应商
-    subtitle: 档案级 LLM 配置；目录和状态来自 Octos UI。
-    title: 供应商
-    unavailable_title: 供应商不可用
   runtime_preview_title: 运行时
   search:
     label: "搜索 "
@@ -1185,6 +1219,8 @@ status:
   profile_delete_active_blocked: "无法删除 %{profile}——这是当前会话正在使用的档案。请先切换到其他档案。"
   switching_profile: "正在切换到档案 %{profile}……"
   provider_route_selected: "已选择供应商线路；请输入 API 密钥"
+  provider_request_failed: "供应商请求失败：%{message}"
+  provider_request_timeout: "供应商请求超时，未收到响应 —— 请重试"
   provider_family_updated: "供应商模型系列已更新"
   provider_model_updated: "供应商模型已更新"
   provider_route_updated: "供应商线路已更新"
@@ -1353,7 +1389,15 @@ status:
   cannot_transition_goal_state: "无法在 `%{state}` 状态下转换目标（由模型管控）。"
   goal_verb_pausing: "正在暂停"
   goal_verb_resuming: "正在恢复"
+  goal_verb_stopping: "正在停止"
   goal_verb_updating: "正在更新"
+  goal_resume_over_budget: "目标已恢复但仍超出预算 —— 提高预算后才会继续：/goal %{objective} --budget <N>"
+  goal_now_active: "目标进行中 —— 自主推进已恢复"
+  goal_now_paused: "目标已暂停 —— 使用 /goal resume 恢复自主推进"
+  goal_now_blocked: "目标因连续失败已阻塞 —— /goal resume 重试，/goal stop 结束"
+  goal_now_budget_limited: "目标预算已用尽 —— 正在收尾；用 /goal %{objective} --budget <N> 提高预算"
+  goal_now_complete: "目标已完成"
+  goal_now_status: "目标状态：%{status}"
   verb_goal: "%{verb}目标"
   local_create_cancelled_transport: "本地档案创建因传输错误而取消 [%{code}]：%{message}"
   local_create_cancelled: "本地档案创建已取消 [%{code}]：%{message}"
