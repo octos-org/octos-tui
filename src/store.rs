@@ -721,6 +721,32 @@ impl Store {
         }
     }
 
+    /// #334 (Phase 2): when a sub-agent detail view (peek) opens or switches,
+    /// pull the child's FULL output via `agent/output/read` so the detail view
+    /// renders the real `final_output`. A background child streams nothing, so
+    /// without this the peek shows only the "no output" placeholder even though
+    /// the server has the full body (fed from `BackgroundTask.final_output`).
+    /// The result lands via `set_agent_output` and `active_agent_output_or_tail`
+    /// then prefers it over the bounded `output_tail`. Returns `None` when the
+    /// active view is not a sub-agent, the method is unavailable, or there is no
+    /// autonomy session.
+    pub(crate) fn agent_view_output_fetch_command(&mut self) -> Option<AppUiCommand> {
+        let crate::model::ChatViewTarget::Agent(agent_id) = self.state.chat_view.clone() else {
+            return None;
+        };
+        if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_OUTPUT_READ) {
+            return None;
+        }
+        let session_id = self.active_autonomy_session_id()?;
+        Some(AppUiCommand::ReadAgentOutput(
+            crate::model::AgentOutputReadParams {
+                session_id,
+                agent_id,
+                cursor: None,
+            },
+        ))
+    }
+
     fn dispatch_agents_command(
         &mut self,
         cmd: crate::autonomy::AgentsCommand,
@@ -1213,7 +1239,9 @@ impl Store {
                     Some(agent_id) => crate::model::ChatViewTarget::Agent(agent_id),
                     None => crate::model::ChatViewTarget::Main,
                 });
-                None
+                // #334 (Phase 2): fetch the child's full output on open so the
+                // detail view renders its `final_output`, not just the tail.
+                self.agent_view_output_fetch_command()
             }
             LocalAction::ToggleAgentDock => {
                 self.state.agent_dock_collapsed = !self.state.agent_dock_collapsed;
@@ -27021,6 +27049,31 @@ mod tests {
         let mut store = protocol_store_with_autonomy();
         store.state.composer = "/agents output ag-7".into();
         match store.compose_command().expect("dispatch") {
+            AppUiCommand::ReadAgentOutput(params) => {
+                assert_eq!(params.agent_id, "ag-7");
+                assert!(params.cursor.is_none());
+            }
+            other => panic!("expected ReadAgentOutput, got {other:?}"),
+        }
+    }
+
+    /// #334 (Phase 2): opening a sub-agent detail view fetches its FULL output
+    /// via `agent/output/read`, so a background child (which streams nothing)
+    /// still renders its `final_output`. On Main / non-agent views it is a
+    /// no-op.
+    #[test]
+    fn agent_view_open_fetches_full_output() {
+        let mut store = protocol_store_with_autonomy();
+        // Main view → no fetch.
+        store.state.chat_view = crate::model::ChatViewTarget::Main;
+        assert!(store.agent_view_output_fetch_command().is_none());
+
+        // Switching to an agent view → an agent/output/read for that agent.
+        store.state.chat_view = crate::model::ChatViewTarget::Agent("ag-7".into());
+        match store
+            .agent_view_output_fetch_command()
+            .expect("agent view must fetch its output")
+        {
             AppUiCommand::ReadAgentOutput(params) => {
                 assert_eq!(params.agent_id, "ag-7");
                 assert!(params.cursor.is_none());

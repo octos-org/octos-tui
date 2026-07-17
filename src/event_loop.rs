@@ -1005,8 +1005,20 @@ fn handle_agent_peek_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     }
     match key.code {
         // Cycle to the next / previous target (wrapping through `main`).
-        KeyCode::Tab => store.state.select_next_chat_view(),
-        KeyCode::BackTab => store.state.select_prev_chat_view(),
+        // #334 (Phase 2): after landing on a sub-agent, pull its full output so
+        // the detail view renders `final_output`, not just the streamed tail.
+        KeyCode::Tab => {
+            store.state.select_next_chat_view();
+            if let Some(command) = store.agent_view_output_fetch_command() {
+                return KeyAction::send(command);
+            }
+        }
+        KeyCode::BackTab => {
+            store.state.select_prev_chat_view();
+            if let Some(command) = store.agent_view_output_fetch_command() {
+                return KeyAction::send(command);
+            }
+        }
         // Leave the peek back to the inline chat.
         KeyCode::Esc => {
             store
@@ -1088,11 +1100,18 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             if store.state.focus == FocusPane::Composer && !store.state.transcript_pager_active =>
         {
             store.state.select_next_chat_view();
+            // #334 (Phase 2): pull the child's full output when the peek opens.
+            if let Some(command) = store.agent_view_output_fetch_command() {
+                return KeyAction::send(command);
+            }
         }
         KeyCode::BackTab
             if store.state.focus == FocusPane::Composer && !store.state.transcript_pager_active =>
         {
             store.state.select_prev_chat_view();
+            if let Some(command) = store.agent_view_output_fetch_command() {
+                return KeyAction::send(command);
+            }
         }
         // Esc clears a stale peek selection (an `Agent(id)` whose agent has
         // vanished, so `agent_view_active` is false and this handler — not

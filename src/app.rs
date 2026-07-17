@@ -2558,6 +2558,39 @@ fn agent_overlay_lines(app: &AppState, palette: Palette, agent_id: &str) -> Vec<
                 palette.muted(),
             )));
         }
+        if let Some(cwd) = agent
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            lines.push(Line::from(Span::styled(
+                format!("cwd: {cwd}"),
+                palette.muted(),
+            )));
+        }
+        // #334 (Phase 2): surface the child's DELIVERABLES (the `*-review.md` /
+        // analysis files it wrote) from the roster record's artifacts, so the
+        // detail view shows what the sub-agent produced, not just its log.
+        if !agent.artifacts.is_empty() {
+            lines.push(Line::from(Span::styled(
+                t!("app.hint.agent_deliverables").into_owned(),
+                palette.title(),
+            )));
+            for artifact in &agent.artifacts {
+                let title = artifact.title.trim();
+                let title = if title.is_empty() {
+                    artifact.id.as_str()
+                } else {
+                    title
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  • ", palette.muted()),
+                    Span::styled(title.to_string(), palette.text()),
+                    Span::styled(format!("  [{}]", artifact.kind), palette.muted()),
+                ]));
+            }
+        }
         lines.push(Line::from(String::new()));
     }
     match app.active_agent_output_or_tail(agent_id) {
@@ -16876,6 +16909,36 @@ mod tests {
         assert!(
             text.contains('⏵'),
             "running glyph must render for the live sub-agent; got:\n{text}"
+        );
+    }
+
+    /// #334 (Phase 2): the sub-agent detail view (peek) surfaces the child's
+    /// DELIVERABLES from the roster record's artifacts — the `*-review.md` /
+    /// analysis files it wrote — so the detail view shows what the sub-agent
+    /// produced, not just its streamed log.
+    #[test]
+    fn agent_peek_renders_deliverable_artifacts() {
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        let mut agent = sample_agent("security-review", "completed");
+        agent.artifacts = vec![octos_core::ui_protocol::UiAgentArtifact {
+            id: "art-1".into(),
+            title: "analysis-octos-security.md".into(),
+            kind: "file".into(),
+            status: "ready".into(),
+            path: Some("/tmp/analysis-octos-security.md".into()),
+            content: None,
+            extra: Default::default(),
+        }];
+        app.upsert_session_agent(&sid, agent);
+
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let lines = agent_overlay_lines(&app, palette, "security-review");
+        let text = lines_text(&lines);
+
+        assert!(
+            text.contains("analysis-octos-security.md"),
+            "the peek must list the child's deliverable artifact; got:\n{text}"
         );
     }
 

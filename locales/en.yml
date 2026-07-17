@@ -152,6 +152,7 @@ app:
     statusbar_keys: "Tab agents | Ctrl+O expand"
     agent_peek_keys: " Tab next · Shift+Tab prev · ↑/↓ scroll · Esc back to chat "
     agent_task_prefix: "task: %{task}"
+    agent_deliverables: "Deliverables"
     agent_strip_main: "main"
     agent_strip_title: " agents "
     agent_strip_more: "+%{count} more (Tab)"

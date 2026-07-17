@@ -142,6 +142,7 @@ app:
     statusbar_keys: "Tab 智能体 | Ctrl+O 展开"
     agent_peek_keys: " Tab 下一个 · Shift+Tab 上一个 · ↑/↓ 滚动 · Esc 返回聊天 "
     agent_task_prefix: "任务：%{task}"
+    agent_deliverables: "交付物"
     agent_strip_main: "主对话"
     agent_strip_title: " 智能体 "
     agent_strip_more: "还有 %{count} 个（Tab 切换）"
