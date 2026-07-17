@@ -8639,6 +8639,21 @@ impl Store {
                 // every agent-status event — during a multi-agent turn that floods
                 // the bottom line. The activity item above already surfaces it; the
                 // status bar is reserved for low-frequency, meaningful state.
+                //
+                // #334 (Phase 2 live fix): the detail view fetches output once on
+                // open, but a just-completed background child's full output lands
+                // on the server AFTER the peek opened (the mirror runs on the
+                // terminal transition). Without a re-fetch the detail view stays
+                // on the "no output" placeholder. When an `agent/updated` arrives
+                // for the agent CURRENTLY shown in the peek, re-issue
+                // `agent/output/read` so its final output appears. Scoped to the
+                // viewed agent, so this never churns during a multi-agent turn.
+                if matches!(
+                    &self.state.chat_view,
+                    crate::model::ChatViewTarget::Agent(viewed) if viewed == &event.agent.agent_id
+                ) {
+                    return self.agent_view_output_fetch_command();
+                }
                 None
             }
             UiNotification::AgentOutputDelta(event) => {
@@ -28296,6 +28311,40 @@ mod tests {
         assert_eq!(mirror.agents.len(), 1);
         assert_eq!(mirror.agents[0].agent_id, "ag-1");
         assert_eq!(mirror.agents[0].status, "running");
+    }
+
+    /// #334 (Phase 2 live fix): a just-completed background child's full output
+    /// lands on the server after the peek opened, so the detail view must
+    /// RE-FETCH when an `agent/updated` arrives for the agent currently shown.
+    /// An update for a DIFFERENT (or no) viewed agent must NOT trigger a fetch.
+    #[test]
+    fn agent_update_for_viewed_agent_refetches_output() {
+        use octos_core::ui_protocol::AgentUpdatedEvent;
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+
+        let updated = |store: &mut Store, id: &str, status: &str| -> Option<AppUiCommand> {
+            store.apply_event(AppUiEvent::Protocol(UiNotification::AgentUpdated(
+                AgentUpdatedEvent {
+                    session_id: session_id.clone(),
+                    agent: terminal_strip_agent(id, status),
+                },
+            )))
+        };
+
+        // Not viewing an agent → an update triggers no fetch.
+        store.state.chat_view = crate::model::ChatViewTarget::Main;
+        assert!(updated(&mut store, "ag-1", "completed").is_none());
+
+        // Viewing ag-1: an update for a DIFFERENT agent → no fetch.
+        store.state.chat_view = crate::model::ChatViewTarget::Agent("ag-1".into());
+        assert!(updated(&mut store, "ag-2", "completed").is_none());
+
+        // An update for the VIEWED agent → re-fetch its output.
+        match updated(&mut store, "ag-1", "completed") {
+            Some(AppUiCommand::ReadAgentOutput(params)) => assert_eq!(params.agent_id, "ag-1"),
+            other => panic!("expected ReadAgentOutput for the viewed agent, got {other:?}"),
+        }
     }
 
     /// Stuck-chip safety net: a spawn_only background task that outlives its
