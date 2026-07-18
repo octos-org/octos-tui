@@ -656,7 +656,7 @@ pub fn finalized_history_lines_range(
             .iter()
             .filter(|(anchor_idx, _)| *anchor_idx == idx)
         {
-            push_turn_activity_log_section(&mut lines, palette, log, app, false, wrap_width);
+            push_turn_activity_log_section(&mut lines, palette, log, app, false, true, wrap_width);
         }
     }
     // Scrollback content must render on the terminal's NATIVE background, not the
@@ -795,7 +795,9 @@ pub fn finalized_history_lines_range_dedup_live(
                     &mut lines, palette, log, app, coverage, wrap_width,
                 );
             } else {
-                push_turn_activity_log_section(&mut lines, palette, log, app, false, wrap_width);
+                push_turn_activity_log_section(
+                    &mut lines, palette, log, app, false, true, wrap_width,
+                );
             }
         }
     }
@@ -3378,7 +3380,9 @@ fn transcript_render_model(app: &AppState, palette: Palette, area: Rect) -> Tran
                 .iter()
                 .filter(|(anchor_idx, _)| *anchor_idx == idx)
             {
-                push_turn_activity_log_section(&mut lines, palette, log, app, true, wrap_width);
+                push_turn_activity_log_section(
+                    &mut lines, palette, log, app, true, false, wrap_width,
+                );
             }
 
             if turn_flow_visible && Some(idx) == latest_user_index {
@@ -6547,6 +6551,7 @@ fn push_turn_activity_log_section(
     log: &TurnActivityLog,
     app: &AppState,
     collapse_settled: bool,
+    finalized: bool,
     wrap_width: usize,
 ) {
     let summary = app.turn_summary_for(&log.turn_id);
@@ -6570,15 +6575,36 @@ fn push_turn_activity_log_section(
             .rev()
             .copied()
             .collect::<Vec<_>>();
+        // A FINALIZED render targets IMMUTABLE scrollback, so it must record the
+        // turn's OWN terminal outcome — never the volatile cross-turn sub-agent
+        // status. A settled turn whose spawned sub-agents are still running would
+        // otherwise be flushed as "Orchestrating… N running" and STRAND frozen
+        // there (append-only scrollback can't be reclaimed): it keeps lying
+        // "N sub-agent(s) running" after the sub-agent finished, and a menu-toggle
+        // reflush strands a second such copy above the live chip (validated on
+        // mini5). The live aggregate chip at the bottom of the viewport carries
+        // the current sub-agent status; scrollback keeps only the parent turn's
+        // terminal state.
+        let live_subagent_titles = if finalized {
+            Vec::new()
+        } else {
+            running_subagent_titles_for_chip(app, Some(&log.turn_id))
+        };
+        let pending_continuations = if finalized {
+            0
+        } else {
+            active_session_pending_continuations(app)
+        };
+        let is_active = !finalized && is_active_group(app, Some(&log.turn_id));
         push_agent_task_group(
             lines,
             palette,
             Some(&log.turn_id),
             &full,
             &shown,
-            &running_subagent_titles_for_chip(app, Some(&log.turn_id)),
-            active_session_pending_continuations(app),
-            is_active_group(app, Some(&log.turn_id)),
+            &live_subagent_titles,
+            pending_continuations,
+            is_active,
             app.expanded_tool_outputs,
             collapse_settled,
             wrap_width,
@@ -14801,6 +14827,79 @@ mod tests {
         assert!(
             !text.contains("Agent task completed"),
             "chip must NOT report completed while sub-agents run: {text:?}"
+        );
+    }
+
+    #[test]
+    fn finalized_scrollback_render_of_subagent_live_turn_is_terminal_not_orchestrating() {
+        // mini5 residual (the second face of the "duplicated orchestrating" bug):
+        // a SETTLED turn whose spawned sub-agents are still running must not be
+        // flushed into IMMUTABLE scrollback as "Orchestrating… N running". That
+        // copy strands frozen (append-only scrollback can't be reclaimed): it
+        // keeps lying "N sub-agent(s) running" after the sub-agent finishes, and
+        // a menu-toggle reflush strands a second such copy above the live chip.
+        // The FINALIZED render records only the parent turn's terminal outcome;
+        // the live aggregate chip carries the volatile sub-agent status.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("launch agents to study X, Y, Z")],
+                tasks: vec![crate::model::TaskView {
+                    id: octos_core::TaskId::new(),
+                    title: "hermes-research".into(),
+                    state: TaskRuntimeState::Running,
+                    runtime_detail: None,
+                    output_tail: String::new(),
+                    turn_id: None,
+                }],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_id.clone(),
+            request: Some("launch agents".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "spawn", "complete")
+                    .with_turn(turn_id)
+                    .with_success(true),
+            ],
+        });
+
+        // The LIVE render still surfaces the running sub-agent (unchanged path).
+        assert!(
+            rendered_text(&app).contains("Orchestrating"),
+            "the live chip must still show sub-agent progress"
+        );
+
+        // The FINALIZED (scrollback) render must be terminal — no volatile status
+        // that would freeze into append-only history.
+        let flushed: String =
+            finalized_history_lines(&app, Palette::for_theme(ThemeName::Slate), 100)
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect();
+        assert!(
+            !flushed.contains("Orchestrating"),
+            "immutable scrollback must not bake in the volatile Orchestrating status: {flushed:?}"
+        );
+        assert!(
+            !flushed.contains("sub-agent(s) running"),
+            "scrollback must not strand a running-count that freezes: {flushed:?}"
+        );
+        assert!(
+            flushed.contains("Agent task completed"),
+            "the flushed turn-card records the parent turn's terminal outcome: {flushed:?}"
         );
     }
 
