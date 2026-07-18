@@ -749,6 +749,23 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
+    // macOS Terminal.app without "Use Option as Meta key" sends Option+letter
+    // as a Unicode char with no modifier instead of Char(letter)+ALT. Remap
+    // the chars that have Alt+letter bindings so they reach their handlers
+    // rather than falling through to handle_plain_key as literal composer text.
+    if key.modifiers.is_empty() {
+        let mapped = match key.code {
+            KeyCode::Char('©') => Some('g'), // Option+G → Alt+G (agent dock)
+            KeyCode::Char('å') => Some('a'), // Option+A → Alt+A (recovery)
+            KeyCode::Char('∆') => Some('j'), // Option+J → Alt+J (move down)
+            KeyCode::Char('˚') => Some('k'), // Option+K → Alt+K (move up)
+            _ => None,
+        };
+        if let Some(ch) = mapped {
+            return handle_key(store, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT));
+        }
+    }
+
     if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
         return handle_plain_key(store, key);
     }
