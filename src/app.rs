@@ -3799,7 +3799,23 @@ fn push_turn_flow(
         }
     }
 
-    push_activity_section_with_finalization(lines, palette, app, live_finalization, width);
+    // While a reserved-row menu (slash/command popup, model picker, …) is open
+    // it squeezes the live tail down to its `Constraint::Min(1)` floor, so the
+    // in-flight activity chip renders as a single truncated "⣾ Orchestrating…"
+    // HEADER row (no sub-agent child line). On the menu-open viewport GROW the
+    // terminal scrolls that squeezed header up into REAL scrollback, where the
+    // menu-close `clear_visible_screen` (`CSI 2J`) cannot reclaim it — leaving a
+    // frozen, one-spinner-frame-behind duplicate stranded above the fresh live
+    // chip (user report: "duplicated orchestrating after slash commands"; the
+    // two chips carry the same turn id but different braille glyphs). The scroll
+    // itself is a deliberately conservative invariant (see
+    // `viewport_growth_after_width_reset_scrolls_full_deficit` / #232 #267), so
+    // the fix is here, not in the scroll geometry: don't paint the chip while a
+    // menu holds focus. With no squeezed header there is nothing to strand, and
+    // the full chip returns the instant the menu closes.
+    if app.active_menu.is_none() {
+        push_activity_section_with_finalization(lines, palette, app, live_finalization, width);
+    }
 
     if live_turn_diff_preview_visible(app) {
         push_inline_diff_preview(lines, palette, &app.diff_preview, app.expanded_tool_outputs);
@@ -15272,6 +15288,68 @@ mod tests {
         assert!(
             text.contains("Orchestrating"),
             "the active turn's in-flight work must still read as Orchestrating: {text:?}"
+        );
+    }
+
+    #[test]
+    fn open_menu_suppresses_the_live_orchestrating_chip() {
+        // "Duplicated orchestrating after slash commands": opening a reserved-row
+        // menu squeezes the live tail to its 1-row floor, so the in-flight chip
+        // renders as a lone truncated "Orchestrating…" header. The menu-open
+        // viewport grow can scroll that squeezed header into real scrollback
+        // where the menu-close clear can't reclaim it, stranding a frozen
+        // duplicate above the fresh chip. The fix suppresses the chip while a
+        // menu holds focus — with no squeezed header there is nothing to strand.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id,
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run the live job")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: String::new(),
+                }),
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                .with_turn(turn_id)
+                .with_tool_call("call-live"),
+        );
+
+        // Baseline: no menu → the active turn reads as Orchestrating.
+        assert!(
+            rendered_text(&app).contains("Orchestrating"),
+            "baseline: the in-flight chip must show while no menu is open"
+        );
+
+        // Open a reserved-row menu (a slash/command popup is `app.active_menu`).
+        app.menu_stack.open("slash.test");
+        app.active_menu = Some(crate::menu::MenuBuildResult::ready(
+            crate::menu::MenuSpec::new(
+                "slash.test",
+                "Slash test",
+                crate::menu::MenuMode::SingleSelect,
+            )
+            .with_items(vec![crate::menu::MenuItem::new(
+                "slash.item.0",
+                "Item 0",
+                crate::menu::MenuAction::Noop,
+            )]),
+        ));
+
+        // With the menu open the strandable squeezed chip is not painted.
+        assert!(
+            !rendered_text(&app).contains("Orchestrating"),
+            "the live chip must be suppressed while a menu holds focus (nothing to strand)"
         );
     }
 
