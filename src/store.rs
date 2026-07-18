@@ -9441,8 +9441,23 @@ impl Store {
                 .with_detail(detail),
         );
         let mut picker = UserQuestionPickerState::from_event(event);
-        picker.visible = self.state.user_question_auto_open;
+        // A newly-arriving question is a HARD block: the turn is paused at the
+        // tool boundary until it's answered, so it must be immediately visible
+        // and answerable. Previously `visible` tracked `user_question_auto_open`,
+        // so a question could arrive HIDDEN — and if the user was viewing a
+        // sub-agent (Tab peek), the peek owned the keyboard and swallowed every
+        // key except the obscure Alt+A recovery, so the user could not answer
+        // and their answers never reached the model. Force it visible and mark
+        // auto-open so the peek yields to it.
+        picker.visible = true;
+        self.state.user_question_auto_open = true;
         self.state.user_question = Some(picker);
+        // A mid-turn question must interrupt whatever the main pane is showing:
+        // exit any sub-agent peek so the picker owns the screen and its keys
+        // reach `handle_user_question_key`, not `handle_agent_peek_key`.
+        if matches!(self.state.chat_view, crate::model::ChatViewTarget::Agent(_)) {
+            self.state.set_chat_view(crate::model::ChatViewTarget::Main);
+        }
         self.state.focus = FocusPane::Composer;
         self.state.set_run_state_blocked(title.clone());
         self.state.status = t!("status.question_asked", title = title).into_owned();
@@ -24141,6 +24156,40 @@ mod tests {
         let picker = store.state.user_question.as_ref().expect("still pending");
         assert!(!picker.visible);
         assert!(!store.state.user_question_auto_open);
+    }
+
+    /// A mid-turn question arriving while the user is viewing a sub-agent (Tab
+    /// peek) must INTERRUPT the peek: it shows visibly and exits the peek, so its
+    /// keys reach the question handler instead of being swallowed by the peek.
+    /// (Regression: a hidden picker + an active peek trapped the user — only the
+    /// obscure Alt+A recovered it — so answers never reached the model.)
+    #[test]
+    fn arriving_question_interrupts_a_sub_agent_peek() {
+        let mut store = store_with_empty_session();
+        // Simulate the pre-question state: auto-open OFF (so a naive picker would
+        // arrive hidden) and the main pane peeking a sub-agent.
+        store.state.user_question_auto_open = false;
+        store.state.chat_view = crate::model::ChatViewTarget::Agent("review-agent".into());
+
+        open_user_question(
+            &mut store,
+            vec![single_select(
+                "Q",
+                "?",
+                vec![option("a", ""), option("b", "")],
+            )],
+        );
+
+        let picker = store.state.user_question.as_ref().expect("picker present");
+        assert!(
+            picker.visible,
+            "a blocking mid-turn question must be visible, not hidden behind the peek"
+        );
+        assert_eq!(
+            store.state.chat_view,
+            crate::model::ChatViewTarget::Main,
+            "the arriving question must exit the sub-agent peek so its keys are not swallowed"
+        );
     }
 
     #[test]
