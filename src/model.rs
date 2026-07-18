@@ -7424,6 +7424,31 @@ impl AppState {
             .any(|id| id == agent_id)
     }
 
+    /// #335 (Phase 3): clear the whole unseen set for the active session. Opening
+    /// the `/ps` dock — a list that shows every sub-agent's terminal outcome —
+    /// counts as "seen", the same way peeking one agent clears its badge in
+    /// `set_chat_view`. Without this, a completed chip that finished off-screen
+    /// stays exempt from the 60s terminal sweep (`sweep_terminal_agents`) even
+    /// after the user has plainly seen it in the dock — the "completed task
+    /// lingers until the next Tab" report. Returns true if anything was cleared.
+    pub fn mark_active_session_agents_seen(&mut self) -> bool {
+        let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
+            return false;
+        };
+        let Some(autonomy) = self
+            .session_autonomy
+            .iter_mut()
+            .find(|autonomy| autonomy.session_id == session_id)
+        else {
+            return false;
+        };
+        if autonomy.unseen.is_empty() {
+            return false;
+        }
+        autonomy.unseen.clear();
+        true
+    }
+
     /// The cached streamed output for a sub-agent of the active session, if
     /// any has arrived. This is the flat text the backend exposes for a worker
     /// (`agent/output/*`) — a running log, not a turn-by-turn transcript, since

@@ -38,6 +38,9 @@ pub fn render(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
         // holds the real chat is never touched. Tab/Shift+Tab/Esc restore it.
         render_agent_overlay(frame, app, palette);
         return;
+    } else if app.focus == FocusPane::Tasks {
+        // #337: `/ps` gets a dedicated two-pane dock, not the full inspector.
+        render_tasks_dock_layout(frame, app, palette);
     } else if inspector_visible(app) {
         render_inspector_layout(frame, app, palette);
     } else {
@@ -2424,6 +2427,56 @@ fn render_inspector_layout(frame: &mut impl FrameLike, app: &AppState, palette: 
     frame.render_widget(render_status(app, palette), root[5]);
 }
 
+/// #337: the dedicated `/ps` dock — a focused two-pane layout (a full-height
+/// Tasks/sub-agents dock on the left + the transcript on the right) instead of
+/// the busy six-pane `render_inspector_layout`. `/ps` is the only way to reach
+/// `FocusPane::Tasks` (Tab no longer cycles panes), so a clean task dashboard is
+/// what the user asked for there; the other panes (Sessions/Artifacts/Workspace/
+/// Git, reachable via `!cmd`) still use the full inspector grid.
+fn render_tasks_dock_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
+    let composer_height = composer_height_for_size(app, frame.area().width, frame.area().height);
+    let active_menu = active_menu_surface(app);
+    let menu_height = menu_height_hint(
+        active_menu.as_ref(),
+        frame.area().width,
+        frame.area().height,
+    );
+    let autonomy_height = autonomy_indicator_height(app);
+    let harness_height = harness_status_height(app);
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(12),
+            Constraint::Length(menu_height),
+            Constraint::Length(autonomy_height),
+            Constraint::Length(harness_height),
+            Constraint::Length(composer_height),
+            Constraint::Length(4),
+        ])
+        .split(frame.area());
+
+    // Two columns: a wide, full-height Tasks dock + the transcript.
+    let upper = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .split(root[0]);
+
+    frame.render_widget(render_tasks(app, palette), upper[0]);
+    frame.render_widget(render_transcript(app, palette, upper[1]), upper[1]);
+    if let Some(menu) = active_menu.as_ref() {
+        menu_render::render_menu_surface(frame, root[1], menu, palette);
+    }
+    if autonomy_height > 0 {
+        frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
+    }
+    if harness_height > 0 {
+        render_harness_status_row(frame, app, palette, root[3]);
+    }
+    frame.render_widget(render_composer(app, palette, root[4]), root[4]);
+    set_composer_cursor(frame, app, root[4]);
+    frame.render_widget(render_status(app, palette), root[5]);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActivityNavigatorAreas {
     pub toolbar: Rect,
@@ -2557,6 +2610,39 @@ fn agent_overlay_lines(app: &AppState, palette: Palette, agent_id: &str) -> Vec<
                 t!("app.hint.agent_task_prefix", task = task).into_owned(),
                 palette.muted(),
             )));
+        }
+        if let Some(cwd) = agent
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            lines.push(Line::from(Span::styled(
+                format!("cwd: {cwd}"),
+                palette.muted(),
+            )));
+        }
+        // #334 (Phase 2): surface the child's DELIVERABLES (the `*-review.md` /
+        // analysis files it wrote) from the roster record's artifacts, so the
+        // detail view shows what the sub-agent produced, not just its log.
+        if !agent.artifacts.is_empty() {
+            lines.push(Line::from(Span::styled(
+                t!("app.hint.agent_deliverables").into_owned(),
+                palette.title(),
+            )));
+            for artifact in &agent.artifacts {
+                let title = artifact.title.trim();
+                let title = if title.is_empty() {
+                    artifact.id.as_str()
+                } else {
+                    title
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  • ", palette.muted()),
+                    Span::styled(title.to_string(), palette.text()),
+                    Span::styled(format!("  [{}]", artifact.kind), palette.muted()),
+                ]));
+            }
         }
         lines.push(Line::from(String::new()));
     }
@@ -2760,6 +2846,16 @@ fn status_style(status: ActivityNavigatorStatus, palette: Palette) -> Style {
     }
 }
 
+/// Whether a slash/command menu surface is active this frame — i.e. the chat
+/// layout is reserving a `menu_height` row block (see `render_chat_layout` /
+/// `render_viewport_with_finalization`). The inline draw loop tracks the
+/// open→closed transition of this predicate to repaint the rows the menu block
+/// vacated (a shrinking reserved block otherwise strands the transcript above a
+/// blank band).
+pub fn menu_surface_active(app: &AppState) -> bool {
+    active_menu_surface(app).is_some()
+}
+
 fn active_menu_surface(app: &AppState) -> Option<menu_render::MenuSurface> {
     let frame = app.menu_stack.active();
     let stack_path = app
@@ -2952,14 +3048,85 @@ fn render_sessions(app: &AppState, palette: Palette) -> List<'static> {
 
 fn render_tasks(app: &AppState, palette: Palette) -> Paragraph<'static> {
     let mut lines = Vec::new();
+
+    // #333 (Phase 1): the pane `/ps` opens must surface the LIVE sub-agent
+    // roster (`session_autonomy[].agents`, kept current by `agent/updated`),
+    // not only the older `session.tasks` cache. A background spawn populates the
+    // roster; rendering it here is what makes `/ps` a live background-task view
+    // instead of a stale side-panel. The roster re-renders every frame from the
+    // roster state, so it updates without a manual refresh.
+    let agents = app.active_session_agents();
+    if !agents.is_empty() {
+        lines.push(Line::from(Span::styled(
+            t!("app.pane.tasks_subagents").to_string(),
+            palette.title(),
+        )));
+        for agent in agents {
+            let glyph = agent_status_glyph(&agent.status);
+            let name = {
+                let n = agent.nickname.trim();
+                if n.is_empty() {
+                    agent.agent_id.clone()
+                } else {
+                    n.to_string()
+                }
+            };
+            let mut spans = vec![
+                Span::styled(format!("  {glyph} "), palette.text()),
+                Span::styled(name, palette.text()),
+                Span::styled(format!("  {}", agent.status), palette.muted()),
+            ];
+            if let Some(elapsed) = agent_elapsed_label(agent) {
+                spans.push(Span::styled(format!("  {elapsed}"), palette.muted()));
+            }
+            lines.push(Line::from(spans));
+            let detail = agent
+                .last_task
+                .as_deref()
+                .or(agent.summary.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if let Some(detail) = detail {
+                lines.push(Line::from(Span::styled(
+                    format!("      {}", truncate_to_display_width(detail, 72)),
+                    palette.muted(),
+                )));
+            }
+        }
+        lines.push(Line::from(Span::raw("")));
+    }
+
+    // #338: a background spawn appears in BOTH the roster (shown above) and the
+    // legacy `session.tasks` cache. Skip the tasks already represented as
+    // sub-agents (matched by task id) so each spawn shows once; non-agent tasks
+    // (e.g. `spawn_only` pipeline tools that never become roster agents) still
+    // render below.
+    let roster_task_ids: std::collections::HashSet<&str> = agents
+        .iter()
+        .filter_map(|agent| agent.task_id.as_deref())
+        .collect();
     if let Some(session) = app.active_session() {
-        if session.tasks.is_empty() {
-            lines.push(Line::from(Span::styled(
-                t!("app.empty.no_tasks").to_string(),
-                palette.muted(),
-            )));
+        let non_roster_tasks: Vec<(usize, &crate::model::TaskView)> = session
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| !roster_task_ids.contains(task.id.0.to_string().as_str()))
+            .collect();
+        if non_roster_tasks.is_empty() {
+            if agents.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    t!("app.empty.no_tasks").to_string(),
+                    palette.muted(),
+                )));
+            }
         } else {
-            for (idx, task) in session.tasks.iter().enumerate() {
+            if !agents.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    t!("app.pane.tasks_other").to_string(),
+                    palette.title(),
+                )));
+            }
+            for (idx, task) in non_roster_tasks {
                 let marker = if idx == app.selected_task { "›" } else { " " };
                 let style = if idx == app.selected_task {
                     palette.selected()
@@ -3632,7 +3799,23 @@ fn push_turn_flow(
         }
     }
 
-    push_activity_section_with_finalization(lines, palette, app, live_finalization, width);
+    // While a reserved-row menu (slash/command popup, model picker, …) is open
+    // it squeezes the live tail down to its `Constraint::Min(1)` floor, so the
+    // in-flight activity chip renders as a single truncated "⣾ Orchestrating…"
+    // HEADER row (no sub-agent child line). On the menu-open viewport GROW the
+    // terminal scrolls that squeezed header up into REAL scrollback, where the
+    // menu-close `clear_visible_screen` (`CSI 2J`) cannot reclaim it — leaving a
+    // frozen, one-spinner-frame-behind duplicate stranded above the fresh live
+    // chip (user report: "duplicated orchestrating after slash commands"; the
+    // two chips carry the same turn id but different braille glyphs). The scroll
+    // itself is a deliberately conservative invariant (see
+    // `viewport_growth_after_width_reset_scrolls_full_deficit` / #232 #267), so
+    // the fix is here, not in the scroll geometry: don't paint the chip while a
+    // menu holds focus. With no squeezed header there is nothing to strand, and
+    // the full chip returns the instant the menu closes.
+    if app.active_menu.is_none() {
+        push_activity_section_with_finalization(lines, palette, app, live_finalization, width);
+    }
 
     if live_turn_diff_preview_visible(app) {
         push_inline_diff_preview(lines, palette, &app.diff_preview, app.expanded_tool_outputs);
@@ -8648,7 +8831,7 @@ pub(crate) fn context_window_usage(app: &AppState, session_id: &SessionKey) -> O
         .get(session_id)
         .copied()
         .filter(|w| *w > 0)
-        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS as u64);
+        .unwrap_or_else(|| model_context_window_hint(app, session_id));
     Some((used, window))
 }
 
@@ -8669,8 +8852,7 @@ fn harness_context_ratio(app: &AppState) -> Option<f64> {
         .get(&session.id)
         .copied()
         .filter(|w| *w > 0)
-        .map(|w| w as usize)
-        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
+        .unwrap_or_else(|| model_context_window_hint(app, &session.id)) as usize;
     if window == 0 {
         return None;
     }
@@ -8918,6 +9100,13 @@ fn render_harness_status_row(
 /// (the footer then shows only the cwd).
 fn composer_footer_model(app: &AppState) -> Option<String> {
     let session_id = &app.active_session()?.id;
+    session_model_id(app, session_id)
+}
+
+/// The active model id for a session — from the runtime status, else the
+/// selected model in the catalog. Shared by the footer and the model-aware
+/// context-window fallback ([`model_context_window_hint`]).
+fn session_model_id(app: &AppState, session_id: &SessionKey) -> Option<String> {
     let from_status = app.runtime_status_for(session_id).and_then(|status| {
         status
             .model
@@ -8942,6 +9131,35 @@ fn composer_footer_model(app: &AppState) -> Option<String> {
         })
         .map(|model| model.trim().to_string())
         .filter(|model| !model.is_empty())
+}
+
+/// A model-aware context-window fallback denominator for the `ctx N%` gauge,
+/// used ONLY until the first `token_cost` update carries the real per-model
+/// window (`session_context_window`). Mirrors the octos server's
+/// `context::context_window_tokens` heuristic for the well-known long-context
+/// models, so a fresh MiniMax-M3 / DeepSeek-V4 / Kimi-K3 / GLM session shows its
+/// real ~1M window instead of the generic 128K placeholder. The authoritative
+/// server value still takes over on the first turn; this only fixes the
+/// pre-first-turn display. Unknown models keep the conservative 128K default.
+fn model_context_window_hint(app: &AppState, session_id: &SessionKey) -> u64 {
+    let Some(model) = session_model_id(app, session_id) else {
+        return DEFAULT_CONTEXT_WINDOW_TOKENS as u64;
+    };
+    let m = model.to_ascii_lowercase();
+    // Bare `k3` / `kimi-for-coding*` are the Kimi coding plan's K3 ids — 1M, like
+    // `kimi-k3` (which they don't contain). Mirrors the server heuristic.
+    if m.contains("deepseek-v4")
+        || m.contains("minimax-m3")
+        || m.contains("kimi-k3")
+        || m == "k3"
+        || m.starts_with("kimi-for-coding")
+    {
+        1_048_576
+    } else if m.contains("glm") || m.contains("minimax") {
+        1_000_000
+    } else {
+        DEFAULT_CONTEXT_WINDOW_TOKENS as u64
+    }
 }
 
 fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
@@ -11772,6 +11990,50 @@ mod tests {
         assert!(!text.contains("INFO calling LLM"));
         assert!(!text.contains("parallel_tools"));
         assert!(!text.contains("tool_ids="));
+    }
+
+    /// #337: `/ps` (focus == Tasks) renders the dedicated two-pane DOCK — the
+    /// Tasks pane + transcript only — NOT the busy six-pane inspector. So the
+    /// Tasks pane shows, but the Workspace/Git panes do not.
+    #[test]
+    fn ps_focus_renders_dedicated_dock_not_full_inspector() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::system("ready")],
+                tasks: vec![crate::model::TaskView {
+                    id: octos_core::TaskId::new(),
+                    title: "pipeline task".into(),
+                    state: TaskRuntimeState::Running,
+                    runtime_detail: None,
+                    output_tail: String::new(),
+                    turn_id: None,
+                }],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.focus = FocusPane::Tasks; // what `/ps` sets
+
+        let text = rendered_text(&app);
+
+        // The dock shows the Tasks pane + transcript...
+        assert!(text.contains("Tasks"), "dock must show the Tasks pane");
+        assert!(text.contains("pipeline task"), "dock must list the task");
+        // ...but NOT the other inspector panes.
+        assert!(
+            !text.contains("Workspace"),
+            "the /ps dock must not show the Workspace pane; got:\n{text}"
+        );
+        assert!(
+            !text.contains("Git  status"),
+            "the /ps dock must not show the Git pane; got:\n{text}"
+        );
     }
 
     #[test]
@@ -15030,6 +15292,68 @@ mod tests {
     }
 
     #[test]
+    fn open_menu_suppresses_the_live_orchestrating_chip() {
+        // "Duplicated orchestrating after slash commands": opening a reserved-row
+        // menu squeezes the live tail to its 1-row floor, so the in-flight chip
+        // renders as a lone truncated "Orchestrating…" header. The menu-open
+        // viewport grow can scroll that squeezed header into real scrollback
+        // where the menu-close clear can't reclaim it, stranding a frozen
+        // duplicate above the fresh chip. The fix suppresses the chip while a
+        // menu holds focus — with no squeezed header there is nothing to strand.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id,
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run the live job")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: String::new(),
+                }),
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                .with_turn(turn_id)
+                .with_tool_call("call-live"),
+        );
+
+        // Baseline: no menu → the active turn reads as Orchestrating.
+        assert!(
+            rendered_text(&app).contains("Orchestrating"),
+            "baseline: the in-flight chip must show while no menu is open"
+        );
+
+        // Open a reserved-row menu (a slash/command popup is `app.active_menu`).
+        app.menu_stack.open("slash.test");
+        app.active_menu = Some(crate::menu::MenuBuildResult::ready(
+            crate::menu::MenuSpec::new(
+                "slash.test",
+                "Slash test",
+                crate::menu::MenuMode::SingleSelect,
+            )
+            .with_items(vec![crate::menu::MenuItem::new(
+                "slash.item.0",
+                "Item 0",
+                crate::menu::MenuAction::Noop,
+            )]),
+        ));
+
+        // With the menu open the strandable squeezed chip is not painted.
+        assert!(
+            !rendered_text(&app).contains("Orchestrating"),
+            "the live chip must be suppressed while a menu holds focus (nothing to strand)"
+        );
+    }
+
+    #[test]
     fn subagents_attributed_per_turn_not_double_counted() {
         // C5 regression: two turns each spawn sub-agents. Before C1's `turn_id`
         // landed on the task wire, `running_subagent_titles_for_chip` returned the
@@ -16796,6 +17120,124 @@ mod tests {
         }
     }
 
+    /// #333 (Phase 1): the Tasks pane that `/ps` opens must surface the LIVE
+    /// sub-agent roster, not only the old `session.tasks` cache. Renders
+    /// `render_tasks` into a buffer and asserts a spawned sub-agent's nickname +
+    /// running glyph appear even though `session.tasks` is empty.
+    #[test]
+    fn tasks_pane_renders_live_subagent_roster() {
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        let mut agent = sample_agent("security-review", "running");
+        agent.nickname = "security-review".into();
+        agent.last_task = Some("Review the octos codebase for SSRF".into());
+        app.upsert_session_agent(&sid, agent);
+
+        // Sanity: the task cache is empty, so pre-#333 this pane showed nothing.
+        assert!(app.active_session().unwrap().tasks.is_empty());
+        assert_eq!(app.active_session_agents().len(), 1);
+
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buffer = Buffer::empty(area);
+        ratatui::widgets::Widget::render(render_tasks(&app, palette), area, &mut buffer);
+        let text = rendered_rows(&buffer).join("\n");
+
+        assert!(
+            text.contains("security-review"),
+            "sub-agent nickname must render in the /ps Tasks pane; got:\n{text}"
+        );
+        assert!(
+            text.contains('⏵'),
+            "running glyph must render for the live sub-agent; got:\n{text}"
+        );
+    }
+
+    /// #334 (Phase 2): the sub-agent detail view (peek) surfaces the child's
+    /// DELIVERABLES from the roster record's artifacts — the `*-review.md` /
+    /// analysis files it wrote — so the detail view shows what the sub-agent
+    /// produced, not just its streamed log.
+    /// #338: a background spawn appears in BOTH the roster and `session.tasks`.
+    /// The Tasks pane must show it ONCE (as a sub-agent), not twice — the task
+    /// whose id matches a roster agent's `task_id` is suppressed from the legacy
+    /// list, while an unrelated (non-agent) task still renders.
+    #[test]
+    fn tasks_pane_dedups_roster_tasks_from_legacy_list() {
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+
+        // A spawn: appears as a roster agent AND a session task with the same id.
+        let shared_task_id = octos_core::TaskId::new();
+        let mut agent = sample_agent("alpha-review", "completed");
+        agent.nickname = "alpha-review".into();
+        agent.task_id = Some(shared_task_id.0.to_string());
+        app.upsert_session_agent(&sid, agent);
+
+        let session = app.active_session_mut().expect("session");
+        session.tasks = vec![
+            crate::model::TaskView {
+                id: shared_task_id, // same spawn as the roster agent → dedup
+                title: "alpha-review".into(),
+                state: TaskRuntimeState::Completed,
+                runtime_detail: None,
+                output_tail: String::new(),
+                turn_id: None,
+            },
+            crate::model::TaskView {
+                id: octos_core::TaskId::new(), // a non-agent pipeline task → keep
+                title: "deep-research-pipeline".into(),
+                state: TaskRuntimeState::Running,
+                runtime_detail: None,
+                output_tail: String::new(),
+                turn_id: None,
+            },
+        ];
+
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buffer = Buffer::empty(area);
+        ratatui::widgets::Widget::render(render_tasks(&app, palette), area, &mut buffer);
+        let text = rendered_rows(&buffer).join("\n");
+
+        // The spawn appears ONCE — as a sub-agent, not repeated in the legacy list.
+        assert_eq!(
+            text.matches("alpha-review").count(),
+            1,
+            "roster spawn must render once, not duplicated; got:\n{text}"
+        );
+        // The non-agent pipeline task still renders below.
+        assert!(
+            text.contains("deep-research-pipeline"),
+            "a non-agent task must still show; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn agent_peek_renders_deliverable_artifacts() {
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        let mut agent = sample_agent("security-review", "completed");
+        agent.artifacts = vec![octos_core::ui_protocol::UiAgentArtifact {
+            id: "art-1".into(),
+            title: "analysis-octos-security.md".into(),
+            kind: "file".into(),
+            status: "ready".into(),
+            path: Some("/tmp/analysis-octos-security.md".into()),
+            content: None,
+            extra: Default::default(),
+        }];
+        app.upsert_session_agent(&sid, agent);
+
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let lines = agent_overlay_lines(&app, palette, "security-review");
+        let text = lines_text(&lines);
+
+        assert!(
+            text.contains("analysis-octos-security.md"),
+            "the peek must list the child's deliverable artifact; got:\n{text}"
+        );
+    }
+
     #[test]
     fn chat_view_selector_cycles_main_then_agents() {
         use crate::model::ChatViewTarget;
@@ -17631,6 +18073,75 @@ mod tests {
         assert_eq!(
             context_window_usage(&app, &session_id),
             Some((64_000, DEFAULT_CONTEXT_WINDOW_TOKENS as u64)),
+        );
+    }
+
+    /// The pre-first-turn fallback window is model-aware: a MiniMax-M3 session
+    /// shows its real ~1M window, not the generic 128K default, before any
+    /// `token_cost` update arrives. An unknown model keeps the 128K default.
+    #[test]
+    fn context_window_fallback_is_model_aware_before_first_cost_update() {
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+        app.context_lifecycle_mut(&session_id).state = Some(crate::model::ContextLifecycleState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: String::new(),
+            item_count: 1,
+            token_estimate: 1_000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        });
+
+        // No model resolved yet → conservative 128K default.
+        assert_eq!(
+            context_window_usage(&app, &session_id),
+            Some((1_000, DEFAULT_CONTEXT_WINDOW_TOKENS as u64)),
+        );
+
+        // MiniMax-M3 → real 1M window, not the 128K placeholder.
+        app.set_runtime_status(runtime_status_with_model_cwd(
+            session_id.clone(),
+            "MiniMax-M3",
+            "/tmp/work",
+        ));
+        let (_, window) = context_window_usage(&app, &session_id).expect("usage");
+        assert!(
+            window >= 1_000_000,
+            "MiniMax-M3 fallback window must be ~1M, got {window}"
+        );
+
+        // The Kimi coding plan's bare `k3` id → 1M, like `kimi-k3`.
+        app.set_runtime_status(runtime_status_with_model_cwd(
+            session_id.clone(),
+            "k3",
+            "/tmp/work",
+        ));
+        let (_, k3_window) = context_window_usage(&app, &session_id).expect("usage");
+        assert!(
+            k3_window >= 1_000_000,
+            "coding-plan k3 fallback window must be ~1M, got {k3_window}"
+        );
+
+        // An unknown model keeps the conservative default.
+        app.set_runtime_status(runtime_status_with_model_cwd(
+            session_id.clone(),
+            "some-tiny-model",
+            "/tmp/work",
+        ));
+        assert_eq!(
+            context_window_usage(&app, &session_id),
+            Some((1_000, DEFAULT_CONTEXT_WINDOW_TOKENS as u64)),
+        );
+
+        // The real per-model window on the wire still wins over the hint.
+        app.session_context_window
+            .insert(session_id.clone(), 500_000);
+        assert_eq!(
+            context_window_usage(&app, &session_id),
+            Some((1_000, 500_000)),
         );
     }
 

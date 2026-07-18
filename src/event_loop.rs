@@ -149,6 +149,11 @@ pub fn run(cli: Cli) -> Result<()> {
     let mut scrollback = ScrollbackTracker::new();
     // Force a draw on the first iteration.
     let mut dirty = true;
+    // Whether the LAST drawn frame reserved a slash/command menu row block. Used
+    // to detect the menu open→closed edge so the frame that reclaims those rows
+    // repaints the transcript over the vacated band (see `draw`). Sampled only
+    // on frames we actually draw, so it tracks what is on screen.
+    let mut menu_reserved_last_frame = false;
     if drain_initial_startup_events(backend.as_mut(), &mut store)? {
         dirty = true;
     }
@@ -168,7 +173,16 @@ pub fn run(cli: Cli) -> Result<()> {
             last_animation = Instant::now();
         }
         if dirty {
-            draw(&mut terminal, &mut guard, &mut store, &mut scrollback)?;
+            let menu_reserved_now = app::menu_surface_active(&store.state);
+            let menu_just_closed = menu_reserved_last_frame && !menu_reserved_now;
+            menu_reserved_last_frame = menu_reserved_now;
+            draw(
+                &mut terminal,
+                &mut guard,
+                &mut store,
+                &mut scrollback,
+                menu_just_closed,
+            )?;
             dirty = false;
         }
 
@@ -266,6 +280,7 @@ fn draw<B>(
     guard: &mut TerminalGuard,
     store: &mut Store,
     scrollback: &mut ScrollbackTracker,
+    menu_just_closed: bool,
 ) -> Result<()>
 where
     B: Backend + io::Write,
@@ -303,6 +318,27 @@ where
 
     let size = terminal.size()?;
     let width = size.width;
+
+    // A slash/command menu is a RESERVED viewport row block (`menu_height` in
+    // `render_viewport_with_finalization`), not a floating overlay. Opening it
+    // grows the bottom-pinned inline viewport, and that grow scrolls whatever
+    // committed transcript sat above the viewport UP into scrollback
+    // (`resize_viewport_to_size` grow path / `insert_history_lines`), updating
+    // the visible-history watermark to the scrolled position. When the menu
+    // CLOSES the viewport shrinks back, but the incremental shrink path clears
+    // only from the OLD (higher) viewport top DOWNWARD — the scrolled-up
+    // transcript is left stranded high on the screen with a `menu_height` blank
+    // band gaping between it and the composer (a plain committed re-flush alone
+    // can't fix it: `insert_history_lines` would append the fresh copy right
+    // below the stranded one, duplicating it). So do exactly what a resize does
+    // for a clean re-render: wipe the visible screen and re-flush the whole
+    // committed transcript flush against the now-shrunk viewport. One frame,
+    // and it only fires on the open→closed edge (see the event loop), so
+    // repeated menu cycles never accumulate blank bands.
+    if menu_just_closed {
+        terminal.clear_visible_screen()?;
+        scrollback.mark_flushed_stale();
+    }
 
     // This frame will take the FULL viewport reset inside
     // `resize_viewport_to` (width change either direction, or terminal-
@@ -1005,8 +1041,20 @@ fn handle_agent_peek_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     }
     match key.code {
         // Cycle to the next / previous target (wrapping through `main`).
-        KeyCode::Tab => store.state.select_next_chat_view(),
-        KeyCode::BackTab => store.state.select_prev_chat_view(),
+        // #334 (Phase 2): after landing on a sub-agent, pull its full output so
+        // the detail view renders `final_output`, not just the streamed tail.
+        KeyCode::Tab => {
+            store.state.select_next_chat_view();
+            if let Some(command) = store.agent_view_output_fetch_command() {
+                return KeyAction::send(command);
+            }
+        }
+        KeyCode::BackTab => {
+            store.state.select_prev_chat_view();
+            if let Some(command) = store.agent_view_output_fetch_command() {
+                return KeyAction::send(command);
+            }
+        }
         // Leave the peek back to the inline chat.
         KeyCode::Esc => {
             store
@@ -1020,6 +1068,13 @@ fn handle_agent_peek_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::PageDown => store.state.scroll_agent_view_down(8),
         KeyCode::Home => store.state.scroll_agent_view_up(usize::MAX),
         KeyCode::End => store.state.scroll_agent_view_down(usize::MAX),
+        // #335 (Phase 3): cancel the viewed sub-agent (no-op if it is already
+        // terminal or the backend can't interrupt).
+        KeyCode::Char('x') => {
+            if let Some(command) = store.interrupt_viewed_agent_command() {
+                return KeyAction::send(command);
+            }
+        }
         // Everything else (text, Enter, Backspace, `/`, Vim keys, …) is swallowed.
         _ => {}
     }
@@ -1088,11 +1143,18 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             if store.state.focus == FocusPane::Composer && !store.state.transcript_pager_active =>
         {
             store.state.select_next_chat_view();
+            // #334 (Phase 2): pull the child's full output when the peek opens.
+            if let Some(command) = store.agent_view_output_fetch_command() {
+                return KeyAction::send(command);
+            }
         }
         KeyCode::BackTab
             if store.state.focus == FocusPane::Composer && !store.state.transcript_pager_active =>
         {
             store.state.select_prev_chat_view();
+            if let Some(command) = store.agent_view_output_fetch_command() {
+                return KeyAction::send(command);
+            }
         }
         // Esc clears a stale peek selection (an `Agent(id)` whose agent has
         // vanished, so `agent_view_active` is false and this handler — not
@@ -1957,6 +2019,16 @@ fn handle_user_question_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::BackTab => store.user_question_back(),
         KeyCode::Backspace => store.user_question_pop_free_text(),
         KeyCode::Enter => {
+            // Navigate + Enter must CHOOSE the highlighted option (only Space
+            // toggled before, so an arrow-key highlight + Enter submitted an
+            // EMPTY answer `[{}]` and the model saw no selection). Refuse to
+            // advance/submit a question with no answer so a stray Enter on an
+            // empty free-text row can never send an empty answer either — the
+            // user picks an option or types, then Enter proceeds.
+            if !store.user_question_commit_highlight() {
+                store.state.status = t!("status.question_needs_answer").into_owned();
+                return KeyAction::Continue;
+            }
             // Stepping through questions; submit only on the final one.
             if store.user_question_advance()
                 && let Some(command) = store.respond_user_question_command()
@@ -3072,6 +3144,52 @@ mod tests {
     }
 
     #[test]
+    fn enter_selects_the_highlighted_option_without_space() {
+        // mini5 "llm questions can not get user inputs": navigating to an option
+        // and pressing Enter (the natural confirm) previously submitted an EMPTY
+        // answer `[{}]` because only Space toggled a selection. A bare Enter must
+        // now CHOOSE the highlighted option. Cursor starts on "axum"; move to
+        // "actix" and press Enter with no Space.
+        let (mut store, question_id) = store_with_visible_user_question();
+
+        handle_key(&mut store, key(KeyCode::Down)); // highlight "actix"
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+        let AppUiCommand::RespondUserQuestion(params) = sent_command(action) else {
+            panic!("expected RespondUserQuestion command");
+        };
+        assert_eq!(params.question_id, question_id);
+        assert_eq!(params.answers.len(), 1);
+        assert_eq!(
+            params.answers[0].selected_labels,
+            vec!["actix".to_string()],
+            "bare Enter must select the highlighted option, not send an empty answer"
+        );
+        assert!(store.state.user_question.is_none());
+    }
+
+    #[test]
+    fn enter_on_empty_free_text_row_refuses_to_submit_an_empty_answer() {
+        // The other half of the fix: a stray Enter on the empty "Other" free-text
+        // row must NOT submit an empty answer — the picker stays open with a hint
+        // so the model never receives `answers:[{}]`.
+        let (mut store, _question_id) = store_with_visible_user_question();
+
+        // Move to the free-text "Other" row (index == options.len()).
+        handle_key(&mut store, key(KeyCode::Down)); // actix
+        handle_key(&mut store, key(KeyCode::Down)); // Other (free-text row)
+
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+        assert!(
+            matches!(action, KeyAction::Continue),
+            "Enter with no answer must not send a command"
+        );
+        assert!(
+            store.state.user_question.is_some(),
+            "the picker must stay open until an answer is given"
+        );
+    }
+
+    #[test]
     fn drain_backend_events_applies_bursts_in_one_tick() {
         let mut backend = FakeBackend::new(vec![
             AppUiEvent::status("one").into(),
@@ -3115,8 +3233,14 @@ mod tests {
             mouse_captured: false,
         };
         let mut scrollback = ScrollbackTracker::new();
-        draw(&mut terminal, &mut guard, &mut store, &mut scrollback)
-            .expect("draw onboarding overlay");
+        draw(
+            &mut terminal,
+            &mut guard,
+            &mut store,
+            &mut scrollback,
+            false,
+        )
+        .expect("draw onboarding overlay");
 
         let written = String::from_utf8_lossy(&terminal.backend().buf);
         assert!(
@@ -3173,8 +3297,14 @@ mod tests {
         };
         let mut scrollback = ScrollbackTracker::new();
 
-        draw(&mut terminal, &mut guard, &mut store, &mut scrollback)
-            .expect("draw active inline frame");
+        draw(
+            &mut terminal,
+            &mut guard,
+            &mut store,
+            &mut scrollback,
+            false,
+        )
+        .expect("draw active inline frame");
 
         let written = String::from_utf8_lossy(&terminal.backend().buf);
         assert_eq!(
@@ -3185,6 +3315,212 @@ mod tests {
         assert!(
             written.contains("cargo clippy --all-targets"),
             "running activity should remain in the live viewport bytes: {written:?}"
+        );
+    }
+
+    #[test]
+    fn menu_close_frame_clears_and_reflushes_committed_transcript() {
+        // A slash menu is a reserved viewport row block: opening it grows the
+        // inline viewport and scrolls the committed transcript up; closing it
+        // shrinks the viewport and, without this fix, strands that transcript
+        // high on screen above a `menu_height` blank band. The close frame must
+        // therefore behave like a resize — clear the visible screen and re-flush
+        // the whole committed transcript flush against the shrunk viewport.
+        let mut store = Store {
+            state: AppState::new(
+                vec![SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "test".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![
+                        Message::user("please answer"),
+                        Message::assistant("reply zztranscriptmarker done"),
+                    ],
+                    tasks: vec![],
+                    live_reply: None,
+                }],
+                0,
+                "Idle".into(),
+                None,
+                false,
+            ),
+        };
+
+        let mut terminal =
+            InlineTerminal::new(RecordingBackend::new(100, 30)).expect("recording terminal");
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+            saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
+            mouse_captured: false,
+        };
+        let mut scrollback = ScrollbackTracker::new();
+
+        // First draw flushes the committed transcript into scrollback.
+        draw(
+            &mut terminal,
+            &mut guard,
+            &mut store,
+            &mut scrollback,
+            false,
+        )
+        .expect("first draw");
+        assert!(
+            String::from_utf8_lossy(&terminal.backend().buf).contains("zztranscriptmarker"),
+            "first draw flushes the committed transcript to scrollback"
+        );
+
+        // A steady-state redraw does NOT re-emit already-flushed committed
+        // history (it lives in scrollback, not the live viewport).
+        let mark = terminal.backend().buf.len();
+        draw(
+            &mut terminal,
+            &mut guard,
+            &mut store,
+            &mut scrollback,
+            false,
+        )
+        .expect("steady redraw");
+        let steady = String::from_utf8_lossy(&terminal.backend().buf[mark..]).into_owned();
+        assert!(
+            !steady.contains("zztranscriptmarker"),
+            "a steady redraw must not re-flush committed history: {steady:?}"
+        );
+
+        // The menu-close frame clears the visible screen and re-flushes the
+        // whole committed transcript so no stranded copy / blank band survives.
+        let mark = terminal.backend().buf.len();
+        let clears_before = terminal.backend().clears.len();
+        draw(&mut terminal, &mut guard, &mut store, &mut scrollback, true)
+            .expect("menu-close draw");
+        let close = String::from_utf8_lossy(&terminal.backend().buf[mark..]).into_owned();
+        assert!(
+            close.contains("zztranscriptmarker"),
+            "the menu-close frame must re-flush the committed transcript: {close:?}"
+        );
+        assert!(
+            terminal.backend().clears[clears_before..].contains(&ClearType::All),
+            "the menu-close frame must clear the visible screen like a resize"
+        );
+    }
+
+    #[test]
+    fn menu_close_frame_does_not_duplicate_orchestrating_chip_during_live_turn() {
+        // Guard for the "two Orchestrating chips on menu-close" report. The
+        // hypothesis was that `mark_flushed_stale()` on the menu-close edge wipes
+        // the live-turn watermark and makes `finalized_live_turn_lines_between`
+        // RE-EMIT the "Orchestrating…" chip into scrollback (a frozen second
+        // copy). This test pins that this does NOT happen: the scrollback flush
+        // never emits the chip, because
+        //   1. `next_live_turn_finalization` only flushes NON-running activity
+        //      (app.rs: `!is_running_activity(item)`), so a running spawn tool
+        //      call is never in the flushed set, and
+        //   2. `push_finalized_activity_items_section` forces `is_active_group =
+        //      false` + empty `subagent_titles`, so `agent_task_group_title`
+        //      resolves to "completed"/"finished with errors", never
+        //      "Orchestrating" (app.rs `push_agent_task_group`).
+        // The live viewport renders exactly one chip; the menu-close frame's
+        // emitted bytes therefore contain "Orchestrating" exactly once.
+        //
+        // NOTE: the ACTUAL reported duplicate (two chips one spinner-frame apart,
+        // the upper one missing its child row) is a TERMINAL-RETAINED / stranded
+        // row, not a re-emitted one — different spinner frames prove the frozen
+        // copy was painted on an earlier frame and kept by the emulator, not
+        // written twice this frame. The `RecordingBackend` here records only the
+        // bytes we EMIT (it models neither a screen grid nor real scrollback —
+        // see insert_history.rs "no vt100 dep"), so it cannot reproduce a
+        // stranded-row artifact; this test only rules the scrollback-flush path
+        // in/out as the cause.
+        let turn_id = TurnId::new();
+        let mut store = Store {
+            state: AppState::new(
+                vec![SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "test".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::user("run a review")],
+                    tasks: vec![],
+                    live_reply: Some(LiveReply {
+                        turn_id: turn_id.clone(),
+                        text: String::new(),
+                    }),
+                }],
+                0,
+                "Thinking".into(),
+                None,
+                false,
+            ),
+        };
+        store.state.set_run_state_in_progress();
+        // A running spawn tool call under the active turn → the live render emits
+        // an "Orchestrating… (1 action(s) · 1 active · turn …)" chip with a
+        // running Spawn child.
+        store.state.push_activity(
+            crate::model::ActivityItem::new(ActivityKind::Tool, "spawn", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-spawn-running")
+                .with_detail("Do a SECURITY + CORRECTNESS review of the module"),
+        );
+
+        let mut terminal =
+            InlineTerminal::new(RecordingBackend::new(100, 30)).expect("recording terminal");
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+            saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
+            mouse_captured: false,
+        };
+        let mut scrollback = ScrollbackTracker::new();
+
+        // Steady draw: establishes the live-turn watermark and paints the single
+        // live "Orchestrating…" chip in the viewport.
+        draw(
+            &mut terminal,
+            &mut guard,
+            &mut store,
+            &mut scrollback,
+            false,
+        )
+        .expect("steady draw");
+
+        // The menu-close frame: clear_visible_screen + mark_flushed_stale +
+        // re-flush. Inspect ONLY the bytes this frame wrote.
+        let mark = terminal.backend().buf.len();
+        draw(&mut terminal, &mut guard, &mut store, &mut scrollback, true)
+            .expect("menu-close draw");
+        let close = String::from_utf8_lossy(&terminal.backend().buf[mark..]).into_owned();
+
+        assert_eq!(
+            close.matches("Orchestrating").count(),
+            1,
+            "the menu-close frame must render the Orchestrating chip exactly once \
+             (a second copy is the frozen/duplicated chip): {close:?}"
+        );
+
+        // Directly assert the flush-level invariant the hypothesis was about:
+        // after `mark_flushed_stale`, the reflushed scrollback lines must NOT
+        // contain the "Orchestrating…" chip (it belongs to the live viewport
+        // only). This is independent of the byte-emit quirks above.
+        let palette = crate::theme::Palette::for_theme(store.state.theme);
+        let mut probe = crate::viewport::ScrollbackTracker::new();
+        let _ = probe.sync(&store.state, palette, 100);
+        probe.mark_flushed_stale();
+        let reflushed = probe.sync(&store.state, palette, 100);
+        let flushed_text = reflushed
+            .lines_to_insert
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(
+            flushed_text.matches("Orchestrating").count(),
+            0,
+            "the menu-close scrollback flush must not re-emit the Orchestrating \
+             chip (running activity is never finalized into scrollback): \
+             {flushed_text:?}"
         );
     }
 
