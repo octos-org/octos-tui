@@ -8805,7 +8805,7 @@ pub(crate) fn context_window_usage(app: &AppState, session_id: &SessionKey) -> O
         .get(session_id)
         .copied()
         .filter(|w| *w > 0)
-        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS as u64);
+        .unwrap_or_else(|| model_context_window_hint(app, session_id));
     Some((used, window))
 }
 
@@ -8826,8 +8826,7 @@ fn harness_context_ratio(app: &AppState) -> Option<f64> {
         .get(&session.id)
         .copied()
         .filter(|w| *w > 0)
-        .map(|w| w as usize)
-        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
+        .unwrap_or_else(|| model_context_window_hint(app, &session.id)) as usize;
     if window == 0 {
         return None;
     }
@@ -9075,6 +9074,13 @@ fn render_harness_status_row(
 /// (the footer then shows only the cwd).
 fn composer_footer_model(app: &AppState) -> Option<String> {
     let session_id = &app.active_session()?.id;
+    session_model_id(app, session_id)
+}
+
+/// The active model id for a session — from the runtime status, else the
+/// selected model in the catalog. Shared by the footer and the model-aware
+/// context-window fallback ([`model_context_window_hint`]).
+fn session_model_id(app: &AppState, session_id: &SessionKey) -> Option<String> {
     let from_status = app.runtime_status_for(session_id).and_then(|status| {
         status
             .model
@@ -9099,6 +9105,28 @@ fn composer_footer_model(app: &AppState) -> Option<String> {
         })
         .map(|model| model.trim().to_string())
         .filter(|model| !model.is_empty())
+}
+
+/// A model-aware context-window fallback denominator for the `ctx N%` gauge,
+/// used ONLY until the first `token_cost` update carries the real per-model
+/// window (`session_context_window`). Mirrors the octos server's
+/// `context::context_window_tokens` heuristic for the well-known long-context
+/// models, so a fresh MiniMax-M3 / DeepSeek-V4 / Kimi-K3 / GLM session shows its
+/// real ~1M window instead of the generic 128K placeholder. The authoritative
+/// server value still takes over on the first turn; this only fixes the
+/// pre-first-turn display. Unknown models keep the conservative 128K default.
+fn model_context_window_hint(app: &AppState, session_id: &SessionKey) -> u64 {
+    let Some(model) = session_model_id(app, session_id) else {
+        return DEFAULT_CONTEXT_WINDOW_TOKENS as u64;
+    };
+    let m = model.to_ascii_lowercase();
+    if m.contains("deepseek-v4") || m.contains("minimax-m3") || m.contains("kimi-k3") {
+        1_048_576
+    } else if m.contains("glm") || m.contains("minimax") {
+        1_000_000
+    } else {
+        DEFAULT_CONTEXT_WINDOW_TOKENS as u64
+    }
 }
 
 fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
@@ -17950,6 +17978,63 @@ mod tests {
         assert_eq!(
             context_window_usage(&app, &session_id),
             Some((64_000, DEFAULT_CONTEXT_WINDOW_TOKENS as u64)),
+        );
+    }
+
+    /// The pre-first-turn fallback window is model-aware: a MiniMax-M3 session
+    /// shows its real ~1M window, not the generic 128K default, before any
+    /// `token_cost` update arrives. An unknown model keeps the 128K default.
+    #[test]
+    fn context_window_fallback_is_model_aware_before_first_cost_update() {
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+        app.context_lifecycle_mut(&session_id).state = Some(crate::model::ContextLifecycleState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: String::new(),
+            item_count: 1,
+            token_estimate: 1_000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        });
+
+        // No model resolved yet → conservative 128K default.
+        assert_eq!(
+            context_window_usage(&app, &session_id),
+            Some((1_000, DEFAULT_CONTEXT_WINDOW_TOKENS as u64)),
+        );
+
+        // MiniMax-M3 → real 1M window, not the 128K placeholder.
+        app.set_runtime_status(runtime_status_with_model_cwd(
+            session_id.clone(),
+            "MiniMax-M3",
+            "/tmp/work",
+        ));
+        let (_, window) = context_window_usage(&app, &session_id).expect("usage");
+        assert!(
+            window >= 1_000_000,
+            "MiniMax-M3 fallback window must be ~1M, got {window}"
+        );
+
+        // An unknown model keeps the conservative default.
+        app.set_runtime_status(runtime_status_with_model_cwd(
+            session_id.clone(),
+            "some-tiny-model",
+            "/tmp/work",
+        ));
+        assert_eq!(
+            context_window_usage(&app, &session_id),
+            Some((1_000, DEFAULT_CONTEXT_WINDOW_TOKENS as u64)),
+        );
+
+        // The real per-model window on the wire still wins over the hint.
+        app.session_context_window
+            .insert(session_id.clone(), 500_000);
+        assert_eq!(
+            context_window_usage(&app, &session_id),
+            Some((1_000, 500_000)),
         );
     }
 
