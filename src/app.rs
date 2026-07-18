@@ -38,6 +38,9 @@ pub fn render(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
         // holds the real chat is never touched. Tab/Shift+Tab/Esc restore it.
         render_agent_overlay(frame, app, palette);
         return;
+    } else if app.focus == FocusPane::Tasks {
+        // #337: `/ps` gets a dedicated two-pane dock, not the full inspector.
+        render_tasks_dock_layout(frame, app, palette);
     } else if inspector_visible(app) {
         render_inspector_layout(frame, app, palette);
     } else {
@@ -2410,6 +2413,56 @@ fn render_inspector_layout(frame: &mut impl FrameLike, app: &AppState, palette: 
     frame.render_widget(render_plan(app, palette), right[0]);
     frame.render_widget(render_workspace(app, palette, right[1].height), right[1]);
     frame.render_widget(render_git(app, palette, right[2].height), right[2]);
+    if let Some(menu) = active_menu.as_ref() {
+        menu_render::render_menu_surface(frame, root[1], menu, palette);
+    }
+    if autonomy_height > 0 {
+        frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
+    }
+    if harness_height > 0 {
+        render_harness_status_row(frame, app, palette, root[3]);
+    }
+    frame.render_widget(render_composer(app, palette, root[4]), root[4]);
+    set_composer_cursor(frame, app, root[4]);
+    frame.render_widget(render_status(app, palette), root[5]);
+}
+
+/// #337: the dedicated `/ps` dock — a focused two-pane layout (a full-height
+/// Tasks/sub-agents dock on the left + the transcript on the right) instead of
+/// the busy six-pane `render_inspector_layout`. `/ps` is the only way to reach
+/// `FocusPane::Tasks` (Tab no longer cycles panes), so a clean task dashboard is
+/// what the user asked for there; the other panes (Sessions/Artifacts/Workspace/
+/// Git, reachable via `!cmd`) still use the full inspector grid.
+fn render_tasks_dock_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
+    let composer_height = composer_height_for_size(app, frame.area().width, frame.area().height);
+    let active_menu = active_menu_surface(app);
+    let menu_height = menu_height_hint(
+        active_menu.as_ref(),
+        frame.area().width,
+        frame.area().height,
+    );
+    let autonomy_height = autonomy_indicator_height(app);
+    let harness_height = harness_status_height(app);
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(12),
+            Constraint::Length(menu_height),
+            Constraint::Length(autonomy_height),
+            Constraint::Length(harness_height),
+            Constraint::Length(composer_height),
+            Constraint::Length(4),
+        ])
+        .split(frame.area());
+
+    // Two columns: a wide, full-height Tasks dock + the transcript.
+    let upper = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .split(root[0]);
+
+    frame.render_widget(render_tasks(app, palette), upper[0]);
+    frame.render_widget(render_transcript(app, palette, upper[1]), upper[1]);
     if let Some(menu) = active_menu.as_ref() {
         menu_render::render_menu_surface(frame, root[1], menu, palette);
     }
@@ -11876,6 +11929,50 @@ mod tests {
         assert!(!text.contains("INFO calling LLM"));
         assert!(!text.contains("parallel_tools"));
         assert!(!text.contains("tool_ids="));
+    }
+
+    /// #337: `/ps` (focus == Tasks) renders the dedicated two-pane DOCK — the
+    /// Tasks pane + transcript only — NOT the busy six-pane inspector. So the
+    /// Tasks pane shows, but the Workspace/Git panes do not.
+    #[test]
+    fn ps_focus_renders_dedicated_dock_not_full_inspector() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::system("ready")],
+                tasks: vec![crate::model::TaskView {
+                    id: octos_core::TaskId::new(),
+                    title: "pipeline task".into(),
+                    state: TaskRuntimeState::Running,
+                    runtime_detail: None,
+                    output_tail: String::new(),
+                    turn_id: None,
+                }],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.focus = FocusPane::Tasks; // what `/ps` sets
+
+        let text = rendered_text(&app);
+
+        // The dock shows the Tasks pane + transcript...
+        assert!(text.contains("Tasks"), "dock must show the Tasks pane");
+        assert!(text.contains("pipeline task"), "dock must list the task");
+        // ...but NOT the other inspector panes.
+        assert!(
+            !text.contains("Workspace"),
+            "the /ps dock must not show the Workspace pane; got:\n{text}"
+        );
+        assert!(
+            !text.contains("Git  status"),
+            "the /ps dock must not show the Git pane; got:\n{text}"
+        );
     }
 
     #[test]
