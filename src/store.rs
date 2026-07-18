@@ -5188,6 +5188,31 @@ impl Store {
         }
     }
 
+    /// Enter behavior: navigate + Enter must CHOOSE the highlighted option, not
+    /// merely submit. Only Space toggled a selection, so an arrow-key highlight
+    /// followed by Enter (the natural "confirm") sent an EMPTY answer — the tool
+    /// result carried `answers:[{}]` and the model saw no selection (mini5 bug:
+    /// "llm questions can not get user inputs"). If the active question has no
+    /// answer yet and the highlight is on a real option row (not the free-text
+    /// "Other" row), select it here. A question already answered via Space or
+    /// free text is left untouched. Returns whether the active question is now
+    /// answered, so the caller can refuse to submit an unanswered question
+    /// rather than send an empty answer.
+    pub fn user_question_commit_highlight(&mut self) -> bool {
+        let Some(entry) = self
+            .state
+            .user_question
+            .as_mut()
+            .and_then(UserQuestionPickerState::active_question_mut)
+        else {
+            return false;
+        };
+        if !entry.has_answer() && entry.cursor < entry.free_text_row() {
+            entry.toggle_cursor();
+        }
+        entry.has_answer()
+    }
+
     /// Append a character into the active question's free-text "Other" box.
     pub fn user_question_push_free_text(&mut self, ch: char) {
         if let Some(entry) = self

@@ -704,6 +704,7 @@ status:
   approval_shown: "Approval shown: %{title}"
   question_progress: "Question %{active}/%{total}"
   question_no_options: "This question has no answerable options; press Esc to dismiss it"
+  question_needs_answer: "Pick an option (↑/↓ then Enter) or type an answer before continuing"
   no_active_question: "No active question to answer"
   answered_question: "Answered question: %{title}"
   no_pending_question: "No pending question to show"
