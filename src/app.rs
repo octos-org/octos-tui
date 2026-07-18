@@ -2846,6 +2846,16 @@ fn status_style(status: ActivityNavigatorStatus, palette: Palette) -> Style {
     }
 }
 
+/// Whether a slash/command menu surface is active this frame — i.e. the chat
+/// layout is reserving a `menu_height` row block (see `render_chat_layout` /
+/// `render_viewport_with_finalization`). The inline draw loop tracks the
+/// open→closed transition of this predicate to repaint the rows the menu block
+/// vacated (a shrinking reserved block otherwise strands the transcript above a
+/// blank band).
+pub fn menu_surface_active(app: &AppState) -> bool {
+    active_menu_surface(app).is_some()
+}
+
 fn active_menu_surface(app: &AppState) -> Option<menu_render::MenuSurface> {
     let frame = app.menu_stack.active();
     let stack_path = app
