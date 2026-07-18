@@ -721,6 +721,63 @@ impl Store {
         }
     }
 
+    /// #334 (Phase 2): when a sub-agent detail view (peek) opens or switches,
+    /// pull the child's FULL output via `agent/output/read` so the detail view
+    /// renders the real `final_output`. A background child streams nothing, so
+    /// without this the peek shows only the "no output" placeholder even though
+    /// the server has the full body (fed from `BackgroundTask.final_output`).
+    /// The result lands via `set_agent_output` and `active_agent_output_or_tail`
+    /// then prefers it over the bounded `output_tail`. Returns `None` when the
+    /// active view is not a sub-agent, the method is unavailable, or there is no
+    /// autonomy session.
+    pub(crate) fn agent_view_output_fetch_command(&mut self) -> Option<AppUiCommand> {
+        let crate::model::ChatViewTarget::Agent(agent_id) = self.state.chat_view.clone() else {
+            return None;
+        };
+        if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_OUTPUT_READ) {
+            return None;
+        }
+        let session_id = self.active_autonomy_session_id()?;
+        Some(AppUiCommand::ReadAgentOutput(
+            crate::model::AgentOutputReadParams {
+                session_id,
+                agent_id,
+                cursor: None,
+            },
+        ))
+    }
+
+    /// #335 (Phase 3): cancel the sub-agent currently shown in the detail view
+    /// (peek) via `agent/interrupt`. Returns `None` when the active view is not
+    /// a sub-agent, the agent is already terminal, the mutating method is
+    /// unavailable, or there is no autonomy session — so a stray `x` never
+    /// fires a spurious interrupt.
+    pub(crate) fn interrupt_viewed_agent_command(&mut self) -> Option<AppUiCommand> {
+        let crate::model::ChatViewTarget::Agent(agent_id) = self.state.chat_view.clone() else {
+            return None;
+        };
+        // Only a running child can be interrupted.
+        let is_terminal = self
+            .state
+            .active_agent_record(&agent_id)
+            .map(|agent| crate::model::agent_status_is_terminal(&agent.status))
+            .unwrap_or(true);
+        if is_terminal {
+            return None;
+        }
+        if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_AGENT_INTERRUPT) {
+            return None;
+        }
+        let session_id = self.active_autonomy_session_id()?;
+        self.state.status = t!("status.interrupt_requested_for", id = agent_id).into_owned();
+        Some(AppUiCommand::InterruptAgent(
+            crate::model::AgentInterruptParams {
+                session_id,
+                agent_id,
+            },
+        ))
+    }
+
     fn dispatch_agents_command(
         &mut self,
         cmd: crate::autonomy::AgentsCommand,
@@ -1213,7 +1270,9 @@ impl Store {
                     Some(agent_id) => crate::model::ChatViewTarget::Agent(agent_id),
                     None => crate::model::ChatViewTarget::Main,
                 });
-                None
+                // #334 (Phase 2): fetch the child's full output on open so the
+                // detail view renders its `final_output`, not just the tail.
+                self.agent_view_output_fetch_command()
             }
             LocalAction::ToggleAgentDock => {
                 self.state.agent_dock_collapsed = !self.state.agent_dock_collapsed;
@@ -4572,6 +4631,11 @@ impl Store {
         .into_owned();
 
         self.state.focus = FocusPane::Tasks;
+        // #335 (Phase 3): the dock shows every sub-agent's outcome, so opening it
+        // counts as "seen" — clear the unseen set so completed chips that
+        // finished off-screen can be retired by the terminal sweep instead of
+        // lingering until the next Tab.
+        self.state.mark_active_session_agents_seen();
         self.state.status = status.clone();
         self.state.scroll_transcript_to_latest();
         self.push_local_activity(
@@ -8575,6 +8639,21 @@ impl Store {
                 // every agent-status event — during a multi-agent turn that floods
                 // the bottom line. The activity item above already surfaces it; the
                 // status bar is reserved for low-frequency, meaningful state.
+                //
+                // #334 (Phase 2 live fix): the detail view fetches output once on
+                // open, but a just-completed background child's full output lands
+                // on the server AFTER the peek opened (the mirror runs on the
+                // terminal transition). Without a re-fetch the detail view stays
+                // on the "no output" placeholder. When an `agent/updated` arrives
+                // for the agent CURRENTLY shown in the peek, re-issue
+                // `agent/output/read` so its final output appears. Scoped to the
+                // viewed agent, so this never churns during a multi-agent turn.
+                if matches!(
+                    &self.state.chat_view,
+                    crate::model::ChatViewTarget::Agent(viewed) if viewed == &event.agent.agent_id
+                ) {
+                    return self.agent_view_output_fetch_command();
+                }
                 None
             }
             UiNotification::AgentOutputDelta(event) => {
@@ -9362,8 +9441,23 @@ impl Store {
                 .with_detail(detail),
         );
         let mut picker = UserQuestionPickerState::from_event(event);
-        picker.visible = self.state.user_question_auto_open;
+        // A newly-arriving question is a HARD block: the turn is paused at the
+        // tool boundary until it's answered, so it must be immediately visible
+        // and answerable. Previously `visible` tracked `user_question_auto_open`,
+        // so a question could arrive HIDDEN — and if the user was viewing a
+        // sub-agent (Tab peek), the peek owned the keyboard and swallowed every
+        // key except the obscure Alt+A recovery, so the user could not answer
+        // and their answers never reached the model. Force it visible and mark
+        // auto-open so the peek yields to it.
+        picker.visible = true;
+        self.state.user_question_auto_open = true;
         self.state.user_question = Some(picker);
+        // A mid-turn question must interrupt whatever the main pane is showing:
+        // exit any sub-agent peek so the picker owns the screen and its keys
+        // reach `handle_user_question_key`, not `handle_agent_peek_key`.
+        if matches!(self.state.chat_view, crate::model::ChatViewTarget::Agent(_)) {
+            self.state.set_chat_view(crate::model::ChatViewTarget::Main);
+        }
         self.state.focus = FocusPane::Composer;
         self.state.set_run_state_blocked(title.clone());
         self.state.status = t!("status.question_asked", title = title).into_owned();
@@ -24064,6 +24158,40 @@ mod tests {
         assert!(!store.state.user_question_auto_open);
     }
 
+    /// A mid-turn question arriving while the user is viewing a sub-agent (Tab
+    /// peek) must INTERRUPT the peek: it shows visibly and exits the peek, so its
+    /// keys reach the question handler instead of being swallowed by the peek.
+    /// (Regression: a hidden picker + an active peek trapped the user — only the
+    /// obscure Alt+A recovered it — so answers never reached the model.)
+    #[test]
+    fn arriving_question_interrupts_a_sub_agent_peek() {
+        let mut store = store_with_empty_session();
+        // Simulate the pre-question state: auto-open OFF (so a naive picker would
+        // arrive hidden) and the main pane peeking a sub-agent.
+        store.state.user_question_auto_open = false;
+        store.state.chat_view = crate::model::ChatViewTarget::Agent("review-agent".into());
+
+        open_user_question(
+            &mut store,
+            vec![single_select(
+                "Q",
+                "?",
+                vec![option("a", ""), option("b", "")],
+            )],
+        );
+
+        let picker = store.state.user_question.as_ref().expect("picker present");
+        assert!(
+            picker.visible,
+            "a blocking mid-turn question must be visible, not hidden behind the peek"
+        );
+        assert_eq!(
+            store.state.chat_view,
+            crate::model::ChatViewTarget::Main,
+            "the arriving question must exit the sub-agent peek so its keys are not swallowed"
+        );
+    }
+
     #[test]
     fn replay_lossy_notification_surfaces_rehydrate_status() {
         let mut store = store_with_empty_session();
@@ -27029,6 +27157,85 @@ mod tests {
         }
     }
 
+    /// #334 (Phase 2): opening a sub-agent detail view fetches its FULL output
+    /// via `agent/output/read`, so a background child (which streams nothing)
+    /// still renders its `final_output`. On Main / non-agent views it is a
+    /// no-op.
+    #[test]
+    fn agent_view_open_fetches_full_output() {
+        let mut store = protocol_store_with_autonomy();
+        // Main view → no fetch.
+        store.state.chat_view = crate::model::ChatViewTarget::Main;
+        assert!(store.agent_view_output_fetch_command().is_none());
+
+        // Switching to an agent view → an agent/output/read for that agent.
+        store.state.chat_view = crate::model::ChatViewTarget::Agent("ag-7".into());
+        match store
+            .agent_view_output_fetch_command()
+            .expect("agent view must fetch its output")
+        {
+            AppUiCommand::ReadAgentOutput(params) => {
+                assert_eq!(params.agent_id, "ag-7");
+                assert!(params.cursor.is_none());
+            }
+            other => panic!("expected ReadAgentOutput, got {other:?}"),
+        }
+    }
+
+    /// #335 (Phase 3): `x` in the detail view cancels a RUNNING sub-agent via
+    /// `agent/interrupt`, and is a no-op for a terminal one (nothing to cancel).
+    #[test]
+    fn viewed_running_agent_can_be_cancelled_terminal_is_noop() {
+        let mut store = protocol_store_with_autonomy();
+        let sid = SessionKey("local:test".into());
+        store
+            .state
+            .upsert_session_agent(&sid, terminal_strip_agent("ag-run", "running"));
+        store
+            .state
+            .upsert_session_agent(&sid, terminal_strip_agent("ag-done", "completed"));
+
+        // Not viewing any agent → no-op.
+        store.state.chat_view = crate::model::ChatViewTarget::Main;
+        assert!(store.interrupt_viewed_agent_command().is_none());
+
+        // Viewing a running agent → agent/interrupt.
+        store.state.chat_view = crate::model::ChatViewTarget::Agent("ag-run".into());
+        match store
+            .interrupt_viewed_agent_command()
+            .expect("running agent must be interruptible")
+        {
+            AppUiCommand::InterruptAgent(params) => assert_eq!(params.agent_id, "ag-run"),
+            other => panic!("expected InterruptAgent, got {other:?}"),
+        }
+
+        // Viewing a completed agent → no-op (nothing to cancel).
+        store.state.chat_view = crate::model::ChatViewTarget::Agent("ag-done".into());
+        assert!(store.interrupt_viewed_agent_command().is_none());
+    }
+
+    /// #335 (Phase 3): opening `/ps` marks the roster seen so completed chips
+    /// that finished off-screen no longer linger past the terminal sweep.
+    #[test]
+    fn opening_ps_marks_subagents_seen() {
+        let mut store = protocol_store_with_autonomy();
+        let sid = SessionKey("local:test".into());
+        // A completed agent that finished while not viewed becomes unseen.
+        store
+            .state
+            .upsert_session_agent(&sid, terminal_strip_agent("ag-1", "running"));
+        store
+            .state
+            .upsert_session_agent(&sid, terminal_strip_agent("ag-1", "completed"));
+        assert!(store.state.is_agent_unseen("ag-1"), "should start unseen");
+
+        store.show_local_process_status();
+        assert!(
+            !store.state.is_agent_unseen("ag-1"),
+            "opening /ps must mark the roster seen so the chip can be swept"
+        );
+    }
+
     #[test]
     fn agents_artifacts_dispatches_artifact_list() {
         let mut store = protocol_store_with_autonomy();
@@ -28153,6 +28360,40 @@ mod tests {
         assert_eq!(mirror.agents.len(), 1);
         assert_eq!(mirror.agents[0].agent_id, "ag-1");
         assert_eq!(mirror.agents[0].status, "running");
+    }
+
+    /// #334 (Phase 2 live fix): a just-completed background child's full output
+    /// lands on the server after the peek opened, so the detail view must
+    /// RE-FETCH when an `agent/updated` arrives for the agent currently shown.
+    /// An update for a DIFFERENT (or no) viewed agent must NOT trigger a fetch.
+    #[test]
+    fn agent_update_for_viewed_agent_refetches_output() {
+        use octos_core::ui_protocol::AgentUpdatedEvent;
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+
+        let updated = |store: &mut Store, id: &str, status: &str| -> Option<AppUiCommand> {
+            store.apply_event(AppUiEvent::Protocol(UiNotification::AgentUpdated(
+                AgentUpdatedEvent {
+                    session_id: session_id.clone(),
+                    agent: terminal_strip_agent(id, status),
+                },
+            )))
+        };
+
+        // Not viewing an agent → an update triggers no fetch.
+        store.state.chat_view = crate::model::ChatViewTarget::Main;
+        assert!(updated(&mut store, "ag-1", "completed").is_none());
+
+        // Viewing ag-1: an update for a DIFFERENT agent → no fetch.
+        store.state.chat_view = crate::model::ChatViewTarget::Agent("ag-1".into());
+        assert!(updated(&mut store, "ag-2", "completed").is_none());
+
+        // An update for the VIEWED agent → re-fetch its output.
+        match updated(&mut store, "ag-1", "completed") {
+            Some(AppUiCommand::ReadAgentOutput(params)) => assert_eq!(params.agent_id, "ag-1"),
+            other => panic!("expected ReadAgentOutput for the viewed agent, got {other:?}"),
+        }
     }
 
     /// Stuck-chip safety net: a spawn_only background task that outlives its
