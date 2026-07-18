@@ -14,6 +14,7 @@ app:
     sessions: "会话"
     tasks: "任务"
     tasks_subagents: "子代理"
+    tasks_other: "其他任务"
     artifacts: "制品"
     plan: "计划"
     workspace: "工作区"

@@ -23,6 +23,7 @@ app:
     sessions: "Sessions"
     tasks: "Tasks"
     tasks_subagents: "Sub-agents"
+    tasks_other: "Other tasks"
     artifacts: "Artifacts"
     plan: "Plan"
     workspace: "Workspace"

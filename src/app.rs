@@ -3033,8 +3033,23 @@ fn render_tasks(app: &AppState, palette: Palette) -> Paragraph<'static> {
         lines.push(Line::from(Span::raw("")));
     }
 
+    // #338: a background spawn appears in BOTH the roster (shown above) and the
+    // legacy `session.tasks` cache. Skip the tasks already represented as
+    // sub-agents (matched by task id) so each spawn shows once; non-agent tasks
+    // (e.g. `spawn_only` pipeline tools that never become roster agents) still
+    // render below.
+    let roster_task_ids: std::collections::HashSet<&str> = agents
+        .iter()
+        .filter_map(|agent| agent.task_id.as_deref())
+        .collect();
     if let Some(session) = app.active_session() {
-        if session.tasks.is_empty() {
+        let non_roster_tasks: Vec<(usize, &crate::model::TaskView)> = session
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| !roster_task_ids.contains(task.id.0.to_string().as_str()))
+            .collect();
+        if non_roster_tasks.is_empty() {
             if agents.is_empty() {
                 lines.push(Line::from(Span::styled(
                     t!("app.empty.no_tasks").to_string(),
@@ -3042,7 +3057,13 @@ fn render_tasks(app: &AppState, palette: Palette) -> Paragraph<'static> {
                 )));
             }
         } else {
-            for (idx, task) in session.tasks.iter().enumerate() {
+            if !agents.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    t!("app.pane.tasks_other").to_string(),
+                    palette.title(),
+                )));
+            }
+            for (idx, task) in non_roster_tasks {
                 let marker = if idx == app.selected_task { "›" } else { " " };
                 let style = if idx == app.selected_task {
                     palette.selected()
@@ -16916,6 +16937,61 @@ mod tests {
     /// DELIVERABLES from the roster record's artifacts — the `*-review.md` /
     /// analysis files it wrote — so the detail view shows what the sub-agent
     /// produced, not just its streamed log.
+    /// #338: a background spawn appears in BOTH the roster and `session.tasks`.
+    /// The Tasks pane must show it ONCE (as a sub-agent), not twice — the task
+    /// whose id matches a roster agent's `task_id` is suppressed from the legacy
+    /// list, while an unrelated (non-agent) task still renders.
+    #[test]
+    fn tasks_pane_dedups_roster_tasks_from_legacy_list() {
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+
+        // A spawn: appears as a roster agent AND a session task with the same id.
+        let shared_task_id = octos_core::TaskId::new();
+        let mut agent = sample_agent("alpha-review", "completed");
+        agent.nickname = "alpha-review".into();
+        agent.task_id = Some(shared_task_id.0.to_string());
+        app.upsert_session_agent(&sid, agent);
+
+        let session = app.active_session_mut().expect("session");
+        session.tasks = vec![
+            crate::model::TaskView {
+                id: shared_task_id, // same spawn as the roster agent → dedup
+                title: "alpha-review".into(),
+                state: TaskRuntimeState::Completed,
+                runtime_detail: None,
+                output_tail: String::new(),
+                turn_id: None,
+            },
+            crate::model::TaskView {
+                id: octos_core::TaskId::new(), // a non-agent pipeline task → keep
+                title: "deep-research-pipeline".into(),
+                state: TaskRuntimeState::Running,
+                runtime_detail: None,
+                output_tail: String::new(),
+                turn_id: None,
+            },
+        ];
+
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buffer = Buffer::empty(area);
+        ratatui::widgets::Widget::render(render_tasks(&app, palette), area, &mut buffer);
+        let text = rendered_rows(&buffer).join("\n");
+
+        // The spawn appears ONCE — as a sub-agent, not repeated in the legacy list.
+        assert_eq!(
+            text.matches("alpha-review").count(),
+            1,
+            "roster spawn must render once, not duplicated; got:\n{text}"
+        );
+        // The non-agent pipeline task still renders below.
+        assert!(
+            text.contains("deep-research-pipeline"),
+            "a non-agent task must still show; got:\n{text}"
+        );
+    }
+
     #[test]
     fn agent_peek_renders_deliverable_artifacts() {
         let mut app = autonomy_app_state();
