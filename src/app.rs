@@ -3846,30 +3846,50 @@ fn push_recent_user_context(
     push_user_message_block(lines, palette, content);
 }
 
-/// User input gets the role-contrast treatment: an accent-colored `▌` gutter
-/// on every logical line plus a bold body. It is the single strongest visual
-/// anchor in the transcript (scanning for "what did I say" is the most common
-/// review motion), works without any background color (backgrounds are
-/// unreliable in the pager, the terminal theme, and native scrollback), and
-/// echoes the input verbatim — user text is a quote, not a markdown document.
+/// User input gets the strongest role-contrast treatment in the transcript:
+/// a **bright bold** accent `▌` gutter on every logical line, a bold body, and
+/// a full-width background shade. Scanning for "what did I say" is the most
+/// common review motion, so the user's turns are the single most important
+/// visual anchor.
+///
+/// The shade is the themed [`Palette::surface_alt`] rendered through the
+/// standard [`chat_line`] line-level-background path (the same one diff panels
+/// and markdown blocks use): [`insert_history`](crate::insert_history)'s
+/// `SetColors` + `Clear(UntilNewLine)` fills the whole row with the bg via the
+/// terminal's erase, so there are no trailing-space pads and no reflow hazard.
+/// In the raw `Terminal` theme `surface_alt` is `Color::Reset`, so that mode
+/// degrades to the reliable bright-gutter-only look and forces no background
+/// onto a terminal whose own theme owns the backdrop.
 fn push_user_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, content: &str) {
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
-    let gutter = Style::default().fg(palette.accent);
-    let body = palette.text().add_modifier(Modifier::BOLD);
+    let bg = (palette.surface_alt != Color::Reset).then_some(palette.surface_alt);
+    let gutter = style_bg(
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+        bg,
+    );
+    let body = style_bg(palette.text().add_modifier(Modifier::BOLD), bg);
     if content.trim().is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("▌ ", gutter),
-            Span::styled("<empty>", palette.muted()),
-        ]));
+        lines.push(chat_line(
+            vec![
+                Span::styled("▌ ", gutter),
+                Span::styled("<empty>", style_bg(palette.muted(), bg)),
+            ],
+            bg,
+        ));
         return;
     }
     for raw_line in content.lines() {
-        lines.push(Line::from(vec![
-            Span::styled("▌ ", gutter),
-            Span::styled(raw_line.trim_end().to_string(), body),
-        ]));
+        lines.push(chat_line(
+            vec![
+                Span::styled("▌ ", gutter),
+                Span::styled(raw_line.trim_end().to_string(), body),
+            ],
+            bg,
+        ));
     }
 }
 
@@ -10429,6 +10449,60 @@ mod tests {
         store::Store,
         viewport::ScrollbackTracker,
     };
+
+    #[test]
+    fn user_message_block_uses_bright_bold_gutter_and_themed_shade() {
+        // Rich theme: bright-bold accent gutter + a full-width surface_alt
+        // background shade on every user line (the strongest transcript anchor).
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        push_user_message_block(&mut lines, palette, "line one\nline two");
+
+        let user_lines: Vec<&Line<'static>> = lines
+            .iter()
+            .filter(|l| l.spans.first().is_some_and(|s| s.content.starts_with('▌')))
+            .collect();
+        assert_eq!(user_lines.len(), 2, "one styled line per input line");
+        for line in user_lines {
+            // Line-level background shade fills the row (via write_history_line).
+            assert_eq!(
+                line.style.bg,
+                Some(palette.surface_alt),
+                "user line carries the themed background shade"
+            );
+            let gutter = &line.spans[0];
+            assert_eq!(gutter.style.fg, Some(palette.accent));
+            assert!(
+                gutter.style.add_modifier.contains(Modifier::BOLD),
+                "gutter is bold/bright"
+            );
+        }
+    }
+
+    #[test]
+    fn user_message_block_degrades_to_no_shade_in_terminal_theme() {
+        // Raw Terminal theme: surface_alt is Reset, so no background is forced
+        // onto the terminal's own backdrop — bright bold gutter still applies.
+        let palette = Palette::for_theme(ThemeName::Terminal);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        push_user_message_block(&mut lines, palette, "hello");
+
+        let user_line = lines
+            .iter()
+            .find(|l| l.spans.first().is_some_and(|s| s.content.starts_with('▌')))
+            .expect("a user line");
+        assert_eq!(
+            user_line.style.bg, None,
+            "no forced background in Terminal theme"
+        );
+        assert!(
+            user_line.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "gutter still bold in Terminal theme"
+        );
+    }
     use octos_core::{
         Message, SessionKey,
         ui_protocol::{
