@@ -1341,6 +1341,7 @@ status:
   approval_shown: "已显示审批：%{title}"
   question_progress: "问题 %{active}/%{total}"
   question_no_options: "此问题没有可回答的选项；按 Esc 关闭"
+  question_needs_answer: "请先选择一个选项（↑/↓ 后回车）或输入答案再继续"
   no_active_question: "没有可回答的活动问题"
   answered_question: "已回答问题：%{title}"
   no_pending_question: "没有可显示的待处理问题"

@@ -2019,6 +2019,16 @@ fn handle_user_question_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::BackTab => store.user_question_back(),
         KeyCode::Backspace => store.user_question_pop_free_text(),
         KeyCode::Enter => {
+            // Navigate + Enter must CHOOSE the highlighted option (only Space
+            // toggled before, so an arrow-key highlight + Enter submitted an
+            // EMPTY answer `[{}]` and the model saw no selection). Refuse to
+            // advance/submit a question with no answer so a stray Enter on an
+            // empty free-text row can never send an empty answer either — the
+            // user picks an option or types, then Enter proceeds.
+            if !store.user_question_commit_highlight() {
+                store.state.status = t!("status.question_needs_answer").into_owned();
+                return KeyAction::Continue;
+            }
             // Stepping through questions; submit only on the final one.
             if store.user_question_advance()
                 && let Some(command) = store.respond_user_question_command()
@@ -3131,6 +3141,52 @@ mod tests {
         assert_eq!(params.answers.len(), 1);
         assert_eq!(params.answers[0].selected_labels, vec!["axum".to_string()]);
         assert!(store.state.user_question.is_none());
+    }
+
+    #[test]
+    fn enter_selects_the_highlighted_option_without_space() {
+        // mini5 "llm questions can not get user inputs": navigating to an option
+        // and pressing Enter (the natural confirm) previously submitted an EMPTY
+        // answer `[{}]` because only Space toggled a selection. A bare Enter must
+        // now CHOOSE the highlighted option. Cursor starts on "axum"; move to
+        // "actix" and press Enter with no Space.
+        let (mut store, question_id) = store_with_visible_user_question();
+
+        handle_key(&mut store, key(KeyCode::Down)); // highlight "actix"
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+        let AppUiCommand::RespondUserQuestion(params) = sent_command(action) else {
+            panic!("expected RespondUserQuestion command");
+        };
+        assert_eq!(params.question_id, question_id);
+        assert_eq!(params.answers.len(), 1);
+        assert_eq!(
+            params.answers[0].selected_labels,
+            vec!["actix".to_string()],
+            "bare Enter must select the highlighted option, not send an empty answer"
+        );
+        assert!(store.state.user_question.is_none());
+    }
+
+    #[test]
+    fn enter_on_empty_free_text_row_refuses_to_submit_an_empty_answer() {
+        // The other half of the fix: a stray Enter on the empty "Other" free-text
+        // row must NOT submit an empty answer — the picker stays open with a hint
+        // so the model never receives `answers:[{}]`.
+        let (mut store, _question_id) = store_with_visible_user_question();
+
+        // Move to the free-text "Other" row (index == options.len()).
+        handle_key(&mut store, key(KeyCode::Down)); // actix
+        handle_key(&mut store, key(KeyCode::Down)); // Other (free-text row)
+
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+        assert!(
+            matches!(action, KeyAction::Continue),
+            "Enter with no answer must not send a command"
+        );
+        assert!(
+            store.state.user_question.is_some(),
+            "the picker must stay open until an answer is given"
+        );
     }
 
     #[test]
