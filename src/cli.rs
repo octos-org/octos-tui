@@ -147,10 +147,33 @@ pub struct Cli {
     pub vim_mode: bool,
 }
 
+/// Version string like `0.2.2-rc.7 (94e43fd 2026-07-17)` — the Cargo version
+/// plus the git short hash + build date captured by `build.rs`. Mirrors the
+/// octos server so an unreleased branch build is distinguishable from the
+/// published release of the same Cargo version (the hash is empty for a build
+/// outside a git checkout, in which case only the bare version is shown).
+fn version_string() -> &'static str {
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    const GIT_HASH: &str = match option_env!("OCTOS_TUI_GIT_HASH") {
+        Some(v) => v,
+        None => "",
+    };
+    const BUILD_DATE: &str = match option_env!("OCTOS_TUI_BUILD_DATE") {
+        Some(v) => v,
+        None => "",
+    };
+    #[allow(clippy::const_is_empty)]
+    if GIT_HASH.is_empty() {
+        VERSION
+    } else {
+        Box::leak(format!("{VERSION} ({GIT_HASH} {BUILD_DATE})").into_boxed_str())
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "octos-tui",
-    version = env!("CARGO_PKG_VERSION"),
+    version = version_string(),
     about = "Mock-backed Octos TUI prototype on the Octos UI Protocol boundary",
     // These leading positionals are handled before clap (see `cmd::dispatch`),
     // so they don't appear as clap subcommands above. (Profiles are created in
