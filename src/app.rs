@@ -9130,7 +9130,14 @@ fn model_context_window_hint(app: &AppState, session_id: &SessionKey) -> u64 {
         return DEFAULT_CONTEXT_WINDOW_TOKENS as u64;
     };
     let m = model.to_ascii_lowercase();
-    if m.contains("deepseek-v4") || m.contains("minimax-m3") || m.contains("kimi-k3") {
+    // Bare `k3` / `kimi-for-coding*` are the Kimi coding plan's K3 ids — 1M, like
+    // `kimi-k3` (which they don't contain). Mirrors the server heuristic.
+    if m.contains("deepseek-v4")
+        || m.contains("minimax-m3")
+        || m.contains("kimi-k3")
+        || m == "k3"
+        || m.starts_with("kimi-for-coding")
+    {
         1_048_576
     } else if m.contains("glm") || m.contains("minimax") {
         1_000_000
@@ -18026,6 +18033,18 @@ mod tests {
         assert!(
             window >= 1_000_000,
             "MiniMax-M3 fallback window must be ~1M, got {window}"
+        );
+
+        // The Kimi coding plan's bare `k3` id → 1M, like `kimi-k3`.
+        app.set_runtime_status(runtime_status_with_model_cwd(
+            session_id.clone(),
+            "k3",
+            "/tmp/work",
+        ));
+        let (_, k3_window) = context_window_usage(&app, &session_id).expect("usage");
+        assert!(
+            k3_window >= 1_000_000,
+            "coding-plan k3 fallback window must be ~1M, got {k3_window}"
         );
 
         // An unknown model keeps the conservative default.
