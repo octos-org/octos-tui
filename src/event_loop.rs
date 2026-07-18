@@ -3350,6 +3350,125 @@ mod tests {
     }
 
     #[test]
+    fn menu_close_frame_does_not_duplicate_orchestrating_chip_during_live_turn() {
+        // Guard for the "two Orchestrating chips on menu-close" report. The
+        // hypothesis was that `mark_flushed_stale()` on the menu-close edge wipes
+        // the live-turn watermark and makes `finalized_live_turn_lines_between`
+        // RE-EMIT the "Orchestrating…" chip into scrollback (a frozen second
+        // copy). This test pins that this does NOT happen: the scrollback flush
+        // never emits the chip, because
+        //   1. `next_live_turn_finalization` only flushes NON-running activity
+        //      (app.rs: `!is_running_activity(item)`), so a running spawn tool
+        //      call is never in the flushed set, and
+        //   2. `push_finalized_activity_items_section` forces `is_active_group =
+        //      false` + empty `subagent_titles`, so `agent_task_group_title`
+        //      resolves to "completed"/"finished with errors", never
+        //      "Orchestrating" (app.rs `push_agent_task_group`).
+        // The live viewport renders exactly one chip; the menu-close frame's
+        // emitted bytes therefore contain "Orchestrating" exactly once.
+        //
+        // NOTE: the ACTUAL reported duplicate (two chips one spinner-frame apart,
+        // the upper one missing its child row) is a TERMINAL-RETAINED / stranded
+        // row, not a re-emitted one — different spinner frames prove the frozen
+        // copy was painted on an earlier frame and kept by the emulator, not
+        // written twice this frame. The `RecordingBackend` here records only the
+        // bytes we EMIT (it models neither a screen grid nor real scrollback —
+        // see insert_history.rs "no vt100 dep"), so it cannot reproduce a
+        // stranded-row artifact; this test only rules the scrollback-flush path
+        // in/out as the cause.
+        let turn_id = TurnId::new();
+        let mut store = Store {
+            state: AppState::new(
+                vec![SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "test".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::user("run a review")],
+                    tasks: vec![],
+                    live_reply: Some(LiveReply {
+                        turn_id: turn_id.clone(),
+                        text: String::new(),
+                    }),
+                }],
+                0,
+                "Thinking".into(),
+                None,
+                false,
+            ),
+        };
+        store.state.set_run_state_in_progress();
+        // A running spawn tool call under the active turn → the live render emits
+        // an "Orchestrating… (1 action(s) · 1 active · turn …)" chip with a
+        // running Spawn child.
+        store.state.push_activity(
+            crate::model::ActivityItem::new(ActivityKind::Tool, "spawn", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-spawn-running")
+                .with_detail("Do a SECURITY + CORRECTNESS review of the module"),
+        );
+
+        let mut terminal =
+            InlineTerminal::new(RecordingBackend::new(100, 30)).expect("recording terminal");
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+            saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
+            mouse_captured: false,
+        };
+        let mut scrollback = ScrollbackTracker::new();
+
+        // Steady draw: establishes the live-turn watermark and paints the single
+        // live "Orchestrating…" chip in the viewport.
+        draw(
+            &mut terminal,
+            &mut guard,
+            &mut store,
+            &mut scrollback,
+            false,
+        )
+        .expect("steady draw");
+
+        // The menu-close frame: clear_visible_screen + mark_flushed_stale +
+        // re-flush. Inspect ONLY the bytes this frame wrote.
+        let mark = terminal.backend().buf.len();
+        draw(&mut terminal, &mut guard, &mut store, &mut scrollback, true)
+            .expect("menu-close draw");
+        let close = String::from_utf8_lossy(&terminal.backend().buf[mark..]).into_owned();
+
+        assert_eq!(
+            close.matches("Orchestrating").count(),
+            1,
+            "the menu-close frame must render the Orchestrating chip exactly once \
+             (a second copy is the frozen/duplicated chip): {close:?}"
+        );
+
+        // Directly assert the flush-level invariant the hypothesis was about:
+        // after `mark_flushed_stale`, the reflushed scrollback lines must NOT
+        // contain the "Orchestrating…" chip (it belongs to the live viewport
+        // only). This is independent of the byte-emit quirks above.
+        let palette = crate::theme::Palette::for_theme(store.state.theme);
+        let mut probe = crate::viewport::ScrollbackTracker::new();
+        let _ = probe.sync(&store.state, palette, 100);
+        probe.mark_flushed_stale();
+        let reflushed = probe.sync(&store.state, palette, 100);
+        let flushed_text = reflushed
+            .lines_to_insert
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(
+            flushed_text.matches("Orchestrating").count(),
+            0,
+            "the menu-close scrollback flush must not re-emit the Orchestrating \
+             chip (running activity is never finalized into scrollback): \
+             {flushed_text:?}"
+        );
+    }
+
+    #[test]
     fn overlay_transition_restores_inline_viewport_for_resize_clear() {
         let mut terminal =
             InlineTerminal::new(RecordingBackend::new(80, 24)).expect("recording terminal");
