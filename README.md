@@ -46,9 +46,9 @@ octos-tui --mode protocol \
 ```
 
 You'll land on the **"Welcome to Octos"** screen. In the next five minutes:
-create your local profile (three fields — the email is local metadata only),
-pick an AI provider, paste its API key, and open your first coding chat.
-The [Quickstart](#quickstart-solo-onboarding) below walks every screen.
+name a local profile, add a model (pick a provider route and paste its API key),
+and open your first coding chat. The [Quickstart](#quickstart-solo-onboarding)
+below walks every screen.
 
 > **Heads-up:** plain `octos-tui` with no flags opens a **mock demo** with
 > canned replies — nice for a look around, but not connected to anything.
@@ -178,43 +178,175 @@ Notes:
 - Do **not** pass `--profile-id` on first run — it selects an existing profile
   and bypasses onboarding.
 
-### 3. Create your local profile
+### 3. Name your profile
 
-On the welcome screen, fill the three fields (the email is local metadata only —
-no OTP is sent):
+The welcome screen is the first step of the setup wizard. A few rows sit on the
+left; a teaching panel on the right always tells you where you are and what to do
+next. Work down the rows:
 
-| Field | How to enter it |
+| Row | What to do |
 |---|---|
-| **Full name** | select the row and type, or `/onboard name <your name>` |
-| **Username** | select the row and type, or `/onboard username <handle>` |
-| **Email** | select the row and type, or `/onboard email <address>` |
+| **Language** | English is selected by default. To change it, select the row and pick **中文** — the whole UI switches immediately (you can also change it later with `/lang`). |
+| **Name this profile** | Select the row and type a short id like `glm`, `work`, or `deepseek`. This is just a label for the setup — it has **nothing** to do with which model you'll run (you choose that in the next step). |
+| **Make this your default brain** *(if your server offers it)* | Toggle **on** to make this the profile a bare `octos-tui` opens in a folder it hasn't seen before. Optional — leave it off if you're unsure. |
 
-Then choose **"Create your local Octos profile" / Continue**. This calls
-`profile/local/create` and advances to provider setup.
+Then move to **Continue** and press Enter. Octos creates the profile
+(`profile/local/create` — nothing is emailed) and advances to model setup.
 
-### 4. Set up an LLM provider
+> **Naming is separate from the model on purpose.** An older server that doesn't
+> support named profiles asks for **Full name**, **Username**, and **Email** here
+> instead (all local metadata, no OTP). Fill the three fields, then Continue.
 
-The screen now reads **"Set Up LLM Provider"** (*"Choose a dashboard model
-route, enter its API key, then save."*). Work down the rows:
+### 4. Add a model
 
-1. **Load provider catalog** — pulls the dashboard's model families and routes.
-2. **Model family → Model → Provider route** — pick one route.
-3. **API key** — select the row and type the key (`/onboard key <secret>`); it
-   is masked in state, logs, and snapshots.
-4. (optional) **Test provider** to verify the route.
-5. **Save provider to profile** — persists it via `profile/llm/upsert` (the same
-   profile JSON the dashboard writes).
+The wizard now shows the **Octos Setup Wizard** with a single **Add a model**
+row. Select it and work through the following in order — the first three each
+open their own picker screen:
 
-The catalog and provider schema are owned by `octos`/the dashboard; the TUI
-never hard-codes provider/model truth.
+1. **Model family** — *Choose Model Family* (e.g. GPT, Claude, GLM).
+2. **Model** — *Choose Model* within that family.
+3. **Provider route** — *Choose Provider Route* (the official route, or an
+   alternative that serves the same model).
+4. **API key** — select the row and type your key (or use `/onboard key <secret>`);
+   it is masked in state, logs, and snapshots.
+5. **Test connection** *(recommended)* — sends one small request and reports
+   success or the exact error, so you catch a bad key or wrong route now.
+6. **Save provider** — persists the route into your profile (`profile/llm/upsert`).
 
-### 5. Open a coding session and chat
+The families, models, and routes all come from the server's catalog — the TUI
+never hard-codes provider or model truth.
 
-Once a provider is saved, choose **"Open coding session"**. This calls
-`session/open` with the resolved profile and drops you into the normal coding
-UI. Type a request in the composer and press Enter — you're chatting with Octos.
+> Once a primary model is saved, the collapsed row becomes **Add another model**,
+> so you can add a fallback or a second route from the same screen. Changing
+> models later is what the `/add-model` command is for.
 
-You can reopen this wizard at any time with the `/setup` slash command.
+### 5. Finish and open your first session
+
+With a model saved, the wizard shows **Finish — brain ready →**. Press Enter and
+you land on the **"You're all set"** screen:
+
+- **Open a session here now** — starts working with your new profile in the
+  current folder immediately, no relaunch needed. This is the quickest way in.
+- **Close** — leaves onboarding. The screen also reminds you that you can start a
+  session later by running `octos-tui` in this folder (now activated for your
+  profile), or `octos-tui --profile-id <name>` from any other folder.
+
+Choose **Open a session here now**, then type a request in the composer and press
+Enter — you're chatting with Octos.
+
+You can reopen the full wizard anytime with `/onboard` (aliases `/setup`,
+`/wizard`), jump straight to changing the model with `/add-model`, or manage all
+your profiles with `/profiles` — see [Manage profiles and
+sessions](#manage-profiles-and-sessions) below.
+
+---
+
+## Manage profiles and sessions
+
+You are not limited to one profile. A **profile** (Octos calls it a "brain")
+bundles a name, its LLM provider/model, and its own history. A **session** is one
+profile's conversation **in one folder**. You can keep a `glm` brain and a
+`claude` brain side by side and switch between them without losing either one's
+work.
+
+### The `/profiles` surface
+
+Type `/profiles` (alias `/profile`) at any time to open the **Profiles** list:
+
+```text
+Profiles
+Manage your local profiles — set the default, delete, or create one.
+
+> glm  *default
+  claude
+  research
+  Create a new profile
+```
+
+- The machine **default** is tagged **`*default`** — that's the brain a bare
+  `octos-tui` opens in a folder it hasn't seen before.
+- **Up/Down** move, **Enter** opens the highlighted profile, **Esc** closes the
+  list.
+- **Create a new profile** starts a fresh setup wizard — the same flow as
+  [first-run onboarding](#quickstart-solo-onboarding), beginning at *Name this
+  profile*.
+
+> `/profiles` manages profile files on disk, so it's a local-solo feature: it
+> appears only when the TUI is talking to a server that owns a local data
+> directory (the `--stdio-command "octos serve --stdio --solo …"` setup from the
+> Quickstart).
+
+### Open a profile → its actions
+
+Select a profile and its details appear in the right pane, with the actions on
+the left:
+
+```text
+Profile: claude                          About this profile
+Use this profile, make it the default,   Profile: claude
+or delete it.                            Model: claude-sonnet-4
+                                         Default: no
+> Open a session here
+  Set as default
+  Delete
+  Back
+```
+
+| Action | What it does |
+|---|---|
+| **Open a session here** | Switches your active session to this profile, opening (or resuming) its conversation **in the current folder**. Your previous profile's session stays intact — sessions are keyed per profile. |
+| **Set as default** | Writes the `default-profile` pointer so a bare launch opens this brain. If it's already the default, the row reads **Already the default** and is disabled. |
+| **Delete** | Removes this profile's config and data — asks you to confirm first (see below). |
+| **Back** | Return to the profiles list. |
+
+The **About this profile** pane shows the profile's saved model (`Model: not
+configured yet` if you haven't added one) and whether it's the default.
+
+### Delete a profile (with confirmation)
+
+**Delete** never removes anything immediately — it opens a yes/no confirm:
+
+```text
+Delete “research”?
+Removes this profile's config and all its data. Cannot be undone.
+
+> Yes, delete research
+  No, keep it
+```
+
+Choose **Yes, delete research** to remove it, or **No, keep it** (or **Esc**) to
+back out.
+
+> **You can't delete the profile you're currently using.** If a session is open
+> on that profile, delete is blocked with a status message:
+> *"Can't delete <profile> — it's the profile this session is using. Switch to
+> another profile first."* Open a session on a different profile, then delete.
+
+### What "activating a folder" means
+
+Sessions live **per profile, per folder**. The first time you start a brain in a
+folder, Octos *activates* that folder for it and creates the session there; after
+that, starting the same brain in the same folder **resumes** that conversation.
+There are three ways activation happens:
+
+- **From the profiles surface** — *Open a session here* activates the current
+  folder for the chosen profile right away.
+- **At the end of onboarding** — the *You're all set* screen's **Open a session
+  here now** does the same thing, with no relaunch.
+- **On a bare launch** — run `octos-tui` in a folder a brain hasn't been used in
+  and Octos may ask **"Activate this folder?"**; choose **Activate with
+  <profile>** to start the conversation here. If the folder already belongs to a
+  different brain, it instead offers **Start <profile> here** (a new conversation)
+  or **Switch to <profile>** (resume that folder's existing one).
+
+To jump straight into a specific profile from any folder, launch with
+`--profile-id` (this also skips onboarding):
+
+```bash
+octos-tui --profile-id claude \
+  --mode protocol \
+  --stdio-command "octos serve --stdio --solo --data-dir ~/.octos-tui-data"
+```
 
 ---
 
@@ -343,7 +475,9 @@ q          quit
 /help       local slash-command help
 /ps         show local task/process status and focus the Tasks pane (Esc returns to the composer)
 /stop       interrupt the active turn (or report locally if none is active)
-/setup      reopen the onboarding wizard
+/onboard    reopen the full setup wizard, or set a field inline (aliases: /setup, /wizard)
+/add-model  add or change this profile's model — family, model, route, key (aliases: /provider, /providers)
+/profiles   manage local profiles: list, create, set default, open a session, delete (alias: /profile)
 /model      browse the server-returned profile models / catalog
 /theme      switch the TUI palette at runtime (menu, or /theme claude)
 /lang       switch the UI language (menu, or /lang zh) — English / 中文
@@ -351,7 +485,6 @@ q          quit
 /scrollmode switch wheel-scroll behavior (toggle, or /scrollmode native|pinned)
 /vimmode    toggle Vim modal editing in the composer (Normal/Insert)
 /saveconfig persist the active theme / language / scroll-mode / vim-mode to the config file
-/onboard    set onboarding fields inline (name, username, email, key, ...)
 /copy       copy the last assistant reply to the clipboard (works over SSH)
 /status     snapshot-backed session, runtime, and connection status
 /cost       server-reported token and cost usage
