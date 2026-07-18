@@ -3846,50 +3846,49 @@ fn push_recent_user_context(
     push_user_message_block(lines, palette, content);
 }
 
-/// User input gets the strongest role-contrast treatment in the transcript:
-/// a **bright bold** accent `▌` gutter on every logical line, a bold body, and
-/// a full-width background shade. Scanning for "what did I say" is the most
-/// common review motion, so the user's turns are the single most important
-/// visual anchor.
+/// User input gets the strongest, most terminal-portable contrast in the
+/// transcript: a **bright bold** accent `▌` gutter plus a **reverse-video**
+/// (SGR 7) body bar on every logical line. Scanning for "what did I say" is
+/// the most common review motion, so the user's turns are the single most
+/// important visual anchor.
 ///
-/// The shade is the themed [`Palette::surface_alt`] rendered through the
-/// standard [`chat_line`] line-level-background path (the same one diff panels
-/// and markdown blocks use): [`insert_history`](crate::insert_history)'s
-/// `SetColors` + `Clear(UntilNewLine)` fills the whole row with the bg via the
-/// terminal's erase, so there are no trailing-space pads and no reflow hazard.
-/// In the raw `Terminal` theme `surface_alt` is `Color::Reset`, so that mode
-/// degrades to the reliable bright-gutter-only look and forces no background
-/// onto a terminal whose own theme owns the backdrop.
+/// Reverse video is deliberate over an RGB background shade: it is a basic
+/// terminal attribute every terminal renders — including plain SSH sessions
+/// that don't advertise truecolor, where `Rgb()` backgrounds silently vanish —
+/// and it works identically in the live viewport and in native scrollback. A
+/// themed `surface_alt` shade was tried first and was invisible on both counts
+/// (dropped over SSH, and a near-invisible ~10/255 lift even when rendered).
+/// A single space of padding on each side frames the text so the highlight
+/// reads as a bar rather than tight-wrapped text.
 fn push_user_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, content: &str) {
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
-    let bg = (palette.surface_alt != Color::Reset).then_some(palette.surface_alt);
-    let gutter = style_bg(
-        Style::default()
-            .fg(palette.accent)
-            .add_modifier(Modifier::BOLD),
-        bg,
-    );
-    let body = style_bg(palette.text().add_modifier(Modifier::BOLD), bg);
+    // Bright bold accent gutter — a colored gutter always renders (the user
+    // already sees the ▌), so it stays the role marker.
+    let gutter = Style::default()
+        .fg(palette.accent)
+        .add_modifier(Modifier::BOLD);
+    // Body is a REVERSE-VIDEO (SGR 7) + bold bar. Reverse video is a basic
+    // terminal attribute every terminal supports, so it renders identically
+    // over SSH and in native scrollback — unlike an RGB `surface_alt` shade,
+    // which silently vanishes on sessions that don't advertise truecolor and
+    // is a near-invisible ~10/255 lift even when it does. A single space of
+    // padding on each side frames the text so the highlight reads as a bar.
+    let body = Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED);
     if content.trim().is_empty() {
-        lines.push(chat_line(
-            vec![
-                Span::styled("▌ ", gutter),
-                Span::styled("<empty>", style_bg(palette.muted(), bg)),
-            ],
-            bg,
-        ));
+        lines.push(Line::from(vec![
+            Span::styled("▌ ", gutter),
+            Span::styled(" <empty> ", body),
+        ]));
         return;
     }
     for raw_line in content.lines() {
-        lines.push(chat_line(
-            vec![
-                Span::styled("▌ ", gutter),
-                Span::styled(raw_line.trim_end().to_string(), body),
-            ],
-            bg,
-        ));
+        let text = raw_line.trim_end();
+        lines.push(Line::from(vec![
+            Span::styled("▌ ", gutter),
+            Span::styled(format!(" {text} "), body),
+        ]));
     }
 }
 
@@ -10451,57 +10450,48 @@ mod tests {
     };
 
     #[test]
-    fn user_message_block_uses_bright_bold_gutter_and_themed_shade() {
-        // Rich theme: bright-bold accent gutter + a full-width surface_alt
-        // background shade on every user line (the strongest transcript anchor).
-        let palette = Palette::for_theme(ThemeName::Codex);
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        push_user_message_block(&mut lines, palette, "line one\nline two");
+    fn user_message_block_uses_bright_gutter_and_reverse_video_body() {
+        // Reverse video is theme-independent and SSH-portable — assert it on
+        // BOTH the raw Terminal theme and a rich Rgb theme, since the old
+        // surface_alt shade was invisible in both (dropped over SSH / too
+        // subtle). Each input line → a bright bold accent gutter + a
+        // reverse-video bold body bar.
+        for theme in [ThemeName::Terminal, ThemeName::Codex] {
+            let palette = Palette::for_theme(theme);
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            push_user_message_block(&mut lines, palette, "line one\nline two");
 
-        let user_lines: Vec<&Line<'static>> = lines
-            .iter()
-            .filter(|l| l.spans.first().is_some_and(|s| s.content.starts_with('▌')))
-            .collect();
-        assert_eq!(user_lines.len(), 2, "one styled line per input line");
-        for line in user_lines {
-            // Line-level background shade fills the row (via write_history_line).
+            let user_lines: Vec<&Line<'static>> = lines
+                .iter()
+                .filter(|l| l.spans.first().is_some_and(|s| s.content.starts_with('▌')))
+                .collect();
             assert_eq!(
-                line.style.bg,
-                Some(palette.surface_alt),
-                "user line carries the themed background shade"
+                user_lines.len(),
+                2,
+                "one styled line per input line ({theme:?})"
             );
-            let gutter = &line.spans[0];
-            assert_eq!(gutter.style.fg, Some(palette.accent));
-            assert!(
-                gutter.style.add_modifier.contains(Modifier::BOLD),
-                "gutter is bold/bright"
-            );
+            for line in user_lines {
+                let gutter = &line.spans[0];
+                assert_eq!(
+                    gutter.style.fg,
+                    Some(palette.accent),
+                    "accent gutter ({theme:?})"
+                );
+                assert!(
+                    gutter.style.add_modifier.contains(Modifier::BOLD),
+                    "gutter is bold/bright ({theme:?})"
+                );
+                let body = &line.spans[1];
+                assert!(
+                    body.style.add_modifier.contains(Modifier::REVERSED),
+                    "body is a reverse-video bar — renders on any terminal ({theme:?})"
+                );
+                assert!(
+                    body.content.contains("line"),
+                    "body carries the user text ({theme:?})"
+                );
+            }
         }
-    }
-
-    #[test]
-    fn user_message_block_degrades_to_no_shade_in_terminal_theme() {
-        // Raw Terminal theme: surface_alt is Reset, so no background is forced
-        // onto the terminal's own backdrop — bright bold gutter still applies.
-        let palette = Palette::for_theme(ThemeName::Terminal);
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        push_user_message_block(&mut lines, palette, "hello");
-
-        let user_line = lines
-            .iter()
-            .find(|l| l.spans.first().is_some_and(|s| s.content.starts_with('▌')))
-            .expect("a user line");
-        assert_eq!(
-            user_line.style.bg, None,
-            "no forced background in Terminal theme"
-        );
-        assert!(
-            user_line.spans[0]
-                .style
-                .add_modifier
-                .contains(Modifier::BOLD),
-            "gutter still bold in Terminal theme"
-        );
     }
     use octos_core::{
         Message, SessionKey,
