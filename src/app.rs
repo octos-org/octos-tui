@@ -3873,13 +3873,13 @@ fn push_user_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, con
     // terminal attribute every terminal supports, so it renders identically
     // over SSH and in native scrollback — unlike an RGB `surface_alt` shade,
     // which silently vanishes on sessions that don't advertise truecolor and
-    // is a near-invisible ~10/255 lift even when it does. A single space of
-    // padding on each side frames the text so the highlight reads as a bar.
+    // is a near-invisible ~10/255 lift even when it does. The gutter owns the
+    // only separating space so rendered prompt text has no extra padding.
     let body = Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED);
     if content.trim().is_empty() {
         lines.push(Line::from(vec![
             Span::styled("▌ ", gutter),
-            Span::styled(" <empty> ", body),
+            Span::styled("<empty>", body),
         ]));
         return;
     }
@@ -3887,7 +3887,7 @@ fn push_user_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, con
         let text = raw_line.trim_end();
         lines.push(Line::from(vec![
             Span::styled("▌ ", gutter),
-            Span::styled(format!(" {text} "), body),
+            Span::styled(text.to_string(), body),
         ]));
     }
 }
