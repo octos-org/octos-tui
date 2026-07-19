@@ -3772,13 +3772,12 @@ fn push_turn_flow(
         );
     }
 
-    if let Some(approval) = app.approval.as_ref().filter(|approval| approval.visible) {
-        push_inline_approval_card(lines, palette, approval);
-    }
-
-    if let Some(picker) = app.user_question.as_ref().filter(|picker| picker.visible) {
-        push_inline_user_question_card(lines, palette, picker, width);
-    }
+    // The pending approval / AskUserQuestion card renders LAST in the turn flow
+    // (see `push_pending_decision_cards` at the end of this fn) so it sits at the
+    // BOTTOM of the height-clipped live tail — the always-visible region. It used
+    // to render HERE (first), so on a turn with lots of streamed output the card
+    // scrolled off the top while still pending and still owning the keyboard,
+    // leaving the user with a bare "Waiting" and no visible prompt.
 
     // `/btw` aside renders as a floating overlay pinned to the TOP of the live
     // viewport (see `render_btw_overlay`), not inline here — otherwise it
@@ -3835,6 +3834,32 @@ fn push_turn_flow(
 
     if live_turn_diff_preview_visible(app) {
         push_inline_diff_preview(lines, palette, &app.diff_preview, app.expanded_tool_outputs);
+    }
+
+    // Pinned LAST: a parked decision's card is the bottom-most turn-flow content,
+    // so the height-clipped live tail (which keeps its bottom rows) always shows
+    // it even when the streamed reply/activity above it overflows the viewport.
+    push_pending_decision_cards(lines, palette, app, width);
+}
+
+/// Render the pending approval / AskUserQuestion card into the live tail. Called
+/// last in [`push_turn_flow`] so the card is the bottom-most content and cannot
+/// scroll off the top of the height-clipped tail while the turn is parked on the
+/// operator (the "Waiting, can't type, no visible prompt" trap). Streamed
+/// reply/activity above it clips first. Gated on `visible` exactly as before, so
+/// keyboard ownership (`modal_owns_keyboard`) and rendering stay coupled.
+fn push_pending_decision_cards(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    app: &AppState,
+    width: usize,
+) {
+    if let Some(approval) = app.approval.as_ref().filter(|approval| approval.visible) {
+        push_inline_approval_card(lines, palette, approval);
+    }
+
+    if let Some(picker) = app.user_question.as_ref().filter(|picker| picker.visible) {
+        push_inline_user_question_card(lines, palette, picker, width);
     }
 }
 
@@ -17068,6 +17093,65 @@ mod tests {
         assert!(text.contains("complete m9 contract"));
         assert!(text.contains("Approval Requested"));
         assert!(text.contains("Mock approval boundary"));
+    }
+
+    #[test]
+    fn pending_decision_card_stays_visible_when_the_live_tail_overflows() {
+        // The reported trap: a turn parked on an approval streams a wall of output
+        // that pushes the (top-rendered) card off the height-clipped live tail, so
+        // the user sees a bare "Waiting" with no prompt and a locked composer. The
+        // card now renders LAST, so it sits in the always-visible bottom region.
+        let streamed: String = (0..60)
+            .map(|idx| format!("streamed line {idx:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run the thing")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: TurnId::new(),
+                    text: streamed,
+                }),
+            }],
+            0,
+            "Working".into(),
+            None,
+            false,
+        );
+        app.approval = Some(ApprovalModalState {
+            session_id: SessionKey("local:test".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            title: "Delete the database".into(),
+            body: "approve?".into(),
+            approval_kind: Some("command".into()),
+            risk: Some("high".into()),
+            typed_details: None,
+            render_hints: None,
+            visible: true,
+        });
+
+        // A short viewport forces the live tail to clip.
+        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Slate), 120, 16);
+        let rows = rendered_rows(&buffer);
+        let screen = rows.join("\n");
+
+        assert!(
+            screen.contains("Approval Requested") && screen.contains("y = approve this command"),
+            "the parked-decision card must survive live-tail clipping: {rows:?}"
+        );
+        // Prove the tail actually overflowed — the earliest streamed line clipped
+        // off the top, so the card's visibility is not an artifact of everything
+        // fitting on screen.
+        assert!(
+            !screen.contains("streamed line 00"),
+            "expected the live tail to overflow (early streamed line clipped): {rows:?}"
+        );
     }
 
     #[test]
