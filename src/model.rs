@@ -7764,6 +7764,29 @@ impl AppState {
         }
     }
 
+    /// A session goal is ONE persistent entity, not a stream of events. Its
+    /// status transitions (`active` -> `budget_limited` -> ...) must update a
+    /// SINGLE activity row, not append a fresh "session goal" row per transition
+    /// — otherwise a thrashing goal renders as N stacked rows (mini5: one goal
+    /// showed as 3 rows "active / budget_limited / budget_limited"), and each
+    /// row with a running-ish status inflates the "N active" aggregate. Replace
+    /// the existing goal row for `item.title` (the localized "session goal"
+    /// label) in place, updating its status; append only when none exists.
+    pub fn push_or_replace_goal_activity(&mut self, item: ActivityItem) {
+        if let Some(existing) = self
+            .activity
+            .iter_mut()
+            .rev()
+            .find(|a| a.kind == item.kind && a.title == item.title)
+        {
+            existing.status = item.status;
+            existing.detail = item.detail;
+            existing.success = item.success;
+            return;
+        }
+        self.push_activity(item);
+    }
+
     pub fn preserve_transcript_position_after_append(&mut self, estimated_rows: usize) {
         if self.transcript_scroll > 0 && estimated_rows > 0 {
             self.transcript_scroll = self.transcript_scroll.saturating_add(estimated_rows);
