@@ -6574,19 +6574,35 @@ fn push_turn_activity_log_section(
     wrap_width: usize,
 ) {
     let summary = app.turn_summary_for(&log.turn_id);
-    // A tool-less turn carries only a summary (no activity items); still render
-    // its report. Nothing at all to show only when both are absent.
-    if log.items.is_empty() && summary.is_none() {
+    // A FINALIZED render targets IMMUTABLE scrollback, so it must record only
+    // the turn's TERMINAL activity — a still-running item would freeze an
+    // in-progress "Orchestrating… (N active)" chip there and strand a second
+    // copy above the live chip (the same failure `push_finalized_activity_items_section`
+    // guards). #342 stripped the volatile sub-agent titles here but still fed
+    // the running item into the header counts. Drop running items on the
+    // finalized path; the live/overlay render (`finalized == false`) keeps them.
+    let items: Vec<&ActivityItem> = if finalized {
+        log.items
+            .iter()
+            .filter(|item| !is_running_activity(item))
+            .collect()
+    } else {
+        log.items.iter().collect()
+    };
+    // A tool-less turn (or a finalized turn whose only items are still running)
+    // carries only a summary; still render its report. Nothing at all to show
+    // only when both are absent.
+    if items.is_empty() && summary.is_none() {
         return;
     }
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
-    if !log.items.is_empty() {
+    if !items.is_empty() {
         let shown_limit = if app.expanded_tool_outputs { 12 } else { 3 };
         // Full uncapped set (header counts + footer tally both derive from this
         // via `task_group_counts`, so they cannot diverge).
-        let full = log.items.iter().collect::<Vec<_>>();
+        let full = items;
         let shown = full
             .iter()
             .rev()
@@ -6735,7 +6751,26 @@ fn push_finalized_activity_items_section(
     items: &[&ActivityItem],
     wrap_width: usize,
 ) {
-    if items.is_empty() {
+    // This section targets IMMUTABLE scrollback, which can never be reclaimed
+    // (`CSI 2J` clears only the visible screen). So it must record only
+    // TERMINAL items — never one that is still RUNNING. A running item flushed
+    // here makes the chip header read "Orchestrating… (N active)" with its
+    // spinner frozen at flush time, and that copy strands one frame behind the
+    // LIVE aggregate chip below: two "Orchestrating" lines for the same turn,
+    // different braille glyphs (the third face of the "duplicated
+    // orchestrating" bug, after #339/#342). It reaches here via the covered
+    // late-activity flush (`finalized_late_activity_lines_for_coverages` /
+    // `push_turn_activity_log_section_unflushed`), whose UNFLUSHED item set is
+    // NOT pre-filtered by run state. Drop running items: they stay in the live
+    // tail (repainted every frame) and are flushed only once they settle.
+    // (`finalized_live_turn_lines_between` already pre-filters to non-running
+    // items, so this is a no-op on that path.)
+    let terminal_items: Vec<&ActivityItem> = items
+        .iter()
+        .copied()
+        .filter(|item| !is_running_activity(item))
+        .collect();
+    if terminal_items.is_empty() {
         return;
     }
     if !lines.is_empty() && !line_is_blank(lines.last()) {
@@ -6745,8 +6780,8 @@ fn push_finalized_activity_items_section(
         lines,
         palette,
         turn_id,
-        items,
-        items,
+        &terminal_items,
+        &terminal_items,
         &[],
         0,
         false,
@@ -15015,6 +15050,132 @@ mod tests {
         assert!(
             flushed.contains("Agent task completed"),
             "the flushed turn-card records the parent turn's terminal outcome: {flushed:?}"
+        );
+    }
+
+    #[test]
+    fn covered_late_activity_flush_of_running_item_is_terminal_not_orchestrating() {
+        // Third face of the "duplicated orchestrating" bug (after #339/#342):
+        // the covered late-activity scrollback flush
+        // (`finalized_late_activity_lines_for_coverages` ->
+        // `push_turn_activity_log_section_unflushed` ->
+        // `push_finalized_activity_items_section`) receives the turn's UNFLUSHED
+        // items WITHOUT filtering by run state, so a still-RUNNING item (e.g. a
+        // long `Bash($ sleep 45 …)` that keeps the turn live) was baked into
+        // IMMUTABLE scrollback as "Orchestrating… (1 active)" with its spinner
+        // frozen. That copy strands one frame behind the LIVE aggregate chip:
+        // two "Orchestrating" lines, same turn, different braille glyphs. The
+        // finalized flush must record only TERMINAL activity; running items stay
+        // in the live tail until they settle.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run the pipeline")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            request: Some("run".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "running")
+                    .with_turn(turn_id.clone()),
+            ],
+        });
+
+        let coverage = LiveTurnFinalization {
+            session_id: session_id.0.clone(),
+            turn_id: turn_id.0.to_string(),
+            reply_flushed_text: "streamed prefix".into(),
+            activity_flushed_items: 0,
+            activity_flushed_keys: Vec::new(),
+        };
+        let flushed: String = finalized_late_activity_lines_for_coverages(
+            &app,
+            Palette::for_theme(ThemeName::Slate),
+            100,
+            &[coverage],
+        )
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect();
+        assert!(
+            !flushed.contains("Orchestrating"),
+            "immutable scrollback must not bake an in-progress Orchestrating chip: {flushed:?}"
+        );
+        assert!(
+            !flushed.contains("· 1 active"),
+            "a running item must not bake a live '1 active' count into scrollback: {flushed:?}"
+        );
+    }
+
+    #[test]
+    fn finalized_turn_card_flush_with_running_item_is_terminal_not_orchestrating() {
+        // Companion to the covered late-activity guard: the committed turn-card
+        // flush (`finalized_history_lines` -> `push_turn_activity_log_section`
+        // with `finalized = true`) also fed the running item into the header
+        // counts, so a turn whose committed log still carried a running item
+        // baked "Orchestrating… (1 active)" into immutable scrollback. #342
+        // stripped the sub-agent titles here but not the running-item count.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run the long job")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_id.clone(),
+            request: Some("run".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_id.clone())
+                    .with_success(true),
+                ActivityItem::new(ActivityKind::Tool, "shell", "running").with_turn(turn_id),
+            ],
+        });
+
+        let flushed: String =
+            finalized_history_lines(&app, Palette::for_theme(ThemeName::Slate), 100)
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect();
+        assert!(
+            !flushed.contains("Orchestrating"),
+            "the finalized turn-card must not bake an in-progress chip: {flushed:?}"
+        );
+        assert!(
+            !flushed.contains("· 1 active"),
+            "immutable scrollback must not freeze a live '1 active' count: {flushed:?}"
+        );
+        // The terminal (completed) item is still recorded.
+        assert!(
+            flushed.contains("Agent task completed"),
+            "the settled portion of the turn still records its terminal outcome: {flushed:?}"
         );
     }
 
