@@ -8219,7 +8219,13 @@ fn plan_panel_rows(plan: &octos_core::ui_protocol::UiPlanRecord) -> u16 {
 /// column wrapping needs the render width, which the height reservation can't
 /// see); a trailing "…" marks an objective longer than the cap. Shared by the
 /// height reservation and the render so they always agree on row count.
-const GOAL_OBJECTIVE_MAX_ROWS: usize = 3;
+///
+/// The cap is generous (≈ 20 rows × 56 chars ≈ 1.1k chars) so a realistic
+/// extensive `/goal` prompt renders in FULL — a 3-row cap (the first pass) still
+/// clipped long objectives with a "…", which users reported. The ceiling exists
+/// only so a pathological multi-KB objective can't shove the composer off screen
+/// (the overall live-UI height clamp bounds it further).
+const GOAL_OBJECTIVE_MAX_ROWS: usize = 20;
 const GOAL_OBJECTIVE_CHARS_PER_ROW: usize = 56;
 
 fn goal_objective_chunks(objective: &str) -> Vec<String> {
