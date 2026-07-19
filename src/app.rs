@@ -225,7 +225,7 @@ pub fn live_ui_height_with_finalization(
     let composer_height = composer_height_for_size(app, width, height);
     let active_menu = active_menu_surface(app);
     let menu_height = menu_height_hint(active_menu.as_ref(), width, height);
-    let autonomy_height = autonomy_indicator_height(app);
+    let autonomy_height = autonomy_indicator_height(app, width);
     let harness_height = harness_status_height(app);
     // The sub-agent selector strip renders between the composer and the status
     // row (see `render_viewport_with_finalization`); reserve its row here too or
@@ -352,7 +352,7 @@ pub fn render_viewport_with_finalization(
     // reserved (cap floors at 3), clipping multi-line input. Everything else
     // legitimately lays out within `area`.
     let composer_height = composer_height_for_size(app, area.width, terminal_height);
-    let autonomy_height = autonomy_indicator_height(app);
+    let autonomy_height = autonomy_indicator_height(app, area.width);
     let harness_height = harness_status_height(app);
     // Height-gated on `terminal_height` — the SAME basis `live_ui_height` used to
     // reserve the row — so the reservation and this layout always agree.
@@ -402,7 +402,10 @@ pub fn render_viewport_with_finalization(
         menu_render::render_menu_surface(frame, root[1], menu, palette);
     }
     if autonomy_height > 0 {
-        frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
+        frame.render_widget(
+            render_autonomy_indicator(app, palette, root[2].width),
+            root[2],
+        );
     }
     if harness_height > 0 {
         render_harness_status_row(frame, app, palette, root[3]);
@@ -1448,7 +1451,10 @@ fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palet
         menu_render::render_menu_surface(frame, areas.menu, menu, palette);
     }
     if areas.autonomy.height > 0 {
-        frame.render_widget(render_autonomy_indicator(app, palette), areas.autonomy);
+        frame.render_widget(
+            render_autonomy_indicator(app, palette, areas.autonomy.width),
+            areas.autonomy,
+        );
     }
     if areas.harness.height > 0 {
         render_harness_status_row(frame, app, palette, areas.harness);
@@ -2151,7 +2157,7 @@ fn chat_layout_areas_for_menu(
 ) -> ChatLayoutAreas {
     let composer_height = composer_height_for_size(app, area.width, area.height);
     let desired_menu_height = menu_height_hint(active_menu, area.width, area.height);
-    let autonomy_height = autonomy_indicator_height(app);
+    let autonomy_height = autonomy_indicator_height(app, area.width);
     let harness_height = harness_status_height(app);
     let agent_strip_height = agent_strip_height(app, area.height);
     let surface_budget = area.height.saturating_sub(
@@ -2367,7 +2373,7 @@ fn render_inspector_layout(frame: &mut impl FrameLike, app: &AppState, palette: 
         frame.area().width,
         frame.area().height,
     );
-    let autonomy_height = autonomy_indicator_height(app);
+    let autonomy_height = autonomy_indicator_height(app, frame.area().width);
     let harness_height = harness_status_height(app);
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -2419,7 +2425,10 @@ fn render_inspector_layout(frame: &mut impl FrameLike, app: &AppState, palette: 
         menu_render::render_menu_surface(frame, root[1], menu, palette);
     }
     if autonomy_height > 0 {
-        frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
+        frame.render_widget(
+            render_autonomy_indicator(app, palette, root[2].width),
+            root[2],
+        );
     }
     if harness_height > 0 {
         render_harness_status_row(frame, app, palette, root[3]);
@@ -2443,7 +2452,7 @@ fn render_tasks_dock_layout(frame: &mut impl FrameLike, app: &AppState, palette:
         frame.area().width,
         frame.area().height,
     );
-    let autonomy_height = autonomy_indicator_height(app);
+    let autonomy_height = autonomy_indicator_height(app, frame.area().width);
     let harness_height = harness_status_height(app);
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -2469,7 +2478,10 @@ fn render_tasks_dock_layout(frame: &mut impl FrameLike, app: &AppState, palette:
         menu_render::render_menu_surface(frame, root[1], menu, palette);
     }
     if autonomy_height > 0 {
-        frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
+        frame.render_widget(
+            render_autonomy_indicator(app, palette, root[2].width),
+            root[2],
+        );
     }
     if harness_height > 0 {
         render_harness_status_row(frame, app, palette, root[3]);
@@ -8261,35 +8273,87 @@ fn plan_panel_rows(plan: &octos_core::ui_protocol::UiPlanRecord) -> u16 {
 /// only so a pathological multi-KB objective can't shove the composer off screen
 /// (the overall live-UI height clamp bounds it further).
 const GOAL_OBJECTIVE_MAX_ROWS: usize = 20;
-const GOAL_OBJECTIVE_CHARS_PER_ROW: usize = 56;
+/// Wrapping floor: even on a very narrow terminal the objective wraps at a sane
+/// minimum rather than collapsing toward one char per row.
+const GOAL_OBJECTIVE_MIN_WIDTH: usize = 24;
 
-fn goal_objective_chunks(objective: &str) -> Vec<String> {
+/// Width available for objective text: the render area width minus the banner's
+/// glyph/prefix gutter (`{glyph} ` on row 1) or the matching continuation indent
+/// — both are `goal_prefix + 2` columns. Threading the real width in (rather than
+/// the old fixed 56) lets the objective use the FULL terminal width; the height
+/// reservation and the render call this with the same width so their row counts
+/// stay in lock-step.
+fn goal_objective_body_width(width: u16) -> usize {
+    let indent = t!("app.autonomy.goal_prefix").chars().count() + 2;
+    (width as usize)
+        .saturating_sub(indent)
+        .max(GOAL_OBJECTIVE_MIN_WIDTH)
+}
+
+/// The status/budget parenthetical trailing the objective (e.g.
+/// "(active · 0K/2000K tokens)"). Built in ONE place so the height reservation
+/// and the render agree on its width when deciding whether it fits the last row.
+fn goal_meta_parenthetical(goal: &octos_core::ui_protocol::UiGoalRecord) -> String {
+    let (_, status_label) = goal_status_display(&goal.status);
+    t!(
+        "app.autonomy.goal_meta",
+        status = status_label,
+        used = format_tokens_k(goal.tokens_used),
+        budget = format_tokens_k(goal.token_budget)
+    )
+    .into_owned()
+}
+
+/// Wrap a goal objective into up to [`GOAL_OBJECTIVE_MAX_ROWS`] display chunks at
+/// the given render `width`. `tail_len` is the trailing parenthetical's column
+/// count: when the objective fits within the cap but the parenthetical wouldn't
+/// fit after the final row, an empty trailing chunk is appended so the
+/// parenthetical renders on its own indented line instead of being clipped off
+/// the right edge. Shared by the height reservation and the render so they always
+/// agree on the row count.
+fn goal_objective_chunks(objective: &str, width: u16, tail_len: usize) -> Vec<String> {
     let objective = objective.trim();
     if objective.is_empty() {
         return Vec::new();
     }
+    let body = goal_objective_body_width(width);
     let chars: Vec<char> = objective.chars().collect();
     let mut chunks: Vec<String> = chars
-        .chunks(GOAL_OBJECTIVE_CHARS_PER_ROW)
+        .chunks(body)
         .take(GOAL_OBJECTIVE_MAX_ROWS)
         .map(|c| c.iter().collect())
         .collect();
-    if chars.len() > GOAL_OBJECTIVE_MAX_ROWS * GOAL_OBJECTIVE_CHARS_PER_ROW {
+    if chars.len() > GOAL_OBJECTIVE_MAX_ROWS * body {
+        // Objective longer than the cap: mark the clip. The parenthetical rides
+        // the (full) last row; the cap already bounds height.
         if let Some(last) = chunks.last_mut() {
             last.push('…');
+        }
+    } else if tail_len > 0 {
+        // Objective fits: keep the status/budget parenthetical fully on-screen —
+        // if it won't fit after the final objective row, give it its own indented
+        // line (only while row budget remains).
+        let last_len = chunks.last().map(|c| c.chars().count()).unwrap_or(0);
+        if last_len + 1 + tail_len > body && chunks.len() < GOAL_OBJECTIVE_MAX_ROWS {
+            chunks.push(String::new());
         }
     }
     chunks
 }
 
-fn autonomy_indicator_height(app: &AppState) -> u16 {
+fn autonomy_indicator_height(app: &AppState, width: u16) -> u16 {
     match active_session_autonomy(app) {
         Some(state) => {
             let mut rows = 0u16;
             if let Some(goal) = state.goal.as_ref() {
                 // At least one row (glyph + status even when the objective is
-                // empty); otherwise the wrapped-objective row count.
-                let obj_rows = goal_objective_chunks(&goal.objective).len().max(1);
+                // empty); otherwise the wrapped-objective row count. MUST use the
+                // same width + parenthetical length as the render so the reserved
+                // height matches the rendered rows exactly.
+                let tail = goal_meta_parenthetical(goal).chars().count();
+                let obj_rows = goal_objective_chunks(&goal.objective, width, tail)
+                    .len()
+                    .max(1);
                 rows += obj_rows as u16;
             }
             if state.loops.iter().any(autonomy_loop_is_active) {
@@ -8396,25 +8460,21 @@ fn goal_status_display(status: &str) -> (&'static str, String) {
     }
 }
 
-fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> {
+fn autonomy_indicator_lines(app: &AppState, palette: Palette, width: u16) -> Vec<Line<'static>> {
     let Some(state) = active_session_autonomy(app) else {
         return Vec::new();
     };
     let mut lines = Vec::new();
     if let Some(goal) = state.goal.as_ref() {
-        let (glyph, status_label) = goal_status_display(&goal.status);
-        let parenthetical = t!(
-            "app.autonomy.goal_meta",
-            status = status_label,
-            used = format_tokens_k(goal.tokens_used),
-            budget = format_tokens_k(goal.token_budget)
-        )
-        .into_owned();
-        // The objective wraps across up to GOAL_OBJECTIVE_MAX_ROWS lines so the
-        // full goal is visible (a raw `/goal` request can be hundreds of chars).
-        // Row count here MUST match `autonomy_indicator_height`'s reservation —
-        // both derive from `goal_objective_chunks`.
-        let mut chunks = goal_objective_chunks(&goal.objective);
+        let (glyph, _status_label) = goal_status_display(&goal.status);
+        let parenthetical = goal_meta_parenthetical(goal);
+        // The objective wraps across up to GOAL_OBJECTIVE_MAX_ROWS lines at the
+        // FULL render width so the whole goal is visible (a raw `/goal` request
+        // can be hundreds of chars). Row count here MUST match
+        // `autonomy_indicator_height`'s reservation — both derive from
+        // `goal_objective_chunks` with the same width + parenthetical length.
+        let mut chunks =
+            goal_objective_chunks(&goal.objective, width, parenthetical.chars().count());
         if chunks.is_empty() {
             chunks.push(goal.goal_id.clone());
         }
@@ -8595,8 +8655,8 @@ fn plan_indicator_lines(
     lines
 }
 
-fn render_autonomy_indicator(app: &AppState, palette: Palette) -> Paragraph<'static> {
-    let lines = autonomy_indicator_lines(app, palette);
+fn render_autonomy_indicator(app: &AppState, palette: Palette, width: u16) -> Paragraph<'static> {
+    let lines = autonomy_indicator_lines(app, palette, width);
     Paragraph::new(Text::from(lines)).style(Style::default().fg(palette.text).bg(palette.surface))
 }
 
@@ -18259,8 +18319,8 @@ mod tests {
     #[test]
     fn render_autonomy_indicator_idle_reserves_no_rows() {
         let app = autonomy_app_state();
-        assert_eq!(autonomy_indicator_height(&app), 0);
-        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        assert_eq!(autonomy_indicator_height(&app, 100), 0);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
         assert!(
             lines.is_empty(),
             "idle state should produce no indicator rows"
@@ -18312,8 +18372,8 @@ mod tests {
         );
 
         // header + 3 item rows, no goal/loops.
-        assert_eq!(autonomy_indicator_height(&app), 4);
-        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        assert_eq!(autonomy_indicator_height(&app, 100), 4);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
         assert_eq!(lines.len(), 4);
 
         let text = rendered_text(&app);
@@ -18347,15 +18407,15 @@ mod tests {
             }],
         });
         app.set_session_plan(&session_id, plan, Some(turn.clone()));
-        assert_eq!(autonomy_indicator_height(&app), 2);
+        assert_eq!(autonomy_indicator_height(&app, 100), 2);
 
         // A completion for a DIFFERENT turn must not clear the panel.
         app.clear_session_plan_for_turn(&session_id, &other_turn);
-        assert_eq!(autonomy_indicator_height(&app), 2);
+        assert_eq!(autonomy_indicator_height(&app, 100), 2);
 
         // The authoring turn's completion clears it.
         app.clear_session_plan_for_turn(&session_id, &turn);
-        assert_eq!(autonomy_indicator_height(&app), 0);
+        assert_eq!(autonomy_indicator_height(&app, 100), 0);
     }
 
     #[test]
@@ -18380,7 +18440,7 @@ mod tests {
             None,
         );
         // header + 8 shown + 1 overflow line.
-        assert_eq!(autonomy_indicator_height(&app), 10);
+        assert_eq!(autonomy_indicator_height(&app, 100), 10);
         assert!(rendered_text(&app).contains("+4 more"));
     }
 
@@ -18546,8 +18606,8 @@ mod tests {
             Some("user".into()),
         );
 
-        assert_eq!(autonomy_indicator_height(&app), 1);
-        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        assert_eq!(autonomy_indicator_height(&app, 100), 1);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
         assert_eq!(lines.len(), 1);
 
         let text = rendered_text(&app);
@@ -18592,8 +18652,8 @@ mod tests {
             Some("user".into()),
         );
 
-        let height = autonomy_indicator_height(&app);
-        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        let height = autonomy_indicator_height(&app, 100);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
         assert!(
             height > 1,
             "a long objective must reserve more than one row"
@@ -18613,6 +18673,51 @@ mod tests {
         assert!(
             text.contains("knockout") || text.contains("group stage"),
             "later objective content must be visible via wrapping"
+        );
+    }
+
+    #[test]
+    fn goal_objective_uses_full_width_not_a_fixed_column() {
+        // Regression (mini5): the objective wrapped at a fixed ~half-screen
+        // column (56) regardless of terminal width. It must now wrap to the FULL
+        // render width — a wider terminal fits more per row and reserves FEWER
+        // rows, and rows exceed the old 56-column cap.
+        let objective = "x ".repeat(120); // ~240 chars
+        let narrow = goal_objective_chunks(&objective, 60, 0);
+        let wide = goal_objective_chunks(&objective, 160, 0);
+        assert!(
+            wide.len() < narrow.len(),
+            "a wider terminal must wrap into fewer rows (full-width): wide={} narrow={}",
+            wide.len(),
+            narrow.len(),
+        );
+        assert!(
+            wide.first().is_some_and(|r| r.chars().count() > 56),
+            "wide rows must exceed the old fixed 56-column wrap",
+        );
+    }
+
+    #[test]
+    fn goal_parenthetical_claims_its_own_row_when_it_would_not_fit() {
+        // When the final objective row is full, the status/budget parenthetical
+        // must drop to its own indented row instead of clipping off the edge.
+        let width = 80u16;
+        let body = goal_objective_body_width(width);
+        let objective = "a".repeat(body * 2); // fills exactly two full rows
+        assert_eq!(
+            goal_objective_chunks(&objective, width, 0).len(),
+            2,
+            "objective alone fills exactly two rows",
+        );
+        let with_tail = goal_objective_chunks(&objective, width, 20);
+        assert_eq!(
+            with_tail.len(),
+            3,
+            "a non-fitting parenthetical must claim its own trailing row",
+        );
+        assert!(
+            with_tail.last().is_some_and(String::is_empty),
+            "the trailing row is empty — the parenthetical renders alone on it",
         );
     }
 
@@ -18643,8 +18748,8 @@ mod tests {
             ],
         );
 
-        assert_eq!(autonomy_indicator_height(&app), 2);
-        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        assert_eq!(autonomy_indicator_height(&app, 100), 2);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
         assert_eq!(lines.len(), 2);
 
         let text = rendered_text(&app);
@@ -18683,7 +18788,7 @@ mod tests {
         app.set_session_loops(&session_id, vec![l1, l2]);
 
         assert_eq!(
-            autonomy_indicator_height(&app),
+            autonomy_indicator_height(&app, 100),
             0,
             "paused-only loops must not reserve an indicator row"
         );
