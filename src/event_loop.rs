@@ -889,7 +889,7 @@ fn handle_paste(store: &mut Store, text: &str) -> KeyAction {
     // beginning with '/' is not a command. Unlike a typed leading '/', we do
     // not open the slash-command menu here. (Regression: pasting a path
     // opened/ran the slash menu.)
-    store.state.insert_composer_text(&text);
+    store.state.insert_pasted_text(&text);
     store.state.focus = FocusPane::Composer;
 
     // Only keep an ALREADY-open slash search in sync (e.g. the user typed '/' to

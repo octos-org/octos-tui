@@ -14274,7 +14274,7 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("Large paste collapsed"));
-        assert!(text.contains("[paste] Pasted block"));
+        assert!(text.contains("[paste] 40 lines"));
         assert!(text.contains("preview: paste-line-01"));
         assert!(!text.contains("paste-line-40"));
         assert!(text.contains("Composer"));

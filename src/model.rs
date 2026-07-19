@@ -3891,6 +3891,11 @@ pub struct AppState {
     pub git: GitPaneState,
     pub composer: String,
     pub composer_cursor: Option<usize>,
+    /// True when the composer currently holds a large UNEDITED paste, so it
+    /// renders as a compact `[paste]` block. Set only by the paste path (real
+    /// paste events), cleared on any manual edit (type/delete/clear/submit) —
+    /// so TYPED multi-line input is never collapsed, only pastes are.
+    pub composer_pasted: bool,
     pub composer_drafts: Vec<ComposerDraft>,
     /// Cross-session command history for Up/Down recall (codex/claude-code
     /// style); persisted to `~/.config/octos-tui/history.jsonl`. See
@@ -5822,6 +5827,7 @@ impl AppState {
             git: panes.git,
             composer: String::new(),
             composer_cursor: None,
+            composer_pasted: false,
             composer_drafts: Vec::new(),
             composer_history: crate::history::ComposerHistory::default(),
             pending_messages: Vec::new(),
@@ -7944,6 +7950,8 @@ impl AppState {
     }
 
     pub fn load_composer_draft_for_selected_session(&mut self) {
+        // A restored draft is editable text, not a fresh paste — render it inline.
+        self.composer_pasted = false;
         let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
             self.composer.clear();
             self.composer_cursor = None;
@@ -7962,6 +7970,7 @@ impl AppState {
         let session_id = self.active_session().map(|session| session.id.clone());
         self.composer.clear();
         self.composer_cursor = None;
+        self.composer_pasted = false;
         // Clearing the composer (e.g. Ctrl+U) ends any history browse, so the
         // next Up recalls the newest entry instead of comparing the now-empty
         // composer against a stale recalled entry (which would scroll and need a
@@ -7976,6 +7985,23 @@ impl AppState {
     pub fn set_composer_text(&mut self, text: impl Into<String>) {
         self.composer = text.into();
         self.composer_cursor = None;
+        self.composer_pasted = false;
+    }
+
+    /// Insert PASTED text at the cursor. When the paste is large enough to be
+    /// worth boxing up (see [`paste_should_collapse`]), the composer is marked as
+    /// holding a paste so it renders as a compact `[paste]` block; small pastes
+    /// insert inline like typing. Only this path (real paste events) sets the
+    /// flag — typed input is never collapsed.
+    pub fn insert_pasted_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let large = paste_should_collapse(text);
+        self.insert_composer_text(text);
+        if large {
+            self.composer_pasted = true;
+        }
     }
 
     pub fn composer_cursor_index(&self) -> usize {
@@ -7992,12 +8018,16 @@ impl AppState {
     }
 
     pub fn insert_composer_char(&mut self, ch: char) {
+        // Typing edits the composer → it's no longer an unedited paste; show it
+        // inline (editable) rather than a collapsed `[paste]` block.
+        self.composer_pasted = false;
         let cursor = self.composer_cursor_index();
         self.composer.insert(cursor, ch);
         self.composer_cursor = Some(cursor + ch.len_utf8());
     }
 
     pub fn delete_composer_prev_char(&mut self) {
+        self.composer_pasted = false;
         let cursor = self.composer_cursor_index();
         let Some(prev) = prev_char_boundary(&self.composer, cursor) else {
             self.composer_cursor = Some(0);
@@ -8008,6 +8038,7 @@ impl AppState {
     }
 
     pub fn delete_composer_next_char(&mut self) {
+        self.composer_pasted = false;
         let cursor = self.composer_cursor_index();
         let Some(next) = next_char_boundary(&self.composer, cursor) else {
             self.composer_cursor = Some(self.composer.len());
@@ -8213,7 +8244,7 @@ impl AppState {
     }
 
     pub fn composer_presentation(&self) -> ComposerPresentation {
-        composer_presentation_for_text(&self.composer)
+        composer_presentation_for_text(&self.composer, self.composer_pasted)
     }
 
     fn clamp_composer_cursor(&self, cursor: usize) -> usize {
@@ -8358,9 +8389,24 @@ fn next_word_boundary(text: &str, cursor: usize) -> usize {
     idx
 }
 
-fn composer_presentation_for_text(text: &str) -> ComposerPresentation {
-    const COLLAPSE_LINE_THRESHOLD: usize = 32;
-    const COLLAPSE_CHAR_THRESHOLD: usize = 4_000;
+/// A paste is worth boxing up into a `[paste]` block once it reaches these
+/// (aggressive) sizes — matched against the pasted text so a small paste inserts
+/// inline like typing. Applied ONLY to real pastes (see [`AppState::composer_pasted`]).
+const PASTE_COLLAPSE_LINE_THRESHOLD: usize = 4;
+const PASTE_COLLAPSE_CHAR_THRESHOLD: usize = 400;
+/// Content this large collapses even when NOT flagged as a paste — a safety net
+/// for a huge blob that arrived some other way (nobody types this much). Kept
+/// high so ordinary typed multi-line prose / long single-line prompts stay inline.
+const TYPED_COLLAPSE_LINE_THRESHOLD: usize = 32;
+const TYPED_COLLAPSE_CHAR_THRESHOLD: usize = 4_000;
+
+/// Whether a pasted string is large enough to collapse into a `[paste]` block.
+fn paste_should_collapse(text: &str) -> bool {
+    text.chars().count() >= PASTE_COLLAPSE_CHAR_THRESHOLD
+        || text.lines().count().max(1) >= PASTE_COLLAPSE_LINE_THRESHOLD
+}
+
+fn composer_presentation_for_text(text: &str, from_paste: bool) -> ComposerPresentation {
     const PREVIEW_CHARS: usize = 88;
 
     if text.is_empty() {
@@ -8369,17 +8415,23 @@ fn composer_presentation_for_text(text: &str) -> ComposerPresentation {
 
     let char_count = text.chars().count();
     let line_count = text.lines().count().max(1);
-    let should_collapse =
-        line_count >= COLLAPSE_LINE_THRESHOLD || char_count >= COLLAPSE_CHAR_THRESHOLD;
+    // Pastes collapse aggressively; anything else only when huge (typed input is
+    // never collapsed at the low paste thresholds).
+    let should_collapse = if from_paste {
+        paste_should_collapse(text)
+    } else {
+        line_count >= TYPED_COLLAPSE_LINE_THRESHOLD || char_count >= TYPED_COLLAPSE_CHAR_THRESHOLD
+    };
 
     if !should_collapse {
         return ComposerPresentation::Inline(text.to_string());
     }
 
-    let summary = if line_count >= COLLAPSE_LINE_THRESHOLD {
-        format!("Pasted block: {line_count} lines, {char_count} chars")
+    // Renders after the `[paste] ` prefix, e.g. "[paste] 18 lines · 1240 chars".
+    let summary = if line_count > 1 {
+        format!("{line_count} lines · {char_count} chars")
     } else {
-        format!("Long prompt: {char_count} chars")
+        format!("{char_count} chars")
     };
     let preview_source = text
         .lines()
@@ -9468,6 +9520,68 @@ mod tests {
         assert_eq!(state.composer, pasted_text);
         assert!(collapse.summary.contains("40 lines"));
         assert_eq!(collapse.preview, "first pasted line");
+    }
+
+    #[test]
+    fn small_paste_collapses_but_the_same_text_typed_stays_inline() {
+        let mut state = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // A 6-line block: well under the 32-line "typed" safety threshold, so it
+        // ONLY collapses because it arrived via paste.
+        let block = (1..=6)
+            .map(|i| format!("pasted code line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Pasted → compact [paste] block.
+        state.insert_pasted_text(&block);
+        assert!(state.composer_pasted, "a large paste sets the paste flag");
+        let ComposerPresentation::Collapsed(collapse) = state.composer_presentation() else {
+            panic!("a 6-line paste should collapse");
+        };
+        assert!(collapse.summary.contains("6 lines"));
+        assert_eq!(state.composer, block, "collapse never mutates the text");
+
+        // The SAME text typed (not pasted) must stay inline — no collapse.
+        state.clear_current_composer_draft();
+        for ch in block.chars() {
+            state.insert_composer_char(ch);
+        }
+        assert!(!state.composer_pasted, "typing never sets the paste flag");
+        assert!(
+            matches!(
+                state.composer_presentation(),
+                ComposerPresentation::Inline(_)
+            ),
+            "typed multi-line input must NOT collapse",
+        );
+
+        // Editing a collapsed paste re-opens it inline (so it stays editable).
+        state.insert_pasted_text(&block);
+        assert!(state.composer_pasted);
+        state.insert_composer_char('!');
+        assert!(!state.composer_pasted, "an edit clears the paste flag");
+        assert!(matches!(
+            state.composer_presentation(),
+            ComposerPresentation::Inline(_)
+        ));
+
+        // A tiny paste stays inline (nothing to box up).
+        state.clear_current_composer_draft();
+        state.insert_pasted_text("hi");
+        assert!(!state.composer_pasted, "a small paste does not collapse");
     }
 
     #[test]
