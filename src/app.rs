@@ -9912,6 +9912,25 @@ fn hint_bar_text(model: HintBarModel) -> String {
     }
 }
 
+/// True when the active session's turn is parked on an operator decision — a
+/// pending tool approval or an `AskUserQuestion` picker. While this holds the
+/// decision modal owns the keyboard (y/s/n) so the composer is locked; the modal
+/// can also scroll out of the height-clipped live tail, leaving the user with a
+/// bare "Waiting" and no visible prompt — so the status bar must advertise the
+/// recovery keys (Alt+A to bring the prompt back, Ctrl+C to interrupt).
+fn active_session_has_pending_decision(app: &AppState) -> bool {
+    let Some(session_id) = app.active_session().map(|session| session.id.clone()) else {
+        return false;
+    };
+    app.approval
+        .as_ref()
+        .is_some_and(|approval| approval.session_id == session_id)
+        || app
+            .user_question
+            .as_ref()
+            .is_some_and(|question| question.session_id == session_id)
+}
+
 fn status_bar_work_text(app: &AppState) -> String {
     let mut parts = Vec::new();
     match &app.run_state {
@@ -9930,7 +9949,14 @@ fn status_bar_work_text(app: &AppState) -> String {
         parts.push(t!("app.statusbar.background_tasks", count = background_tasks).into_owned());
         parts.push(t!("app.statusbar.ps_to_view").into_owned());
     }
-    if app.active_turn().is_some() {
+    if active_session_has_pending_decision(app) {
+        // Turn parked on YOUR decision; the approval/question card may have
+        // scrolled out of the clipped live tail, so a bare "Esc interrupt" (a
+        // two-step while a modal is up) is a dead end. Advertise the real
+        // recovery keys instead — shown whenever a decision is pending, not just
+        // when an active turn is reported.
+        parts.push(t!("app.statusbar.pending_decision_help").into_owned());
+    } else if app.active_turn().is_some() {
         parts.push(t!("app.statusbar.esc_interrupt").into_owned());
         parts.push(t!("app.statusbar.stop_to_close").into_owned());
     }
@@ -11463,6 +11489,64 @@ mod tests {
             status_row.contains("Working"),
             "resolved decision returns to Working: {status_row:?}"
         );
+    }
+
+    #[test]
+    fn status_work_text_advertises_recovery_keys_when_a_decision_is_pending() {
+        // Regression: a turn parked on an approval/question locks the composer and
+        // its card can scroll off the clipped live tail — leaving a bare "Waiting"
+        // with only the (two-step) Esc hint. The work text must instead advertise
+        // Alt+A (bring the prompt back) and Ctrl+C (one-press interrupt).
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "t".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.run_state = SessionRunState::Blocked {
+            message: "Run command".into(),
+        };
+        // No pending decision → no recovery hint.
+        assert!(!status_bar_work_text(&app).contains("Alt+A"));
+
+        // Park the active session on an approval (even collapsed/hidden).
+        app.approval = Some(ApprovalModalState {
+            session_id: session_id.clone(),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            title: "Run".into(),
+            body: "approve?".into(),
+            approval_kind: None,
+            risk: None,
+            typed_details: None,
+            render_hints: None,
+            visible: false,
+        });
+        let work = status_bar_work_text(&app);
+        assert!(
+            work.contains("Alt+A") && work.contains("Ctrl+C"),
+            "a parked decision must advertise the recovery keys: {work:?}"
+        );
+        assert!(
+            !work.contains("Esc interrupt"),
+            "the dead-end Esc hint is replaced while a decision is pending: {work:?}"
+        );
+
+        // A decision on ANOTHER session must not hijack this session's hint.
+        if let Some(approval) = app.approval.as_mut() {
+            approval.session_id = SessionKey("local:other".into());
+        }
+        assert!(!status_bar_work_text(&app).contains("Alt+A"));
     }
 
     #[test]

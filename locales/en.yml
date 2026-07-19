@@ -111,6 +111,7 @@ app:
     ps_to_view: "/ps to view"
     esc_interrupt: "Esc interrupt"
     stop_to_close: "/stop to close"
+    pending_decision_help: "Waiting on you — Alt+A answer · Ctrl+C interrupt"
     tool_output_expanded: "tool output expanded"
   btw:
     answering: "Answering…"
