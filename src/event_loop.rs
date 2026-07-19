@@ -2010,8 +2010,12 @@ fn handle_user_question_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::Char(' ') if !store.user_question_editing_free_text() => {
             store.user_question_toggle();
         }
-        KeyCode::Char(']') => store.user_question_cursor_down(),
-        KeyCode::Char('[') => store.user_question_cursor_up(),
+        KeyCode::Char(']') if !store.user_question_editing_free_text() => {
+            store.user_question_cursor_down()
+        }
+        KeyCode::Char('[') if !store.user_question_editing_free_text() => {
+            store.user_question_cursor_up()
+        }
         KeyCode::Tab => {
             // Step forward through questions without submitting.
             store.user_question_advance();
