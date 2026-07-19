@@ -4,14 +4,14 @@ use octos_core::app_ui::{AppUiEvent, AppUiSnapshot};
 use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
     ApprovalRespondParams, DiffPreviewGetParams, EnvelopeNotification, EnvelopeToolEndStatus,
-    HydratedMessage, InputItem, MessageDeltaEvent, MessagePersistedEvent, Payload,
-    ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult, SessionListParams,
-    SessionListResult, SessionOpenParams, SessionRollbackParams, SessionRollbackResult,
-    TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState,
-    TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent, TurnId,
-    TurnInterruptParams, TurnLifecycleState, TurnSpawnCompleteEvent, TurnStartParams,
-    TurnStateGetParams, UiContextState, UiNotification, UiProgressEvent,
-    UserQuestionRequestedEvent,
+    EnvelopeV2Notification, HydratedMessage, InputItem, MessageDeltaEvent, MessagePersistedEvent,
+    Payload, PayloadV2, ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult,
+    SessionListParams, SessionListResult, SessionOpenParams, SessionRollbackParams,
+    SessionRollbackResult, TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams,
+    TaskRuntimeState, TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent,
+    TurnId, TurnInterruptParams, TurnLifecycleState, TurnSpawnCompleteEvent, TurnStartParams,
+    TurnStateGetParams, TurnTerminalOutcome, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
+    UiContextState, UiNotification, UiProgressEvent, UserQuestionRequestedEvent,
 };
 use octos_core::{Message, MessageRole, SessionKey, TaskId, ThreadId};
 use serde_json::Value;
@@ -43,7 +43,7 @@ use crate::{
         SessionMcpCatalog, SessionModelCatalog, SessionRuntimeStatus, SessionToolCatalog,
         SessionView, StagedSubmitGate, TaskView, ToolConfigDeleteParams, ToolConfigListParams,
         ToolConfigSetEnabledParams, ToolConfigTestParams, ToolConfigUpsertParams,
-        UserQuestionPickerState, complete_plan_steps_in_text, task_state_label,
+        UserQuestionPickerState, V2AssistantSegment, complete_plan_steps_in_text, task_state_label,
         terminal_task_state_from_agent_status,
     },
 };
@@ -6259,6 +6259,8 @@ impl Store {
                 let turn_prompt_anchors = self.state.turn_prompt_anchors.clone();
                 let live_reply_segment_boundaries =
                     self.state.live_reply_segment_boundaries.clone();
+                let v2_live_assistant_segments = self.state.v2_live_assistant_segments.clone();
+                let v2_turn_ids = self.state.v2_turn_ids.clone();
                 let approval_auto_open = self.state.approval_auto_open;
                 let user_question_auto_open = self.state.user_question_auto_open;
                 let expanded_tool_outputs = self.state.expanded_tool_outputs;
@@ -6359,6 +6361,8 @@ impl Store {
                 state.optimistic_user_messages = optimistic_user_messages;
                 state.turn_prompt_anchors = turn_prompt_anchors;
                 state.live_reply_segment_boundaries = live_reply_segment_boundaries;
+                state.v2_live_assistant_segments = v2_live_assistant_segments;
+                state.v2_turn_ids = v2_turn_ids;
                 state.approval_auto_open = approval_auto_open;
                 state.user_question_auto_open = user_question_auto_open;
                 state.expanded_tool_outputs = expanded_tool_outputs;
@@ -7200,6 +7204,9 @@ impl Store {
             .remove(&(session_id.clone(), turn_id.clone()));
         self.state
             .clear_live_reply_segment_boundaries(session_id, turn_id);
+        self.state
+            .v2_live_assistant_segments
+            .remove(&(session_id.clone(), turn_id.clone()));
         self.release_staged_gate_for_turn(session_id, turn_id);
         self.state.mark_turn_completed(session_id, turn_id);
         self.state.reconcile_terminal_turn_running_activity(turn_id);
@@ -8345,74 +8352,7 @@ impl Store {
                 text,
                 ..
             }) => {
-                // A late delta for an already-terminal turn (e.g. background
-                // spawn_only tokens re-streamed under the dead foreground turn
-                // id) must NOT lazy-bind into `live_reply`: that latches
-                // `active_turn()` forever (the completed turn never gets a second
-                // TurnCompleted to clear it), wedging the composer into queuing
-                // all input. Drop it.
-                if self.state.is_turn_completed(&session_id, &turn_id) {
-                    return None;
-                }
-                // Global chip + scroll belong to the ACTIVE session; a
-                // background session's stream must not move them (its text
-                // still accumulates into its own live_reply below).
-                let targets_active = self.event_targets_active_session(&session_id);
-                let follow_tail = self.state.transcript_scroll == 0;
-                // Lazy-bind: a delta whose turn_id has no current live_reply
-                // binding (None, or a binding for an OLDER turn) must still be
-                // accumulated — never dropped. This covers continuation turns
-                // whose `TurnStarted` was not delivered to this connection, so
-                // the first frame the client sees for the turn is a delta. When
-                // switching to a new turn_id, commit/close the prior turn's
-                // live_reply first so its answer is preserved.
-                let needs_bind = self
-                    .find_session(&session_id)
-                    .and_then(|session| session.live_reply.as_ref())
-                    .map(|live_reply| live_reply.turn_id != turn_id)
-                    .unwrap_or(true);
-                if needs_bind {
-                    self.commit_pending_live_reply_for_turn_switch(&session_id, &turn_id);
-                    self.state
-                        .record_turn_prompt_anchor_from_latest_user(&session_id, &turn_id);
-                    // A successor turn that materializes DELTA-FIRST (its
-                    // `TurnStarted` never reached this client) supersedes the
-                    // session's pending interrupt-restore exactly as the
-                    // `TurnStarted` arm does — otherwise the stale prompt
-                    // survives to re-block the `/` popup on the next menu
-                    // close while this successor streams (codex round-4).
-                    self.supersede_pending_interrupt_restore(&session_id, &turn_id);
-                }
-                let mut reset_scroll = false;
-                if let Some(session) = self.find_session_mut(&session_id) {
-                    let live_reply = session.live_reply.get_or_insert_with(|| LiveReply {
-                        turn_id: turn_id.clone(),
-                        text: String::new(),
-                    });
-                    if live_reply.turn_id == turn_id {
-                        // Server text can quote raw tool output (dev servers,
-                        // vite, npm) — strip escape/control sequences before
-                        // they reach the styled transcript renderer.
-                        live_reply
-                            .text
-                            .push_str(&crate::sanitize::strip_terminal_controls(&text));
-                        reset_scroll = true;
-                    }
-                }
-                if needs_bind && reset_scroll && targets_active {
-                    // A delta-first continuation turn (its TurnStarted was not
-                    // delivered) is genuinely streaming — reflect the active run.
-                    self.state.set_run_state_in_progress();
-                }
-                if reset_scroll && targets_active {
-                    if follow_tail {
-                        self.state.scroll_transcript_to_latest();
-                    } else {
-                        self.state.preserve_transcript_position_after_append(
-                            text.lines().count().saturating_sub(1),
-                        );
-                    }
-                }
+                self.append_live_reply_delta(&session_id, &turn_id, &text);
                 None
             }
             UiNotification::ToolStarted(event) => {
@@ -8425,8 +8365,7 @@ impl Store {
                 // markdown block for the next segment instead of gluing
                 // "...skeleton." onto the next "### Step N". (MessagePersisted is the
                 // wrong signal: it fires at turn end with the full text length.)
-                self.state
-                    .record_live_reply_segment_boundary(&event.session_id, &event.turn_id);
+                self.finalize_live_reply_segment(&event.session_id, &event.turn_id);
                 let mut item =
                     ActivityItem::new(ActivityKind::Tool, event.tool_name.clone(), "running")
                         // Session attribution keeps a BACKGROUND session's tool
@@ -8603,6 +8542,7 @@ impl Store {
             UiNotification::TurnSpawnComplete(event) => self.apply_turn_spawn_complete(event),
             UiNotification::FileAttached(event) => self.apply_file_attached(event),
             UiNotification::Envelope(event) => self.apply_envelope(event),
+            UiNotification::EnvelopeV2(event) => self.apply_envelope_v2(event),
             UiNotification::SessionEventBridged(event) => self.apply_session_event_bridged(event),
             UiNotification::RouterStatus(event) => {
                 self.state.status = format!(
@@ -9085,6 +9025,101 @@ impl Store {
         }
     }
 
+    /// Shared live-delta path for legacy `message/delta` and canonical v2
+    /// `assistant_delta`. Both protocol families must bind, stream, scroll,
+    /// and set the working state identically; only v2's segment identity is
+    /// tracked by its caller.
+    fn append_live_reply_delta(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+        text: &str,
+    ) -> Option<usize> {
+        // A late delta for an already-terminal turn (e.g. background
+        // spawn_only tokens re-streamed under the dead foreground turn id)
+        // must not re-bind `live_reply` and wedge the composer.
+        if self.state.is_turn_completed(session_id, turn_id) {
+            return None;
+        }
+        let targets_active = self.event_targets_active_session(session_id);
+        let follow_tail = self.state.transcript_scroll == 0;
+        // Lazy-bind a delta-first continuation, first committing any prior
+        // turn so its answer is never merged into the successor.
+        let needs_bind = self
+            .find_session(session_id)
+            .and_then(|session| session.live_reply.as_ref())
+            .map(|live_reply| &live_reply.turn_id != turn_id)
+            .unwrap_or(true);
+        if needs_bind {
+            self.commit_pending_live_reply_for_turn_switch(session_id, turn_id);
+            self.state
+                .record_turn_prompt_anchor_from_latest_user(session_id, turn_id);
+            self.supersede_pending_interrupt_restore(session_id, turn_id);
+        }
+
+        let mut end_offset = None;
+        if let Some(session) = self.find_session_mut(session_id) {
+            let live_reply = session.live_reply.get_or_insert_with(|| LiveReply {
+                turn_id: turn_id.clone(),
+                text: String::new(),
+            });
+            if &live_reply.turn_id == turn_id {
+                // Server text can quote raw tool output (dev servers, vite,
+                // npm) — strip escape/control sequences before the styled
+                // transcript renderer sees it.
+                live_reply
+                    .text
+                    .push_str(&crate::sanitize::strip_terminal_controls(text));
+                end_offset = Some(live_reply.text.len());
+            }
+        }
+
+        if needs_bind && end_offset.is_some() && targets_active {
+            // A delta-first continuation is genuinely streaming even when its
+            // `TurnStarted` was not delivered on this connection.
+            self.state.set_run_state_in_progress();
+        }
+        if end_offset.is_some() && targets_active {
+            if follow_tail {
+                self.state.scroll_transcript_to_latest();
+            } else {
+                self.state.preserve_transcript_position_after_append(
+                    text.lines().count().saturating_sub(1),
+                );
+            }
+        }
+        end_offset
+    }
+
+    /// The sole boundary operation shared by the legacy persistence/tool path
+    /// and v2's canonical `assistant_persisted` / `tool_start` path.
+    fn finalize_live_reply_segment(&mut self, session_id: &SessionKey, turn_id: &TurnId) -> bool {
+        self.state
+            .record_live_reply_segment_boundary(session_id, turn_id)
+    }
+
+    fn projection_envelope_v2_negotiated(&self) -> bool {
+        self.state
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                capabilities.supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
+            })
+    }
+
+    fn v2_drives_turn(&self, session_id: &SessionKey, turn_id: &TurnId) -> bool {
+        self.state
+            .v2_live_assistant_segments
+            .contains_key(&(session_id.clone(), turn_id.clone()))
+            || self
+                .state
+                .v2_turn_ids
+                .iter()
+                .any(|((mapped_session_id, _), mapped_turn_id)| {
+                    mapped_session_id == session_id && mapped_turn_id == turn_id
+                })
+    }
+
     fn apply_envelope(&mut self, event: EnvelopeNotification) -> Option<AppUiCommand> {
         let EnvelopeNotification {
             session_id,
@@ -9245,6 +9280,465 @@ impl Store {
         }
     }
 
+    /// Resolve v2's string wire identity into the typed turn id used by the
+    /// established TUI lifecycle. Native v2 producers may use UUIDs, while the
+    /// Stage-1 compatibility projection can use a non-UUID stream id; retaining
+    /// this map lets either shape drive the same `LiveReply`/terminal reducer.
+    ///
+    /// Stage 1 projects legacy envelope content with its old thread-shaped id,
+    /// but projects the richer terminal/file events with the canonical turn
+    /// UUID. `may_alias_active_turn` joins that terminal/file UUID to the sole
+    /// current v2 live reply, then caches the alias so terminal replay stays
+    /// idempotent. Normal content events never make that inference: a new
+    /// content id must still open a new reply segment/turn.
+    fn resolve_v2_turn_id(
+        &mut self,
+        session_id: &SessionKey,
+        wire_turn_id: &str,
+        may_alias_active_turn: bool,
+    ) -> TurnId {
+        let key = (session_id.clone(), wire_turn_id.to_owned());
+        if let Some(turn_id) = self.state.v2_turn_ids.get(&key) {
+            return turn_id.clone();
+        }
+
+        let matching_live_turn = self
+            .find_session(session_id)
+            .and_then(|session| session.live_reply.as_ref())
+            .filter(|live_reply| live_reply.turn_id.0.to_string() == wire_turn_id)
+            .map(|live_reply| live_reply.turn_id.clone());
+        let parsed_turn_id = serde_json::from_value(Value::String(wire_turn_id.to_owned())).ok();
+        let active_v2_turn = may_alias_active_turn
+            .then(|| {
+                self.find_session(session_id)
+                    .and_then(|session| session.live_reply.as_ref())
+                    .map(|live_reply| live_reply.turn_id.clone())
+                    .filter(|turn_id| {
+                        self.state
+                            .v2_live_assistant_segments
+                            .contains_key(&(session_id.clone(), turn_id.clone()))
+                    })
+            })
+            .flatten();
+        let turn_id = matching_live_turn
+            .or(active_v2_turn)
+            .or(parsed_turn_id)
+            .unwrap_or_default();
+        self.state.v2_turn_ids.insert(key, turn_id.clone());
+        turn_id
+    }
+
+    fn apply_v2_assistant_delta(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+        assistant_segment_id: String,
+        text: String,
+    ) {
+        let key = (session_id.clone(), turn_id.clone());
+        let known_segment = self
+            .state
+            .v2_live_assistant_segments
+            .get(&key)
+            .and_then(|segments| {
+                segments
+                    .iter()
+                    .find(|segment| segment.id == assistant_segment_id)
+                    .cloned()
+            });
+        if known_segment
+            .as_ref()
+            .is_some_and(|segment| segment.finalized)
+        {
+            // Replayed deltas for an already-persisted segment must never
+            // re-open it or append duplicate content after a later segment.
+            return;
+        }
+        if known_segment.as_ref().is_some_and(|_| {
+            self.state
+                .v2_live_assistant_segments
+                .get(&key)
+                .and_then(|segments| segments.last())
+                .is_none_or(|segment| segment.id != assistant_segment_id)
+        }) {
+            // Out-of-order content for an older in-flight segment cannot be
+            // safely spliced into a later one. The canonical sequence order
+            // makes this defensive no-op preferable to overwriting content.
+            return;
+        }
+
+        if known_segment.is_none()
+            && self
+                .find_session(session_id)
+                .and_then(|session| session.live_reply.as_ref())
+                .is_some_and(|live_reply| {
+                    &live_reply.turn_id == turn_id && !live_reply.text.is_empty()
+                })
+        {
+            // A new canonical id starts a new segment even if a producer
+            // omitted a prior persisted event. The normal persisted path uses
+            // the exact same helper below, and duplicate boundaries are
+            // suppressed by AppState.
+            self.finalize_live_reply_segment(session_id, turn_id);
+        }
+
+        let sanitized = crate::sanitize::strip_terminal_controls(&text).into_owned();
+        let end_offset = self.append_live_reply_delta(session_id, turn_id, &sanitized);
+        if known_segment.is_none()
+            && let Some(end_offset) = end_offset
+        {
+            let start_offset = end_offset.saturating_sub(sanitized.len());
+            self.state
+                .v2_live_assistant_segments
+                .entry(key)
+                .or_default()
+                .push(V2AssistantSegment {
+                    id: assistant_segment_id,
+                    start_offset,
+                    finalized: false,
+                });
+        }
+    }
+
+    fn apply_v2_assistant_persisted(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+        assistant_segment_id: String,
+        text: String,
+    ) {
+        let key = (session_id.clone(), turn_id.clone());
+        let known_segment = self
+            .state
+            .v2_live_assistant_segments
+            .get(&key)
+            .and_then(|segments| {
+                segments
+                    .iter()
+                    .find(|segment| segment.id == assistant_segment_id)
+                    .cloned()
+            });
+        if known_segment.is_none() {
+            // A persisted row may be the first frame observed after replay.
+            // Seed it through the SAME delta path, then replace only that
+            // segment below rather than replacing the whole live reply.
+            self.apply_v2_assistant_delta(
+                session_id,
+                turn_id,
+                assistant_segment_id.clone(),
+                text.clone(),
+            );
+        }
+        let Some(segment) = self
+            .state
+            .v2_live_assistant_segments
+            .get(&key)
+            .and_then(|segments| {
+                segments
+                    .iter()
+                    .find(|segment| segment.id == assistant_segment_id)
+                    .cloned()
+            })
+        else {
+            return;
+        };
+        if segment.finalized
+            || self
+                .state
+                .v2_live_assistant_segments
+                .get(&key)
+                .and_then(|segments| segments.last())
+                .is_none_or(|latest| latest.id != assistant_segment_id)
+        {
+            return;
+        }
+
+        let sanitized = crate::sanitize::strip_terminal_controls(&text).into_owned();
+        let targets_active = self.event_targets_active_session(session_id);
+        let follow_tail = self.state.transcript_scroll == 0;
+        let mut replaced = false;
+        if let Some(session) = self.find_session_mut(session_id)
+            && let Some(live_reply) = session.live_reply.as_mut()
+            && &live_reply.turn_id == turn_id
+            && segment.start_offset <= live_reply.text.len()
+            && live_reply.text.is_char_boundary(segment.start_offset)
+        {
+            live_reply
+                .text
+                .replace_range(segment.start_offset.., &sanitized);
+            replaced = true;
+        }
+        if !replaced {
+            return;
+        }
+
+        if let Some(segments) = self.state.v2_live_assistant_segments.get_mut(&key)
+            && let Some(segment) = segments
+                .iter_mut()
+                .find(|segment| segment.id == assistant_segment_id)
+        {
+            segment.finalized = true;
+        }
+        self.finalize_live_reply_segment(session_id, turn_id);
+        if targets_active {
+            if follow_tail {
+                self.state.scroll_transcript_to_latest();
+            } else {
+                self.state.preserve_transcript_position_after_append(
+                    sanitized.lines().count().saturating_sub(1),
+                );
+            }
+        }
+    }
+
+    fn apply_envelope_v2(&mut self, event: EnvelopeV2Notification) -> Option<AppUiCommand> {
+        let EnvelopeV2Notification {
+            session_id,
+            topic,
+            envelope,
+        } = event;
+        let thread_id = envelope.thread_id;
+        let cursor = envelope.cursor;
+        let wire_turn_id = envelope.turn_id;
+
+        match envelope.payload {
+            PayloadV2::UserMessage { text, files } => {
+                let _ = self.resolve_v2_turn_id(&session_id, &wire_turn_id, false);
+                if let Some(session) = self.find_session_mut(&session_id) {
+                    let already_present = session.messages.iter().any(|message| {
+                        message.role == MessageRole::User
+                            && message.thread_id.as_deref() == Some(thread_id.as_str())
+                    });
+                    if !already_present {
+                        let mut message =
+                            Message::user(text).with_thread_id(ThreadId::new(thread_id));
+                        message.media = files.into_iter().map(|file| file.path).collect();
+                        session.messages.push(message);
+                    }
+                }
+                None
+            }
+            PayloadV2::AssistantDelta {
+                text,
+                assistant_segment_id,
+            } => {
+                let turn_id = self.resolve_v2_turn_id(&session_id, &wire_turn_id, false);
+                self.apply_v2_assistant_delta(&session_id, &turn_id, assistant_segment_id, text);
+                None
+            }
+            PayloadV2::ReasoningDelta { text } => {
+                let turn_id = self.resolve_v2_turn_id(&session_id, &wire_turn_id, false);
+                self.state
+                    .live_reasoning
+                    .entry((session_id, turn_id))
+                    .or_default()
+                    .push_str(&text);
+                None
+            }
+            PayloadV2::AssistantPersisted {
+                text,
+                assistant_segment_id,
+                meta: _,
+            } => {
+                let turn_id = self.resolve_v2_turn_id(&session_id, &wire_turn_id, false);
+                self.apply_v2_assistant_persisted(
+                    &session_id,
+                    &turn_id,
+                    assistant_segment_id,
+                    text,
+                );
+                None
+            }
+            PayloadV2::ToolStart {
+                tool_call_id,
+                name,
+                arguments_preview,
+            } => {
+                let turn_id = self.resolve_v2_turn_id(&session_id, &wire_turn_id, false);
+                self.state
+                    .record_turn_prompt_anchor_from_latest_user(&session_id, &turn_id);
+                self.finalize_live_reply_segment(&session_id, &turn_id);
+                let mut item = ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
+                    .with_session(session_id.clone())
+                    .with_turn(turn_id.clone())
+                    .with_tool_call(tool_call_id.clone());
+                if let Some(arguments_preview) = arguments_preview {
+                    item = item.with_arguments(Value::String(arguments_preview));
+                }
+                self.state.push_activity(item);
+                if self.event_targets_active_session(&session_id) {
+                    self.state.set_run_state_in_progress();
+                }
+                self.state.status =
+                    t!("status.tool_started", name = name, id = tool_call_id).into_owned();
+                None
+            }
+            PayloadV2::ToolProgress {
+                tool_call_id,
+                message,
+            } => {
+                let _ = self.resolve_v2_turn_id(&session_id, &wire_turn_id, false);
+                self.state.update_tool_activity(
+                    &tool_call_id,
+                    "running",
+                    Some(message.clone()),
+                    None,
+                    None,
+                    None,
+                );
+                if self.event_targets_active_session(&session_id) {
+                    self.state.set_run_state_in_progress();
+                }
+                self.state.status = message;
+                None
+            }
+            PayloadV2::ToolEnd {
+                tool_call_id,
+                status,
+                error,
+                reason,
+                output_preview,
+                duration_ms,
+            } => {
+                let _ = self.resolve_v2_turn_id(&session_id, &wire_turn_id, false);
+                let (label, success) = match status {
+                    EnvelopeToolEndStatus::Complete => ("complete", Some(true)),
+                    EnvelopeToolEndStatus::Error => ("failed", Some(false)),
+                    EnvelopeToolEndStatus::Skipped => ("skipped", None),
+                    EnvelopeToolEndStatus::Aborted => ("aborted", Some(false)),
+                };
+                self.state.update_tool_activity(
+                    &tool_call_id,
+                    label,
+                    None,
+                    output_preview.or(error).or(reason),
+                    success,
+                    duration_ms,
+                );
+                self.state.status = format!("Tool {label}: {tool_call_id}");
+                None
+            }
+            PayloadV2::FileAttached {
+                path,
+                mime,
+                size_bytes,
+                attachment_owner,
+            } => {
+                let turn_id = self.resolve_v2_turn_id(&session_id, &wire_turn_id, true);
+                let mut detail = format!("{mime}, {size_bytes} bytes");
+                if let Some(assistant_segment_id) = attachment_owner.assistant_segment_id {
+                    detail.push_str(&format!("; assistant segment {assistant_segment_id}"));
+                }
+                let mut item = ActivityItem::new(ActivityKind::Tool, path.clone(), "attached")
+                    .with_session(session_id.clone())
+                    .with_turn(turn_id)
+                    .with_detail(detail);
+                if let Some(tool_call_id) = attachment_owner.tool_call_id {
+                    item = item.with_tool_call(tool_call_id);
+                }
+                self.state.push_activity(item);
+                self.state.status = format!("File attached: {path}");
+                None
+            }
+            PayloadV2::TurnTerminal {
+                outcome,
+                error,
+                token_usage,
+            } => {
+                let turn_id = self.resolve_v2_turn_id(&session_id, &wire_turn_id, true);
+                let command = match outcome {
+                    TurnTerminalOutcome::Completed => {
+                        let (tokens_in, tokens_out) = token_usage
+                            .map(|usage| {
+                                (
+                                    u32::try_from(usage.input_tokens).ok(),
+                                    u32::try_from(usage.output_tokens).ok(),
+                                )
+                            })
+                            .unwrap_or((None, None));
+                        self.commit_live_reply(TurnCompletedEvent {
+                            session_id: session_id.clone(),
+                            topic,
+                            turn_id: turn_id.clone(),
+                            cursor,
+                            tokens_in,
+                            tokens_out,
+                            session_result: None,
+                        })
+                    }
+                    TurnTerminalOutcome::Errored | TurnTerminalOutcome::Interrupted => {
+                        let is_interrupted = outcome == TurnTerminalOutcome::Interrupted;
+                        let error = error.unwrap_or_else(|| {
+                            let (code, message) = if is_interrupted {
+                                ("interrupted", "Turn interrupted.")
+                            } else {
+                                ("turn_errored", "Turn errored.")
+                            };
+                            octos_core::ui_protocol::TurnTerminalError {
+                                code: code.into(),
+                                message: message.into(),
+                                data: None,
+                            }
+                        });
+                        let message = error.message.clone();
+                        let command = self.fail_live_reply(TurnErrorEvent {
+                            session_id: session_id.clone(),
+                            topic,
+                            turn_id: turn_id.clone(),
+                            code: if is_interrupted {
+                                "interrupted".into()
+                            } else {
+                                error.code
+                            },
+                            message: message.clone(),
+                        });
+                        if is_interrupted {
+                            // The shared legacy error finalizer intentionally
+                            // keeps interrupted turns terse. V2 still carries a
+                            // canonical error payload, so retain its text in the
+                            // status surface after the common cleanup finishes.
+                            self.state.status = format!("Turn interrupted: {message}");
+                        }
+                        command
+                    }
+                };
+                self.state
+                    .v2_live_assistant_segments
+                    .remove(&(session_id, turn_id));
+                command
+            }
+            PayloadV2::BackgroundChildCompleted {
+                parent_turn_id,
+                task_id,
+                content,
+                tool_call_id,
+                message_id,
+                source,
+                media,
+                ..
+            } => {
+                let _ = self.resolve_v2_turn_id(&session_id, &wire_turn_id, false);
+                let parent_turn_id = self.resolve_v2_turn_id(&session_id, &parent_turn_id, true);
+                if let Some(session) = self.find_session_mut(&session_id) {
+                    let mut message =
+                        Message::assistant_with_thread(content, ThreadId::new(thread_id));
+                    message.media = media;
+                    session.messages.push(message);
+                }
+                let mut item = ActivityItem::new(ActivityKind::Progress, task_id, "completed")
+                    .with_detail(source)
+                    .with_session(session_id.clone())
+                    .with_turn(parent_turn_id);
+                if let Some(tool_call_id) = tool_call_id {
+                    item = item.with_tool_call(tool_call_id);
+                }
+                self.state.push_activity(item);
+                self.state.status = format!("Background completion persisted: {message_id}");
+                None
+            }
+        }
+    }
+
     fn upsert_envelope_assistant_message(
         &mut self,
         session_id: &SessionKey,
@@ -9368,9 +9862,11 @@ impl Store {
                     .map(|live_reply| live_reply.turn_id.clone())
             })
             .flatten();
-        if let Some(turn_id) = persisted_live_assistant_turn {
-            self.state
-                .record_live_reply_segment_boundary(&event.session_id, &turn_id);
+        if let Some(turn_id) = persisted_live_assistant_turn
+            && !self.projection_envelope_v2_negotiated()
+            && !self.v2_drives_turn(&event.session_id, &turn_id)
+        {
+            self.finalize_live_reply_segment(&event.session_id, &turn_id);
         }
 
         let attachment_count = event.media.len();
@@ -10511,6 +11007,9 @@ impl Store {
         }
         self.state
             .clear_live_reply_segment_boundaries(session_id, &prior_turn);
+        self.state
+            .v2_live_assistant_segments
+            .remove(&(session_id.clone(), prior_turn.clone()));
         // The prior turn's streamed reasoning commits with its message below (or is
         // dropped with an empty turn); either way it must leave the accumulator,
         // since this switch finalizes the turn and its own late TurnCompleted
@@ -22750,6 +23249,425 @@ mod tests {
                 payload,
             },
         })
+    }
+
+    fn envelope_v2_notification(
+        session_id: SessionKey,
+        seq: u64,
+        turn_id: &str,
+        payload: octos_core::ui_protocol::PayloadV2,
+    ) -> UiNotification {
+        UiNotification::EnvelopeV2(octos_core::ui_protocol::EnvelopeV2Notification {
+            session_id,
+            topic: None,
+            envelope: octos_core::ui_protocol::EnvelopeV2 {
+                thread_id: "thread-v2".into(),
+                seq,
+                cursor: Some(UiCursor {
+                    stream: "local:test".into(),
+                    seq,
+                }),
+                turn_id: turn_id.into(),
+                client_message_id: None,
+                payload,
+            },
+        })
+    }
+
+    #[test]
+    fn envelope_v2_turn_segments_once_and_commits_once() {
+        use octos_core::ui_protocol::{MessageMeta, PayloadV2, TurnTerminalOutcome};
+
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let turn_id = "turn-v2-segments";
+
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id.clone(),
+            1,
+            turn_id,
+            PayloadV2::AssistantDelta {
+                text: "draft first".into(),
+                assistant_segment_id: "segment-1".into(),
+            },
+        )));
+        let resolved_turn = store
+            .state
+            .v2_turn_ids
+            .get(&(session_id.clone(), turn_id.into()))
+            .expect("v2 turn id resolved")
+            .clone();
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id.clone(),
+            2,
+            turn_id,
+            PayloadV2::AssistantPersisted {
+                text: "first segment".into(),
+                assistant_segment_id: "segment-1".into(),
+                meta: MessageMeta {
+                    message_id: "message-1".into(),
+                    persisted_at: chrono::Utc::now(),
+                    media: vec![],
+                },
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id.clone(),
+            3,
+            turn_id,
+            PayloadV2::ToolStart {
+                tool_call_id: "tool-1".into(),
+                name: "write_file".into(),
+                arguments_preview: None,
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id.clone(),
+            4,
+            turn_id,
+            PayloadV2::AssistantDelta {
+                text: "draft second".into(),
+                assistant_segment_id: "segment-2".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id.clone(),
+            5,
+            turn_id,
+            PayloadV2::AssistantPersisted {
+                text: "second segment".into(),
+                assistant_segment_id: "segment-2".into(),
+                meta: MessageMeta {
+                    message_id: "message-2".into(),
+                    persisted_at: chrono::Utc::now(),
+                    media: vec![],
+                },
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id.clone(),
+            6,
+            turn_id,
+            PayloadV2::TurnTerminal {
+                outcome: TurnTerminalOutcome::Completed,
+                error: None,
+                token_usage: None,
+            },
+        )));
+
+        let session = &store.state.sessions[0];
+        assert!(
+            session.live_reply.is_none(),
+            "v2 terminal clears live reply"
+        );
+        assert_eq!(session.messages.len(), 1, "one turn commits one reply");
+        assert_eq!(session.messages[0].content, "first segmentsecond segment");
+        assert_eq!(
+            store
+                .state
+                .live_reply_segment_boundaries
+                .get(&(session_id.clone(), resolved_turn))
+                .cloned(),
+            Some(vec![
+                "first segment".len(),
+                "first segmentsecond segment".len()
+            ]),
+            "each persisted v2 segment records the shared boundary lifecycle"
+        );
+
+        // A replayed canonical terminal is idempotent: it cannot add a second
+        // final assistant reply.
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id,
+            7,
+            turn_id,
+            PayloadV2::TurnTerminal {
+                outcome: TurnTerminalOutcome::Completed,
+                error: None,
+                token_usage: None,
+            },
+        )));
+        assert_eq!(store.state.sessions[0].messages.len(), 1);
+    }
+
+    #[test]
+    fn envelope_v2_stage_one_thread_content_aliases_its_terminal_uuid() {
+        use octos_core::ui_protocol::{MessageMeta, PayloadV2, TurnTerminalOutcome};
+
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let compatibility_thread_id = "legacy-envelope-thread";
+        let canonical_terminal_turn_id = TurnId::new().0.to_string();
+
+        // The Stage-1 server projects legacy envelope content under its
+        // thread-shaped id, then projects the rich terminal event under the
+        // canonical UUID. The TUI must bind those two representations to one
+        // live turn rather than leaving the streamed reply hung.
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id.clone(),
+            1,
+            compatibility_thread_id,
+            PayloadV2::AssistantDelta {
+                text: "draft".into(),
+                assistant_segment_id: "segment-1".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id.clone(),
+            2,
+            compatibility_thread_id,
+            PayloadV2::AssistantPersisted {
+                text: "settled reply".into(),
+                assistant_segment_id: "segment-1".into(),
+                meta: MessageMeta {
+                    message_id: "message-1".into(),
+                    persisted_at: chrono::Utc::now(),
+                    media: vec![],
+                },
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id.clone(),
+            3,
+            &canonical_terminal_turn_id,
+            PayloadV2::TurnTerminal {
+                outcome: TurnTerminalOutcome::Completed,
+                error: None,
+                token_usage: None,
+            },
+        )));
+
+        let session = &store.state.sessions[0];
+        assert!(session.live_reply.is_none());
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "settled reply");
+        let terminal_turn = store
+            .state
+            .v2_turn_ids
+            .get(&(session_id.clone(), canonical_terminal_turn_id));
+        let content_turn = store
+            .state
+            .v2_turn_ids
+            .get(&(session_id, compatibility_thread_id.into()));
+        assert_eq!(
+            terminal_turn, content_turn,
+            "the terminal UUID aliases the content stream's stable live turn"
+        );
+    }
+
+    #[test]
+    fn envelope_v2_terminal_errors_and_interrupts_release_the_live_turn() {
+        use octos_core::ui_protocol::{PayloadV2, TurnTerminalError, TurnTerminalOutcome};
+
+        for (turn_id, outcome, code, message) in [
+            (
+                "turn-v2-error",
+                TurnTerminalOutcome::Errored,
+                "provider_failed",
+                "provider stopped",
+            ),
+            (
+                "turn-v2-interrupted",
+                TurnTerminalOutcome::Interrupted,
+                "canceled",
+                "stopped by user",
+            ),
+        ] {
+            let mut store = store_with_empty_session();
+            let session_id = store.state.sessions[0].id.clone();
+            store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+                session_id.clone(),
+                1,
+                turn_id,
+                PayloadV2::AssistantDelta {
+                    text: "partial reply".into(),
+                    assistant_segment_id: "segment-1".into(),
+                },
+            )));
+            store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+                session_id,
+                2,
+                turn_id,
+                PayloadV2::TurnTerminal {
+                    outcome,
+                    error: Some(TurnTerminalError {
+                        code: code.into(),
+                        message: message.into(),
+                        data: None,
+                    }),
+                    token_usage: None,
+                },
+            )));
+
+            assert!(
+                store.state.sessions[0].live_reply.is_none(),
+                "{outcome:?} must release the streaming reply"
+            );
+            assert!(
+                !store.state.run_state.is_active(),
+                "{outcome:?} must clear the working state"
+            );
+            assert!(
+                store.state.status.contains(message),
+                "{outcome:?} should surface the canonical error text: {}",
+                store.state.status
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_v2_file_attachment_keeps_its_segment_and_tool_owner() {
+        use octos_core::ui_protocol::{AttachmentOwnerV2, PayloadV2};
+
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let turn_id = "turn-v2-attachment";
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id.clone(),
+            1,
+            turn_id,
+            PayloadV2::AssistantDelta {
+                text: "attachment follows".into(),
+                assistant_segment_id: "segment-attachment".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id.clone(),
+            2,
+            turn_id,
+            PayloadV2::ToolStart {
+                tool_call_id: "tool-attachment".into(),
+                name: "write_file".into(),
+                arguments_preview: None,
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id,
+            3,
+            turn_id,
+            PayloadV2::FileAttached {
+                path: "artifacts/report.md".into(),
+                mime: "text/markdown".into(),
+                size_bytes: 42,
+                attachment_owner: AttachmentOwnerV2 {
+                    assistant_segment_id: Some("segment-attachment".into()),
+                    tool_call_id: Some("tool-attachment".into()),
+                },
+            },
+        )));
+
+        let attachment = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.title == "artifacts/report.md")
+            .expect("attachment activity");
+        assert_eq!(attachment.tool_call_id.as_deref(), Some("tool-attachment"));
+        assert!(
+            attachment
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("segment-attachment")),
+            "attachment must retain the explicit assistant segment owner"
+        );
+    }
+
+    #[test]
+    fn legacy_message_persisted_remains_the_boundary_without_v2_negotiation() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "legacy segment");
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .set_capabilities(UiProtocolCapabilities::new(&[], &[]));
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessagePersisted(
+            MessagePersistedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: Some(turn_id.clone()),
+                thread_id: None,
+                seq: 1,
+                role: "assistant".into(),
+                message_id: "legacy-message".into(),
+                client_message_id: None,
+                source: octos_core::ui_protocol::MessagePersistedSource::Assistant,
+                cursor: UiCursor {
+                    stream: "local:test".into(),
+                    seq: 1,
+                },
+                persisted_at: chrono::Utc::now(),
+                media: vec![],
+                content: Some("legacy segment".into()),
+            },
+        )));
+
+        assert_eq!(
+            store
+                .state
+                .live_reply_segment_boundaries
+                .get(&(session_id, turn_id))
+                .cloned(),
+            Some(vec!["legacy segment".len()]),
+            "old servers retain the MessagePersisted boundary fallback"
+        );
+    }
+
+    #[test]
+    fn v2_negotiation_skips_legacy_message_persisted_boundary_duplicates() {
+        use octos_core::ui_protocol::PayloadV2;
+
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let wire_turn_id = "turn-v2-no-legacy-boundary";
+        store.state.set_capabilities(
+            UiProtocolCapabilities::new(&[], &[])
+                .with_supported_features([UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2]),
+        );
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id.clone(),
+            1,
+            wire_turn_id,
+            PayloadV2::AssistantDelta {
+                text: "canonical segment".into(),
+                assistant_segment_id: "segment-1".into(),
+            },
+        )));
+        let resolved_turn = store
+            .state
+            .v2_turn_ids
+            .get(&(session_id.clone(), wire_turn_id.into()))
+            .expect("v2 turn id resolved")
+            .clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessagePersisted(
+            MessagePersistedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: Some(resolved_turn.clone()),
+                thread_id: None,
+                seq: 2,
+                role: "assistant".into(),
+                message_id: "legacy-duplicate".into(),
+                client_message_id: None,
+                source: octos_core::ui_protocol::MessagePersistedSource::Assistant,
+                cursor: UiCursor {
+                    stream: "local:test".into(),
+                    seq: 2,
+                },
+                persisted_at: chrono::Utc::now(),
+                media: vec![],
+                content: Some("canonical segment".into()),
+            },
+        )));
+
+        assert!(
+            !store
+                .state
+                .live_reply_segment_boundaries
+                .contains_key(&(session_id, resolved_turn)),
+            "when v2 is negotiated, MessagePersisted cannot create a duplicate boundary"
+        );
     }
 
     #[test]

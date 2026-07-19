@@ -28,6 +28,17 @@ pub type LiveReply = AppUiLiveReply;
 pub type SessionView = AppUiSession;
 pub type TaskView = AppUiTask;
 
+/// One canonical `projection.envelope.v2` assistant content segment within a
+/// live turn. The transcript still accumulates its bytes in [`LiveReply`] so
+/// the legacy and v2 paths share the same commit/render lifecycle; this record
+/// prevents a later segment's durable row from replacing an earlier segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct V2AssistantSegment {
+    pub(crate) id: String,
+    pub(crate) start_offset: usize,
+    pub(crate) finalized: bool,
+}
+
 pub const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str = "config/capabilities/list";
 pub const APPUI_METHOD_SESSION_STATUS_READ: &str = "session/status/read";
 pub const APPUI_METHOD_SESSION_COMPACT: &str = "session/compact";
@@ -3929,6 +3940,17 @@ pub struct AppState {
     /// markdown. Kept out-of-band so coverage/dedup can keep comparing the
     /// unmodified live text against committed content.
     pub live_reply_segment_boundaries: std::collections::HashMap<(SessionKey, TurnId), Vec<usize>>,
+    /// Canonical v2 assistant segments currently projected into a live reply,
+    /// keyed by session and resolved local turn id. Segment identity is kept
+    /// separately from the text so a later `assistant_segment_id` can open a
+    /// fresh segment without overwriting a prior persisted one.
+    pub(crate) v2_live_assistant_segments:
+        std::collections::HashMap<(SessionKey, TurnId), Vec<V2AssistantSegment>>,
+    /// Maps the string turn id carried by v2 envelopes to the typed local
+    /// [`TurnId`] used by the established live-reply lifecycle. V2 permits
+    /// non-UUID wire ids during compatibility projection, so the map lets the
+    /// reducer retain stable identity without weakening the existing model.
+    pub(crate) v2_turn_ids: std::collections::HashMap<(SessionKey, String), TurnId>,
     /// Accumulated streamed reasoning fragments per active turn (legacy
     /// `ReasoningDelta` path). `commit_live_reply` moves them onto the committed
     /// message's `reasoning_content`, which the transcript renders as a separate
@@ -5808,6 +5830,8 @@ impl AppState {
             optimistic_user_messages: Vec::new(),
             turn_prompt_anchors: Vec::new(),
             live_reply_segment_boundaries: std::collections::HashMap::new(),
+            v2_live_assistant_segments: std::collections::HashMap::new(),
+            v2_turn_ids: std::collections::HashMap::new(),
             live_reasoning: std::collections::HashMap::new(),
             live_compaction: std::collections::HashMap::new(),
             status,
