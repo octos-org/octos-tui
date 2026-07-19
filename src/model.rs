@@ -7769,20 +7769,27 @@ impl AppState {
     /// SINGLE activity row, not append a fresh "session goal" row per transition
     /// — otherwise a thrashing goal renders as N stacked rows (mini5: one goal
     /// showed as 3 rows "active / budget_limited / budget_limited"), and each
-    /// row with a running-ish status inflates the "N active" aggregate. Replace
-    /// the existing goal row for `item.title` (the localized "session goal"
-    /// label) in place, updating its status; append only when none exists.
+    /// row with a running-ish status inflates the "N active" aggregate.
+    ///
+    /// Dedup on the HIDDEN stable key in `tool_call_id` (`session_goal:{session}:
+    /// {goal_id}`), NOT the localized title — a title match would collide across
+    /// distinct goals in a session, break on a locale change, and snag any other
+    /// Progress row that reused the label (codex review). Replace the row with
+    /// the matching key in place; append only when none exists.
     pub fn push_or_replace_goal_activity(&mut self, item: ActivityItem) {
-        if let Some(existing) = self
-            .activity
-            .iter_mut()
-            .rev()
-            .find(|a| a.kind == item.kind && a.title == item.title)
-        {
-            existing.status = item.status;
-            existing.detail = item.detail;
-            existing.success = item.success;
-            return;
+        if let Some(key) = item.tool_call_id.as_deref() {
+            if let Some(existing) = self
+                .activity
+                .iter_mut()
+                .rev()
+                .find(|a| a.tool_call_id.as_deref() == Some(key))
+            {
+                existing.status = item.status;
+                existing.detail = item.detail;
+                existing.success = item.success;
+                existing.title = item.title;
+                return;
+            }
         }
         self.push_activity(item);
     }

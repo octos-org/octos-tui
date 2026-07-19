@@ -8747,11 +8747,20 @@ impl Store {
                     Some(event.goal.clone()),
                     Some(event.transition_actor.clone()),
                 );
-                self.state.push_or_replace_goal_activity(ActivityItem::new(
-                    ActivityKind::Progress,
-                    t!("status.activity_session_goal").into_owned(),
-                    status_label.clone(),
-                ));
+                self.state.push_or_replace_goal_activity(
+                    ActivityItem::new(
+                        ActivityKind::Progress,
+                        t!("status.activity_session_goal").into_owned(),
+                        status_label.clone(),
+                    )
+                    // Hidden stable identity so transitions replace ONE row
+                    // regardless of locale/label (see push_or_replace_goal_activity).
+                    .with_tool_call(format!(
+                        "session_goal:{}:{}",
+                        event.session_id.0, event.goal.goal_id
+                    ))
+                    .with_session(event.session_id.clone()),
+                );
                 let transitioned = previous_status.as_deref() != Some(status_label.as_str());
                 self.state.status = if transitioned {
                     match status_label.as_str() {
@@ -28611,6 +28620,29 @@ mod tests {
         assert!(
             !crate::model::activity_status_is_running(&goal_rows[0].status),
             "a budget_limited goal row must not count as a running/active activity"
+        );
+
+        // A DIFFERENT goal_id in the same session is a distinct goal → its own
+        // row (dedup is keyed on goal_id, not the shared localized label).
+        let mut goal2 = mk("active");
+        goal2.goal_id = "goal_02".into();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionGoalUpdated(
+            SessionGoalUpdatedEvent {
+                session_id: session_id.clone(),
+                profile_id: Some("coding".into()),
+                goal: goal2,
+                transition_actor: "user".into(),
+            },
+        )));
+        let goal_rows_after: usize = store
+            .state
+            .activity
+            .iter()
+            .filter(|a| a.title == goal_label)
+            .count();
+        assert_eq!(
+            goal_rows_after, 2,
+            "a distinct goal_id must not collapse into another goal's row"
         );
     }
 

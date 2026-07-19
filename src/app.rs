@@ -8213,12 +8213,43 @@ fn plan_panel_rows(plan: &octos_core::ui_protocol::UiPlanRecord) -> u16 {
     (1 + shown + overflow) as u16
 }
 
+/// Wrap a goal objective into up to [`GOAL_OBJECTIVE_MAX_ROWS`] display chunks so
+/// the banner shows the WHOLE goal (not a single clipped line — the user's raw
+/// `/goal` text can be hundreds of chars). Char-chunked at a nominal width (exact
+/// column wrapping needs the render width, which the height reservation can't
+/// see); a trailing "…" marks an objective longer than the cap. Shared by the
+/// height reservation and the render so they always agree on row count.
+const GOAL_OBJECTIVE_MAX_ROWS: usize = 3;
+const GOAL_OBJECTIVE_CHARS_PER_ROW: usize = 56;
+
+fn goal_objective_chunks(objective: &str) -> Vec<String> {
+    let objective = objective.trim();
+    if objective.is_empty() {
+        return Vec::new();
+    }
+    let chars: Vec<char> = objective.chars().collect();
+    let mut chunks: Vec<String> = chars
+        .chunks(GOAL_OBJECTIVE_CHARS_PER_ROW)
+        .take(GOAL_OBJECTIVE_MAX_ROWS)
+        .map(|c| c.iter().collect())
+        .collect();
+    if chars.len() > GOAL_OBJECTIVE_MAX_ROWS * GOAL_OBJECTIVE_CHARS_PER_ROW {
+        if let Some(last) = chunks.last_mut() {
+            last.push('…');
+        }
+    }
+    chunks
+}
+
 fn autonomy_indicator_height(app: &AppState) -> u16 {
     match active_session_autonomy(app) {
         Some(state) => {
             let mut rows = 0u16;
-            if state.goal.is_some() {
-                rows += 1;
+            if let Some(goal) = state.goal.as_ref() {
+                // At least one row (glyph + status even when the objective is
+                // empty); otherwise the wrapped-objective row count.
+                let obj_rows = goal_objective_chunks(&goal.objective).len().max(1);
+                rows += obj_rows as u16;
             }
             if state.loops.iter().any(autonomy_loop_is_active) {
                 rows += 1;
@@ -8330,11 +8361,6 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
     };
     let mut lines = Vec::new();
     if let Some(goal) = state.goal.as_ref() {
-        let objective = if goal.objective.trim().is_empty() {
-            goal.goal_id.clone()
-        } else {
-            goal.objective.clone()
-        };
         let (glyph, status_label) = goal_status_display(&goal.status);
         let parenthetical = t!(
             "app.autonomy.goal_meta",
@@ -8343,21 +8369,46 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
             budget = format_tokens_k(goal.token_budget)
         )
         .into_owned();
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{glyph} "),
-                Style::default()
-                    .fg(palette.accent)
-                    .add_modifier(Modifier::BOLD)
-                    .bg(palette.surface),
-            ),
-            Span::styled(
-                t!("app.autonomy.goal_prefix").to_string(),
-                palette.title().bg(palette.surface),
-            ),
-            Span::styled(objective, palette.text().bg(palette.surface)),
-            Span::styled(parenthetical, palette.muted().bg(palette.surface)),
-        ]));
+        // The objective wraps across up to GOAL_OBJECTIVE_MAX_ROWS lines so the
+        // full goal is visible (a raw `/goal` request can be hundreds of chars).
+        // Row count here MUST match `autonomy_indicator_height`'s reservation —
+        // both derive from `goal_objective_chunks`.
+        let mut chunks = goal_objective_chunks(&goal.objective);
+        if chunks.is_empty() {
+            chunks.push(goal.goal_id.clone());
+        }
+        let last = chunks.len() - 1;
+        let indent = " ".repeat(t!("app.autonomy.goal_prefix").chars().count() + 2);
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            let mut spans = Vec::new();
+            if idx == 0 {
+                spans.push(Span::styled(
+                    format!("{glyph} "),
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(palette.surface),
+                ));
+                spans.push(Span::styled(
+                    t!("app.autonomy.goal_prefix").to_string(),
+                    palette.title().bg(palette.surface),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    indent.clone(),
+                    palette.text().bg(palette.surface),
+                ));
+            }
+            spans.push(Span::styled(chunk, palette.text().bg(palette.surface)));
+            // The status/budget parenthetical rides the FINAL objective line.
+            if idx == last {
+                spans.push(Span::styled(
+                    parenthetical.clone(),
+                    palette.muted().bg(palette.surface),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
     }
     // The loops row shows only while something is actually FIRING: a
     // paused-only session must not pin a permanent banner above the composer
@@ -18344,6 +18395,58 @@ mod tests {
             "goal tokens render in K units, got: {text}"
         );
         assert!(!text.contains("Loops:"), "loops row must be hidden");
+    }
+
+    #[test]
+    fn render_autonomy_indicator_wraps_a_long_objective_across_rows() {
+        // mini5: a long `/goal` objective was truncated to one clipped line.
+        // It must now wrap across multiple rows (bounded), and the reserved
+        // height MUST equal the rendered row count (else the banner clips or
+        // strands a blank band).
+        let mut app = autonomy_app_state();
+        let session_id = SessionKey("local:test".into());
+        let long_objective = "build a react website about the 2026 world cup finals with all 48 \
+             teams, players, coaches, photos, group stage and knockout brackets, per-match \
+             details, and a UX score of at least nine out of ten"
+            .to_string();
+        app.set_session_goal(
+            &session_id,
+            Some(octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some("coding".into()),
+                goal_id: "goal_01".into(),
+                objective: long_objective.clone(),
+                status: "active".into(),
+                token_budget: 2_000_000,
+                tokens_used: 0,
+                time_used_seconds: 0,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }),
+            Some("user".into()),
+        );
+
+        let height = autonomy_indicator_height(&app);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        assert!(
+            height > 1,
+            "a long objective must reserve more than one row"
+        );
+        assert!(
+            height as usize <= GOAL_OBJECTIVE_MAX_ROWS,
+            "objective rows are bounded by the cap"
+        );
+        assert_eq!(
+            height as usize,
+            lines.len(),
+            "reserved height must match rendered rows exactly"
+        );
+        // Far more of the objective is visible than a single 56-char line.
+        let text = rendered_text(&app);
+        assert!(text.contains("build a react website"));
+        assert!(
+            text.contains("knockout") || text.contains("group stage"),
+            "later objective content must be visible via wrapping"
+        );
     }
 
     #[test]
