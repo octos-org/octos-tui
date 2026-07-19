@@ -3980,9 +3980,9 @@ pub struct AppState {
     pub diff_preview: DiffPreviewPaneState,
     pub activity: Vec<ActivityItem>,
     pub turn_activity_logs: Vec<TurnActivityLog>,
-    /// Hydrate-replayed tool envelopes already applied, keyed by
+    /// Hydrate-replayed v2 tool envelopes already applied, keyed by
     /// `(session, thread_id, seq)` — `seq` is the envelope's identity within
-    /// its thread (#1515). Hydrate re-runs on every reconnect; without this
+    /// its thread. Hydrate re-runs on every reconnect; without this
     /// ledger each re-run would duplicate the per-action rows.
     pub applied_hydrate_tool_envelopes: std::collections::HashSet<(String, String, u64)>,
     pub turn_activity_summaries: Vec<TurnActivitySummary>,
@@ -4386,14 +4386,8 @@ pub struct ActivityItem {
     pub duration_ms: Option<u64>,
     pub turn_id: Option<TurnId>,
     pub tool_call_id: Option<String>,
-    /// Owning session for items created on a session-scoped path. Set by the
-    /// projection-envelope `ToolStart` emit (`apply_envelope`) — the one path
-    /// whose items carry NO turn identity and so cannot be reconciled by
-    /// `turn_id` (the envelope `TurnCompleted` self-heal,
-    /// [`AppState::reconcile_envelope_thread_running_activity`], filters on it
-    /// so a thread_id shared across sessions cannot over-suppress a sibling
-    /// session's genuinely-active chip) — and by the session-scoped protocol
-    /// arms (`ToolStarted`, progress events), where
+    /// Owning session for items created by session-scoped protocol arms
+    /// (`ToolStarted`, progress events, and v2 projection payloads), where
     /// [`AppState::push_activity`] / [`AppState::update_tool_activity`] use it
     /// to keep a background session's activity from drifting the ACTIVE
     /// transcript's scroll (P2 tri-repo #246). `None` = unattributed (treated
@@ -7192,60 +7186,6 @@ impl AppState {
             .collect();
         self.turn_activity_summaries
             .retain(|summary| live_turns.contains(&summary.turn_id));
-    }
-
-    /// Detail marker stamped on activity items created by the M9-γ
-    /// projection-envelope `ToolStart` path. The envelope wire shape carries NO
-    /// turn identity (it is keyed on `thread_id`/`seq`), so envelope tool items
-    /// have `turn_id == None` and the turn-scoped reconcile cannot match them.
-    /// This thread-scoped marker is how the envelope `TurnCompleted` reconcile
-    /// (GAP 2) finds the items the envelope path itself started, keeping emit and
-    /// reconcile in lockstep (same discipline as the running-status set).
-    pub fn envelope_tool_detail_for_thread(thread_id: &str) -> String {
-        format!("thread {thread_id}")
-    }
-
-    /// GAP 2 — orphan activity-chip self-heal on the projection-envelope path.
-    /// An envelope `TurnCompleted` is a hard terminal barrier for its
-    /// `(session_id, thread_id)` pair: no further tool activity can legitimately
-    /// run for that thread in that session. Reconcile any turn-less running item
-    /// the envelope `ToolStart` path created for this session's thread (a
-    /// `ToolStart` whose `ToolEnd` never arrived) to
-    /// [`ACTIVITY_STATUS_INTERRUPTED`] so it can no longer pin a turn-less
-    /// "Orchestrating…" chip.
-    ///
-    /// Scoped tightly to NOT over-suppress, on FOUR independent guards:
-    /// - `session_id` — `thread_id` is NOT globally unique (two sessions can run
-    ///   envelope tools under the same projection thread), so the sweep is
-    ///   confined to items the envelope path stamped for THIS session. Without
-    ///   it, session A's `TurnCompleted` would suppress session B's
-    ///   genuinely-active chip on the same `thread_id`.
-    /// - [`ActivityKind::Tool`] — the envelope `ToolStart` path only ever creates
-    ///   `Tool` items; a non-tool turn-less row is never touched.
-    /// - `turn_id == None` — all envelope items are turn-less; turn-scoped items
-    ///   reconcile via [`Self::reconcile_terminal_turn_running_activity`].
-    /// - the thread's envelope-tool marker (kept in lockstep with the emit via
-    ///   the shared [`Self::envelope_tool_detail_for_thread`] source) — so legacy
-    ///   turn-less sub-agent progress rows are left alone.
-    pub fn reconcile_envelope_thread_running_activity(
-        &mut self,
-        session_id: &SessionKey,
-        thread_id: &str,
-    ) -> usize {
-        let marker = Self::envelope_tool_detail_for_thread(thread_id);
-        let mut flipped = 0;
-        for item in self.activity.iter_mut().filter(|item| {
-            item.session_id.as_ref() == Some(session_id)
-                && item.kind == ActivityKind::Tool
-                && item.turn_id.is_none()
-                && item.detail.as_deref() == Some(marker.as_str())
-        }) {
-            if activity_status_is_running(&item.status) {
-                item.status = ACTIVITY_STATUS_INTERRUPTED.to_string();
-                flipped += 1;
-            }
-        }
-        flipped
     }
 
     pub fn has_pending_messages(&self) -> bool {
