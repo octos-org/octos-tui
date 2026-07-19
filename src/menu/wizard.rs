@@ -136,11 +136,12 @@ impl WizardProgress {
                 state.provider_status(),
                 OnboardingProviderStatus::SavedPrimary
             );
-        let save_done = saved_primary_ready
-            || matches!(
-                state.provider_status(),
-                OnboardingProviderStatus::SavedPrimary | OnboardingProviderStatus::SavedFallback
-            );
+        let save_done = connect_done
+            && (saved_primary_ready
+                || matches!(
+                    state.provider_status(),
+                    OnboardingProviderStatus::SavedPrimary | OnboardingProviderStatus::SavedFallback
+                ));
         let workspace_done = matches!(
             state.workspace_validation,
             OnboardingWorkspaceValidation::Valid { .. }
