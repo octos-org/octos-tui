@@ -103,6 +103,7 @@ app:
     esc_interrupt: "Esc 中断"
     stop_to_close: "/stop 关闭"
     pending_decision_help: "等待你的确认 — Alt+A 应答 · Ctrl+C 中断"
+    parked_decision_banner: "⚠ 已等待你 %{elapsed} — Alt+A 应答 · Ctrl+C 中断"
     tool_output_expanded: "工具输出已展开"
   btw:
     answering: "回答中…"

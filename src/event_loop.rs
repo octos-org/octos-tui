@@ -168,9 +168,18 @@ pub fn run(cli: Cli) -> Result<()> {
         // redraw on the animation cadence so the spinner/status moves; otherwise
         // an idle UI emits no terminal writes and never wipes a live selection.
         let turn_active = store.state.run_state.is_active();
-        if turn_active && last_animation.elapsed() >= ANIMATION_INTERVAL {
-            dirty = true;
-            last_animation = Instant::now();
+        if turn_active {
+            // Watchdog: after a turn has sat parked on an operator decision past
+            // the escalation threshold, re-show a hidden prompt (never
+            // auto-resolves). The prominent banner is driven purely by elapsed
+            // time in the render pass; this handles the modal-visibility side.
+            if store.escalate_parked_decision_if_due() {
+                dirty = true;
+            }
+            if last_animation.elapsed() >= ANIMATION_INTERVAL {
+                dirty = true;
+                last_animation = Instant::now();
+            }
         }
         if dirty {
             let menu_reserved_now = app::menu_surface_active(&store.state);

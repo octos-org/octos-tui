@@ -112,6 +112,7 @@ app:
     esc_interrupt: "Esc interrupt"
     stop_to_close: "/stop to close"
     pending_decision_help: "Waiting on you — Alt+A answer · Ctrl+C interrupt"
+    parked_decision_banner: "⚠ Parked on you for %{elapsed} — Alt+A answer · Ctrl+C interrupt"
     tool_output_expanded: "tool output expanded"
   btw:
     answering: "Answering…"

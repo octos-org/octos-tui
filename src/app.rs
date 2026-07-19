@@ -234,8 +234,17 @@ pub fn live_ui_height_with_finalization(
     // Ratatui compresses a fixed row at the tail floor. Height-gated on the same
     // `height` the render pass uses, so reservation and layout never disagree.
     let agent_strip_height = agent_strip_height(app, height);
-    let chrome =
-        menu_height + autonomy_height + harness_height + agent_strip_height + composer_height + 1; // +1 status
+    // The parked-decision watchdog banner reserves one row above the composer
+    // (see `render_viewport_with_finalization`); reserve it here too or the live
+    // viewport is oversubscribed by one row while the escalation is showing.
+    let decision_height = decision_banner_height(app);
+    let chrome = menu_height
+        + autonomy_height
+        + harness_height
+        + decision_height
+        + agent_strip_height
+        + composer_height
+        + 1; // +1 status
 
     let tail_height = live_tail_height_with_finalization(app, width, height, live_finalization);
     // The live-tail pane is laid out with `Constraint::Min(1)`, so it always
@@ -355,6 +364,9 @@ pub fn render_viewport_with_finalization(
     let composer_height = composer_height_for_size(app, area.width, terminal_height);
     let autonomy_height = autonomy_indicator_height(app, area.width);
     let harness_height = harness_status_height(app);
+    // Parked-decision watchdog banner: one reserved row just above the composer,
+    // present only once the escalation threshold has passed.
+    let decision_height = decision_banner_height(app);
     // Height-gated on `terminal_height` — the SAME basis `live_ui_height` used to
     // reserve the row — so the reservation and this layout always agree.
     let agent_strip_height = agent_strip_height(app, terminal_height);
@@ -371,6 +383,7 @@ pub fn render_viewport_with_finalization(
             + 1 // status
             + autonomy_height
             + harness_height
+            + decision_height
             + agent_strip_height,
     );
     let menu_height = menu_height_for_viewport(active_menu.as_ref(), area.width, menu_available);
@@ -382,6 +395,7 @@ pub fn render_viewport_with_finalization(
             Constraint::Length(menu_height),
             Constraint::Length(autonomy_height),
             Constraint::Length(harness_height),
+            Constraint::Length(decision_height),
             Constraint::Length(composer_height),
             Constraint::Length(agent_strip_height),
             Constraint::Length(1),
@@ -411,15 +425,18 @@ pub fn render_viewport_with_finalization(
     if harness_height > 0 {
         render_harness_status_row(frame, app, palette, root[3]);
     }
-    frame.render_widget(render_composer(app, palette, root[4]), root[4]);
-    set_composer_cursor(frame, app, root[4]);
+    if decision_height > 0 {
+        frame.render_widget(render_decision_banner(app, palette), root[4]);
+    }
+    frame.render_widget(render_composer(app, palette, root[5]), root[5]);
+    set_composer_cursor(frame, app, root[5]);
     if agent_strip_height > 0 {
         frame.render_widget(
-            render_agent_strip(app, palette, root[5].height.saturating_sub(1)),
-            root[5],
+            render_agent_strip(app, palette, root[6].height.saturating_sub(1)),
+            root[6],
         );
     }
-    frame.render_widget(render_status(app, palette), root[6]);
+    frame.render_widget(render_status(app, palette), root[7]);
 }
 
 /// The live (uncommitted / in-flight) transcript tail rendered inside the
@@ -1460,6 +1477,9 @@ fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palet
     if areas.harness.height > 0 {
         render_harness_status_row(frame, app, palette, areas.harness);
     }
+    if areas.decision.height > 0 {
+        frame.render_widget(render_decision_banner(app, palette), areas.decision);
+    }
     frame.render_widget(
         render_composer(app, palette, areas.composer),
         areas.composer,
@@ -1480,6 +1500,9 @@ pub struct ChatLayoutAreas {
     pub menu: Rect,
     pub autonomy: Rect,
     pub harness: Rect,
+    /// Parked-decision watchdog banner, directly above the composer (0-height
+    /// until a turn has been parked on a decision past the escalation threshold).
+    pub decision: Rect,
     pub composer: Rect,
     /// Sub-agent selector strip, directly under the composer (0-height when the
     /// session has no sub-agents).
@@ -2160,12 +2183,14 @@ fn chat_layout_areas_for_menu(
     let desired_menu_height = menu_height_hint(active_menu, area.width, area.height);
     let autonomy_height = autonomy_indicator_height(app, area.width);
     let harness_height = harness_status_height(app);
+    let decision_height = decision_banner_height(app);
     let agent_strip_height = agent_strip_height(app, area.height);
     let surface_budget = area.height.saturating_sub(
         min_transcript_height(area.height)
             + composer_height
             + autonomy_height
             + harness_height
+            + decision_height
             + agent_strip_height
             + 1,
     );
@@ -2177,6 +2202,7 @@ fn chat_layout_areas_for_menu(
             Constraint::Length(menu_height),
             Constraint::Length(autonomy_height),
             Constraint::Length(harness_height),
+            Constraint::Length(decision_height),
             Constraint::Length(composer_height),
             Constraint::Length(agent_strip_height),
             Constraint::Length(1),
@@ -2188,9 +2214,10 @@ fn chat_layout_areas_for_menu(
         menu: root[1],
         autonomy: root[2],
         harness: root[3],
-        composer: root[4],
-        agent_strip: root[5],
-        status: root[6],
+        decision: root[4],
+        composer: root[5],
+        agent_strip: root[6],
+        status: root[7],
     }
 }
 
@@ -9969,6 +9996,50 @@ pub(crate) fn active_session_has_pending_decision(app: &AppState) -> bool {
     active_session_pending_decision_turn(app).is_some()
 }
 
+/// Seconds a turn may sit parked on an operator decision before the watchdog
+/// escalates. The escalation re-shows a hidden modal and paints a prominent
+/// banner above the composer; it NEVER auto-answers or auto-interrupts — a
+/// human-approval gate must wait for the human.
+pub(crate) const PARKED_DECISION_ESCALATE_SECS: u64 = 60;
+
+/// `Some(elapsed_secs)` once the active session has been parked on a decision for
+/// at least [`PARKED_DECISION_ESCALATE_SECS`]. Elapsed is derived from the SAME
+/// source as the status bar's "11m 12s" (`run_state_elapsed_secs`, a monotonic
+/// `Instant`), so the banner and the status agree and the threshold check stays
+/// deterministic in tests.
+pub(crate) fn parked_decision_escalation_secs(app: &AppState) -> Option<u64> {
+    if !active_session_has_pending_decision(app) {
+        return None;
+    }
+    app.run_state_elapsed_secs()
+        .filter(|elapsed| *elapsed >= PARKED_DECISION_ESCALATE_SECS)
+}
+
+/// Rows reserved for the parked-decision escalation banner (one line, styled as a
+/// solid attention band above the composer). Zero until the escalation fires.
+/// Reserved height equals the rendered rows — one — so the layout reservation and
+/// [`render_decision_banner`] agree (same discipline as the autonomy indicator).
+fn decision_banner_height(app: &AppState) -> u16 {
+    u16::from(parked_decision_escalation_secs(app).is_some())
+}
+
+fn render_decision_banner(app: &AppState, palette: Palette) -> Paragraph<'static> {
+    let elapsed = parked_decision_escalation_secs(app).unwrap_or(0);
+    let text = t!(
+        "app.statusbar.parked_decision_banner",
+        elapsed = format_elapsed_secs(elapsed)
+    )
+    .into_owned();
+    Paragraph::new(Line::from(Span::styled(
+        format!(" {text} "),
+        Style::default()
+            .fg(palette.text)
+            .bg(palette.danger_bg)
+            .add_modifier(Modifier::BOLD),
+    )))
+    .style(Style::default().bg(palette.danger_bg))
+}
+
 fn status_bar_work_text(app: &AppState) -> String {
     let mut parts = Vec::new();
     match &app.run_state {
@@ -17165,6 +17236,66 @@ mod tests {
             !screen.contains("streamed line 00"),
             "expected the live tail to overflow (early streamed line clipped): {rows:?}"
         );
+    }
+
+    #[test]
+    fn parked_decision_banner_appears_only_after_the_escalation_threshold() {
+        // Fix 3: the watchdog surfaces a prominent banner once a turn has been
+        // parked on a decision past the threshold. Below threshold it reserves no
+        // rows; above threshold it reserves exactly one and advertises recovery.
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "t".into(),
+                profile_id: Some("coding".into()),
+                // A committed message keeps the fresh-launch banner off, so the
+                // normal viewport (with the decision-banner pane) renders.
+                messages: vec![Message::user("run the thing")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.approval = Some(ApprovalModalState {
+            session_id: session_id.clone(),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            title: "Run".into(),
+            body: "approve?".into(),
+            approval_kind: None,
+            risk: None,
+            typed_details: None,
+            render_hints: None,
+            visible: true,
+        });
+        app.run_state = SessionRunState::Blocked {
+            message: "Run command".into(),
+        };
+
+        // Just parked (below threshold): no banner reserved.
+        app.run_state_started_at = Some(std::time::Instant::now());
+        assert_eq!(decision_banner_height(&app), 0);
+
+        // Parked past the threshold: exactly one reserved banner row.
+        app.run_state_started_at = std::time::Instant::now().checked_sub(
+            std::time::Duration::from_secs(PARKED_DECISION_ESCALATE_SECS + 5),
+        );
+        assert_eq!(decision_banner_height(&app), 1);
+        let rows = rendered_rows(&rendered_buffer(&app, Palette::for_theme(ThemeName::Slate)));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Parked on you") && row.contains("Alt+A")),
+            "the escalation banner must advertise the recovery keys: {rows:?}"
+        );
+
+        // No pending decision → no banner even past the threshold.
+        app.approval = None;
+        assert_eq!(decision_banner_height(&app), 0);
     }
 
     #[test]

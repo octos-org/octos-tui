@@ -4931,6 +4931,39 @@ impl Store {
         }))
     }
 
+    /// Watchdog escalation for a turn parked on an operator decision: once it has
+    /// been pending for `PARKED_DECISION_ESCALATE_SECS` (a prominent banner has
+    /// also appeared), re-show the modal if the user hid it, so the prompt is back
+    /// on screen with the keyboard. It NEVER auto-answers or auto-interrupts — a
+    /// human-approval gate must wait for the human. Idempotent: once the modal is
+    /// visible, `show_pending_*` are no-ops. Returns true when it changed visible
+    /// state so the caller redraws. Driven off the same monotonic elapsed clock as
+    /// the status bar, so it fires deterministically.
+    pub fn escalate_parked_decision_if_due(&mut self) -> bool {
+        if crate::app::parked_decision_escalation_secs(&self.state).is_none() {
+            return false;
+        }
+        // Bring a hidden prompt back — question first, mirroring the Alt+A
+        // recovery precedence in `handle_key`.
+        if self
+            .state
+            .user_question
+            .as_ref()
+            .is_some_and(|picker| !picker.visible)
+        {
+            return self.show_pending_user_question();
+        }
+        if self
+            .state
+            .approval
+            .as_ref()
+            .is_some_and(|approval| !approval.visible)
+        {
+            return self.show_pending_approval();
+        }
+        false
+    }
+
     /// Apply (or drop) the deferred Esc/Ctrl+C prompt restore when the
     /// interrupted turn's terminal lands (see `interrupt_command`). The prompt
     /// goes into the live composer only when the session is still active, the
@@ -25504,6 +25537,51 @@ mod tests {
             store.state.status,
             "Approval pane hidden; auto-open disabled until approval is shown again"
         );
+    }
+
+    #[test]
+    fn watchdog_reshows_a_hidden_decision_after_the_threshold_but_never_below() {
+        // Fix 3: a decision that arrives hidden (auto-open disabled) leaves the
+        // composer locked with no visible prompt. Past the escalation threshold
+        // the watchdog re-shows it — but NEVER early, and NEVER auto-answers or
+        // auto-interrupts (it only flips `visible`).
+        let mut store = store_with_empty_session();
+        store.state.approval_auto_open = false;
+        let session_id = store.state.sessions[0].id.clone();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            ApprovalRequestedEvent::generic(
+                session_id,
+                ApprovalId::new(),
+                TurnId::new(),
+                "shell",
+                "Run command",
+                "cargo test",
+            ),
+        )));
+        assert!(!store.state.approval.as_ref().expect("pending").visible);
+        assert!(store.state.run_state.is_active());
+
+        // Below the threshold: the watchdog does not re-show.
+        store.state.run_state_started_at = Some(std::time::Instant::now());
+        assert!(!store.escalate_parked_decision_if_due());
+        assert!(!store.state.approval.as_ref().expect("pending").visible);
+
+        // Past the threshold: the prompt comes back, still pending (not answered
+        // or interrupted).
+        store.state.run_state_started_at = std::time::Instant::now().checked_sub(
+            std::time::Duration::from_secs(crate::app::PARKED_DECISION_ESCALATE_SECS + 5),
+        );
+        assert!(store.escalate_parked_decision_if_due());
+        assert!(
+            store
+                .state
+                .approval
+                .as_ref()
+                .expect("still pending")
+                .visible
+        );
+        // Idempotent once visible — no repeated churn.
+        assert!(!store.escalate_parked_decision_if_due());
     }
 
     #[test]
