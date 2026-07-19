@@ -7470,7 +7470,7 @@ fn push_inline_diff_preview(
                     lines,
                     palette,
                     file_idx,
-                    diff.selected_file,
+                    file_idx,
                     diff.selected_hunk,
                     file,
                     expanded,
