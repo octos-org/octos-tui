@@ -2152,10 +2152,13 @@ impl AppUiBackend for ProtocolAppUiBackend {
         }
 
         if let Err(err) = self.send_text(text) {
+            // Remove the pending entry before mark_disconnected so that
+            // cancel_pending_requests does not emit a duplicate "cancelled"
+            // event for this request on top of the transport_send error below.
+            self.protocol.pending_requests.remove(&request_id);
             self.mark_disconnected(format!(
                 "UI protocol disconnected; reconnect will retry on next send/read: {err:#}"
             ));
-            self.protocol.pending_requests.remove(&request_id);
             self.queue.push_back(
                 AppUiEvent::Error(AppUiError {
                     code: "transport_send".into(),
