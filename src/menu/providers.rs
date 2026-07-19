@@ -1934,20 +1934,22 @@ fn launch_prompt_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         // "start the launching brain here" first, then one switch row per
         // profile already used in this folder.
         _ => {
-            let mut items = vec![
-                MenuItem::new(
-                    "launch.start",
-                    t!(
-                        "menu.launch_prompt.cross.item.start.label",
-                        profile = prompt.resolved_profile.clone()
-                    ),
-                    open_session(&prompt.resolved_profile),
-                )
-                .with_description(t!(
-                    "menu.launch_prompt.cross.item.start.desc",
+            let mut start_item = MenuItem::new(
+                "launch.start",
+                t!(
+                    "menu.launch_prompt.cross.item.start.label",
                     profile = prompt.resolved_profile.clone()
-                )),
-            ];
+                ),
+                open_session(&prompt.resolved_profile),
+            )
+            .with_description(t!(
+                "menu.launch_prompt.cross.item.start.desc",
+                profile = prompt.resolved_profile.clone()
+            ));
+            if let Some(shortcut) = numeric_shortcut(0) {
+                start_item = start_item.with_shortcut(shortcut);
+            }
+            let mut items = vec![start_item];
             for (index, existing) in prompt.existing_profiles.iter().enumerate() {
                 let mut item = MenuItem::new(
                     format!("launch.switch.{index}"),
