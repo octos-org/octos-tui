@@ -4908,6 +4908,29 @@ impl Store {
         }))
     }
 
+    /// Interrupt the turn parked on the active session's pending decision — a
+    /// tool approval or an `AskUserQuestion` picker. A single Esc (or Ctrl+C) on a
+    /// parked turn cancels it here; the server-side interrupt drops the parked
+    /// approval / question waiter guard (→ `approval/cancelled` / turn terminal),
+    /// so the pending decision is torn down with no zombie.
+    ///
+    /// Prefers [`Self::interrupt_command`] when a live turn is reported (it also
+    /// arms the Esc/Ctrl+C prompt-restore). But a decision can park a turn BEFORE
+    /// any reply streams, so `active_turn()` — which keys off `live_reply` — is
+    /// `None` in exactly that case; then the interrupt is built from the
+    /// decision's own session/turn id, which is authoritative for the parked turn.
+    pub fn interrupt_active_decision_command(&mut self) -> Option<AppUiCommand> {
+        if self.state.active_turn().is_some() {
+            return self.interrupt_command();
+        }
+        let (session_id, turn_id) = crate::app::active_session_pending_decision_turn(&self.state)?;
+        self.state.status = t!("status.interrupt_requested_active_turn").into_owned();
+        Some(AppUiCommand::InterruptTurn(TurnInterruptParams {
+            session_id,
+            turn_id,
+        }))
+    }
+
     /// Apply (or drop) the deferred Esc/Ctrl+C prompt restore when the
     /// interrupted turn's terminal lands (see `interrupt_command`). The prompt
     /// goes into the live composer only when the session is still active, the

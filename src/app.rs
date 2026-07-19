@@ -11,7 +11,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use octos_core::{
-    Message, SessionKey, TaskId, ui_protocol::TaskRuntimeState, ui_protocol::approval_kinds,
+    Message, SessionKey, TaskId, ui_protocol::TaskRuntimeState, ui_protocol::TurnId,
+    ui_protocol::approval_kinds,
 };
 
 use crate::{
@@ -9937,23 +9938,35 @@ fn hint_bar_text(model: HintBarModel) -> String {
     }
 }
 
+/// The `(session, turn)` of the operator decision the active session's turn is
+/// parked on — a pending tool approval or an `AskUserQuestion` picker — if any.
+/// This is authoritative for interrupting a parked turn: the decision carries its
+/// own `turn_id`, so it works even when `active_turn()` is `None` (a decision can
+/// park a turn before any reply streams, so there is no `live_reply` for
+/// `active_turn` to key off).
+pub(crate) fn active_session_pending_decision_turn(app: &AppState) -> Option<(SessionKey, TurnId)> {
+    let session_id = app.active_session().map(|session| session.id.clone())?;
+    if let Some(approval) = app
+        .approval
+        .as_ref()
+        .filter(|approval| approval.session_id == session_id)
+    {
+        return Some((approval.session_id.clone(), approval.turn_id.clone()));
+    }
+    app.user_question
+        .as_ref()
+        .filter(|question| question.session_id == session_id)
+        .map(|question| (question.session_id.clone(), question.turn_id.clone()))
+}
+
 /// True when the active session's turn is parked on an operator decision — a
 /// pending tool approval or an `AskUserQuestion` picker. While this holds the
 /// decision modal owns the keyboard (y/s/n) so the composer is locked; the modal
 /// can also scroll out of the height-clipped live tail, leaving the user with a
 /// bare "Waiting" and no visible prompt — so the status bar must advertise the
 /// recovery keys (Alt+A to bring the prompt back, Ctrl+C to interrupt).
-fn active_session_has_pending_decision(app: &AppState) -> bool {
-    let Some(session_id) = app.active_session().map(|session| session.id.clone()) else {
-        return false;
-    };
-    app.approval
-        .as_ref()
-        .is_some_and(|approval| approval.session_id == session_id)
-        || app
-            .user_question
-            .as_ref()
-            .is_some_and(|question| question.session_id == session_id)
+pub(crate) fn active_session_has_pending_decision(app: &AppState) -> bool {
+    active_session_pending_decision_turn(app).is_some()
 }
 
 fn status_bar_work_text(app: &AppState) -> String {
