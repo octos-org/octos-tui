@@ -84,7 +84,7 @@ app:
     loops_running: "循环：%{count} 个活动中"
     loops_paused_suffix: " · %{count} 个已暂停"
     goal_meta: " (%{status} · %{used}/%{budget} Token)"
-    goal_fold_hint: " · Alt+E 展开"
+    goal_fold_hint: " · Ctrl+P 展开"
     status_active: "进行中"
     status_paused: "已暂停"
     status_budget_limited: "预算已用尽"
@@ -435,7 +435,7 @@ command:
   profiles:
     desc: 管理本地档案——列出、设为默认、删除或新建。
   goal:
-    desc: 查看、设置、暂停/恢复、停止或清除持久化的会话目标
+    desc: "设置：/goal <目标> [--budget 2m|500k]。管理：pause、resume、stop、clear。单独 /goal 查看当前目标。"
   help:
     desc: 显示可用命令
   keymap:
