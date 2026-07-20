@@ -8863,6 +8863,20 @@ const AGENT_STRIP_MIN_TERMINAL_ROWS: u16 = 12;
 /// overflow marker and the visible window shifts to keep the selection shown.
 const AGENT_STRIP_MAX_AGENT_ROWS: u16 = 4;
 
+/// Sub-agents shown in the under-composer selector strip: the active session's
+/// roster minus any that have reached a terminal state. A completed / failed /
+/// interrupted sub-agent leaves the strip the instant its terminal
+/// `agent/updated` lands — no linger, no waiting for the next Tab-cycle or
+/// submit. The ROSTER itself keeps the terminal record (the tick sweep still
+/// ages it out for `/ps`), so the peek, the `/ps` dock, and the scrollback card
+/// continue to show completed agents; only this live selector drops them.
+fn strip_live_agents(app: &AppState) -> Vec<&octos_core::ui_protocol::UiAgentRecord> {
+    app.active_session_agents()
+        .iter()
+        .filter(|agent| !crate::model::agent_status_is_terminal(&agent.status))
+        .collect()
+}
+
 /// Rows the agent strip occupies under the composer: a title row (with the
 /// `main` chip) plus ONE ROW PER SUB-AGENT — vertical so each agent gets a
 /// full line of status/task visibility instead of an abbreviated chip. Agent
@@ -8879,7 +8893,7 @@ const AGENT_STRIP_MAX_AGENT_ROWS: u16 = 4;
 fn agent_strip_height(app: &AppState, terminal_height: u16) -> u16 {
     if app.transcript_pager_active
         || terminal_height < AGENT_STRIP_MIN_TERMINAL_ROWS
-        || app.active_session_agents().is_empty()
+        || strip_live_agents(app).is_empty()
     {
         0
     } else if app.agent_dock_collapsed {
@@ -8896,7 +8910,7 @@ fn agent_strip_height(app: &AppState, terminal_height: u16) -> u16 {
 /// height the strip degrades to the title row alone — the `+N` marker and Tab
 /// keep every agent reachable).
 fn agent_strip_agent_rows(app: &AppState, terminal_height: u16) -> u16 {
-    let roster = app.active_session_agents().len().min(u16::MAX as usize) as u16;
+    let roster = strip_live_agents(app).len().min(u16::MAX as usize) as u16;
     roster
         .min(AGENT_STRIP_MAX_AGENT_ROWS)
         .min(terminal_height.saturating_sub(AGENT_STRIP_MIN_TERMINAL_ROWS))
@@ -8907,7 +8921,7 @@ fn agent_strip_agent_rows(app: &AppState, terminal_height: u16) -> u16 {
 /// left out. The window starts at the top of the roster and shifts down just
 /// enough to keep the selected agent visible.
 fn agent_strip_window(app: &AppState, rows: usize) -> (std::ops::Range<usize>, usize) {
-    let agents = app.active_session_agents();
+    let agents = strip_live_agents(app);
     let len = agents.len();
     if rows == 0 || len == 0 {
         return (0..0, len);
@@ -9050,7 +9064,10 @@ fn agent_strip_lines(app: &AppState, palette: Palette, agent_rows: u16) -> Vec<L
     if app.agent_dock_collapsed {
         return vec![agent_dock_pill_line(app, palette)];
     }
-    let agents = app.active_session_agents();
+    // Full roster for tree-depth (a child's parent may itself be terminal and
+    // hidden from the rows) — but only LIVE agents become rows.
+    let roster = app.active_session_agents();
+    let agents = strip_live_agents(app);
     let (window, hidden) = agent_strip_window(app, agent_rows as usize);
     let selected_style = Style::default()
         .fg(palette.surface)
@@ -9097,7 +9114,7 @@ fn agent_strip_lines(app: &AppState, palette: Palette, agent_rows: u16) -> Vec<L
     }
     let mut lines = vec![Line::from(title_spans)];
 
-    for agent in &agents[window] {
+    for &agent in &agents[window] {
         let selected = matches!(
             &app.chat_view,
             crate::model::ChatViewTarget::Agent(id) if id == &agent.agent_id
@@ -9109,18 +9126,13 @@ fn agent_strip_lines(app: &AppState, palette: Palette, agent_rows: u16) -> Vec<L
         };
         // Depth-indent children under their parent (#323) — nested spawns
         // read as a tree instead of a flat list.
-        let indent = "  ".repeat(agent_depth(agents, &agent.agent_id));
-        let unseen = app.is_agent_unseen(&agent.agent_id);
+        let indent = "  ".repeat(agent_depth(roster, &agent.agent_id));
+        // Only LIVE agents are rows now (a terminal agent leaves the strip the
+        // instant it finishes), and the unread badge only ever marks terminal
+        // agents — so a per-row unread dot can never fire here. The unread
+        // outcome still surfaces on the title-row summary and the collapsed
+        // pill, and the full result stays in `/ps`, the peek, and scrollback.
         let mut spans = Vec::new();
-        if unseen {
-            spans.push(Span::styled(
-                "●".to_string(),
-                Style::default()
-                    .fg(palette.highlight)
-                    .bg(palette.surface)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
         let elapsed = agent_elapsed_label(agent)
             .map(|label| format!(" · {label}"))
             .unwrap_or_default();
@@ -18383,6 +18395,74 @@ mod tests {
     }
 
     #[test]
+    fn completed_subagent_leaves_the_strip_immediately_without_a_tab_cycle() {
+        // A Running sub-agent occupies the strip: title row + its one row.
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        app.upsert_session_agent(&sid, sample_agent("worker", "running"));
+        assert_eq!(
+            agent_strip_height(&app, 40),
+            2,
+            "running sub-agent shows in the strip"
+        );
+        let rendered = line_texts(&agent_strip_lines(&app, Palette::for_theme(app.theme), 1));
+        assert!(
+            rendered.iter().any(|line| line.contains("worker")),
+            "the running agent's row is present"
+        );
+
+        // Its terminal `agent/updated` lands. With NO Tab-cycle and NO submit,
+        // the strip drops it on the very next render — the whole strip collapses
+        // because that was the only agent.
+        app.upsert_session_agent(&sid, sample_agent("worker", "completed"));
+        assert_eq!(
+            agent_strip_height(&app, 40),
+            0,
+            "a completed sub-agent leaves the strip immediately"
+        );
+
+        // The roster itself keeps the record so `/ps`, the peek, and the
+        // scrollback card still show the completed agent.
+        assert!(
+            app.active_session_agents()
+                .iter()
+                .any(|agent| agent.agent_id == "worker" && agent.status == "completed"),
+            "the completed agent stays in the roster for /ps and the peek"
+        );
+    }
+
+    #[test]
+    fn strip_keeps_running_agents_when_a_sibling_completes() {
+        // Two running siblings, then one completes: the strip keeps the still-
+        // running one and only the finished sibling's row disappears.
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:test".into());
+        app.upsert_session_agent(&sid, sample_agent("alpha", "running"));
+        app.upsert_session_agent(&sid, sample_agent("beta", "running"));
+        assert_eq!(
+            agent_strip_height(&app, 40),
+            3,
+            "title row + two agent rows"
+        );
+
+        app.upsert_session_agent(&sid, sample_agent("beta", "failed"));
+        assert_eq!(
+            agent_strip_height(&app, 40),
+            2,
+            "title row + the one still-running agent"
+        );
+        let rendered = line_texts(&agent_strip_lines(&app, Palette::for_theme(app.theme), 1));
+        assert!(
+            rendered.iter().any(|line| line.contains("alpha")),
+            "the running sibling stays"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains("beta")),
+            "the terminal sibling's row is gone"
+        );
+    }
+
+    #[test]
     fn peek_output_falls_back_to_the_record_tail_when_cache_is_empty() {
         let mut app = autonomy_app_state();
         let sid = app.active_session().unwrap().id.clone();
@@ -18570,7 +18650,9 @@ mod tests {
         edison.nickname = "Edison".into();
         edison.last_task = Some("clone the repo\nsecond line ignored".into());
         app.upsert_session_agent(&sid, edison);
-        app.upsert_session_agent(&sid, sample_agent("thomas", "completed"));
+        // Both agents are live: a terminal agent would leave the strip at once,
+        // so the multi-row / overflow rendering is exercised with running ones.
+        app.upsert_session_agent(&sid, sample_agent("thomas", "running"));
 
         let lines = agent_strip_lines(&app, Palette::for_theme(ThemeName::Codex), 2);
         let flat: Vec<String> = lines
@@ -18595,7 +18677,7 @@ mod tests {
             flat[1]
         );
         assert!(
-            flat[2].contains("thomas") && flat[2].contains("completed"),
+            flat[2].contains("thomas") && flat[2].contains("running"),
             "second agent row present: {}",
             flat[2]
         );
@@ -18660,21 +18742,23 @@ mod tests {
         assert!(!pill.contains('●'), "seen -> no unread segment: {pill}");
     }
 
-    /// Expanded rows carry the unread dot and depth-indent children under
-    /// their parent (#323).
+    /// Expanded rows depth-indent LIVE children under their parent (#323). A
+    /// finished agent has already left the strip, so the per-row unread dot no
+    /// longer applies — the unread outcome is summarized on the title row while
+    /// the completed agent's row is gone.
     #[test]
-    fn agent_strip_rows_show_unseen_dot_and_depth_indent() {
+    fn agent_strip_rows_indent_live_children_and_title_summarizes_unread() {
         let mut app = autonomy_app_state();
         let sid = SessionKey("local:test".into());
         app.upsert_session_agent(&sid, sample_agent("lead", "running"));
         let mut child = sample_agent("worker", "running");
         child.parent_agent_id = Some("lead".into());
-        app.upsert_session_agent(&sid, child.clone());
-        // The child finishes while the user is on Main -> unread dot.
-        child.status = "completed".into();
         app.upsert_session_agent(&sid, child);
+        // A sibling finishes while the user is on Main -> unread, and leaves the
+        // strip immediately.
+        app.upsert_session_agent(&sid, sample_agent("scout", "completed"));
 
-        let lines = agent_strip_lines(&app, Palette::for_theme(ThemeName::Codex), 2);
+        let lines = agent_strip_lines(&app, Palette::for_theme(ThemeName::Codex), 3);
         let rows: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -18684,23 +18768,23 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
+        // The title row still summarizes the one unread completion...
         assert!(
             rows[0].contains("1●"),
             "title row unread count: {}",
             rows[0]
         );
+        // ...but the completed agent itself is no longer a row.
         assert!(
-            !rows[1].starts_with('●'),
-            "running parent has no dot: {}",
-            rows[1]
+            !rows.iter().any(|row| row.contains("scout")),
+            "the finished agent left the strip: {rows:?}"
         );
-        assert!(rows[2].starts_with('●'), "unseen child dotted: {}", rows[2]);
+        assert_eq!(rows.len(), 3, "title + the two live agent rows: {rows:?}");
         let parent_indent = rows[1].chars().take_while(|c| *c == ' ').count();
-        let child_body = rows[2].trim_start_matches('●');
-        let child_indent = child_body.chars().take_while(|c| *c == ' ').count();
+        let child_indent = rows[2].chars().take_while(|c| *c == ' ').count();
         assert!(
             child_indent > parent_indent,
-            "child indents deeper than parent: {parent_indent} vs {child_indent}"
+            "live child indents deeper than parent: {parent_indent} vs {child_indent}"
         );
     }
 
