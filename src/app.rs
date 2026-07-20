@@ -10158,24 +10158,61 @@ pub(crate) fn parked_decision_escalation_secs(app: &AppState) -> Option<u64> {
 /// Reserved height equals the rendered rows — one — so the layout reservation and
 /// [`render_decision_banner`] agree (same discipline as the autonomy indicator).
 fn decision_banner_height(app: &AppState) -> u16 {
-    u16::from(parked_decision_escalation_secs(app).is_some())
+    u16::from(
+        parked_decision_escalation_secs(app).is_some()
+            || pending_question_for_banner(app).is_some(),
+    )
+}
+
+/// A pending, keyboard-owning question renders its submit/toggle affordance in
+/// the reserved decision-banner chrome, so the SUBMIT control can never scroll
+/// off the height-capped live tail. The options list can (and does) scroll; the
+/// submit hint must not — before this, the only submit affordance lived at the
+/// bottom of the scrollable picker card (clips vertically) and in the unwrapped
+/// status line (clips horizontally), so a taller-than-half-screen question left
+/// the user staring at options with no visible way to submit.
+fn pending_question_for_banner(app: &AppState) -> Option<&UserQuestionPickerState> {
+    app.user_question
+        .as_ref()
+        .filter(|picker| picker.visible && !picker.questions.is_empty())
 }
 
 fn render_decision_banner(app: &AppState, palette: Palette) -> Paragraph<'static> {
-    let elapsed = parked_decision_escalation_secs(app).unwrap_or(0);
-    let text = t!(
-        "app.statusbar.parked_decision_banner",
-        elapsed = format_elapsed_secs(elapsed)
-    )
-    .into_owned();
-    Paragraph::new(Line::from(Span::styled(
-        format!(" {text} "),
-        Style::default()
-            .fg(palette.text)
-            .bg(palette.danger_bg)
-            .add_modifier(Modifier::BOLD),
-    )))
-    .style(Style::default().bg(palette.danger_bg))
+    // The 60s parked-decision escalation is a danger-styled alert and takes
+    // precedence over the (calmer) submit affordance.
+    if let Some(elapsed) = parked_decision_escalation_secs(app) {
+        let text = t!(
+            "app.statusbar.parked_decision_banner",
+            elapsed = format_elapsed_secs(elapsed)
+        )
+        .into_owned();
+        return Paragraph::new(Line::from(Span::styled(
+            format!(" {text} "),
+            Style::default()
+                .fg(palette.text)
+                .bg(palette.danger_bg)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .style(Style::default().bg(palette.danger_bg));
+    }
+
+    // A pending question: pin its submit/toggle affordance here so it is ALWAYS
+    // visible, regardless of live-tail scroll or status-bar truncation. Styled
+    // like a highlighted option row (▌ accent) so it reads as a control, not a
+    // dim footer hint.
+    if let Some(picker) = pending_question_for_banner(app) {
+        let hint = user_question_action_labels(picker).join("   ");
+        return Paragraph::new(Line::from(vec![
+            Span::styled(" ▌ ", palette.title().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{hint} "),
+                palette.selected().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+
+    // `decision_banner_height` is 0 in every other case, so this is never shown.
+    Paragraph::new(Line::from(""))
 }
 
 fn status_bar_work_text(app: &AppState) -> String {
@@ -20091,6 +20128,44 @@ mod tests {
         });
 
         assert_eq!(hint_bar_model(&app).mode, HintBarMode::UserQuestion);
+    }
+
+    #[test]
+    fn decision_banner_reserves_a_row_and_shows_submit_hint_for_a_pending_question() {
+        let mut app = chat_app(vec![Message::user("hi")]);
+        // No question → no banner row reserved.
+        assert_eq!(decision_banner_height(&app), 0);
+        assert!(pending_question_for_banner(&app).is_none());
+
+        app.user_question = Some(UserQuestionPickerState {
+            session_id: SessionKey("local:test".into()),
+            question_id: QuestionId::new(),
+            turn_id: TurnId::new(),
+            title: "Choose path".into(),
+            body: "Which option?".into(),
+            questions: vec![crate::model::UserQuestionEntry {
+                header: "Path".into(),
+                question: "Which?".into(),
+                options: vec![],
+                multi_select: true,
+                option_selected: vec![],
+                free_text: String::new(),
+                cursor: 0,
+                editing_free_text: false,
+            }],
+            active: 0,
+            visible: true,
+        });
+        // A visible, non-empty question reserves the always-on banner row so the
+        // submit affordance can never scroll off the height-capped live tail.
+        assert!(pending_question_for_banner(&app).is_some());
+        assert_eq!(decision_banner_height(&app), 1);
+
+        // Dismissed (Alt+A) → banner row released; the picker no longer owns the
+        // reserved chrome.
+        app.user_question.as_mut().unwrap().visible = false;
+        assert_eq!(decision_banner_height(&app), 0);
+        assert!(pending_question_for_banner(&app).is_none());
     }
 
     /// Render `render_viewport` into a buffer via the custom inline `Frame`, at
