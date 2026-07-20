@@ -1460,7 +1460,7 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
 
     if key.modifiers.contains(KeyModifiers::ALT) {
         match key.code {
-            // Ctrl+Pnter also inserts a newline where the terminal reports it as
+            // Alt+Enter also inserts a newline where the terminal reports it as
             // Enter+ALT (e.g. iTerm2). Some terminals (Warp) send Option+Enter
             // as ESC+CR instead, where it can't be caught — use Shift+Enter or
             // Ctrl+J there.
@@ -1492,8 +1492,8 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
         match key.code {
             // Ctrl+J is a literal line feed and works in every terminal (no
             // Kitty/modifyOtherKeys needed), so it is the portable newline key
-            // alongside Ctrl+Pnter. (Terminals that fold Ctrl+J into Enter will
-            // submit instead — Ctrl+Pnter is the fallback there.)
+            // alongside Alt+Enter. (Terminals that fold Ctrl+J into Enter will
+            // submit instead — Alt+Enter is the fallback there.)
             KeyCode::Char('j') => {
                 store.state.insert_composer_text("\n");
                 return true;
