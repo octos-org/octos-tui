@@ -506,6 +506,9 @@ menu:
       empty:
         label: 尚未配置研究通道
         desc: "使用 /research add <key> <provider> <model> 添加。"
+      stale:
+        label: 尚未加载此配置的通道
+        desc: 选择"刷新"以加载此配置的研究通道。
       lane:
         desc: "选择以预填 /research rm — 按 Enter 确认。"
       add:

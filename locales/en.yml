@@ -940,6 +940,9 @@ menu:
       empty:
         label: No research lanes configured
         desc: "Add one with /research add <key> <provider> <model>."
+      stale:
+        label: Lanes not loaded for this profile
+        desc: Select Refresh to load this profile's research lanes.
       lane:
         desc: "Select to stage /research rm — Enter to confirm."
       add:

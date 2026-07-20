@@ -627,15 +627,13 @@ impl Store {
     /// Changes are RESTART-to-apply on a pinned solo profile (the router builds
     /// at ProfileRuntime bootstrap) — the mutation status says so.
     pub(crate) fn dispatch_research_slash(&mut self, draft: &str) -> SlashDispatchOutcome {
-        // Target the SAME profile the menu displays (the last list's profile),
-        // else the active profile — NOT the connection default, or an inline `rm`
-        // could delete a lane from a different profile than the one shown.
-        let profile_id = self
-            .state
-            .sub_providers_state
-            .as_ref()
-            .and_then(|state| state.profile_id.clone())
-            .or_else(|| self.current_profile_for_onboarding());
+        // Target the ACTIVE profile — the same value the /research menu resolves
+        // (`active_profile_id`), NOT the last list's cached profile and NOT the
+        // connection default. Reading the active profile (rather than the mutable
+        // lane cache) means a background list response for another profile can't
+        // retarget an `rm` the user already staged, and it can't delete a lane
+        // from a different profile than the one on screen.
+        let profile_id = self.active_profile_id();
 
         let rest = draft.trim().strip_prefix("/research").unwrap_or("").trim();
         let mut tokens = rest.split_whitespace();
@@ -3774,6 +3772,48 @@ impl Store {
                     .as_ref()
                     .and_then(|state| non_empty_string(state.profile_id.as_deref()?.to_owned()))
             })
+    }
+
+    /// The profile the ACTIVE session runs under: runtime status first, then the
+    /// session record, then the onboarding/llm/skills caches. This is the single
+    /// source of truth for "which profile do config mutations target".
+    ///
+    /// It MUST stay identical to the menu snapshot's `current_profile`
+    /// (`menu_app_snapshot`) — the `/research` dispatcher resolves the target this
+    /// way and the menu resolves it that way, and if the two diverged an inline
+    /// `/research rm` and a menu Refresh could hit different profiles. (This is the
+    /// owned-`String` twin; the snapshot needs a borrow, which is why the logic is
+    /// mirrored rather than shared.) It deliberately does NOT consult
+    /// `current_profile_for_onboarding`, which prefers the onboarding profile over
+    /// the active session.
+    fn active_profile_id(&self) -> Option<String> {
+        let selected_session = self.state.active_session();
+        let runtime_status =
+            selected_session.and_then(|session| self.state.runtime_status_for(&session.id));
+        runtime_status
+            .and_then(|status| {
+                status.profile_id.as_deref().or_else(|| {
+                    status
+                        .runtime_policy_stamp
+                        .as_ref()
+                        .and_then(|stamp| stamp.profile_id.as_deref())
+                })
+            })
+            .or_else(|| selected_session.and_then(|session| session.profile_id.as_deref()))
+            .or(self.state.onboarding.profile_id.as_deref())
+            .or_else(|| {
+                self.state
+                    .profile_llm_state
+                    .as_ref()
+                    .and_then(|state| state.profile_id.as_deref())
+            })
+            .or_else(|| {
+                self.state
+                    .profile_skills
+                    .as_ref()
+                    .and_then(|state| state.profile_id.as_deref())
+            })
+            .map(str::to_owned)
     }
 
     fn open_session_provider_block_reason(&self, profile_id: &str) -> Option<String> {
