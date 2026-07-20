@@ -23,7 +23,7 @@ path = "src/main.rs"
 # per-project `session/list` scoping below. This rev is a clean 1-commit
 # superset of the previous main pin `82b1abf11148`. RE-PIN to the merged main
 # rev once #1662 lands on octos `main`.
-octos-core = { git = "https://github.com/octos-org/octos", rev = "2991cb64743f337a30ff55753f15b5b7de86ede8" }
+octos-core = { git = "https://github.com/octos-org/octos", rev = "95ac58ad48c60df1e46cea429d618d20e7717c1f" }
 clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
 color-eyre = "0.6"

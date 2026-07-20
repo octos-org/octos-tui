@@ -5715,18 +5715,17 @@ const RAW_ARG_FALLBACK_COLS: usize = 512;
 /// then a compact `key=value` of the first meaningful object field, then a
 /// bounded raw-JSON fallback.
 ///
-/// DISPLAY-ONLY: `ActivityItem.detail` itself is never rewritten — the
-/// envelope thread marker stored there is load-bearing for the turn-less
-/// reconcile ([`AppState::reconcile_envelope_thread_running_activity`]).
+/// DISPLAY-ONLY: `ActivityItem.detail` itself is never rewritten so the
+/// underlying protocol-provided invocation echo remains available to other
+/// activity consumers.
 fn tool_invocation_text(item: &ActivityItem) -> Option<String> {
     if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
         return Some(humanize_args_echo(detail, &item.title));
     }
     let arguments = item.arguments.as_ref()?;
-    // The envelope lane parks the same serialized args echo in `arguments` as
-    // a JSON String (its `detail` carries the thread marker instead): treat
-    // the inner text exactly like a detail echo — re-serializing it would
-    // render `"{\"cmd\":…`.
+    // The projection lane can carry a serialized args echo in `arguments` as
+    // a JSON String: treat the inner text exactly like a detail echo —
+    // re-serializing it would render `"{\"cmd\":…`.
     if let Some(echo) = arguments.as_str() {
         let echo = echo.trim();
         if !echo.is_empty() {
@@ -14778,8 +14777,7 @@ mod tests {
         );
     }
 
-    /// Plain (non-JSON) details are untouched: a bang command echo and the
-    /// load-bearing envelope thread marker render verbatim.
+    /// Plain (non-JSON) details are untouched.
     #[test]
     fn agent_task_row_keeps_plain_detail_verbatim() {
         let bang = ActivityItem::new(ActivityKind::Tool, "bash", "complete")
@@ -14789,14 +14787,6 @@ mod tests {
         assert!(
             text.contains("! echo hi"),
             "plain detail must render unchanged: {text:?}"
-        );
-
-        let marker = ActivityItem::new(ActivityKind::Tool, "shell", "running")
-            .with_detail(AppState::envelope_tool_detail_for_thread("th-123"));
-        let text = agent_task_child_text(&marker, 120);
-        assert!(
-            text.contains("thread th-123"),
-            "thread marker must render unchanged: {text:?}"
         );
     }
 

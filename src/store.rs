@@ -3,15 +3,15 @@ use std::collections::BTreeSet;
 use octos_core::app_ui::{AppUiEvent, AppUiSnapshot};
 use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
-    ApprovalRespondParams, DiffPreviewGetParams, EnvelopeNotification, EnvelopeToolEndStatus,
-    EnvelopeV2Notification, HydratedMessage, InputItem, MessageDeltaEvent, MessagePersistedEvent,
-    Payload, PayloadV2, ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult,
-    SessionListParams, SessionListResult, SessionOpenParams, SessionRollbackParams,
-    SessionRollbackResult, TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams,
-    TaskRuntimeState, TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent,
-    TurnId, TurnInterruptParams, TurnLifecycleState, TurnSpawnCompleteEvent, TurnStartParams,
-    TurnStateGetParams, TurnTerminalOutcome, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
-    UiContextState, UiNotification, UiProgressEvent, UserQuestionRequestedEvent,
+    ApprovalRespondParams, DiffPreviewGetParams, EnvelopeToolEndStatus, EnvelopeV2,
+    EnvelopeV2Notification, HydratedMessage, InputItem, MessageDeltaEvent, PayloadV2,
+    ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult, SessionListParams,
+    SessionListResult, SessionOpenParams, SessionRollbackParams, SessionRollbackResult,
+    TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState,
+    TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent, TurnId,
+    TurnInterruptParams, TurnLifecycleState, TurnStartParams, TurnStateGetParams,
+    TurnTerminalOutcome, UiContextState, UiNotification, UiProgressEvent,
+    UserQuestionRequestedEvent,
 };
 use octos_core::{Message, MessageRole, SessionKey, TaskId, ThreadId};
 use serde_json::Value;
@@ -7337,40 +7337,21 @@ impl Store {
                 });
         }
 
-        // #1515 replay lane: the server ships the session's persisted
-        // tool_start/progress/end projection envelopes on hydrate (stdio
-        // negotiates `event.spawn_complete.v1` by default). Re-apply them so
-        // archived turn groups regain their per-action rows after a client
-        // restart, instead of rendering a bare "N action(s)" header with no
-        // children. Idempotent via `applied_hydrate_tool_envelopes`.
+        // Re-apply the server's canonical v2 tool projection envelopes so
+        // archived turn groups regain their per-action rows after a restart,
+        // rather than rendering a bare "N action(s)" header with no children.
+        // This is idempotent via `applied_hydrate_tool_envelopes`.
         if let Some(envelopes) = result.replayed_tool_envelopes.as_deref() {
-            // Envelopes from the legacy-notification emitter use the TURN id
-            // as their thread id, and hydrated turns may carry no thread_id at
-            // all — index by BOTH so replay rows resolve their turn either way.
-            let thread_turns: std::collections::HashMap<
-                String,
-                &octos_core::ui_protocol::HydratedTurn,
-            > = result
-                .turns
-                .iter()
-                .flatten()
-                .flat_map(|turn| {
-                    turn.thread_id
-                        .clone()
-                        .map(|thread| (thread, turn))
-                        .into_iter()
-                        .chain(std::iter::once((turn.turn_id.0.to_string(), turn)))
-                })
-                .collect();
-            // tool_call_ids whose ToolStart THIS pass created — Progress/End
-            // envelopes only ever mutate rows this replay owns (or upgrade a
+            let hydrated_turns = result.turns.as_deref().unwrap_or(&[]);
+            // Tool-call ids whose ToolStart THIS pass created — Progress/End
+            // envelopes only mutate rows this replay owns (or upgrade a
             // still-running row), never a richer live-streamed terminal row.
             let mut created: std::collections::HashSet<String> = std::collections::HashSet::new();
             for envelope in envelopes {
                 self.apply_replayed_tool_envelope(
                     &session_id,
                     envelope,
-                    &thread_turns,
+                    hydrated_turns,
                     &mut created,
                 );
             }
@@ -7498,8 +7479,8 @@ impl Store {
     fn apply_replayed_tool_envelope(
         &mut self,
         session_id: &SessionKey,
-        envelope: &octos_core::ui_protocol::Envelope,
-        thread_turns: &std::collections::HashMap<String, &octos_core::ui_protocol::HydratedTurn>,
+        envelope: &EnvelopeV2,
+        hydrated_turns: &[octos_core::ui_protocol::HydratedTurn],
         created: &mut std::collections::HashSet<String>,
     ) {
         let key = (
@@ -7514,62 +7495,29 @@ impl Store {
         {
             return;
         }
-        let hydrated_turn = thread_turns.get(envelope.thread_id.as_str());
-        let turn_id = hydrated_turn.map(|turn| turn.turn_id.clone());
-        let turn_is_terminal = hydrated_turn.is_some_and(|turn| {
-            matches!(
-                turn.state,
-                TurnLifecycleState::Completed
-                    | TurnLifecycleState::Errored
-                    | TurnLifecycleState::Interrupted
-            )
-        });
+        // V2 carries an explicit turn id. The hydrated-turn lookup keeps the
+        // Stage-3 compatibility alias working if a replayed v2 record uses a
+        // thread-shaped id while the snapshot has the canonical UUID.
+        let turn_id = hydrated_turns
+            .iter()
+            .find(|turn| {
+                turn.turn_id.0.to_string() == envelope.turn_id
+                    || turn.thread_id.as_deref() == Some(envelope.turn_id.as_str())
+            })
+            .map(|turn| turn.turn_id.clone())
+            .or_else(|| serde_json::from_value(Value::String(envelope.turn_id.clone())).ok());
         match &envelope.payload {
-            Payload::ToolStart {
+            PayloadV2::ToolStart {
                 tool_call_id,
                 name,
                 arguments_preview,
             } => {
                 // A live-streamed row (or a prior replay already archived into
                 // the turn log) covers this call — never double-render it.
-                // But a LIVE envelope row is turnless (the envelope path has
-                // no turn identity): ADOPT it onto the hydrated turn first,
-                // or the capture pass below can't archive it and a terminal
-                // row strands in the live strip while the turn group omits it.
-                // Adoption is only safe once the turn is TERMINAL (capture
-                // follows immediately, and turn-scoped reconcile covers it).
-                // Adopting onto a still-active turn would pull the row out of
-                // the thread-marker heal's reach with no ToolEnd guaranteed.
-                if turn_is_terminal {
-                    if let Some(turn) = turn_id.as_ref() {
-                        if let Some(item) = self.state.activity.iter_mut().find(|item| {
-                            item.tool_call_id.as_deref() == Some(tool_call_id.as_str())
-                                && item.turn_id.is_none()
-                        }) {
-                            item.turn_id = Some(turn.clone());
-                            item.session_id = None;
-                            // Turn-scoped now: the thread marker is no longer
-                            // the heal key, so the slot is free for the echo.
-                            if let Some(preview) = arguments_preview.clone() {
-                                item.detail = Some(preview);
-                            }
-                        }
-                    }
-                } else if self.state.activity.iter().any(|item| {
+                let in_live = self.state.activity.iter().any(|item| {
                     item.tool_call_id.as_deref() == Some(tool_call_id.as_str())
-                        && item.turn_id.is_none()
-                }) {
-                    // Live row on a still-active turn: the live path stays in
-                    // charge. Un-consume the seq so a LATER (terminal) hydrate
-                    // can adopt + archive this row instead of stranding it.
-                    self.state.applied_hydrate_tool_envelopes.remove(&key);
-                    return;
-                }
-                let in_live = self
-                    .state
-                    .activity
-                    .iter()
-                    .any(|item| item.tool_call_id.as_deref() == Some(tool_call_id.as_str()));
+                        && item.turn_id.as_ref() == turn_id.as_ref()
+                });
                 let in_archive = turn_id.as_ref().is_some_and(|turn| {
                     self.state.turn_activity_logs.iter().any(|log| {
                         &log.turn_id == turn
@@ -7583,32 +7531,17 @@ impl Store {
                 }
                 created.insert(tool_call_id.clone());
                 let mut item = ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
-                    .with_tool_call(tool_call_id.clone());
-                item = match turn_id {
-                    Some(turn) => {
-                        // Turn-scoped rows reconcile by turn_id, so `detail`
-                        // is free for the invocation echo (`command: …`).
-                        let mut item = item.with_turn(turn);
-                        if let Some(preview) = arguments_preview.clone() {
-                            item = item.with_detail(preview);
-                        }
-                        item
-                    }
-                    None => {
-                        // Thread marker stays load-bearing for the envelope
-                        // heal; the args preview rides in `arguments` instead.
-                        let mut item = item.with_session(session_id.clone()).with_detail(
-                            AppState::envelope_tool_detail_for_thread(&envelope.thread_id),
-                        );
-                        if let Some(preview) = arguments_preview.clone() {
-                            item = item.with_arguments(serde_json::Value::String(preview));
-                        }
-                        item
-                    }
-                };
+                    .with_tool_call(tool_call_id.clone())
+                    .with_session(session_id.clone());
+                if let Some(turn_id) = turn_id {
+                    item = item.with_turn(turn_id);
+                }
+                if let Some(preview) = arguments_preview.clone() {
+                    item = item.with_detail(preview);
+                }
                 self.state.push_activity(item);
             }
-            Payload::ToolProgress {
+            PayloadV2::ToolProgress {
                 tool_call_id,
                 message,
             } => {
@@ -7627,7 +7560,7 @@ impl Store {
                     None,
                 );
             }
-            Payload::ToolEnd {
+            PayloadV2::ToolEnd {
                 tool_call_id,
                 status,
                 error,
@@ -8419,8 +8352,8 @@ impl Store {
                 // the live-reply length NOW as a segment boundary, with the correct
                 // per-segment offset, so the live-delta renderer starts a fresh
                 // markdown block for the next segment instead of gluing
-                // "...skeleton." onto the next "### Step N". (MessagePersisted is the
-                // wrong signal: it fires at turn end with the full text length.)
+                // "...skeleton." onto the next "### Step N". A terminal signal
+                // would arrive too late, with the full text length.
                 self.finalize_live_reply_segment(&event.session_id, &event.turn_id);
                 let mut item =
                     ActivityItem::new(ActivityKind::Tool, event.tool_name.clone(), "running")
@@ -8594,10 +8527,12 @@ impl Store {
             UiNotification::ApprovalCancelled(event) => self.apply_approval_cancelled(event),
             UiNotification::ProgressUpdated(event) => self.apply_progress(event),
             UiNotification::ReplayLossy(event) => self.apply_replay_lossy(event),
-            UiNotification::MessagePersisted(event) => self.apply_message_persisted(event),
             UiNotification::TurnSpawnComplete(event) => self.apply_turn_spawn_complete(event),
             UiNotification::FileAttached(event) => self.apply_file_attached(event),
-            UiNotification::Envelope(event) => self.apply_envelope(event),
+            // octos-core retains the v1 enum variant for wire compatibility,
+            // but v2-only servers never emit it and the TUI intentionally does
+            // not render it.
+            UiNotification::Envelope(_) => None,
             UiNotification::EnvelopeV2(event) => self.apply_envelope_v2(event),
             UiNotification::SessionEventBridged(event) => self.apply_session_event_bridged(event),
             UiNotification::RouterStatus(event) => {
@@ -9147,193 +9082,10 @@ impl Store {
         end_offset
     }
 
-    /// The sole boundary operation shared by the legacy persistence/tool path
-    /// and v2's canonical `assistant_persisted` / `tool_start` path.
+    /// The boundary operation for canonical v2 assistant and tool segments.
     fn finalize_live_reply_segment(&mut self, session_id: &SessionKey, turn_id: &TurnId) -> bool {
         self.state
             .record_live_reply_segment_boundary(session_id, turn_id)
-    }
-
-    fn projection_envelope_v2_negotiated(&self) -> bool {
-        self.state
-            .capabilities
-            .as_ref()
-            .is_some_and(|capabilities| {
-                capabilities.supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
-            })
-    }
-
-    fn v2_drives_turn(&self, session_id: &SessionKey, turn_id: &TurnId) -> bool {
-        self.state
-            .v2_live_assistant_segments
-            .contains_key(&(session_id.clone(), turn_id.clone()))
-            || self
-                .state
-                .v2_turn_ids
-                .iter()
-                .any(|((mapped_session_id, _), mapped_turn_id)| {
-                    mapped_session_id == session_id && mapped_turn_id == turn_id
-                })
-    }
-
-    fn apply_envelope(&mut self, event: EnvelopeNotification) -> Option<AppUiCommand> {
-        let EnvelopeNotification {
-            session_id,
-            envelope,
-            ..
-        } = event;
-        let thread_id = envelope.thread_id.clone();
-
-        match envelope.payload {
-            Payload::UserMessage { text, files } => {
-                if let Some(session) = self.find_session_mut(&session_id) {
-                    let already_present = session.messages.iter().any(|message| {
-                        message.role == MessageRole::User
-                            && message.thread_id.as_deref() == Some(thread_id.as_str())
-                    });
-                    if !already_present {
-                        let mut message =
-                            Message::user(text).with_thread_id(ThreadId::new(thread_id.clone()));
-                        message.media = files.into_iter().map(|file| file.path).collect();
-                        session.messages.push(message);
-                    }
-                }
-                // Envelope projection is internal bookkeeping — don't leak the
-                // thread_id into the status bar on every projected message (it
-                // churned "… projected for <thread_id>" at the bottom of the
-                // composer). The transcript already reflects the message.
-                None
-            }
-            Payload::AssistantDelta { text } => {
-                self.upsert_envelope_assistant_message(
-                    &session_id,
-                    &thread_id,
-                    crate::sanitize::strip_terminal_controls(&text).into_owned(),
-                    false,
-                );
-                // Streaming deltas arrive many times per second; writing the
-                // status bar each time flooded the bottom line with "Assistant
-                // delta projected for <thread_id>". The streamed text is already
-                // visible in the transcript — leave the status line stable.
-                None
-            }
-            Payload::AssistantPersisted { text, .. } => {
-                self.upsert_envelope_assistant_message(
-                    &session_id,
-                    &thread_id,
-                    crate::sanitize::strip_terminal_controls(&text).into_owned(),
-                    true,
-                );
-                // Same as AssistantDelta: internal projection, not status-bar news.
-                None
-            }
-            Payload::ReasoningDelta { text } => {
-                // Envelope reasoning stream → the assistant message's
-                // reasoning_content (rendered as a "· reasoning" block). Internal
-                // projection, not status-bar news.
-                self.upsert_envelope_assistant_reasoning(&session_id, &thread_id, text);
-                None
-            }
-            Payload::ToolStart {
-                tool_call_id,
-                name,
-                arguments_preview,
-            } => {
-                let mut item = ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
-                    .with_tool_call(tool_call_id.clone())
-                    .with_session(session_id.clone())
-                    // The thread marker is load-bearing: the envelope-thread
-                    // heal matches items by this exact detail string, so the
-                    // args preview rides in `arguments` (the renderer's
-                    // `tool_invocation_text` fallback) instead.
-                    .with_detail(AppState::envelope_tool_detail_for_thread(&thread_id));
-                if let Some(preview) = arguments_preview {
-                    item = item.with_arguments(serde_json::Value::String(preview));
-                }
-                self.state.push_activity(item);
-                if self.event_targets_active_session(&session_id) {
-                    self.state.set_run_state_in_progress();
-                }
-                self.state.status =
-                    t!("status.tool_started", name = name, id = tool_call_id).into_owned();
-                None
-            }
-            Payload::ToolProgress {
-                tool_call_id,
-                message,
-            } => {
-                self.state.update_tool_activity(
-                    &tool_call_id,
-                    "running",
-                    Some(message.clone()),
-                    None,
-                    None,
-                    None,
-                );
-                if self.event_targets_active_session(&session_id) {
-                    self.state.set_run_state_in_progress();
-                }
-                self.state.status = message;
-                None
-            }
-            Payload::ToolEnd {
-                tool_call_id,
-                status,
-                error,
-                reason,
-                output_preview,
-                duration_ms,
-            } => {
-                let (label, success) = match status {
-                    EnvelopeToolEndStatus::Complete => ("complete", Some(true)),
-                    EnvelopeToolEndStatus::Error => ("failed", Some(false)),
-                    EnvelopeToolEndStatus::Skipped => ("skipped", None),
-                    EnvelopeToolEndStatus::Aborted => ("aborted", Some(false)),
-                };
-                // `detail` stays untouched: it carries the load-bearing
-                // thread marker (envelope-heal key) or the invocation echo.
-                // Error / reason text belongs in the result excerpt.
-                let failure_text = error.or(reason);
-                self.state.update_tool_activity(
-                    &tool_call_id,
-                    label,
-                    None,
-                    output_preview.or(failure_text),
-                    success,
-                    duration_ms,
-                );
-                self.state.status = format!("Tool {label}: {tool_call_id}");
-                None
-            }
-            Payload::FileAttached {
-                path,
-                mime,
-                size_bytes,
-            } => {
-                self.state.push_activity(
-                    ActivityItem::new(ActivityKind::Tool, path.clone(), "attached")
-                        .with_detail(format!("{mime}, {size_bytes} bytes")),
-                );
-                self.state.status = format!("File attached: {path}");
-                None
-            }
-            Payload::TurnCompleted { .. } => {
-                // GAP 2: this envelope is a hard terminal barrier for this
-                // session's thread. Heal any stranded running tool item the
-                // envelope path started for this session+thread (a `ToolStart`
-                // whose `ToolEnd` never arrived) so it can no longer pin a
-                // turn-less "Orchestrating…" chip. Scoped to `session_id` so a
-                // thread_id shared with another session cannot suppress that
-                // sibling's genuinely-active chip.
-                self.state
-                    .reconcile_envelope_thread_running_activity(&session_id, &thread_id);
-                self.state.status = format!("Turn completed for {thread_id}");
-                if self.event_targets_active_session(&session_id) {
-                    self.state.set_run_state_success();
-                }
-                self.submit_next_pending_if_idle()
-            }
-        }
     }
 
     /// Resolve v2's string wire identity into the typed turn id used by the
@@ -9795,73 +9547,6 @@ impl Store {
         }
     }
 
-    fn upsert_envelope_assistant_message(
-        &mut self,
-        session_id: &SessionKey,
-        thread_id: &str,
-        text: String,
-        replace: bool,
-    ) {
-        // Scroll belongs to the ACTIVE transcript; an envelope append into a
-        // background session must not move it.
-        let targets_active = self.event_targets_active_session(session_id);
-        let follow_tail = self.state.transcript_scroll == 0;
-        let Some(session) = self.find_session_mut(session_id) else {
-            return;
-        };
-        if let Some(message) = session.messages.iter_mut().rev().find(|message| {
-            message.role == MessageRole::Assistant
-                && message.thread_id.as_deref() == Some(thread_id)
-        }) {
-            if replace {
-                message.content = text;
-            } else {
-                message.content.push_str(&text);
-            }
-        } else {
-            session.messages.push(Message::assistant_with_thread(
-                text,
-                ThreadId::new(thread_id.to_owned()),
-            ));
-        }
-        if targets_active {
-            if follow_tail {
-                self.state.scroll_transcript_to_latest();
-            } else {
-                self.state.preserve_transcript_position_after_append(1);
-            }
-        }
-    }
-
-    /// Append a streamed reasoning fragment to the envelope assistant message's
-    /// `reasoning_content` (rendered as a `· reasoning` block), creating the
-    /// message if reasoning arrives before any answer text. Mirrors
-    /// [`Self::upsert_envelope_assistant_message`] but targets `reasoning_content`.
-    fn upsert_envelope_assistant_reasoning(
-        &mut self,
-        session_id: &SessionKey,
-        thread_id: &str,
-        text: String,
-    ) {
-        let Some(session) = self.find_session_mut(session_id) else {
-            return;
-        };
-        if let Some(message) = session.messages.iter_mut().rev().find(|message| {
-            message.role == MessageRole::Assistant
-                && message.thread_id.as_deref() == Some(thread_id)
-        }) {
-            message
-                .reasoning_content
-                .get_or_insert_with(String::new)
-                .push_str(&text);
-        } else {
-            let mut message =
-                Message::assistant_with_thread(String::new(), ThreadId::new(thread_id.to_owned()));
-            message.reasoning_content = Some(text);
-            session.messages.push(message);
-        }
-    }
-
     fn apply_turn_spawn_complete(
         &mut self,
         event: octos_core::ui_protocol::TurnSpawnCompleteEvent,
@@ -9901,40 +9586,6 @@ impl Store {
                 .with_detail("legacy session event"),
         );
         self.state.status = format!("Session event: {}", event.kind);
-        None
-    }
-
-    fn apply_message_persisted(&mut self, event: MessagePersistedEvent) -> Option<AppUiCommand> {
-        let persisted_live_assistant_turn = (event.role.as_str() == "assistant")
-            .then(|| {
-                self.find_session(&event.session_id)
-                    .and_then(|session| session.live_reply.as_ref())
-                    .filter(|live_reply| {
-                        event
-                            .turn_id
-                            .as_ref()
-                            .is_none_or(|turn_id| turn_id == &live_reply.turn_id)
-                    })
-                    .map(|live_reply| live_reply.turn_id.clone())
-            })
-            .flatten();
-        if let Some(turn_id) = persisted_live_assistant_turn
-            && !self.projection_envelope_v2_negotiated()
-            && !self.v2_drives_turn(&event.session_id, &turn_id)
-        {
-            self.finalize_live_reply_segment(&event.session_id, &turn_id);
-        }
-
-        let attachment_count = event.media.len();
-        let attachment_hint = match attachment_count {
-            0 => String::new(),
-            1 => " with 1 attachment".into(),
-            count => format!(" with {count} attachments"),
-        };
-        self.state.status = format!(
-            "Persisted {} message seq {}{}",
-            event.role, event.seq, attachment_hint
-        );
         None
     }
 
@@ -11793,14 +11444,14 @@ fn short_id(id: &str) -> String {
 
 enum HydratedProjection {
     Message(HydratedMessage),
-    SpawnComplete(TurnSpawnCompleteEvent),
+    BackgroundChildCompleted(EnvelopeV2),
 }
 
 impl HydratedProjection {
     fn seq(&self) -> u64 {
         match self {
             Self::Message(message) => message.seq,
-            Self::SpawnComplete(event) => event.seq,
+            Self::BackgroundChildCompleted(envelope) => envelope.seq,
         }
     }
 }
@@ -11810,7 +11461,10 @@ fn hydrated_projection_messages(result: &SessionHydrateResult) -> Option<Vec<Mes
     let envelopes = result.replayed_envelopes.as_deref().unwrap_or_default();
     let envelope_message_ids = envelopes
         .iter()
-        .map(|event| event.message_id.clone())
+        .filter_map(|envelope| match &envelope.payload {
+            PayloadV2::BackgroundChildCompleted { message_id, .. } => Some(message_id.clone()),
+            _ => None,
+        })
         .collect::<BTreeSet<_>>();
 
     let mut projections = rows
@@ -11823,8 +11477,14 @@ fn hydrated_projection_messages(result: &SessionHydrateResult) -> Option<Vec<Mes
     projections.extend(
         envelopes
             .iter()
+            .filter(|envelope| {
+                matches!(
+                    &envelope.payload,
+                    PayloadV2::BackgroundChildCompleted { .. }
+                )
+            })
             .cloned()
-            .map(HydratedProjection::SpawnComplete),
+            .map(HydratedProjection::BackgroundChildCompleted),
     );
     projections.sort_by_key(HydratedProjection::seq);
     Some(
@@ -11832,7 +11492,9 @@ fn hydrated_projection_messages(result: &SessionHydrateResult) -> Option<Vec<Mes
             .into_iter()
             .map(|projection| match projection {
                 HydratedProjection::Message(row) => hydrated_row_to_message(row),
-                HydratedProjection::SpawnComplete(event) => spawn_complete_to_message(event),
+                HydratedProjection::BackgroundChildCompleted(envelope) => {
+                    background_child_completed_to_message(envelope)
+                }
             })
             .collect(),
     )
@@ -11855,7 +11517,7 @@ fn hydrated_row_is_displayable(row: &HydratedMessage) -> bool {
 
 fn hydrated_row_is_covered_by_envelope(
     row: &HydratedMessage,
-    envelopes: &[TurnSpawnCompleteEvent],
+    envelopes: &[EnvelopeV2],
     envelope_message_ids: &BTreeSet<String>,
 ) -> bool {
     if row
@@ -11871,9 +11533,12 @@ fn hydrated_row_is_covered_by_envelope(
     let Some(thread_id) = row.thread_id.as_deref() else {
         return false;
     };
-    envelopes.iter().any(|event| {
-        event.thread_id.as_deref() == Some(thread_id)
-            && row.seq < event.seq
+    envelopes.iter().any(|envelope| {
+        matches!(
+            &envelope.payload,
+            PayloadV2::BackgroundChildCompleted { .. }
+        ) && envelope.thread_id == thread_id
+            && row.seq < envelope.seq
             && row
                 .message_id
                 .as_ref()
@@ -11900,14 +11565,23 @@ fn hydrated_row_to_message(row: HydratedMessage) -> Message {
     }
 }
 
-fn spawn_complete_to_message(event: TurnSpawnCompleteEvent) -> Message {
-    let content = crate::sanitize::strip_terminal_controls(&event.content).into_owned();
-    let mut message = match event.thread_id {
-        Some(thread_id) => Message::assistant_with_thread(content, ThreadId::new(thread_id)),
-        None => Message::assistant(content),
+fn background_child_completed_to_message(envelope: EnvelopeV2) -> Message {
+    let EnvelopeV2 {
+        thread_id, payload, ..
+    } = envelope;
+    let PayloadV2::BackgroundChildCompleted {
+        content,
+        media,
+        persisted_at,
+        ..
+    } = payload
+    else {
+        unreachable!("only background-child envelopes are converted during hydrate")
     };
-    message.media = event.media;
-    message.timestamp = event.persisted_at;
+    let content = crate::sanitize::strip_terminal_controls(&content).into_owned();
+    let mut message = Message::assistant_with_thread(content, ThreadId::new(thread_id));
+    message.media = media;
+    message.timestamp = persisted_at;
     message
 }
 
@@ -12220,13 +11894,12 @@ mod tests {
     use octos_core::SessionKey;
     use octos_core::ui_protocol::{
         ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalDecision,
-        ApprovalDiffDetails, ApprovalId, ApprovalRequestedEvent, ApprovalTypedDetails, Envelope,
-        EnvelopeNotification, HydratedMessage, HydratedTurn, OutputCursor, Payload, PreviewId,
-        ReplayLossyEvent, SessionHydrateResult, TaskRuntimeState, ThreadGraphEntry,
-        ToolCompletedEvent, ToolStartedEvent, TurnId, TurnLifecycleState, TurnSpawnCompleteEvent,
-        TurnStartedEvent, UiContextState, UiCursor, UiFileMutationNotice, UiProgressMetadata,
-        UiProtocolCapabilities, UiTokenCostUpdate, approval_kinds, approval_scopes, methods,
-        progress_kinds,
+        ApprovalDiffDetails, ApprovalId, ApprovalRequestedEvent, ApprovalTypedDetails, EnvelopeV2,
+        HydratedMessage, HydratedTurn, OutputCursor, PreviewId, ReplayLossyEvent,
+        SessionHydrateResult, TaskRuntimeState, ThreadGraphEntry, ToolCompletedEvent,
+        ToolStartedEvent, TurnId, TurnLifecycleState, TurnStartedEvent, UiContextState, UiCursor,
+        UiFileMutationNotice, UiProgressMetadata, UiProtocolCapabilities, UiTokenCostUpdate,
+        approval_kinds, approval_scopes, methods, progress_kinds,
     };
 
     fn store_with_live_reply(turn_id: TurnId, text: impl Into<String>) -> Store {
@@ -21498,53 +21171,14 @@ mod tests {
     }
 
     #[test]
-    fn assistant_message_persisted_records_live_reply_segment_boundary() {
-        let turn_id = TurnId::new();
-        let text = "### Step 1\n\nBody one.";
-        let mut store = store_with_live_reply(turn_id.clone(), text);
-        let session_id = store.state.sessions[0].id.clone();
-
-        store.apply_event(AppUiEvent::Protocol(UiNotification::MessagePersisted(
-            MessagePersistedEvent {
-                session_id: session_id.clone(),
-                topic: None,
-                turn_id: Some(turn_id.clone()),
-                thread_id: None,
-                seq: 1,
-                role: "assistant".into(),
-                message_id: "msg-1".into(),
-                client_message_id: None,
-                source: octos_core::ui_protocol::MessagePersistedSource::Assistant,
-                cursor: UiCursor {
-                    stream: "local:test".into(),
-                    seq: 1,
-                },
-                persisted_at: chrono::Utc::now(),
-                media: vec![],
-                content: Some(text.into()),
-            },
-        )));
-
-        assert_eq!(
-            store
-                .state
-                .live_reply_segment_boundaries
-                .get(&(session_id, turn_id))
-                .cloned(),
-            Some(vec![text.len()]),
-            "assistant persistence while the turn is live should mark the current live buffer length"
-        );
-    }
-
-    #[test]
     fn tool_started_records_live_reply_segment_boundary_at_segment_offset() {
         // The REAL per-segment boundary signal. A tool call starting means the
         // current assistant CONTENT segment just ended, so the live-reply length
         // at that moment is exactly where the live-delta renderer must start the
         // next segment as a fresh markdown block. Without this, an agentic turn's
         // later "### Step N" glued onto the previous segment's body on the real
-        // terminal (MessagePersisted fires at turn END with the full length — the
-        // wrong offset — so it never split mid-turn).
+        // terminal event fires at turn end with the full length — the wrong
+        // offset — so it never split mid-turn).
         let turn_id = TurnId::new();
         let text = "### Step 1\n\nBody one.";
         let mut store = store_with_live_reply(turn_id.clone(), text);
@@ -23294,19 +22928,6 @@ mod tests {
         );
     }
 
-    fn envelope_notification(session_id: SessionKey, seq: u64, payload: Payload) -> UiNotification {
-        UiNotification::Envelope(EnvelopeNotification {
-            session_id,
-            topic: None,
-            envelope: Envelope {
-                thread_id: "thread-1".into(),
-                seq,
-                client_message_id: None,
-                payload,
-            },
-        })
-    }
-
     fn envelope_v2_notification(
         session_id: SessionKey,
         seq: u64,
@@ -23628,372 +23249,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn legacy_message_persisted_remains_the_boundary_without_v2_negotiation() {
-        let turn_id = TurnId::new();
-        let mut store = store_with_live_reply(turn_id.clone(), "legacy segment");
-        let session_id = store.state.sessions[0].id.clone();
-        store
-            .state
-            .set_capabilities(UiProtocolCapabilities::new(&[], &[]));
-
-        store.apply_event(AppUiEvent::Protocol(UiNotification::MessagePersisted(
-            MessagePersistedEvent {
-                session_id: session_id.clone(),
-                topic: None,
-                turn_id: Some(turn_id.clone()),
-                thread_id: None,
-                seq: 1,
-                role: "assistant".into(),
-                message_id: "legacy-message".into(),
-                client_message_id: None,
-                source: octos_core::ui_protocol::MessagePersistedSource::Assistant,
-                cursor: UiCursor {
-                    stream: "local:test".into(),
-                    seq: 1,
-                },
-                persisted_at: chrono::Utc::now(),
-                media: vec![],
-                content: Some("legacy segment".into()),
-            },
-        )));
-
-        assert_eq!(
-            store
-                .state
-                .live_reply_segment_boundaries
-                .get(&(session_id, turn_id))
-                .cloned(),
-            Some(vec!["legacy segment".len()]),
-            "old servers retain the MessagePersisted boundary fallback"
-        );
-    }
-
-    #[test]
-    fn v2_negotiation_skips_legacy_message_persisted_boundary_duplicates() {
-        use octos_core::ui_protocol::PayloadV2;
-
-        let mut store = store_with_empty_session();
-        let session_id = store.state.sessions[0].id.clone();
-        let wire_turn_id = "turn-v2-no-legacy-boundary";
-        store.state.set_capabilities(
-            UiProtocolCapabilities::new(&[], &[])
-                .with_supported_features([UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2]),
-        );
-        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
-            session_id.clone(),
-            1,
-            wire_turn_id,
-            PayloadV2::AssistantDelta {
-                text: "canonical segment".into(),
-                assistant_segment_id: "segment-1".into(),
-            },
-        )));
-        let resolved_turn = store
-            .state
-            .v2_turn_ids
-            .get(&(session_id.clone(), wire_turn_id.into()))
-            .expect("v2 turn id resolved")
-            .clone();
-
-        store.apply_event(AppUiEvent::Protocol(UiNotification::MessagePersisted(
-            MessagePersistedEvent {
-                session_id: session_id.clone(),
-                topic: None,
-                turn_id: Some(resolved_turn.clone()),
-                thread_id: None,
-                seq: 2,
-                role: "assistant".into(),
-                message_id: "legacy-duplicate".into(),
-                client_message_id: None,
-                source: octos_core::ui_protocol::MessagePersistedSource::Assistant,
-                cursor: UiCursor {
-                    stream: "local:test".into(),
-                    seq: 2,
-                },
-                persisted_at: chrono::Utc::now(),
-                media: vec![],
-                content: Some("canonical segment".into()),
-            },
-        )));
-
-        assert!(
-            !store
-                .state
-                .live_reply_segment_boundaries
-                .contains_key(&(session_id, resolved_turn)),
-            "when v2 is negotiated, MessagePersisted cannot create a duplicate boundary"
-        );
-    }
-
-    #[test]
-    fn envelope_assistant_delta_projects_into_threaded_message() {
-        let mut store = store_with_empty_session();
-        let session_id = store.state.sessions[0].id.clone();
-
-        store.apply_event(AppUiEvent::Protocol(envelope_notification(
-            session_id.clone(),
-            1,
-            Payload::AssistantDelta {
-                text: "hello".into(),
-            },
-        )));
-        store.apply_event(AppUiEvent::Protocol(envelope_notification(
-            session_id,
-            2,
-            Payload::AssistantDelta {
-                text: " world".into(),
-            },
-        )));
-
-        let messages = &store.state.sessions[0].messages;
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, MessageRole::Assistant);
-        assert_eq!(messages[0].thread_id.as_deref(), Some("thread-1"));
-        assert_eq!(messages[0].content, "hello world");
-    }
-
-    #[test]
-    fn envelope_assistant_delta_does_not_churn_status_bar() {
-        // mini5 soak UX: streaming deltas arrive many times/sec and used to
-        // overwrite the status bar with "Assistant delta projected for
-        // <thread_id>", churning the bottom-of-composer line. The projection is
-        // internal bookkeeping — it must NOT touch the status bar (the streamed
-        // text is already visible in the transcript).
-        let mut store = store_with_empty_session();
-        let session_id = store.state.sessions[0].id.clone();
-        store.state.status = "Working".into();
-
-        for seq in 1..=3 {
-            store.apply_event(AppUiEvent::Protocol(envelope_notification(
-                session_id.clone(),
-                seq,
-                Payload::AssistantDelta {
-                    text: "tok ".into(),
-                },
-            )));
-        }
-
-        assert_eq!(
-            store.state.status, "Working",
-            "assistant-delta projection must not overwrite the status bar"
-        );
-        // The delta still projects into the transcript — only the status churn is gone.
-        assert_eq!(store.state.sessions[0].messages.len(), 1);
-    }
-
-    #[test]
-    fn envelope_assistant_persisted_replaces_streamed_text() {
-        let mut store = store_with_empty_session();
-        let session_id = store.state.sessions[0].id.clone();
-
-        store.apply_event(AppUiEvent::Protocol(envelope_notification(
-            session_id.clone(),
-            1,
-            Payload::AssistantDelta {
-                text: "draft".into(),
-            },
-        )));
-        store.apply_event(AppUiEvent::Protocol(envelope_notification(
-            session_id,
-            2,
-            Payload::AssistantPersisted {
-                text: "final answer".into(),
-                meta: octos_core::ui_protocol::MessageMeta {
-                    message_id: "message-1".into(),
-                    persisted_at: chrono::Utc::now(),
-                    media: vec![],
-                },
-            },
-        )));
-
-        let messages = &store.state.sessions[0].messages;
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, MessageRole::Assistant);
-        assert_eq!(messages[0].thread_id.as_deref(), Some("thread-1"));
-        assert_eq!(messages[0].content, "final answer");
-    }
-
-    #[test]
-    fn envelope_turn_completed_reconciles_stranded_running_tool_item() {
-        // GAP 2: the M9-γ projection-envelope path creates tool activity with NO
-        // turn_id (the envelope is keyed on thread_id/seq — there is no turn
-        // identity on the wire). A `ToolStart` whose `ToolEnd` never arrived
-        // leaves a turn-less "running" Tool item. When `Payload::TurnCompleted`
-        // closes the thread (a hard terminal barrier), that stranded running item
-        // must be reconciled so it can no longer pin a turn-less "Orchestrating…"
-        // chip.
-        let mut store = store_with_empty_session();
-        let session_id = store.state.sessions[0].id.clone();
-
-        store.apply_event(AppUiEvent::Protocol(envelope_notification(
-            session_id.clone(),
-            1,
-            Payload::ToolStart {
-                tool_call_id: "call-leaked".into(),
-                name: "run_pipeline".into(),
-                arguments_preview: None,
-            },
-        )));
-        // Terminal barrier for the thread — no ToolEnd ever came for call-leaked.
-        store.apply_event(AppUiEvent::Protocol(envelope_notification(
-            session_id,
-            2,
-            Payload::TurnCompleted {
-                token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
-            },
-        )));
-
-        let leaked = store
-            .state
-            .activity
-            .iter()
-            .find(|item| item.tool_call_id.as_deref() == Some("call-leaked"))
-            .expect("leaked envelope tool item retained");
-        assert!(
-            !crate::model::activity_status_is_running(&leaked.status),
-            "an envelope TurnCompleted must leave no running-status chip pinned, got {:?}",
-            leaked.status
-        );
-        assert_eq!(
-            leaked.status,
-            crate::model::ACTIVITY_STATUS_INTERRUPTED,
-            "the stranded envelope tool item must be reconciled to interrupted"
-        );
-    }
-
-    #[test]
-    fn envelope_turn_completed_does_not_touch_settled_tool_item() {
-        // GAP 2 guard: a tool that DID complete (ToolEnd arrived) must keep its
-        // settled status across a TurnCompleted barrier — the reconcile only
-        // sweeps still-running items.
-        let mut store = store_with_empty_session();
-        let session_id = store.state.sessions[0].id.clone();
-
-        store.apply_event(AppUiEvent::Protocol(envelope_notification(
-            session_id.clone(),
-            1,
-            Payload::ToolStart {
-                tool_call_id: "call-done".into(),
-                name: "run_pipeline".into(),
-                arguments_preview: None,
-            },
-        )));
-        store.apply_event(AppUiEvent::Protocol(envelope_notification(
-            session_id.clone(),
-            2,
-            Payload::ToolEnd {
-                tool_call_id: "call-done".into(),
-                status: EnvelopeToolEndStatus::Complete,
-                error: None,
-                reason: None,
-                output_preview: None,
-                duration_ms: None,
-            },
-        )));
-        store.apply_event(AppUiEvent::Protocol(envelope_notification(
-            session_id,
-            3,
-            Payload::TurnCompleted {
-                token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
-            },
-        )));
-
-        let done = store
-            .state
-            .activity
-            .iter()
-            .find(|item| item.tool_call_id.as_deref() == Some("call-done"))
-            .expect("settled envelope tool item retained");
-        assert_eq!(
-            done.status, "complete",
-            "a settled envelope tool item must keep its terminal status across TurnCompleted"
-        );
-    }
-
-    #[test]
-    fn envelope_turn_completed_does_not_suppress_other_session_same_thread() {
-        // GAP 2 over-suppression guard: two sessions can each be running an
-        // envelope tool under the SAME thread_id (thread_id is NOT globally
-        // unique — it is scoped to a session's projection). A `TurnCompleted`
-        // for session A's thread must heal ONLY session A's stranded running
-        // envelope tool item; session B's genuinely-active chip on the same
-        // thread_id must stay running.
-        let mut store = store_with_two_sessions("local:a", "local:b");
-        let session_a = store.state.sessions[0].id.clone();
-        let session_b = store.state.sessions[1].id.clone();
-        assert_eq!(session_a, SessionKey("local:a".into()));
-        assert_eq!(session_b, SessionKey("local:b".into()));
-
-        // Both sessions start a turn-less running envelope tool on "thread-1"
-        // (envelope_notification hardcodes thread_id = "thread-1").
-        store.apply_event(AppUiEvent::Protocol(envelope_notification(
-            session_a.clone(),
-            1,
-            Payload::ToolStart {
-                tool_call_id: "call-a".into(),
-                name: "run_pipeline".into(),
-                arguments_preview: None,
-            },
-        )));
-        store.apply_event(AppUiEvent::Protocol(envelope_notification(
-            session_b.clone(),
-            1,
-            Payload::ToolStart {
-                tool_call_id: "call-b".into(),
-                name: "run_pipeline".into(),
-                arguments_preview: None,
-            },
-        )));
-
-        // Terminal barrier for session A's thread only.
-        store.apply_event(AppUiEvent::Protocol(envelope_notification(
-            session_a,
-            2,
-            Payload::TurnCompleted {
-                token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
-            },
-        )));
-
-        let item_a = store
-            .state
-            .activity
-            .iter()
-            .find(|item| item.tool_call_id.as_deref() == Some("call-a"))
-            .expect("session A envelope tool item retained");
-        assert_eq!(
-            item_a.status,
-            crate::model::ACTIVITY_STATUS_INTERRUPTED,
-            "session A's stranded envelope tool item must be reconciled"
-        );
-
-        let item_b = store
-            .state
-            .activity
-            .iter()
-            .find(|item| item.tool_call_id.as_deref() == Some("call-b"))
-            .expect("session B envelope tool item retained");
-        assert!(
-            crate::model::activity_status_is_running(&item_b.status),
-            "session B's genuinely-active envelope tool item must NOT be suppressed \
-             by session A's TurnCompleted on the same thread_id, got {:?}",
-            item_b.status
-        );
-    }
-
-    /// Build the FLATTENED `projection/envelope` wire `params` the
-    /// server now emits (feat(envelope-wire-routing)): bare Envelope
-    /// fields at the top level PLUS `session_id` + optional `topic`.
-    fn envelope_wire_params(
+    /// Build the flattened v2 `projection/envelope` wire payload emitted by
+    /// the server: routing keys plus the bare `EnvelopeV2` fields.
+    fn envelope_v2_wire_params(
         session_id: &str,
         thread_id: &str,
         seq: u64,
+        turn_id: &str,
         payload: serde_json::Value,
     ) -> serde_json::Value {
         serde_json::json!({
             "session_id": session_id,
             "thread_id": thread_id,
             "seq": seq,
+            "turn_id": turn_id,
             "payload": payload,
         })
     }
@@ -24001,7 +23270,7 @@ mod tests {
     /// Decode a wire `projection/envelope` frame through the SAME
     /// `from_method_and_params` path the transport uses, then apply it.
     /// This exercises the real DECODE — not a directly-constructed
-    /// `EnvelopeNotification` — so the wire-routing contract is under
+    /// `EnvelopeV2Notification` — so the wire-routing contract is under
     /// test end-to-end.
     fn apply_envelope_wire_frame(store: &mut Store, params: serde_json::Value) {
         let notif = UiNotification::from_method_and_params(
@@ -24012,21 +23281,10 @@ mod tests {
         store.apply_event(AppUiEvent::Protocol(notif));
     }
 
-    /// feat(envelope-wire-routing) — THE full-decode-path guard codex
-    /// asked for. Two sessions share `thread_id = "thread-1"`. We drive
-    /// the REAL wire path (build flattened `projection/envelope` params
-    /// → `from_method_and_params` → `apply_envelope`) and assert:
-    ///   (a) each session's envelope routes to the CORRECT session — not
-    ///       dropped on an empty `session_id` key, and
-    ///   (b) session A's `TurnCompleted` reconciles A's stranded chip but
-    ///       NOT session B's genuinely-running chip on the same thread.
-    ///
-    /// RED on the pre-change core: the wire stripped `session_id`, so
-    /// every decoded envelope arrived with an EMPTY `SessionKey`,
-    /// `find_session_mut` failed, messages were dropped, and the
-    /// session-scoped reconcile could not distinguish A from B.
+    /// Full-decode-path guard for canonical v2 routing. Two sessions share a
+    /// thread id; the flattened v2 frame must still land in the right session.
     #[test]
-    fn envelope_wire_decode_routes_to_correct_session_and_scopes_reconcile() {
+    fn envelope_v2_wire_decode_routes_to_correct_session() {
         let mut store = store_with_two_sessions("local:a", "local:b");
         let session_a = store.state.sessions[0].id.clone();
         let session_b = store.state.sessions[1].id.clone();
@@ -24036,10 +23294,11 @@ mod tests {
         // (a) Route a user_message to each session via the wire decode.
         apply_envelope_wire_frame(
             &mut store,
-            envelope_wire_params(
+            envelope_v2_wire_params(
                 "local:a",
                 "thread-1",
                 1,
+                "turn-a",
                 serde_json::json!({
                     "type": "user_message",
                     "data": { "text": "hello from A", "files": [] }
@@ -24048,10 +23307,11 @@ mod tests {
         );
         apply_envelope_wire_frame(
             &mut store,
-            envelope_wire_params(
+            envelope_v2_wire_params(
                 "local:b",
                 "thread-1",
                 1,
+                "turn-b",
                 serde_json::json!({
                     "type": "user_message",
                     "data": { "text": "hello from B", "files": [] }
@@ -24075,233 +23335,6 @@ mod tests {
             "session B must receive exactly its message"
         );
         assert_eq!(b_msgs[0].content, "hello from B");
-
-        // Both sessions start a turn-less running envelope tool on the
-        // SHARED thread-1, routed via the wire decode.
-        apply_envelope_wire_frame(
-            &mut store,
-            envelope_wire_params(
-                "local:a",
-                "thread-1",
-                2,
-                serde_json::json!({
-                    "type": "tool_start",
-                    "data": { "tool_call_id": "call-a", "name": "run_pipeline" }
-                }),
-            ),
-        );
-        apply_envelope_wire_frame(
-            &mut store,
-            envelope_wire_params(
-                "local:b",
-                "thread-1",
-                2,
-                serde_json::json!({
-                    "type": "tool_start",
-                    "data": { "tool_call_id": "call-b", "name": "run_pipeline" }
-                }),
-            ),
-        );
-
-        // (b) TurnCompleted for session A's thread ONLY — routed by the
-        // decoded session_id.
-        apply_envelope_wire_frame(
-            &mut store,
-            envelope_wire_params(
-                "local:a",
-                "thread-1",
-                3,
-                serde_json::json!({
-                    "type": "turn_completed",
-                    "data": { "token_usage": {} }
-                }),
-            ),
-        );
-
-        let item_a = store
-            .state
-            .activity
-            .iter()
-            .find(|item| item.tool_call_id.as_deref() == Some("call-a"))
-            .expect("session A envelope tool item retained");
-        assert_eq!(
-            item_a.status,
-            crate::model::ACTIVITY_STATUS_INTERRUPTED,
-            "session A's stranded chip must reconcile via the decoded session_id",
-        );
-
-        let item_b = store
-            .state
-            .activity
-            .iter()
-            .find(|item| item.tool_call_id.as_deref() == Some("call-b"))
-            .expect("session B envelope tool item retained");
-        assert!(
-            crate::model::activity_status_is_running(&item_b.status),
-            "session B's chip on the SAME thread must NOT be suppressed by \
-             session A's TurnCompleted; got {:?}",
-            item_b.status
-        );
-    }
-
-    /// Build the wire `projection/envelope` `params` the SERVER actually
-    /// emits when the turn is TOPIC-scoped: the emitting
-    /// `EnvelopeNotification.session_id` carries the `"base#topic"`
-    /// composite key (`turn/start` folds the topic in). Driving it
-    /// through the REAL `into_rpc_notification` boundary exercises the
-    /// core wire-normalization (session_id → bare base, topic preserved),
-    /// so this guard fails if that normalization regresses.
-    fn topic_folded_envelope_wire_params(
-        base_topic_session_id: &str,
-        thread_id: &str,
-        seq: u64,
-        payload: Payload,
-    ) -> serde_json::Value {
-        let notif = UiNotification::Envelope(EnvelopeNotification {
-            session_id: SessionKey(base_topic_session_id.into()),
-            topic: None,
-            envelope: Envelope {
-                thread_id: thread_id.into(),
-                seq,
-                client_message_id: None,
-                payload,
-            },
-        });
-        notif
-            .into_rpc_notification()
-            .expect("topic-folded envelope serializes to the wire")
-            .params
-    }
-
-    /// feat(envelope-wire-routing) — codex BLOCKER, TUI decode-path guard.
-    /// On a TOPIC turn the server's `EnvelopeNotification.session_id` is
-    /// the composite `"local:a#research"` key. The TUI knows only the
-    /// BARE base session `"local:a"`, so it must route by the base key.
-    /// We drive the FULL real path: build the wire from the topic-folded
-    /// notification → `into_rpc_notification` (core normalizes the wire
-    /// session_id to the base) → `from_method_and_params` →
-    /// `apply_envelope`, and assert:
-    ///   (a) the message lands in the BARE `"local:a"` session
-    ///       (`find_session_mut` succeeds), and
-    ///   (b) the topic-turn's `TurnCompleted` reconcile scopes to the
-    ///       BARE `"local:a"` session — healing its own stranded chip
-    ///       without touching a sibling.
-    ///
-    /// RED before the core fix: the wire carried `"local:a#research"`, so
-    /// `find_session_mut` and the reconcile both searched the composite
-    /// key, missing the real `"local:a"` session → message dropped and
-    /// the self-heal scoped to the wrong key.
-    #[test]
-    fn topic_folded_envelope_wire_routes_to_base_session_and_scopes_reconcile() {
-        let mut store = store_with_two_sessions("local:a", "local:b");
-        let session_a = store.state.sessions[0].id.clone();
-        assert_eq!(session_a, SessionKey("local:a".into()));
-
-        // (a) A topic-scoped user_message for session A's research topic.
-        apply_envelope_wire_frame(
-            &mut store,
-            topic_folded_envelope_wire_params(
-                "local:a#research",
-                "thread-topic",
-                1,
-                Payload::UserMessage {
-                    text: "topic msg for A".into(),
-                    files: vec![],
-                },
-            ),
-        );
-        let a_msgs = &store.state.sessions[0].messages;
-        assert_eq!(
-            a_msgs.len(),
-            1,
-            "topic-scoped message must route to the BARE base session, \
-             not a composite base#topic key",
-        );
-        assert_eq!(a_msgs[0].content, "topic msg for A");
-        assert!(
-            store.state.sessions[1].messages.is_empty(),
-            "session B must not receive session A's topic message",
-        );
-
-        // A turn-less running tool on session A's topic thread.
-        apply_envelope_wire_frame(
-            &mut store,
-            topic_folded_envelope_wire_params(
-                "local:a#research",
-                "thread-topic",
-                2,
-                Payload::ToolStart {
-                    tool_call_id: "call-topic".into(),
-                    name: "run_pipeline".into(),
-                    arguments_preview: None,
-                },
-            ),
-        );
-
-        // The chip must be tagged with the BARE base session key so the
-        // session-scoped reconcile (which matches on the base key) finds
-        // it. RED on the pre-fix wire (tagged "local:a#research").
-        let chip = store
-            .state
-            .activity
-            .iter()
-            .find(|item| item.tool_call_id.as_deref() == Some("call-topic"))
-            .expect("topic envelope tool item retained");
-        assert_eq!(
-            chip.session_id.as_ref(),
-            Some(&SessionKey("local:a".into())),
-            "chip must be scoped to the bare base session key",
-        );
-
-        // (b) The topic turn's TurnCompleted reconciles A's stranded chip
-        // via the BARE base key.
-        apply_envelope_wire_frame(
-            &mut store,
-            topic_folded_envelope_wire_params(
-                "local:a#research",
-                "thread-topic",
-                3,
-                Payload::TurnCompleted {
-                    token_usage: Default::default(),
-                },
-            ),
-        );
-        let chip = store
-            .state
-            .activity
-            .iter()
-            .find(|item| item.tool_call_id.as_deref() == Some("call-topic"))
-            .expect("topic envelope tool item retained after turn complete");
-        assert_eq!(
-            chip.status,
-            crate::model::ACTIVITY_STATUS_INTERRUPTED,
-            "topic turn's TurnCompleted must reconcile the chip scoped to \
-             the bare base session key",
-        );
-    }
-
-    /// feat(envelope-wire-routing) backward-compat at the consumer: an
-    /// OLD bare-envelope wire frame (no `session_id`) still decodes
-    /// without error through the transport path. The routing key is
-    /// empty so it cannot match a session — but it must NOT crash the
-    /// decode (it is silently un-routed, the legacy behaviour).
-    #[test]
-    fn legacy_bare_envelope_wire_frame_decodes_without_routing() {
-        let mut store = store_with_two_sessions("local:a", "local:b");
-        // No session_id key — the pre-change wire shape.
-        let legacy = serde_json::json!({
-            "thread_id": "thread-1",
-            "seq": 1,
-            "payload": {
-                "type": "assistant_delta",
-                "data": { "text": "orphaned delta" }
-            }
-        });
-        apply_envelope_wire_frame(&mut store, legacy);
-        // Un-routed (empty session_id matches no session) — neither
-        // session gains a message, and nothing panicked.
-        assert!(store.state.sessions[0].messages.is_empty());
-        assert!(store.state.sessions[1].messages.is_empty());
     }
 
     #[test]
@@ -30206,24 +29239,26 @@ mod tests {
             }]),
             pending_approvals: Some(vec![approval]),
             pending_questions: None,
-            replayed_envelopes: Some(vec![TurnSpawnCompleteEvent {
-                session_id: session_id.clone(),
-                topic: None,
-                turn_id: Some(turn_id.clone()),
-                thread_id: Some("thread-1".into()),
-                task_id: "task-1".into(),
-                tool_call_id: None,
-                response_to_client_message_id: Some("cmid-1".into()),
+            replayed_envelopes: Some(vec![EnvelopeV2 {
+                thread_id: "thread-1".into(),
                 seq: 3,
-                message_id: "spawn-ack".into(),
-                source: "background".into(),
-                cursor: UiCursor {
+                cursor: Some(UiCursor {
                     stream: "session".into(),
                     seq: 3,
+                }),
+                turn_id: turn_id.0.to_string(),
+                client_message_id: None,
+                payload: PayloadV2::BackgroundChildCompleted {
+                    parent_turn_id: turn_id.0.to_string(),
+                    response_to_client_message_id: Some("cmid-1".into()),
+                    task_id: "task-1".into(),
+                    content: "background result".into(),
+                    tool_call_id: None,
+                    message_id: "spawn-ack".into(),
+                    source: "background".into(),
+                    persisted_at: now,
+                    media: vec!["out.md".into()],
                 },
-                persisted_at: now,
-                content: "background result".into(),
-                media: vec!["out.md".into()],
             }]),
         };
 
@@ -30386,8 +29421,8 @@ mod tests {
     #[test]
     fn hydrate_replays_tool_envelopes_into_archived_turn_group() {
         use crate::client_event::ClientEvent;
-        // #1515 replay lane: a client restarting mid-project hydrates a
-        // session whose past turn ran tools. The replayed envelopes must
+        // A client restarting mid-project hydrates a session whose past turn
+        // ran tools. The replayed v2 envelopes must
         // materialize per-action rows (name + terminal status + error detail)
         // and land in the turn's archived activity log — the group chip must
         // not read "1 action(s) · 1 failed" with no children.
@@ -30395,12 +29430,14 @@ mod tests {
         let mut store = store_with_empty_session();
         let session_id = store.state.sessions[0].id.clone();
 
-        // Production shape: legacy-notification envelopes use the TURN id
-        // as their thread id, and the hydrated turn carries thread_id: None —
-        // the replay must resolve the turn through the turn-id key.
-        let envelope = |seq: u64, payload: Payload| Envelope {
-            thread_id: turn_id.0.to_string(),
+        let envelope = |seq: u64, payload: PayloadV2| EnvelopeV2 {
+            thread_id: "thread-replay-1".into(),
             seq,
+            cursor: Some(UiCursor {
+                stream: session_id.0.clone(),
+                seq,
+            }),
+            turn_id: turn_id.0.to_string(),
             client_message_id: None,
             payload,
         };
@@ -30427,7 +29464,7 @@ mod tests {
             replayed_tool_envelopes: Some(vec![
                 envelope(
                     4,
-                    Payload::ToolStart {
+                    PayloadV2::ToolStart {
                         tool_call_id: "tc-replay-1".into(),
                         name: "shell".into(),
                         arguments_preview: Some("command: \"cargo test\"".into()),
@@ -30435,14 +29472,14 @@ mod tests {
                 ),
                 envelope(
                     5,
-                    Payload::ToolProgress {
+                    PayloadV2::ToolProgress {
                         tool_call_id: "tc-replay-1".into(),
                         message: "running cargo test".into(),
                     },
                 ),
                 envelope(
                     6,
-                    Payload::ToolEnd {
+                    PayloadV2::ToolEnd {
                         tool_call_id: "tc-replay-1".into(),
                         status: EnvelopeToolEndStatus::Error,
                         error: Some("exit status 101".into()),
@@ -30491,144 +29528,6 @@ mod tests {
     }
 
     #[test]
-    fn hydrate_replay_adopts_live_turnless_envelope_row_into_turn_group() {
-        use crate::client_event::ClientEvent;
-        // A tool that streamed LIVE via the envelope path leaves a turnless
-        // row (thread-marker detail). When the same call replays on hydrate,
-        // the row must be ADOPTED onto the hydrated turn — otherwise the
-        // capture pass can't archive it and a terminal row strands in the
-        // live strip while the turn group omits it.
-        let turn_id = TurnId::new();
-        let mut store = store_with_empty_session();
-        let session_id = store.state.sessions[0].id.clone();
-        let thread = turn_id.0.to_string();
-
-        // Live envelope path created the turnless row.
-        store.state.push_activity(
-            ActivityItem::new(ActivityKind::Tool, "shell", "running")
-                .with_tool_call("tc-adopt")
-                .with_session(session_id.clone())
-                .with_detail(AppState::envelope_tool_detail_for_thread(&thread)),
-        );
-
-        // While the turn is still ACTIVE, replay must leave the live row in
-        // charge (turnless, marker intact) and NOT consume the seq — the
-        // heal contract stays with the thread marker until the turn ends.
-        let active_result = SessionHydrateResult {
-            session_id: session_id.clone(),
-            cursor: octos_core::ui_protocol::UiCursor {
-                stream: session_id.0.clone(),
-                seq: 5,
-            },
-            context: None,
-            context_state: None,
-            messages: None,
-            threads: None,
-            turns: Some(vec![HydratedTurn {
-                turn_id: turn_id.clone(),
-                state: TurnLifecycleState::Active,
-                started_at: None,
-                completed_at: None,
-                thread_id: None,
-            }]),
-            pending_approvals: None,
-            pending_questions: None,
-            replayed_envelopes: None,
-            replayed_tool_envelopes: Some(vec![Envelope {
-                thread_id: thread.clone(),
-                seq: 1,
-                client_message_id: None,
-                payload: Payload::ToolStart {
-                    tool_call_id: "tc-adopt".into(),
-                    name: "shell".into(),
-                    arguments_preview: Some("command: \"ls\"".into()),
-                },
-            }]),
-        };
-        store.apply_client_event(ClientEvent::SessionHydrate(active_result));
-        let live_row = store
-            .state
-            .activity
-            .iter()
-            .find(|item| item.tool_call_id.as_deref() == Some("tc-adopt"))
-            .expect("live row still present while the turn is active");
-        assert!(
-            live_row.turn_id.is_none(),
-            "no adoption while the turn is active — the marker heal owns it"
-        );
-
-        let result = SessionHydrateResult {
-            session_id: session_id.clone(),
-            cursor: octos_core::ui_protocol::UiCursor {
-                stream: session_id.0.clone(),
-                seq: 9,
-            },
-            context: None,
-            context_state: None,
-            messages: None,
-            threads: None,
-            turns: Some(vec![HydratedTurn {
-                turn_id: turn_id.clone(),
-                state: TurnLifecycleState::Completed,
-                started_at: None,
-                completed_at: None,
-                thread_id: None,
-            }]),
-            pending_approvals: None,
-            pending_questions: None,
-            replayed_envelopes: None,
-            replayed_tool_envelopes: Some(vec![
-                Envelope {
-                    thread_id: thread.clone(),
-                    seq: 1,
-                    client_message_id: None,
-                    payload: Payload::ToolStart {
-                        tool_call_id: "tc-adopt".into(),
-                        name: "shell".into(),
-                        arguments_preview: Some("command: \"ls\"".into()),
-                    },
-                },
-                Envelope {
-                    thread_id: thread,
-                    seq: 2,
-                    client_message_id: None,
-                    payload: Payload::ToolEnd {
-                        tool_call_id: "tc-adopt".into(),
-                        status: EnvelopeToolEndStatus::Complete,
-                        error: None,
-                        reason: None,
-                        output_preview: Some("ok".into()),
-                        duration_ms: Some(7),
-                    },
-                },
-            ]),
-        };
-        store.apply_client_event(ClientEvent::SessionHydrate(result));
-
-        let log = store
-            .state
-            .turn_activity_logs
-            .iter()
-            .find(|log| log.turn_id == turn_id)
-            .expect("adopted live row must be archived into the turn log");
-        let row = log
-            .items
-            .iter()
-            .find(|item| item.tool_call_id.as_deref() == Some("tc-adopt"))
-            .expect("row present in the archive");
-        assert_eq!(row.detail.as_deref(), Some("command: \"ls\""));
-        assert_eq!(row.output_preview.as_deref(), Some("ok"));
-        assert!(
-            !store
-                .state
-                .activity
-                .iter()
-                .any(|item| item.tool_call_id.as_deref() == Some("tc-adopt")),
-            "no stranded duplicate may remain in the live strip"
-        );
-    }
-
-    #[test]
     fn hydrate_tool_envelope_replay_is_idempotent_across_rehydrates() {
         use crate::client_event::ClientEvent;
         // Hydrate re-runs on every reconnect; the (session, thread, seq)
@@ -30636,6 +29535,17 @@ mod tests {
         let turn_id = TurnId::new();
         let mut store = store_with_empty_session();
         let session_id = store.state.sessions[0].id.clone();
+        let envelope = |seq: u64, payload: PayloadV2| EnvelopeV2 {
+            thread_id: "thread-replay-2".into(),
+            seq,
+            cursor: Some(UiCursor {
+                stream: session_id.0.clone(),
+                seq,
+            }),
+            turn_id: turn_id.0.to_string(),
+            client_message_id: None,
+            payload,
+        };
         let make_result = || SessionHydrateResult {
             session_id: session_id.clone(),
             cursor: octos_core::ui_protocol::UiCursor {
@@ -30657,21 +29567,17 @@ mod tests {
             pending_questions: None,
             replayed_envelopes: None,
             replayed_tool_envelopes: Some(vec![
-                Envelope {
-                    thread_id: "thread-replay-2".into(),
-                    seq: 1,
-                    client_message_id: None,
-                    payload: Payload::ToolStart {
+                envelope(
+                    1,
+                    PayloadV2::ToolStart {
                         tool_call_id: "tc-idem".into(),
                         name: "read_file".into(),
                         arguments_preview: None,
                     },
-                },
-                Envelope {
-                    thread_id: "thread-replay-2".into(),
-                    seq: 2,
-                    client_message_id: None,
-                    payload: Payload::ToolEnd {
+                ),
+                envelope(
+                    2,
+                    PayloadV2::ToolEnd {
                         tool_call_id: "tc-idem".into(),
                         status: EnvelopeToolEndStatus::Complete,
                         error: None,
@@ -30679,7 +29585,7 @@ mod tests {
                         output_preview: None,
                         duration_ms: None,
                     },
-                },
+                ),
             ]),
         };
 
@@ -30895,43 +29801,6 @@ mod tests {
                 "the dead turn's stranded running chip must be reconciled ({terminal:?})"
             );
         }
-    }
-
-    #[test]
-    fn envelope_turn_completed_does_not_touch_non_tool_turn_less_row() {
-        // GAP 2 kind guard: the envelope reconcile is filtered to
-        // `ActivityKind::Tool`. A turn-less NON-tool row carrying this thread's
-        // marker (e.g. a Progress row) must never be flipped, even when its
-        // session+thread match the TurnCompleted barrier.
-        let mut store = store_with_empty_session();
-        let session_id = store.state.sessions[0].id.clone();
-        store.state.push_activity(
-            ActivityItem::new(ActivityKind::Progress, "sub-agent", "running")
-                .with_session(session_id.clone())
-                .with_detail(crate::model::AppState::envelope_tool_detail_for_thread(
-                    "thread-1",
-                )),
-        );
-
-        store.apply_event(AppUiEvent::Protocol(envelope_notification(
-            session_id,
-            1,
-            Payload::TurnCompleted {
-                token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
-            },
-        )));
-
-        let row = store
-            .state
-            .activity
-            .iter()
-            .find(|item| item.kind == ActivityKind::Progress && item.title == "sub-agent")
-            .expect("non-tool progress row retained");
-        assert!(
-            crate::model::activity_status_is_running(&row.status),
-            "a non-tool turn-less row must NOT be reconciled by the envelope sweep, got {:?}",
-            row.status
-        );
     }
 
     #[test]
