@@ -8296,7 +8296,7 @@ fn active_session_autonomy(app: &AppState) -> Option<&SessionAutonomyState> {
 }
 
 /// Whether the active session currently has a goal in its autonomy mirror.
-/// Gates the Ctrl+G fold toggle so the key is only claimed when the ◆ Goal
+/// Gates the Alt+E fold toggle so the key is only claimed when the ◆ Goal
 /// banner is actually showing (otherwise it falls through, unswallowed).
 pub(crate) fn active_session_has_goal(app: &AppState) -> bool {
     active_session_autonomy(app).is_some_and(|state| state.goal.is_some())
@@ -8401,10 +8401,10 @@ fn goal_objective_chunks(objective: &str, width: u16, tail_len: usize) -> Vec<St
 }
 
 /// Auto-fold threshold: a goal whose objective wraps to MORE than this many rows
-/// at the render width is folded to one compact row by DEFAULT (Ctrl+G expands),
+/// at the render width is folded to one compact row by DEFAULT (Alt+E expands),
 /// so a huge pasted objective can't dominate the banner. A 1–3 row goal shows in
 /// full — short goals never look truncated. Only consulted while the fold
-/// preference is [`GoalObjectiveFold::Auto`]; an explicit Ctrl+G choice wins.
+/// preference is [`GoalObjectiveFold::Auto`]; an explicit Alt+E choice wins.
 const GOAL_FOLD_AUTO_MAX_ROWS: usize = 3;
 
 /// Minimum columns the folded preview keeps even on a narrow terminal, so a
@@ -8412,7 +8412,7 @@ const GOAL_FOLD_AUTO_MAX_ROWS: usize = 3;
 const GOAL_FOLD_PREVIEW_MIN: usize = 8;
 
 /// Resolve the EFFECTIVE fold for the goal objective and record it on `app` so
-/// Ctrl+G ([`AppState::toggle_goal_objective_fold`]) can flip whatever is on
+/// Alt+E ([`AppState::toggle_goal_objective_fold`]) can flip whatever is on
 /// screen. `Auto` folds a long objective (wraps beyond
 /// [`GOAL_FOLD_AUTO_MAX_ROWS`] rows at `width`) and shows a short one in full; an
 /// explicit fold choice always wins. Both the height reservation and the render
@@ -8563,7 +8563,7 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette, width: u16) -> Vec
     if let Some(goal) = state.goal.as_ref() {
         let (glyph, _status_label) = goal_status_display(&goal.status);
         let parenthetical = goal_meta_parenthetical(goal);
-        // Folded (default for a long objective, or after Ctrl+G): ONE compact
+        // Folded (default for a long objective, or after Alt+E): ONE compact
         // row. The fold decision MUST match `autonomy_indicator_height` — both
         // call `goal_objective_folded` with the same width (reserve==render).
         // Loops/plan rows still render below, exactly as in the unfolded case.
@@ -8675,9 +8675,9 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette, width: u16) -> Vec
 }
 
 /// Render the ◆ Goal banner folded to ONE compact row:
-/// `{glyph} Goal: {preview}… {(status · used/budget tokens)} · Ctrl+G expand`.
+/// `{glyph} Goal: {preview}… {(status · used/budget tokens)} · Alt+E expand`.
 /// Used when the objective is folded (default for a long objective, or after
-/// Ctrl+G). Always exactly one line, matching `autonomy_indicator_height`'s
+/// Alt+E). Always exactly one line, matching `autonomy_indicator_height`'s
 /// folded reservation of a single row (reserve==render). The banner Paragraph
 /// CLIPS rather than wraps, so the preview is budgeted to leave room for the
 /// parenthetical and the hint — a long objective is truncated, its status/budget
@@ -8732,7 +8732,7 @@ fn goal_folded_line(
         spans.push(Span::styled("…", palette.text().bg(palette.surface)));
     }
     // `parenthetical` already carries a leading space (`" (…)"`); the hint carries
-    // its own ` · ` separator — so they read `… (active · …) · Ctrl+G expand`.
+    // its own ` · ` separator — so they read `… (active · …) · Alt+E expand`.
     spans.push(Span::styled(
         parenthetical.to_string(),
         palette.muted().bg(palette.surface),
@@ -19082,7 +19082,7 @@ mod tests {
         // reserved height MUST equal the rendered row count (else the banner
         // clips or strands a blank band). (A long objective now folds BY
         // DEFAULT — see `goal_objective_folds_a_long_objective_by_default` — so
-        // this test drives the explicit unfolded state Ctrl+G produces.)
+        // this test drives the explicit unfolded state Alt+E produces.)
         let mut app = autonomy_app_state();
         app.goal_objective_fold = GoalObjectiveFold::Unfolded;
         let session_id = SessionKey("local:test".into());
@@ -19135,7 +19135,7 @@ mod tests {
         // The user's complaint: a huge pasted objective (shader code) dominated
         // the banner. With the default `Auto` fold it collapses to ONE compact
         // preview row — glyph + prefix + truncated preview + `…` + parenthetical
-        // + a Ctrl+G hint — and the reserved height matches (reserve==render).
+        // + a Alt+E hint — and the reserved height matches (reserve==render).
         let long = "build a react website about the 2026 world cup finals ".repeat(20);
         let app = autonomy_app_with_goal(&long);
         assert_eq!(
@@ -19150,7 +19150,7 @@ mod tests {
         assert_eq!(lines.len(), 1, "reserve==render in the folded state");
         assert!(
             app.goal_objective_folded_effective.get(),
-            "the resolver records the effective fold for Ctrl+G",
+            "the resolver records the effective fold for Alt+E",
         );
 
         let text = rendered_text(&app);
@@ -19160,7 +19160,7 @@ mod tests {
             text.contains("2000K"),
             "status/budget parenthetical stays on-screen"
         );
-        assert!(text.contains("Ctrl+G"), "folded row hints Ctrl+G expands");
+        assert!(text.contains("Alt+E"), "folded row hints Alt+E expands");
     }
 
     #[test]
@@ -19187,7 +19187,7 @@ mod tests {
         );
         let text = rendered_text(&app);
         assert!(
-            !text.contains("Ctrl+G"),
+            !text.contains("Alt+E"),
             "an unfolded goal shows no expand hint",
         );
     }
@@ -19225,7 +19225,7 @@ mod tests {
 
     #[test]
     fn toggling_goal_fold_flips_between_compact_and_full() {
-        // Ctrl+G (via `toggle_goal_objective_fold`) flips whatever is on screen:
+        // Alt+E (via `toggle_goal_objective_fold`) flips whatever is on screen:
         // a folded long goal expands to many rows; toggling again re-folds it.
         let long = "port the physically based renderer to wgpu with IBL and bloom ".repeat(12);
         let mut app = autonomy_app_with_goal(&long);
@@ -19237,16 +19237,12 @@ mod tests {
         app.toggle_goal_objective_fold();
         assert_eq!(app.goal_objective_fold, GoalObjectiveFold::Unfolded);
         let open_h = autonomy_indicator_height(&app, 100);
-        assert!(open_h > 1, "Ctrl+G expands the folded goal");
+        assert!(open_h > 1, "Alt+E expands the folded goal");
 
         // Second toggle → explicit Folded → back to one row.
         app.toggle_goal_objective_fold();
         assert_eq!(app.goal_objective_fold, GoalObjectiveFold::Folded);
-        assert_eq!(
-            autonomy_indicator_height(&app, 100),
-            1,
-            "Ctrl+G re-folds it"
-        );
+        assert_eq!(autonomy_indicator_height(&app, 100), 1, "Alt+E re-folds it");
     }
 
     #[test]
