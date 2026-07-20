@@ -789,13 +789,14 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
-    // Alt+E folds/unfolds the ◆ Goal banner objective. A huge pasted objective
-    // (e.g. shader code) folds to one compact preview row by default; Alt+E
+    // Ctrl+P folds/unfolds the ◆ Goal banner objective. A huge pasted objective
+    // (e.g. shader code) folds to one compact preview row by default; Ctrl+P
     // expands it (and re-folds). Only claimed while the active session has a
     // goal — otherwise the key falls through unswallowed so it stays free.
-    // (Alt+E, not Ctrl+G — Ctrl+G collides with browser/terminal bindings, and
-    // Ctrl+E is already the composer's cursor-to-end-of-line.)
-    if is_alt_char(&key, 'e') && app::active_session_has_goal(&store.state) {
+    // (Ctrl+P — Ctrl+G collides with browser bindings, Ctrl+E is the composer's
+    // cursor-to-end-of-line, and Alt/Option+E is a dead accent key on macOS
+    // unless "Option as Meta" is enabled. Ctrl+P is free and works everywhere.)
+    if is_control_char(&key, 'p') && app::active_session_has_goal(&store.state) {
         store.state.toggle_goal_objective_fold();
         return KeyAction::Continue;
     }
@@ -1459,7 +1460,7 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
 
     if key.modifiers.contains(KeyModifiers::ALT) {
         match key.code {
-            // Alt+Enter also inserts a newline where the terminal reports it as
+            // Ctrl+Pnter also inserts a newline where the terminal reports it as
             // Enter+ALT (e.g. iTerm2). Some terminals (Warp) send Option+Enter
             // as ESC+CR instead, where it can't be caught — use Shift+Enter or
             // Ctrl+J there.
@@ -1491,8 +1492,8 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
         match key.code {
             // Ctrl+J is a literal line feed and works in every terminal (no
             // Kitty/modifyOtherKeys needed), so it is the portable newline key
-            // alongside Alt+Enter. (Terminals that fold Ctrl+J into Enter will
-            // submit instead — Alt+Enter is the fallback there.)
+            // alongside Ctrl+Pnter. (Terminals that fold Ctrl+J into Enter will
+            // submit instead — Ctrl+Pnter is the fallback there.)
             KeyCode::Char('j') => {
                 store.state.insert_composer_text("\n");
                 return true;
@@ -2692,7 +2693,7 @@ mod tests {
     }
 
     #[test]
-    fn alt_e_toggles_goal_objective_fold_when_goal_present() {
+    fn ctrl_p_toggles_goal_objective_fold_when_goal_present() {
         use crate::model::GoalObjectiveFold;
         let mut store = store_with_sessions(1);
         let sid = store.state.active_session().unwrap().id.clone();
@@ -2706,41 +2707,41 @@ mod tests {
         store.state.goal_objective_folded_effective.set(true);
         handle_key(
             &mut store,
-            modified_key(KeyCode::Char('e'), KeyModifiers::ALT),
+            modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL),
         );
         assert_eq!(
             store.state.goal_objective_fold,
             GoalObjectiveFold::Unfolded,
-            "Alt+E on a folded goal expands it",
+            "Ctrl+P on a folded goal expands it",
         );
 
-        // Simulate it now rendered UNFOLDED; Alt+E re-folds.
+        // Simulate it now rendered UNFOLDED; Ctrl+P re-folds.
         store.state.goal_objective_folded_effective.set(false);
         handle_key(
             &mut store,
-            modified_key(KeyCode::Char('e'), KeyModifiers::ALT),
+            modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL),
         );
         assert_eq!(
             store.state.goal_objective_fold,
             GoalObjectiveFold::Folded,
-            "Alt+E on an unfolded goal re-folds it",
+            "Ctrl+P on an unfolded goal re-folds it",
         );
     }
 
     #[test]
-    fn alt_e_is_a_noop_without_a_goal() {
+    fn ctrl_p_is_a_noop_without_a_goal() {
         use crate::model::GoalObjectiveFold;
         let mut store = store_with_sessions(1);
-        // No goal on the active session — Alt+E must not claim the key or
+        // No goal on the active session — Ctrl+P must not claim the key or
         // mutate the fold preference.
         handle_key(
             &mut store,
-            modified_key(KeyCode::Char('e'), KeyModifiers::ALT),
+            modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL),
         );
         assert_eq!(
             store.state.goal_objective_fold,
             GoalObjectiveFold::Auto,
-            "Alt+E without a goal leaves the fold preference untouched",
+            "Ctrl+P without a goal leaves the fold preference untouched",
         );
     }
 

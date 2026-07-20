@@ -93,7 +93,7 @@ app:
     loops_running: "Loops: %{count} active"
     loops_paused_suffix: " · %{count} paused"
     goal_meta: " (%{status} · %{used}/%{budget} tokens)"
-    goal_fold_hint: " · Alt+E expand"
+    goal_fold_hint: " · Ctrl+P expand"
     status_active: "active"
     status_paused: "paused"
     status_budget_limited: "budget limited"
@@ -870,7 +870,7 @@ command:
   profiles:
     desc: Manage local profiles — list, set the default, delete, or create one.
   goal:
-    desc: View, set, pause, resume, stop, or clear the persisted session goal.
+    desc: "Set: /goal <objective> [--budget 2m|500k]. Manage: pause, resume, stop, clear. Plain /goal shows the current goal."
   help:
     desc: Show available commands.
   keymap:
