@@ -480,6 +480,324 @@ The AppUi backend agent is created when `octos serve` starts. If you add or
 change the provider/model after the server is already up (via the dashboard or a
 hand-edited profile), restart `octos serve` before opening a new coding session.
 
+### Hooks
+
+Hooks run a command at agent lifecycle events. They are **server-side** profile
+config — edit them on the host that runs `octos serve`; the TUI just shows their
+effects. The command is an **argv array** (no shell interpretation, so no pipes
+or globs), the environment is sanitized, and a leading `~` in `command[0]` is
+expanded. A hook can observe an event, deny it, inject context, or rewrite a
+pending tool call.
+
+#### Placement and inheritance
+
+Hooks (and `env_vars`, `sandbox`, `plugins`, `memory`, and the skills layer
+below) can be declared in two places:
+
+- **Per-profile** — under `config.hooks` in `~/.octos/profiles/<id>.json`. Fires
+  only for that profile.
+- **Globally** — as a top-level `hooks` array in
+  `<registry-root>/profile-defaults.json` (typically
+  `~/.octos/profile-defaults.json`). Every profile inherits it.
+
+The two **stack**: the global hooks run first (in file order), then the
+profile's own — both fire. This defaults-under-profile inheritance is the same
+mechanism used for `env_vars`, `sandbox`, `plugins`, `memory`, and the skill
+layering described in [Custom skills](#custom-skills).
+
+#### Config shape
+
+```json
+{
+  "hooks": [
+    {
+      "event": "after_tool_call",
+      "command": ["ruff", "check", "--quiet"],
+      "timeout_ms": 8000,
+      "tool_filter": ["write_file", "edit_file"],
+      "path_filter": ["**/*.py"],
+      "requires_bin": "ruff"
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `event` | Which lifecycle event triggers the hook (table below). Required. |
+| `command` | Argv array — `command[0]` is the program, the rest are arguments. |
+| `timeout_ms` | Kill the hook after this many ms (default `5000`). |
+| `tool_filter` | Tool events only: fire only for these tool names. Empty = all tools. |
+| `path_filter` | Tool events only: fire only when the tool's `args.path` matches one of these glob patterns. Tools with no `path` argument are skipped. |
+| `requires_bin` | Skip the hook unless this binary is on `PATH` (ship optional linters without forcing every host to install them). |
+
+#### Events
+
+| Event | When it fires | Can deny? |
+|---|---|---|
+| `user_prompt_submit` | Once, when a real user prompt enters a turn, **before** the first LLM call. | **Yes** |
+| `before_tool_call` | Before each tool executes. | **Yes** |
+| `after_tool_call` | After each tool returns. | No |
+| `before_llm_call` | Before each LLM iteration within a turn. | **Yes** |
+| `after_llm_call` | After each LLM response (carries token / cost / provider stats). | No |
+| `on_turn_end` | When a turn settles. | No |
+| `on_resume` | When a session resumes. | No |
+| `before_spawn_verify` / `on_spawn_verify` / `on_spawn_complete` / `on_spawn_failure` | Background sub-agent (spawn) lifecycle. | `before_spawn_verify` only |
+
+`user_prompt_submit` is distinct from `before_llm_call`: it fires **once per
+user turn**, while `before_llm_call` fires on **every** LLM iteration inside that
+turn.
+
+#### Protocol
+
+The hook receives a JSON payload on **stdin** and signals its verdict via **exit
+code**. The payload always carries `event`, plus `session_id`, `profile_id`, and
+`model` / `cwd` where relevant:
+
+- Tool events add `tool_name` and `arguments`, and (after) `result`, `success`,
+  `duration_ms`. Arguments/results for `shell`, `read_file`, and `write_file`
+  are **redacted**; other tools are truncated to 1 KB.
+- `user_prompt_submit` adds the `prompt` text and the turn's `cwd`.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Allow. For `user_prompt_submit`, anything printed to **stdout** is injected as extra per-turn context for the model. |
+| `1` | Deny — for the before-events above only (blocks the operation; the stdout message is surfaced). On after-events, exit 1 is treated as an error. |
+| `2` | For `before_tool_call` / `before_spawn_verify`: replace the pending arguments with the JSON printed on stdout. |
+| other | Error (logged, does not block). |
+
+A hook that fails (unexpected non-zero, timeout, or spawn error) **3 consecutive
+times** is disabled by a circuit breaker until the server restarts.
+
+#### Examples
+
+Inject live git state into every turn — `user_prompt_submit`, exit 0, stdout
+becomes per-turn model context:
+
+```bash
+#!/usr/bin/env bash
+# ~/.octos/hooks/git-context.sh
+set -euo pipefail
+payload="$(cat)"
+cwd="$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("cwd") or ".")')"
+cd "$cwd" 2>/dev/null || exit 0
+echo "git branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '(not a git repo)')"
+git status --short 2>/dev/null | head -20
+exit 0   # allow the turn; stdout is added to the model's context
+```
+
+```json
+{ "event": "user_prompt_submit", "command": ["~/.octos/hooks/git-context.sh"], "timeout_ms": 4000 }
+```
+
+Deny a prompt that leaks a secret — `user_prompt_submit`, exit 1, the turn never
+reaches the LLM:
+
+```bash
+#!/usr/bin/env bash
+# ~/.octos/hooks/no-secrets.sh
+set -euo pipefail
+prompt="$(cat | python3 -c 'import json,sys; print(json.load(sys.stdin).get("prompt",""))')"
+if printf '%s' "$prompt" | grep -Eq 'AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----'; then
+  echo "Blocked: the prompt appears to contain a credential."
+  exit 1
+fi
+exit 0
+```
+
+```json
+{ "event": "user_prompt_submit", "command": ["~/.octos/hooks/no-secrets.sh"], "timeout_ms": 3000 }
+```
+
+Lint Rust files after they are written — `after_tool_call` scoped by
+`tool_filter` + `path_filter`, gated on `cargo` being installed:
+
+```json
+{
+  "event": "after_tool_call",
+  "command": ["cargo", "clippy", "--quiet"],
+  "timeout_ms": 20000,
+  "tool_filter": ["write_file", "edit_file"],
+  "path_filter": ["**/*.rs"],
+  "requires_bin": "cargo"
+}
+```
+
+Stacking global + per-profile: put the secret-guard in the global defaults so it
+protects every profile, and add the Rust linter to just your coding profile.
+
+```jsonc
+// ~/.octos/profile-defaults.json  — top-level "hooks", inherited by all profiles
+{ "hooks": [ { "event": "user_prompt_submit", "command": ["~/.octos/hooks/no-secrets.sh"] } ] }
+```
+
+```jsonc
+// ~/.octos/profiles/coding.json  — "config.hooks", only this profile
+{ "config": { "hooks": [
+  { "event": "after_tool_call", "command": ["cargo", "clippy", "--quiet"],
+    "tool_filter": ["write_file", "edit_file"], "path_filter": ["**/*.rs"],
+    "requires_bin": "cargo" }
+] } }
+```
+
+At runtime the secret-guard (from defaults) runs first, then the profile's
+linter — both fire.
+
+### Custom skills
+
+Skills are the agent's plug-in tools. They are configured **server-side** (loaded
+by `octos serve` from the profile and its skill directories); the TUI surfaces
+them through `/skills` when the server advertises the capability. A skill is a
+directory containing a `manifest.json` and an executable binary.
+
+#### Anatomy
+
+```text
+greeter/
+├── manifest.json     # declares the skill id, its tools, and load gating
+└── main              # the executable (chmod +x); override the name with "binary"
+```
+
+`manifest.json` declares the skill and each tool it exposes:
+
+```json
+{
+  "name": "greeter",
+  "version": "1.0.0",
+  "author": "you",
+  "description": "Friendly greetings for any name",
+  "binary": "main",
+  "timeout_secs": 10,
+  "tools": [
+    {
+      "name": "greet",
+      "description": "Return a greeting for a person by name.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "Who to greet" }
+        },
+        "required": ["name"]
+      }
+    }
+  ],
+  "requires": { "bins": [], "env": [], "os": [] }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `name` / `id` | Skill identifier (kebab-case). Equals the directory name and the id used by the layering rules below. |
+| `version` | Semver string. |
+| `binary` | Executable filename relative to the skill dir (default `main`). |
+| `timeout_secs` | Per-tool-call timeout. |
+| `tools[]` | One entry per tool: `name` (snake_case, unique), `description`, `input_schema` (JSON Schema). Add `"concurrency_class": "exclusive"` to a tool that writes files or mutates shared state so the scheduler never races it against a sibling. |
+| `requires` | Load gating: `bins` (must be on `PATH`), `env` (must be set), `os` (allowed values; empty = any). |
+
+#### Binary protocol
+
+The runtime invokes `./<binary> <tool_name>`, writes the tool arguments as JSON
+to **stdin**, and reads one JSON object from **stdout**:
+
+```bash
+#!/usr/bin/env bash
+# greeter/main — implements the `greet` tool
+set -euo pipefail
+tool="$1"                              # tool name = argv[1]
+args="$(cat)"                          # JSON arguments on stdin
+name="$(printf '%s' "$args" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("name","world"))')"
+
+case "$tool" in
+  greet) printf '{"success": true, "output": "Hello, %s!", "files_to_send": []}\n' "$name" ;;
+  *)     printf '{"success": false, "output": "unknown tool: %s"}\n' "$tool" ;;
+esac
+```
+
+The response object is `{ "output": string, "success": bool, "files_to_send":
+[paths] }`. `output` is what the model sees; any paths in `files_to_send` are
+auto-delivered to the chat.
+
+#### Where skills are discovered
+
+`octos serve` scans, in order: the project-local `plugins/` and `skills/`
+directories, the bundled system skills, per-profile installs under
+`<data-dir>/skills/`, and any colon-separated paths in `OCTOS_SKILLS_PATH`. Drop
+the `greeter/` directory into your project's `skills/` (or the profile's
+`<data-dir>/skills/`) and restart the server. The legacy global
+`~/.octos/skills` and `~/.octos/plugins` directories are **deprecated** and no
+longer scanned.
+
+#### Built-in "super power" system skills
+
+Every deployment ships a set of bundled system skills — the "super power" skills.
+The core app skills:
+
+| Skill (`id`) | What it does |
+|---|---|
+| `weather` | Current weather + multi-day forecast for any city via Open-Meteo (no API key). |
+| `clock` | Current date/time in any timezone (directory `time/`). |
+| `news` | Raw headlines and article text from Google News, Hacker News, Yahoo News, Substack, and Medium. |
+| `deep-search` | Iterative multi-round web research: parallel crawling, reference chasing, structured report. |
+| `deep-crawl` | Recursive same-origin website crawl via headless Chrome (requires `google-chrome`). |
+| `send-email` | Send email via SMTP or Feishu/Lark Mail. |
+| `account-manager` | Manage sub-accounts under the current profile. |
+
+The `voice` platform skill (OminiX ASR + preset-voice TTS on Apple Silicon) is
+admin-only and loaded explicitly by `octos serve`.
+
+#### Per-profile skill layering
+
+A profile can choose which discovered skills load, via a `skills` block. In a
+per-profile file it lives under `config.skills`; in the global defaults file it
+is top-level (see the [Hooks](#hooks) section for the two placements and how they
+merge). Omitting the block loads every discovered skill — the default,
+backward-compatible behavior.
+
+```json
+{
+  "skills": {
+    "mode": "all_discovered",
+    "rules": [
+      { "id": "deep-crawl", "enabled": false }
+    ]
+  }
+}
+```
+
+- `mode: "all_discovered"` (the default) loads **every** discovered skill except
+  those with an `enabled: false` rule. The example above ships everything but
+  `deep-crawl`.
+- `mode: "all_list"` loads **only** skills with an explicit `enabled: true`
+  rule — **everything else is disabled, including the bundled system skills**.
+  Use it to pin a profile to a fixed toolset:
+
+```json
+{
+  "skills": {
+    "mode": "all_list",
+    "rules": [
+      { "id": "weather", "enabled": true },
+      { "id": "clock", "enabled": true }
+    ]
+  }
+}
+```
+
+Rules are keyed by the manifest `id` and are last-wins per id. When the `skills`
+block is inherited from `profile-defaults.json`, the two rule sets are unioned
+(defaults first) and the profile's rule for a given id replaces the inherited
+one — so a profile can re-enable a skill the global defaults disabled:
+
+```jsonc
+// ~/.octos/profile-defaults.json  — top-level "skills", inherited by all profiles
+{ "skills": { "mode": "all_discovered", "rules": [ { "id": "deep-crawl", "enabled": false } ] } }
+```
+
+```jsonc
+// ~/.octos/profiles/research.json  — re-enables deep-crawl for just this profile
+{ "config": { "skills": { "rules": [ { "id": "deep-crawl", "enabled": true } ] } } }
+```
+
 ### Troubleshooting
 
 | Symptom | Fix |
