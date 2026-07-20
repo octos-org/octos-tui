@@ -4161,11 +4161,17 @@ fn research_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let can_remove = ctx
         .availability
         .supports_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE);
-    let profile_id = ctx.app.current_profile.map(str::to_owned).or_else(|| {
-        ctx.app
-            .sub_providers_state
-            .and_then(|state| state.profile_id.clone())
-    });
+    let can_upsert = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT);
+    // Prefer the profile the DISPLAYED lanes belong to (the last list's profile),
+    // else the active profile — so a refresh re-lists exactly what's on screen and
+    // never silently retargets another profile.
+    let profile_id = ctx
+        .app
+        .sub_providers_state
+        .and_then(|state| state.profile_id.clone())
+        .or_else(|| ctx.app.current_profile.map(str::to_owned));
 
     let refresh_action = if can_list {
         MenuAction::send_appui(AppUiCommand::ProfileSubProvidersList(
@@ -4215,13 +4221,14 @@ fn research_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                     .map(|m| format!("/{m}"))
                     .unwrap_or_default()
             );
+            // Stage the removal in the composer rather than deleting on select —
+            // selecting a row is a single keystroke and a lane deletion needs a
+            // deliberate Enter to confirm.
             let action = if can_remove {
-                MenuAction::send_appui(AppUiCommand::ProfileSubProvidersRemove(
-                    crate::model::SubProvidersRemoveParams {
-                        profile_id: profile_id.clone(),
-                        key: lane.key.clone(),
-                    },
-                ))
+                MenuAction::Local(crate::menu::types::LocalAction::EditComposer(format!(
+                    "/research rm {}",
+                    lane.key
+                )))
             } else {
                 MenuAction::Noop
             };
@@ -4237,16 +4244,25 @@ fn research_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         }
     }
 
-    items.push(
-        MenuItem::new(
-            "research.add",
-            t!("menu.research.item.add.label"),
+    let mut add = MenuItem::new(
+        "research.add",
+        t!("menu.research.item.add.label"),
+        if can_upsert {
             MenuAction::Local(crate::menu::types::LocalAction::EditComposer(
                 "/research add ".to_string(),
-            )),
-        )
-        .with_description(t!("menu.research.item.add.desc")),
-    );
+            ))
+        } else {
+            MenuAction::Noop
+        },
+    )
+    .with_description(t!("menu.research.item.add.desc"));
+    if !can_upsert {
+        add = add.disabled(method_missing_reason(
+            ctx,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+        ));
+    }
+    items.push(add);
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(crate::menu::registry::MENU_RESEARCH),

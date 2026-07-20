@@ -932,7 +932,7 @@ menu:
   research:
     title: Research Provider Lanes
     subtitle: "Named provider lanes (cheap/strong) for the deep_research pipeline. Restart to apply."
-    footer: Enter select a lane to remove | Esc close
+    footer: Enter stage a lane's removal | Esc close
     item:
       refresh:
         label: Refresh lanes
@@ -941,7 +941,7 @@ menu:
         label: No research lanes configured
         desc: "Add one with /research add <key> <provider> <model>."
       lane:
-        desc: Select to remove this lane.
+        desc: "Select to stage /research rm — Enter to confirm."
       add:
         label: Add a lane…
         desc: "Pre-fills /research add — then type <key> <provider> <model>."

@@ -627,30 +627,46 @@ impl Store {
     /// Changes are RESTART-to-apply on a pinned solo profile (the router builds
     /// at ProfileRuntime bootstrap) — the mutation status says so.
     pub(crate) fn dispatch_research_slash(&mut self, draft: &str) -> SlashDispatchOutcome {
+        // Target the SAME profile the menu displays (the last list's profile),
+        // else the active profile — NOT the connection default, or an inline `rm`
+        // could delete a lane from a different profile than the one shown.
+        let profile_id = self
+            .state
+            .sub_providers_state
+            .as_ref()
+            .and_then(|state| state.profile_id.clone())
+            .or_else(|| self.current_profile_for_onboarding());
+
         let rest = draft.trim().strip_prefix("/research").unwrap_or("").trim();
         let mut tokens = rest.split_whitespace();
         match tokens.next() {
             None => {
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_RESEARCH));
                 SlashDispatchOutcome::accepted(Some(AppUiCommand::ProfileSubProvidersList(
-                    SubProvidersListParams::default(),
+                    SubProvidersListParams { profile_id },
                 )))
             }
             Some("add") | Some("set") => {
-                let (Some(key), Some(provider)) = (tokens.next(), tokens.next()) else {
+                // Require key + provider + MODEL (a dropped model used to save a
+                // lane with no model), and reject trailing junk.
+                let (key, provider, model) = (tokens.next(), tokens.next(), tokens.next());
+                let base_url = tokens.next().map(str::to_string);
+                let api_key_env = tokens.next().map(str::to_string);
+                let (Some(key), Some(provider), Some(model)) = (key, provider, model) else {
                     self.state.status = t!("status.research_add_usage").into_owned();
                     return SlashDispatchOutcome::Rejected;
                 };
-                let model = tokens.next().map(str::to_string);
-                let base_url = tokens.next().map(str::to_string);
-                let api_key_env = tokens.next().map(str::to_string);
+                if tokens.next().is_some() {
+                    self.state.status = t!("status.research_add_usage").into_owned();
+                    return SlashDispatchOutcome::Rejected;
+                }
                 SlashDispatchOutcome::accepted(Some(AppUiCommand::ProfileSubProvidersUpsert(
                     SubProvidersUpsertParams {
-                        profile_id: None,
+                        profile_id,
                         sub_provider: SubProviderView {
                             key: key.to_string(),
                             provider: Some(provider.to_string()),
-                            model,
+                            model: Some(model.to_string()),
                             base_url,
                             api_key_env,
                             ..Default::default()
@@ -664,9 +680,15 @@ impl Store {
                     self.state.status = t!("status.research_rm_usage").into_owned();
                     return SlashDispatchOutcome::Rejected;
                 };
+                // Reject trailing junk so `/research rm cheap typo` doesn't
+                // silently delete `cheap`.
+                if tokens.next().is_some() {
+                    self.state.status = t!("status.research_rm_usage").into_owned();
+                    return SlashDispatchOutcome::Rejected;
+                }
                 SlashDispatchOutcome::accepted(Some(AppUiCommand::ProfileSubProvidersRemove(
                     SubProvidersRemoveParams {
-                        profile_id: None,
+                        profile_id,
                         key: key.to_string(),
                     },
                 )))
@@ -6382,6 +6404,10 @@ impl Store {
             AppUiEvent::Snapshot(snapshot) => {
                 let composer = self.state.composer.clone();
                 let composer_drafts = self.state.composer_drafts.clone();
+                // Local-only: the server never re-pushes the sub-provider (research
+                // lane) list on reconnect — `from_snapshot` would drop it and leave
+                // the /research menu blank until the user re-opens it. Carry it.
+                let sub_providers_state = self.state.sub_providers_state.clone();
                 // Local-only: command history is a client-side ring the server
                 // never echoes; `from_snapshot` would drop it. Preserve the
                 // entries across replays (reconnect/refresh) and reset browsing.
@@ -6484,6 +6510,9 @@ impl Store {
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
                     state.capabilities = previous_capabilities;
+                }
+                if state.sub_providers_state.is_none() {
+                    state.sub_providers_state = sub_providers_state;
                 }
                 state.set_composer_text(composer);
                 state.composer_drafts = composer_drafts;
@@ -12283,6 +12312,64 @@ mod tests {
         };
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        }
+    }
+
+    #[test]
+    fn should_reject_research_add_when_model_missing() {
+        let mut store = store_with_empty_session();
+        // key + provider but no model — a lane saved with no model is invalid.
+        let outcome = store.dispatch_research_slash("/research add cheap moonshot");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+    }
+
+    #[test]
+    fn should_reject_research_add_with_trailing_junk() {
+        let mut store = store_with_empty_session();
+        let outcome = store
+            .dispatch_research_slash("/research add cheap moonshot k3 https://x/v1 KEY_ENV extra");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+    }
+
+    #[test]
+    fn should_upsert_research_lane_targeting_active_profile() {
+        let mut store = store_with_empty_session();
+        let cmd = store
+            .dispatch_research_slash("/research add cheap moonshot k3")
+            .into_command();
+        match cmd {
+            Some(AppUiCommand::ProfileSubProvidersUpsert(params)) => {
+                // Targets the active profile, not the connection default.
+                assert_eq!(params.profile_id.as_deref(), Some("coding"));
+                assert_eq!(params.sub_provider.key, "cheap");
+                assert_eq!(params.sub_provider.provider.as_deref(), Some("moonshot"));
+                assert_eq!(params.sub_provider.model.as_deref(), Some("k3"));
+                assert!(params.api_key.is_none());
+            }
+            _ => panic!("expected a ProfileSubProvidersUpsert command"),
+        }
+    }
+
+    #[test]
+    fn should_reject_research_rm_with_trailing_junk() {
+        let mut store = store_with_empty_session();
+        // Guards against `/research rm cheap typo` silently deleting `cheap`.
+        let outcome = store.dispatch_research_slash("/research rm cheap typo");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+    }
+
+    #[test]
+    fn should_remove_research_lane_targeting_active_profile() {
+        let mut store = store_with_empty_session();
+        let cmd = store
+            .dispatch_research_slash("/research rm cheap")
+            .into_command();
+        match cmd {
+            Some(AppUiCommand::ProfileSubProvidersRemove(params)) => {
+                assert_eq!(params.profile_id.as_deref(), Some("coding"));
+                assert_eq!(params.key, "cheap");
+            }
+            _ => panic!("expected a ProfileSubProvidersRemove command"),
         }
     }
 

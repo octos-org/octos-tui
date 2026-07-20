@@ -498,7 +498,7 @@ menu:
   research:
     title: 研究模型通道
     subtitle: "deep_research 流水线的命名模型通道（cheap/strong）。需重启生效。"
-    footer: Enter 选择通道以删除 | Esc 关闭
+    footer: Enter 预填删除命令 | Esc 关闭
     item:
       refresh:
         label: 刷新通道
@@ -507,7 +507,7 @@ menu:
         label: 尚未配置研究通道
         desc: "使用 /research add <key> <provider> <model> 添加。"
       lane:
-        desc: 选择以删除此通道。
+        desc: "选择以预填 /research rm — 按 Enter 确认。"
       add:
         label: 添加通道…
         desc: "预填 /research add — 然后输入 <key> <provider> <model>。"
