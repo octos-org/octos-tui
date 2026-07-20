@@ -89,6 +89,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::Mcp,
         Provider::ToolSettings,
         Provider::Skills,
+        Provider::Research,
     ] {
         registry
             .register_provider(provider)
@@ -133,6 +134,7 @@ enum Provider {
     Mcp,
     ToolSettings,
     Skills,
+    Research,
 }
 
 impl MenuProvider for Provider {
@@ -172,6 +174,7 @@ impl MenuProvider for Provider {
             Self::Mcp => MENU_MCP,
             Self::ToolSettings => MENU_TOOL_SETTINGS,
             Self::Skills => MENU_SKILLS,
+            Self::Research => crate::menu::registry::MENU_RESEARCH,
         })
     }
 
@@ -211,6 +214,7 @@ impl MenuProvider for Provider {
             Self::Mcp => mcp_menu(ctx),
             Self::ToolSettings => tool_settings_menu(ctx),
             Self::Skills => skills_menu(ctx),
+            Self::Research => research_menu(ctx),
         }
     }
 
@@ -4142,6 +4146,118 @@ fn login_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             )
             .collect(),
         }),
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// `/research` — the named provider lanes (`sub_providers`) backing the isolated
+/// deep_research pipeline router. Lists configured lanes (select a lane to
+/// remove it), plus an "Add a lane" row that pre-fills the `/research add`
+/// inline command. Changes are restart-to-apply on a pinned solo profile.
+fn research_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let can_list = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST);
+    let can_remove = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE);
+    let profile_id = ctx.app.current_profile.map(str::to_owned).or_else(|| {
+        ctx.app
+            .sub_providers_state
+            .and_then(|state| state.profile_id.clone())
+    });
+
+    let refresh_action = if can_list {
+        MenuAction::send_appui(AppUiCommand::ProfileSubProvidersList(
+            crate::model::SubProvidersListParams {
+                profile_id: profile_id.clone(),
+            },
+        ))
+    } else {
+        MenuAction::Noop
+    };
+    let mut refresh = MenuItem::new(
+        "research.refresh",
+        t!("menu.research.item.refresh.label"),
+        refresh_action,
+    )
+    .with_description(t!("menu.research.item.refresh.desc"));
+    if !can_list {
+        refresh = refresh.disabled(method_missing_reason(
+            ctx,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+        ));
+    }
+    let mut items = vec![refresh];
+
+    let lanes = ctx
+        .app
+        .sub_providers_state
+        .map(|state| state.sub_providers.as_slice())
+        .unwrap_or_default();
+    if lanes.is_empty() {
+        items.push(
+            MenuItem::new(
+                "research.empty",
+                t!("menu.research.item.empty.label"),
+                MenuAction::Noop,
+            )
+            .disabled(t!("menu.research.item.empty.desc").into_owned()),
+        );
+    } else {
+        for (idx, lane) in lanes.iter().enumerate() {
+            let label = format!(
+                "{} — {}{}",
+                lane.key,
+                lane.provider.as_deref().unwrap_or("?"),
+                lane.model
+                    .as_deref()
+                    .map(|m| format!("/{m}"))
+                    .unwrap_or_default()
+            );
+            let action = if can_remove {
+                MenuAction::send_appui(AppUiCommand::ProfileSubProvidersRemove(
+                    crate::model::SubProvidersRemoveParams {
+                        profile_id: profile_id.clone(),
+                        key: lane.key.clone(),
+                    },
+                ))
+            } else {
+                MenuAction::Noop
+            };
+            let mut item = MenuItem::new(format!("research.lane.{idx}"), label, action)
+                .with_description(t!("menu.research.item.lane.desc"));
+            if !can_remove {
+                item = item.disabled(method_missing_reason(
+                    ctx,
+                    crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+                ));
+            }
+            items.push(item);
+        }
+    }
+
+    items.push(
+        MenuItem::new(
+            "research.add",
+            t!("menu.research.item.add.label"),
+            MenuAction::Local(crate::menu::types::LocalAction::EditComposer(
+                "/research add ".to_string(),
+            )),
+        )
+        .with_description(t!("menu.research.item.add.desc")),
+    );
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_RESEARCH),
+        title: t!("menu.research.title").into_owned(),
+        subtitle: Some(t!("menu.research.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.research.footer").into_owned()),
+        preview: None,
         mode: MenuMode::SingleSelect,
     })
 }

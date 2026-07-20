@@ -52,6 +52,9 @@ pub const MENU_MODEL_REMOVE_CONFIRM: &str = "model-remove-confirm";
 pub const MENU_COMPACT_CONFIRM: &str = "compact-confirm";
 pub const MENU_CONTEXT: &str = "context";
 pub const MENU_MODEL: &str = "model";
+/// Named provider lanes (`sub_providers`) for the deep_research pipeline lane —
+/// the `/research` menu lists them and `/research add|rm` mutates them.
+pub const MENU_RESEARCH: &str = "research";
 pub const MENU_COST: &str = "cost";
 /// `/resume` session picker menu.
 pub const MENU_RESUME: &str = "resume";
@@ -634,6 +637,23 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
                 .with_required_methods_when_capabilities(&[APPUI_METHOD_MODEL_LIST]),
             inline_args: InlineArgMode::None,
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_MODEL)),
+        },
+        // `/research` — manage the named provider lanes (`sub_providers`) that
+        // back the isolated deep_research pipeline router. Bare opens the lanes
+        // menu; `add`/`rm` mutate a lane inline (Custom, like the autonomy
+        // verbs). Gated on the sub_providers list method so old servers hide it.
+        CommandSpec {
+            name: "research",
+            aliases: &["lanes"],
+            description: "command.research.desc",
+            category: CommandCategory::Settings,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_when_capabilities(&[
+                    crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+                ]),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::Custom("research")),
         },
         CommandSpec {
             name: "status",

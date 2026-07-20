@@ -4,7 +4,7 @@ use crate::menu::availability::{AvailabilityContext, CommandAvailability};
 use crate::model::{
     AppUiCommand, OnboardingAction, OnboardingWizardState, ProfileLlmCatalogResult,
     ProfileLlmListResult, ProfileSkillsListResult, ProfileSkillsRegistrySearchResult,
-    SessionMcpCatalog, SessionModelCatalog, SessionRuntimeStatus,
+    SessionMcpCatalog, SessionModelCatalog, SessionRuntimeStatus, SubProvidersListResult,
 };
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -690,6 +690,7 @@ pub struct MenuAppSnapshot<'a> {
     pub model_catalog: Option<&'a SessionModelCatalog>,
     pub profile_llm_catalog: Option<&'a ProfileLlmCatalogResult>,
     pub profile_llm_state: Option<&'a ProfileLlmListResult>,
+    pub sub_providers_state: Option<&'a SubProvidersListResult>,
     pub profile_skills: Option<&'a ProfileSkillsListResult>,
     pub profile_skill_registry: Option<&'a ProfileSkillsRegistrySearchResult>,
     pub mcp_catalog: Option<&'a SessionMcpCatalog>,
