@@ -789,11 +789,13 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
-    // Ctrl+G folds/unfolds the ◆ Goal banner objective. A huge pasted objective
-    // (e.g. shader code) folds to one compact preview row by default; Ctrl+G
+    // Alt+E folds/unfolds the ◆ Goal banner objective. A huge pasted objective
+    // (e.g. shader code) folds to one compact preview row by default; Alt+E
     // expands it (and re-folds). Only claimed while the active session has a
     // goal — otherwise the key falls through unswallowed so it stays free.
-    if is_control_char(&key, 'g') && app::active_session_has_goal(&store.state) {
+    // (Alt+E, not Ctrl+G — Ctrl+G collides with browser/terminal bindings, and
+    // Ctrl+E is already the composer's cursor-to-end-of-line.)
+    if is_alt_char(&key, 'e') && app::active_session_has_goal(&store.state) {
         store.state.toggle_goal_objective_fold();
         return KeyAction::Continue;
     }
@@ -2690,7 +2692,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_g_toggles_goal_objective_fold_when_goal_present() {
+    fn alt_e_toggles_goal_objective_fold_when_goal_present() {
         use crate::model::GoalObjectiveFold;
         let mut store = store_with_sessions(1);
         let sid = store.state.active_session().unwrap().id.clone();
@@ -2704,41 +2706,41 @@ mod tests {
         store.state.goal_objective_folded_effective.set(true);
         handle_key(
             &mut store,
-            modified_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            modified_key(KeyCode::Char('e'), KeyModifiers::ALT),
         );
         assert_eq!(
             store.state.goal_objective_fold,
             GoalObjectiveFold::Unfolded,
-            "Ctrl+G on a folded goal expands it",
+            "Alt+E on a folded goal expands it",
         );
 
-        // Simulate it now rendered UNFOLDED; Ctrl+G re-folds.
+        // Simulate it now rendered UNFOLDED; Alt+E re-folds.
         store.state.goal_objective_folded_effective.set(false);
         handle_key(
             &mut store,
-            modified_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            modified_key(KeyCode::Char('e'), KeyModifiers::ALT),
         );
         assert_eq!(
             store.state.goal_objective_fold,
             GoalObjectiveFold::Folded,
-            "Ctrl+G on an unfolded goal re-folds it",
+            "Alt+E on an unfolded goal re-folds it",
         );
     }
 
     #[test]
-    fn ctrl_g_is_a_noop_without_a_goal() {
+    fn alt_e_is_a_noop_without_a_goal() {
         use crate::model::GoalObjectiveFold;
         let mut store = store_with_sessions(1);
-        // No goal on the active session — Ctrl+G must not claim the key or
+        // No goal on the active session — Alt+E must not claim the key or
         // mutate the fold preference.
         handle_key(
             &mut store,
-            modified_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            modified_key(KeyCode::Char('e'), KeyModifiers::ALT),
         );
         assert_eq!(
             store.state.goal_objective_fold,
             GoalObjectiveFold::Auto,
-            "Ctrl+G without a goal leaves the fold preference untouched",
+            "Alt+E without a goal leaves the fold preference untouched",
         );
     }
 

@@ -93,7 +93,7 @@ app:
     loops_running: "Loops: %{count} active"
     loops_paused_suffix: " · %{count} paused"
     goal_meta: " (%{status} · %{used}/%{budget} tokens)"
-    goal_fold_hint: " · Ctrl+G expand"
+    goal_fold_hint: " · Alt+E expand"
     status_active: "active"
     status_paused: "paused"
     status_budget_limited: "budget limited"

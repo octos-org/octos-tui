@@ -3752,12 +3752,12 @@ impl SessionRunState {
 
 type SessionUsage = (Option<u64>, Option<u64>, Option<f64>);
 
-/// Fold preference for the ◆ Goal banner's objective, toggled by Ctrl+G.
+/// Fold preference for the ◆ Goal banner's objective, toggled by Alt+E.
 ///
 /// `Auto` is the default: the fold is derived EACH FRAME from the objective's
 /// wrapped length at the real render width — a short goal (≤ a few wrapped rows)
 /// shows in full, a long one (a huge pasted objective) is compact by default so
-/// it can't dominate the screen. Once the user presses Ctrl+G the choice becomes
+/// it can't dominate the screen. Once the user presses Alt+E the choice becomes
 /// explicit (`Folded`/`Unfolded`) and is honored on every subsequent frame
 /// regardless of length. A global UI preference, not per-session state — the
 /// same discipline as [`AppState::agent_dock_collapsed`]; `Auto` adapts to
@@ -3882,14 +3882,14 @@ pub struct AppState {
     /// rows. Toggled by Alt+D or the `/agents` menu; a UI preference, not
     /// per-session state.
     pub agent_dock_collapsed: bool,
-    /// ◆ Goal banner fold preference (Ctrl+G). See [`GoalObjectiveFold`]: a huge
+    /// ◆ Goal banner fold preference (Alt+E). See [`GoalObjectiveFold`]: a huge
     /// pasted objective folds to one compact row by default, a short one shows
-    /// in full, and an explicit Ctrl+G choice sticks. A global UI preference,
+    /// in full, and an explicit Alt+E choice sticks. A global UI preference,
     /// not per-session state (like `agent_dock_collapsed`).
     pub goal_objective_fold: GoalObjectiveFold,
     /// Last EFFECTIVE goal-objective fold the banner rendered — `Auto` resolved
     /// from the objective's wrapped length at the REAL render width. A `Cell`
-    /// because the render/height paths borrow `&AppState`; Ctrl+G reads it to
+    /// because the render/height paths borrow `&AppState`; Alt+E reads it to
     /// flip whatever is currently on screen (the banner always draws before a
     /// key is read, so it is stale by at most one frame — the same discipline as
     /// [`AppState::agent_view_scroll_max`]).
@@ -6172,11 +6172,11 @@ impl AppState {
         entry.goal_transition_actor = transition_actor;
     }
 
-    /// Ctrl+G: flip the ◆ Goal banner objective between folded and unfolded.
+    /// Alt+E: flip the ◆ Goal banner objective between folded and unfolded.
     ///
     /// Reads the EFFECTIVE fold the banner last rendered (which resolves `Auto`
     /// from the objective's wrapped length at the real width) and pins the
-    /// explicit opposite, so the first Ctrl+G always visibly flips whatever is on
+    /// explicit opposite, so the first Alt+E always visibly flips whatever is on
     /// screen and every later frame honors the choice. The caller gates this on
     /// the active session actually having a goal, so an unfolded short goal is
     /// still a meaningful (re-fold) toggle rather than a no-op.
