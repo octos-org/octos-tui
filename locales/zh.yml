@@ -84,6 +84,7 @@ app:
     loops_running: "循环：%{count} 个活动中"
     loops_paused_suffix: " · %{count} 个已暂停"
     goal_meta: " (%{status} · %{used}/%{budget} Token)"
+    goal_fold_hint: " · Ctrl+G 展开"
     status_active: "进行中"
     status_paused: "已暂停"
     status_budget_limited: "预算已用尽"
@@ -102,6 +103,8 @@ app:
     ps_to_view: "/ps 查看"
     esc_interrupt: "Esc 中断"
     stop_to_close: "/stop 关闭"
+    pending_decision_help: "等待你的确认 — Alt+A 应答 · Ctrl+C 中断"
+    parked_decision_banner: "⚠ 已等待你 %{elapsed} — Alt+A 应答 · Ctrl+C 中断"
     tool_output_expanded: "工具输出已展开"
   btw:
     answering: "回答中…"

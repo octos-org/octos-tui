@@ -11,7 +11,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use octos_core::{
-    Message, SessionKey, TaskId, ui_protocol::TaskRuntimeState, ui_protocol::approval_kinds,
+    Message, SessionKey, TaskId, ui_protocol::TaskRuntimeState, ui_protocol::TurnId,
+    ui_protocol::approval_kinds,
 };
 
 use crate::{
@@ -19,10 +20,10 @@ use crate::{
     model::{
         ActivityItem, ActivityKind, ActivityNavigatorFilter, AppState, ApprovalModalState,
         ArtifactDetailState, ComposerPresentation, DiffPreviewPaneState, FocusPane,
-        PlanStep as RenderedPlanStep, SessionAutonomyState, SessionRunState, SessionView,
-        TaskOutputDetailState, TaskView, ThreadGraphDetailState, TurnActivityLog, TurnPromptAnchor,
-        TurnStateDetailState, UserQuestionEntry, UserQuestionPickerState, extract_plan_steps,
-        task_state_label,
+        GoalObjectiveFold, PlanStep as RenderedPlanStep, SessionAutonomyState, SessionRunState,
+        SessionView, TaskOutputDetailState, TaskView, ThreadGraphDetailState, TurnActivityLog,
+        TurnPromptAnchor, TurnStateDetailState, UserQuestionEntry, UserQuestionPickerState,
+        extract_plan_steps, task_state_label,
     },
     theme::Palette,
     tui_terminal::FrameLike,
@@ -225,7 +226,7 @@ pub fn live_ui_height_with_finalization(
     let composer_height = composer_height_for_size(app, width, height);
     let active_menu = active_menu_surface(app);
     let menu_height = menu_height_hint(active_menu.as_ref(), width, height);
-    let autonomy_height = autonomy_indicator_height(app);
+    let autonomy_height = autonomy_indicator_height(app, width);
     let harness_height = harness_status_height(app);
     // The sub-agent selector strip renders between the composer and the status
     // row (see `render_viewport_with_finalization`); reserve its row here too or
@@ -233,8 +234,17 @@ pub fn live_ui_height_with_finalization(
     // Ratatui compresses a fixed row at the tail floor. Height-gated on the same
     // `height` the render pass uses, so reservation and layout never disagree.
     let agent_strip_height = agent_strip_height(app, height);
-    let chrome =
-        menu_height + autonomy_height + harness_height + agent_strip_height + composer_height + 1; // +1 status
+    // The parked-decision watchdog banner reserves one row above the composer
+    // (see `render_viewport_with_finalization`); reserve it here too or the live
+    // viewport is oversubscribed by one row while the escalation is showing.
+    let decision_height = decision_banner_height(app);
+    let chrome = menu_height
+        + autonomy_height
+        + harness_height
+        + decision_height
+        + agent_strip_height
+        + composer_height
+        + 1; // +1 status
 
     let tail_height = live_tail_height_with_finalization(app, width, height, live_finalization);
     // The live-tail pane is laid out with `Constraint::Min(1)`, so it always
@@ -352,8 +362,11 @@ pub fn render_viewport_with_finalization(
     // reserved (cap floors at 3), clipping multi-line input. Everything else
     // legitimately lays out within `area`.
     let composer_height = composer_height_for_size(app, area.width, terminal_height);
-    let autonomy_height = autonomy_indicator_height(app);
+    let autonomy_height = autonomy_indicator_height(app, area.width);
     let harness_height = harness_status_height(app);
+    // Parked-decision watchdog banner: one reserved row just above the composer,
+    // present only once the escalation threshold has passed.
+    let decision_height = decision_banner_height(app);
     // Height-gated on `terminal_height` — the SAME basis `live_ui_height` used to
     // reserve the row — so the reservation and this layout always agree.
     let agent_strip_height = agent_strip_height(app, terminal_height);
@@ -370,6 +383,7 @@ pub fn render_viewport_with_finalization(
             + 1 // status
             + autonomy_height
             + harness_height
+            + decision_height
             + agent_strip_height,
     );
     let menu_height = menu_height_for_viewport(active_menu.as_ref(), area.width, menu_available);
@@ -381,6 +395,7 @@ pub fn render_viewport_with_finalization(
             Constraint::Length(menu_height),
             Constraint::Length(autonomy_height),
             Constraint::Length(harness_height),
+            Constraint::Length(decision_height),
             Constraint::Length(composer_height),
             Constraint::Length(agent_strip_height),
             Constraint::Length(1),
@@ -402,20 +417,26 @@ pub fn render_viewport_with_finalization(
         menu_render::render_menu_surface(frame, root[1], menu, palette);
     }
     if autonomy_height > 0 {
-        frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
+        frame.render_widget(
+            render_autonomy_indicator(app, palette, root[2].width),
+            root[2],
+        );
     }
     if harness_height > 0 {
         render_harness_status_row(frame, app, palette, root[3]);
     }
-    frame.render_widget(render_composer(app, palette, root[4]), root[4]);
-    set_composer_cursor(frame, app, root[4]);
+    if decision_height > 0 {
+        frame.render_widget(render_decision_banner(app, palette), root[4]);
+    }
+    frame.render_widget(render_composer(app, palette, root[5]), root[5]);
+    set_composer_cursor(frame, app, root[5]);
     if agent_strip_height > 0 {
         frame.render_widget(
-            render_agent_strip(app, palette, root[5].height.saturating_sub(1)),
-            root[5],
+            render_agent_strip(app, palette, root[6].height.saturating_sub(1)),
+            root[6],
         );
     }
-    frame.render_widget(render_status(app, palette), root[6]);
+    frame.render_widget(render_status(app, palette), root[7]);
 }
 
 /// The live (uncommitted / in-flight) transcript tail rendered inside the
@@ -1448,10 +1469,16 @@ fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palet
         menu_render::render_menu_surface(frame, areas.menu, menu, palette);
     }
     if areas.autonomy.height > 0 {
-        frame.render_widget(render_autonomy_indicator(app, palette), areas.autonomy);
+        frame.render_widget(
+            render_autonomy_indicator(app, palette, areas.autonomy.width),
+            areas.autonomy,
+        );
     }
     if areas.harness.height > 0 {
         render_harness_status_row(frame, app, palette, areas.harness);
+    }
+    if areas.decision.height > 0 {
+        frame.render_widget(render_decision_banner(app, palette), areas.decision);
     }
     frame.render_widget(
         render_composer(app, palette, areas.composer),
@@ -1473,6 +1500,9 @@ pub struct ChatLayoutAreas {
     pub menu: Rect,
     pub autonomy: Rect,
     pub harness: Rect,
+    /// Parked-decision watchdog banner, directly above the composer (0-height
+    /// until a turn has been parked on a decision past the escalation threshold).
+    pub decision: Rect,
     pub composer: Rect,
     /// Sub-agent selector strip, directly under the composer (0-height when the
     /// session has no sub-agents).
@@ -2151,14 +2181,16 @@ fn chat_layout_areas_for_menu(
 ) -> ChatLayoutAreas {
     let composer_height = composer_height_for_size(app, area.width, area.height);
     let desired_menu_height = menu_height_hint(active_menu, area.width, area.height);
-    let autonomy_height = autonomy_indicator_height(app);
+    let autonomy_height = autonomy_indicator_height(app, area.width);
     let harness_height = harness_status_height(app);
+    let decision_height = decision_banner_height(app);
     let agent_strip_height = agent_strip_height(app, area.height);
     let surface_budget = area.height.saturating_sub(
         min_transcript_height(area.height)
             + composer_height
             + autonomy_height
             + harness_height
+            + decision_height
             + agent_strip_height
             + 1,
     );
@@ -2170,6 +2202,7 @@ fn chat_layout_areas_for_menu(
             Constraint::Length(menu_height),
             Constraint::Length(autonomy_height),
             Constraint::Length(harness_height),
+            Constraint::Length(decision_height),
             Constraint::Length(composer_height),
             Constraint::Length(agent_strip_height),
             Constraint::Length(1),
@@ -2181,9 +2214,10 @@ fn chat_layout_areas_for_menu(
         menu: root[1],
         autonomy: root[2],
         harness: root[3],
-        composer: root[4],
-        agent_strip: root[5],
-        status: root[6],
+        decision: root[4],
+        composer: root[5],
+        agent_strip: root[6],
+        status: root[7],
     }
 }
 
@@ -2367,7 +2401,7 @@ fn render_inspector_layout(frame: &mut impl FrameLike, app: &AppState, palette: 
         frame.area().width,
         frame.area().height,
     );
-    let autonomy_height = autonomy_indicator_height(app);
+    let autonomy_height = autonomy_indicator_height(app, frame.area().width);
     let harness_height = harness_status_height(app);
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -2419,7 +2453,10 @@ fn render_inspector_layout(frame: &mut impl FrameLike, app: &AppState, palette: 
         menu_render::render_menu_surface(frame, root[1], menu, palette);
     }
     if autonomy_height > 0 {
-        frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
+        frame.render_widget(
+            render_autonomy_indicator(app, palette, root[2].width),
+            root[2],
+        );
     }
     if harness_height > 0 {
         render_harness_status_row(frame, app, palette, root[3]);
@@ -2443,7 +2480,7 @@ fn render_tasks_dock_layout(frame: &mut impl FrameLike, app: &AppState, palette:
         frame.area().width,
         frame.area().height,
     );
-    let autonomy_height = autonomy_indicator_height(app);
+    let autonomy_height = autonomy_indicator_height(app, frame.area().width);
     let harness_height = harness_status_height(app);
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -2469,7 +2506,10 @@ fn render_tasks_dock_layout(frame: &mut impl FrameLike, app: &AppState, palette:
         menu_render::render_menu_surface(frame, root[1], menu, palette);
     }
     if autonomy_height > 0 {
-        frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
+        frame.render_widget(
+            render_autonomy_indicator(app, palette, root[2].width),
+            root[2],
+        );
     }
     if harness_height > 0 {
         render_harness_status_row(frame, app, palette, root[3]);
@@ -3760,13 +3800,12 @@ fn push_turn_flow(
         );
     }
 
-    if let Some(approval) = app.approval.as_ref().filter(|approval| approval.visible) {
-        push_inline_approval_card(lines, palette, approval);
-    }
-
-    if let Some(picker) = app.user_question.as_ref().filter(|picker| picker.visible) {
-        push_inline_user_question_card(lines, palette, picker, width);
-    }
+    // The pending approval / AskUserQuestion card renders LAST in the turn flow
+    // (see `push_pending_decision_cards` at the end of this fn) so it sits at the
+    // BOTTOM of the height-clipped live tail — the always-visible region. It used
+    // to render HERE (first), so on a turn with lots of streamed output the card
+    // scrolled off the top while still pending and still owning the keyboard,
+    // leaving the user with a bare "Waiting" and no visible prompt.
 
     // `/btw` aside renders as a floating overlay pinned to the TOP of the live
     // viewport (see `render_btw_overlay`), not inline here — otherwise it
@@ -3823,6 +3862,32 @@ fn push_turn_flow(
 
     if live_turn_diff_preview_visible(app) {
         push_inline_diff_preview(lines, palette, &app.diff_preview, app.expanded_tool_outputs);
+    }
+
+    // Pinned LAST: a parked decision's card is the bottom-most turn-flow content,
+    // so the height-clipped live tail (which keeps its bottom rows) always shows
+    // it even when the streamed reply/activity above it overflows the viewport.
+    push_pending_decision_cards(lines, palette, app, width);
+}
+
+/// Render the pending approval / AskUserQuestion card into the live tail. Called
+/// last in [`push_turn_flow`] so the card is the bottom-most content and cannot
+/// scroll off the top of the height-clipped tail while the turn is parked on the
+/// operator (the "Waiting, can't type, no visible prompt" trap). Streamed
+/// reply/activity above it clips first. Gated on `visible` exactly as before, so
+/// keyboard ownership (`modal_owns_keyboard`) and rendering stay coupled.
+fn push_pending_decision_cards(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    app: &AppState,
+    width: usize,
+) {
+    if let Some(approval) = app.approval.as_ref().filter(|approval| approval.visible) {
+        push_inline_approval_card(lines, palette, approval);
+    }
+
+    if let Some(picker) = app.user_question.as_ref().filter(|picker| picker.visible) {
+        push_inline_user_question_card(lines, palette, picker, width);
     }
 }
 
@@ -6573,19 +6638,35 @@ fn push_turn_activity_log_section(
     wrap_width: usize,
 ) {
     let summary = app.turn_summary_for(&log.turn_id);
-    // A tool-less turn carries only a summary (no activity items); still render
-    // its report. Nothing at all to show only when both are absent.
-    if log.items.is_empty() && summary.is_none() {
+    // A FINALIZED render targets IMMUTABLE scrollback, so it must record only
+    // the turn's TERMINAL activity — a still-running item would freeze an
+    // in-progress "Orchestrating… (N active)" chip there and strand a second
+    // copy above the live chip (the same failure `push_finalized_activity_items_section`
+    // guards). #342 stripped the volatile sub-agent titles here but still fed
+    // the running item into the header counts. Drop running items on the
+    // finalized path; the live/overlay render (`finalized == false`) keeps them.
+    let items: Vec<&ActivityItem> = if finalized {
+        log.items
+            .iter()
+            .filter(|item| !is_running_activity(item))
+            .collect()
+    } else {
+        log.items.iter().collect()
+    };
+    // A tool-less turn (or a finalized turn whose only items are still running)
+    // carries only a summary; still render its report. Nothing at all to show
+    // only when both are absent.
+    if items.is_empty() && summary.is_none() {
         return;
     }
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
-    if !log.items.is_empty() {
+    if !items.is_empty() {
         let shown_limit = if app.expanded_tool_outputs { 12 } else { 3 };
         // Full uncapped set (header counts + footer tally both derive from this
         // via `task_group_counts`, so they cannot diverge).
-        let full = log.items.iter().collect::<Vec<_>>();
+        let full = items;
         let shown = full
             .iter()
             .rev()
@@ -6734,7 +6815,26 @@ fn push_finalized_activity_items_section(
     items: &[&ActivityItem],
     wrap_width: usize,
 ) {
-    if items.is_empty() {
+    // This section targets IMMUTABLE scrollback, which can never be reclaimed
+    // (`CSI 2J` clears only the visible screen). So it must record only
+    // TERMINAL items — never one that is still RUNNING. A running item flushed
+    // here makes the chip header read "Orchestrating… (N active)" with its
+    // spinner frozen at flush time, and that copy strands one frame behind the
+    // LIVE aggregate chip below: two "Orchestrating" lines for the same turn,
+    // different braille glyphs (the third face of the "duplicated
+    // orchestrating" bug, after #339/#342). It reaches here via the covered
+    // late-activity flush (`finalized_late_activity_lines_for_coverages` /
+    // `push_turn_activity_log_section_unflushed`), whose UNFLUSHED item set is
+    // NOT pre-filtered by run state. Drop running items: they stay in the live
+    // tail (repainted every frame) and are flushed only once they settle.
+    // (`finalized_live_turn_lines_between` already pre-filters to non-running
+    // items, so this is a no-op on that path.)
+    let terminal_items: Vec<&ActivityItem> = items
+        .iter()
+        .copied()
+        .filter(|item| !is_running_activity(item))
+        .collect();
+    if terminal_items.is_empty() {
         return;
     }
     if !lines.is_empty() && !line_is_blank(lines.last()) {
@@ -6744,8 +6844,8 @@ fn push_finalized_activity_items_section(
         lines,
         palette,
         turn_id,
-        items,
-        items,
+        &terminal_items,
+        &terminal_items,
         &[],
         0,
         false,
@@ -8195,6 +8295,13 @@ fn active_session_autonomy(app: &AppState) -> Option<&SessionAutonomyState> {
     app.session_autonomy_for(&session.id)
 }
 
+/// Whether the active session currently has a goal in its autonomy mirror.
+/// Gates the Ctrl+G fold toggle so the key is only claimed when the ◆ Goal
+/// banner is actually showing (otherwise it falls through, unswallowed).
+pub(crate) fn active_session_has_goal(app: &AppState) -> bool {
+    active_session_autonomy(app).is_some_and(|state| state.goal.is_some())
+}
+
 /// Number of rows the sticky autonomy indicator needs: 0 when both goal
 /// and loops are absent, 1 when only one is present, 2 when both are.
 /// Max plan items rendered in the sticky panel before collapsing to a
@@ -8218,36 +8325,130 @@ fn plan_panel_rows(plan: &octos_core::ui_protocol::UiPlanRecord) -> u16 {
 /// column wrapping needs the render width, which the height reservation can't
 /// see); a trailing "…" marks an objective longer than the cap. Shared by the
 /// height reservation and the render so they always agree on row count.
-const GOAL_OBJECTIVE_MAX_ROWS: usize = 3;
-const GOAL_OBJECTIVE_CHARS_PER_ROW: usize = 56;
+///
+/// The cap is generous (≈ 20 rows × 56 chars ≈ 1.1k chars) so a realistic
+/// extensive `/goal` prompt renders in FULL — a 3-row cap (the first pass) still
+/// clipped long objectives with a "…", which users reported. The ceiling exists
+/// only so a pathological multi-KB objective can't shove the composer off screen
+/// (the overall live-UI height clamp bounds it further).
+const GOAL_OBJECTIVE_MAX_ROWS: usize = 20;
+/// Wrapping floor: even on a very narrow terminal the objective wraps at a sane
+/// minimum rather than collapsing toward one char per row.
+const GOAL_OBJECTIVE_MIN_WIDTH: usize = 24;
 
-fn goal_objective_chunks(objective: &str) -> Vec<String> {
+/// Width available for objective text: the render area width minus the banner's
+/// glyph/prefix gutter (`{glyph} ` on row 1) or the matching continuation indent
+/// — both are `goal_prefix + 2` columns. Threading the real width in (rather than
+/// the old fixed 56) lets the objective use the FULL terminal width; the height
+/// reservation and the render call this with the same width so their row counts
+/// stay in lock-step.
+fn goal_objective_body_width(width: u16) -> usize {
+    let indent = t!("app.autonomy.goal_prefix").chars().count() + 2;
+    (width as usize)
+        .saturating_sub(indent)
+        .max(GOAL_OBJECTIVE_MIN_WIDTH)
+}
+
+/// The status/budget parenthetical trailing the objective (e.g.
+/// "(active · 0K/2000K tokens)"). Built in ONE place so the height reservation
+/// and the render agree on its width when deciding whether it fits the last row.
+fn goal_meta_parenthetical(goal: &octos_core::ui_protocol::UiGoalRecord) -> String {
+    let (_, status_label) = goal_status_display(&goal.status);
+    t!(
+        "app.autonomy.goal_meta",
+        status = status_label,
+        used = format_tokens_k(goal.tokens_used),
+        budget = format_tokens_k(goal.token_budget)
+    )
+    .into_owned()
+}
+
+/// Wrap a goal objective into up to [`GOAL_OBJECTIVE_MAX_ROWS`] display chunks at
+/// the given render `width`. `tail_len` is the trailing parenthetical's column
+/// count: when the objective fits within the cap but the parenthetical wouldn't
+/// fit after the final row, an empty trailing chunk is appended so the
+/// parenthetical renders on its own indented line instead of being clipped off
+/// the right edge. Shared by the height reservation and the render so they always
+/// agree on the row count.
+fn goal_objective_chunks(objective: &str, width: u16, tail_len: usize) -> Vec<String> {
     let objective = objective.trim();
     if objective.is_empty() {
         return Vec::new();
     }
+    let body = goal_objective_body_width(width);
     let chars: Vec<char> = objective.chars().collect();
     let mut chunks: Vec<String> = chars
-        .chunks(GOAL_OBJECTIVE_CHARS_PER_ROW)
+        .chunks(body)
         .take(GOAL_OBJECTIVE_MAX_ROWS)
         .map(|c| c.iter().collect())
         .collect();
-    if chars.len() > GOAL_OBJECTIVE_MAX_ROWS * GOAL_OBJECTIVE_CHARS_PER_ROW {
+    if chars.len() > GOAL_OBJECTIVE_MAX_ROWS * body {
+        // Objective longer than the cap: mark the clip. The parenthetical rides
+        // the (full) last row; the cap already bounds height.
         if let Some(last) = chunks.last_mut() {
             last.push('…');
+        }
+    } else if tail_len > 0 {
+        // Objective fits: keep the status/budget parenthetical fully on-screen —
+        // if it won't fit after the final objective row, give it its own indented
+        // line (only while row budget remains).
+        let last_len = chunks.last().map(|c| c.chars().count()).unwrap_or(0);
+        if last_len + 1 + tail_len > body && chunks.len() < GOAL_OBJECTIVE_MAX_ROWS {
+            chunks.push(String::new());
         }
     }
     chunks
 }
 
-fn autonomy_indicator_height(app: &AppState) -> u16 {
+/// Auto-fold threshold: a goal whose objective wraps to MORE than this many rows
+/// at the render width is folded to one compact row by DEFAULT (Ctrl+G expands),
+/// so a huge pasted objective can't dominate the banner. A 1–3 row goal shows in
+/// full — short goals never look truncated. Only consulted while the fold
+/// preference is [`GoalObjectiveFold::Auto`]; an explicit Ctrl+G choice wins.
+const GOAL_FOLD_AUTO_MAX_ROWS: usize = 3;
+
+/// Minimum columns the folded preview keeps even on a narrow terminal, so a
+/// sliver of the objective is always legible before the `…`.
+const GOAL_FOLD_PREVIEW_MIN: usize = 8;
+
+/// Resolve the EFFECTIVE fold for the goal objective and record it on `app` so
+/// Ctrl+G ([`AppState::toggle_goal_objective_fold`]) can flip whatever is on
+/// screen. `Auto` folds a long objective (wraps beyond
+/// [`GOAL_FOLD_AUTO_MAX_ROWS`] rows at `width`) and shows a short one in full; an
+/// explicit fold choice always wins. Both the height reservation and the render
+/// call this with the SAME width, so their fold decision — hence their row count
+/// — always agree (the banner's reserve==render discipline).
+fn goal_objective_folded(app: &AppState, objective: &str, width: u16) -> bool {
+    let folded = match app.goal_objective_fold {
+        GoalObjectiveFold::Folded => true,
+        GoalObjectiveFold::Unfolded => false,
+        GoalObjectiveFold::Auto => {
+            goal_objective_chunks(objective, width, 0).len() > GOAL_FOLD_AUTO_MAX_ROWS
+        }
+    };
+    app.goal_objective_folded_effective.set(folded);
+    folded
+}
+
+fn autonomy_indicator_height(app: &AppState, width: u16) -> u16 {
     match active_session_autonomy(app) {
         Some(state) => {
             let mut rows = 0u16;
             if let Some(goal) = state.goal.as_ref() {
-                // At least one row (glyph + status even when the objective is
-                // empty); otherwise the wrapped-objective row count.
-                let obj_rows = goal_objective_chunks(&goal.objective).len().max(1);
+                // Folded: exactly ONE compact row (glyph + preview + parenthetical
+                // + hint). Unfolded: at least one row (glyph + status even when the
+                // objective is empty), otherwise the wrapped-objective row count.
+                // MUST use the same fold decision + width + parenthetical length as
+                // the render so the reserved height matches the rendered rows
+                // exactly (reserve==render).
+                let obj_rows = if goal_objective_folded(app, &goal.objective, width) {
+                    1
+                } else {
+                    let tail = goal_meta_parenthetical(goal).chars().count();
+                    goal_objective_chunks(&goal.objective, width, tail)
+                        .len()
+                        .max(1)
+                };
                 rows += obj_rows as u16;
             }
             if state.loops.iter().any(autonomy_loop_is_active) {
@@ -8354,59 +8555,69 @@ fn goal_status_display(status: &str) -> (&'static str, String) {
     }
 }
 
-fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> {
+fn autonomy_indicator_lines(app: &AppState, palette: Palette, width: u16) -> Vec<Line<'static>> {
     let Some(state) = active_session_autonomy(app) else {
         return Vec::new();
     };
     let mut lines = Vec::new();
     if let Some(goal) = state.goal.as_ref() {
-        let (glyph, status_label) = goal_status_display(&goal.status);
-        let parenthetical = t!(
-            "app.autonomy.goal_meta",
-            status = status_label,
-            used = format_tokens_k(goal.tokens_used),
-            budget = format_tokens_k(goal.token_budget)
-        )
-        .into_owned();
-        // The objective wraps across up to GOAL_OBJECTIVE_MAX_ROWS lines so the
-        // full goal is visible (a raw `/goal` request can be hundreds of chars).
-        // Row count here MUST match `autonomy_indicator_height`'s reservation —
-        // both derive from `goal_objective_chunks`.
-        let mut chunks = goal_objective_chunks(&goal.objective);
-        if chunks.is_empty() {
-            chunks.push(goal.goal_id.clone());
-        }
-        let last = chunks.len() - 1;
-        let indent = " ".repeat(t!("app.autonomy.goal_prefix").chars().count() + 2);
-        for (idx, chunk) in chunks.into_iter().enumerate() {
-            let mut spans = Vec::new();
-            if idx == 0 {
-                spans.push(Span::styled(
-                    format!("{glyph} "),
-                    Style::default()
-                        .fg(palette.accent)
-                        .add_modifier(Modifier::BOLD)
-                        .bg(palette.surface),
-                ));
-                spans.push(Span::styled(
-                    t!("app.autonomy.goal_prefix").to_string(),
-                    palette.title().bg(palette.surface),
-                ));
-            } else {
-                spans.push(Span::styled(
-                    indent.clone(),
-                    palette.text().bg(palette.surface),
-                ));
+        let (glyph, _status_label) = goal_status_display(&goal.status);
+        let parenthetical = goal_meta_parenthetical(goal);
+        // Folded (default for a long objective, or after Ctrl+G): ONE compact
+        // row. The fold decision MUST match `autonomy_indicator_height` — both
+        // call `goal_objective_folded` with the same width (reserve==render).
+        // Loops/plan rows still render below, exactly as in the unfolded case.
+        if goal_objective_folded(app, &goal.objective, width) {
+            lines.push(goal_folded_line(
+                goal,
+                glyph,
+                &parenthetical,
+                palette,
+                width,
+            ));
+        } else {
+            // The objective wraps across up to GOAL_OBJECTIVE_MAX_ROWS lines at
+            // the FULL render width so the whole goal is visible (a raw `/goal`
+            // request can be hundreds of chars). Row count here MUST match
+            // `autonomy_indicator_height`'s reservation — both derive from
+            // `goal_objective_chunks` with the same width + parenthetical length.
+            let mut chunks =
+                goal_objective_chunks(&goal.objective, width, parenthetical.chars().count());
+            if chunks.is_empty() {
+                chunks.push(goal.goal_id.clone());
             }
-            spans.push(Span::styled(chunk, palette.text().bg(palette.surface)));
-            // The status/budget parenthetical rides the FINAL objective line.
-            if idx == last {
-                spans.push(Span::styled(
-                    parenthetical.clone(),
-                    palette.muted().bg(palette.surface),
-                ));
+            let last = chunks.len() - 1;
+            let indent = " ".repeat(t!("app.autonomy.goal_prefix").chars().count() + 2);
+            for (idx, chunk) in chunks.into_iter().enumerate() {
+                let mut spans = Vec::new();
+                if idx == 0 {
+                    spans.push(Span::styled(
+                        format!("{glyph} "),
+                        Style::default()
+                            .fg(palette.accent)
+                            .add_modifier(Modifier::BOLD)
+                            .bg(palette.surface),
+                    ));
+                    spans.push(Span::styled(
+                        t!("app.autonomy.goal_prefix").to_string(),
+                        palette.title().bg(palette.surface),
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        indent.clone(),
+                        palette.text().bg(palette.surface),
+                    ));
+                }
+                spans.push(Span::styled(chunk, palette.text().bg(palette.surface)));
+                // The status/budget parenthetical rides the FINAL objective line.
+                if idx == last {
+                    spans.push(Span::styled(
+                        parenthetical.clone(),
+                        palette.muted().bg(palette.surface),
+                    ));
+                }
+                lines.push(Line::from(spans));
             }
-            lines.push(Line::from(spans));
         }
     }
     // The loops row shows only while something is actually FIRING: a
@@ -8461,6 +8672,76 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
         lines.extend(plan_indicator_lines(plan, palette));
     }
     lines
+}
+
+/// Render the ◆ Goal banner folded to ONE compact row:
+/// `{glyph} Goal: {preview}… {(status · used/budget tokens)} · Ctrl+G expand`.
+/// Used when the objective is folded (default for a long objective, or after
+/// Ctrl+G). Always exactly one line, matching `autonomy_indicator_height`'s
+/// folded reservation of a single row (reserve==render). The banner Paragraph
+/// CLIPS rather than wraps, so the preview is budgeted to leave room for the
+/// parenthetical and the hint — a long objective is truncated, its status/budget
+/// and the expand hint stay on-screen.
+fn goal_folded_line(
+    goal: &octos_core::ui_protocol::UiGoalRecord,
+    glyph: &str,
+    parenthetical: &str,
+    palette: Palette,
+    width: u16,
+) -> Line<'static> {
+    let prefix = t!("app.autonomy.goal_prefix");
+    let hint = t!("app.autonomy.goal_fold_hint");
+    // Reserve the fixed columns (glyph+space, prefix, `…`, parenthetical, hint)
+    // so the objective preview — not the trailing status/hint — is what gets
+    // truncated when the goal is long.
+    let reserved = prefix.chars().count()
+        + 2 // "{glyph} "
+        + 1 // the trailing "…"
+        + parenthetical.chars().count()
+        + hint.chars().count();
+    let budget = (width as usize)
+        .saturating_sub(reserved)
+        .max(GOAL_FOLD_PREVIEW_MIN);
+    let first_line = goal.objective.trim().lines().next().unwrap_or("").trim();
+    let mut preview: String = first_line.chars().take(budget).collect();
+    // Ellipsis when the preview doesn't show the whole objective (truncated
+    // first line, or there is more than one line).
+    let truncated = preview.chars().count() < first_line.chars().count()
+        || goal.objective.trim().lines().nth(1).is_some();
+    // Drop trailing whitespace so `word …` reads cleanly.
+    while preview.ends_with(char::is_whitespace) {
+        preview.pop();
+    }
+    if preview.is_empty() {
+        // Objective empty (or all whitespace): fall back to the goal id so the
+        // row is never a bare glyph, mirroring the unfolded empty-objective case.
+        preview = goal.goal_id.clone();
+    }
+    let mut spans = vec![
+        Span::styled(
+            format!("{glyph} "),
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+                .bg(palette.surface),
+        ),
+        Span::styled(prefix.to_string(), palette.title().bg(palette.surface)),
+        Span::styled(preview, palette.text().bg(palette.surface)),
+    ];
+    if truncated {
+        spans.push(Span::styled("…", palette.text().bg(palette.surface)));
+    }
+    // `parenthetical` already carries a leading space (`" (…)"`); the hint carries
+    // its own ` · ` separator — so they read `… (active · …) · Ctrl+G expand`.
+    spans.push(Span::styled(
+        parenthetical.to_string(),
+        palette.muted().bg(palette.surface),
+    ));
+    spans.push(Span::styled(
+        hint.to_string(),
+        palette.muted().bg(palette.surface),
+    ));
+    Line::from(spans)
 }
 
 /// Render the model-authored plan/todo checklist as a header line
@@ -8553,8 +8834,8 @@ fn plan_indicator_lines(
     lines
 }
 
-fn render_autonomy_indicator(app: &AppState, palette: Palette) -> Paragraph<'static> {
-    let lines = autonomy_indicator_lines(app, palette);
+fn render_autonomy_indicator(app: &AppState, palette: Palette, width: u16) -> Paragraph<'static> {
+    let lines = autonomy_indicator_lines(app, palette, width);
     Paragraph::new(Text::from(lines)).style(Style::default().fg(palette.text).bg(palette.surface))
 }
 
@@ -9810,6 +10091,81 @@ fn hint_bar_text(model: HintBarModel) -> String {
     }
 }
 
+/// The `(session, turn)` of the operator decision the active session's turn is
+/// parked on — a pending tool approval or an `AskUserQuestion` picker — if any.
+/// This is authoritative for interrupting a parked turn: the decision carries its
+/// own `turn_id`, so it works even when `active_turn()` is `None` (a decision can
+/// park a turn before any reply streams, so there is no `live_reply` for
+/// `active_turn` to key off).
+pub(crate) fn active_session_pending_decision_turn(app: &AppState) -> Option<(SessionKey, TurnId)> {
+    let session_id = app.active_session().map(|session| session.id.clone())?;
+    if let Some(approval) = app
+        .approval
+        .as_ref()
+        .filter(|approval| approval.session_id == session_id)
+    {
+        return Some((approval.session_id.clone(), approval.turn_id.clone()));
+    }
+    app.user_question
+        .as_ref()
+        .filter(|question| question.session_id == session_id)
+        .map(|question| (question.session_id.clone(), question.turn_id.clone()))
+}
+
+/// True when the active session's turn is parked on an operator decision — a
+/// pending tool approval or an `AskUserQuestion` picker. While this holds the
+/// decision modal owns the keyboard (y/s/n) so the composer is locked; the modal
+/// can also scroll out of the height-clipped live tail, leaving the user with a
+/// bare "Waiting" and no visible prompt — so the status bar must advertise the
+/// recovery keys (Alt+A to bring the prompt back, Ctrl+C to interrupt).
+pub(crate) fn active_session_has_pending_decision(app: &AppState) -> bool {
+    active_session_pending_decision_turn(app).is_some()
+}
+
+/// Seconds a turn may sit parked on an operator decision before the watchdog
+/// escalates. The escalation re-shows a hidden modal and paints a prominent
+/// banner above the composer; it NEVER auto-answers or auto-interrupts — a
+/// human-approval gate must wait for the human.
+pub(crate) const PARKED_DECISION_ESCALATE_SECS: u64 = 60;
+
+/// `Some(elapsed_secs)` once the active session has been parked on a decision for
+/// at least [`PARKED_DECISION_ESCALATE_SECS`]. Elapsed is derived from the SAME
+/// source as the status bar's "11m 12s" (`run_state_elapsed_secs`, a monotonic
+/// `Instant`), so the banner and the status agree and the threshold check stays
+/// deterministic in tests.
+pub(crate) fn parked_decision_escalation_secs(app: &AppState) -> Option<u64> {
+    if !active_session_has_pending_decision(app) {
+        return None;
+    }
+    app.run_state_elapsed_secs()
+        .filter(|elapsed| *elapsed >= PARKED_DECISION_ESCALATE_SECS)
+}
+
+/// Rows reserved for the parked-decision escalation banner (one line, styled as a
+/// solid attention band above the composer). Zero until the escalation fires.
+/// Reserved height equals the rendered rows — one — so the layout reservation and
+/// [`render_decision_banner`] agree (same discipline as the autonomy indicator).
+fn decision_banner_height(app: &AppState) -> u16 {
+    u16::from(parked_decision_escalation_secs(app).is_some())
+}
+
+fn render_decision_banner(app: &AppState, palette: Palette) -> Paragraph<'static> {
+    let elapsed = parked_decision_escalation_secs(app).unwrap_or(0);
+    let text = t!(
+        "app.statusbar.parked_decision_banner",
+        elapsed = format_elapsed_secs(elapsed)
+    )
+    .into_owned();
+    Paragraph::new(Line::from(Span::styled(
+        format!(" {text} "),
+        Style::default()
+            .fg(palette.text)
+            .bg(palette.danger_bg)
+            .add_modifier(Modifier::BOLD),
+    )))
+    .style(Style::default().bg(palette.danger_bg))
+}
+
 fn status_bar_work_text(app: &AppState) -> String {
     let mut parts = Vec::new();
     match &app.run_state {
@@ -9828,7 +10184,14 @@ fn status_bar_work_text(app: &AppState) -> String {
         parts.push(t!("app.statusbar.background_tasks", count = background_tasks).into_owned());
         parts.push(t!("app.statusbar.ps_to_view").into_owned());
     }
-    if app.active_turn().is_some() {
+    if active_session_has_pending_decision(app) {
+        // Turn parked on YOUR decision; the approval/question card may have
+        // scrolled out of the clipped live tail, so a bare "Esc interrupt" (a
+        // two-step while a modal is up) is a dead end. Advertise the real
+        // recovery keys instead — shown whenever a decision is pending, not just
+        // when an active turn is reported.
+        parts.push(t!("app.statusbar.pending_decision_help").into_owned());
+    } else if app.active_turn().is_some() {
         parts.push(t!("app.statusbar.esc_interrupt").into_owned());
         parts.push(t!("app.statusbar.stop_to_close").into_owned());
     }
@@ -11361,6 +11724,64 @@ mod tests {
             status_row.contains("Working"),
             "resolved decision returns to Working: {status_row:?}"
         );
+    }
+
+    #[test]
+    fn status_work_text_advertises_recovery_keys_when_a_decision_is_pending() {
+        // Regression: a turn parked on an approval/question locks the composer and
+        // its card can scroll off the clipped live tail — leaving a bare "Waiting"
+        // with only the (two-step) Esc hint. The work text must instead advertise
+        // Alt+A (bring the prompt back) and Ctrl+C (one-press interrupt).
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "t".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.run_state = SessionRunState::Blocked {
+            message: "Run command".into(),
+        };
+        // No pending decision → no recovery hint.
+        assert!(!status_bar_work_text(&app).contains("Alt+A"));
+
+        // Park the active session on an approval (even collapsed/hidden).
+        app.approval = Some(ApprovalModalState {
+            session_id: session_id.clone(),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            title: "Run".into(),
+            body: "approve?".into(),
+            approval_kind: None,
+            risk: None,
+            typed_details: None,
+            render_hints: None,
+            visible: false,
+        });
+        let work = status_bar_work_text(&app);
+        assert!(
+            work.contains("Alt+A") && work.contains("Ctrl+C"),
+            "a parked decision must advertise the recovery keys: {work:?}"
+        );
+        assert!(
+            !work.contains("Esc interrupt"),
+            "the dead-end Esc hint is replaced while a decision is pending: {work:?}"
+        );
+
+        // A decision on ANOTHER session must not hijack this session's hint.
+        if let Some(approval) = app.approval.as_mut() {
+            approval.session_id = SessionKey("local:other".into());
+        }
+        assert!(!status_bar_work_text(&app).contains("Alt+A"));
     }
 
     #[test]
@@ -14172,7 +14593,7 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("Large paste collapsed"));
-        assert!(text.contains("[paste] Pasted block"));
+        assert!(text.contains("[paste] 40 lines"));
         assert!(text.contains("preview: paste-line-01"));
         assert!(!text.contains("paste-line-40"));
         assert!(text.contains("Composer"));
@@ -15005,6 +15426,132 @@ mod tests {
         assert!(
             flushed.contains("Agent task completed"),
             "the flushed turn-card records the parent turn's terminal outcome: {flushed:?}"
+        );
+    }
+
+    #[test]
+    fn covered_late_activity_flush_of_running_item_is_terminal_not_orchestrating() {
+        // Third face of the "duplicated orchestrating" bug (after #339/#342):
+        // the covered late-activity scrollback flush
+        // (`finalized_late_activity_lines_for_coverages` ->
+        // `push_turn_activity_log_section_unflushed` ->
+        // `push_finalized_activity_items_section`) receives the turn's UNFLUSHED
+        // items WITHOUT filtering by run state, so a still-RUNNING item (e.g. a
+        // long `Bash($ sleep 45 …)` that keeps the turn live) was baked into
+        // IMMUTABLE scrollback as "Orchestrating… (1 active)" with its spinner
+        // frozen. That copy strands one frame behind the LIVE aggregate chip:
+        // two "Orchestrating" lines, same turn, different braille glyphs. The
+        // finalized flush must record only TERMINAL activity; running items stay
+        // in the live tail until they settle.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run the pipeline")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            request: Some("run".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "running")
+                    .with_turn(turn_id.clone()),
+            ],
+        });
+
+        let coverage = LiveTurnFinalization {
+            session_id: session_id.0.clone(),
+            turn_id: turn_id.0.to_string(),
+            reply_flushed_text: "streamed prefix".into(),
+            activity_flushed_items: 0,
+            activity_flushed_keys: Vec::new(),
+        };
+        let flushed: String = finalized_late_activity_lines_for_coverages(
+            &app,
+            Palette::for_theme(ThemeName::Slate),
+            100,
+            &[coverage],
+        )
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect();
+        assert!(
+            !flushed.contains("Orchestrating"),
+            "immutable scrollback must not bake an in-progress Orchestrating chip: {flushed:?}"
+        );
+        assert!(
+            !flushed.contains("· 1 active"),
+            "a running item must not bake a live '1 active' count into scrollback: {flushed:?}"
+        );
+    }
+
+    #[test]
+    fn finalized_turn_card_flush_with_running_item_is_terminal_not_orchestrating() {
+        // Companion to the covered late-activity guard: the committed turn-card
+        // flush (`finalized_history_lines` -> `push_turn_activity_log_section`
+        // with `finalized = true`) also fed the running item into the header
+        // counts, so a turn whose committed log still carried a running item
+        // baked "Orchestrating… (1 active)" into immutable scrollback. #342
+        // stripped the sub-agent titles here but not the running-item count.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run the long job")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_id.clone(),
+            request: Some("run".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_id.clone())
+                    .with_success(true),
+                ActivityItem::new(ActivityKind::Tool, "shell", "running").with_turn(turn_id),
+            ],
+        });
+
+        let flushed: String =
+            finalized_history_lines(&app, Palette::for_theme(ThemeName::Slate), 100)
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect();
+        assert!(
+            !flushed.contains("Orchestrating"),
+            "the finalized turn-card must not bake an in-progress chip: {flushed:?}"
+        );
+        assert!(
+            !flushed.contains("· 1 active"),
+            "immutable scrollback must not freeze a live '1 active' count: {flushed:?}"
+        );
+        // The terminal (completed) item is still recorded.
+        assert!(
+            flushed.contains("Agent task completed"),
+            "the settled portion of the turn still records its terminal outcome: {flushed:?}"
         );
     }
 
@@ -16750,6 +17297,125 @@ mod tests {
     }
 
     #[test]
+    fn pending_decision_card_stays_visible_when_the_live_tail_overflows() {
+        // The reported trap: a turn parked on an approval streams a wall of output
+        // that pushes the (top-rendered) card off the height-clipped live tail, so
+        // the user sees a bare "Waiting" with no prompt and a locked composer. The
+        // card now renders LAST, so it sits in the always-visible bottom region.
+        let streamed: String = (0..60)
+            .map(|idx| format!("streamed line {idx:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run the thing")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: TurnId::new(),
+                    text: streamed,
+                }),
+            }],
+            0,
+            "Working".into(),
+            None,
+            false,
+        );
+        app.approval = Some(ApprovalModalState {
+            session_id: SessionKey("local:test".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            title: "Delete the database".into(),
+            body: "approve?".into(),
+            approval_kind: Some("command".into()),
+            risk: Some("high".into()),
+            typed_details: None,
+            render_hints: None,
+            visible: true,
+        });
+
+        // A short viewport forces the live tail to clip.
+        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Slate), 120, 16);
+        let rows = rendered_rows(&buffer);
+        let screen = rows.join("\n");
+
+        assert!(
+            screen.contains("Approval Requested") && screen.contains("y = approve this command"),
+            "the parked-decision card must survive live-tail clipping: {rows:?}"
+        );
+        // Prove the tail actually overflowed — the earliest streamed line clipped
+        // off the top, so the card's visibility is not an artifact of everything
+        // fitting on screen.
+        assert!(
+            !screen.contains("streamed line 00"),
+            "expected the live tail to overflow (early streamed line clipped): {rows:?}"
+        );
+    }
+
+    #[test]
+    fn parked_decision_banner_appears_only_after_the_escalation_threshold() {
+        // Fix 3: the watchdog surfaces a prominent banner once a turn has been
+        // parked on a decision past the threshold. Below threshold it reserves no
+        // rows; above threshold it reserves exactly one and advertises recovery.
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "t".into(),
+                profile_id: Some("coding".into()),
+                // A committed message keeps the fresh-launch banner off, so the
+                // normal viewport (with the decision-banner pane) renders.
+                messages: vec![Message::user("run the thing")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.approval = Some(ApprovalModalState {
+            session_id: session_id.clone(),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            title: "Run".into(),
+            body: "approve?".into(),
+            approval_kind: None,
+            risk: None,
+            typed_details: None,
+            render_hints: None,
+            visible: true,
+        });
+        app.run_state = SessionRunState::Blocked {
+            message: "Run command".into(),
+        };
+
+        // Just parked (below threshold): no banner reserved.
+        app.run_state_started_at = Some(std::time::Instant::now());
+        assert_eq!(decision_banner_height(&app), 0);
+
+        // Parked past the threshold: exactly one reserved banner row.
+        app.run_state_started_at = std::time::Instant::now().checked_sub(
+            std::time::Duration::from_secs(PARKED_DECISION_ESCALATE_SECS + 5),
+        );
+        assert_eq!(decision_banner_height(&app), 1);
+        let rows = rendered_rows(&rendered_buffer(&app, Palette::for_theme(ThemeName::Slate)));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Parked on you") && row.contains("Alt+A")),
+            "the escalation banner must advertise the recovery keys: {rows:?}"
+        );
+
+        // No pending decision → no banner even past the threshold.
+        app.approval = None;
+        assert_eq!(decision_banner_height(&app), 0);
+    }
+
+    #[test]
     fn render_compact_blocked_turn_keeps_latest_user_prompt_visible() {
         let mut app = AppState::new(
             vec![SessionView {
@@ -17297,6 +17963,28 @@ mod tests {
             None,
             false,
         )
+    }
+
+    /// An autonomy `AppState` whose active session carries an active goal with
+    /// `objective`; the fold preference stays at its default (`Auto`).
+    fn autonomy_app_with_goal(objective: &str) -> AppState {
+        let mut app = autonomy_app_state();
+        app.set_session_goal(
+            &SessionKey("local:test".into()),
+            Some(octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some("coding".into()),
+                goal_id: "goal_01".into(),
+                objective: objective.into(),
+                status: "active".into(),
+                token_budget: 2_000_000,
+                tokens_used: 0,
+                time_used_seconds: 0,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }),
+            Some("user".into()),
+        );
+        app
     }
 
     fn sample_agent(id: &str, status: &str) -> octos_core::ui_protocol::UiAgentRecord {
@@ -18082,8 +18770,8 @@ mod tests {
     #[test]
     fn render_autonomy_indicator_idle_reserves_no_rows() {
         let app = autonomy_app_state();
-        assert_eq!(autonomy_indicator_height(&app), 0);
-        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        assert_eq!(autonomy_indicator_height(&app, 100), 0);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
         assert!(
             lines.is_empty(),
             "idle state should produce no indicator rows"
@@ -18135,8 +18823,8 @@ mod tests {
         );
 
         // header + 3 item rows, no goal/loops.
-        assert_eq!(autonomy_indicator_height(&app), 4);
-        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        assert_eq!(autonomy_indicator_height(&app, 100), 4);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
         assert_eq!(lines.len(), 4);
 
         let text = rendered_text(&app);
@@ -18170,15 +18858,15 @@ mod tests {
             }],
         });
         app.set_session_plan(&session_id, plan, Some(turn.clone()));
-        assert_eq!(autonomy_indicator_height(&app), 2);
+        assert_eq!(autonomy_indicator_height(&app, 100), 2);
 
         // A completion for a DIFFERENT turn must not clear the panel.
         app.clear_session_plan_for_turn(&session_id, &other_turn);
-        assert_eq!(autonomy_indicator_height(&app), 2);
+        assert_eq!(autonomy_indicator_height(&app, 100), 2);
 
         // The authoring turn's completion clears it.
         app.clear_session_plan_for_turn(&session_id, &turn);
-        assert_eq!(autonomy_indicator_height(&app), 0);
+        assert_eq!(autonomy_indicator_height(&app, 100), 0);
     }
 
     #[test]
@@ -18203,7 +18891,7 @@ mod tests {
             None,
         );
         // header + 8 shown + 1 overflow line.
-        assert_eq!(autonomy_indicator_height(&app), 10);
+        assert_eq!(autonomy_indicator_height(&app, 100), 10);
         assert!(rendered_text(&app).contains("+4 more"));
     }
 
@@ -18369,8 +19057,8 @@ mod tests {
             Some("user".into()),
         );
 
-        assert_eq!(autonomy_indicator_height(&app), 1);
-        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        assert_eq!(autonomy_indicator_height(&app, 100), 1);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
         assert_eq!(lines.len(), 1);
 
         let text = rendered_text(&app);
@@ -18390,10 +19078,13 @@ mod tests {
     #[test]
     fn render_autonomy_indicator_wraps_a_long_objective_across_rows() {
         // mini5: a long `/goal` objective was truncated to one clipped line.
-        // It must now wrap across multiple rows (bounded), and the reserved
-        // height MUST equal the rendered row count (else the banner clips or
-        // strands a blank band).
+        // When UNFOLDED it must wrap across multiple rows (bounded), and the
+        // reserved height MUST equal the rendered row count (else the banner
+        // clips or strands a blank band). (A long objective now folds BY
+        // DEFAULT — see `goal_objective_folds_a_long_objective_by_default` — so
+        // this test drives the explicit unfolded state Ctrl+G produces.)
         let mut app = autonomy_app_state();
+        app.goal_objective_fold = GoalObjectiveFold::Unfolded;
         let session_id = SessionKey("local:test".into());
         let long_objective = "build a react website about the 2026 world cup finals with all 48 \
              teams, players, coaches, photos, group stage and knockout brackets, per-match \
@@ -18415,8 +19106,8 @@ mod tests {
             Some("user".into()),
         );
 
-        let height = autonomy_indicator_height(&app);
-        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        let height = autonomy_indicator_height(&app, 100);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
         assert!(
             height > 1,
             "a long objective must reserve more than one row"
@@ -18436,6 +19127,170 @@ mod tests {
         assert!(
             text.contains("knockout") || text.contains("group stage"),
             "later objective content must be visible via wrapping"
+        );
+    }
+
+    #[test]
+    fn goal_objective_folds_a_long_objective_by_default() {
+        // The user's complaint: a huge pasted objective (shader code) dominated
+        // the banner. With the default `Auto` fold it collapses to ONE compact
+        // preview row — glyph + prefix + truncated preview + `…` + parenthetical
+        // + a Ctrl+G hint — and the reserved height matches (reserve==render).
+        let long = "build a react website about the 2026 world cup finals ".repeat(20);
+        let app = autonomy_app_with_goal(&long);
+        assert_eq!(
+            app.goal_objective_fold,
+            GoalObjectiveFold::Auto,
+            "no explicit toggle yet — the default derives fold from length",
+        );
+
+        let height = autonomy_indicator_height(&app, 100);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
+        assert_eq!(height, 1, "a long objective folds to one row by default");
+        assert_eq!(lines.len(), 1, "reserve==render in the folded state");
+        assert!(
+            app.goal_objective_folded_effective.get(),
+            "the resolver records the effective fold for Ctrl+G",
+        );
+
+        let text = rendered_text(&app);
+        assert!(text.contains("Goal:"), "folded row keeps the goal label");
+        assert!(text.contains('…'), "folded row shows a truncation ellipsis");
+        assert!(
+            text.contains("2000K"),
+            "status/budget parenthetical stays on-screen"
+        );
+        assert!(text.contains("Ctrl+G"), "folded row hints Ctrl+G expands");
+    }
+
+    #[test]
+    fn goal_objective_shows_a_short_goal_in_full_by_default() {
+        // A short goal (≤ the auto threshold of rows) must NEVER look truncated
+        // by default — `Auto` shows it in full, with no ellipsis or expand hint.
+        // A ~200-char objective wraps to 3 rows at width 100 — right at the
+        // boundary that stays unfolded.
+        let app = autonomy_app_with_goal(&"x".repeat(200));
+        let height = autonomy_indicator_height(&app, 100);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
+        assert_eq!(
+            height, 3,
+            "a 3-row goal shows in full (not folded) by default"
+        );
+        assert_eq!(
+            height as usize,
+            lines.len(),
+            "reserve==render when unfolded"
+        );
+        assert!(
+            !app.goal_objective_folded_effective.get(),
+            "a short goal is not folded by default",
+        );
+        let text = rendered_text(&app);
+        assert!(
+            !text.contains("Ctrl+G"),
+            "an unfolded goal shows no expand hint",
+        );
+    }
+
+    #[test]
+    fn goal_fold_reserve_matches_render_in_both_states() {
+        // The reserve==render discipline must hold whether the objective is
+        // folded (default long) or explicitly unfolded — a mismatch clips the
+        // banner or strands a blank band above the composer.
+        let long = "explore the moduli space of stable maps and render every chart ".repeat(12);
+        let mut app = autonomy_app_with_goal(&long);
+
+        // Folded (Auto default for a long objective): exactly one row.
+        assert_eq!(app.goal_objective_fold, GoalObjectiveFold::Auto);
+        let folded_h = autonomy_indicator_height(&app, 90);
+        let folded_lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 90);
+        assert_eq!(folded_h, 1);
+        assert_eq!(
+            folded_h as usize,
+            folded_lines.len(),
+            "folded reserve==render"
+        );
+
+        // Unfolded: many rows, still exactly reserved.
+        app.goal_objective_fold = GoalObjectiveFold::Unfolded;
+        let open_h = autonomy_indicator_height(&app, 90);
+        let open_lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 90);
+        assert!(open_h > 1, "unfolded long objective spans many rows");
+        assert_eq!(
+            open_h as usize,
+            open_lines.len(),
+            "unfolded reserve==render"
+        );
+    }
+
+    #[test]
+    fn toggling_goal_fold_flips_between_compact_and_full() {
+        // Ctrl+G (via `toggle_goal_objective_fold`) flips whatever is on screen:
+        // a folded long goal expands to many rows; toggling again re-folds it.
+        let long = "port the physically based renderer to wgpu with IBL and bloom ".repeat(12);
+        let mut app = autonomy_app_with_goal(&long);
+
+        // Render once so the effective fold (folded, via Auto) is recorded.
+        assert_eq!(autonomy_indicator_height(&app, 100), 1);
+
+        // First toggle → explicit Unfolded → many rows.
+        app.toggle_goal_objective_fold();
+        assert_eq!(app.goal_objective_fold, GoalObjectiveFold::Unfolded);
+        let open_h = autonomy_indicator_height(&app, 100);
+        assert!(open_h > 1, "Ctrl+G expands the folded goal");
+
+        // Second toggle → explicit Folded → back to one row.
+        app.toggle_goal_objective_fold();
+        assert_eq!(app.goal_objective_fold, GoalObjectiveFold::Folded);
+        assert_eq!(
+            autonomy_indicator_height(&app, 100),
+            1,
+            "Ctrl+G re-folds it"
+        );
+    }
+
+    #[test]
+    fn goal_objective_uses_full_width_not_a_fixed_column() {
+        // Regression (mini5): the objective wrapped at a fixed ~half-screen
+        // column (56) regardless of terminal width. It must now wrap to the FULL
+        // render width — a wider terminal fits more per row and reserves FEWER
+        // rows, and rows exceed the old 56-column cap.
+        let objective = "x ".repeat(120); // ~240 chars
+        let narrow = goal_objective_chunks(&objective, 60, 0);
+        let wide = goal_objective_chunks(&objective, 160, 0);
+        assert!(
+            wide.len() < narrow.len(),
+            "a wider terminal must wrap into fewer rows (full-width): wide={} narrow={}",
+            wide.len(),
+            narrow.len(),
+        );
+        assert!(
+            wide.first().is_some_and(|r| r.chars().count() > 56),
+            "wide rows must exceed the old fixed 56-column wrap",
+        );
+    }
+
+    #[test]
+    fn goal_parenthetical_claims_its_own_row_when_it_would_not_fit() {
+        // When the final objective row is full, the status/budget parenthetical
+        // must drop to its own indented row instead of clipping off the edge.
+        let width = 80u16;
+        let body = goal_objective_body_width(width);
+        let objective = "a".repeat(body * 2); // fills exactly two full rows
+        assert_eq!(
+            goal_objective_chunks(&objective, width, 0).len(),
+            2,
+            "objective alone fills exactly two rows",
+        );
+        let with_tail = goal_objective_chunks(&objective, width, 20);
+        assert_eq!(
+            with_tail.len(),
+            3,
+            "a non-fitting parenthetical must claim its own trailing row",
+        );
+        assert!(
+            with_tail.last().is_some_and(String::is_empty),
+            "the trailing row is empty — the parenthetical renders alone on it",
         );
     }
 
@@ -18466,8 +19321,8 @@ mod tests {
             ],
         );
 
-        assert_eq!(autonomy_indicator_height(&app), 2);
-        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex));
+        assert_eq!(autonomy_indicator_height(&app, 100), 2);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
         assert_eq!(lines.len(), 2);
 
         let text = rendered_text(&app);
@@ -18506,7 +19361,7 @@ mod tests {
         app.set_session_loops(&session_id, vec![l1, l2]);
 
         assert_eq!(
-            autonomy_indicator_height(&app),
+            autonomy_indicator_height(&app, 100),
             0,
             "paused-only loops must not reserve an indicator row"
         );

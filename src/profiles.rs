@@ -225,6 +225,46 @@ pub fn delete_profile(data_dir: &Path, id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Per-instance runtime data dir for a stdio serve, so multiple octos-tui
+/// windows can run concurrently while sharing ONE profile registry. Passed to
+/// the spawned serve as `OCTOS_INSTANCE_DATA_DIR`; the server keeps the profile
+/// registry + catalog at the shared `state_home` and puts all exclusively-locked
+/// runtime (redb stores, sessions, goals, the serve flock) under this dir.
+///
+/// Returns `Some(<base>/instances/<cwd-hash>)` ONLY when the launch command
+/// carries NO explicit data-dir override (the default `~/.octos` case) — an
+/// explicit `--data-dir`/`OCTOS_HOME=` means the operator controls placement, so
+/// we never second-guess it. `None` for remote/WebSocket launches (no command),
+/// an unresolvable override, or when `OCTOS_TUI_SHARED_INSTANCE` opts out (legacy
+/// single shared instance). The hash keys on the launch cwd: stable across
+/// relaunch (sessions/goals persist per project) and distinct across folders
+/// (windows in different projects run concurrently).
+pub fn instance_data_dir_for_launch(stdio_command: Option<&str>, cwd: &Path) -> Option<PathBuf> {
+    if std::env::var_os("OCTOS_TUI_SHARED_INSTANCE").is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    match stdio_command.map(data_dir_from_command) {
+        Some(DataDirResolution::None) => {
+            Some(default_octos_home()?.join("instances").join(cwd_hash(cwd)))
+        }
+        // Explicit/unresolvable override, or remote launch (no command): the
+        // operator (or the remote server) owns the data layout — do not isolate.
+        _ => None,
+    }
+}
+
+/// A stable, filesystem-safe short hash of the launch cwd. `DefaultHasher` uses
+/// fixed keys, so it is deterministic across processes and runs — the same
+/// project dir always maps to the same instance dir (session persistence),
+/// while different dirs diverge (concurrent windows).
+fn cwd_hash(cwd: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 fn default_octos_home() -> Option<PathBuf> {
     home_dir().map(|home| home.join(".octos"))
 }
@@ -319,6 +359,58 @@ mod tests {
         assert_eq!(
             data_dir_from_command("octos serve --data-dir $HOME/x"),
             DataDirResolution::Unresolvable
+        );
+    }
+
+    #[test]
+    fn instance_dir_is_per_cwd_stable_and_distinct_when_no_override() {
+        // The core multi-instance contract: no explicit data-dir override ⇒ an
+        // instance dir under `<base>/instances/<cwd-hash>` that is STABLE for a
+        // given cwd (session persistence across relaunch) and DISTINCT across
+        // cwds (windows in different projects run concurrently).
+        if default_octos_home().is_none() {
+            return; // no resolvable HOME in this env; structure test is moot
+        }
+        let a = TempDir::new("inst-a");
+        let b = TempDir::new("inst-b");
+        let cmd = Some("octos serve --stdio --solo");
+
+        let a1 = instance_data_dir_for_launch(cmd, a.path()).expect("some for no-override");
+        let a2 = instance_data_dir_for_launch(cmd, a.path()).expect("some for no-override");
+        let b1 = instance_data_dir_for_launch(cmd, b.path()).expect("some for no-override");
+
+        assert_eq!(
+            a1, a2,
+            "same cwd must map to the same instance dir (stable)"
+        );
+        assert_ne!(a1, b1, "different cwds must diverge (concurrent windows)");
+        assert!(
+            a1.parent().is_some_and(|p| p.ends_with(".octos/instances")),
+            "instance dir must sit under <base>/instances, got {}",
+            a1.display()
+        );
+    }
+
+    #[test]
+    fn instance_dir_is_none_for_explicit_override_or_remote() {
+        // Operator-controlled placement (explicit --data-dir / OCTOS_HOME=) and
+        // remote/WebSocket launches (no command) must NOT be isolated.
+        let cwd = std::env::temp_dir();
+        assert!(
+            instance_data_dir_for_launch(Some("octos serve --data-dir /srv/x"), &cwd).is_none(),
+            "explicit --data-dir must opt out of isolation"
+        );
+        assert!(
+            instance_data_dir_for_launch(Some("OCTOS_HOME=/srv/h octos serve"), &cwd).is_none(),
+            "explicit OCTOS_HOME= must opt out of isolation"
+        );
+        assert!(
+            instance_data_dir_for_launch(Some("octos serve --data-dir $HOME/x"), &cwd).is_none(),
+            "unresolvable override must opt out of isolation"
+        );
+        assert!(
+            instance_data_dir_for_launch(None, &cwd).is_none(),
+            "remote launch (no command) must not be isolated"
         );
     }
 

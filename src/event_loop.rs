@@ -168,9 +168,18 @@ pub fn run(cli: Cli) -> Result<()> {
         // redraw on the animation cadence so the spinner/status moves; otherwise
         // an idle UI emits no terminal writes and never wipes a live selection.
         let turn_active = store.state.run_state.is_active();
-        if turn_active && last_animation.elapsed() >= ANIMATION_INTERVAL {
-            dirty = true;
-            last_animation = Instant::now();
+        if turn_active {
+            // Watchdog: after a turn has sat parked on an operator decision past
+            // the escalation threshold, re-show a hidden prompt (never
+            // auto-resolves). The prominent banner is driven purely by elapsed
+            // time in the render pass; this handles the modal-visibility side.
+            if store.escalate_parked_decision_if_due() {
+                dirty = true;
+            }
+            if last_animation.elapsed() >= ANIMATION_INTERVAL {
+                dirty = true;
+                last_animation = Instant::now();
+            }
         }
         if dirty {
             let menu_reserved_now = app::menu_surface_active(&store.state);
@@ -728,9 +737,16 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     }
 
     if is_control_char(&key, 'c') {
-        return store
-            .interrupt_command()
-            .map_or(KeyAction::Continue, KeyAction::send);
+        // A turn parked on a decision (approval / question) can be waiting BEFORE
+        // any reply streams, so `active_turn()` — hence `interrupt_command()` —
+        // is a no-op there. Route through the decision-aware interrupt so Ctrl+C
+        // reliably cancels a parked turn (and tears down its server-side waiter).
+        let command = if app::active_session_has_pending_decision(&store.state) {
+            store.interrupt_active_decision_command()
+        } else {
+            store.interrupt_command()
+        };
+        return command.map_or(KeyAction::Continue, KeyAction::send);
     }
 
     // A live sub-agent peek OWNS the keyboard, exactly like a modal: routed here
@@ -770,6 +786,15 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
 
     if is_control_char(&key, 't') {
         toggle_transcript_pager(store);
+        return KeyAction::Continue;
+    }
+
+    // Ctrl+G folds/unfolds the ◆ Goal banner objective. A huge pasted objective
+    // (e.g. shader code) folds to one compact preview row by default; Ctrl+G
+    // expands it (and re-folds). Only claimed while the active session has a
+    // goal — otherwise the key falls through unswallowed so it stays free.
+    if is_control_char(&key, 'g') && app::active_session_has_goal(&store.state) {
+        store.state.toggle_goal_objective_fold();
         return KeyAction::Continue;
     }
 
@@ -889,7 +914,7 @@ fn handle_paste(store: &mut Store, text: &str) -> KeyAction {
     // beginning with '/' is not a command. Unlike a typed leading '/', we do
     // not open the slash-command menu here. (Regression: pasting a path
     // opened/ran the slash menu.)
-    store.state.insert_composer_text(&text);
+    store.state.insert_pasted_text(&text);
     store.state.focus = FocusPane::Composer;
 
     // Only keep an ALREADY-open slash search in sync (e.g. the user typed '/' to
@@ -1964,6 +1989,14 @@ fn delete_active_menu_search_prev_char(store: &mut Store) {
 fn handle_approval_modal_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     match key.code {
         KeyCode::Esc => {
+            // A parked decision: Esc INTERRUPTS the turn in ONE press (the user
+            // traded the peek-behind-the-card affordance for a reliable escape),
+            // mirroring Ctrl+C. The server-side interrupt drops the parked
+            // approval waiter so no zombie decision is left. Falls back to hiding
+            // the card only when there is no parked turn to interrupt.
+            if let Some(command) = store.interrupt_active_decision_command() {
+                return KeyAction::send(command);
+            }
             store.close_modal();
         }
         KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'y') => {
@@ -1999,10 +2032,17 @@ fn handle_approval_modal_key(store: &mut Store, key: KeyEvent) -> KeyAction {
 
 /// UPCR-2026-023: drive the AskUserQuestion picker. Keyboard model mirrors the
 /// multi-select menu (Up/Down move, Space toggle) plus typing-to-Other and
-/// Enter to step questions / submit. Esc hides the picker without answering.
+/// Enter to step questions / submit. Esc INTERRUPTS the parked turn in one press
+/// (mirroring Ctrl+C), cancelling the question rather than merely hiding it.
 fn handle_user_question_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     match key.code {
         KeyCode::Esc => {
+            // One-press interrupt of the turn parked on this question; the
+            // server-side interrupt drops the parked question waiter. Falls back
+            // to hiding only when there is no parked turn to interrupt.
+            if let Some(command) = store.interrupt_active_decision_command() {
+                return KeyAction::send(command);
+            }
             store.close_modal();
         }
         KeyCode::Up => store.user_question_cursor_up(),
@@ -2635,6 +2675,73 @@ mod tests {
         }
     }
 
+    fn sample_goal(objective: &str) -> octos_core::ui_protocol::UiGoalRecord {
+        octos_core::ui_protocol::UiGoalRecord {
+            profile_id: Some("coding".into()),
+            goal_id: "goal_01".into(),
+            objective: objective.into(),
+            status: "active".into(),
+            token_budget: 2_000_000,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    #[test]
+    fn ctrl_g_toggles_goal_objective_fold_when_goal_present() {
+        use crate::model::GoalObjectiveFold;
+        let mut store = store_with_sessions(1);
+        let sid = store.state.active_session().unwrap().id.clone();
+        store.state.set_session_goal(
+            &sid,
+            Some(sample_goal("shader code …")),
+            Some("user".into()),
+        );
+
+        // Simulate the banner having rendered FOLDED (Auto → long objective).
+        store.state.goal_objective_folded_effective.set(true);
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            store.state.goal_objective_fold,
+            GoalObjectiveFold::Unfolded,
+            "Ctrl+G on a folded goal expands it",
+        );
+
+        // Simulate it now rendered UNFOLDED; Ctrl+G re-folds.
+        store.state.goal_objective_folded_effective.set(false);
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            store.state.goal_objective_fold,
+            GoalObjectiveFold::Folded,
+            "Ctrl+G on an unfolded goal re-folds it",
+        );
+    }
+
+    #[test]
+    fn ctrl_g_is_a_noop_without_a_goal() {
+        use crate::model::GoalObjectiveFold;
+        let mut store = store_with_sessions(1);
+        // No goal on the active session — Ctrl+G must not claim the key or
+        // mutate the fold preference.
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            store.state.goal_objective_fold,
+            GoalObjectiveFold::Auto,
+            "Ctrl+G without a goal leaves the fold preference untouched",
+        );
+    }
+
     #[test]
     fn tab_cycles_chat_view_between_main_and_agents() {
         use crate::model::ChatViewTarget;
@@ -3141,6 +3248,89 @@ mod tests {
         assert_eq!(params.answers.len(), 1);
         assert_eq!(params.answers[0].selected_labels, vec!["axum".to_string()]);
         assert!(store.state.user_question.is_none());
+    }
+
+    #[test]
+    fn esc_on_a_parked_approval_interrupts_the_turn_in_one_press() {
+        // Fix 2: a turn parked on an approval can be waiting BEFORE any reply
+        // streams, so `active_turn()` (which needs a `live_reply`) is None and the
+        // plain `interrupt_command()` no-ops. Esc must STILL interrupt the parked
+        // turn — not merely hide the card (the old two-step trap) — by building
+        // the interrupt from the decision's own turn id.
+        let (mut store, _approval_id) = store_with_visible_approval();
+        let expected_session = store.state.sessions[0].id.clone();
+        let expected_turn = store
+            .state
+            .approval
+            .as_ref()
+            .expect("approval pending")
+            .turn_id
+            .clone();
+        assert!(
+            store.state.active_turn().is_none(),
+            "no live_reply: the interrupt must come from the decision's turn id"
+        );
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+
+        let AppUiCommand::InterruptTurn(params) = sent_command(action) else {
+            panic!("Esc on a parked approval must issue an interrupt, not hide the card");
+        };
+        assert_eq!(params.session_id, expected_session);
+        assert_eq!(params.turn_id, expected_turn);
+        // The card is NOT silently hidden into the pending-but-invisible limbo: it
+        // stays until the server-side cancel lands, exactly like Ctrl+C.
+        assert!(
+            store.state.approval.as_ref().is_some_and(|a| a.visible),
+            "interrupt must not hide the card the way the old Esc did"
+        );
+    }
+
+    #[test]
+    fn esc_on_a_parked_question_interrupts_the_turn_in_one_press() {
+        // Same one-press interrupt for a parked AskUserQuestion picker.
+        let (mut store, _question_id) = store_with_visible_user_question();
+        let expected_turn = store
+            .state
+            .user_question
+            .as_ref()
+            .expect("question pending")
+            .turn_id
+            .clone();
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+
+        let AppUiCommand::InterruptTurn(params) = sent_command(action) else {
+            panic!("Esc on a parked question must issue an interrupt, not hide the picker");
+        };
+        assert_eq!(params.turn_id, expected_turn);
+        assert!(
+            store
+                .state
+                .user_question
+                .as_ref()
+                .is_some_and(|q| q.visible),
+            "interrupt must not hide the picker the way the old Esc did"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_a_parked_decision_even_without_a_live_reply() {
+        // The old Ctrl+C path called `interrupt_command()`, which no-ops when a
+        // decision parks a turn before any reply streams. Route it through the
+        // decision-aware interrupt so Ctrl+C reliably cancels a parked turn.
+        let (mut store, _approval_id) = store_with_visible_approval();
+        assert!(store.state.active_turn().is_none());
+
+        let action = handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert!(
+            matches!(sent_command(action), AppUiCommand::InterruptTurn(_)),
+            "Ctrl+C on a parked decision must interrupt, not no-op"
+        );
     }
 
     #[test]

@@ -843,6 +843,19 @@ impl StdioTransportDriver {
         let mut child = runtime
             .block_on(async {
                 let mut command = shell_command(&self.command);
+                // Multi-instance stdio: isolate this window's runtime (redb
+                // stores, sessions, goals, the serve flock) under a per-cwd
+                // instance dir so several octos-tui windows can run at once
+                // while sharing one profile registry. No-op for explicit
+                // --data-dir launches, remote launches, or when opted out via
+                // OCTOS_TUI_SHARED_INSTANCE. Re-spawns (reconnects) resolve to
+                // the same dir, so a reconnect re-attaches, not forks.
+                if let Some(instance_dir) = crate::profiles::instance_data_dir_for_launch(
+                    Some(&self.command),
+                    &std::env::current_dir().unwrap_or_default(),
+                ) {
+                    command.env("OCTOS_INSTANCE_DATA_DIR", &instance_dir);
+                }
                 command
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
