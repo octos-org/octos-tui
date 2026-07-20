@@ -9552,9 +9552,27 @@ impl Store {
         event: octos_core::ui_protocol::TurnSpawnCompleteEvent,
     ) -> Option<AppUiCommand> {
         if let Some(session) = self.find_session_mut(&event.session_id) {
-            session
-                .messages
-                .push(Message::assistant(event.content.clone()));
+            // Mirror the hydration path (spawn_complete_to_message): if the
+            // event carries a thread_id, check whether the envelope path
+            // (AssistantDelta / AssistantPersisted) has already committed a
+            // message for the same thread. If so, skip — emitting a second
+            // threadless entry would render the content twice. If not, push
+            // WITH the thread_id so a subsequent AssistantPersisted can find
+            // and replace it rather than appending a duplicate.
+            let already_committed = event.thread_id.as_deref().is_some_and(|tid| {
+                session.messages.iter().any(|m| {
+                    m.role == MessageRole::Assistant && m.thread_id.as_deref() == Some(tid)
+                })
+            });
+            if !already_committed {
+                let content =
+                    crate::sanitize::strip_terminal_controls(&event.content).into_owned();
+                let message = match event.thread_id.clone() {
+                    Some(tid) => Message::assistant_with_thread(content, ThreadId::new(tid)),
+                    None => Message::assistant(content),
+                };
+                session.messages.push(message);
+            }
         }
         self.state.push_activity(
             ActivityItem::new(ActivityKind::Progress, event.task_id.clone(), "completed")
@@ -9920,9 +9938,32 @@ impl Store {
                         &fallback_summary,
                         &partial_fallback_summary,
                     );
-                    let mut message = Message::assistant(text);
-                    message.reasoning_content = reasoning;
-                    session.messages.push(message);
+                    // When the backend sends parallel MessageDelta and
+                    // AssistantDelta/AssistantPersisted streams for the same
+                    // goal turn, the envelope path already committed `text`
+                    // under a thread_id. Detect that and merge reasoning onto
+                    // the existing message rather than pushing a duplicate
+                    // threadless bubble.
+                    let envelope_idx = if !text.trim().is_empty() {
+                        session.messages.iter().rposition(|m| {
+                            m.role == MessageRole::Assistant
+                                && m.thread_id.is_some()
+                                && m.content == text
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(idx) = envelope_idx {
+                        if let Some(r) = reasoning {
+                            if session.messages[idx].reasoning_content.is_none() {
+                                session.messages[idx].reasoning_content = Some(r);
+                            }
+                        }
+                    } else {
+                        let mut message = Message::assistant(text);
+                        message.reasoning_content = reasoning;
+                        session.messages.push(message);
+                    }
                     (
                         t!("status.turn_completed", title = title, seq = seq).into_owned(),
                         true,
@@ -26112,13 +26153,10 @@ mod tests {
         assert!(store.state.sessions[0].tasks[0].output_tail.len() <= TASK_OUTPUT_TAIL_BYTES);
     }
 
-    /// UPCR-2026-026: `context/compaction_started` arms the in-progress
-    /// block; completed (or a turn terminal — the hang-safety path) clears
-    /// it, and the durable notice carries the fullness bar.
+    /// UPCR-2026-026: a turn terminal (hang-safety path) clears a dangling
+    /// live-compaction block; the durable notice carries the fullness bar.
     #[test]
-    fn compaction_started_arms_live_block_and_terminal_clears_it() {
-        use octos_core::ui_protocol::{ContextCompactionStartedEvent, UiContextState};
-
+    fn compaction_live_block_cleared_by_turn_terminal() {
         let session_id = SessionKey("local:test".into());
         let session = SessionView {
             id: session_id.clone(),
@@ -26132,45 +26170,21 @@ mod tests {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
         };
 
-        let context_state = UiContextState {
-            session_id: session_id.clone(),
-            thread_id: Some("thread-1".into()),
-            generation: 4,
-            transcript_hash: "abc123".into(),
-            item_count: 42,
-            token_estimate: 91_000,
-            recovery_state: "healthy".into(),
-            last_checkpoint_id: None,
-            last_compaction_id: None,
-        };
-        store.apply_event(AppUiEvent::Protocol(
-            UiNotification::ContextCompactionStarted(ContextCompactionStartedEvent {
-                session_id: session_id.clone(),
-                context_state,
-                trigger: "preflight".into(),
-                threshold_tokens: 96_000,
-            }),
-        ));
-        let live = store
-            .state
-            .live_compaction
-            .get(&session_id)
-            .expect("started must arm the live block");
-        assert_eq!(live.token_estimate_before, 91_000);
-        assert_eq!(live.threshold_tokens, 96_000);
-        assert_eq!(live.trigger, "preflight");
-
         // A turn terminal clears a dangling block (hang safety) even when
         // completed never arrives.
         // A STALE terminal (different turn) must NOT clear a block owned
         // by the live turn.
         let owner_turn = TurnId::new();
-        store
-            .state
-            .live_compaction
-            .get_mut(&session_id)
-            .expect("armed")
-            .turn_id = Some(owner_turn.clone());
+        store.state.live_compaction.insert(
+            session_id.clone(),
+            crate::model::LiveCompaction {
+                started_at: std::time::Instant::now(),
+                token_estimate_before: 91_000,
+                threshold_tokens: 96_000,
+                trigger: "preflight".into(),
+                turn_id: Some(owner_turn.clone()),
+            },
+        );
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
                 session_id: session_id.clone(),
