@@ -20,10 +20,10 @@ use crate::{
     model::{
         ActivityItem, ActivityKind, ActivityNavigatorFilter, AppState, ApprovalModalState,
         ArtifactDetailState, ComposerPresentation, DiffPreviewPaneState, FocusPane,
-        PlanStep as RenderedPlanStep, SessionAutonomyState, SessionRunState, SessionView,
-        TaskOutputDetailState, TaskView, ThreadGraphDetailState, TurnActivityLog, TurnPromptAnchor,
-        TurnStateDetailState, UserQuestionEntry, UserQuestionPickerState, extract_plan_steps,
-        task_state_label,
+        GoalObjectiveFold, PlanStep as RenderedPlanStep, SessionAutonomyState, SessionRunState,
+        SessionView, TaskOutputDetailState, TaskView, ThreadGraphDetailState, TurnActivityLog,
+        TurnPromptAnchor, TurnStateDetailState, UserQuestionEntry, UserQuestionPickerState,
+        extract_plan_steps, task_state_label,
     },
     theme::Palette,
     tui_terminal::FrameLike,
@@ -8295,6 +8295,13 @@ fn active_session_autonomy(app: &AppState) -> Option<&SessionAutonomyState> {
     app.session_autonomy_for(&session.id)
 }
 
+/// Whether the active session currently has a goal in its autonomy mirror.
+/// Gates the Ctrl+G fold toggle so the key is only claimed when the ◆ Goal
+/// banner is actually showing (otherwise it falls through, unswallowed).
+pub(crate) fn active_session_has_goal(app: &AppState) -> bool {
+    active_session_autonomy(app).is_some_and(|state| state.goal.is_some())
+}
+
 /// Number of rows the sticky autonomy indicator needs: 0 when both goal
 /// and loops are absent, 1 when only one is present, 2 when both are.
 /// Max plan items rendered in the sticky panel before collapsing to a
@@ -8393,19 +8400,55 @@ fn goal_objective_chunks(objective: &str, width: u16, tail_len: usize) -> Vec<St
     chunks
 }
 
+/// Auto-fold threshold: a goal whose objective wraps to MORE than this many rows
+/// at the render width is folded to one compact row by DEFAULT (Ctrl+G expands),
+/// so a huge pasted objective can't dominate the banner. A 1–3 row goal shows in
+/// full — short goals never look truncated. Only consulted while the fold
+/// preference is [`GoalObjectiveFold::Auto`]; an explicit Ctrl+G choice wins.
+const GOAL_FOLD_AUTO_MAX_ROWS: usize = 3;
+
+/// Minimum columns the folded preview keeps even on a narrow terminal, so a
+/// sliver of the objective is always legible before the `…`.
+const GOAL_FOLD_PREVIEW_MIN: usize = 8;
+
+/// Resolve the EFFECTIVE fold for the goal objective and record it on `app` so
+/// Ctrl+G ([`AppState::toggle_goal_objective_fold`]) can flip whatever is on
+/// screen. `Auto` folds a long objective (wraps beyond
+/// [`GOAL_FOLD_AUTO_MAX_ROWS`] rows at `width`) and shows a short one in full; an
+/// explicit fold choice always wins. Both the height reservation and the render
+/// call this with the SAME width, so their fold decision — hence their row count
+/// — always agree (the banner's reserve==render discipline).
+fn goal_objective_folded(app: &AppState, objective: &str, width: u16) -> bool {
+    let folded = match app.goal_objective_fold {
+        GoalObjectiveFold::Folded => true,
+        GoalObjectiveFold::Unfolded => false,
+        GoalObjectiveFold::Auto => {
+            goal_objective_chunks(objective, width, 0).len() > GOAL_FOLD_AUTO_MAX_ROWS
+        }
+    };
+    app.goal_objective_folded_effective.set(folded);
+    folded
+}
+
 fn autonomy_indicator_height(app: &AppState, width: u16) -> u16 {
     match active_session_autonomy(app) {
         Some(state) => {
             let mut rows = 0u16;
             if let Some(goal) = state.goal.as_ref() {
-                // At least one row (glyph + status even when the objective is
-                // empty); otherwise the wrapped-objective row count. MUST use the
-                // same width + parenthetical length as the render so the reserved
-                // height matches the rendered rows exactly.
-                let tail = goal_meta_parenthetical(goal).chars().count();
-                let obj_rows = goal_objective_chunks(&goal.objective, width, tail)
-                    .len()
-                    .max(1);
+                // Folded: exactly ONE compact row (glyph + preview + parenthetical
+                // + hint). Unfolded: at least one row (glyph + status even when the
+                // objective is empty), otherwise the wrapped-objective row count.
+                // MUST use the same fold decision + width + parenthetical length as
+                // the render so the reserved height matches the rendered rows
+                // exactly (reserve==render).
+                let obj_rows = if goal_objective_folded(app, &goal.objective, width) {
+                    1
+                } else {
+                    let tail = goal_meta_parenthetical(goal).chars().count();
+                    goal_objective_chunks(&goal.objective, width, tail)
+                        .len()
+                        .max(1)
+                };
                 rows += obj_rows as u16;
             }
             if state.loops.iter().any(autonomy_loop_is_active) {
@@ -8520,47 +8563,61 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette, width: u16) -> Vec
     if let Some(goal) = state.goal.as_ref() {
         let (glyph, _status_label) = goal_status_display(&goal.status);
         let parenthetical = goal_meta_parenthetical(goal);
-        // The objective wraps across up to GOAL_OBJECTIVE_MAX_ROWS lines at the
-        // FULL render width so the whole goal is visible (a raw `/goal` request
-        // can be hundreds of chars). Row count here MUST match
-        // `autonomy_indicator_height`'s reservation — both derive from
-        // `goal_objective_chunks` with the same width + parenthetical length.
-        let mut chunks =
-            goal_objective_chunks(&goal.objective, width, parenthetical.chars().count());
-        if chunks.is_empty() {
-            chunks.push(goal.goal_id.clone());
-        }
-        let last = chunks.len() - 1;
-        let indent = " ".repeat(t!("app.autonomy.goal_prefix").chars().count() + 2);
-        for (idx, chunk) in chunks.into_iter().enumerate() {
-            let mut spans = Vec::new();
-            if idx == 0 {
-                spans.push(Span::styled(
-                    format!("{glyph} "),
-                    Style::default()
-                        .fg(palette.accent)
-                        .add_modifier(Modifier::BOLD)
-                        .bg(palette.surface),
-                ));
-                spans.push(Span::styled(
-                    t!("app.autonomy.goal_prefix").to_string(),
-                    palette.title().bg(palette.surface),
-                ));
-            } else {
-                spans.push(Span::styled(
-                    indent.clone(),
-                    palette.text().bg(palette.surface),
-                ));
+        // Folded (default for a long objective, or after Ctrl+G): ONE compact
+        // row. The fold decision MUST match `autonomy_indicator_height` — both
+        // call `goal_objective_folded` with the same width (reserve==render).
+        // Loops/plan rows still render below, exactly as in the unfolded case.
+        if goal_objective_folded(app, &goal.objective, width) {
+            lines.push(goal_folded_line(
+                goal,
+                glyph,
+                &parenthetical,
+                palette,
+                width,
+            ));
+        } else {
+            // The objective wraps across up to GOAL_OBJECTIVE_MAX_ROWS lines at
+            // the FULL render width so the whole goal is visible (a raw `/goal`
+            // request can be hundreds of chars). Row count here MUST match
+            // `autonomy_indicator_height`'s reservation — both derive from
+            // `goal_objective_chunks` with the same width + parenthetical length.
+            let mut chunks =
+                goal_objective_chunks(&goal.objective, width, parenthetical.chars().count());
+            if chunks.is_empty() {
+                chunks.push(goal.goal_id.clone());
             }
-            spans.push(Span::styled(chunk, palette.text().bg(palette.surface)));
-            // The status/budget parenthetical rides the FINAL objective line.
-            if idx == last {
-                spans.push(Span::styled(
-                    parenthetical.clone(),
-                    palette.muted().bg(palette.surface),
-                ));
+            let last = chunks.len() - 1;
+            let indent = " ".repeat(t!("app.autonomy.goal_prefix").chars().count() + 2);
+            for (idx, chunk) in chunks.into_iter().enumerate() {
+                let mut spans = Vec::new();
+                if idx == 0 {
+                    spans.push(Span::styled(
+                        format!("{glyph} "),
+                        Style::default()
+                            .fg(palette.accent)
+                            .add_modifier(Modifier::BOLD)
+                            .bg(palette.surface),
+                    ));
+                    spans.push(Span::styled(
+                        t!("app.autonomy.goal_prefix").to_string(),
+                        palette.title().bg(palette.surface),
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        indent.clone(),
+                        palette.text().bg(palette.surface),
+                    ));
+                }
+                spans.push(Span::styled(chunk, palette.text().bg(palette.surface)));
+                // The status/budget parenthetical rides the FINAL objective line.
+                if idx == last {
+                    spans.push(Span::styled(
+                        parenthetical.clone(),
+                        palette.muted().bg(palette.surface),
+                    ));
+                }
+                lines.push(Line::from(spans));
             }
-            lines.push(Line::from(spans));
         }
     }
     // The loops row shows only while something is actually FIRING: a
@@ -8615,6 +8672,76 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette, width: u16) -> Vec
         lines.extend(plan_indicator_lines(plan, palette));
     }
     lines
+}
+
+/// Render the ◆ Goal banner folded to ONE compact row:
+/// `{glyph} Goal: {preview}… {(status · used/budget tokens)} · Ctrl+G expand`.
+/// Used when the objective is folded (default for a long objective, or after
+/// Ctrl+G). Always exactly one line, matching `autonomy_indicator_height`'s
+/// folded reservation of a single row (reserve==render). The banner Paragraph
+/// CLIPS rather than wraps, so the preview is budgeted to leave room for the
+/// parenthetical and the hint — a long objective is truncated, its status/budget
+/// and the expand hint stay on-screen.
+fn goal_folded_line(
+    goal: &octos_core::ui_protocol::UiGoalRecord,
+    glyph: &str,
+    parenthetical: &str,
+    palette: Palette,
+    width: u16,
+) -> Line<'static> {
+    let prefix = t!("app.autonomy.goal_prefix");
+    let hint = t!("app.autonomy.goal_fold_hint");
+    // Reserve the fixed columns (glyph+space, prefix, `…`, parenthetical, hint)
+    // so the objective preview — not the trailing status/hint — is what gets
+    // truncated when the goal is long.
+    let reserved = prefix.chars().count()
+        + 2 // "{glyph} "
+        + 1 // the trailing "…"
+        + parenthetical.chars().count()
+        + hint.chars().count();
+    let budget = (width as usize)
+        .saturating_sub(reserved)
+        .max(GOAL_FOLD_PREVIEW_MIN);
+    let first_line = goal.objective.trim().lines().next().unwrap_or("").trim();
+    let mut preview: String = first_line.chars().take(budget).collect();
+    // Ellipsis when the preview doesn't show the whole objective (truncated
+    // first line, or there is more than one line).
+    let truncated = preview.chars().count() < first_line.chars().count()
+        || goal.objective.trim().lines().nth(1).is_some();
+    // Drop trailing whitespace so `word …` reads cleanly.
+    while preview.ends_with(char::is_whitespace) {
+        preview.pop();
+    }
+    if preview.is_empty() {
+        // Objective empty (or all whitespace): fall back to the goal id so the
+        // row is never a bare glyph, mirroring the unfolded empty-objective case.
+        preview = goal.goal_id.clone();
+    }
+    let mut spans = vec![
+        Span::styled(
+            format!("{glyph} "),
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+                .bg(palette.surface),
+        ),
+        Span::styled(prefix.to_string(), palette.title().bg(palette.surface)),
+        Span::styled(preview, palette.text().bg(palette.surface)),
+    ];
+    if truncated {
+        spans.push(Span::styled("…", palette.text().bg(palette.surface)));
+    }
+    // `parenthetical` already carries a leading space (`" (…)"`); the hint carries
+    // its own ` · ` separator — so they read `… (active · …) · Ctrl+G expand`.
+    spans.push(Span::styled(
+        parenthetical.to_string(),
+        palette.muted().bg(palette.surface),
+    ));
+    spans.push(Span::styled(
+        hint.to_string(),
+        palette.muted().bg(palette.surface),
+    ));
+    Line::from(spans)
 }
 
 /// Render the model-authored plan/todo checklist as a header line
@@ -17838,6 +17965,28 @@ mod tests {
         )
     }
 
+    /// An autonomy `AppState` whose active session carries an active goal with
+    /// `objective`; the fold preference stays at its default (`Auto`).
+    fn autonomy_app_with_goal(objective: &str) -> AppState {
+        let mut app = autonomy_app_state();
+        app.set_session_goal(
+            &SessionKey("local:test".into()),
+            Some(octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some("coding".into()),
+                goal_id: "goal_01".into(),
+                objective: objective.into(),
+                status: "active".into(),
+                token_budget: 2_000_000,
+                tokens_used: 0,
+                time_used_seconds: 0,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }),
+            Some("user".into()),
+        );
+        app
+    }
+
     fn sample_agent(id: &str, status: &str) -> octos_core::ui_protocol::UiAgentRecord {
         octos_core::ui_protocol::UiAgentRecord {
             agent_id: id.into(),
@@ -18929,10 +19078,13 @@ mod tests {
     #[test]
     fn render_autonomy_indicator_wraps_a_long_objective_across_rows() {
         // mini5: a long `/goal` objective was truncated to one clipped line.
-        // It must now wrap across multiple rows (bounded), and the reserved
-        // height MUST equal the rendered row count (else the banner clips or
-        // strands a blank band).
+        // When UNFOLDED it must wrap across multiple rows (bounded), and the
+        // reserved height MUST equal the rendered row count (else the banner
+        // clips or strands a blank band). (A long objective now folds BY
+        // DEFAULT — see `goal_objective_folds_a_long_objective_by_default` — so
+        // this test drives the explicit unfolded state Ctrl+G produces.)
         let mut app = autonomy_app_state();
+        app.goal_objective_fold = GoalObjectiveFold::Unfolded;
         let session_id = SessionKey("local:test".into());
         let long_objective = "build a react website about the 2026 world cup finals with all 48 \
              teams, players, coaches, photos, group stage and knockout brackets, per-match \
@@ -18975,6 +19127,125 @@ mod tests {
         assert!(
             text.contains("knockout") || text.contains("group stage"),
             "later objective content must be visible via wrapping"
+        );
+    }
+
+    #[test]
+    fn goal_objective_folds_a_long_objective_by_default() {
+        // The user's complaint: a huge pasted objective (shader code) dominated
+        // the banner. With the default `Auto` fold it collapses to ONE compact
+        // preview row — glyph + prefix + truncated preview + `…` + parenthetical
+        // + a Ctrl+G hint — and the reserved height matches (reserve==render).
+        let long = "build a react website about the 2026 world cup finals ".repeat(20);
+        let app = autonomy_app_with_goal(&long);
+        assert_eq!(
+            app.goal_objective_fold,
+            GoalObjectiveFold::Auto,
+            "no explicit toggle yet — the default derives fold from length",
+        );
+
+        let height = autonomy_indicator_height(&app, 100);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
+        assert_eq!(height, 1, "a long objective folds to one row by default");
+        assert_eq!(lines.len(), 1, "reserve==render in the folded state");
+        assert!(
+            app.goal_objective_folded_effective.get(),
+            "the resolver records the effective fold for Ctrl+G",
+        );
+
+        let text = rendered_text(&app);
+        assert!(text.contains("Goal:"), "folded row keeps the goal label");
+        assert!(text.contains('…'), "folded row shows a truncation ellipsis");
+        assert!(
+            text.contains("2000K"),
+            "status/budget parenthetical stays on-screen"
+        );
+        assert!(text.contains("Ctrl+G"), "folded row hints Ctrl+G expands");
+    }
+
+    #[test]
+    fn goal_objective_shows_a_short_goal_in_full_by_default() {
+        // A short goal (≤ the auto threshold of rows) must NEVER look truncated
+        // by default — `Auto` shows it in full, with no ellipsis or expand hint.
+        // A ~200-char objective wraps to 3 rows at width 100 — right at the
+        // boundary that stays unfolded.
+        let app = autonomy_app_with_goal(&"x".repeat(200));
+        let height = autonomy_indicator_height(&app, 100);
+        let lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 100);
+        assert_eq!(
+            height, 3,
+            "a 3-row goal shows in full (not folded) by default"
+        );
+        assert_eq!(
+            height as usize,
+            lines.len(),
+            "reserve==render when unfolded"
+        );
+        assert!(
+            !app.goal_objective_folded_effective.get(),
+            "a short goal is not folded by default",
+        );
+        let text = rendered_text(&app);
+        assert!(
+            !text.contains("Ctrl+G"),
+            "an unfolded goal shows no expand hint",
+        );
+    }
+
+    #[test]
+    fn goal_fold_reserve_matches_render_in_both_states() {
+        // The reserve==render discipline must hold whether the objective is
+        // folded (default long) or explicitly unfolded — a mismatch clips the
+        // banner or strands a blank band above the composer.
+        let long = "explore the moduli space of stable maps and render every chart ".repeat(12);
+        let mut app = autonomy_app_with_goal(&long);
+
+        // Folded (Auto default for a long objective): exactly one row.
+        assert_eq!(app.goal_objective_fold, GoalObjectiveFold::Auto);
+        let folded_h = autonomy_indicator_height(&app, 90);
+        let folded_lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 90);
+        assert_eq!(folded_h, 1);
+        assert_eq!(
+            folded_h as usize,
+            folded_lines.len(),
+            "folded reserve==render"
+        );
+
+        // Unfolded: many rows, still exactly reserved.
+        app.goal_objective_fold = GoalObjectiveFold::Unfolded;
+        let open_h = autonomy_indicator_height(&app, 90);
+        let open_lines = autonomy_indicator_lines(&app, Palette::for_theme(ThemeName::Codex), 90);
+        assert!(open_h > 1, "unfolded long objective spans many rows");
+        assert_eq!(
+            open_h as usize,
+            open_lines.len(),
+            "unfolded reserve==render"
+        );
+    }
+
+    #[test]
+    fn toggling_goal_fold_flips_between_compact_and_full() {
+        // Ctrl+G (via `toggle_goal_objective_fold`) flips whatever is on screen:
+        // a folded long goal expands to many rows; toggling again re-folds it.
+        let long = "port the physically based renderer to wgpu with IBL and bloom ".repeat(12);
+        let mut app = autonomy_app_with_goal(&long);
+
+        // Render once so the effective fold (folded, via Auto) is recorded.
+        assert_eq!(autonomy_indicator_height(&app, 100), 1);
+
+        // First toggle → explicit Unfolded → many rows.
+        app.toggle_goal_objective_fold();
+        assert_eq!(app.goal_objective_fold, GoalObjectiveFold::Unfolded);
+        let open_h = autonomy_indicator_height(&app, 100);
+        assert!(open_h > 1, "Ctrl+G expands the folded goal");
+
+        // Second toggle → explicit Folded → back to one row.
+        app.toggle_goal_objective_fold();
+        assert_eq!(app.goal_objective_fold, GoalObjectiveFold::Folded);
+        assert_eq!(
+            autonomy_indicator_height(&app, 100),
+            1,
+            "Ctrl+G re-folds it"
         );
     }
 
