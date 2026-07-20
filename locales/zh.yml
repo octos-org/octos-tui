@@ -84,6 +84,7 @@ app:
     loops_running: "循环：%{count} 个活动中"
     loops_paused_suffix: " · %{count} 个已暂停"
     goal_meta: " (%{status} · %{used}/%{budget} Token)"
+    goal_fold_hint: " · Ctrl+G 展开"
     status_active: "进行中"
     status_paused: "已暂停"
     status_budget_limited: "预算已用尽"

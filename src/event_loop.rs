@@ -789,6 +789,15 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
+    // Ctrl+G folds/unfolds the ◆ Goal banner objective. A huge pasted objective
+    // (e.g. shader code) folds to one compact preview row by default; Ctrl+G
+    // expands it (and re-folds). Only claimed while the active session has a
+    // goal — otherwise the key falls through unswallowed so it stays free.
+    if is_control_char(&key, 'g') && app::active_session_has_goal(&store.state) {
+        store.state.toggle_goal_objective_fold();
+        return KeyAction::Continue;
+    }
+
     // Modified-key composer edits are gated on no modal owning the keyboard:
     // the approval/question modals force-focus the composer, so without the
     // gate Ctrl+W / Alt+b / Shift+Enter kept mutating the hidden draft while a
@@ -2664,6 +2673,73 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 2,
         }
+    }
+
+    fn sample_goal(objective: &str) -> octos_core::ui_protocol::UiGoalRecord {
+        octos_core::ui_protocol::UiGoalRecord {
+            profile_id: Some("coding".into()),
+            goal_id: "goal_01".into(),
+            objective: objective.into(),
+            status: "active".into(),
+            token_budget: 2_000_000,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    #[test]
+    fn ctrl_g_toggles_goal_objective_fold_when_goal_present() {
+        use crate::model::GoalObjectiveFold;
+        let mut store = store_with_sessions(1);
+        let sid = store.state.active_session().unwrap().id.clone();
+        store.state.set_session_goal(
+            &sid,
+            Some(sample_goal("shader code …")),
+            Some("user".into()),
+        );
+
+        // Simulate the banner having rendered FOLDED (Auto → long objective).
+        store.state.goal_objective_folded_effective.set(true);
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            store.state.goal_objective_fold,
+            GoalObjectiveFold::Unfolded,
+            "Ctrl+G on a folded goal expands it",
+        );
+
+        // Simulate it now rendered UNFOLDED; Ctrl+G re-folds.
+        store.state.goal_objective_folded_effective.set(false);
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            store.state.goal_objective_fold,
+            GoalObjectiveFold::Folded,
+            "Ctrl+G on an unfolded goal re-folds it",
+        );
+    }
+
+    #[test]
+    fn ctrl_g_is_a_noop_without_a_goal() {
+        use crate::model::GoalObjectiveFold;
+        let mut store = store_with_sessions(1);
+        // No goal on the active session — Ctrl+G must not claim the key or
+        // mutate the fold preference.
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            store.state.goal_objective_fold,
+            GoalObjectiveFold::Auto,
+            "Ctrl+G without a goal leaves the fold preference untouched",
+        );
     }
 
     #[test]
