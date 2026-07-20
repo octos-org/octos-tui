@@ -56,8 +56,9 @@ use crate::{
         PermissionProfileClientEvent, ProfileLlmCatalogClientEvent, ProfileLlmListClientEvent,
         ProfileLlmMutationClientEvent, ProfileLocalCreateClientEvent, ProfileSkillsListClientEvent,
         ProfileSkillsMutationClientEvent, ProfileSkillsRegistrySearchClientEvent,
-        SessionBtwClientEvent, SessionStatusClientEvent, ToolConfigListClientEvent,
-        ToolConfigMutationClientEvent, ToolStatusClientEvent,
+        SessionBtwClientEvent, SessionStatusClientEvent, SubProvidersListClientEvent,
+        SubProvidersMutationClientEvent, ToolConfigListClientEvent, ToolConfigMutationClientEvent,
+        ToolStatusClientEvent,
     },
     model::{
         AppUiAuthToken, AppUiCommand, AuthLogoutResult, AuthMeResult, AuthSendCodeResult,
@@ -70,8 +71,9 @@ use crate::{
         ProfileSkillEntry, ProfileSkillRegistryPackage, ProfileSkillsListResult,
         ProfileSkillsMutationResult, ProfileSkillsRegistrySearchResult, ReviewStartResult,
         RuntimeHealthStatus, RuntimePolicyMcpServer, RuntimePolicyStamp, SessionStatusReadResult,
-        ToolConfigEntry, ToolConfigListResult, ToolConfigMutationResult, ToolPolicyDenial,
-        ToolStatus, ToolStatusListResult, ToolStatusSummary, auth_me_email, auth_me_profile_id,
+        SubProvidersListResult, SubProvidersMutationResult, ToolConfigEntry, ToolConfigListResult,
+        ToolConfigMutationResult, ToolPolicyDenial, ToolStatus, ToolStatusListResult,
+        ToolStatusSummary, auth_me_email, auth_me_profile_id,
     },
 };
 
@@ -1809,6 +1811,7 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ProfileLlmCatalog(_)
                 | AppUiCommand::ProfileLlmList(_)
                 | AppUiCommand::ProfileLlmFetchModels(_)
+                | AppUiCommand::ProfileSubProvidersList(_)
                 | AppUiCommand::ProfileSkillsList(_)
                 | AppUiCommand::ProfileSkillsRegistrySearch(_)
                 // M15-E read-only autonomy inspection. Reconnect
@@ -2009,6 +2012,8 @@ impl ProtocolAppUiBackend {
             | AppUiCommand::ProfileLocalCreate(_)
             | AppUiCommand::ProfileLlmUpsert(_)
             | AppUiCommand::ProfileLlmDelete(_)
+            | AppUiCommand::ProfileSubProvidersUpsert(_)
+            | AppUiCommand::ProfileSubProvidersRemove(_)
             | AppUiCommand::ProfileLlmSelect(_)
             | AppUiCommand::ProfileLlmTest(_)
             | AppUiCommand::ProfileSkillsInstall(_)
@@ -2665,6 +2670,9 @@ fn rpc_request_from_command(
         AppUiCommand::ProfileLlmList(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmUpsert(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmDelete(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileSubProvidersList(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileSubProvidersUpsert(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileSubProvidersRemove(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmSelect(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmTest(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmFetchModels(params) => serde_json::to_value(params),
@@ -3092,6 +3100,35 @@ fn success_response_to_app_event(
                         "invalid_result",
                         format!(
                             "failed to decode UI protocol result for profile/llm mutation: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST => {
+            match serde_json::from_value::<SubProvidersListResult>(result) {
+                Ok(result) => Ok(Some(sub_providers_list_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for profile/sub_providers/list: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT
+        | crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE => {
+            match serde_json::from_value::<SubProvidersMutationResult>(result) {
+                Ok(result) => Ok(Some(sub_providers_mutation_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for profile/sub_providers mutation: {err}"
                         ),
                     )
                     .into(),
@@ -3634,6 +3671,28 @@ fn profile_llm_mutation_event(result: ProfileLlmMutationResult) -> ClientEvent {
         _ => format!("Provider profile updated: {count} configured provider(s)"),
     };
     ClientEvent::ProfileLlmMutation(ProfileLlmMutationClientEvent { message, result })
+}
+
+fn sub_providers_list_event(result: SubProvidersListResult) -> ClientEvent {
+    let count = result.sub_providers.len();
+    ClientEvent::SubProvidersList(SubProvidersListClientEvent {
+        message: match count {
+            0 => "Research lanes refreshed: none configured".into(),
+            1 => "Research lanes refreshed: 1 lane".into(),
+            _ => format!("Research lanes refreshed: {count} lanes"),
+        },
+        result,
+    })
+}
+
+fn sub_providers_mutation_event(result: SubProvidersMutationResult) -> ClientEvent {
+    let count = result.sub_providers.len();
+    let message = if result.applied {
+        format!("Research lanes updated: {count} configured — restart to apply")
+    } else {
+        "Research lane unchanged".into()
+    };
+    ClientEvent::SubProvidersMutation(SubProvidersMutationClientEvent { message, result })
 }
 
 fn profile_skills_list_event(result: ProfileSkillsListResult) -> ClientEvent {

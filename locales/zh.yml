@@ -450,6 +450,8 @@ command:
     desc: 列出或配置服务器支持的 MCP 条目
   model:
     desc: 选择服务器返回的档案 LLM 模型
+  research:
+    desc: 管理研究模型通道（deep_research 的 cheap/strong 模型）。
   onboard:
     desc: 打开设置向导以配置或重新配置您的档案、供应商、模型和工作区
   permissions:
@@ -493,6 +495,22 @@ lang:
   unknown: 未知语言 '%{value}'。可选：en、zh。
   usage: 当前语言：%{current}。用法：/lang <en|zh>。
 menu:
+  research:
+    title: 研究模型通道
+    subtitle: "deep_research 流水线的命名模型通道（cheap/strong）。需重启生效。"
+    footer: Enter 选择通道以删除 | Esc 关闭
+    item:
+      refresh:
+        label: 刷新通道
+        desc: 使用 profile/sub_providers/list。
+      empty:
+        label: 尚未配置研究通道
+        desc: "使用 /research add <key> <provider> <model> 添加。"
+      lane:
+        desc: 选择以删除此通道。
+      add:
+        label: 添加通道…
+        desc: "预填 /research add — 然后输入 <key> <provider> <model>。"
   agents:
     item:
       dock_collapse:
@@ -1108,6 +1126,9 @@ menu:
     unavailable_title: 工具设置不可用
   unavailable: 菜单不可用
 status:
+  research_usage: "用法：/research | /research add <key> <provider> <model> [base_url] [api_key_env] | /research rm <key>"
+  research_add_usage: "用法：/research add <key> <provider> <model> [base_url] [api_key_env]"
+  research_rm_usage: "用法：/research rm <key>"
   opening_diff_preview: "正在打开差异预览：%{operation} %{path}"
   opening_inline_diff_preview: "正在打开内联差异预览：%{title}"
   approval_requested: "请求审批：%{title}"

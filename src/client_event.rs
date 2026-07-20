@@ -17,7 +17,8 @@ use crate::model::{
     ProfileLlmMutationResult, ProfileLocalCreateResult, ProfileSkillsListResult,
     ProfileSkillsMutationResult, ProfileSkillsRegistrySearchResult, ReviewStartResult,
     SessionGoalClearResult, SessionGoalGetResult, SessionGoalSetResult, SessionStatusReadResult,
-    ToolConfigListResult, ToolConfigMutationResult, ToolStatusListResult,
+    SubProvidersListResult, SubProvidersMutationResult, ToolConfigListResult,
+    ToolConfigMutationResult, ToolStatusListResult,
 };
 
 #[derive(Debug, Clone)]
@@ -54,6 +55,8 @@ pub enum ClientEvent {
     ProfileLlmCatalog(ProfileLlmCatalogClientEvent),
     ProfileLlmList(ProfileLlmListClientEvent),
     ProfileLlmMutation(ProfileLlmMutationClientEvent),
+    SubProvidersList(SubProvidersListClientEvent),
+    SubProvidersMutation(SubProvidersMutationClientEvent),
     ProfileSkillsList(ProfileSkillsListClientEvent),
     ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchClientEvent),
     ProfileSkillsMutation(ProfileSkillsMutationClientEvent),
@@ -186,6 +189,18 @@ pub struct ProfileLlmListClientEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProfileLlmMutationClientEvent {
     pub result: ProfileLlmMutationResult,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubProvidersListClientEvent {
+    pub result: SubProvidersListResult,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubProvidersMutationClientEvent {
+    pub result: SubProvidersMutationResult,
     pub message: String,
 }
 

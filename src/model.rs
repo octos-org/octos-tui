@@ -66,6 +66,9 @@ pub const APPUI_METHOD_PROFILE_LOCAL_CREATE: &str = "profile/local/create";
 pub const APPUI_METHOD_PROFILE_LLM_CATALOG: &str = "profile/llm/catalog";
 pub const APPUI_METHOD_PROFILE_LLM_UPSERT: &str = "profile/llm/upsert";
 pub const APPUI_METHOD_PROFILE_LLM_DELETE: &str = "profile/llm/delete";
+pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST: &str = "profile/sub_providers/list";
+pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT: &str = "profile/sub_providers/upsert";
+pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE: &str = "profile/sub_providers/remove";
 pub const APPUI_METHOD_PROFILE_LLM_TEST: &str = "profile/llm/test";
 pub const APPUI_METHOD_PROFILE_LLM_FETCH_MODELS: &str = "profile/llm/fetch_models";
 pub const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
@@ -746,6 +749,9 @@ pub enum AppUiCommand {
     ProfileLlmSelect(ProfileLlmSelectParams),
     ProfileLlmTest(ProfileLlmTestParams),
     ProfileLlmFetchModels(ProfileLlmFetchModelsParams),
+    ProfileSubProvidersList(SubProvidersListParams),
+    ProfileSubProvidersUpsert(SubProvidersUpsertParams),
+    ProfileSubProvidersRemove(SubProvidersRemoveParams),
     ProfileSkillsList(ProfileSkillsListParams),
     ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchParams),
     ProfileSkillsInstall(ProfileSkillsInstallParams),
@@ -840,6 +846,9 @@ impl AppUiCommand {
             Self::ProfileLlmDelete(_) => APPUI_METHOD_PROFILE_LLM_DELETE,
             Self::ProfileLlmTest(_) => APPUI_METHOD_PROFILE_LLM_TEST,
             Self::ProfileLlmFetchModels(_) => APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+            Self::ProfileSubProvidersList(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+            Self::ProfileSubProvidersUpsert(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+            Self::ProfileSubProvidersRemove(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
             Self::ProfileSkillsList(_) => APPUI_METHOD_PROFILE_SKILLS_LIST,
             Self::ProfileSkillsRegistrySearch(_) => APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
             Self::ProfileSkillsInstall(_) => APPUI_METHOD_PROFILE_SKILLS_INSTALL,
@@ -3272,6 +3281,84 @@ pub struct ProfileLlmSelectParams {
     pub route_id: String,
 }
 
+/// One named provider lane (`sub_providers`) as seen by the `/research` menu —
+/// mirrors the server `SubProviderConfig`. `key` addresses the lane; the rest
+/// are the editable fields.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SubProviderView {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubProvidersListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubProvidersUpsertParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub sub_provider: SubProviderView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretString>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubProvidersRemoveParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SubProvidersListResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub sub_providers: Vec<SubProviderView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SubProvidersMutationResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub sub_providers: Vec<SubProviderView>,
+    #[serde(default)]
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
+}
+
+impl SubProvidersMutationResult {
+    pub fn to_list_result(&self) -> SubProvidersListResult {
+        SubProvidersListResult {
+            profile_id: self.profile_id.clone(),
+            sub_providers: self.sub_providers.clone(),
+            runtime_policy_stamp: self.runtime_policy_stamp.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProfileLlmTestParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4049,6 +4136,9 @@ pub struct AppState {
     pub session_runtime_statuses: Vec<SessionRuntimeStatus>,
     pub profile_llm_catalog: Option<ProfileLlmCatalogResult>,
     pub profile_llm_state: Option<ProfileLlmListResult>,
+    /// Named provider lanes (`sub_providers`) shown by the `/research` menu,
+    /// populated from `profile/sub_providers/list`.
+    pub sub_providers_state: Option<SubProvidersListResult>,
     pub profile_skills: Option<ProfileSkillsListResult>,
     pub profile_skill_registry: Option<ProfileSkillsRegistrySearchResult>,
     pub session_model_catalogs: Vec<SessionModelCatalog>,
@@ -5898,6 +5988,7 @@ impl AppState {
             session_runtime_statuses: Vec::new(),
             profile_llm_catalog: None,
             profile_llm_state: None,
+            sub_providers_state: None,
             profile_skills: None,
             profile_skill_registry: None,
             session_model_catalogs: Vec::new(),

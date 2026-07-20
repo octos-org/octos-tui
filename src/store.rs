@@ -23,8 +23,8 @@ use crate::{
         ModelSelectClientEvent, PermissionProfileClientEvent, ProfileLlmCatalogClientEvent,
         ProfileLlmListClientEvent, ProfileLlmMutationClientEvent, ProfileSkillsListClientEvent,
         ProfileSkillsMutationClientEvent, ProfileSkillsRegistrySearchClientEvent,
-        SessionStatusClientEvent, ToolConfigListClientEvent, ToolConfigMutationClientEvent,
-        ToolStatusClientEvent,
+        SessionStatusClientEvent, SubProvidersListClientEvent, SubProvidersMutationClientEvent,
+        ToolConfigListClientEvent, ToolConfigMutationClientEvent, ToolStatusClientEvent,
     },
     menu::{
         CommandEntry, CommandRegistry, CommandResolution, LocalAction, MenuAction, MenuAppSnapshot,
@@ -41,10 +41,11 @@ use crate::{
         ProfileSkillsListParams, ProfileSkillsRegistrySearchParams, ProfileSkillsRemoveParams,
         ResumeSessionRow, ReviewStartParams, ReviewStartResult, RewindTurnRow, SecretString,
         SessionMcpCatalog, SessionModelCatalog, SessionRuntimeStatus, SessionToolCatalog,
-        SessionView, StagedSubmitGate, TaskView, ToolConfigDeleteParams, ToolConfigListParams,
-        ToolConfigSetEnabledParams, ToolConfigTestParams, ToolConfigUpsertParams,
-        UserQuestionPickerState, V2AssistantSegment, complete_plan_steps_in_text, task_state_label,
-        terminal_task_state_from_agent_status,
+        SessionView, StagedSubmitGate, SubProviderView, SubProvidersListParams,
+        SubProvidersRemoveParams, SubProvidersUpsertParams, TaskView, ToolConfigDeleteParams,
+        ToolConfigListParams, ToolConfigSetEnabledParams, ToolConfigTestParams,
+        ToolConfigUpsertParams, UserQuestionPickerState, V2AssistantSegment,
+        complete_plan_steps_in_text, task_state_label, terminal_task_state_from_agent_status,
     },
 };
 
@@ -554,6 +555,14 @@ impl Store {
                 ) {
                     return self.dispatch_autonomy_slash(draft);
                 }
+                if matches!(
+                    &command.entry,
+                    crate::menu::types::CommandEntry::LocalAction(
+                        crate::menu::types::LocalAction::Custom("research"),
+                    )
+                ) {
+                    return self.dispatch_research_slash(draft);
+                }
                 self.dispatch_command_entry(&command.entry, Some(invocation.args))
             }
             CommandResolution::EmptyCommand => {
@@ -609,6 +618,63 @@ impl Store {
         match produced {
             Some(command) => SlashDispatchOutcome::accepted(Some(command)),
             None => SlashDispatchOutcome::Rejected,
+        }
+    }
+
+    /// `/research` — manage the named provider lanes (`sub_providers`) that back
+    /// the isolated deep_research pipeline router (Stage 1). Bare `/research`
+    /// opens the lanes menu and refreshes it; `add`/`rm` mutate a lane inline.
+    /// Changes are RESTART-to-apply on a pinned solo profile (the router builds
+    /// at ProfileRuntime bootstrap) — the mutation status says so.
+    pub(crate) fn dispatch_research_slash(&mut self, draft: &str) -> SlashDispatchOutcome {
+        let rest = draft.trim().strip_prefix("/research").unwrap_or("").trim();
+        let mut tokens = rest.split_whitespace();
+        match tokens.next() {
+            None => {
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_RESEARCH));
+                SlashDispatchOutcome::accepted(Some(AppUiCommand::ProfileSubProvidersList(
+                    SubProvidersListParams::default(),
+                )))
+            }
+            Some("add") | Some("set") => {
+                let (Some(key), Some(provider)) = (tokens.next(), tokens.next()) else {
+                    self.state.status = t!("status.research_add_usage").into_owned();
+                    return SlashDispatchOutcome::Rejected;
+                };
+                let model = tokens.next().map(str::to_string);
+                let base_url = tokens.next().map(str::to_string);
+                let api_key_env = tokens.next().map(str::to_string);
+                SlashDispatchOutcome::accepted(Some(AppUiCommand::ProfileSubProvidersUpsert(
+                    SubProvidersUpsertParams {
+                        profile_id: None,
+                        sub_provider: SubProviderView {
+                            key: key.to_string(),
+                            provider: Some(provider.to_string()),
+                            model,
+                            base_url,
+                            api_key_env,
+                            ..Default::default()
+                        },
+                        api_key: None,
+                    },
+                )))
+            }
+            Some("rm") | Some("remove") | Some("delete") => {
+                let Some(key) = tokens.next() else {
+                    self.state.status = t!("status.research_rm_usage").into_owned();
+                    return SlashDispatchOutcome::Rejected;
+                };
+                SlashDispatchOutcome::accepted(Some(AppUiCommand::ProfileSubProvidersRemove(
+                    SubProvidersRemoveParams {
+                        profile_id: None,
+                        key: key.to_string(),
+                    },
+                )))
+            }
+            Some(_) => {
+                self.state.status = t!("status.research_usage").into_owned();
+                SlashDispatchOutcome::Rejected
+            }
         }
     }
 
@@ -4547,6 +4613,7 @@ impl Store {
             model_catalog,
             profile_llm_catalog: self.state.profile_llm_catalog.as_ref(),
             profile_llm_state: self.state.profile_llm_state.as_ref(),
+            sub_providers_state: self.state.sub_providers_state.as_ref(),
             profile_skills: self.state.profile_skills.as_ref(),
             profile_skill_registry: self.state.profile_skill_registry.as_ref(),
             mcp_catalog,
@@ -5844,6 +5911,16 @@ impl Store {
             }
             ClientEvent::ProfileLlmMutation(event) => {
                 self.apply_profile_llm_mutation_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::SubProvidersList(event) => {
+                self.apply_sub_providers_list_event(event);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::SubProvidersMutation(event) => {
+                self.apply_sub_providers_mutation_event(event);
                 self.refresh_active_menu_if_open();
                 None
             }
@@ -7779,6 +7856,28 @@ impl Store {
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
             "providers",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
+    fn apply_sub_providers_list_event(&mut self, event: SubProvidersListClientEvent) {
+        self.state.sub_providers_state = Some(event.result);
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "research",
+            event.message.clone(),
+        ));
+        self.state.status = event.message;
+    }
+
+    fn apply_sub_providers_mutation_event(&mut self, event: SubProvidersMutationClientEvent) {
+        if event.result.applied {
+            self.state.sub_providers_state = Some(event.result.to_list_result());
+        }
+        self.state.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "research",
             event.message.clone(),
         ));
         self.state.status = event.message;
@@ -12131,6 +12230,46 @@ mod tests {
             !store.state.reasoning_display_enabled(&session_id),
             "second toggle turns it back off"
         );
+    }
+
+    #[test]
+    fn research_slash_parses_add_rm_and_rejects_missing_args() {
+        let mut store = store_with_empty_session();
+
+        // `/research add <key> <provider> <model> …` → upsert with those fields.
+        let cmd = store
+            .dispatch_research_slash("/research add cheap gemini gemini-2.5-flash")
+            .into_command();
+        match cmd {
+            Some(AppUiCommand::ProfileSubProvidersUpsert(p)) => {
+                assert_eq!(p.sub_provider.key, "cheap");
+                assert_eq!(p.sub_provider.provider.as_deref(), Some("gemini"));
+                assert_eq!(p.sub_provider.model.as_deref(), Some("gemini-2.5-flash"));
+            }
+            other => panic!("add should produce an upsert, got {other:?}"),
+        }
+
+        // `/research rm <key>` → remove.
+        let cmd = store
+            .dispatch_research_slash("/research rm cheap")
+            .into_command();
+        match cmd {
+            Some(AppUiCommand::ProfileSubProvidersRemove(p)) => assert_eq!(p.key, "cheap"),
+            other => panic!("rm should produce a remove, got {other:?}"),
+        }
+
+        // Missing provider → rejected, no command.
+        assert!(matches!(
+            store.dispatch_research_slash("/research add cheap"),
+            SlashDispatchOutcome::Rejected
+        ));
+
+        // Bare `/research` opens the lanes menu and refreshes it (list command).
+        let cmd = store.dispatch_research_slash("/research").into_command();
+        assert!(matches!(
+            cmd,
+            Some(AppUiCommand::ProfileSubProvidersList(_))
+        ));
     }
 
     fn store_with_empty_session() -> Store {
