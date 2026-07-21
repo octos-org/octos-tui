@@ -216,6 +216,29 @@ UI. Type a request in the composer and press Enter — you're chatting with Octo
 
 You can reopen this wizard at any time with the `/setup` slash command.
 
+### Agent permissions & code review
+
+A coding session drives an agent that reads and (optionally) edits code in your
+workspace. How much it may do is a **per-session** setting you change live with
+`/permissions` — no restart, no launch flag:
+
+| Mode | The agent can… | Use it for |
+| --- | --- | --- |
+| **Read-only** | read files, run read-only commands (`git diff`, `grep`); writes fail | code review — it can't change your repo |
+| **Workspace-write** | read + write inside the workspace | hands-on edits, scoped to your project |
+| **Full Access** ("yolo") | host filesystem + network, approvals never | trusted local automation — **risk of data loss** |
+
+So for a review, run `/permissions` → **Read-only** and ask the agent to review
+the diff; for hands-on changes, switch to **Workspace-write** (or **Full
+Access**). The TUI only *requests* the mode — the backend applies it, and **Full
+Access is offered only on solo/local backends**, never on a shared `octos serve`.
+
+For **headless / scripted** code review and for running **many review or edit
+agents in parallel**, use the `octos chat` CLI in the main
+[octos](https://github.com/octos-org/octos) repo (`--sandbox`, `--yolo`,
+`--profile`, `--no-session-persistence`) — see its README's *Headless agent mode
+& code review* section.
+
 ---
 
 ## Other ways to run
@@ -345,6 +368,9 @@ q          quit
 /stop       interrupt the active turn (or report locally if none is active)
 /setup      reopen the onboarding wizard
 /model      browse the server-returned profile models / catalog
+/permissions  set the session's sandbox + approval mode (menu): Read-only,
+              Workspace-write, or Full Access (the "yolo" mode — host access,
+              network, approvals never). Solo/local backends only.
 /theme      switch the TUI palette at runtime (menu, or /theme claude)
 /lang       switch the UI language (menu, or /lang zh) — English / 中文
 /thinking   set reasoning effort for thinking models, per session (menu, or /thinking high)
