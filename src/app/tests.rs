@@ -2,6 +2,8 @@
 //! 23k lines of which ~87% was this test code. `use super::*` reaches the
 //! app module's items exactly as the inline test module did.
 
+#![allow(clippy::module_inception)]
+
 use super::*;
 
 fn composer_height(app: &AppState) -> u16 {
