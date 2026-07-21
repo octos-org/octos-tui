@@ -285,7 +285,7 @@ fn live_tail_height_with_finalization(
         // The empty-session launch banner wants a generous block.
         return height.saturating_sub(8).clamp(6, 16);
     }
-    let wrap_width = usize::from(width.saturating_sub(2)).max(1);
+    let wrap_width = crate::model::transcript_wrap_width_for(width);
     let lines = live_tail_lines_with_finalization(
         app,
         Palette::for_theme(app.theme),
@@ -3569,7 +3569,7 @@ fn transcript_visible_height(area: Rect) -> usize {
 }
 
 fn transcript_wrap_width(area: Rect) -> usize {
-    usize::from(area.width.saturating_sub(2)).max(1)
+    crate::model::transcript_wrap_width_for(area.width)
 }
 
 fn transcript_visual_rows(lines: &[Line<'static>], wrap_width: usize) -> usize {
@@ -3861,7 +3861,13 @@ fn push_turn_flow(
     }
 
     if live_turn_diff_preview_visible(app) {
-        push_inline_diff_preview(lines, palette, &app.diff_preview, app.expanded_tool_outputs);
+        push_inline_diff_preview(
+            lines,
+            palette,
+            &app.diff_preview,
+            app.expanded_tool_outputs,
+            width,
+        );
     }
 
     // Pinned LAST: a parked decision's card is the bottom-most turn-flow content,
@@ -6726,7 +6732,13 @@ fn push_turn_activity_log_section(
             ]));
         }
         if app.diff_preview.active && app.diff_preview.turn_id.as_ref() == Some(&log.turn_id) {
-            push_inline_diff_preview(lines, palette, &app.diff_preview, app.expanded_tool_outputs);
+            push_inline_diff_preview(
+                lines,
+                palette,
+                &app.diff_preview,
+                app.expanded_tool_outputs,
+                wrap_width,
+            );
         }
     }
     push_turn_summary_line(lines, palette, app, &log.turn_id);
@@ -7535,6 +7547,7 @@ fn push_inline_diff_preview(
     palette: Palette,
     diff: &DiffPreviewPaneState,
     expanded: bool,
+    wrap_width: usize,
 ) {
     // C6: when there is no usable line diff ("line diff unavailable for this
     // mutation"), hide the box entirely instead of rendering an empty preview
@@ -7542,6 +7555,10 @@ fn push_inline_diff_preview(
     if !diff.has_renderable_diff() {
         return;
     }
+    // Side-by-side needs room for two readable columns; below the minimum the
+    // render AUTO-FALLS-BACK to unified (and the footer hint explains why).
+    let side_by_side_available = wrap_width >= crate::model::DIFF_SIDE_BY_SIDE_MIN_WIDTH;
+    let side_by_side = diff.side_by_side && side_by_side_available;
     if !lines.is_empty() {
         lines.push(Line::from(""));
     }
@@ -7596,12 +7613,26 @@ fn push_inline_diff_preview(
         }
 
         if !preview.files.is_empty() {
+            // Footer hint: hunk navigation/staging, plus the view-mode toggle
+            // — or, when the transcript is too narrow to split, why `v` is
+            // disabled.
+            let mut hint = t!("app.diff.select_stage_hint").into_owned();
+            hint.push_str(" | ");
+            if side_by_side_available {
+                hint.push_str(&if diff.side_by_side {
+                    t!("app.diff.toggle_unified_hint")
+                } else {
+                    t!("app.diff.toggle_side_by_side_hint")
+                });
+            } else {
+                hint.push_str(&t!(
+                    "app.diff.side_by_side_too_narrow",
+                    min = crate::model::DIFF_SIDE_BY_SIDE_MIN_WIDTH
+                ));
+            }
             lines.push(Line::from(vec![
                 Span::styled("    ", palette.muted()),
-                Span::styled(
-                    t!("app.diff.select_stage_hint").into_owned(),
-                    palette.selected(),
-                ),
+                Span::styled(hint, palette.selected()),
             ]));
         }
 
@@ -7618,6 +7649,8 @@ fn push_inline_diff_preview(
                     diff.selected_hunk,
                     file,
                     expanded,
+                    wrap_width,
+                    side_by_side,
                 );
             }
         }
@@ -7677,6 +7710,224 @@ fn push_diff_content_line(
     ]));
 }
 
+/// One aligned side-by-side row: old file's line on the left, new file's on
+/// the right. `None` = blank half (a removed line with no added counterpart,
+/// or vice versa).
+type SideBySideRow<'a> = (
+    Option<&'a crate::model::DiffPreviewLine>,
+    Option<&'a crate::model::DiffPreviewLine>,
+);
+
+/// Pair already-parsed unified hunk lines into aligned side-by-side rows:
+/// context appears on both sides, a removed run pairs row-by-row with the
+/// added run it abuts, and surplus removed/added lines keep a blank opposite
+/// column. Reuses `DiffPreviewLine` — no re-parsing.
+fn side_by_side_rows(lines: &[crate::model::DiffPreviewLine]) -> Vec<SideBySideRow<'_>> {
+    fn flush_changes<'a>(
+        rows: &mut Vec<SideBySideRow<'a>>,
+        removed: &mut Vec<&'a crate::model::DiffPreviewLine>,
+        added: &mut Vec<&'a crate::model::DiffPreviewLine>,
+    ) {
+        for idx in 0..removed.len().max(added.len()) {
+            rows.push((removed.get(idx).copied(), added.get(idx).copied()));
+        }
+        removed.clear();
+        added.clear();
+    }
+
+    let mut rows = Vec::with_capacity(lines.len());
+    let mut removed: Vec<&crate::model::DiffPreviewLine> = Vec::new();
+    let mut added: Vec<&crate::model::DiffPreviewLine> = Vec::new();
+    for line in lines {
+        // Kind aliases mirror `diff_preview_line_is_change` (model.rs).
+        match line.kind.as_str() {
+            "removed" | "delete" | "deleted" => removed.push(line),
+            "added" | "insert" | "inserted" => added.push(line),
+            _ => {
+                flush_changes(&mut rows, &mut removed, &mut added);
+                rows.push((Some(line), Some(line)));
+            }
+        }
+    }
+    flush_changes(&mut rows, &mut removed, &mut added);
+    rows
+}
+
+/// Minimum line-number gutter width in a side-by-side half (matches the
+/// unified view's `{n:>4}` gutter).
+const SIDE_BY_SIDE_MIN_GUTTER: usize = 4;
+
+/// Line-number gutter width for one hunk's side-by-side rows: wide enough
+/// for the LARGEST line number either side shows, never below
+/// [`SIDE_BY_SIDE_MIN_GUTTER`]. Computed per hunk — a fixed `{n:>4}` gutter
+/// silently widened only the rows with numbers >= 10000, shifting that
+/// row's separator out of column and breaking the hunk's shared-row
+/// alignment (#362 review).
+fn side_by_side_gutter_width(lines: &[crate::model::DiffPreviewLine]) -> usize {
+    lines
+        .iter()
+        .filter_map(|line| line.old_line.max(line.new_line))
+        .max()
+        .map(|max| max.to_string().len())
+        .unwrap_or(SIDE_BY_SIDE_MIN_GUTTER)
+        .max(SIDE_BY_SIDE_MIN_GUTTER)
+}
+
+/// Fixed columns in a side-by-side row besides the two content cells, for a
+/// given line-number gutter width: 4 indent + (gutter + 1 space + sign + 1
+/// space) per half + 3 separator.
+fn side_by_side_chrome_cols(gutter: usize) -> usize {
+    4 + 2 * (gutter + 3) + 3
+}
+
+/// Fit `content` into exactly `cell` display columns: truncate with a
+/// trailing `…` when too wide (no horizontal scroll in v1), pad with spaces
+/// when narrower so the column separator stays aligned. UTF-8/display-width
+/// safe (a wide char never straddles the cell boundary).
+///
+/// Sanitizes (tabs -> 4 spaces, other control chars stripped) BEFORE
+/// measuring — the same order `insert_history` and `finish_hanging_body`
+/// use. The finalized-scrollback flush runs `sanitize_line_in_place` AFTER
+/// this cell has been padded to exact width, so measuring a raw `\t` would
+/// let the row grow four columns per tab at insert time, hard-wrap in native
+/// scrollback, and permanently misalign the old|new separator.
+fn fit_diff_cell(content: &str, cell: usize) -> String {
+    let content: std::borrow::Cow<'_, str> = if content.chars().any(char::is_control) {
+        std::borrow::Cow::Owned(crate::insert_history::sanitize_span_content(content))
+    } else {
+        std::borrow::Cow::Borrowed(content)
+    };
+    let content = content.as_ref();
+    let width = UnicodeWidthStr::width(content);
+    if width <= cell {
+        let mut out = String::with_capacity(content.len() + (cell - width));
+        out.push_str(content);
+        out.push_str(&" ".repeat(cell - width));
+        return out;
+    }
+    let budget = cell.saturating_sub(1); // room for the ellipsis marker
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in content.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > budget {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out.push('…');
+    // A wide char stopping short of the boundary leaves the cell a column
+    // narrow; pad so the separator stays aligned.
+    out.push_str(&" ".repeat(cell.saturating_sub(used + 1)));
+    out
+}
+
+/// Render one half of a side-by-side row: line number, sign, and the content
+/// cell, styled by the line's kind — or a blank filler half when this side has
+/// no line.
+fn push_diff_half_spans(
+    spans: &mut Vec<Span<'static>>,
+    palette: Palette,
+    line: Option<&crate::model::DiffPreviewLine>,
+    line_no: fn(&crate::model::DiffPreviewLine) -> Option<u32>,
+    gutter_width: usize,
+    cell: usize,
+    leading_indent: bool,
+) {
+    match line {
+        Some(line) => {
+            let number = line_no(line)
+                .map(|number| number.to_string())
+                .unwrap_or_else(|| "-".into());
+            let gutter = diff_line_gutter_style(&line.kind, palette);
+            if leading_indent {
+                spans.push(Span::styled("    ", gutter));
+            }
+            spans.push(Span::styled(format!("{number:>gutter_width$} "), gutter));
+            spans.push(Span::styled(
+                format!("{} ", diff_line_sign(&line.kind)),
+                diff_line_marker_style(&line.kind, palette),
+            ));
+            spans.push(Span::styled(
+                fit_diff_cell(&line.content, cell),
+                diff_line_style(&line.kind, palette),
+            ));
+        }
+        None => {
+            let blank = palette.muted().bg(palette.surface_alt);
+            if leading_indent {
+                spans.push(Span::styled("    ", blank));
+            }
+            spans.push(Span::styled(" ".repeat(gutter_width + 3 + cell), blank));
+        }
+    }
+}
+
+/// One aligned old|new row: `NNNN - old-cell │ NNNN + new-cell`. Long content
+/// truncates with `…` inside its cell — v1 has no horizontal scroll.
+fn push_diff_side_by_side_row(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    row: SideBySideRow<'_>,
+    gutter_width: usize,
+    wrap_width: usize,
+) {
+    let (left, right) = row;
+    let cell = (wrap_width.saturating_sub(side_by_side_chrome_cols(gutter_width)) / 2).max(8);
+    let mut spans = Vec::with_capacity(9);
+    push_diff_half_spans(
+        &mut spans,
+        palette,
+        left,
+        |line| line.old_line,
+        gutter_width,
+        cell,
+        true,
+    );
+    spans.push(Span::styled(" │ ", palette.muted()));
+    push_diff_half_spans(
+        &mut spans,
+        palette,
+        right,
+        |line| line.new_line,
+        gutter_width,
+        cell,
+        false,
+    );
+    lines.push(Line::from(spans));
+}
+
+/// Render one hunk's body. Unified: one row per `DiffPreviewLine`.
+/// Side-by-side: lines are paired into aligned old/new rows first
+/// (`side_by_side_rows`). `max_rows` caps the output (the collapsed inline
+/// view); returns how many rows the cap hid.
+fn push_diff_hunk_body(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    hunk_lines: &[crate::model::DiffPreviewLine],
+    side_by_side: bool,
+    wrap_width: usize,
+    max_rows: Option<usize>,
+) -> usize {
+    if side_by_side {
+        let rows = side_by_side_rows(hunk_lines);
+        let gutter_width = side_by_side_gutter_width(hunk_lines);
+        let shown = max_rows.unwrap_or(rows.len()).min(rows.len());
+        for row in rows.iter().take(shown) {
+            push_diff_side_by_side_row(lines, palette, *row, gutter_width, wrap_width);
+        }
+        rows.len() - shown
+    } else {
+        let shown = max_rows.unwrap_or(hunk_lines.len()).min(hunk_lines.len());
+        for line in hunk_lines.iter().take(shown) {
+            push_diff_content_line(lines, palette, line);
+        }
+        hunk_lines.len() - shown
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn push_diff_file_lines(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -7685,6 +7936,8 @@ fn push_diff_file_lines(
     selected_hunk: usize,
     file: &crate::model::DiffPreviewFile,
     expanded: bool,
+    wrap_width: usize,
+    side_by_side: bool,
 ) {
     let path = match &file.old_path {
         Some(old_path) if old_path != &file.path => format!("{old_path} -> {}", file.path),
@@ -7737,9 +7990,7 @@ fn push_diff_file_lines(
                 Span::styled(hunk.header.clone(), diff_hunk_style(palette)),
             ]));
             if selected {
-                for line in &hunk.lines {
-                    push_diff_content_line(lines, palette, line);
-                }
+                push_diff_hunk_body(lines, palette, &hunk.lines, side_by_side, wrap_width, None);
             }
         }
         return;
@@ -7762,16 +8013,26 @@ fn push_diff_file_lines(
             Span::styled(marker, palette.selected()),
             Span::styled(hunk.header.clone(), diff_hunk_style(palette)),
         ]));
-        for line in hunk.lines.iter().take(4) {
-            push_diff_content_line(lines, palette, line);
-        }
-        if hunk.lines.len() > 4 {
+        let hidden = push_diff_hunk_body(
+            lines,
+            palette,
+            &hunk.lines,
+            side_by_side,
+            wrap_width,
+            Some(4),
+        );
+        if hidden > 0 {
+            // Side-by-side hides PAIRED ROWS (one row holds up to two
+            // unified lines), so the notice counts rows — the unified
+            // "line(s)" label would understate what's hidden.
+            let notice = if side_by_side {
+                t!("app.diff.more_rows_hidden", count = hidden)
+            } else {
+                t!("app.diff.more_lines_hidden", count = hidden)
+            };
             lines.push(Line::from(vec![
                 Span::styled("    ", palette.muted()),
-                Span::styled(
-                    t!("app.diff.more_lines_hidden", count = hunk.lines.len() - 4).into_owned(),
-                    palette.muted(),
-                ),
+                Span::styled(notice.into_owned(), palette.muted()),
             ]));
         }
     }
@@ -12968,6 +13229,400 @@ mod tests {
         assert!(!rows.join("\n").contains("Work  sticky"));
         assert!(!rows.join("\n").contains("Activity"));
         assert!(!rows.join("\n").contains("**Hero**"));
+    }
+
+    fn mixed_hunk_line(
+        kind: &str,
+        content: &str,
+        old_line: Option<u32>,
+        new_line: Option<u32>,
+    ) -> DiffPreviewLine {
+        DiffPreviewLine {
+            kind: kind.into(),
+            content: content.into(),
+            old_line,
+            new_line,
+        }
+    }
+
+    /// A hunk mixing context, a paired removed/added change, and a surplus
+    /// removed line — the alignment cases side-by-side has to get right.
+    fn mixed_hunk_lines() -> Vec<DiffPreviewLine> {
+        vec![
+            mixed_hunk_line("context", "use std::fmt;", Some(1), Some(1)),
+            mixed_hunk_line("removed", "let x = alpha_old;", Some(2), None),
+            mixed_hunk_line("removed", "let y = beta_old;", Some(3), None),
+            mixed_hunk_line("added", "let x = alpha_new;", None, Some(2)),
+            mixed_hunk_line("context", "done();", Some(4), Some(3)),
+        ]
+    }
+
+    fn mixed_hunk_diff_result() -> DiffPreviewGetResult {
+        DiffPreviewGetResult {
+            status: "ready".into(),
+            source: "pending_store".into(),
+            preview: DiffPreview {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+                title: Some("Mixed patch".into()),
+                files: vec![DiffPreviewFile {
+                    path: "src/lib.rs".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    hunks: vec![DiffPreviewHunk {
+                        header: "@@ -1,4 +1,3 @@".into(),
+                        lines: mixed_hunk_lines(),
+                    }],
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn side_by_side_rows_align_mixed_hunk() {
+        let lines = mixed_hunk_lines();
+        let rows = side_by_side_rows(&lines);
+
+        assert_eq!(rows.len(), 4, "5 unified lines pair into 4 aligned rows");
+        // Context renders on both sides.
+        assert_eq!(rows[0].0.expect("left context").content, "use std::fmt;");
+        assert_eq!(rows[0].1.expect("right context").content, "use std::fmt;");
+        // First removed line pairs with the added line.
+        assert_eq!(
+            rows[1].0.expect("left removed").content,
+            "let x = alpha_old;"
+        );
+        assert_eq!(
+            rows[1].1.expect("right added").content,
+            "let x = alpha_new;"
+        );
+        // Surplus removed line keeps the left column only.
+        assert_eq!(
+            rows[2].0.expect("left removed").content,
+            "let y = beta_old;"
+        );
+        assert!(rows[2].1.is_none(), "no added line to pair on the right");
+        // Trailing context on both sides again.
+        assert_eq!(rows[3].0.expect("left context").content, "done();");
+        assert_eq!(rows[3].1.expect("right context").content, "done();");
+    }
+
+    #[test]
+    fn fit_diff_cell_truncates_with_ellipsis_and_pads_to_cell_width() {
+        assert_eq!(fit_diff_cell("short", 8), "short   ");
+        assert_eq!(fit_diff_cell("exactly8", 8), "exactly8");
+        assert_eq!(fit_diff_cell("very long content", 8), "very lo…");
+        // A wide char never straddles the boundary; the cell stays exactly
+        // `cell` display columns so the column separator keeps aligning.
+        let cjk = fit_diff_cell("宽字符内容测试", 8);
+        assert_eq!(UnicodeWidthStr::width(cjk.as_str()), 8);
+        assert!(cjk.contains('…'));
+    }
+
+    /// codex-review (#362): the finalized-scrollback flush
+    /// (`insert_history::sanitize_line_in_place`) expands tabs to FOUR
+    /// spaces and strips other control chars AFTER the cell was padded to
+    /// exact width, so measuring the raw `\t` (0 columns) let tab-bearing
+    /// rows grow past the wrap width at insert time, hard-wrap in immutable
+    /// native scrollback, and permanently misalign the old|new separator.
+    /// Sanitize BEFORE measuring — the same order `finish_hanging_body`
+    /// uses for assistant bodies.
+    #[test]
+    fn fit_diff_cell_expands_tabs_and_strips_controls_before_measuring() {
+        // A tab counts as four columns in the width math and leaves no raw
+        // `\t` behind for the scrollback sanitizer to widen later.
+        assert_eq!(fit_diff_cell("a\tb", 8), "a    b  ");
+        // Truncation operates on the EXPANDED text: the leading tab plus
+        // three chars already fill the 8-col cell minus the ellipsis.
+        assert_eq!(fit_diff_cell("\tabcdef", 8), "    abc…");
+        // Other control chars (the ESC introducer here) are stripped,
+        // defusing the escape sequence exactly like the sanitizer would.
+        assert_eq!(fit_diff_cell("a\u{1b}[31mb", 8), "a[31mb  ");
+    }
+
+    /// Row-level guarantee for the scrollback flush: side-by-side rows carry
+    /// no raw control characters (so `sanitize_line_in_place` is a no-op on
+    /// them) and every row — full pair, tab-indented, or blank-half — shares
+    /// one exact width within the wrap budget, the alignment the old│new
+    /// separator depends on once rows land in native scrollback.
+    #[test]
+    fn side_by_side_rows_with_tabs_stay_aligned_after_scrollback_sanitize() {
+        let wrap_width = 100usize;
+        let hunk = vec![
+            mixed_hunk_line("context", "\tfor path in paths {", Some(1), Some(1)),
+            mixed_hunk_line("removed", "\t\tvisit(path);", Some(2), None),
+            mixed_hunk_line("removed", "\t\tlog(path);", Some(3), None),
+            mixed_hunk_line("added", "\t\tvisit(path)?;\u{7f}", None, Some(2)),
+        ];
+        let mut lines = Vec::new();
+        push_diff_hunk_body(
+            &mut lines,
+            Palette::for_theme(ThemeName::Codex),
+            &hunk,
+            true,
+            wrap_width,
+            None,
+        );
+        assert_eq!(lines.len(), 3, "context + paired change + surplus removed");
+        let widths: Vec<usize> = lines
+            .iter()
+            .map(|line| {
+                let text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                assert!(
+                    !text.chars().any(char::is_control),
+                    "row must carry no raw control characters: {text:?}"
+                );
+                UnicodeWidthStr::width(text.as_str())
+            })
+            .collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0] && *w <= wrap_width),
+            "rows must share one exact width within the wrap budget: {widths:?}"
+        );
+    }
+
+    /// #362 review: alignment was only ever tested with surplus REMOVED
+    /// lines. Pin the opposite direction — surplus ADDED lines keep the
+    /// right column with a blank left half.
+    #[test]
+    fn side_by_side_rows_align_surplus_added_hunk() {
+        let hunk = vec![
+            mixed_hunk_line("removed", "let a = old();", Some(5), None),
+            mixed_hunk_line("added", "let a = new();", None, Some(5)),
+            mixed_hunk_line("added", "let extra = more();", None, Some(6)),
+        ];
+        let rows = side_by_side_rows(&hunk);
+        assert_eq!(rows.len(), 2, "1R/2A pairs into 2 rows");
+        assert_eq!(rows[0].0.expect("left removed").content, "let a = old();");
+        assert_eq!(rows[0].1.expect("right added").content, "let a = new();");
+        assert!(rows[1].0.is_none(), "no removed line to pair on the left");
+        assert_eq!(
+            rows[1].1.expect("surplus added").content,
+            "let extra = more();"
+        );
+    }
+
+    /// #362 review: a fixed `{n:>4}` gutter widened ONLY the rows whose
+    /// line numbers reached five digits, shifting their separator out of
+    /// column. The gutter now sizes to the hunk's largest line number, so
+    /// small- and five-digit-numbered rows share one exact width and one
+    /// separator column.
+    #[test]
+    fn side_by_side_rows_with_five_digit_line_numbers_stay_aligned() {
+        let wrap_width = 100usize;
+        let hunk = vec![
+            mixed_hunk_line("context", "fn before() {}", Some(9998), Some(9999)),
+            mixed_hunk_line("removed", "let x = old();", Some(9999), None),
+            mixed_hunk_line("added", "let x = new();", None, Some(10001)),
+        ];
+        assert_eq!(side_by_side_gutter_width(&hunk), 5, "sized to 10001");
+        let mut lines = Vec::new();
+        push_diff_hunk_body(
+            &mut lines,
+            Palette::for_theme(ThemeName::Codex),
+            &hunk,
+            true,
+            wrap_width,
+            None,
+        );
+        assert_eq!(lines.len(), 2, "context + paired change");
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let widths: Vec<usize> = rendered
+            .iter()
+            .map(|text| UnicodeWidthStr::width(text.as_str()))
+            .collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0] && *w <= wrap_width),
+            "rows must share one exact width: {widths:?}"
+        );
+        let separator_cols: Vec<usize> = rendered
+            .iter()
+            .map(|text| {
+                let at = text.find(" │ ").expect("separator present");
+                UnicodeWidthStr::width(&text[..at])
+            })
+            .collect();
+        assert!(
+            separator_cols.iter().all(|c| *c == separator_cols[0]),
+            "the old│new separator must sit in one column: {separator_cols:?}"
+        );
+    }
+
+    /// A hunk tall enough to overflow the collapsed 4-row cap in BOTH view
+    /// modes: 10 removed + 10 added lines pair into 10 side-by-side rows
+    /// (20 unified rows).
+    fn tall_hunk_diff_result() -> DiffPreviewGetResult {
+        let mut lines = Vec::new();
+        for idx in 0..10u32 {
+            lines.push(mixed_hunk_line(
+                "removed",
+                &format!("old line {idx}"),
+                Some(idx + 1),
+                None,
+            ));
+        }
+        for idx in 0..10u32 {
+            lines.push(mixed_hunk_line(
+                "added",
+                &format!("new line {idx}"),
+                None,
+                Some(idx + 1),
+            ));
+        }
+        DiffPreviewGetResult {
+            status: "ready".into(),
+            source: "pending_store".into(),
+            preview: DiffPreview {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+                title: Some("Tall patch".into()),
+                files: vec![DiffPreviewFile {
+                    path: "src/tall.rs".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    hunks: vec![DiffPreviewHunk {
+                        header: "@@ -1,10 +1,10 @@".into(),
+                        lines,
+                    }],
+                }],
+            },
+        }
+    }
+
+    /// codex-review (#362): the collapsed 4-row cap hides PAIRED ROWS in
+    /// side-by-side mode (one row holds up to two unified lines), so
+    /// reporting the count through the unified "diff line(s)" string
+    /// understated what's hidden. Side-by-side counts rows; unified keeps
+    /// counting lines.
+    #[test]
+    fn collapsed_side_by_side_cap_reports_hidden_rows_not_lines() {
+        let mut app = app_with_diff(tall_hunk_diff_result());
+        app.diff_preview.side_by_side = true;
+        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Codex), 150, 42);
+        let joined = rendered_rows(&buffer).join("\n");
+        assert!(
+            joined.contains("6 more diff row(s) hidden"),
+            "side-by-side reports hidden PAIRED ROWS in row units: {joined}"
+        );
+        assert!(
+            !joined.contains("diff line(s) hidden"),
+            "row units replace the understating line units: {joined}"
+        );
+
+        let unified = app_with_diff(tall_hunk_diff_result());
+        let buffer =
+            rendered_buffer_with_size(&unified, Palette::for_theme(ThemeName::Codex), 150, 42);
+        let joined = rendered_rows(&buffer).join("\n");
+        assert!(
+            joined.contains("16 more diff line(s) hidden"),
+            "unified still counts hidden unified lines: {joined}"
+        );
+    }
+
+    #[test]
+    fn render_side_by_side_diff_pairs_old_and_new_columns_when_wide() {
+        let mut app = app_with_diff(mixed_hunk_diff_result());
+        app.diff_preview.side_by_side = true;
+
+        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Codex), 150, 42);
+        let rows = rendered_rows(&buffer);
+
+        let paired = rows
+            .iter()
+            .find(|row| row.contains("alpha_old"))
+            .expect("removed line rendered");
+        assert!(
+            paired.contains("alpha_new"),
+            "side-by-side pairs removed (left) with added (right): {paired:?}"
+        );
+        assert!(
+            paired.find("alpha_old") < paired.find("alpha_new"),
+            "old content stays in the left column: {paired:?}"
+        );
+        assert!(paired.contains('│'), "columns are visually separated");
+        let left_only = rows
+            .iter()
+            .find(|row| row.contains("beta_old"))
+            .expect("surplus removed line rendered");
+        assert!(
+            !left_only.contains("alpha"),
+            "surplus removed line keeps a blank right column: {left_only:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("v unified")),
+            "footer hint advertises the toggle back to unified"
+        );
+    }
+
+    #[test]
+    fn render_side_by_side_falls_back_to_unified_below_min_width() {
+        let mut app = app_with_diff(mixed_hunk_diff_result());
+        app.diff_preview.side_by_side = true;
+
+        // Terminal width 101 -> wrap width 99: one column short of the
+        // threshold, so the render must fall back to unified rows.
+        let narrow = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Codex), 101, 42);
+        let narrow_rows = rendered_rows(&narrow);
+        let removed_row = narrow_rows
+            .iter()
+            .find(|row| row.contains("alpha_old"))
+            .expect("diff rendered");
+        assert!(
+            !removed_row.contains("alpha_new"),
+            "narrow render must fall back to unified rows: {removed_row:?}"
+        );
+        assert!(
+            narrow_rows
+                .iter()
+                .any(|row| row.contains("needs 100+ cols")),
+            "narrow render explains why side-by-side is unavailable"
+        );
+
+        // Terminal width 102 -> wrap width 100: exactly at the threshold, the
+        // side-by-side request takes effect again.
+        let wide = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Codex), 102, 42);
+        let wide_rows = rendered_rows(&wide);
+        let paired = wide_rows
+            .iter()
+            .find(|row| row.contains("alpha_old"))
+            .expect("diff rendered");
+        assert!(
+            paired.contains("alpha_new"),
+            "at the threshold the columns split again: {paired:?}"
+        );
+    }
+
+    #[test]
+    fn render_unified_diff_advertises_side_by_side_toggle_when_wide() {
+        let app = app_with_diff(mixed_hunk_diff_result());
+
+        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Codex), 150, 42);
+        let rows = rendered_rows(&buffer);
+
+        let removed_row = rows
+            .iter()
+            .find(|row| row.contains("alpha_old"))
+            .expect("diff rendered");
+        assert!(
+            !removed_row.contains("alpha_new"),
+            "default mode stays unified: {removed_row:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("v side-by-side")),
+            "footer hint advertises the side-by-side toggle"
+        );
     }
 
     #[test]

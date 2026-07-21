@@ -301,6 +301,7 @@ where
         guard.enter_alt_screen(terminal)?;
         guard.sync_mouse_capture(terminal, app::wants_mouse_capture(&store.state))?;
         let size = terminal.size()?;
+        store.state.last_terminal_width = size.width;
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
         let resized = size != terminal.last_known_screen_size || terminal.viewport_area != area;
         if resized {
@@ -327,6 +328,9 @@ where
 
     let size = terminal.size()?;
     let width = size.width;
+    // Key handlers gate on the drawn width (side-by-side diff toggle); record
+    // it on the frame that renders, so gate and render agree.
+    store.state.last_terminal_width = width;
 
     // A slash/command menu is a RESERVED viewport row block (`menu_height` in
     // `render_viewport_with_finalization`), not a floating overlay. Opening it
@@ -1380,6 +1384,11 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         {
             store.stage_selected_diff_context();
         }
+        KeyCode::Char('v')
+            if store.state.focus != FocusPane::Composer && store.state.diff_preview.active =>
+        {
+            store.toggle_diff_view_mode();
+        }
         KeyCode::Char(ch) => {
             // Store-level composer input: inserts the char and runs the prefix
             // triggers (`/` slash popup, `!` shell-escape hint #364, `@` file
@@ -2064,6 +2073,9 @@ fn handle_approval_modal_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             if let Some(command) = store.read_diff_preview_command() {
                 return KeyAction::send(command);
             }
+        }
+        KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'v') && store.state.diff_preview.active => {
+            store.toggle_diff_view_mode();
         }
         _ => {}
     }
@@ -5523,6 +5535,116 @@ mod tests {
         assert!(store.state.composer.contains("file: src/lib.rs"));
         assert!(store.state.composer.contains("@@ -9 +9 @@"));
         assert_eq!(store.state.focus, FocusPane::Composer);
+    }
+
+    fn diff_result_with_two_hunks(session_id: SessionKey) -> crate::model::DiffPreviewGetResult {
+        crate::model::DiffPreviewGetResult {
+            status: "ready".into(),
+            source: "pending_store".into(),
+            preview: crate::model::DiffPreview {
+                session_id,
+                preview_id: PreviewId::new(),
+                title: Some("Patch".into()),
+                files: vec![crate::model::DiffPreviewFile {
+                    path: "src/lib.rs".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    hunks: vec![
+                        crate::model::DiffPreviewHunk {
+                            header: "@@ -1 +1 @@".into(),
+                            lines: vec![crate::model::DiffPreviewLine {
+                                kind: "removed".into(),
+                                content: "old".into(),
+                                old_line: Some(1),
+                                new_line: None,
+                            }],
+                        },
+                        crate::model::DiffPreviewHunk {
+                            header: "@@ -9 +9 @@".into(),
+                            lines: vec![crate::model::DiffPreviewLine {
+                                kind: "added".into(),
+                                content: "new".into(),
+                                old_line: None,
+                                new_line: Some(9),
+                            }],
+                        },
+                    ],
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn v_toggles_diff_view_round_trip_preserving_scroll_position() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Transcript;
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .diff_preview
+            .apply_result(diff_result_with_two_hunks(session_id));
+        store.state.diff_preview.scroll = 7;
+        store.state.diff_preview.selected_hunk = 1;
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('v'))),
+            KeyAction::Continue
+        ));
+        assert!(store.state.diff_preview.side_by_side);
+        assert_eq!(
+            store.state.diff_preview.scroll, 7,
+            "toggle must preserve scroll position"
+        );
+        assert_eq!(
+            store.state.diff_preview.selected_hunk, 1,
+            "toggle must preserve hunk selection"
+        );
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('v'))),
+            KeyAction::Continue
+        ));
+        assert!(
+            !store.state.diff_preview.side_by_side,
+            "second press round-trips back to unified"
+        );
+        assert_eq!(store.state.diff_preview.scroll, 7);
+        assert_eq!(store.state.diff_preview.selected_hunk, 1);
+    }
+
+    #[test]
+    fn v_toggle_disabled_when_terminal_too_narrow() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Transcript;
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .diff_preview
+            .apply_result(diff_result_with_two_hunks(session_id));
+        store.state.last_terminal_width = 80;
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('v'))),
+            KeyAction::Continue
+        ));
+        assert!(
+            !store.state.diff_preview.side_by_side,
+            "toggle is disabled below the side-by-side minimum width"
+        );
+    }
+
+    #[test]
+    fn v_types_into_composer_when_composer_focused() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.diff_preview.open_loading(PreviewId::new());
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('v'))),
+            KeyAction::Continue
+        ));
+        assert!(!store.state.diff_preview.side_by_side);
+        assert_eq!(store.state.composer, "v");
     }
 
     #[test]
