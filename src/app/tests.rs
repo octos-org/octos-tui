@@ -6,6 +6,52 @@
 
 use super::*;
 
+/// #324: the session strip costs a row only with 2+ open sessions.
+#[test]
+fn session_strip_row_appears_only_with_multiple_sessions() {
+    let one = AppState::new(
+        vec![SessionView {
+            id: SessionKey("local:a".into()),
+            title: "a".into(),
+            profile_id: None,
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        }],
+        0,
+        "ready".into(),
+        None,
+        false,
+    );
+    assert_eq!(session_strip_height(&one), 0, "single session pays no row");
+
+    let two = AppState::new(
+        vec![
+            SessionView {
+                id: SessionKey("local:a".into()),
+                title: "a".into(),
+                profile_id: None,
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            },
+            SessionView {
+                id: SessionKey("local:b".into()),
+                title: "b".into(),
+                profile_id: None,
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            },
+        ],
+        0,
+        "ready".into(),
+        None,
+        false,
+    );
+    assert_eq!(session_strip_height(&two), 1);
+}
+
 fn composer_height(app: &AppState) -> u16 {
     composer_height_for_size(app, 120, 42)
 }

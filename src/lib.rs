@@ -87,6 +87,27 @@ mod i18n_tests {
         }
     }
 
+    /// #324: the session-switcher strings resolve in BOTH locales.
+    #[test]
+    fn sessions_popup_keys_resolve_in_en_and_zh() {
+        let keys = [
+            "command.sessions.desc",
+            "menu.sessions.title",
+            "menu.sessions.subtitle",
+            "menu.sessions.footer",
+            "menu.sessions.item.current",
+            "menu.sessions.item.switch_desc",
+            "menu.sessions.item.empty",
+            "menu.sessions.item.empty_desc",
+        ];
+        for key in keys {
+            for locale in ["en", "zh"] {
+                let value = t!(key, locale = locale);
+                assert_ne!(&*value, key, "missing {locale} translation for {key}");
+            }
+        }
+    }
+
     /// #1768: the /undo snapshot picker strings resolve in BOTH locales.
     #[test]
     fn undo_picker_keys_resolve_in_en_and_zh() {

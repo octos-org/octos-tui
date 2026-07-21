@@ -4889,6 +4889,24 @@ impl Store {
             profile_llm_state: self.state.profile_llm_state.as_ref(),
             sub_providers_state: self.state.sub_providers_state.as_ref(),
             snapshots_state: self.state.snapshots_state.as_ref(),
+            session_chips: self
+                .state
+                .sessions
+                .iter()
+                .enumerate()
+                .map(|(idx, session)| crate::model::SessionChipView {
+                    session_id: session.id.clone(),
+                    title: session.title.clone(),
+                    focused: idx == self.state.selected_session,
+                    live: self.state.session_turn_live(&session.id),
+                    unread: self
+                        .state
+                        .unread_turns
+                        .get(&session.id)
+                        .copied()
+                        .unwrap_or(0),
+                })
+                .collect(),
             profile_skills: self.state.profile_skills.as_ref(),
             profile_skill_registry: self.state.profile_skill_registry.as_ref(),
             mcp_catalog,
@@ -10277,6 +10295,7 @@ impl Store {
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
         self.state.pre_token_turns.remove(&event.session_id);
+        self.bump_unread_for_background_terminal(&event.session_id);
         // The turn the user interrupted has settled — its deferred prompt
         // restore applies now (before the duplicate-terminal early returns:
         // any first terminal for the armed turn consumes the stash).
@@ -10478,6 +10497,7 @@ impl Store {
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
         self.state.pre_token_turns.remove(&event.session_id);
+        self.bump_unread_for_background_terminal(&event.session_id);
         // The interrupted turn has settled (an Esc/Ctrl+C typically lands here
         // as the server's `code == "interrupted"` terminal) — apply the
         // deferred prompt restore (mirror of `commit_live_reply`).
@@ -10877,6 +10897,23 @@ impl Store {
     /// queue (FIFO order survives the retry) and withdraw the optimistic
     /// transcript row so the re-submit cannot render a duplicate. Returns
     /// true when a prompt was re-staged (false for a backoff-only gate).
+    /// #324: a turn reaching its terminal in a NON-focused session bumps
+    /// that session's unread badge (strip + Alt+S popup). Focused sessions
+    /// never count — the user is watching.
+    fn bump_unread_for_background_terminal(&mut self, session_id: &SessionKey) {
+        let is_active = self
+            .state
+            .active_session()
+            .is_some_and(|session| &session.id == session_id);
+        if !is_active {
+            *self
+                .state
+                .unread_turns
+                .entry(session_id.clone())
+                .or_insert(0) += 1;
+        }
+    }
+
     fn restage_dead_staged_submit(
         &mut self,
         session_id: &SessionKey,
@@ -31242,6 +31279,74 @@ mod tests {
         assert_eq!(
             store.state.pending_messages,
             vec!["early follow-up".to_string()]
+        );
+    }
+
+    /// #324: a turn finishing in a NON-focused session bumps its unread
+    /// badge; finishing in the focused session does not; focusing clears.
+    #[test]
+    fn background_terminal_bumps_unread_and_focus_clears_it() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+        // A is focused; B's turn completes in the background.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: b.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert_eq!(store.state.unread_turns.get(&b).copied(), Some(1));
+
+        // The FOCUSED session's terminal never counts.
+        let a = SessionKey("local:a".into());
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: a.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(!store.state.unread_turns.contains_key(&a));
+
+        // Focusing B marks it read.
+        store.state.switch_selected_session(1);
+        assert!(!store.state.unread_turns.contains_key(&b));
+    }
+
+    /// #324: the live-turn signal covers both the streaming window
+    /// (live_reply bound) and the pre-first-token window (submit marker).
+    #[test]
+    fn session_turn_live_covers_streaming_and_pre_token_windows() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        assert!(!store.state.session_turn_live(&a));
+
+        // Pre-token: submitted, no delta yet.
+        let command = store.queue_or_start_prompt_turn("go".into(), "sent".into());
+        assert!(command.is_some());
+        assert!(
+            store.state.session_turn_live(&a),
+            "pre-token window is live"
+        );
+
+        // Streaming: live_reply bound.
+        store.state.pre_token_turns.clear();
+        store.state.sessions[0].live_reply = Some(crate::model::LiveReply {
+            turn_id: TurnId::new(),
+            text: "streaming".into(),
+        });
+        assert!(
+            store.state.session_turn_live(&a),
+            "streaming window is live"
         );
     }
 

@@ -424,6 +424,8 @@ pub struct CommittedFingerprint {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChatLayoutAreas {
+    /// #324: session strip across the top (0-height with a single session).
+    pub session_strip: Rect,
     pub transcript: Rect,
     pub menu: Rect,
     pub autonomy: Rect,
@@ -604,6 +606,7 @@ fn chat_layout_areas_for_menu(
     area: Rect,
     active_menu: Option<&menu_render::MenuSurface>,
 ) -> ChatLayoutAreas {
+    let session_strip_height = session_strip_height(app);
     let composer_height = composer_height_for_size(app, area.width, area.height);
     let desired_menu_height = menu_height_hint(active_menu, area.width, area.height);
     let autonomy_height = autonomy_indicator_height(app, area.width);
@@ -612,6 +615,7 @@ fn chat_layout_areas_for_menu(
     let agent_strip_height = agent_strip_height(app, area.height);
     let surface_budget = area.height.saturating_sub(
         min_transcript_height(area.height)
+            + session_strip_height
             + composer_height
             + autonomy_height
             + harness_height
@@ -623,6 +627,7 @@ fn chat_layout_areas_for_menu(
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(session_strip_height),
             Constraint::Min(8),
             Constraint::Length(menu_height),
             Constraint::Length(autonomy_height),
@@ -635,15 +640,22 @@ fn chat_layout_areas_for_menu(
         .split(area);
 
     ChatLayoutAreas {
-        transcript: root[0],
-        menu: root[1],
-        autonomy: root[2],
-        harness: root[3],
-        decision: root[4],
-        composer: root[5],
-        agent_strip: root[6],
-        status: root[7],
+        session_strip: root[0],
+        transcript: root[1],
+        menu: root[2],
+        autonomy: root[3],
+        harness: root[4],
+        decision: root[5],
+        composer: root[6],
+        agent_strip: root[7],
+        status: root[8],
     }
+}
+
+/// #324: the session strip renders only when there is something to glance at
+/// — two or more open sessions. Single-session users pay zero rows.
+fn session_strip_height(app: &AppState) -> u16 {
+    if app.sessions.len() >= 2 { 1 } else { 0 }
 }
 
 /// OCTOS figlet wordmark shown in the MAIN window on the first-launch
