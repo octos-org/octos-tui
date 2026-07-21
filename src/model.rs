@@ -8166,6 +8166,21 @@ impl AppState {
     }
 
     pub fn delete_composer_prev_char(&mut self) {
+        // A collapsed `[paste]` block is a single atomic unit. Deleting it must
+        // REMOVE THE WHOLE BLOCK, not re-open it: clearing `composer_pasted`
+        // before deleting would expand the full pasted text into the composer
+        // first, so a single backspace appears to do nothing but explode the
+        // block. Instead, when the composer is currently presented as a collapsed
+        // paste, delete the entire block (clear the composer) in one action.
+        if self.composer_pasted
+            && matches!(
+                self.composer_presentation(),
+                ComposerPresentation::Collapsed(_)
+            )
+        {
+            self.clear_current_composer_draft();
+            return;
+        }
         self.composer_pasted = false;
         let cursor = self.composer_cursor_index();
         let Some(prev) = prev_char_boundary(&self.composer, cursor) else {
@@ -8177,6 +8192,18 @@ impl AppState {
     }
 
     pub fn delete_composer_next_char(&mut self) {
+        // Same atomic-block rule as `delete_composer_prev_char`: deleting a
+        // collapsed `[paste]` block removes the whole block, it does not expand
+        // it into the composer first.
+        if self.composer_pasted
+            && matches!(
+                self.composer_presentation(),
+                ComposerPresentation::Collapsed(_)
+            )
+        {
+            self.clear_current_composer_draft();
+            return;
+        }
         self.composer_pasted = false;
         let cursor = self.composer_cursor_index();
         let Some(next) = next_char_boundary(&self.composer, cursor) else {
@@ -10223,5 +10250,57 @@ mod tests {
         };
         let wire = serde_json::to_value(&params).expect("SessionListParams serializes");
         assert_eq!(wire, serde_json::json!({ "cwd": "/tmp/project" }));
+    }
+
+    /// Deleting a collapsed `[paste]` block removes the WHOLE block in one
+    /// action instead of expanding the full pasted text into the composer
+    /// first (which made a single backspace appear to just explode the block).
+    #[test]
+    fn backspace_on_collapsed_paste_deletes_the_whole_block() {
+        let mut state = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let block = (1..=20)
+            .map(|i| format!("pasted line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.insert_pasted_text(&block);
+        assert!(state.composer_pasted);
+        assert!(matches!(
+            state.composer_presentation(),
+            ComposerPresentation::Collapsed(_)
+        ));
+
+        state.delete_composer_prev_char();
+        assert!(
+            state.composer.is_empty(),
+            "backspace on a collapsed paste deletes the whole block, got: {:?}",
+            state.composer
+        );
+        assert!(matches!(
+            state.composer_presentation(),
+            ComposerPresentation::Empty
+        ));
+
+        // Forward-delete behaves the same.
+        state.insert_pasted_text(&block);
+        assert!(state.composer_pasted);
+        state.delete_composer_next_char();
+        assert!(
+            state.composer.is_empty(),
+            "forward-delete on a collapsed paste deletes the whole block, got: {:?}",
+            state.composer
+        );
     }
 }
