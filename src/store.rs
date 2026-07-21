@@ -7975,6 +7975,11 @@ impl Store {
     }
 
     fn apply_sub_providers_mutation_event(&mut self, event: SubProvidersMutationClientEvent) {
+        // The staged removal is a one-shot: once any sub_providers mutation
+        // round-trips, drop the pending intent so a re-opened confirm can't
+        // re-fire it (it survives snapshot replay along with the rest of
+        // `onboarding`).
+        self.state.onboarding.pending_research_lane_removal = None;
         if event.result.applied {
             self.state.sub_providers_state = Some(event.result.to_list_result());
         }
@@ -12590,10 +12595,55 @@ mod tests {
             store.dispatch_research_slash("/research rm cheap"),
             SlashDispatchOutcome::Rejected
         ));
+        // Rejected for the RIGHT reason (unresolved profile), not a usage/
+        // capability message — the guard must fire, not an earlier check.
+        assert_eq!(
+            store.state.status,
+            t!("status.research_profile_unresolved").into_owned()
+        );
         assert!(matches!(
             store.dispatch_research_slash("/research add cheap moonshot k3"),
             SlashDispatchOutcome::Rejected
         ));
+        assert_eq!(
+            store.state.status,
+            t!("status.research_profile_unresolved").into_owned()
+        );
+    }
+
+    #[test]
+    fn request_remove_research_lane_opens_confirm_and_yes_sends_captured_profile() {
+        // End-to-end store wiring (mirrors remove_model_confirm_sends_profile_llm_delete):
+        // the lane-row action stages the removal, opens the confirm, and the Yes
+        // row emits a remove carrying the CAPTURED profile + key.
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE]);
+        store.close_all_menus();
+
+        store.dispatch_menu_action(MenuAction::Local(LocalAction::RequestRemoveResearchLane(
+            Box::new(crate::model::ResearchLaneRemoval {
+                profile_id: Some("coding".into()),
+                key: "cheap".into(),
+            }),
+        )));
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM),
+            "the request opens the confirm menu"
+        );
+        assert!(
+            store
+                .state
+                .onboarding
+                .pending_research_lane_removal
+                .is_some()
+        );
+
+        let command = store.accept_active_menu_item();
+        let Some(AppUiCommand::ProfileSubProvidersRemove(params)) = command else {
+            panic!("expected a ProfileSubProvidersRemove, got {command:?}");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+        assert_eq!(params.key, "cheap");
     }
 
     fn store_with_assistant_message(text: &str) -> Store {

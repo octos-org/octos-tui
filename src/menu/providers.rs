@@ -4319,11 +4319,16 @@ fn research_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 /// open cannot retarget the delete. The mutation result refreshes the lane list
 /// through the standard apply path.
 fn research_remove_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
-    let Some(request) = ctx
+    let staged = ctx
         .app
         .onboarding
-        .and_then(|onboarding| onboarding.pending_research_lane_removal.clone())
-    else {
+        .and_then(|onboarding| onboarding.pending_research_lane_removal.clone());
+    // A staged removal must carry a resolved profile — lanes only render when the
+    // active profile is Some, so this is always true today. Treat a None-profile
+    // stage as "nothing staged" rather than firing a `profile_id: None` remove
+    // (which the server would resolve to its DEFAULT profile): a defensive
+    // tripwire pinning the capture-site invariant this change relies on.
+    let Some(request) = staged.filter(|request| request.profile_id.is_some()) else {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM),
             title: t!("menu.research_remove.title").into_owned(),
@@ -4331,21 +4336,37 @@ fn research_remove_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
         });
     };
-    let items = vec![
-        MenuItem::new(
-            "research.remove.yes",
-            t!(
-                "menu.research_remove.confirm.yes",
-                lane = request.key.clone()
-            ),
+    let can_remove = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE);
+    let mut yes = MenuItem::new(
+        "research.remove.yes",
+        t!(
+            "menu.research_remove.confirm.yes",
+            lane = request.key.clone()
+        ),
+        if can_remove {
             MenuAction::send_appui(AppUiCommand::ProfileSubProvidersRemove(
                 crate::model::SubProvidersRemoveParams {
                     profile_id: request.profile_id.clone(),
                     key: request.key.clone(),
                 },
-            )),
-        )
-        .with_description(t!("menu.research_remove.confirm.yes_desc")),
+            ))
+        } else {
+            MenuAction::Noop
+        },
+    )
+    .with_description(t!("menu.research_remove.confirm.yes_desc"));
+    // Gate the row that FIRES the delete, not just the lane row that staged it —
+    // the server can drop the remove capability while this confirm is open.
+    if !can_remove {
+        yes = yes.disabled(method_missing_reason(
+            ctx,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+        ));
+    }
+    let items = vec![
+        yes,
         MenuItem::new(
             "research.remove.no",
             t!("menu.research_remove.confirm.no"),
