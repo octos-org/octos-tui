@@ -805,9 +805,14 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     // the approval/question modals force-focus the composer, so without the
     // gate Ctrl+W / Alt+b / Shift+Enter kept mutating the hidden draft while a
     // dialog was up. Menus are NOT gated here — `handle_menu_key` routes to
-    // `handle_composer_modified_key` itself where composer editing is intended.
+    // `handle_composer_modified_key` itself where composer editing is intended
+    // — EXCEPT the `@` file picker: its Esc-restore contract ("delete the
+    // trigger `@`, composer back to its pre-`@` text") relies on the composer
+    // being frozen while the picker is up, so a Ctrl+W leaking through here
+    // would silently mutate the hidden draft and break the restore (#363).
     if store.state.focus == FocusPane::Composer
         && !modal_owns_keyboard(store)
+        && store.state.file_picker.is_none()
         && handle_composer_modified_key(store, key)
     {
         return KeyAction::Continue;
@@ -2833,6 +2838,92 @@ mod tests {
         assert_eq!(store.state.chat_view, ChatViewTarget::Main);
         handle_key(&mut store, key(KeyCode::Char('z')));
         assert_eq!(store.state.composer, "z");
+    }
+
+    /// Open the `@` file picker over a fixed in-memory listing (no fs scan):
+    /// composer holds "see @" (the trigger `@` last), the picker state is set,
+    /// and the picker menu is the active frame — the exact state
+    /// `handle_composer_char_input('@')` produces.
+    fn open_file_picker(store: &mut Store) {
+        store.state.set_composer_text("see @");
+        store.state.file_picker = Some(crate::file_picker::FilePickerState {
+            root: "ws".into(),
+            files: vec!["a.rs".into()],
+            truncated: false,
+        });
+        store.open_menu(crate::menu::MenuId::from(
+            crate::menu::registry::MENU_FILE_PICKER,
+        ));
+    }
+
+    #[test]
+    fn modified_keys_leave_composer_frozen_while_file_picker_open() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        open_file_picker(&mut store);
+        assert_eq!(store.state.composer, "see @");
+
+        // #363 review: Ctrl+W must NOT reach the hidden draft while the
+        // picker owns the keyboard — it would eat the trigger `@` (and the
+        // word before it) and break Esc's exact-restore contract.
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            store.state.composer, "see @",
+            "composer is frozen while the picker owns the keyboard"
+        );
+
+        // Sanity: with the picker closed the same key edits the draft again —
+        // proving the freeze above came from the picker gate specifically.
+        store.cancel_composer_file_picker();
+        assert_eq!(store.state.composer, "see ");
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_ne!(store.state.composer, "see ");
+    }
+
+    #[test]
+    fn esc_cancels_shell_escape_draft_before_interrupting_turn() {
+        // #364 review: arm precedence — Esc on a `!` draft discards the draft
+        // and must NEVER fall through to the interrupt arm, even mid-turn.
+        let mut store = store_with_live_reply_text("working…");
+        store.state.focus = FocusPane::Composer;
+        assert!(
+            store.state.active_turn().is_some(),
+            "precondition: a turn is live, so plain Esc WOULD interrupt"
+        );
+        store.state.set_composer_text("!ls -la");
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+        assert!(
+            matches!(action, KeyAction::Continue),
+            "first Esc cancels the draft without sending anything"
+        );
+        assert_eq!(store.state.composer, "");
+        assert!(!store.shell_escape_mode_active());
+    }
+
+    #[test]
+    fn esc_closes_file_picker_without_interrupting_turn() {
+        // #363 review: arm precedence — Esc with the picker open cancels the
+        // picker (restoring the pre-`@` draft) and never reaches the
+        // interrupt arm.
+        let mut store = store_with_live_reply_text("working…");
+        store.state.focus = FocusPane::Composer;
+        open_file_picker(&mut store);
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+        assert!(matches!(action, KeyAction::Continue));
+        assert!(store.state.file_picker.is_none(), "picker state cleared");
+        assert_eq!(
+            store.state.composer, "see ",
+            "trigger `@` removed; draft restored to its pre-`@` text"
+        );
+        assert!(!store.state.menu_stack.is_active(), "picker frame closed");
     }
 
     #[test]
