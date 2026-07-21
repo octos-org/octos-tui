@@ -1484,6 +1484,7 @@ impl ProtocolAppUiBackend {
             let _ = tx.send(LocalShellResultEvent {
                 local_id,
                 cmdline: cmd,
+                cwd: cwd.as_ref().map(|path| path.display().to_string()),
                 stdout: String::new(),
                 stderr: runtime_unavailable(self.runtime_error.as_deref()).to_string(),
                 exit_code: None,
@@ -2280,6 +2281,17 @@ async fn run_local_shell_command(
     local_id: String,
 ) -> LocalShellResultEvent {
     let started = std::time::Instant::now();
+    // Display form of the directory the command runs in, for the transcript
+    // card's cwd label. An explicit `cwd` wins; otherwise the child inherits
+    // this process's working directory, so resolve that for the label.
+    let cwd_display = cwd
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.display().to_string())
+        });
     let (program, args) = local_shell_command_args(&cmd);
 
     let mut builder = Command::new(program);
@@ -2303,6 +2315,7 @@ async fn run_local_shell_command(
             return LocalShellResultEvent {
                 local_id,
                 cmdline: cmd,
+                cwd: cwd_display,
                 stdout: String::new(),
                 stderr: format!("failed to spawn local shell command: {err}"),
                 exit_code: None,
@@ -2350,6 +2363,7 @@ async fn run_local_shell_command(
             return LocalShellResultEvent {
                 local_id,
                 cmdline: cmd,
+                cwd: cwd_display,
                 stdout: String::new(),
                 stderr: format!("local shell command failed: {err}"),
                 exit_code: None,
@@ -2405,6 +2419,7 @@ async fn run_local_shell_command(
     LocalShellResultEvent {
         local_id,
         cmdline: cmd,
+        cwd: cwd_display,
         stdout,
         stderr,
         exit_code,
@@ -5631,6 +5646,27 @@ mod tests {
         assert_eq!(event.exit_code, Some(0));
         assert!(event.stdout.contains("hi"));
         assert!(!event.truncated);
+        // With no explicit cwd the child inherits the process cwd — the event
+        // labels that so the transcript card can show WHERE the command ran.
+        assert_eq!(
+            event.cwd,
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.display().to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn run_local_shell_labels_explicit_cwd() {
+        let dir = std::env::temp_dir();
+        let event =
+            run_local_shell_command("echo hi".into(), Some(dir.clone()), "local-shell:t2".into())
+                .await;
+        assert_eq!(event.exit_code, Some(0));
+        assert_eq!(
+            event.cwd.as_deref(),
+            Some(dir.display().to_string().as_str())
+        );
     }
 
     struct ProtocolCaptureServer {

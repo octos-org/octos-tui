@@ -91,6 +91,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::Skills,
         Provider::Research,
         Provider::ResearchRemoveConfirm,
+        Provider::FilePicker,
     ] {
         registry
             .register_provider(provider)
@@ -137,6 +138,7 @@ enum Provider {
     Skills,
     Research,
     ResearchRemoveConfirm,
+    FilePicker,
 }
 
 impl MenuProvider for Provider {
@@ -178,6 +180,7 @@ impl MenuProvider for Provider {
             Self::Skills => MENU_SKILLS,
             Self::Research => crate::menu::registry::MENU_RESEARCH,
             Self::ResearchRemoveConfirm => crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM,
+            Self::FilePicker => crate::menu::registry::MENU_FILE_PICKER,
         })
     }
 
@@ -219,6 +222,7 @@ impl MenuProvider for Provider {
             Self::Skills => skills_menu(ctx),
             Self::Research => research_menu(ctx),
             Self::ResearchRemoveConfirm => research_remove_confirm_menu(ctx),
+            Self::FilePicker => file_picker_menu(ctx),
         }
     }
 
@@ -6804,6 +6808,78 @@ fn keymap_tabs() -> Vec<MenuTab> {
 fn numeric_shortcut(index: usize) -> Option<KeyBinding> {
     let digit = char::from_digit((index + 1) as u32, 10)?;
     Some(KeyBinding::new(KeyCode::Char(digit), KeyModifiers::empty()))
+}
+
+/// `@` composer file picker (#363): one searchable row per workspace file,
+/// labeled with the relative path; Enter inserts that path at the composer
+/// cursor (`LocalAction::InsertComposerText`, which also closes the picker).
+///
+/// The rows come from the scan `Store::open_composer_file_picker` stored on
+/// `AppState::file_picker` at open time — the menu build itself never touches
+/// the filesystem, so search-refresh keystrokes stay cheap. No numeric
+/// shortcuts: digits must FILTER here (file names contain digits).
+fn file_picker_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let Some(picker) = ctx.app.file_picker else {
+        // Opened without a scan snapshot (should not happen via `@`): render
+        // an explanatory status instead of an empty shell.
+        return MenuBuildResult::Unavailable(MenuStatusSpec::new(
+            crate::menu::registry::MENU_FILE_PICKER,
+            t!("menu.file_picker.title").into_owned(),
+            t!("menu.file_picker.item.empty.label").into_owned(),
+        ));
+    };
+
+    let mut items: Vec<MenuItem> = picker
+        .files
+        .iter()
+        .map(|path| {
+            MenuItem::new(
+                path.clone(),
+                path.clone(),
+                // Trailing space so the prompt keeps reading naturally after
+                // the inserted `@path` token.
+                MenuAction::Local(LocalAction::InsertComposerText(format!("{path} "))),
+            )
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(
+            MenuItem::new(
+                "file_picker.empty",
+                t!("menu.file_picker.item.empty.label"),
+                MenuAction::Noop,
+            )
+            .disabled(t!("menu.file_picker.item.empty.desc").into_owned()),
+        );
+    } else if picker.truncated {
+        items.push(
+            MenuItem::new(
+                "file_picker.truncated",
+                t!(
+                    "menu.file_picker.item.truncated.label",
+                    count = picker.files.len()
+                ),
+                MenuAction::Noop,
+            )
+            .with_state(MenuItemState {
+                non_selectable: true,
+                ..MenuItemState::default()
+            }),
+        );
+    }
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_FILE_PICKER),
+        title: t!("menu.file_picker.title").into_owned(),
+        subtitle: Some(picker.root.clone()),
+        items,
+        tabs: Vec::new(),
+        searchable: true,
+        search_placeholder: Some(t!("menu.file_picker.search").into_owned()),
+        footer_hint: Some(t!("menu.file_picker.footer").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
 }
 
 #[cfg(test)]

@@ -457,6 +457,118 @@ impl Store {
         self.queue_or_start_prompt_turn(prompt, t!("status.queued_turn_start").into_owned())
     }
 
+    /// Insert a typed character into the composer, running the composer's
+    /// prefix triggers (the store-level twin of the event loop's plain
+    /// `KeyCode::Char` arm so the trigger decisions are store-testable):
+    ///
+    /// * `/` on an EMPTY composer opens the slash-command popup;
+    /// * `!` on an EMPTY composer enters shell-escape mode (#364) — the mode
+    ///   itself is derived from the draft (see [`Self::shell_escape_mode_active`]),
+    ///   this only surfaces the entry hint with the cwd the command will run in;
+    /// * `@` at a word boundary opens the workspace file picker (#363). The
+    ///   `@` is inserted first so Esc can restore the composer exactly by
+    ///   deleting it; mid-word `@` (emails, handles) inserts plainly.
+    pub fn handle_composer_char_input(&mut self, ch: char) {
+        let composer_was_empty = self.state.composer.is_empty();
+        let opens_slash_popup = ch == '/' && composer_was_empty;
+        let enters_shell_escape = ch == '!' && composer_was_empty;
+        let opens_file_picker = ch == '@' && self.composer_at_file_picker_boundary();
+        self.state.insert_composer_char(ch);
+        self.state.focus = FocusPane::Composer;
+        if opens_slash_popup {
+            self.open_menu(MenuId::from(crate::menu::registry::MENU_HELP));
+        } else if enters_shell_escape {
+            let cwd = local_shell_cwd_display().unwrap_or_else(|| "?".into());
+            self.state.status = t!("status.bang_mode_hint", cwd = cwd).into_owned();
+        } else if opens_file_picker {
+            self.open_composer_file_picker();
+        }
+    }
+
+    /// Whether the cursor sits at a word boundary (composer start or after
+    /// whitespace), the only place a typed `@` opens the file picker — so
+    /// emails/handles (`user@host`) never trigger it mid-word.
+    fn composer_at_file_picker_boundary(&self) -> bool {
+        let cursor = self.state.composer_cursor_index();
+        self.state.composer[..cursor]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace)
+    }
+
+    /// Whether the composer holds a `!` shell-escape draft (#364). The mode is
+    /// DERIVED from the draft text — exactly the prefix [`Self::compose_command`]
+    /// intercepts on Enter — so it can never desync from what submit would do.
+    pub fn shell_escape_mode_active(&self) -> bool {
+        self.state.composer.trim_start().starts_with('!')
+    }
+
+    /// Esc in shell-escape mode: discard the `!` draft and return to the plain
+    /// composer WITHOUT running anything (#364). Returns false (and touches
+    /// nothing) when the composer is not a shell-escape draft, so the caller
+    /// falls through to the ordinary Esc semantics (interrupt etc.).
+    pub fn cancel_shell_escape_mode(&mut self) -> bool {
+        if !self.shell_escape_mode_active() {
+            return false;
+        }
+        self.state.clear_current_composer_draft();
+        self.state.status = t!("status.bang_mode_cancelled").into_owned();
+        true
+    }
+
+    /// Open the `@` composer file picker (#363): scan the workspace root NOW
+    /// (bounded — see [`crate::file_picker`]) and open the searchable
+    /// `file-picker` menu over the result. Rescanned on every open so the
+    /// picker never serves a stale tree.
+    pub fn open_composer_file_picker(&mut self) {
+        let picker = match self.file_picker_scan_root() {
+            Some(root) => crate::file_picker::FilePickerState::scan(&root),
+            None => crate::file_picker::FilePickerState {
+                root: String::new(),
+                files: Vec::new(),
+                truncated: false,
+            },
+        };
+        self.state.file_picker = Some(picker);
+        self.open_menu(MenuId::from(crate::menu::registry::MENU_FILE_PICKER));
+    }
+
+    /// Esc/Backspace-out of the `@` file picker: close it WITHOUT inserting a
+    /// path and remove the auto-typed `@` trigger so the composer is restored
+    /// to exactly what it was before `@` was pressed. (While the picker owns
+    /// the keyboard the composer is frozen, so the char before the cursor is
+    /// still that `@` — checked defensively anyway.)
+    pub fn cancel_composer_file_picker(&mut self) {
+        let cursor = self.state.composer_cursor_index();
+        if self.state.composer[..cursor].ends_with('@') {
+            self.state.delete_composer_prev_char();
+        }
+        self.state.file_picker = None;
+        self.close_menu();
+        self.state.status = t!("status.file_picker_closed").into_owned();
+    }
+
+    /// The directory the `@` picker scans: the ACTIVE session's server-reported
+    /// workspace root (when it exists on THIS machine — local/stdio launches),
+    /// else the workspace pane root, else the process cwd. Remote workspaces
+    /// whose roots don't exist locally fall through to the local cwd — v1 of
+    /// the picker is a client-local feature by design (no protocol traffic).
+    fn file_picker_scan_root(&self) -> Option<std::path::PathBuf> {
+        self.state
+            .active_session()
+            .and_then(|session| self.state.runtime_status_for(&session.id))
+            .and_then(|status| status.workspace_root.as_deref().or(status.cwd.as_deref()))
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_dir())
+            .or_else(|| {
+                let root = self.state.workspace.root.as_str();
+                (!root.is_empty())
+                    .then(|| std::path::PathBuf::from(root))
+                    .filter(|path| path.is_dir())
+            })
+            .or_else(|| std::env::current_dir().ok())
+    }
+
     /// Mid-turn staging chokepoint for every prompt submission (composer,
     /// menu `SubmitPrompt`, `PromptTemplate`): an active turn stages the
     /// prompt onto the session's queue — starting a SECOND `turn/start`
@@ -1431,6 +1543,16 @@ impl Store {
                 self.state.set_composer_text(draft);
                 self.state.focus = FocusPane::Composer;
                 self.state.status = t!("status.edit_field_prompt").into_owned();
+                None
+            }
+            LocalAction::InsertComposerText(text) => {
+                // `@` file picker row (#363): insert at the CURSOR (the draft
+                // around it survives), then let the accept path's default
+                // close-all dismiss the picker.
+                self.state.insert_composer_text(&text);
+                self.state.focus = FocusPane::Composer;
+                self.state.status =
+                    t!("status.inserted_at_cursor", text = text.trim_end()).into_owned();
                 None
             }
             LocalAction::RunSlashCommand(draft) => {
@@ -4745,6 +4867,7 @@ impl Store {
                 _ => None,
             },
             agent_dock_collapsed: self.state.agent_dock_collapsed,
+            file_picker: self.state.file_picker.as_ref(),
         }
     }
 
@@ -4885,9 +5008,13 @@ impl Store {
         // result reconciles against the right chip even with concurrent bangs.
         let local_id = format!("local-shell:{}", TurnId::new().0);
         let running = t!("status.bang_running").into_owned();
+        // Label the card with the cwd the command runs in (#364): the child
+        // inherits THIS process's working directory (see the transport's
+        // `spawn_local_shell`), so the running chip can already say where.
+        let detail = local_shell_card_detail(cmd, local_shell_cwd_display().as_deref());
         self.state.push_activity(
             ActivityItem::new(ActivityKind::Tool, "!", running.clone())
-                .with_detail(cmd.to_string())
+                .with_detail(detail)
                 .with_tool_call(local_id.clone()),
         );
         self.state.focus = FocusPane::Tasks;
@@ -4911,10 +5038,15 @@ impl Store {
         };
 
         let output = local_shell_output_preview(&event);
+        // The completed card keeps the cwd label (#364): prefer the cwd the
+        // transport ACTUALLY ran in (carried on the event); fall back to this
+        // process's cwd — same process, so the same directory — when unset.
+        let cwd = event.cwd.clone().or_else(local_shell_cwd_display);
+        let detail = local_shell_card_detail(&event.cmdline, cwd.as_deref());
         self.state.update_tool_activity(
             &event.local_id,
             status.clone(),
-            Some(format!("! {}", event.cmdline)),
+            Some(detail),
             Some(output),
             Some(success),
             Some(event.duration_ms),
@@ -11139,6 +11271,27 @@ impl Store {
             .tasks
             .iter_mut()
             .find(|task| &task.id == task_id)
+    }
+}
+
+/// Display form of the directory a `!`-bang command runs in — the TUI process
+/// cwd, which is exactly what the transport's `spawn_local_shell` hands the
+/// child (same process). Used to label the RUNNING chip; the completion event
+/// then carries the authoritative cwd back from the transport.
+fn local_shell_cwd_display() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string())
+}
+
+/// The one-line label for a `!`-bang activity card: the command plus the cwd
+/// it runs in (#364 — the card must say WHERE the local command executed).
+fn local_shell_card_detail(cmd: &str, cwd: Option<&str>) -> String {
+    match cwd {
+        Some(cwd) if !cwd.is_empty() => {
+            format!("{cmd} · {}", t!("status.bang_cwd", cwd = cwd))
+        }
+        _ => cmd.to_string(),
     }
 }
 
@@ -20346,12 +20499,23 @@ mod tests {
 
         // Composer cleared.
         assert!(store.state.composer.is_empty());
-        // A "running" Tool chip stamped with the local id.
+        // NOT an LLM send: no user message was recorded or staged anywhere.
+        assert!(store.state.sessions[0].messages.is_empty());
+        assert!(store.state.optimistic_user_messages.is_empty());
+        assert!(store.state.pending_messages.is_empty());
+        // A "running" Tool chip stamped with the local id, labeled with the
+        // cwd the command runs in (#364 — the TUI process cwd).
         let chip = store.state.activity.last().expect("running activity chip");
         assert_eq!(chip.kind, ActivityKind::Tool);
         assert_eq!(chip.title, "!");
         assert_eq!(chip.status, "running");
-        assert_eq!(chip.detail.as_deref(), Some("echo hi"));
+        let detail = chip.detail.as_deref().expect("running chip detail");
+        assert!(detail.starts_with("echo hi"), "detail: {detail}");
+        let cwd = std::env::current_dir().expect("test cwd");
+        assert!(
+            detail.contains(&format!("cwd: {}", cwd.display())),
+            "detail should label the cwd: {detail}"
+        );
         assert_eq!(chip.tool_call_id.as_deref(), Some(local_id.as_str()));
         assert!(chip.success.is_none());
     }
@@ -20400,6 +20564,7 @@ mod tests {
             crate::client_event::LocalShellResultEvent {
                 local_id: local_id.clone(),
                 cmdline: "echo hi".into(),
+                cwd: Some("/tmp/workdir".into()),
                 stdout: "hi\n".into(),
                 stderr: String::new(),
                 exit_code: Some(0),
@@ -20422,6 +20587,12 @@ mod tests {
         assert_eq!(chip.success, Some(true));
         assert_eq!(chip.duration_ms, Some(12));
         assert_eq!(chip.output_preview.as_deref(), Some("hi\n"));
+        // The completed card is labeled with the cwd the transport ran in.
+        assert_eq!(
+            chip.detail.as_deref(),
+            Some("echo hi · cwd: /tmp/workdir"),
+            "completed card labels the transport-reported cwd"
+        );
     }
 
     #[test]
@@ -20437,6 +20608,7 @@ mod tests {
             crate::client_event::LocalShellResultEvent {
                 local_id: local_id.clone(),
                 cmdline: "false".into(),
+                cwd: None,
                 stdout: String::new(),
                 stderr: "boom\n".into(),
                 exit_code: Some(1),
@@ -20463,6 +20635,7 @@ mod tests {
         let event = crate::client_event::LocalShellResultEvent {
             local_id: "local-shell:x".into(),
             cmdline: "cmd".into(),
+            cwd: None,
             stdout: "out".into(),
             stderr: "err".into(),
             exit_code: Some(0),
@@ -20477,6 +20650,238 @@ mod tests {
             ..event
         };
         assert_eq!(local_shell_output_preview(&empty), "(no output)");
+    }
+
+    // ----- `!` shell-escape mode (#364) -----
+
+    #[test]
+    fn typing_bang_on_empty_composer_enters_shell_escape_mode_with_hint() {
+        let mut store = store_with_empty_session();
+
+        store.handle_composer_char_input('!');
+
+        assert_eq!(store.state.composer, "!");
+        assert!(store.shell_escape_mode_active());
+        // The entry hint names the cwd the command will run in and the exits.
+        let cwd = std::env::current_dir().expect("test cwd");
+        assert!(
+            store.state.status.contains(&cwd.display().to_string()),
+            "hint should name the cwd: {}",
+            store.state.status
+        );
+        // No menu opened, nothing sent.
+        assert!(!store.state.menu_stack.is_active());
+    }
+
+    #[test]
+    fn typing_bang_mid_prompt_does_not_enter_shell_escape_mode() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "warn".into();
+        let status_before = store.state.status.clone();
+
+        store.handle_composer_char_input('!');
+
+        assert_eq!(store.state.composer, "warn!");
+        assert!(!store.shell_escape_mode_active());
+        assert_eq!(store.state.status, status_before);
+    }
+
+    #[test]
+    fn esc_cancels_shell_escape_mode_without_running_anything() {
+        let mut store = store_with_empty_session();
+        store.handle_composer_char_input('!');
+        for ch in "git status".chars() {
+            store.handle_composer_char_input(ch);
+        }
+        assert!(store.shell_escape_mode_active());
+        let chips_before = store.state.activity.len();
+
+        assert!(store.cancel_shell_escape_mode());
+
+        // Draft discarded, mode over, nothing executed or pushed.
+        assert!(store.state.composer.is_empty());
+        assert!(!store.shell_escape_mode_active());
+        assert_eq!(store.state.activity.len(), chips_before);
+        assert_eq!(store.state.status, "local shell cancelled");
+    }
+
+    #[test]
+    fn cancel_shell_escape_is_noop_on_plain_draft() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "fix the tests".into();
+
+        assert!(!store.cancel_shell_escape_mode());
+
+        // The plain draft must survive so Esc falls through to interrupt
+        // semantics instead of eating the user's text.
+        assert_eq!(store.state.composer, "fix the tests");
+    }
+
+    // ----- `@` composer file picker (#363) -----
+
+    /// Minimal self-cleaning temp dir (repo convention — no tempfile dep).
+    struct PickerTempDir(std::path::PathBuf);
+
+    impl PickerTempDir {
+        fn new(tag: &str) -> Self {
+            let mut dir = std::env::temp_dir();
+            dir.push(format!(
+                "octos-tui-store-picker-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock after epoch")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn touch(&self, rel: &str) {
+            let path = self.0.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create parent dirs");
+            }
+            std::fs::write(&path, b"x").expect("write file");
+        }
+    }
+
+    impl Drop for PickerTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn store_with_picker_workspace(dir: &PickerTempDir) -> Store {
+        let mut store = store_with_empty_session();
+        store.state.workspace.root = dir.0.display().to_string();
+        store
+    }
+
+    fn active_file_picker_labels(store: &Store) -> Vec<String> {
+        match store.state.active_menu.as_ref() {
+            Some(crate::menu::MenuBuildResult::Ready(spec)) => {
+                spec.items.iter().map(|item| item.label.clone()).collect()
+            }
+            other => panic!("expected Ready file picker menu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typing_at_opens_file_picker_over_workspace_files() {
+        let dir = PickerTempDir::new("open");
+        dir.touch("a.rs");
+        dir.touch("sub/b.rs");
+        dir.touch(".git/config");
+        dir.touch("target/debug/junk");
+        let mut store = store_with_picker_workspace(&dir);
+
+        store.handle_composer_char_input('@');
+
+        // The `@` is inserted (so Esc can restore by deleting it) and the
+        // searchable picker menu is the active frame.
+        assert_eq!(store.state.composer, "@");
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_FILE_PICKER)
+        );
+        let labels = active_file_picker_labels(&store);
+        assert!(labels.contains(&"a.rs".to_string()), "labels: {labels:?}");
+        assert!(
+            labels.contains(&"sub/b.rs".to_string()),
+            "labels: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label.contains(".git")),
+            ".git must be skipped: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label.contains("target")),
+            "target must be skipped: {labels:?}"
+        );
+        // Searchable: typed characters filter instead of editing the composer.
+        match store.state.active_menu.as_ref() {
+            Some(crate::menu::MenuBuildResult::Ready(spec)) => assert!(spec.searchable),
+            other => panic!("expected Ready menu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_picker_selection_inserts_relative_path_at_cursor() {
+        let dir = PickerTempDir::new("insert");
+        dir.touch("a.rs");
+        dir.touch("sub/b.rs");
+        let mut store = store_with_picker_workspace(&dir);
+        // Cursor mid-draft: after "fix " and before " please".
+        store.state.composer = "fix  please".into();
+        store.state.composer_cursor = Some(4);
+
+        store.handle_composer_char_input('@');
+        assert_eq!(store.state.composer, "fix @ please");
+
+        // Pick the nested file to prove the RELATIVE path (with separator) is
+        // what lands in the draft.
+        let labels = active_file_picker_labels(&store);
+        let index = labels
+            .iter()
+            .position(|label| label == "sub/b.rs")
+            .expect("nested file row");
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("picker frame")
+            .selected_index = index;
+
+        let command = store.accept_active_menu_item();
+
+        // Local insertion only — nothing goes to the backend.
+        assert!(command.is_none());
+        assert_eq!(store.state.composer, "fix @sub/b.rs  please");
+        // Cursor sits right after the inserted path (+ its trailing space).
+        assert_eq!(store.state.composer_cursor, Some("fix @sub/b.rs ".len()));
+        // One pick = done: the picker closed itself.
+        assert!(!store.state.menu_stack.is_active());
+    }
+
+    #[test]
+    fn file_picker_escape_restores_composer_without_inserting() {
+        let dir = PickerTempDir::new("cancel");
+        dir.touch("a.rs");
+        let mut store = store_with_picker_workspace(&dir);
+        store.state.composer = "fix ".into();
+
+        store.handle_composer_char_input('@');
+        assert_eq!(store.state.composer, "fix @");
+        assert!(store.state.menu_stack.is_active());
+
+        store.cancel_composer_file_picker();
+
+        // Exactly the pre-`@` draft, picker gone, snapshot dropped.
+        assert_eq!(store.state.composer, "fix ");
+        assert!(!store.state.menu_stack.is_active());
+        assert!(store.state.file_picker.is_none());
+    }
+
+    #[test]
+    fn at_mid_word_inserts_literal_at_without_picker() {
+        let dir = PickerTempDir::new("midword");
+        dir.touch("a.rs");
+        let mut store = store_with_picker_workspace(&dir);
+        for ch in "mail user".chars() {
+            store.handle_composer_char_input(ch);
+        }
+
+        store.handle_composer_char_input('@');
+
+        // Emails/handles keep typing plainly — no picker mid-word.
+        assert_eq!(store.state.composer, "mail user@");
+        assert!(!store.state.menu_stack.is_active());
+        assert!(store.state.file_picker.is_none());
     }
 
     #[test]

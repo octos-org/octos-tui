@@ -77,6 +77,10 @@ pub const MENU_PERMISSIONS: &str = "permissions";
 pub const MENU_MCP: &str = "mcp";
 pub const MENU_TOOL_SETTINGS: &str = "tool-settings";
 pub const MENU_SKILLS: &str = "skills";
+/// `@` composer file picker (#363): searchable path list over the workspace
+/// file tree; selecting inserts the relative path at the composer cursor.
+/// Opened by typing `@` at a word boundary in the composer — no slash command.
+pub const MENU_FILE_PICKER: &str = "file-picker";
 
 pub const APPUI_METHOD_MODEL_LIST: &str = crate::model::APPUI_METHOD_MODEL_LIST;
 pub const APPUI_METHOD_MODEL_SELECT: &str = crate::model::APPUI_METHOD_MODEL_SELECT;

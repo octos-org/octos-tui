@@ -815,6 +815,11 @@ status:
   bang_failed: "failed"
   bang_usage: "usage: !<command>"
   bang_no_output: "(no output)"
+  bang_mode_hint: "local shell — Enter runs on this machine in %{cwd} · Esc cancels"
+  bang_mode_cancelled: "local shell cancelled"
+  bang_cwd: "cwd: %{cwd}"
+  inserted_at_cursor: "Inserted %{text}"
+  file_picker_closed: "File picker closed (nothing inserted)"
   # Review / goal / staged-message status lines
   cannot_start_review_active_turn: "Cannot start review while a turn is active"
   server_clamped_onboarding_choice: "Server clamped or rejected the staged onboarding choice."
@@ -930,6 +935,16 @@ command:
   turn:
     desc: Inspect backend turn lifecycle state.
 menu:
+  file_picker:
+    title: "Insert file path"
+    search: "Type to filter workspace files"
+    footer: "Enter insert relative path at cursor | Esc close without inserting"
+    item:
+      empty:
+        label: "No files found in this workspace"
+        desc: "The scan found no listable files under the workspace root (`.git`, `target`, and `node_modules` are skipped)."
+      truncated:
+        label: "Showing the first %{count} files — type to narrow the search"
   research:
     title: Research Provider Lanes
     subtitle: "Named provider lanes (cheap/strong) for the deep_research pipeline. Restart to apply."

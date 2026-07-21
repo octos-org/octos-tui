@@ -495,6 +495,16 @@ lang:
   unknown: 未知语言 '%{value}'。可选：en、zh。
   usage: 当前语言：%{current}。用法：/lang <en|zh>。
 menu:
+  file_picker:
+    title: "插入文件路径"
+    search: "输入以筛选工作区文件"
+    footer: "Enter 在光标处插入相对路径 | Esc 关闭且不插入"
+    item:
+      empty:
+        label: "此工作区中未找到文件"
+        desc: "在工作区根目录下未扫描到可列出的文件（已跳过 .git、target 与 node_modules）。"
+      truncated:
+        label: "仅显示前 %{count} 个文件 —— 输入以缩小范围"
   research:
     title: 研究模型通道
     subtitle: "deep_research 流水线的命名模型通道（cheap/strong）。需重启生效。"
@@ -1481,6 +1491,11 @@ status:
   bang_failed: "失败"
   bang_usage: "用法：!<命令>"
   bang_no_output: "（无输出）"
+  bang_mode_hint: "本地 shell —— Enter 在本机 %{cwd} 中运行 · Esc 取消"
+  bang_mode_cancelled: "已取消本地 shell"
+  bang_cwd: "工作目录：%{cwd}"
+  inserted_at_cursor: "已插入 %{text}"
+  file_picker_closed: "文件选择器已关闭（未插入内容）"
   cannot_start_review_active_turn: "轮次进行中，无法启动审查。"
   server_clamped_onboarding_choice: "服务器收紧或拒绝了暂存的引导设置选择。"
   goal_clear_requested: "已请求清除目标"
