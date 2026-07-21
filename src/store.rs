@@ -5780,6 +5780,30 @@ impl Store {
         }
     }
 
+    /// `v` while the inline diff preview is open: toggle unified <->
+    /// side-by-side. Gated on the last drawn width — below the side-by-side
+    /// minimum the renderer falls back to unified anyway, so the toggle stays
+    /// a no-op with an explanatory status instead of arming an invisible mode.
+    pub fn toggle_diff_view_mode(&mut self) {
+        if !self.state.diff_preview.active {
+            return;
+        }
+        if !self.state.diff_side_by_side_toggle_enabled() {
+            self.state.status = t!(
+                "status.diff_view_too_narrow",
+                min = crate::model::DIFF_SIDE_BY_SIDE_MIN_WIDTH
+            )
+            .into_owned();
+            return;
+        }
+        self.state.diff_preview.toggle_view_mode();
+        self.state.status = if self.state.diff_preview.side_by_side {
+            t!("status.diff_view_side_by_side").into_owned()
+        } else {
+            t!("status.diff_view_unified").into_owned()
+        };
+    }
+
     pub fn stage_selected_diff_context(&mut self) {
         let Some(context) = self.state.diff_preview.selected_hunk_context() else {
             self.state.status = t!("status.no_diff_hunk_context").into_owned();

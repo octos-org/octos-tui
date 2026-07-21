@@ -54,6 +54,33 @@ mod i18n_tests {
         assert!(locales.contains(&"zh"), "missing zh: {locales:?}");
     }
 
+    /// #362: the side-by-side diff view toggle strings (footer hints + status
+    /// feedback) resolve in BOTH locales.
+    #[test]
+    fn diff_view_toggle_keys_resolve_in_en_and_zh() {
+        let keys = [
+            "app.diff.toggle_side_by_side_hint",
+            "app.diff.toggle_unified_hint",
+            "app.diff.side_by_side_too_narrow",
+            "status.diff_view_side_by_side",
+            "status.diff_view_unified",
+            "status.diff_view_too_narrow",
+        ];
+        for key in keys {
+            for locale in ["en", "zh"] {
+                let value = t!(key, locale = locale);
+                assert_ne!(
+                    &*value, key,
+                    "missing {locale} translation for `{key}` (got the raw key back)"
+                );
+                assert!(
+                    !value.trim().is_empty(),
+                    "empty {locale} translation for `{key}`"
+                );
+            }
+        }
+    }
+
     /// UX2 A.3/B.2: the new onboarding teaching-panel + workspace-step keys
     /// resolve in BOTH locales (rust-i18n echoes the key on a miss, so a typo or
     /// a missing `zh` translation would leave the dotted key in the output).
