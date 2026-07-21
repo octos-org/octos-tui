@@ -4029,6 +4029,13 @@ pub struct AppState {
     /// paste events), cleared on any manual edit (type/delete/clear/submit) —
     /// so TYPED multi-line input is never collapsed, only pastes are.
     pub composer_pasted: bool,
+    /// Byte range of the collapsed paste inside `composer` (#382): lets the
+    /// atomic block delete drain ONLY the pasted bytes so typed text around
+    /// the chip survives. `None` (e.g. state predating the span) falls back
+    /// to clearing the whole draft. Maintained by `insert_pasted_text`
+    /// (unioned across consecutive pastes) and invalidated wherever
+    /// `composer_pasted` is cleared.
+    pub composer_paste_span: Option<std::ops::Range<usize>>,
     pub composer_drafts: Vec<ComposerDraft>,
     /// Snapshot backing the `@` composer file picker (#363): the workspace
     /// file list scanned when the picker was last opened. `Some` only feeds
@@ -6001,6 +6008,7 @@ impl AppState {
             composer: String::new(),
             composer_cursor: None,
             composer_pasted: false,
+            composer_paste_span: None,
             composer_drafts: Vec::new(),
             file_picker: None,
             composer_history: crate::history::ComposerHistory::default(),
@@ -8113,6 +8121,7 @@ impl AppState {
     pub fn load_composer_draft_for_selected_session(&mut self) {
         // A restored draft is editable text, not a fresh paste — render it inline.
         self.composer_pasted = false;
+        self.composer_paste_span = None;
         let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
             self.composer.clear();
             self.composer_cursor = None;
@@ -8132,6 +8141,7 @@ impl AppState {
         self.composer.clear();
         self.composer_cursor = None;
         self.composer_pasted = false;
+        self.composer_paste_span = None;
         // Clearing the composer (e.g. Ctrl+U) ends any history browse, so the
         // next Up recalls the newest entry instead of comparing the now-empty
         // composer against a stale recalled entry (which would scroll and need a
@@ -8147,6 +8157,7 @@ impl AppState {
         self.composer = text.into();
         self.composer_cursor = None;
         self.composer_pasted = false;
+        self.composer_paste_span = None;
     }
 
     /// Insert PASTED text at the cursor. When the paste is large enough to be
@@ -8159,8 +8170,30 @@ impl AppState {
             return;
         }
         let large = paste_should_collapse(text);
+        let cursor = self.composer_cursor_index();
         self.insert_composer_text(text);
         if large {
+            // Record the pasted byte range; a second paste while collapsed
+            // unions with the existing span (the chip presents them as one
+            // block), shifting it when the insertion landed before/inside it.
+            let inserted = cursor..cursor + text.len();
+            let span = match self
+                .composer_paste_span
+                .take()
+                .filter(|_| self.composer_pasted)
+            {
+                Some(mut existing) => {
+                    if cursor <= existing.start {
+                        existing.start += text.len();
+                        existing.end += text.len();
+                    } else if cursor < existing.end {
+                        existing.end += text.len();
+                    }
+                    existing.start.min(inserted.start)..existing.end.max(inserted.end)
+                }
+                None => inserted,
+            };
+            self.composer_paste_span = Some(span);
             self.composer_pasted = true;
         }
     }
@@ -8182,28 +8215,55 @@ impl AppState {
         // Typing edits the composer → it's no longer an unedited paste; show it
         // inline (editable) rather than a collapsed `[paste]` block.
         self.composer_pasted = false;
+        self.composer_paste_span = None;
         let cursor = self.composer_cursor_index();
         self.composer.insert(cursor, ch);
         self.composer_cursor = Some(cursor + ch.len_utf8());
     }
 
-    pub fn delete_composer_prev_char(&mut self) {
-        // A collapsed `[paste]` block is a single atomic unit. Deleting it must
-        // REMOVE THE WHOLE BLOCK, not re-open it: clearing `composer_pasted`
-        // before deleting would expand the full pasted text into the composer
-        // first, so a single backspace appears to do nothing but explode the
-        // block. Instead, when the composer is currently presented as a collapsed
-        // paste, delete the entire block (clear the composer) in one action.
-        if self.composer_pasted
+    /// Atomic collapsed-paste delete (#380/#382/#383): when the composer is
+    /// presented as a collapsed `[paste]` chip, ANY delete removes the paste
+    /// as ONE unit — never expands it. With a recorded span only the pasted
+    /// bytes are drained, so typed text around the chip survives (#382);
+    /// without a valid span the whole draft clears (the #380 behavior).
+    /// Returns true when the delete was handled here.
+    fn take_collapsed_paste_block(&mut self) -> bool {
+        if !(self.composer_pasted
             && matches!(
                 self.composer_presentation(),
                 ComposerPresentation::Collapsed(_)
-            )
+            ))
         {
-            self.clear_current_composer_draft();
+            return false;
+        }
+        match self.composer_paste_span.take() {
+            Some(span)
+                if span.start < span.end
+                    && span.end <= self.composer.len()
+                    && self.composer.is_char_boundary(span.start)
+                    && self.composer.is_char_boundary(span.end) =>
+            {
+                self.composer.drain(span.clone());
+                self.composer_pasted = false;
+                if self.composer.trim().is_empty() {
+                    // Nothing but the paste (± whitespace): behave like #380
+                    // and clear the draft entirely.
+                    self.clear_current_composer_draft();
+                } else {
+                    self.composer_cursor = Some(self.clamp_composer_cursor(span.start));
+                }
+            }
+            _ => self.clear_current_composer_draft(),
+        }
+        true
+    }
+
+    pub fn delete_composer_prev_char(&mut self) {
+        if self.take_collapsed_paste_block() {
             return;
         }
         self.composer_pasted = false;
+        self.composer_paste_span = None;
         let cursor = self.composer_cursor_index();
         let Some(prev) = prev_char_boundary(&self.composer, cursor) else {
             self.composer_cursor = Some(0);
@@ -8214,19 +8274,12 @@ impl AppState {
     }
 
     pub fn delete_composer_next_char(&mut self) {
-        // Same atomic-block rule as `delete_composer_prev_char`: deleting a
-        // collapsed `[paste]` block removes the whole block, it does not expand
-        // it into the composer first.
-        if self.composer_pasted
-            && matches!(
-                self.composer_presentation(),
-                ComposerPresentation::Collapsed(_)
-            )
-        {
-            self.clear_current_composer_draft();
+        // Same atomic-block rule as `delete_composer_prev_char`.
+        if self.take_collapsed_paste_block() {
             return;
         }
         self.composer_pasted = false;
+        self.composer_paste_span = None;
         let cursor = self.composer_cursor_index();
         let Some(next) = next_char_boundary(&self.composer, cursor) else {
             self.composer_cursor = Some(self.composer.len());
@@ -8333,6 +8386,11 @@ impl AppState {
 
     /// Vim `dw`: delete from the cursor to the start of the next word.
     pub fn delete_composer_word_forward(&mut self) {
+        // #383: word/line deletes bypassed the collapsed-paste atomicity and
+        // silently edited text HIDDEN under the chip. Same rule as Backspace.
+        if self.take_collapsed_paste_block() {
+            return;
+        }
         let cursor = self.composer_cursor_index();
         let end = vim_word_forward_boundary(&self.composer, cursor);
         self.composer.drain(cursor..end);
@@ -8352,6 +8410,11 @@ impl AppState {
     /// Vim `dd`: delete the current logical line. Removes its trailing newline
     /// (or, on the last line, the preceding one) so lines don't pile up empty.
     pub fn delete_composer_line(&mut self) {
+        // #383: word/line deletes bypassed the collapsed-paste atomicity and
+        // silently edited text HIDDEN under the chip. Same rule as Backspace.
+        if self.take_collapsed_paste_block() {
+            return;
+        }
         let cursor = self.composer_cursor_index();
         let line_start = self.composer[..cursor]
             .rfind('\n')
@@ -8375,6 +8438,11 @@ impl AppState {
     /// Vim `cc` body: clear the current logical line's content, cursor at line
     /// start (the caller switches to Insert).
     pub fn clear_composer_line(&mut self) {
+        // #383: word/line deletes bypassed the collapsed-paste atomicity and
+        // silently edited text HIDDEN under the chip. Same rule as Backspace.
+        if self.take_collapsed_paste_block() {
+            return;
+        }
         let cursor = self.composer_cursor_index();
         let line_start = self.composer[..cursor]
             .rfind('\n')
@@ -8408,6 +8476,11 @@ impl AppState {
     }
 
     pub fn delete_composer_prev_word(&mut self) {
+        // #383: word/line deletes bypassed the collapsed-paste atomicity and
+        // silently edited text HIDDEN under the chip. Same rule as Backspace.
+        if self.take_collapsed_paste_block() {
+            return;
+        }
         let cursor = self.composer_cursor_index();
         let start = prev_word_boundary(&self.composer, cursor);
         self.composer.drain(start..cursor);
@@ -8415,6 +8488,11 @@ impl AppState {
     }
 
     pub fn delete_composer_next_word(&mut self) {
+        // #383: word/line deletes bypassed the collapsed-paste atomicity and
+        // silently edited text HIDDEN under the chip. Same rule as Backspace.
+        if self.take_collapsed_paste_block() {
+            return;
+        }
         let cursor = self.composer_cursor_index();
         let end = next_word_boundary(&self.composer, cursor);
         self.composer.drain(cursor..end);
@@ -8422,6 +8500,11 @@ impl AppState {
     }
 
     pub fn kill_composer_to_line_end(&mut self) {
+        // #383: word/line deletes bypassed the collapsed-paste atomicity and
+        // silently edited text HIDDEN under the chip. Same rule as Backspace.
+        if self.take_collapsed_paste_block() {
+            return;
+        }
         let cursor = self.composer_cursor_index();
         let end = self.composer[cursor..]
             .find('\n')
@@ -10329,5 +10412,122 @@ mod tests {
             "forward-delete on a collapsed paste deletes the whole block, got: {:?}",
             state.composer
         );
+    }
+
+    fn paste_test_state() -> AppState {
+        AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        )
+    }
+
+    fn big_paste_block() -> String {
+        (1..=20)
+            .map(|i| format!("pasted line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// #382: the atomic delete drains ONLY the pasted span — typed text
+    /// around the chip survives (it used to be wiped with the block).
+    #[test]
+    fn atomic_paste_delete_spares_the_typed_prefix() {
+        let mut state = paste_test_state();
+        for ch in "look at this error: ".chars() {
+            state.insert_composer_char(ch);
+        }
+        state.insert_pasted_text(&big_paste_block());
+        assert!(state.composer_pasted);
+        assert!(matches!(
+            state.composer_presentation(),
+            ComposerPresentation::Collapsed(_)
+        ));
+
+        state.delete_composer_prev_char();
+        assert_eq!(
+            state.composer, "look at this error: ",
+            "the typed prefix must survive the atomic paste delete"
+        );
+        assert!(!state.composer_pasted);
+        assert_eq!(
+            state.composer_cursor_index(),
+            "look at this error: ".len(),
+            "cursor lands where the block was"
+        );
+    }
+
+    /// #383: word/line deletes obey the same atomic rule — they used to gnaw
+    /// text HIDDEN under the collapsed chip.
+    #[test]
+    fn word_and_line_deletes_are_atomic_on_collapsed_paste() {
+        // Ctrl+W (delete_composer_prev_word)
+        let mut state = paste_test_state();
+        for ch in "fix: ".chars() {
+            state.insert_composer_char(ch);
+        }
+        state.insert_pasted_text(&big_paste_block());
+        state.delete_composer_prev_word();
+        assert_eq!(
+            state.composer, "fix: ",
+            "Ctrl+W removes the block atomically"
+        );
+
+        // Ctrl+K (kill_composer_to_line_end) from inside the hidden text.
+        let mut state = paste_test_state();
+        state.insert_pasted_text(&big_paste_block());
+        state.composer_cursor = Some(4);
+        state.kill_composer_to_line_end();
+        assert!(
+            state.composer.is_empty(),
+            "Ctrl+K on a paste-only chip clears the block, got {:?}",
+            state.composer
+        );
+
+        // vim dd (delete_composer_line)
+        let mut state = paste_test_state();
+        state.insert_pasted_text(&big_paste_block());
+        state.delete_composer_line();
+        assert!(state.composer.is_empty(), "dd removes the whole block");
+    }
+
+    /// #382: consecutive large pastes union into ONE atomic block; a single
+    /// delete removes both while the typed prefix survives.
+    #[test]
+    fn consecutive_pastes_union_into_one_atomic_block() {
+        let mut state = paste_test_state();
+        for ch in "ctx: ".chars() {
+            state.insert_composer_char(ch);
+        }
+        state.insert_pasted_text(&big_paste_block());
+        state.insert_pasted_text(&big_paste_block());
+        assert!(state.composer_pasted);
+
+        state.delete_composer_prev_char();
+        assert_eq!(
+            state.composer, "ctx: ",
+            "one delete removes the unioned block, sparing the prefix"
+        );
+    }
+
+    /// #382 fallback: a collapsed paste WITHOUT a recorded span (legacy state)
+    /// falls back to the #380 whole-draft clear rather than exploding.
+    #[test]
+    fn collapsed_paste_without_span_falls_back_to_full_clear() {
+        let mut state = paste_test_state();
+        state.insert_pasted_text(&big_paste_block());
+        state.composer_paste_span = None;
+        state.delete_composer_prev_char();
+        assert!(state.composer.is_empty(), "no span -> #380 full clear");
+        assert!(!state.composer_pasted);
     }
 }
