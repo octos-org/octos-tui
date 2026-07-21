@@ -31506,4 +31506,58 @@ mod tests {
             "the staged prompt stays queued behind the in-progress turn"
         );
     }
+    /// Deep-review fix: a `spawn`/`spawn_only` background child's output rides
+    /// `task/output/delta` into the PER-TASK store, while the per-agent
+    /// `output_tail` only lands on the terminal `agent/updated`. While the
+    /// child runs, `active_agent_output_or_tail` must fall back to the per-task
+    /// tail so the dock shows live output instead of the empty placeholder.
+    #[test]
+    fn background_agent_output_falls_back_to_task_tail() {
+        use octos_core::ui_protocol::{AgentUpdatedEvent, UiAgentRecord};
+        let task_id = TaskId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut store = store_with_task(task_id.clone());
+        // Give the per-task store live output (what task/output/delta writes).
+        store
+            .find_task_mut(&session_id, &task_id)
+            .expect("task")
+            .output_tail = "live sub-agent output".to_string();
+
+        // Register the background agent record with NO per-agent output_tail
+        // (the terminal snapshot hasn't arrived yet).
+        let agent = UiAgentRecord {
+            agent_id: "task-0...[credential-redacted]".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: Some(task_id.to_string()),
+            path: "master/task".into(),
+            role: "background_task".into(),
+            nickname: "spawn".into(),
+            title: None,
+            backend_kind: "task_supervisor:spawn".into(),
+            status: "running".into(),
+            last_task: None,
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::AgentUpdated(
+            AgentUpdatedEvent {
+                session_id: session_id.clone(),
+                agent,
+            },
+        )));
+
+        let text = store
+            .state
+            .active_agent_output_or_tail("task-0...[credential-redacted]")
+            .expect("the fallback must surface the per-task tail");
+        assert_eq!(text, "live sub-agent output");
+    }
 }
