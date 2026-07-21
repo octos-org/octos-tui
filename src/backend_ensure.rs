@@ -105,22 +105,17 @@ pub fn ensure_octos_backend(cli: &mut Cli) -> Result<()> {
         // Usable only in the install dir — rewrite the command to launch it
         // directly, since its dir isn't on this process's PATH.
         Resolved::AtPath(octos) => {
-            // On Windows the stdio transport runs the command via `cmd /C`.
-            // `rewrite_program` below re-serializes with POSIX (shlex) quoting,
-            // which cmd mangles (codex) — so Windows gets a `cmd`-safe rewrite
-            // that double-quotes the full exe path. This matters now that the
-            // Windows auto-installer (`install_octos_windows_bundle`) drops octos
-            // into `~\.octos\bin`, which isn't on PATH.
+            // On Windows, DON'T rewrite the command to an explicit path. The
+            // stdio transport spawns via `cmd /C <command>`, and a path embedded
+            // in that string — quoted or not — gets mangled by Rust's arg quoting
+            // plus cmd's own quirky quote parsing (the child then dies with exit
+            // 1). Instead the transport prepends this install dir to the child's
+            // PATH (see `install_bin_dir` / `shell_command`), so the bare `octos`
+            // in the command resolves to the exe the auto-installer dropped into
+            // `~\.octos\bin`. Nothing to rewrite here — `octos` is bound only for
+            // the non-Windows path below.
             if cfg!(windows) {
-                let rewritten = rewrite_program_windows(&command, &octos).ok_or_else(|| {
-                    eyre!(
-                        "octos is installed at {} but isn't on PATH, and the launch command \
-                         uses shell syntax we can't safely rewrite. Add its directory to PATH \
-                         and relaunch octos-tui.",
-                        octos.display()
-                    )
-                })?;
-                cli.stdio_command = Some(rewritten);
+                let _ = &octos;
                 return Ok(());
             }
             let rewritten = rewrite_program(&command, &octos).ok_or_else(|| {
@@ -302,6 +297,15 @@ fn install_dir_octos() -> Option<PathBuf> {
     };
     let name = if cfg!(windows) { "octos.exe" } else { "octos" };
     Some(dir.join(name))
+}
+
+/// The directory the auto-installer drops `octos` into (`$OCTOS_PREFIX` or
+/// `~/.octos/bin`). The stdio transport prepends this to the child's PATH so a
+/// bare `octos` in the launch command resolves to the auto-installed exe —
+/// without embedding a path in the command string, which `cmd /C` mangles on
+/// Windows. `None` if no home dir.
+pub(crate) fn install_bin_dir() -> Option<PathBuf> {
+    install_dir_octos().and_then(|exe| exe.parent().map(Path::to_path_buf))
 }
 
 /// Home directory, treating an empty `HOME` as absent so the Windows
@@ -733,75 +737,21 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Windows counterpart to [`rewrite_program`]: replace the leading bare `octos`
-/// token with a double-quoted full path, preserving a `stdio:` prefix and all
-/// trailing args verbatim. The Windows stdio transport runs the command through
-/// `cmd /C`, which honors double quotes — so this is round-trip safe for the
-/// paths we generate. Returns `None` for a command carrying a pipe/redirect (a
-/// user-managed shell form we won't blindly requote) or whose leading token
-/// isn't a bare `octos`, so the caller surfaces an actionable error instead.
-fn rewrite_program_windows(command: &str, octos_path: &Path) -> Option<String> {
-    let trimmed = command.trim();
-    let (prefix, body) = match trimmed.strip_prefix("stdio:") {
-        Some(rest) => ("stdio:", rest.trim()),
-        None => ("", trimmed),
-    };
-    if body.contains(['|', '<', '>', '&', '^']) {
-        return None;
-    }
-    let mut parts = body.splitn(2, char::is_whitespace);
-    // Only the canonical bare `octos` form is rewritten; a leading `env` /
-    // `KEY=value` (a Unix idiom, not a Windows one) is left to the user.
-    if parts.next()? != "octos" {
-        return None;
-    }
-    let quoted = format!("\"{}\"", octos_path.display());
-    Some(match parts.next().map(str::trim_start) {
-        Some(rest) if !rest.is_empty() => format!("{prefix}{quoted} {rest}"),
-        _ => format!("{prefix}{quoted}"),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn rewrite_program_windows_quotes_the_full_exe_path() {
-        let octos = Path::new(r"C:\Users\me\.octos\bin\octos.exe");
-        assert_eq!(
-            rewrite_program_windows("octos serve --stdio --solo", octos).as_deref(),
-            Some(r#""C:\Users\me\.octos\bin\octos.exe" serve --stdio --solo"#)
-        );
-        // A `stdio:` transport label is preserved.
-        assert_eq!(
-            rewrite_program_windows("stdio:octos serve", octos).as_deref(),
-            Some(r#"stdio:"C:\Users\me\.octos\bin\octos.exe" serve"#)
-        );
-        // No trailing args.
-        assert_eq!(
-            rewrite_program_windows("octos", octos).as_deref(),
-            Some(r#""C:\Users\me\.octos\bin\octos.exe""#)
-        );
-    }
-
-    #[test]
-    fn rewrite_program_windows_refuses_pipes_and_non_octos() {
-        let octos = Path::new(r"C:\x\octos.exe");
-        assert_eq!(
-            rewrite_program_windows("octos serve | tee log", octos),
-            None
-        );
-        assert_eq!(
-            rewrite_program_windows("octos serve > out.txt", octos),
-            None
-        );
-        // A leading `env`/`KEY=value` (Unix idiom) is left to the user.
-        assert_eq!(
-            rewrite_program_windows("env FOO=1 octos serve", octos),
-            None
-        );
-        assert_eq!(rewrite_program_windows("C:/x/octos.exe serve", octos), None);
+    fn install_bin_dir_is_the_parent_of_the_probed_exe() {
+        // `install_bin_dir` (used by the transport to augment the child PATH)
+        // must be exactly the directory the exe is probed/installed in.
+        let exe = install_dir_octos();
+        let dir = install_bin_dir();
+        match (exe, dir) {
+            (Some(exe), Some(dir)) => assert_eq!(exe.parent(), Some(dir.as_path())),
+            (None, None) => {} // no HOME/USERPROFILE in this env — both absent
+            other => panic!("exe/dir presence mismatch: {other:?}"),
+        }
     }
 
     #[test]

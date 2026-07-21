@@ -1411,15 +1411,27 @@ fn bounded_send_error(
 }
 
 fn shell_command(command: &str) -> Command {
-    #[cfg(windows)]
-    {
+    // `cfg!(windows)` (runtime) rather than `#[cfg(windows)]` so BOTH branches
+    // type-check on every host — the Windows path can't be cross-compiled from
+    // macOS/Linux, so keeping it compiled everywhere is our only static check.
+    if cfg!(windows) {
         let mut process = Command::new("cmd");
         process.arg("/C").arg(command);
+        // Prepend the auto-installer's dir (`~\.octos\bin`) to the CHILD's PATH
+        // so a bare `octos` in `command` resolves to the exe `backend_ensure`
+        // dropped there — WITHOUT embedding a path in the command string, which
+        // `cmd /C` + Rust arg-quoting mangle (that was the exit-1 launch bug).
+        // Setting the child's env is not `unsafe` and never touches our own PATH.
+        if let Some(bin) = crate::backend_ensure::install_bin_dir() {
+            let mut path = bin.into_os_string();
+            if let Some(existing) = std::env::var_os("PATH") {
+                path.push(";"); // Windows PATH separator (this branch is Windows-only at runtime)
+                path.push(existing);
+            }
+            process.env("PATH", path);
+        }
         process
-    }
-
-    #[cfg(not(windows))]
-    {
+    } else {
         let mut process = Command::new("sh");
         process.arg("-c").arg(command);
         process
