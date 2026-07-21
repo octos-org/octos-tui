@@ -548,6 +548,18 @@ impl Store {
         self.state.status = t!("status.file_picker_closed").into_owned();
     }
 
+    /// A session switch must not carry the `@` file picker across (#363
+    /// review): the picker lists the OUTGOING session's workspace, and its
+    /// Esc-restore contract (delete the trigger `@`) applies to the OUTGOING
+    /// draft. Cancel it — restoring that draft — BEFORE the switch persists
+    /// drafts, so the incoming session never inherits a stale file listing
+    /// and the outgoing draft is stored in its pre-`@` shape.
+    fn close_file_picker_for_session_switch(&mut self) {
+        if self.state.file_picker.is_some() {
+            self.cancel_composer_file_picker();
+        }
+    }
+
     /// The directory the `@` picker scans: the ACTIVE session's server-reported
     /// workspace root (when it exists on THIS machine — local/stdio launches),
     /// else the workspace pane root, else the process cwd. Remote workspaces
@@ -1978,6 +1990,7 @@ impl Store {
         // (`switch_selected_session`) — assigning `selected_session` directly
         // would silently delete the outgoing session's composer draft and
         // strand/misdeliver its staged messages.
+        self.close_file_picker_for_session_switch();
         if let Some(index) = self
             .state
             .sessions
@@ -7622,6 +7635,7 @@ impl Store {
                 });
                 // Full switch bundle (draft + staged-queue housekeeping), not a
                 // bare `selected_session` assignment — see `switch_selected_session`.
+                self.close_file_picker_for_session_switch();
                 self.state
                     .switch_selected_session(self.state.sessions.len().saturating_sub(1));
             }
@@ -8516,6 +8530,7 @@ impl Store {
                 // composer draft is persisted (not silently deleted or
                 // attributed to the incoming session) and staged messages
                 // stay bound to the session they were staged in.
+                self.close_file_picker_for_session_switch();
                 if let Some(index) = self
                     .state
                     .sessions
@@ -20846,6 +20861,49 @@ mod tests {
         assert_eq!(store.state.composer_cursor, Some("fix @sub/b.rs ".len()));
         // One pick = done: the picker closed itself.
         assert!(!store.state.menu_stack.is_active());
+    }
+
+    #[test]
+    fn session_switch_closes_file_picker_and_restores_outgoing_draft() {
+        // #363 review: a session switch must not carry the picker across —
+        // it lists the OUTGOING session's workspace, and its Esc-restore
+        // (delete the trigger `@`) belongs to the OUTGOING draft.
+        let dir = PickerTempDir::new("switch");
+        dir.touch("a.rs");
+        let mut store = store_with_picker_workspace(&dir);
+        let incoming = SessionKey("local:incoming".into());
+        store.state.sessions.push(crate::model::SessionView {
+            id: incoming.clone(),
+            title: "incoming".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        });
+
+        store.state.set_composer_text("see ");
+        store.handle_composer_char_input('@');
+        assert!(store.state.file_picker.is_some());
+        assert_eq!(store.state.composer, "see @");
+
+        // Resume-switch to the other session (one of the switch bundle
+        // sites): the picker must close and the OUTGOING draft must be
+        // persisted in its pre-`@` shape.
+        store.resume_session_command(incoming.0.clone());
+        assert!(
+            store.state.file_picker.is_none(),
+            "picker must not survive a session switch"
+        );
+        assert!(!store.state.menu_stack.is_active());
+        assert!(
+            store
+                .state
+                .composer_drafts
+                .iter()
+                .any(|draft| draft.session_id.0 == "local:test" && draft.text == "see "),
+            "outgoing draft persisted WITHOUT the trigger `@`; drafts: {:?}",
+            store.state.composer_drafts
+        );
     }
 
     #[test]
