@@ -2218,6 +2218,11 @@ pub enum OnboardingProviderPending {
 pub enum OnboardingProviderSaveTarget {
     Primary,
     Fallback,
+    /// Save the staged provider as a research sub-provider lane (the `/research`
+    /// add flow reuses the model wizard, but the result lands in
+    /// `profile/sub_providers/upsert` as a named lane, not the profile's
+    /// primary/fallback provider).
+    ResearchLane,
 }
 
 /// M22-E: product-grade lifecycle status for the provider setup
@@ -2718,9 +2723,9 @@ impl OnboardingWizardState {
                 Some(OnboardingProviderSaveTarget::Fallback) => {
                     OnboardingProviderStatus::SavedFallback
                 }
-                Some(OnboardingProviderSaveTarget::Primary) | None => {
-                    OnboardingProviderStatus::SavedPrimary
-                }
+                Some(OnboardingProviderSaveTarget::Primary)
+                | Some(OnboardingProviderSaveTarget::ResearchLane)
+                | None => OnboardingProviderStatus::SavedPrimary,
             };
         }
         if !self.selection_ready() {
@@ -2793,6 +2798,43 @@ impl OnboardingWizardState {
         self.selection_ready().then(|| ProfileLlmFetchModelsParams {
             profile_id: self.effective_profile_id(current_profile),
             selection: self.provider.clone(),
+            api_key: self.api_key.clone(),
+        })
+    }
+
+    /// Build the `/research` sub-provider lane upsert from the wizard's staged
+    /// provider selection. Maps the wizard's `LlmSelectionConfig` onto a
+    /// `SubProviderView` (family→provider, model→model, route→base_url /
+    /// api_key_env / api_type) so the rich model-setting flow lands as a named
+    /// research lane instead of the profile's primary/fallback provider. The
+    /// lane `key` defaults to the family id when not explicitly set.
+    pub fn build_research_lane_params(
+        &self,
+        current_profile: Option<&str>,
+    ) -> Option<SubProvidersUpsertParams> {
+        if !self.selection_ready() {
+            return None;
+        }
+        let route = &self.provider.route;
+        let key = {
+            let family = self.provider.family_id.trim();
+            if family.is_empty() {
+                "research".to_string()
+            } else {
+                family.to_string()
+            }
+        };
+        Some(SubProvidersUpsertParams {
+            profile_id: self.effective_profile_id(current_profile),
+            sub_provider: SubProviderView {
+                key,
+                provider: non_empty(self.provider.family_id.trim().to_string()),
+                model: non_empty(self.provider.model_id.trim().to_string()),
+                api_key_env: route.api_key_env.clone(),
+                base_url: route.base_url.clone(),
+                api_type: route.api_type.clone(),
+                ..Default::default()
+            },
             api_key: self.api_key.clone(),
         })
     }
