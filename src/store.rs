@@ -784,12 +784,19 @@ impl Store {
             Some("add") | Some("set") => {
                 // Bare `/research add` (no args) opens the model-setting wizard
                 // (the same flow as /model add-model) targeted at a research
-                // lane, instead of the terse inline form — the wizard collects
-                // family/model/route/base_url/api_key_env/api_key with fetch +
-                // test, then saves via profile/sub_providers/upsert.
+                // lane, instead of the terse inline form. Set the PERSISTENT
+                // lane intent (survives wizard edits) rather than the transient
+                // provider_save_target, which the dirty-marking paths clear.
                 if tokens.clone().next().is_none() {
-                    self.state.onboarding.provider_save_target =
-                        Some(OnboardingProviderSaveTarget::ResearchLane);
+                    // Codex PR384 review (F4): gate on lane UPSERT, not just the
+                    // wizard. On a lane-list-only server the wizard couldn't save,
+                    // so block here with the friendly capability message instead.
+                    if !self.require_appui_method(
+                        crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+                    ) {
+                        return SlashDispatchOutcome::Rejected;
+                    }
+                    self.state.onboarding.research_lane_intent = true;
                     self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
                     return SlashDispatchOutcome::Accepted(None);
                 }
@@ -3618,16 +3625,11 @@ impl Store {
     }
 
     fn onboarding_save_provider_command(&mut self) -> Option<AppUiCommand> {
-        // Route on the pre-set save target: the `/research` add flow opens this
-        // wizard with `provider_save_target = ResearchLane`, so its save must go
-        // to `profile/sub_providers/upsert` (a named lane), not the profile's
-        // primary provider. Primary/fallback stay on `profile/llm/upsert`.
-        let save_target = self
-            .state
-            .onboarding
-            .provider_save_target
-            .unwrap_or(OnboardingProviderSaveTarget::Primary);
-        if matches!(save_target, OnboardingProviderSaveTarget::ResearchLane) {
+        // Route on the PERSISTENT lane intent: bare `/research add` sets
+        // `research_lane_intent`, which survives staged-input edits (unlike the
+        // transient provider_save_target). A lane save goes to
+        // `profile/sub_providers/upsert`, not the profile's primary provider.
+        if self.state.onboarding.research_lane_intent {
             return self.onboarding_save_research_lane_command();
         }
         if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT) {
@@ -3673,6 +3675,14 @@ impl Store {
             return None;
         }
         let profile_id = self.active_profile_id();
+        // Codex PR384 review (F3): use the RESOLVED active profile directly, not
+        // `effective_profile_id` (which prefers a stale `onboarding.profile_id`).
+        // Refuse to save when no active profile is resolved rather than silently
+        // targeting the server default.
+        if profile_id.is_none() {
+            self.state.status = t!("status.research_profile_unresolved").into_owned();
+            return None;
+        }
         let Some(params) = self
             .state
             .onboarding
@@ -8230,6 +8240,19 @@ impl Store {
         self.state.onboarding.pending_research_lane_removal = None;
         if event.result.applied {
             self.state.sub_providers_state = Some(event.result.to_list_result());
+            // Codex PR384 review (F2): a lane SAVE round-trip must complete the
+            // wizard's pending save, not just refresh the lanes cache — otherwise
+            // the wizard wedges in `Saving(ResearchLane)` until the 30s timeout.
+            // Consume provider_pending, record the lane save, and clear the
+            // persistent lane intent so the next Save isn't misrouted.
+            if self.state.onboarding.provider_pending.is_some() {
+                self.state.onboarding.provider_pending = None;
+                self.state.onboarding.provider_save_target =
+                    Some(OnboardingProviderSaveTarget::ResearchLane);
+                self.state.onboarding.last_saved_provider_target =
+                    Some(OnboardingProviderSaveTarget::ResearchLane);
+                self.state.onboarding.research_lane_intent = false;
+            }
         }
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
@@ -31413,6 +31436,31 @@ mod tests {
             store.state.pending_messages,
             vec!["early follow-up".to_string()],
             "the staged prompt stays queued behind the in-progress turn"
+        );
+    }
+
+    /// Codex PR384 review (F1): the research-lane intent must SURVIVE normal
+    /// wizard interaction. `provider_save_target` is cleared on every
+    /// staged-input edit (dirty marking), so routing a lane save on it would
+    /// silently fall through to a primary-provider save after the user edits.
+    /// The separate `research_lane_intent` flag is NOT cleared by edits, so the
+    /// Save stays lane-targeted for the whole flow.
+    #[test]
+    fn research_lane_intent_survives_wizard_edits() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.onboarding.research_lane_intent = true;
+        store.state.onboarding.provider_save_target =
+            Some(OnboardingProviderSaveTarget::ResearchLane);
+
+        // A staged-input edit clears the transient save target but NOT the intent.
+        store.mark_onboarding_provider_dirty("edited");
+        assert!(
+            store.state.onboarding.provider_save_target.is_none(),
+            "edits clear the transient provider_save_target"
+        );
+        assert!(
+            store.state.onboarding.research_lane_intent,
+            "the persistent lane intent survives the edit"
         );
     }
 }
