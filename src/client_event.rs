@@ -56,6 +56,8 @@ pub enum ClientEvent {
     ProfileLlmList(ProfileLlmListClientEvent),
     ProfileLlmMutation(ProfileLlmMutationClientEvent),
     SubProvidersList(SubProvidersListClientEvent),
+    /// #1768: snapshot list/restore result (restore echoes refreshed rows).
+    SnapshotList(SnapshotListClientEvent),
     SubProvidersMutation(SubProvidersMutationClientEvent),
     ProfileSkillsList(ProfileSkillsListClientEvent),
     ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchClientEvent),
@@ -190,6 +192,13 @@ pub struct ProfileLlmListClientEvent {
 pub struct ProfileLlmMutationClientEvent {
     pub result: ProfileLlmMutationResult,
     pub message: String,
+}
+
+/// #1768 snapshot undo list (also carries restore acknowledgements).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotListClientEvent {
+    pub message: String,
+    pub result: crate::model::SnapshotListResult,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -454,6 +454,8 @@ command:
     desc: 列出或配置服务器支持的 MCP 条目
   model:
     desc: 选择服务器返回的档案 LLM 模型
+  undo:
+    desc: 将工作区文件回滚到修改前的快照（#1768）。
   research:
     desc: 管理研究模型通道（deep_research 的 cheap/strong 模型）。
   onboard:
@@ -509,6 +511,40 @@ menu:
         desc: "在工作区根目录下未扫描到可列出的文件（已跳过 .git、target 与 node_modules）。"
       truncated:
         label: "仅显示前 %{count} 个文件 —— 输入以缩小范围"
+  undo:
+    title: 工作区快照
+    subtitle: "在代理修改文件前自动记录的还原点。选择一个将工作区回滚。"
+    footer: Enter 恢复快照（会先确认） | Esc 关闭
+    age:
+      just_now: 刚刚
+    item:
+      refresh:
+        label: 刷新快照
+        desc: 对当前会话调用 snapshot/list。
+      stale:
+        label: 尚未加载此会话的快照
+        desc: 选择"刷新"以加载当前会话的快照。
+      unavailable:
+        label: 快照不可用
+        desc: 此会话没有工作区，或未安装 git。
+      disabled:
+        label: "快照采集已关闭（snapshots.enabled）"
+        desc: 下方已有快照仍可恢复；新的修改不会被记录。
+      empty:
+        label: 暂无快照
+        desc: "代理修改文件前会自动记录快照（需开启 snapshots.enabled）。"
+      snap:
+        desc: 选择以恢复 —— 会先确认。
+  undo_confirm:
+    title: "恢复快照"
+    subtitle: "将工作区文件回滚。恢复前会先自动记录当前状态，因此本操作也可撤销。"
+    confirm_title: "恢复 %{snapshot}？"
+    "yes": "是，恢复 %{snapshot}"
+    yes_desc: "使用 snapshot/restore；会话有正在运行的回合时会被拒绝。"
+    "no": "否，保留当前文件"
+    item:
+      empty:
+        label: "没有待恢复的快照"
   research:
     title: 研究模型通道
     subtitle: "deep_research 流水线的命名模型通道（cheap/strong）。需重启生效。"
@@ -1154,6 +1190,7 @@ menu:
     unavailable_title: 工具设置不可用
   unavailable: 菜单不可用
 status:
+  undo_no_session: "没有可撤销的活动会话。"
   research_usage: "用法：/research | /research add <key> <provider> <model> [base_url] [api_key_env] | /research rm <key>"
   research_add_usage: "用法：/research add <key> <provider> <model> [base_url] [api_key_env]"
   research_rm_usage: "用法：/research rm <key>"

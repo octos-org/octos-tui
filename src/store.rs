@@ -700,6 +700,14 @@ impl Store {
                 ) {
                     return self.dispatch_research_slash(draft);
                 }
+                if matches!(
+                    &command.entry,
+                    crate::menu::types::CommandEntry::LocalAction(
+                        crate::menu::types::LocalAction::Custom("undo"),
+                    )
+                ) {
+                    return self.dispatch_undo_slash();
+                }
                 self.dispatch_command_entry(&command.entry, Some(invocation.args))
             }
             CommandResolution::EmptyCommand => {
@@ -763,6 +771,23 @@ impl Store {
     /// opens the lanes menu and refreshes it; `add`/`rm` mutate a lane inline.
     /// Changes are RESTART-to-apply on a pinned solo profile (the router builds
     /// at ProfileRuntime bootstrap) — the mutation status says so.
+    /// `/undo` (#1768): open the snapshot picker and refresh it for the
+    /// ACTIVE session.
+    pub(crate) fn dispatch_undo_slash(&mut self) -> SlashDispatchOutcome {
+        let Some(session_id) = self
+            .state
+            .active_session()
+            .map(|session| session.id.clone())
+        else {
+            self.state.status = t!("status.undo_no_session").into_owned();
+            return SlashDispatchOutcome::Rejected;
+        };
+        self.open_menu(MenuId::from(crate::menu::registry::MENU_UNDO));
+        SlashDispatchOutcome::accepted(Some(AppUiCommand::SnapshotList(
+            crate::model::SnapshotListParams { session_id },
+        )))
+    }
+
     pub(crate) fn dispatch_research_slash(&mut self, draft: &str) -> SlashDispatchOutcome {
         // Target the ACTIVE profile — the same value the /research menu resolves
         // (`active_profile_id`), NOT the last list's cached profile and NOT the
@@ -1641,6 +1666,11 @@ impl Store {
                 self.open_menu(MenuId::from(
                     crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM,
                 ));
+                None
+            }
+            LocalAction::RequestRestoreSnapshot(request) => {
+                self.state.onboarding.pending_snapshot_restore = Some(*request);
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_UNDO_CONFIRM));
                 None
             }
             LocalAction::SetScrollMode => {
@@ -4858,6 +4888,7 @@ impl Store {
             profile_llm_catalog: self.state.profile_llm_catalog.as_ref(),
             profile_llm_state: self.state.profile_llm_state.as_ref(),
             sub_providers_state: self.state.sub_providers_state.as_ref(),
+            snapshots_state: self.state.snapshots_state.as_ref(),
             profile_skills: self.state.profile_skills.as_ref(),
             profile_skill_registry: self.state.profile_skill_registry.as_ref(),
             mcp_catalog,
@@ -6202,6 +6233,12 @@ impl Store {
                 self.refresh_active_menu_if_open();
                 None
             }
+            ClientEvent::SnapshotList(event) => {
+                self.state.snapshots_state = Some(event.result);
+                self.state.status = event.message;
+                self.refresh_active_menu_if_open();
+                None
+            }
             ClientEvent::SubProvidersMutation(event) => {
                 self.apply_sub_providers_mutation_event(event);
                 self.refresh_active_menu_if_open();
@@ -6669,6 +6706,7 @@ impl Store {
                 // lane) list on reconnect — `from_snapshot` would drop it and leave
                 // the /research menu blank until the user re-opens it. Carry it.
                 let sub_providers_state = self.state.sub_providers_state.clone();
+                let snapshots_state = self.state.snapshots_state.clone();
                 // Local-only: command history is a client-side ring the server
                 // never echoes; `from_snapshot` would drop it. Preserve the
                 // entries across replays (reconnect/refresh) and reset browsing.
@@ -6779,6 +6817,9 @@ impl Store {
                 }
                 if state.sub_providers_state.is_none() {
                     state.sub_providers_state = sub_providers_state;
+                    if state.snapshots_state.is_none() {
+                        state.snapshots_state = snapshots_state;
+                    }
                 }
                 state.set_composer_text(composer);
                 state.composer_drafts = composer_drafts;
