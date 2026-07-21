@@ -11,7 +11,7 @@ use octos_core::ui_protocol::{
     TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent, TurnId,
     TurnInterruptParams, TurnLifecycleState, TurnStartParams, TurnStateGetParams,
     TurnTerminalOutcome, UiContextState, UiNotification, UiProgressEvent,
-    UserQuestionRequestedEvent,
+    UserQuestionRequestedEvent, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
 };
 use octos_core::{Message, MessageRole, SessionKey, TaskId, ThreadId};
 use serde_json::Value;
@@ -8348,6 +8348,34 @@ impl Store {
     }
 
     fn apply_notification(&mut self, notification: UiNotification) -> Option<AppUiCommand> {
+        // Legacy-lane gate: when the connection negotiated `projection.envelope.v2`,
+        // the canonical EnvelopeV2 carries the SAME content (deltas, reasoning,
+        // tool lifecycle, turn terminal) and these legacy notifications are
+        // dual-emitted alongside it. Both lanes funnel into the same state
+        // (`append_live_reply_delta`, `live_reasoning`, `commit_live_reply`) with
+        // no cross-lane dedup, so processing both renders the answer TWICE. Drop
+        // the legacy copies and let the v2 envelope deliver them. On a legacy
+        // (non-v2) server there is no envelope, so the legacy lanes still apply.
+        if self
+            .state
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                capabilities.supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
+            })
+        {
+            match &notification {
+                UiNotification::MessageDelta(_)
+                | UiNotification::ReasoningDelta(_)
+                | UiNotification::ToolStarted(_)
+                | UiNotification::ToolProgress(_)
+                | UiNotification::ToolCompleted(_)
+                | UiNotification::TurnCompleted(_)
+                | UiNotification::TurnError(_)
+                | UiNotification::Envelope(_) => return None,
+                _ => {}
+            }
+        }
         match notification {
             // #1477 voice rich-output visual lifecycle. octos-tui does not yet
             // render generated visuals (a separate feature); ignore gracefully
