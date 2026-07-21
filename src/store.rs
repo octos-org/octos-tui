@@ -613,6 +613,19 @@ impl Store {
             .or_else(|| std::env::current_dir().ok())
     }
 
+    /// True when a turn is running on the active session, whether or not it has
+    /// streamed its first token yet. `active_turn()` requires a `live_reply`,
+    /// which only exists once the first assistant delta arrives — so in the
+    /// window between turn-start and the first token (model thinking, or a tool
+    /// call before any text) it returns `None` even though a turn IS running.
+    /// The run-state is set to `InProgress` at turn-start (before any delta), so
+    /// combining both gives the correct "is a turn active" answer for the whole
+    /// turn lifecycle. Use this for staging/idle decisions; using `active_turn()`
+    /// alone would start a SECOND concurrent turn when a prompt arrives early.
+    fn turn_in_progress(&self) -> bool {
+        self.state.active_turn().is_some() || self.state.run_state.is_active()
+    }
+
     /// Mid-turn staging chokepoint for every prompt submission (composer,
     /// menu `SubmitPrompt`, `PromptTemplate`): an active turn stages the
     /// prompt onto the session's queue — starting a SECOND `turn/start`
@@ -623,7 +636,7 @@ impl Store {
         prompt: String,
         queued_status: String,
     ) -> Option<AppUiCommand> {
-        if self.state.active_turn().is_some() {
+        if self.turn_in_progress() {
             self.state.pending_messages.push(prompt);
             self.state.status = t!("status.message_staged").into_owned();
             self.state.scroll_transcript_to_latest();
@@ -10734,7 +10747,14 @@ impl Store {
     /// terminal firing here can never submit another session's staged prompt
     /// into this one.
     fn submit_next_pending_if_idle(&mut self) -> Option<AppUiCommand> {
-        if self.state.active_turn().is_some() {
+        // Gate on the FULL turn-in-progress signal (active_turn's live_reply OR
+        // the run-state set at turn-start), not just active_turn(). A turn in
+        // its pre-first-token window has no live_reply yet, so active_turn()
+        // alone would let this drain dequeue a staged prompt as a SECOND
+        // concurrent turn while the first is still running (codex PR371
+        // review). run_state is reset to Success/Idle on turn completion, so a
+        // genuinely finished turn does not block the drain.
+        if self.turn_in_progress() {
             return None;
         }
         // A staged submit is already in flight for this session but its
@@ -13969,6 +13989,10 @@ mod tests {
             .submit_next_pending_if_idle()
             .expect("staged prompt drains");
         assert!(store.state.pending_messages.is_empty());
+        // Simulate the turn COMPLETING (run_state Success, as commit_live_reply
+        // sets) so the drain is no longer gated on the in-progress run-state;
+        // the only thing left is the stale in-flight gate.
+        store.state.set_run_state_success();
         // Age the prompt-bearing gate past the TTL without ANY wire error.
         let gate = store
             .state
@@ -14005,6 +14029,9 @@ mod tests {
         store
             .submit_next_pending_if_idle()
             .expect("first staged prompt drains");
+        // Simulate the first turn COMPLETING so the drain is no longer gated on
+        // the in-progress run-state; only the stale in-flight gate remains.
+        store.state.set_run_state_success();
         let gate = store
             .state
             .staged_submit_in_flight
@@ -31046,6 +31073,55 @@ mod tests {
         assert!(
             text2.contains("mock reply"),
             "a legacy delta for a NON-v2-fed turn (mock) must be kept: {text2}"
+        );
+    }
+
+    /// Regression: a prompt submitted while a turn is in its pre-first-token
+    /// window (run_state is `InProgress` from turn-start, but no `live_reply`
+    /// delta has arrived yet, so `active_turn()` is `None`) must be STAGED onto
+    /// the queue — NOT started as a second concurrent turn. Before the
+    /// `turn_in_progress()` fix, `queue_or_start_prompt_turn` consulted only
+    /// `active_turn()`, saw `None`, and called `start_prompt_turn`, racing the
+    /// live turn.
+    #[test]
+    fn prompt_submitted_before_first_delta_is_staged_not_a_concurrent_turn() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        // Simulate a turn that has STARTED (run_state InProgress) but has not
+        // yet streamed any token: no live_reply, so active_turn() is None.
+        store.state.set_run_state_in_progress();
+        assert!(store.state.active_turn().is_none());
+        assert!(store.state.run_state.is_active());
+
+        let command = store.queue_or_start_prompt_turn(
+            "early follow-up".to_string(),
+            "queued".to_string(),
+        );
+
+        // Must STAGE (no command emitted), not start a concurrent turn.
+        assert!(
+            command.is_none(),
+            "an early prompt must be staged, not started concurrently: {command:?}"
+        );
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["early follow-up".to_string()],
+            "the early prompt lands on the FIFO queue"
+        );
+
+        // Codex PR371 review: the periodic drain must ALSO not start a
+        // concurrent turn in this window. Even though the first turn has no
+        // live_reply yet (active_turn() is None), the run-state is InProgress,
+        // so the drain must hold the staged prompt instead of emitting a second
+        // SubmitPrompt.
+        let drained = store.submit_next_pending_if_idle();
+        assert!(
+            drained.is_none(),
+            "the drain must not start a concurrent turn while the first is pre-first-token: {drained:?}"
+        );
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["early follow-up".to_string()],
+            "the staged prompt stays queued behind the in-progress turn"
         );
     }
 }
