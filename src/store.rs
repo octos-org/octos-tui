@@ -782,6 +782,17 @@ impl Store {
                 )))
             }
             Some("add") | Some("set") => {
+                // Bare `/research add` (no args) opens the model-setting wizard
+                // (the same flow as /model add-model) targeted at a research
+                // lane, instead of the terse inline form — the wizard collects
+                // family/model/route/base_url/api_key_env/api_key with fetch +
+                // test, then saves via profile/sub_providers/upsert.
+                if tokens.clone().next().is_none() {
+                    self.state.onboarding.provider_save_target =
+                        Some(OnboardingProviderSaveTarget::ResearchLane);
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                    return SlashDispatchOutcome::Accepted(None);
+                }
                 // Require key + provider + MODEL (a dropped model used to save a
                 // lane with no model), and reject trailing junk.
                 let (key, provider, model) = (tokens.next(), tokens.next(), tokens.next());
@@ -3607,6 +3618,18 @@ impl Store {
     }
 
     fn onboarding_save_provider_command(&mut self) -> Option<AppUiCommand> {
+        // Route on the pre-set save target: the `/research` add flow opens this
+        // wizard with `provider_save_target = ResearchLane`, so its save must go
+        // to `profile/sub_providers/upsert` (a named lane), not the profile's
+        // primary provider. Primary/fallback stay on `profile/llm/upsert`.
+        let save_target = self
+            .state
+            .onboarding
+            .provider_save_target
+            .unwrap_or(OnboardingProviderSaveTarget::Primary);
+        if matches!(save_target, OnboardingProviderSaveTarget::ResearchLane) {
+            return self.onboarding_save_research_lane_command();
+        }
         if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT) {
             return None;
         }
@@ -3634,6 +3657,37 @@ impl Store {
         self.state.status = t!("status.saving_provider_config").into_owned();
         self.refresh_active_menu_if_open();
         Some(AppUiCommand::ProfileLlmUpsert(params))
+    }
+
+    /// Save the wizard's staged provider as a research sub-provider lane (the
+    /// `/research` add flow). Builds a `SubProvidersUpsert` from the staged
+    /// selection and marks the pending save with the `ResearchLane` target so
+    /// the success path records it as a lane, not the primary provider.
+    fn onboarding_save_research_lane_command(&mut self) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT) {
+            return None;
+        }
+        if let Some(pending) = self.state.onboarding.provider_pending {
+            self.state.status = onboarding_pending_status(pending);
+            self.refresh_active_menu_if_open();
+            return None;
+        }
+        let profile_id = self.active_profile_id();
+        let Some(params) = self
+            .state
+            .onboarding
+            .build_research_lane_params(profile_id.as_deref())
+        else {
+            self.state.status = t!("status.onboarding_provider_selection_incomplete").into_owned();
+            return None;
+        };
+        self.state.onboarding.last_message = Some(t!("status.saving_provider").into_owned());
+        self.state.onboarding.provider_pending = Some(OnboardingProviderPending::Save);
+        self.state.onboarding.provider_save_target =
+            Some(OnboardingProviderSaveTarget::ResearchLane);
+        self.state.status = t!("status.saving_provider_config").into_owned();
+        self.refresh_active_menu_if_open();
+        Some(AppUiCommand::ProfileSubProvidersUpsert(params))
     }
 
     fn onboarding_save_provider_fallback_command(&mut self) -> Option<AppUiCommand> {
@@ -8210,7 +8264,8 @@ impl Store {
                             self.state.onboarding.saved_primary_provider_label =
                                 Some(staged_provider_label.clone());
                         }
-                        OnboardingProviderSaveTarget::Fallback => {
+                        OnboardingProviderSaveTarget::Fallback
+                        | OnboardingProviderSaveTarget::ResearchLane => {
                             self.state.onboarding.provider_tested = false;
                             reset_staged_provider = true;
                         }

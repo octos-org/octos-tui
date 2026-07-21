@@ -3710,6 +3710,7 @@ fn save_target_label(target: OnboardingProviderSaveTarget) -> String {
     match target {
         OnboardingProviderSaveTarget::Primary => t!("onboarding.provider.primary").into_owned(),
         OnboardingProviderSaveTarget::Fallback => t!("onboarding.provider.fallback").into_owned(),
+        OnboardingProviderSaveTarget::ResearchLane => "research lane".into(),
     }
 }
 
