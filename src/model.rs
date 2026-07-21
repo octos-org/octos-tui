@@ -2448,6 +2448,13 @@ pub struct OnboardingWizardState {
     /// `profile/sub_providers/remove` with the captured `profile_id` + `key`.
     pub pending_research_lane_removal: Option<ResearchLaneRemoval>,
     pub provider_save_target: Option<OnboardingProviderSaveTarget>,
+    /// Persistent "this wizard session is creating a RESEARCH lane" intent, set
+    /// by bare `/research add` and kept for the WHOLE flow. Unlike
+    /// `provider_save_target` (a pending-op field cleared on every staged-input
+    /// edit), this is NOT cleared by `mark_onboarding_provider_dirty` /
+    /// `apply_selection` / key updates, so the Save routing stays lane-targeted
+    /// across normal wizard interaction (codex PR384 review).
+    pub research_lane_intent: bool,
     pub last_saved_provider_label: Option<String>,
     pub last_saved_provider_target: Option<OnboardingProviderSaveTarget>,
     pub saved_primary_provider_label: Option<String>,
@@ -2500,6 +2507,7 @@ impl Default for OnboardingWizardState {
             pending_model_removal: None,
             pending_research_lane_removal: None,
             provider_save_target: None,
+            research_lane_intent: false,
             last_saved_provider_label: None,
             last_saved_provider_target: None,
             saved_primary_provider_label: None,
@@ -2825,7 +2833,11 @@ impl OnboardingWizardState {
             }
         };
         Some(SubProvidersUpsertParams {
-            profile_id: self.effective_profile_id(current_profile),
+            // Use the caller-resolved ACTIVE profile directly (codex PR384 F3):
+            // do NOT fall back to `effective_profile_id`, which prefers a stale
+            // `onboarding.profile_id` and could retarget the lane to the wrong
+            // profile or the server default.
+            profile_id: current_profile.map(str::to_owned),
             sub_provider: SubProviderView {
                 key,
                 provider: non_empty(self.provider.family_id.trim().to_string()),
