@@ -98,38 +98,6 @@ fn looks_like_validation_activity(activity: &ActivityItem) -> bool {
         || text.contains("pnpm ")
 }
 
-/// Extract the `(session_id, turn_id)` a legacy-lane notification belongs to, for
-/// cross-lane dedup against the canonical `projection.envelope.v2` feed. Returns
-/// `None` for notifications that are not turn-scoped legacy lanes (so they are
-/// never deduped). The legacy `Envelope` variant carries no usable turn identity
-/// here and is already ignored by the renderer, so it is excluded.
-fn legacy_lane_turn(notification: &UiNotification) -> Option<(SessionKey, TurnId)> {
-    match notification {
-        UiNotification::MessageDelta(event) => {
-            Some((event.session_id.clone(), event.turn_id.clone()))
-        }
-        UiNotification::ReasoningDelta(event) => {
-            Some((event.session_id.clone(), event.turn_id.clone()))
-        }
-        UiNotification::ToolStarted(event) => {
-            Some((event.session_id.clone(), event.turn_id.clone()))
-        }
-        UiNotification::ToolProgress(event) => {
-            Some((event.session_id.clone(), event.turn_id.clone()))
-        }
-        UiNotification::ToolCompleted(event) => {
-            Some((event.session_id.clone(), event.turn_id.clone()))
-        }
-        UiNotification::TurnCompleted(event) => {
-            Some((event.session_id.clone(), event.turn_id.clone()))
-        }
-        UiNotification::TurnError(event) => {
-            Some((event.session_id.clone(), event.turn_id.clone()))
-        }
-        _ => None,
-    }
-}
-
 fn looks_like_file_change_activity(activity: &ActivityItem) -> bool {
     let text = format!(
         "{} {} {}",
@@ -5141,6 +5109,11 @@ impl Store {
         self.state.scroll_transcript_to_latest();
         self.state.status = status.into();
         self.state.set_run_state_in_progress();
+        // Pre-first-token marker (#379 review F3): survives a session switch
+        // round-trip, unlike the global run_state re-derived on switch.
+        self.state
+            .pre_token_turns
+            .insert(session_id.clone(), std::time::Instant::now());
         let reasoning_effort = self
             .state
             .session_reasoning_effort
@@ -8563,33 +8536,6 @@ impl Store {
     }
 
     fn apply_notification(&mut self, notification: UiNotification) -> Option<AppUiCommand> {
-        // Cross-lane dedup for dual-emitted turns. The server (during the
-        // protocol migration) can emit the SAME turn content on BOTH a legacy
-        // lane (`message/delta`, `reasoning_delta`, `tool/*`, `turn/completed`)
-        // AND the canonical `projection.envelope.v2`. Both lanes funnel into the
-        // same state (`append_live_reply_delta`, `live_reasoning`,
-        // `commit_live_reply`) with no built-in dedup, so the answer renders
-        // twice. Drop a legacy frame only when THIS turn is already being fed by
-        // the v2 envelope (tracked in `v2_turn_ids` / `v2_live_assistant_segments`
-        // by the v2 apply path). This is keyed on CONTENT identity, not the
-        // negotiated capability, so it works on the default stdio transport
-        // (where v2 is delivered without a `client_hello` feature flag) and is
-        // safe for the mock backend (which emits legacy-only and never populates
-        // the v2 maps, so its frames are always kept).
-        if let Some((session_id, turn_id)) = legacy_lane_turn(&notification) {
-            let fed_by_v2 = self
-                .state
-                .v2_live_assistant_segments
-                .contains_key(&(session_id.clone(), turn_id.clone()))
-                || self
-                    .state
-                    .v2_turn_ids
-                    .values()
-                    .any(|v2_turn| v2_turn == &turn_id);
-            if fed_by_v2 {
-                return None;
-            }
-        }
         match notification {
             // #1477 voice rich-output visual lifecycle. octos-tui does not yet
             // render generated visuals (a separate feature); ignore gracefully
@@ -8719,6 +8665,9 @@ impl Store {
                 // on turn so a stale/continuation TurnStarted for a DIFFERENT
                 // turn cannot drop a newer staged submit's gate.
                 self.release_staged_gate_for_turn(&event.session_id, &event.turn_id);
+                // The pre-first-token window is over for this session — the
+                // live_reply bound below carries the in-progress signal now.
+                self.state.pre_token_turns.remove(&event.session_id);
                 // A NEWER turn in this session supersedes its pending
                 // interrupt-restore: restoring the old prompt while the
                 // successor streams would re-block the `/` slash popup
@@ -9676,6 +9625,25 @@ impl Store {
                     .find(|segment| segment.id == assistant_segment_id)
                     .cloned()
             });
+        // Double-render fix (#379 review F1): on stdio the turn streams over
+        // the LEGACY lane, so the live reply already holds this very text but
+        // NO v2 segment was ever recorded. This persisted row is the CANONICAL
+        // copy of that same content — replace the legacy-fed text instead of
+        // seeding an append after it (which rendered the answer twice).
+        if known_segment.is_none()
+            && self
+                .state
+                .v2_live_assistant_segments
+                .get(&key)
+                .is_none_or(|segments| segments.is_empty())
+            && let Some(live_reply) = self
+                .find_session_mut(session_id)
+                .and_then(|session| session.live_reply.as_mut())
+            && live_reply.turn_id == *turn_id
+            && !live_reply.text.is_empty()
+        {
+            live_reply.text.clear();
+        }
         if known_segment.is_none() {
             // A persisted row may be the first frame observed after replay.
             // Seed it through the SAME delta path, then replace only that
@@ -10261,6 +10229,7 @@ impl Store {
     }
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
+        self.state.pre_token_turns.remove(&event.session_id);
         // The turn the user interrupted has settled — its deferred prompt
         // restore applies now (before the duplicate-terminal early returns:
         // any first terminal for the armed turn consumes the stash).
@@ -10461,6 +10430,7 @@ impl Store {
     }
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
+        self.state.pre_token_turns.remove(&event.session_id);
         // The interrupted turn has settled (an Esc/Ctrl+C typically lands here
         // as the server's `code == "interrupted"` terminal) — apply the
         // deferred prompt restore (mirror of `commit_live_reply`).
@@ -10747,15 +10717,31 @@ impl Store {
     /// terminal firing here can never submit another session's staged prompt
     /// into this one.
     fn submit_next_pending_if_idle(&mut self) -> Option<AppUiCommand> {
-        // Gate on the FULL turn-in-progress signal (active_turn's live_reply OR
-        // the run-state set at turn-start), not just active_turn(). A turn in
-        // its pre-first-token window has no live_reply yet, so active_turn()
-        // alone would let this drain dequeue a staged prompt as a SECOND
-        // concurrent turn while the first is still running (codex PR371
-        // review). run_state is reset to Success/Idle on turn completion, so a
-        // genuinely finished turn does not block the drain.
-        if self.turn_in_progress() {
+        // A streaming turn (live_reply present) always blocks the drain.
+        if self.state.active_turn().is_some() {
             return None;
+        }
+        let session_id = self
+            .state
+            .active_session()
+            .map(|session| session.id.clone())?;
+        // Pre-first-token window: run_state is InProgress from turn-start but
+        // no delta has arrived, so active_turn() is None. Draining here would
+        // start a SECOND concurrent turn (codex PR371 review) — UNLESS the
+        // in-flight staged gate has gone stale, which means the submit died
+        // unattributably and run_state is stuck: fall through to the stale
+        // re-stage below so the TTL self-heal stays reachable (#379 review
+        // F2 — the original gate ordering made the TTL dead code exactly in
+        // its target scenario).
+        if self.state.run_state.is_active() {
+            let stale_gate = self
+                .state
+                .staged_submit_in_flight
+                .get(&session_id)
+                .is_some_and(|gate| gate.submitted_at.elapsed() >= STAGED_SUBMIT_GATE_TTL);
+            if !stale_gate {
+                return None;
+            }
         }
         // A staged submit is already in flight for this session but its
         // turn/started has not arrived — the session LOOKS idle, yet draining
@@ -10767,13 +10753,16 @@ impl Store {
         // deaths of the in-flight turn/start are only partially attributable
         // from wire errors, so any missed release self-heals here instead of
         // wedging the queue behind an ever-growing error-code taxonomy.
-        let session_id = self
-            .state
-            .active_session()
-            .map(|session| session.id.clone())?;
         match self.state.staged_submit_in_flight.get(&session_id) {
             Some(gate) if gate.submitted_at.elapsed() < STAGED_SUBMIT_GATE_TTL => return None,
             Some(_) => {
+                // The dead in-flight turn left run_state stuck InProgress —
+                // reset it (and its pre-token marker) so this drain and the
+                // status chip reflect the recovery instead of a phantom turn.
+                self.state.pre_token_turns.remove(&session_id);
+                if self.state.run_state.is_active() {
+                    self.state.set_run_state_idle();
+                }
                 // Stale gate: the in-flight death was UNATTRIBUTABLE (no wire
                 // error matched a release arm). If the gate still carries its
                 // prompt, that is the ONLY surviving copy — re-stage it at the
@@ -13989,10 +13978,14 @@ mod tests {
             .submit_next_pending_if_idle()
             .expect("staged prompt drains");
         assert!(store.state.pending_messages.is_empty());
-        // Simulate the turn COMPLETING (run_state Success, as commit_live_reply
-        // sets) so the drain is no longer gated on the in-progress run-state;
-        // the only thing left is the stale in-flight gate.
-        store.state.set_run_state_success();
+        // No terminal EVER arrives (unattributable transport death): run_state
+        // stays stuck InProgress. The stale-gate TTL must still be reachable
+        // and recover — gating the drain on run_state alone made this dead
+        // code in exactly this scenario (#379 review F2).
+        assert!(
+            store.state.run_state.is_active(),
+            "precondition: stuck InProgress"
+        );
         // Age the prompt-bearing gate past the TTL without ANY wire error.
         let gate = store
             .state
@@ -14029,9 +14022,12 @@ mod tests {
         store
             .submit_next_pending_if_idle()
             .expect("first staged prompt drains");
-        // Simulate the first turn COMPLETING so the drain is no longer gated on
-        // the in-progress run-state; only the stale in-flight gate remains.
-        store.state.set_run_state_success();
+        // No terminal arrives; run_state is stuck InProgress — the stale gate
+        // alone must unlock the recovery (#379 review F2).
+        assert!(
+            store.state.run_state.is_active(),
+            "precondition: stuck InProgress"
+        );
         let gate = store
             .state
             .staged_submit_in_flight
@@ -31020,59 +31016,111 @@ mod tests {
         );
     }
 
-    /// Cross-lane dedup (codex PR370 review): a legacy `MessageDelta` is dropped
-    /// ONLY when its turn is already fed by the v2 envelope — keyed on content
-    /// identity, not the negotiated capability. This makes it work on the stdio
-    /// transport (no `client_hello` v2 flag) and keeps the mock backend (which
-    /// emits legacy-only) rendering.
+    /// Double-render fix (#379 review F1): on stdio the turn streams over the
+    /// LEGACY lane (live_reply filled, no v2 segments), then the persisted v2
+    /// `AssistantPersisted` row arrives carrying the SAME full text. It must
+    /// REPLACE the legacy-fed text — the old seed path appended a second copy.
     #[test]
-    fn legacy_delta_dropped_only_when_turn_is_v2_fed() {
+    fn persisted_v2_row_replaces_legacy_fed_live_text() {
         let turn = TurnId::new();
         let session_id = SessionKey("local:test".into());
-        // A turn fed by the v2 envelope: the v2 apply path registered it.
-        let mut store = store_with_live_reply(turn.clone(), "v2 chunk");
-        store
-            .state
-            .v2_turn_ids
-            .insert((session_id.clone(), "wire-1".into()), turn.clone());
+        let mut store = store_with_live_reply(turn.clone(), "Hello, world!");
 
-        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
-            MessageDeltaEvent {
-                session_id: session_id.clone(),
-                topic: None,
-                turn_id: turn.clone(),
-                text: "LEGACY DUPLICATE".into(),
-            },
-        )));
+        store.apply_v2_assistant_persisted(
+            &session_id,
+            &turn,
+            "seg-1".into(),
+            "Hello, world!".into(),
+        );
+
         let text = &store.state.sessions[0]
             .live_reply
             .as_ref()
-            .expect("live reply")
+            .expect("live reply survives")
             .text;
-        assert!(
-            !text.contains("LEGACY DUPLICATE"),
-            "a legacy delta for a v2-fed turn must be dropped: {text}"
+        assert_eq!(
+            text, "Hello, world!",
+            "the canonical persisted copy must REPLACE the legacy-fed text, not append"
+        );
+    }
+
+    /// stdio wedge regression (#379 review F1): the persisted v2 rows register
+    /// the turn in the v2 maps, but on stdio the legacy `turn/completed` is the
+    /// ONLY terminal the client receives — it must still commit the reply (the
+    /// withdrawn cross-lane dedup dropped it, wedging every session after
+    /// turn 1).
+    #[test]
+    fn legacy_terminal_still_commits_after_v2_persisted_rows() {
+        let turn = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut store = store_with_live_reply(turn.clone(), "streamed answer");
+
+        // Persisted v2 row lands first (it bypasses capability filtering).
+        store.apply_v2_assistant_persisted(
+            &session_id,
+            &turn,
+            "seg-1".into(),
+            "streamed answer".into(),
         );
 
-        // A turn NOT fed by v2 (the mock backend case): the legacy delta is kept.
-        let turn2 = TurnId::new();
-        let mut store2 = store_with_live_reply(turn2.clone(), String::new());
-        store2.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
-            MessageDeltaEvent {
-                session_id: SessionKey("local:test".into()),
+        // The legacy terminal must still commit — not be deduped away.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
                 topic: None,
-                turn_id: turn2.clone(),
-                text: "mock reply".into(),
+                turn_id: turn.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
             },
         )));
-        let text2 = &store2.state.sessions[0]
-            .live_reply
-            .as_ref()
-            .expect("live reply")
-            .text;
         assert!(
-            text2.contains("mock reply"),
-            "a legacy delta for a NON-v2-fed turn (mock) must be kept: {text2}"
+            store.state.sessions[0].live_reply.is_none(),
+            "the legacy terminal must commit the live reply"
+        );
+        assert!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("streamed answer")),
+            "the committed assistant message must exist"
+        );
+        assert!(
+            !store.state.run_state.is_active(),
+            "run_state must settle so later prompts are not staged forever"
+        );
+    }
+
+    /// #379 review F3: the pre-first-token InProgress signal must survive a
+    /// session switch round-trip — the switch re-derives run_state from
+    /// live_reply presence, which is None in that window, so without the
+    /// submit marker a returning submit started a SECOND concurrent turn.
+    #[test]
+    fn pre_token_turn_survives_session_switch_roundtrip() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let command = store.queue_or_start_prompt_turn("first".into(), "sent".into());
+        assert!(command.is_some(), "idle session starts the turn");
+        assert!(store.state.run_state.is_active());
+        assert!(
+            store.state.active_turn().is_none(),
+            "pre-token: no live_reply yet"
+        );
+
+        // Switch away and back inside the pre-token window.
+        store.state.switch_selected_session(1);
+        store.state.switch_selected_session(0);
+        assert!(
+            store.state.run_state.is_active(),
+            "the pre-token marker must restore InProgress after the round-trip"
+        );
+
+        // A submit now must STAGE, not start a concurrent turn.
+        let command = store.queue_or_start_prompt_turn("early follow-up".into(), "q".into());
+        assert!(command.is_none(), "staged, not a second concurrent turn");
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["early follow-up".to_string()]
         );
     }
 
@@ -31092,10 +31140,8 @@ mod tests {
         assert!(store.state.active_turn().is_none());
         assert!(store.state.run_state.is_active());
 
-        let command = store.queue_or_start_prompt_turn(
-            "early follow-up".to_string(),
-            "queued".to_string(),
-        );
+        let command =
+            store.queue_or_start_prompt_turn("early follow-up".to_string(), "queued".to_string());
 
         // Must STAGE (no command emitted), not start a concurrent turn.
         assert!(

@@ -4109,6 +4109,15 @@ pub struct AppState {
     pub protocol_version: &'static str,
     pub run_state: SessionRunState,
     pub run_state_started_at: Option<Instant>,
+    /// Sessions with a SUBMITTED turn that has not yet streamed its first
+    /// delta (`live_reply` absent). `initial_run_state` derives run-state from
+    /// `live_reply` presence alone, so without this marker a rapid
+    /// switch-away-and-back inside the pre-first-token window read the session
+    /// as Idle and let a submit start a SECOND concurrent turn (#379 review
+    /// F3). Armed at submit, cleared on turn/started + both terminals; entries
+    /// older than [`PRE_TOKEN_TURN_TTL`] are ignored (dead submit — matches
+    /// the staged-gate TTL self-heal).
+    pub pre_token_turns: std::collections::HashMap<SessionKey, Instant>,
     pub approval_auto_open: bool,
     pub approval: Option<ApprovalModalState>,
     /// Pending AskUserQuestion picker (UPCR-2026-023), mirroring `approval`.
@@ -6011,6 +6020,7 @@ impl AppState {
             protocol_version: APP_UI_API_V1,
             run_state,
             run_state_started_at,
+            pre_token_turns: std::collections::HashMap::new(),
             approval_auto_open: true,
             approval: None,
             user_question: None,
@@ -8052,6 +8062,18 @@ impl AppState {
 
     pub fn refresh_run_state_from_selection(&mut self) {
         self.run_state = initial_run_state(&self.sessions, self.selected_session);
+        // Pre-first-token turns have no live_reply, so the derivation above
+        // reads them as Idle — restore InProgress from the submit marker so a
+        // switch round-trip inside that window cannot start a concurrent turn
+        // (#379 review F3). Stale markers (dead submits) are pruned here.
+        self.pre_token_turns
+            .retain(|_, armed| armed.elapsed() < PRE_TOKEN_TURN_TTL);
+        if !self.run_state.is_active()
+            && let Some(session_id) = self.active_session().map(|session| session.id.clone())
+            && self.pre_token_turns.contains_key(&session_id)
+        {
+            self.run_state = SessionRunState::InProgress;
+        }
         self.run_state_started_at = self.run_state.is_active().then(Instant::now);
     }
 
@@ -8852,6 +8874,11 @@ fn is_plan_heading(line: &str) -> bool {
             | "checklist"
     )
 }
+
+/// How long a [`AppState::pre_token_turns`] marker stays authoritative. A
+/// submit whose turn/started never arrives within this window is treated as
+/// dead (mirrors the staged-gate TTL in `store.rs`).
+const PRE_TOKEN_TURN_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn initial_run_state(sessions: &[SessionView], selected_session: usize) -> SessionRunState {
     if sessions
