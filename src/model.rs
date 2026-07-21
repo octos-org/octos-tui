@@ -4120,6 +4120,10 @@ pub struct AppState {
     pub turn_state_detail: TurnStateDetailState,
     pub task_output_cursors: Vec<TaskOutputCursor>,
     pub diff_preview: DiffPreviewPaneState,
+    /// Terminal width of the last drawn frame (0 = not drawn yet, e.g. in
+    /// tests). Lets key handlers apply width gates — the side-by-side diff
+    /// toggle is a no-op when the transcript is too narrow to split.
+    pub last_terminal_width: u16,
     pub activity: Vec<ActivityItem>,
     pub turn_activity_logs: Vec<TurnActivityLog>,
     /// Hydrate-replayed v2 tool envelopes already applied, keyed by
@@ -5281,6 +5285,18 @@ pub struct GitHistoryItem {
     pub summary: String,
 }
 
+/// Minimum transcript wrap width (columns) for the side-by-side diff view.
+/// Below this the two columns are too cramped to read, so rendering
+/// auto-falls back to unified and the toggle is disabled.
+pub const DIFF_SIDE_BY_SIDE_MIN_WIDTH: usize = 100;
+
+/// The transcript wrap width for a terminal of `width` columns — single
+/// source for the render path (`app::transcript_wrap_width`) and the
+/// side-by-side toggle gate, so they can never disagree about the threshold.
+pub fn transcript_wrap_width_for(width: u16) -> usize {
+    usize::from(width.saturating_sub(2)).max(1)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiffPreviewPaneState {
     pub active: bool,
@@ -5294,6 +5310,10 @@ pub struct DiffPreviewPaneState {
     pub scroll: usize,
     pub selected_file: usize,
     pub selected_hunk: usize,
+    /// `v` toggles unified <-> side-by-side while the preview is open. A view
+    /// preference, not per-preview data: it survives `apply_result` and a
+    /// reload (`open_loading_for_turn`); only `close()` resets it.
+    pub side_by_side: bool,
 }
 
 impl DiffPreviewPaneState {
@@ -5314,7 +5334,15 @@ impl DiffPreviewPaneState {
             scroll: 0,
             selected_file: 0,
             selected_hunk: 0,
+            side_by_side: self.side_by_side,
         };
+    }
+
+    /// Flip unified <-> side-by-side. Touches ONLY the mode bit — scroll and
+    /// hunk selection are the user's place in the diff and must survive the
+    /// round trip.
+    pub fn toggle_view_mode(&mut self) {
+        self.side_by_side = !self.side_by_side;
     }
 
     pub fn apply_result(&mut self, result: DiffPreviewGetResult) {
@@ -5993,6 +6021,7 @@ impl AppState {
             turn_state_detail: TurnStateDetailState::default(),
             task_output_cursors: Vec::new(),
             diff_preview: DiffPreviewPaneState::default(),
+            last_terminal_width: 0,
             activity: Vec::new(),
             turn_activity_logs: Vec::new(),
             applied_hydrate_tool_envelopes: std::collections::HashSet::new(),
@@ -7379,6 +7408,16 @@ impl AppState {
             .as_deref()
             .and_then(preview_id_from_text)
             .or_else(|| preview_id_from_text(&task.output_tail))
+    }
+
+    /// Whether the side-by-side diff toggle may take effect at the last drawn
+    /// terminal width. Below `DIFF_SIDE_BY_SIDE_MIN_WIDTH` transcript columns
+    /// the renderer falls back to unified anyway, so the toggle is a gated
+    /// no-op there instead of silently arming a mode that cannot show. An
+    /// unknown width (0: no frame drawn yet) does not gate.
+    pub fn diff_side_by_side_toggle_enabled(&self) -> bool {
+        self.last_terminal_width == 0
+            || transcript_wrap_width_for(self.last_terminal_width) >= DIFF_SIDE_BY_SIDE_MIN_WIDTH
     }
 
     /// Switch the selected session to `index`, running the FULL housekeeping
@@ -9408,6 +9447,32 @@ mod tests {
         assert_eq!(result.source, "future_cache");
         assert_eq!(result.preview.files[0].status, "copied");
         assert_eq!(result.preview.files[0].hunks[0].lines[0].kind, "metadata");
+    }
+
+    #[test]
+    fn diff_view_mode_toggle_preserves_scroll_and_survives_reopen() {
+        let mut diff = DiffPreviewPaneState::default();
+        let preview_id = PreviewId::new();
+        diff.open_loading(preview_id.clone());
+        diff.scroll = 7;
+        diff.selected_file = 0;
+        diff.selected_hunk = 1;
+
+        assert!(!diff.side_by_side, "unified is the default view mode");
+        diff.toggle_view_mode();
+        assert!(diff.side_by_side);
+        assert_eq!(diff.scroll, 7, "toggle must preserve scroll position");
+        assert_eq!(diff.selected_hunk, 1, "toggle must preserve hunk selection");
+        diff.toggle_view_mode();
+        assert!(!diff.side_by_side, "toggle round-trips back to unified");
+        assert_eq!(diff.scroll, 7);
+        assert_eq!(diff.selected_hunk, 1);
+
+        // Re-requesting the preview (a fresh `d`) must not silently flip the
+        // view mode back to unified.
+        diff.toggle_view_mode();
+        diff.open_loading(preview_id);
+        assert!(diff.side_by_side, "view mode survives a preview reload");
     }
 
     #[test]
