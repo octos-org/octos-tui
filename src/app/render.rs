@@ -183,6 +183,62 @@ pub(super) fn render_live_tail_with_finalization(
         .wrap(Wrap { trim: false })
 }
 
+/// #324 Phase C: the top session strip — one chip per open session.
+/// Focused: `● title`; background: `○ title` + `✻` while its turn is live +
+/// `(n)` unread terminals since last focus. Chips that don't fit collapse
+/// into a trailing `+N`.
+pub(super) fn render_session_strip(
+    app: &AppState,
+    palette: Palette,
+    width: u16,
+) -> Paragraph<'static> {
+    let budget = width as usize;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut hidden = 0usize;
+    let total = app.sessions.len();
+    for (idx, session) in app.sessions.iter().enumerate() {
+        let focused = idx == app.selected_session;
+        let live = app.session_turn_live(&session.id);
+        let unread = app.unread_turns.get(&session.id).copied().unwrap_or(0);
+        let mut title: String = session.title.chars().take(14).collect();
+        if session.title.chars().count() > 14 {
+            title.push('…');
+        }
+        let mut chip = format!("{} {}", if focused { "●" } else { "○" }, title);
+        if live {
+            chip.push_str(" ✻");
+        }
+        if unread > 0 && !focused {
+            chip.push_str(&format!(" ({unread})"));
+        }
+        let chip_width = UnicodeWidthStr::width(chip.as_str()) + 3; // "   " gap
+        // Reserve room for a possible trailing "+N" marker.
+        if used + chip_width + 4 > budget && idx + 1 < total {
+            hidden = total - idx;
+            break;
+        }
+        if used + chip_width > budget {
+            hidden = total - idx;
+            break;
+        }
+        let style = if focused {
+            palette.text().add_modifier(Modifier::BOLD)
+        } else if live || unread > 0 {
+            palette.text()
+        } else {
+            palette.muted()
+        };
+        spans.push(Span::styled(chip, style));
+        spans.push(Span::styled("   ".to_string(), palette.muted()));
+        used += chip_width;
+    }
+    if hidden > 0 {
+        spans.push(Span::styled(format!("+{hidden}"), palette.muted()));
+    }
+    Paragraph::new(Line::from(spans)).style(Style::default().bg(palette.surface_alt))
+}
+
 pub(super) fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
     if onboarding_first_launch_active(app) {
         render_onboarding_first_launch_layout(frame, app, palette);
@@ -191,6 +247,13 @@ pub(super) fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, pal
 
     let active_menu = active_menu_surface(app);
     let areas = chat_layout_areas_for_menu(app, frame.area(), active_menu.as_ref());
+
+    if areas.session_strip.height > 0 {
+        frame.render_widget(
+            render_session_strip(app, palette, areas.session_strip.width),
+            areas.session_strip,
+        );
+    }
 
     if launch_banner_active(app) {
         render_launch_banner(frame, app, palette, areas.transcript);

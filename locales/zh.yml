@@ -454,6 +454,8 @@ command:
     desc: 列出或配置服务器支持的 MCP 条目
   model:
     desc: 选择服务器返回的档案 LLM 模型
+  sessions:
+    desc: 在打开的会话间切换（Alt+S）—— 实时回合与未读标记。
   undo:
     desc: 将工作区文件回滚到修改前的快照（#1768）。
   research:
@@ -511,6 +513,15 @@ menu:
         desc: "在工作区根目录下未扫描到可列出的文件（已跳过 .git、target 与 node_modules）。"
       truncated:
         label: "仅显示前 %{count} 个文件 —— 输入以缩小范围"
+  sessions:
+    title: 会话
+    subtitle: "✻ = 回合进行中 · (n) = 自上次查看后完成的回合数。"
+    footer: Enter 切换 | Esc 关闭
+    item:
+      current: 当前聚焦的会话。
+      switch_desc: 切换到此会话。
+      empty: 没有打开的会话
+      empty_desc: 请先打开一个会话。
   undo:
     title: 工作区快照
     subtitle: "在代理修改文件前自动记录的还原点。选择一个将工作区回滚。"

@@ -860,6 +860,16 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
+    // #324: Alt+S — the session switcher popup (open sessions with live-turn
+    // and unread annotations). Only claimed with 2+ sessions so the key stays
+    // free for single-session users.
+    if is_alt_char(&key, 's') && store.state.sessions.len() >= 2 {
+        store.open_menu(crate::menu::MenuId::from(
+            crate::menu::registry::MENU_SESSIONS,
+        ));
+        return KeyAction::Continue;
+    }
+
     KeyAction::Continue
 }
 

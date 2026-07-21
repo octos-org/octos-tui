@@ -902,6 +902,8 @@ command:
     desc: List or configure server-owned MCP entries when supported.
   model:
     desc: Choose a server-returned profile LLM model.
+  sessions:
+    desc: Switch between open sessions (Alt+S) — live turns and unread badges.
   undo:
     desc: Roll workspace files back to a pre-mutation snapshot (#1768).
   research:
@@ -955,6 +957,15 @@ menu:
         desc: "The scan found no listable files under the workspace root (`.git`, `target`, and `node_modules` are skipped)."
       truncated:
         label: "Showing the first %{count} files — type to narrow the search"
+  sessions:
+    title: Sessions
+    subtitle: "✻ = turn running · (n) = turns finished since you last looked."
+    footer: Enter switch | Esc close
+    item:
+      current: This is the focused session.
+      switch_desc: Switch to this session.
+      empty: No open sessions
+      empty_desc: Open a session first.
   undo:
     title: Workspace Snapshots
     subtitle: "Undo points taken before agent file mutations. Select one to roll the workspace back."

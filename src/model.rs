@@ -3276,6 +3276,17 @@ pub struct ModelRemovalRequest {
     pub label: String,
 }
 
+/// #324: one session-strip / Alt+S-popup chip, computed per frame from the
+/// live store state (focused flag, live-turn signal, unread count).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionChipView {
+    pub session_id: SessionKey,
+    pub title: String,
+    pub focused: bool,
+    pub live: bool,
+    pub unread: usize,
+}
+
 /// A snapshot restore staged from the `/undo` picker (#1768). `session_id`
 /// and `snapshot_id` are captured at menu-BUILD time and carried through the
 /// Yes/No confirm, so a session switch mid-confirm can never retarget the
@@ -4185,6 +4196,10 @@ pub struct AppState {
     /// older than [`PRE_TOKEN_TURN_TTL`] are ignored (dead submit — matches
     /// the staged-gate TTL self-heal).
     pub pre_token_turns: std::collections::HashMap<SessionKey, Instant>,
+    /// #324 Phase C: per-session unread counters — turns that reached a
+    /// terminal while the session was NOT focused. Incremented by the store's
+    /// terminal appliers, cleared when the session gains focus.
+    pub unread_turns: std::collections::HashMap<SessionKey, usize>,
     pub approval_auto_open: bool,
     pub approval: Option<ApprovalModalState>,
     /// Pending AskUserQuestion picker (UPCR-2026-023), mirroring `approval`.
@@ -6093,6 +6108,7 @@ impl AppState {
             run_state,
             run_state_started_at,
             pre_token_turns: std::collections::HashMap::new(),
+            unread_turns: std::collections::HashMap::new(),
             approval_auto_open: true,
             approval: None,
             user_question: None,
@@ -7529,6 +7545,10 @@ impl AppState {
         self.load_composer_draft_for_selected_session();
         self.load_pending_messages_for_selected_session();
         self.refresh_run_state_from_selection();
+        // #324: focusing a session marks it read.
+        if let Some(session_id) = self.active_session().map(|session| session.id.clone()) {
+            self.unread_turns.remove(&session_id);
+        }
         // A session that raced the capabilities response missed its open-time
         // status probe; probe it the moment it becomes active so the composer
         // footer's model/cwd reflect it (no-op once a status is cached).
@@ -8131,6 +8151,19 @@ impl AppState {
             message: message.into(),
         };
         self.run_state_started_at = None;
+    }
+
+    /// #324: whether `session_id`'s turn is live RIGHT NOW — streaming
+    /// (`live_reply` bound) or submitted-but-pre-first-token (fresh marker).
+    pub fn session_turn_live(&self, session_id: &SessionKey) -> bool {
+        self.sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .is_some_and(|session| session.live_reply.is_some())
+            || self
+                .pre_token_turns
+                .get(session_id)
+                .is_some_and(|armed| armed.elapsed() < PRE_TOKEN_TURN_TTL)
     }
 
     pub fn refresh_run_state_from_selection(&mut self) {

@@ -93,6 +93,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::ResearchRemoveConfirm,
         Provider::Undo,
         Provider::UndoConfirm,
+        Provider::Sessions,
         Provider::FilePicker,
     ] {
         registry
@@ -143,6 +144,7 @@ enum Provider {
     FilePicker,
     Undo,
     UndoConfirm,
+    Sessions,
 }
 
 impl MenuProvider for Provider {
@@ -187,6 +189,7 @@ impl MenuProvider for Provider {
             Self::FilePicker => crate::menu::registry::MENU_FILE_PICKER,
             Self::Undo => crate::menu::registry::MENU_UNDO,
             Self::UndoConfirm => crate::menu::registry::MENU_UNDO_CONFIRM,
+            Self::Sessions => crate::menu::registry::MENU_SESSIONS,
         })
     }
 
@@ -231,6 +234,7 @@ impl MenuProvider for Provider {
             Self::FilePicker => file_picker_menu(ctx),
             Self::Undo => undo_menu(ctx),
             Self::UndoConfirm => undo_confirm_menu(ctx),
+            Self::Sessions => sessions_menu(ctx),
         }
     }
 
@@ -4603,6 +4607,61 @@ fn undo_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         searchable: false,
         search_placeholder: None,
         footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// #324: Alt+S / `/sessions` — the open-session switcher popup. Rows carry
+/// the same live-turn `✻` and unread `(n)` annotations as the top strip;
+/// selecting a row switches through the resume path (full switch bundle).
+fn sessions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let mut items = Vec::new();
+    for (idx, chip) in ctx.app.session_chips.iter().enumerate() {
+        let mut label = format!("{} {}", if chip.focused { "●" } else { "○" }, chip.title);
+        if chip.live {
+            label.push_str(" ✻");
+        }
+        if chip.unread > 0 {
+            label.push_str(&format!(" ({})", chip.unread));
+        }
+        if chip.focused {
+            items.push(
+                MenuItem::new(format!("sessions.row.{idx}"), label, MenuAction::Noop)
+                    .disabled(t!("menu.sessions.item.current").into_owned()),
+            );
+        } else {
+            items.push(
+                MenuItem::new(
+                    format!("sessions.row.{idx}"),
+                    label,
+                    MenuAction::Local(crate::menu::types::LocalAction::ResumeSession(
+                        chip.session_id.0.clone(),
+                    )),
+                )
+                .with_description(t!("menu.sessions.item.switch_desc")),
+            );
+        }
+    }
+    if items.is_empty() {
+        items.push(
+            MenuItem::new(
+                "sessions.empty",
+                t!("menu.sessions.item.empty"),
+                MenuAction::Noop,
+            )
+            .disabled(t!("menu.sessions.item.empty_desc").into_owned()),
+        );
+    }
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_SESSIONS),
+        title: t!("menu.sessions.title").into_owned(),
+        subtitle: Some(t!("menu.sessions.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.sessions.footer").into_owned()),
         preview: None,
         mode: MenuMode::SingleSelect,
     })
@@ -9970,6 +10029,67 @@ mod tests {
                 &empty_ctx,
             ),
             MenuBuildResult::Unavailable(_)
+        ));
+    }
+
+    /// #324: the Alt+S popup lists open sessions — the focused row is
+    /// informational, background rows switch via the resume path and carry
+    /// the live `✻` / unread `(n)` annotations.
+    #[test]
+    fn sessions_popup_lists_chips_and_switches_background_rows() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods(["session/hydrate"]);
+        let chips = vec![
+            crate::model::SessionChipView {
+                session_id: octos_core::SessionKey("local:a".into()),
+                title: "api-work".into(),
+                focused: true,
+                live: false,
+                unread: 0,
+            },
+            crate::model::SessionChipView {
+                session_id: octos_core::SessionKey("local:b".into()),
+                title: "octos-web".into(),
+                focused: false,
+                live: true,
+                unread: 3,
+            },
+        ];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                session_chips: chips,
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) =
+            registry.build(&MenuId::from(crate::menu::registry::MENU_SESSIONS), &ctx)
+        else {
+            panic!("expected sessions menu");
+        };
+        let focused = spec
+            .items
+            .iter()
+            .find(|item| item.id == "sessions.row.0")
+            .expect("focused row");
+        assert!(
+            focused.disabled_reason.is_some(),
+            "focused row is informational"
+        );
+        let bg = spec
+            .items
+            .iter()
+            .find(|item| item.id == "sessions.row.1")
+            .expect("background row");
+        assert!(bg.label.contains("✻"), "live badge shown: {}", bg.label);
+        assert!(bg.label.contains("(3)"), "unread badge shown: {}", bg.label);
+        assert!(matches!(
+            &bg.action,
+            MenuAction::Local(crate::menu::types::LocalAction::ResumeSession(id))
+                if id == "local:b"
         ));
     }
 

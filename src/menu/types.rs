@@ -726,6 +726,8 @@ pub struct MenuAppSnapshot<'a> {
     /// render one row per session. Empty until the first fetch lands (the menu
     /// renders `Loading` in that window).
     pub resume_sessions: &'a [crate::model::ResumeSessionRow],
+    /// #324: open-session chips for the Alt+S switcher popup.
+    pub session_chips: Vec<crate::model::SessionChipView>,
     /// Whether a `session/list` result has landed, mirrored from
     /// `AppState::resume_list_loaded`. Lets `resume_menu` tell a genuinely
     /// in-flight fetch (render `Loading`) apart from a completed fetch that
