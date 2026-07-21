@@ -467,6 +467,7 @@ status:
   research_usage: "Usage: /research | /research add <key> <provider> <model> [base_url] [api_key_env] | /research rm <key>"
   research_add_usage: "Usage: /research add <key> <provider> <model> [base_url] [api_key_env]"
   research_rm_usage: "Usage: /research rm <key>"
+  research_profile_unresolved: "Active profile not resolved yet — try again once the session is ready."
   opening_diff_preview: "Opening diff preview: %{operation} %{path}"
   opening_inline_diff_preview: "Opening inline diff preview: %{title}"
   approval_requested: "Approval requested: %{title}"
@@ -932,7 +933,7 @@ menu:
   research:
     title: Research Provider Lanes
     subtitle: "Named provider lanes (cheap/strong) for the deep_research pipeline. Restart to apply."
-    footer: Enter stage a lane's removal | Esc close
+    footer: Enter remove a lane (asks to confirm) | Esc close
     item:
       refresh:
         label: Refresh lanes
@@ -944,10 +945,21 @@ menu:
         label: Lanes not loaded for this profile
         desc: Select Refresh to load this profile's research lanes.
       lane:
-        desc: "Select to stage /research rm — Enter to confirm."
+        desc: Select to remove this lane — asks to confirm first.
       add:
         label: Add a lane…
         desc: "Pre-fills /research add — then type <key> <provider> <model>."
+  research_remove:
+    title: "Remove a research lane"
+    item:
+      empty:
+        label: "No lane staged for removal"
+    confirm:
+      title: "Remove lane %{lane}?"
+      subtitle: "Deletes this lane from the profile's sub_providers. Restart to apply."
+      yes: "Yes, remove %{lane}"
+      yes_desc: "Uses profile/sub_providers/remove; the lane list refreshes when it completes."
+      no: "No, keep it"
   agents:
     item:
       dock_collapse:

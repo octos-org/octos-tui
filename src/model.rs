@@ -2438,6 +2438,10 @@ pub struct OnboardingWizardState {
     /// the confirm menu (`MENU_MODEL_REMOVE_CONFIRM`), whose Yes row sends
     /// `profile/llm/delete` with these coordinates.
     pub pending_model_removal: Option<ModelRemovalRequest>,
+    /// A research lane staged for removal by the `/research` menu — read by the
+    /// confirm menu (`MENU_RESEARCH_REMOVE_CONFIRM`), whose Yes row sends
+    /// `profile/sub_providers/remove` with the captured `profile_id` + `key`.
+    pub pending_research_lane_removal: Option<ResearchLaneRemoval>,
     pub provider_save_target: Option<OnboardingProviderSaveTarget>,
     pub last_saved_provider_label: Option<String>,
     pub last_saved_provider_target: Option<OnboardingProviderSaveTarget>,
@@ -2489,6 +2493,7 @@ impl Default for OnboardingWizardState {
             provider_pending: None,
             provider_pending_since: None,
             pending_model_removal: None,
+            pending_research_lane_removal: None,
             provider_save_target: None,
             last_saved_provider_label: None,
             last_saved_provider_target: None,
@@ -3256,6 +3261,17 @@ pub struct ModelRemovalRequest {
     pub model_id: String,
     pub route_id: String,
     pub label: String,
+}
+
+/// A research provider lane staged for removal (`/research` menu → lane row).
+/// The `profile_id` is captured at menu-BUILD time (the profile whose lanes are
+/// on screen) and carried through the Yes/No confirm, so a profile switch
+/// between selecting the row and confirming can never retarget the delete to a
+/// different profile — the exact cross-profile hazard a bare composer draft has.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResearchLaneRemoval {
+    pub profile_id: Option<String>,
+    pub key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

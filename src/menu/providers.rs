@@ -90,6 +90,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::ToolSettings,
         Provider::Skills,
         Provider::Research,
+        Provider::ResearchRemoveConfirm,
     ] {
         registry
             .register_provider(provider)
@@ -135,6 +136,7 @@ enum Provider {
     ToolSettings,
     Skills,
     Research,
+    ResearchRemoveConfirm,
 }
 
 impl MenuProvider for Provider {
@@ -175,6 +177,7 @@ impl MenuProvider for Provider {
             Self::ToolSettings => MENU_TOOL_SETTINGS,
             Self::Skills => MENU_SKILLS,
             Self::Research => crate::menu::registry::MENU_RESEARCH,
+            Self::ResearchRemoveConfirm => crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM,
         })
     }
 
@@ -215,6 +218,7 @@ impl MenuProvider for Provider {
             Self::ToolSettings => tool_settings_menu(ctx),
             Self::Skills => skills_menu(ctx),
             Self::Research => research_menu(ctx),
+            Self::ResearchRemoveConfirm => research_remove_confirm_menu(ctx),
         }
     }
 
@@ -4193,22 +4197,20 @@ fn research_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     }
     let mut items = vec![refresh];
 
-    // Only show lanes we KNOW belong to the active profile. The server always
+    // Only show lanes we KNOW belong to the active profile: the server always
     // echoes the resolved profile in the list result, so a cache left over from a
     // different (e.g. pre-switch) profile is withheld rather than shown as if it
-    // were this profile's — otherwise selecting a row could stage a removal
-    // against a lane that isn't in the active profile at all.
-    let cached_matches_active = ctx
-        .app
-        .sub_providers_state
-        .map(|state| {
-            // When we can't resolve the active profile locally (e.g. before
-            // runtime status arrives), we can't judge staleness — but the server
-            // resolves the SAME default for our list AND for any subsequent
-            // mutation, so trust its echoed cache instead of hiding lanes forever.
-            profile_id.is_none() || state.profile_id.as_deref() == profile_id.as_deref()
-        })
-        .unwrap_or(false);
+    // were this profile's. When the active profile is unresolvable locally
+    // (`profile_id` None, e.g. before runtime status arrives) we DON'T trust the
+    // cache — showing it would let a removal target the server's default profile,
+    // not the one the user thinks they're viewing. Hidden-until-resolved is the
+    // safe choice; the stale hint tells the user to Refresh once resolved.
+    let cached_matches_active = profile_id.is_some()
+        && ctx
+            .app
+            .sub_providers_state
+            .map(|state| state.profile_id.as_deref() == profile_id.as_deref())
+            .unwrap_or(false);
     let lanes: &[crate::model::SubProviderView] = if cached_matches_active {
         ctx.app
             .sub_providers_state
@@ -4248,14 +4250,20 @@ fn research_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                     .map(|m| format!("/{m}"))
                     .unwrap_or_default()
             );
-            // Stage the removal in the composer rather than deleting on select —
-            // selecting a row is a single keystroke and a lane deletion needs a
-            // deliberate Enter to confirm.
+            // Open a Yes/No confirm that CAPTURES this row's profile (the profile
+            // whose lanes are on screen). A bare composer draft carries no
+            // profile, so a profile switch between select and Enter would retarget
+            // the delete; binding `profile_id` here makes that impossible, and the
+            // confirm keeps a lane deletion from being a single accidental
+            // keystroke. Lanes only render when `profile_id` is Some (the
+            // display-match above), so the captured profile is always resolved.
             let action = if can_remove {
-                MenuAction::Local(crate::menu::types::LocalAction::EditComposer(format!(
-                    "/research rm {}",
-                    lane.key
-                )))
+                MenuAction::Local(crate::menu::types::LocalAction::RequestRemoveResearchLane(
+                    Box::new(crate::model::ResearchLaneRemoval {
+                        profile_id: profile_id.clone(),
+                        key: lane.key.clone(),
+                    }),
+                ))
             } else {
                 MenuAction::Noop
             };
@@ -4300,6 +4308,59 @@ fn research_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         searchable: false,
         search_placeholder: None,
         footer_hint: Some(t!("menu.research.footer").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Yes/No confirm for removing the staged research lane. Yes sends
+/// `profile/sub_providers/remove` with the profile + key CAPTURED when the row
+/// was selected (not re-resolved now), so a profile switch while the confirm is
+/// open cannot retarget the delete. The mutation result refreshes the lane list
+/// through the standard apply path.
+fn research_remove_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let Some(request) = ctx
+        .app
+        .onboarding
+        .and_then(|onboarding| onboarding.pending_research_lane_removal.clone())
+    else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM),
+            title: t!("menu.research_remove.title").into_owned(),
+            message: t!("menu.research_remove.item.empty.label").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        });
+    };
+    let items = vec![
+        MenuItem::new(
+            "research.remove.yes",
+            t!(
+                "menu.research_remove.confirm.yes",
+                lane = request.key.clone()
+            ),
+            MenuAction::send_appui(AppUiCommand::ProfileSubProvidersRemove(
+                crate::model::SubProvidersRemoveParams {
+                    profile_id: request.profile_id.clone(),
+                    key: request.key.clone(),
+                },
+            )),
+        )
+        .with_description(t!("menu.research_remove.confirm.yes_desc")),
+        MenuItem::new(
+            "research.remove.no",
+            t!("menu.research_remove.confirm.no"),
+            MenuAction::Close,
+        ),
+    ];
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM),
+        title: t!("menu.research_remove.confirm.title", lane = request.key).into_owned(),
+        subtitle: Some(t!("menu.research_remove.confirm.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
         preview: None,
         mode: MenuMode::SingleSelect,
     })
@@ -9412,18 +9473,21 @@ mod tests {
         else {
             panic!("expected research menu");
         };
-        // The active-profile lane is shown, and selecting it STAGES a removal in
-        // the composer rather than deleting on select.
+        // The active-profile lane is shown, and selecting it opens a confirm that
+        // CAPTURES the displayed profile ("coding") + key — not a bare composer
+        // string that would re-resolve the profile at Enter time.
         let lane = spec
             .items
             .iter()
             .find(|item| item.id == "research.lane.0")
             .expect("active-profile lane is listed");
-        assert!(matches!(
-            &lane.action,
-            MenuAction::Local(crate::menu::types::LocalAction::EditComposer(text))
-                if text == "/research rm cheap"
-        ));
+        let MenuAction::Local(crate::menu::types::LocalAction::RequestRemoveResearchLane(request)) =
+            &lane.action
+        else {
+            panic!("expected a RequestRemoveResearchLane action");
+        };
+        assert_eq!(request.profile_id.as_deref(), Some("coding"));
+        assert_eq!(request.key, "cheap");
         // Refresh targets the active profile, and there is no stale hint.
         let refresh = spec
             .items
@@ -9488,6 +9552,111 @@ mod tests {
             panic!("expected list command");
         };
         assert_eq!(params.profile_id.as_deref(), Some("coding"));
+    }
+
+    #[test]
+    fn research_menu_hides_lanes_when_active_profile_unresolved() {
+        // No active profile resolvable (pre-bootstrap). Even though a cache is
+        // present, lanes must be withheld — showing them would let a removal
+        // target the server's default profile, not the intended one.
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+        ]);
+        let lanes = crate::model::SubProvidersListResult {
+            profile_id: Some("coding".into()),
+            sub_providers: vec![research_lane("cheap")],
+            runtime_policy_stamp: None,
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: None,
+                sub_providers_state: Some(&lanes),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) =
+            registry.build(&MenuId::from(crate::menu::registry::MENU_RESEARCH), &ctx)
+        else {
+            panic!("expected research menu");
+        };
+        assert!(
+            spec.items
+                .iter()
+                .all(|item| !item.id.starts_with("research.lane.")),
+            "no removable lane rows when the active profile is unresolved"
+        );
+        assert!(spec.items.iter().any(|item| item.id == "research.stale"));
+    }
+
+    #[test]
+    fn research_remove_confirm_targets_the_captured_profile_not_the_active_one() {
+        let registry = core_menu_registry();
+        let capabilities =
+            CapabilitySet::from_methods([crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE]);
+        let onboarding = crate::model::OnboardingWizardState {
+            pending_research_lane_removal: Some(crate::model::ResearchLaneRemoval {
+                profile_id: Some("coding".into()),
+                key: "cheap".into(),
+            }),
+            ..crate::model::OnboardingWizardState::default()
+        };
+        // The active profile has since flipped to "writing"; the confirm must
+        // still delete from the CAPTURED "coding" (the profile whose lane the
+        // user selected), never the now-active profile.
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("writing"),
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) = registry.build(
+            &MenuId::from(crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM),
+            &ctx,
+        ) else {
+            panic!("expected research remove confirm menu");
+        };
+        let yes = spec
+            .items
+            .iter()
+            .find(|item| item.id == "research.remove.yes")
+            .expect("confirm Yes row present");
+        let AppUiCommand::ProfileSubProvidersRemove(params) = appui_command(&yes.action) else {
+            panic!("expected a remove command");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+        assert_eq!(params.key, "cheap");
+
+        // With nothing staged, the confirm menu is Unavailable (no accidental
+        // empty confirm).
+        let empty = crate::model::OnboardingWizardState::default();
+        let empty_ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                onboarding: Some(&empty),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        assert!(matches!(
+            registry.build(
+                &MenuId::from(crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM),
+                &empty_ctx,
+            ),
+            MenuBuildResult::Unavailable(_)
+        ));
     }
 
     /// `/model` absorbed the add-model flow: a trailing "Add a model…" row

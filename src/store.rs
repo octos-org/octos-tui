@@ -666,6 +666,13 @@ impl Store {
                 {
                     return SlashDispatchOutcome::Rejected;
                 }
+                // Refuse to mutate when the active profile is unresolved: a
+                // `profile_id: None` upsert would land on the server's DEFAULT
+                // profile, not the one the user means. Wait for it to resolve.
+                if profile_id.is_none() {
+                    self.state.status = t!("status.research_profile_unresolved").into_owned();
+                    return SlashDispatchOutcome::Rejected;
+                }
                 SlashDispatchOutcome::accepted(Some(AppUiCommand::ProfileSubProvidersUpsert(
                     SubProvidersUpsertParams {
                         profile_id,
@@ -695,6 +702,13 @@ impl Store {
                 if !self
                     .require_appui_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE)
                 {
+                    return SlashDispatchOutcome::Rejected;
+                }
+                // Refuse to delete against an unresolved profile: `None` would
+                // resolve to the server default and could delete a same-named
+                // lane (`cheap`/`strong`) from the wrong profile.
+                if profile_id.is_none() {
+                    self.state.status = t!("status.research_profile_unresolved").into_owned();
                     return SlashDispatchOutcome::Rejected;
                 }
                 SlashDispatchOutcome::accepted(Some(AppUiCommand::ProfileSubProvidersRemove(
@@ -1472,6 +1486,13 @@ impl Store {
                 self.state.onboarding.pending_model_removal = Some(*request);
                 self.open_menu(MenuId::from(
                     crate::menu::registry::MENU_MODEL_REMOVE_CONFIRM,
+                ));
+                None
+            }
+            LocalAction::RequestRemoveResearchLane(request) => {
+                self.state.onboarding.pending_research_lane_removal = Some(*request);
+                self.open_menu(MenuId::from(
+                    crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM,
                 ));
                 None
             }
@@ -12375,7 +12396,14 @@ mod tests {
 
     #[test]
     fn should_reject_research_add_when_model_missing() {
+        // Advertise UPSERT so the per-verb capability gate PASSES and the parser
+        // is the only thing that can reject — otherwise (capabilities: None) the
+        // gate rejects regardless and this test would pass even if the
+        // model-required check were removed.
         let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+        ]));
         // key + provider but no model — a lane saved with no model is invalid.
         let outcome = store.dispatch_research_slash("/research add cheap moonshot");
         assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
@@ -12383,7 +12411,12 @@ mod tests {
 
     #[test]
     fn should_reject_research_add_with_trailing_junk() {
+        // Advertise UPSERT so the parser (trailing-junk check), not the gate, is
+        // what rejects. See should_reject_research_add_when_model_missing.
         let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+        ]));
         let outcome = store
             .dispatch_research_slash("/research add cheap moonshot k3 https://x/v1 KEY_ENV extra");
         assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
@@ -12413,8 +12446,13 @@ mod tests {
 
     #[test]
     fn should_reject_research_rm_with_trailing_junk() {
+        // Advertise REMOVE so the parser (trailing-junk check), not the gate, is
+        // what rejects. Guards against `/research rm cheap typo` silently
+        // deleting `cheap`.
         let mut store = store_with_empty_session();
-        // Guards against `/research rm cheap typo` silently deleting `cheap`.
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+        ]));
         let outcome = store.dispatch_research_slash("/research rm cheap typo");
         assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
     }
@@ -12450,26 +12488,112 @@ mod tests {
         assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
     }
 
-    #[test]
-    fn active_profile_id_matches_menu_snapshot_current_profile() {
-        // The inline /research dispatcher and the menu MUST resolve the same
-        // active profile — a divergence is exactly the cross-profile targeting
-        // bug this guards against. Assert the two resolvers agree, including when
-        // an onboarding profile is set (which must NOT override the active
-        // session's profile).
-        let mut store = store_with_empty_session();
-        assert_eq!(
-            store.active_profile_id().as_deref(),
-            store.menu_app_snapshot().current_profile,
-        );
+    /// Build a store whose active-profile sources are set to the given tiers, so
+    /// a test can drive `active_profile_id` / the menu snapshot down a chosen
+    /// fallback rung (the runtime-status tier — the shared chain head — is
+    /// exercised by the menu tests; here we cover session/onboarding/llm/none).
+    fn store_with_profile_sources(
+        session_profile: Option<&str>,
+        onboarding_profile: Option<&str>,
+        llm_profile: Option<&str>,
+    ) -> Store {
+        let session = SessionView {
+            id: SessionKey("local:test".into()),
+            title: "test".into(),
+            profile_id: session_profile.map(str::to_owned),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut state = AppState::new(vec![session], 0, "ready".into(), None, false);
+        state.onboarding.profile_id = onboarding_profile.map(str::to_owned);
+        if let Some(llm) = llm_profile {
+            state.profile_llm_state = Some(crate::model::ProfileLlmListResult {
+                profile_id: Some(llm.to_owned()),
+                primary: None,
+                fallbacks: Vec::new(),
+                llm: None,
+                runtime_policy_stamp: None,
+            });
+        }
+        Store { state }
+    }
 
-        store.state.onboarding.profile_id = Some("other".into());
-        assert_eq!(
-            store.active_profile_id().as_deref(),
-            store.menu_app_snapshot().current_profile,
-            "resolvers diverged once onboarding.profile_id was set",
-        );
-        assert_eq!(store.active_profile_id().as_deref(), Some("coding"));
+    #[test]
+    fn active_profile_id_matches_menu_snapshot_across_resolver_tiers() {
+        // The inline /research dispatcher and the menu MUST resolve the same
+        // active profile at EVERY fallback tier — a divergence in any one rung is
+        // the cross-profile targeting bug this guards against. Drive each tier and
+        // assert both resolvers agree AND land on the expected source.
+        let cases = [
+            // session wins over onboarding + llm
+            (Some("sess"), Some("wiz"), Some("llm"), Some("sess")),
+            // no session profile -> onboarding wins over llm
+            (None, Some("wiz"), Some("llm"), Some("wiz")),
+            // no session/onboarding -> llm
+            (None, None, Some("llm"), Some("llm")),
+            // nothing resolvable -> None (the mutation-blocking case)
+            (None, None, None, None),
+        ];
+        for (session_p, onboarding_p, llm_p, expected) in cases {
+            let store = store_with_profile_sources(session_p, onboarding_p, llm_p);
+            assert_eq!(
+                store.active_profile_id().as_deref(),
+                store.menu_app_snapshot().current_profile,
+                "resolvers diverged (session={session_p:?} onboarding={onboarding_p:?} llm={llm_p:?})",
+            );
+            assert_eq!(store.active_profile_id().as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn research_rm_targets_active_profile_not_a_stale_cache() {
+        // Negative-drift guard: a cached list echoed for profile "other" (e.g. a
+        // background list that landed after a profile switch) must NOT retarget
+        // the delete — the command targets the ACTIVE "coding".
+        let mut store = store_with_empty_session(); // active profile = "coding"
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+        ]));
+        store.state.sub_providers_state = Some(crate::model::SubProvidersListResult {
+            profile_id: Some("other".into()),
+            sub_providers: vec![crate::model::SubProviderView {
+                key: "cheap".into(),
+                ..Default::default()
+            }],
+            runtime_policy_stamp: None,
+        });
+        let cmd = store
+            .dispatch_research_slash("/research rm cheap")
+            .into_command();
+        match cmd {
+            Some(AppUiCommand::ProfileSubProvidersRemove(params)) => {
+                assert_eq!(params.profile_id.as_deref(), Some("coding"));
+                assert_eq!(params.key, "cheap");
+            }
+            _ => panic!("expected a remove targeting the active profile"),
+        }
+    }
+
+    #[test]
+    fn research_mutations_are_blocked_when_active_profile_unresolved() {
+        // No session profile / onboarding / llm -> active profile None. A mutation
+        // must NOT go out with profile_id: None (which the server resolves to its
+        // DEFAULT profile, a wrong-profile hazard) — it is rejected client-side.
+        let mut store = store_with_profile_sources(None, None, None);
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+        ]));
+        assert!(store.active_profile_id().is_none());
+        assert!(matches!(
+            store.dispatch_research_slash("/research rm cheap"),
+            SlashDispatchOutcome::Rejected
+        ));
+        assert!(matches!(
+            store.dispatch_research_slash("/research add cheap moonshot k3"),
+            SlashDispatchOutcome::Rejected
+        ));
     }
 
     fn store_with_assistant_message(text: &str) -> Store {
