@@ -98,6 +98,38 @@ fn looks_like_validation_activity(activity: &ActivityItem) -> bool {
         || text.contains("pnpm ")
 }
 
+/// Extract the `(session_id, turn_id)` a legacy-lane notification belongs to, for
+/// cross-lane dedup against the canonical `projection.envelope.v2` feed. Returns
+/// `None` for notifications that are not turn-scoped legacy lanes (so they are
+/// never deduped). The legacy `Envelope` variant carries no usable turn identity
+/// here and is already ignored by the renderer, so it is excluded.
+fn legacy_lane_turn(notification: &UiNotification) -> Option<(SessionKey, TurnId)> {
+    match notification {
+        UiNotification::MessageDelta(event) => {
+            Some((event.session_id.clone(), event.turn_id.clone()))
+        }
+        UiNotification::ReasoningDelta(event) => {
+            Some((event.session_id.clone(), event.turn_id.clone()))
+        }
+        UiNotification::ToolStarted(event) => {
+            Some((event.session_id.clone(), event.turn_id.clone()))
+        }
+        UiNotification::ToolProgress(event) => {
+            Some((event.session_id.clone(), event.turn_id.clone()))
+        }
+        UiNotification::ToolCompleted(event) => {
+            Some((event.session_id.clone(), event.turn_id.clone()))
+        }
+        UiNotification::TurnCompleted(event) => {
+            Some((event.session_id.clone(), event.turn_id.clone()))
+        }
+        UiNotification::TurnError(event) => {
+            Some((event.session_id.clone(), event.turn_id.clone()))
+        }
+        _ => None,
+    }
+}
+
 fn looks_like_file_change_activity(activity: &ActivityItem) -> bool {
     let text = format!(
         "{} {} {}",
@@ -8518,6 +8550,33 @@ impl Store {
     }
 
     fn apply_notification(&mut self, notification: UiNotification) -> Option<AppUiCommand> {
+        // Cross-lane dedup for dual-emitted turns. The server (during the
+        // protocol migration) can emit the SAME turn content on BOTH a legacy
+        // lane (`message/delta`, `reasoning_delta`, `tool/*`, `turn/completed`)
+        // AND the canonical `projection.envelope.v2`. Both lanes funnel into the
+        // same state (`append_live_reply_delta`, `live_reasoning`,
+        // `commit_live_reply`) with no built-in dedup, so the answer renders
+        // twice. Drop a legacy frame only when THIS turn is already being fed by
+        // the v2 envelope (tracked in `v2_turn_ids` / `v2_live_assistant_segments`
+        // by the v2 apply path). This is keyed on CONTENT identity, not the
+        // negotiated capability, so it works on the default stdio transport
+        // (where v2 is delivered without a `client_hello` feature flag) and is
+        // safe for the mock backend (which emits legacy-only and never populates
+        // the v2 maps, so its frames are always kept).
+        if let Some((session_id, turn_id)) = legacy_lane_turn(&notification) {
+            let fed_by_v2 = self
+                .state
+                .v2_live_assistant_segments
+                .contains_key(&(session_id.clone(), turn_id.clone()))
+                || self
+                    .state
+                    .v2_turn_ids
+                    .values()
+                    .any(|v2_turn| v2_turn == &turn_id);
+            if fed_by_v2 {
+                return None;
+            }
+        }
         match notification {
             // #1477 voice rich-output visual lifecycle. octos-tui does not yet
             // render generated visuals (a separate feature); ignore gracefully
@@ -30931,6 +30990,62 @@ mod tests {
         assert!(
             json.get("action").is_none(),
             "action must NOT appear on the wire: {json}"
+        );
+    }
+
+    /// Cross-lane dedup (codex PR370 review): a legacy `MessageDelta` is dropped
+    /// ONLY when its turn is already fed by the v2 envelope — keyed on content
+    /// identity, not the negotiated capability. This makes it work on the stdio
+    /// transport (no `client_hello` v2 flag) and keeps the mock backend (which
+    /// emits legacy-only) rendering.
+    #[test]
+    fn legacy_delta_dropped_only_when_turn_is_v2_fed() {
+        let turn = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        // A turn fed by the v2 envelope: the v2 apply path registered it.
+        let mut store = store_with_live_reply(turn.clone(), "v2 chunk");
+        store
+            .state
+            .v2_turn_ids
+            .insert((session_id.clone(), "wire-1".into()), turn.clone());
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn.clone(),
+                text: "LEGACY DUPLICATE".into(),
+            },
+        )));
+        let text = &store.state.sessions[0]
+            .live_reply
+            .as_ref()
+            .expect("live reply")
+            .text;
+        assert!(
+            !text.contains("LEGACY DUPLICATE"),
+            "a legacy delta for a v2-fed turn must be dropped: {text}"
+        );
+
+        // A turn NOT fed by v2 (the mock backend case): the legacy delta is kept.
+        let turn2 = TurnId::new();
+        let mut store2 = store_with_live_reply(turn2.clone(), String::new());
+        store2.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: SessionKey("local:test".into()),
+                topic: None,
+                turn_id: turn2.clone(),
+                text: "mock reply".into(),
+            },
+        )));
+        let text2 = &store2.state.sessions[0]
+            .live_reply
+            .as_ref()
+            .expect("live reply")
+            .text;
+        assert!(
+            text2.contains("mock reply"),
+            "a legacy delta for a NON-v2-fed turn (mock) must be kept: {text2}"
         );
     }
 }
