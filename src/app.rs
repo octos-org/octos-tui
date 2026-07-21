@@ -7762,7 +7762,20 @@ const SIDE_BY_SIDE_CHROME_COLS: usize = 21;
 /// trailing `…` when too wide (no horizontal scroll in v1), pad with spaces
 /// when narrower so the column separator stays aligned. UTF-8/display-width
 /// safe (a wide char never straddles the cell boundary).
+///
+/// Sanitizes (tabs -> 4 spaces, other control chars stripped) BEFORE
+/// measuring — the same order `insert_history` and `finish_hanging_body`
+/// use. The finalized-scrollback flush runs `sanitize_line_in_place` AFTER
+/// this cell has been padded to exact width, so measuring a raw `\t` would
+/// let the row grow four columns per tab at insert time, hard-wrap in native
+/// scrollback, and permanently misalign the old|new separator.
 fn fit_diff_cell(content: &str, cell: usize) -> String {
+    let content: std::borrow::Cow<'_, str> = if content.chars().any(char::is_control) {
+        std::borrow::Cow::Owned(crate::insert_history::sanitize_span_content(content))
+    } else {
+        std::borrow::Cow::Borrowed(content)
+    };
+    let content = content.as_ref();
     let width = UnicodeWidthStr::width(content);
     if width <= cell {
         let mut out = String::with_capacity(content.len() + (cell - width));
@@ -7975,12 +7988,17 @@ fn push_diff_file_lines(
             Some(4),
         );
         if hidden > 0 {
+            // Side-by-side hides PAIRED ROWS (one row holds up to two
+            // unified lines), so the notice counts rows — the unified
+            // "line(s)" label would understate what's hidden.
+            let notice = if side_by_side {
+                t!("app.diff.more_rows_hidden", count = hidden)
+            } else {
+                t!("app.diff.more_lines_hidden", count = hidden)
+            };
             lines.push(Line::from(vec![
                 Span::styled("    ", palette.muted()),
-                Span::styled(
-                    t!("app.diff.more_lines_hidden", count = hidden).into_owned(),
-                    palette.muted(),
-                ),
+                Span::styled(notice.into_owned(), palette.muted()),
             ]));
         }
     }
@@ -13265,6 +13283,143 @@ mod tests {
         let cjk = fit_diff_cell("宽字符内容测试", 8);
         assert_eq!(UnicodeWidthStr::width(cjk.as_str()), 8);
         assert!(cjk.contains('…'));
+    }
+
+    /// codex-review (#362): the finalized-scrollback flush
+    /// (`insert_history::sanitize_line_in_place`) expands tabs to FOUR
+    /// spaces and strips other control chars AFTER the cell was padded to
+    /// exact width, so measuring the raw `\t` (0 columns) let tab-bearing
+    /// rows grow past the wrap width at insert time, hard-wrap in immutable
+    /// native scrollback, and permanently misalign the old|new separator.
+    /// Sanitize BEFORE measuring — the same order `finish_hanging_body`
+    /// uses for assistant bodies.
+    #[test]
+    fn fit_diff_cell_expands_tabs_and_strips_controls_before_measuring() {
+        // A tab counts as four columns in the width math and leaves no raw
+        // `\t` behind for the scrollback sanitizer to widen later.
+        assert_eq!(fit_diff_cell("a\tb", 8), "a    b  ");
+        // Truncation operates on the EXPANDED text: the leading tab plus
+        // three chars already fill the 8-col cell minus the ellipsis.
+        assert_eq!(fit_diff_cell("\tabcdef", 8), "    abc…");
+        // Other control chars (the ESC introducer here) are stripped,
+        // defusing the escape sequence exactly like the sanitizer would.
+        assert_eq!(fit_diff_cell("a\u{1b}[31mb", 8), "a[31mb  ");
+    }
+
+    /// Row-level guarantee for the scrollback flush: side-by-side rows carry
+    /// no raw control characters (so `sanitize_line_in_place` is a no-op on
+    /// them) and every row — full pair, tab-indented, or blank-half — shares
+    /// one exact width within the wrap budget, the alignment the old│new
+    /// separator depends on once rows land in native scrollback.
+    #[test]
+    fn side_by_side_rows_with_tabs_stay_aligned_after_scrollback_sanitize() {
+        let wrap_width = 100usize;
+        let hunk = vec![
+            mixed_hunk_line("context", "\tfor path in paths {", Some(1), Some(1)),
+            mixed_hunk_line("removed", "\t\tvisit(path);", Some(2), None),
+            mixed_hunk_line("removed", "\t\tlog(path);", Some(3), None),
+            mixed_hunk_line("added", "\t\tvisit(path)?;\u{7f}", None, Some(2)),
+        ];
+        let mut lines = Vec::new();
+        push_diff_hunk_body(
+            &mut lines,
+            Palette::for_theme(ThemeName::Codex),
+            &hunk,
+            true,
+            wrap_width,
+            None,
+        );
+        assert_eq!(lines.len(), 3, "context + paired change + surplus removed");
+        let widths: Vec<usize> = lines
+            .iter()
+            .map(|line| {
+                let text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                assert!(
+                    !text.chars().any(char::is_control),
+                    "row must carry no raw control characters: {text:?}"
+                );
+                UnicodeWidthStr::width(text.as_str())
+            })
+            .collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0] && *w <= wrap_width),
+            "rows must share one exact width within the wrap budget: {widths:?}"
+        );
+    }
+
+    /// A hunk tall enough to overflow the collapsed 4-row cap in BOTH view
+    /// modes: 10 removed + 10 added lines pair into 10 side-by-side rows
+    /// (20 unified rows).
+    fn tall_hunk_diff_result() -> DiffPreviewGetResult {
+        let mut lines = Vec::new();
+        for idx in 0..10u32 {
+            lines.push(mixed_hunk_line(
+                "removed",
+                &format!("old line {idx}"),
+                Some(idx + 1),
+                None,
+            ));
+        }
+        for idx in 0..10u32 {
+            lines.push(mixed_hunk_line(
+                "added",
+                &format!("new line {idx}"),
+                None,
+                Some(idx + 1),
+            ));
+        }
+        DiffPreviewGetResult {
+            status: "ready".into(),
+            source: "pending_store".into(),
+            preview: DiffPreview {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+                title: Some("Tall patch".into()),
+                files: vec![DiffPreviewFile {
+                    path: "src/tall.rs".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    hunks: vec![DiffPreviewHunk {
+                        header: "@@ -1,10 +1,10 @@".into(),
+                        lines,
+                    }],
+                }],
+            },
+        }
+    }
+
+    /// codex-review (#362): the collapsed 4-row cap hides PAIRED ROWS in
+    /// side-by-side mode (one row holds up to two unified lines), so
+    /// reporting the count through the unified "diff line(s)" string
+    /// understated what's hidden. Side-by-side counts rows; unified keeps
+    /// counting lines.
+    #[test]
+    fn collapsed_side_by_side_cap_reports_hidden_rows_not_lines() {
+        let mut app = app_with_diff(tall_hunk_diff_result());
+        app.diff_preview.side_by_side = true;
+        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Codex), 150, 42);
+        let joined = rendered_rows(&buffer).join("\n");
+        assert!(
+            joined.contains("6 more diff row(s) hidden"),
+            "side-by-side reports hidden PAIRED ROWS in row units: {joined}"
+        );
+        assert!(
+            !joined.contains("diff line(s) hidden"),
+            "row units replace the understating line units: {joined}"
+        );
+
+        let unified = app_with_diff(tall_hunk_diff_result());
+        let buffer =
+            rendered_buffer_with_size(&unified, Palette::for_theme(ThemeName::Codex), 150, 42);
+        let joined = rendered_rows(&buffer).join("\n");
+        assert!(
+            joined.contains("16 more diff line(s) hidden"),
+            "unified still counts hidden unified lines: {joined}"
+        );
     }
 
     #[test]

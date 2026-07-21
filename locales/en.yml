@@ -90,6 +90,7 @@ app:
     more_files_hidden: "+%{count} more file(s) hidden"
     line_unavailable: "line diff unavailable for this mutation"
     more_lines_hidden: "%{count} more diff line(s) hidden (Ctrl+O expand)"
+    more_rows_hidden: "%{count} more diff row(s) hidden (Ctrl+O expand)"
     more_hunks_hidden: "+%{count} more hunk(s) hidden (Ctrl+O expand)"
   autonomy:
     goal_prefix: "Goal: "

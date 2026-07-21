@@ -81,6 +81,7 @@ app:
     more_files_hidden: "还有 %{count} 个文件已隐藏"
     line_unavailable: "此更改无可用的行级差异"
     more_lines_hidden: "还有 %{count} 行差异已隐藏（Ctrl+O 展开）"
+    more_rows_hidden: "还有 %{count} 行并排差异已隐藏（Ctrl+O 展开）"
     more_hunks_hidden: "还有 %{count} 个代码块已隐藏（Ctrl+O 展开）"
   autonomy:
     goal_prefix: "目标："
