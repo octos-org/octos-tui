@@ -394,6 +394,12 @@ pub enum LocalAction {
     /// (`/model` → "Remove a model…" picker row). The confirmed Yes row sends
     /// `profile/llm/delete`.
     RequestRemoveModel(Box<crate::model::ModelRemovalRequest>),
+    /// Stage a research provider lane for removal and open its Yes/No confirm
+    /// (`/research` menu → lane row). The captured `profile_id` + `key` are
+    /// carried to the confirm's Yes row, which sends
+    /// `profile/sub_providers/remove` — so a profile switch between select and
+    /// confirm cannot retarget the delete.
+    RequestRemoveResearchLane(Box<crate::model::ResearchLaneRemoval>),
     Custom(&'static str),
 }
 

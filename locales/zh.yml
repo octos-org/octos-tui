@@ -498,7 +498,7 @@ menu:
   research:
     title: 研究模型通道
     subtitle: "deep_research 流水线的命名模型通道（cheap/strong）。需重启生效。"
-    footer: Enter 预填删除命令 | Esc 关闭
+    footer: Enter 移除通道（会先确认） | Esc 关闭
     item:
       refresh:
         label: 刷新通道
@@ -510,10 +510,21 @@ menu:
         label: 尚未加载此配置的通道
         desc: 选择"刷新"以加载此配置的研究通道。
       lane:
-        desc: "选择以预填 /research rm — 按 Enter 确认。"
+        desc: 选择以移除此通道 —— 会先确认。
       add:
         label: 添加通道…
         desc: "预填 /research add — 然后输入 <key> <provider> <model>。"
+  research_remove:
+    title: "移除研究通道"
+    item:
+      empty:
+        label: "没有待移除的通道"
+    confirm:
+      title: "移除通道 %{lane}？"
+      subtitle: "从档案的 sub_providers 中删除该通道。需重启生效。"
+      yes: "是，移除 %{lane}"
+      yes_desc: "使用 profile/sub_providers/remove；完成后通道列表会刷新。"
+      no: "否，保留"
   agents:
     item:
       dock_collapse:
@@ -1132,6 +1143,7 @@ status:
   research_usage: "用法：/research | /research add <key> <provider> <model> [base_url] [api_key_env] | /research rm <key>"
   research_add_usage: "用法：/research add <key> <provider> <model> [base_url] [api_key_env]"
   research_rm_usage: "用法：/research rm <key>"
+  research_profile_unresolved: "当前档案尚未就绪 —— 请在会话准备好后重试。"
   opening_diff_preview: "正在打开差异预览：%{operation} %{path}"
   opening_inline_diff_preview: "正在打开内联差异预览：%{title}"
   approval_requested: "请求审批：%{title}"

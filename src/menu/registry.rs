@@ -55,6 +55,9 @@ pub const MENU_MODEL: &str = "model";
 /// Named provider lanes (`sub_providers`) for the deep_research pipeline lane —
 /// the `/research` menu lists them and `/research add|rm` mutates them.
 pub const MENU_RESEARCH: &str = "research";
+/// Yes/No confirm for removing a staged research lane via
+/// `profile/sub_providers/remove`.
+pub const MENU_RESEARCH_REMOVE_CONFIRM: &str = "research-remove-confirm";
 pub const MENU_COST: &str = "cost";
 /// `/resume` session picker menu.
 pub const MENU_RESUME: &str = "resume";
