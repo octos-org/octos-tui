@@ -4201,7 +4201,13 @@ fn research_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let cached_matches_active = ctx
         .app
         .sub_providers_state
-        .map(|state| state.profile_id.as_deref() == profile_id.as_deref())
+        .map(|state| {
+            // When we can't resolve the active profile locally (e.g. before
+            // runtime status arrives), we can't judge staleness — but the server
+            // resolves the SAME default for our list AND for any subsequent
+            // mutation, so trust its echoed cache instead of hiding lanes forever.
+            profile_id.is_none() || state.profile_id.as_deref() == profile_id.as_deref()
+        })
         .unwrap_or(false);
     let lanes: &[crate::model::SubProviderView] = if cached_matches_active {
         ctx.app

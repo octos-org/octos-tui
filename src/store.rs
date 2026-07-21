@@ -658,6 +658,14 @@ impl Store {
                     self.state.status = t!("status.research_add_usage").into_owned();
                     return SlashDispatchOutcome::Rejected;
                 }
+                // Gate per verb (the menu gates Add on this method too) so a
+                // capability-stripped server that advertises list-but-not-upsert
+                // gets a friendly block instead of a rejected mutation round-trip.
+                if !self
+                    .require_appui_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT)
+                {
+                    return SlashDispatchOutcome::Rejected;
+                }
                 SlashDispatchOutcome::accepted(Some(AppUiCommand::ProfileSubProvidersUpsert(
                     SubProvidersUpsertParams {
                         profile_id,
@@ -682,6 +690,11 @@ impl Store {
                 // silently delete `cheap`.
                 if tokens.next().is_some() {
                     self.state.status = t!("status.research_rm_usage").into_owned();
+                    return SlashDispatchOutcome::Rejected;
+                }
+                if !self
+                    .require_appui_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE)
+                {
                     return SlashDispatchOutcome::Rejected;
                 }
                 SlashDispatchOutcome::accepted(Some(AppUiCommand::ProfileSubProvidersRemove(
@@ -12304,6 +12317,11 @@ mod tests {
     #[test]
     fn research_slash_parses_add_rm_and_rejects_missing_args() {
         let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+        ]));
 
         // `/research add <key> <provider> <model> …` → upsert with those fields.
         let cmd = store
@@ -12374,6 +12392,9 @@ mod tests {
     #[test]
     fn should_upsert_research_lane_targeting_active_profile() {
         let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+        ]));
         let cmd = store
             .dispatch_research_slash("/research add cheap moonshot k3")
             .into_command();
@@ -12401,6 +12422,9 @@ mod tests {
     #[test]
     fn should_remove_research_lane_targeting_active_profile() {
         let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+        ]));
         let cmd = store
             .dispatch_research_slash("/research rm cheap")
             .into_command();
@@ -12411,6 +12435,41 @@ mod tests {
             }
             _ => panic!("expected a ProfileSubProvidersRemove command"),
         }
+    }
+
+    #[test]
+    fn should_reject_research_add_when_upsert_capability_missing() {
+        // A well-formed add against a server that advertises list-but-not-upsert
+        // is blocked client-side (friendly status) rather than emitting a
+        // mutation the server will reject.
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+        ]));
+        let outcome = store.dispatch_research_slash("/research add cheap moonshot k3");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+    }
+
+    #[test]
+    fn active_profile_id_matches_menu_snapshot_current_profile() {
+        // The inline /research dispatcher and the menu MUST resolve the same
+        // active profile — a divergence is exactly the cross-profile targeting
+        // bug this guards against. Assert the two resolvers agree, including when
+        // an onboarding profile is set (which must NOT override the active
+        // session's profile).
+        let mut store = store_with_empty_session();
+        assert_eq!(
+            store.active_profile_id().as_deref(),
+            store.menu_app_snapshot().current_profile,
+        );
+
+        store.state.onboarding.profile_id = Some("other".into());
+        assert_eq!(
+            store.active_profile_id().as_deref(),
+            store.menu_app_snapshot().current_profile,
+            "resolvers diverged once onboarding.profile_id was set",
+        );
+        assert_eq!(store.active_profile_id().as_deref(), Some("coding"));
     }
 
     fn store_with_assistant_message(text: &str) -> Store {
