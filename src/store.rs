@@ -6767,6 +6767,11 @@ impl Store {
                 // turn genuinely died with the old connection self-heals via
                 // the TTL re-stage path.
                 let staged_submit_in_flight = self.state.staged_submit_in_flight.clone();
+                // Same replay window as the staged gate: a submit whose
+                // turn/started has not arrived must not read as Idle after a
+                // reconnect, or the tick backstop starts a second turn (K3
+                // review). Harmless when stale — TTL-pruned on refresh.
+                let pre_token_turns = self.state.pre_token_turns.clone();
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
@@ -6823,6 +6828,7 @@ impl Store {
                 state.session_status_word = session_status_word;
                 state.session_context_window = session_context_window;
                 state.staged_submit_in_flight = staged_submit_in_flight;
+                state.pre_token_turns = pre_token_turns;
                 // Settle gates the snapshot already reflects BEFORE the
                 // optimistic restore below re-inserts un-echoed rows (which
                 // would inflate the echo count and mis-settle live gates).
@@ -10734,12 +10740,23 @@ impl Store {
         // F2 — the original gate ordering made the TTL dead code exactly in
         // its target scenario).
         if self.state.run_state.is_active() {
+            // A Blocked wait (approval/question pending) is a LIVE turn no
+            // matter how old the gate is — recovery here would flatten the
+            // wait and double-drain into it (K3 review). And an InProgress
+            // that this session's dead submit did NOT arm (e.g. /review, an
+            // approval re-arm) is someone else's live turn: only recover when
+            // the pre-token marker says the stuck state came from our submit.
+            let blocked = matches!(
+                self.state.run_state,
+                crate::model::SessionRunState::Blocked { .. }
+            );
             let stale_gate = self
                 .state
                 .staged_submit_in_flight
                 .get(&session_id)
                 .is_some_and(|gate| gate.submitted_at.elapsed() >= STAGED_SUBMIT_GATE_TTL);
-            if !stale_gate {
+            let ours = self.state.pre_token_turns.contains_key(&session_id);
+            if blocked || !stale_gate || !ours {
                 return None;
             }
         }
@@ -10759,8 +10776,12 @@ impl Store {
                 // The dead in-flight turn left run_state stuck InProgress —
                 // reset it (and its pre-token marker) so this drain and the
                 // status chip reflect the recovery instead of a phantom turn.
+                // (The guard above already refused Blocked / foreign turns.)
                 self.state.pre_token_turns.remove(&session_id);
-                if self.state.run_state.is_active() {
+                if matches!(
+                    self.state.run_state,
+                    crate::model::SessionRunState::InProgress
+                ) {
                     self.state.set_run_state_idle();
                 }
                 // Stale gate: the in-flight death was UNATTRIBUTABLE (no wire
@@ -10820,6 +10841,24 @@ impl Store {
         session_id: &SessionKey,
         gate: StagedSubmitGate,
     ) -> bool {
+        // The submit is dead: its pre-token marker must not keep re-arming a
+        // phantom InProgress (which would gate the very drain that retries
+        // the restaged prompt — K3 review: gate-less restage + stuck
+        // run_state = staging wedge until manual action). Only the marker's
+        // own InProgress is reset; a Blocked wait or a foreign live turn is
+        // left alone.
+        if self.state.pre_token_turns.remove(session_id).is_some()
+            && matches!(
+                self.state.run_state,
+                crate::model::SessionRunState::InProgress
+            )
+            && self
+                .state
+                .active_session()
+                .is_some_and(|session| &session.id == session_id && session.live_reply.is_none())
+        {
+            self.state.set_run_state_idle();
+        }
         let Some(in_flight) = gate.in_flight else {
             return false;
         };
@@ -14013,6 +14052,17 @@ mod tests {
                 .count(),
             1,
             "withdraw + re-record leaves exactly ONE user row"
+        );
+        // K3 review: recovery must consume the dead submit's marker — only
+        // the retry's FRESH marker may remain (a stale leftover would re-arm
+        // phantom InProgress on the next switch round-trip).
+        assert!(
+            store
+                .state
+                .pre_token_turns
+                .values()
+                .all(|armed| armed.elapsed() < std::time::Duration::from_secs(1)),
+            "only the retry's fresh pre-token marker may remain"
         );
 
         // QUEUED-successor variant: the stale gate's prompt must go FIRST
@@ -31025,12 +31075,42 @@ mod tests {
         let turn = TurnId::new();
         let session_id = SessionKey("local:test".into());
         let mut store = store_with_live_reply(turn.clone(), "Hello, world!");
+        // Preconditions pin the REAL stdio shape (K3 review): the legacy lane
+        // already filled the live text and NO v2 segment exists — a guard that
+        // only fired on an empty live reply would silently regress the fix
+        // while the final assert still passed.
+        assert!(
+            !store.state.sessions[0]
+                .live_reply
+                .as_ref()
+                .unwrap()
+                .text
+                .is_empty(),
+            "precondition: legacy-fed text present"
+        );
+        let key = (session_id.clone(), turn.clone());
+        assert!(
+            store
+                .state
+                .v2_live_assistant_segments
+                .get(&key)
+                .is_none_or(|segments| segments.is_empty()),
+            "precondition: no v2 segments recorded"
+        );
 
         store.apply_v2_assistant_persisted(
             &session_id,
             &turn,
             "seg-1".into(),
             "Hello, world!".into(),
+        );
+        assert!(
+            store
+                .state
+                .v2_live_assistant_segments
+                .get(&key)
+                .is_some_and(|segments| !segments.is_empty()),
+            "the persisted row must record its segment"
         );
 
         let text = &store.state.sessions[0]
@@ -31121,6 +31201,116 @@ mod tests {
         assert_eq!(
             store.state.pending_messages,
             vec!["early follow-up".to_string()]
+        );
+    }
+
+    /// K3 review: a genuinely v2-fed turn must NOT be clobbered by the
+    /// replace-at-seed — its first delta recorded a segment, so a later
+    /// persisted row for a NEW segment appends after it.
+    #[test]
+    fn persisted_v2_row_does_not_replace_v2_fed_text() {
+        let turn = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut store = store_with_live_reply(turn.clone(), String::new());
+
+        store.apply_v2_assistant_delta(&session_id, &turn, "seg-1".into(), "first ".into());
+        store.apply_v2_assistant_persisted(&session_id, &turn, "seg-2".into(), "second".into());
+
+        let text = &store.state.sessions[0]
+            .live_reply
+            .as_ref()
+            .expect("live reply")
+            .text;
+        assert!(
+            text.contains("first"),
+            "v2-fed content must survive a later persisted segment: {text}"
+        );
+        assert!(text.contains("second"), "new segment appended: {text}");
+    }
+
+    /// K3 review: an AGED pre-token marker is a dead submit — the switch-time
+    /// re-derivation must prune it and leave the session Idle, or a dead
+    /// submit wedges the session InProgress forever.
+    #[test]
+    fn stale_pre_token_marker_is_pruned_on_switch() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        store.state.pre_token_turns.insert(
+            a,
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(11))
+                .expect("instant in the past"),
+        );
+        store.state.switch_selected_session(1);
+        store.state.switch_selected_session(0);
+        assert!(
+            !store.state.run_state.is_active(),
+            "an aged marker must not re-arm InProgress"
+        );
+        assert!(store.state.pre_token_turns.is_empty(), "marker pruned");
+    }
+
+    /// K3 review: turn/started ends the pre-token window — the marker must
+    /// clear so it cannot re-arm InProgress after the turn's own terminal.
+    #[test]
+    fn turn_started_clears_pre_token_marker() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let command = store.queue_or_start_prompt_turn("go".into(), "sent".into());
+        assert!(command.is_some());
+        let a = SessionKey("local:a".into());
+        assert!(
+            store.state.pre_token_turns.contains_key(&a),
+            "armed at submit"
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            octos_core::ui_protocol::TurnStartedEvent {
+                session_id: a.clone(),
+                turn_id: TurnId::new(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        assert!(
+            !store.state.pre_token_turns.contains_key(&a),
+            "turn/started must clear the pre-token marker"
+        );
+    }
+
+    /// K3 review: the stale-gate recovery must never flatten a Blocked
+    /// (approval-pending) wait — that is a LIVE turn regardless of gate age.
+    #[test]
+    fn stale_gate_recovery_refuses_blocked_wait() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        store.state.pending_messages = vec!["queued".into()];
+        store
+            .submit_next_pending_if_idle()
+            .expect("staged prompt drains");
+        // The turn blocks on an approval; the gate then goes stale.
+        store.state.run_state = crate::model::SessionRunState::Blocked {
+            message: "approval pending".into(),
+        };
+        let gate = store
+            .state
+            .staged_submit_in_flight
+            .get_mut(&a)
+            .expect("gate armed");
+        gate.submitted_at = std::time::Instant::now()
+            .checked_sub(STAGED_SUBMIT_GATE_TTL + std::time::Duration::from_secs(1))
+            .expect("instant in the past");
+        store.state.pending_messages = vec!["later".into()];
+
+        assert!(
+            store.submit_next_pending_if_idle().is_none(),
+            "a Blocked wait must never be recovered into"
+        );
+        assert!(
+            matches!(
+                store.state.run_state,
+                crate::model::SessionRunState::Blocked { .. }
+            ),
+            "the Blocked state survives"
         );
     }
 
