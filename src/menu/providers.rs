@@ -4161,11 +4161,14 @@ fn research_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let can_remove = ctx
         .availability
         .supports_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE);
-    let profile_id = ctx.app.current_profile.map(str::to_owned).or_else(|| {
-        ctx.app
-            .sub_providers_state
-            .and_then(|state| state.profile_id.clone())
-    });
+    let can_upsert = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT);
+    // Target the ACTIVE profile (the same resolver the inline /research dispatcher
+    // uses via `active_profile_id`). Do NOT prefer the cached list's profile —
+    // after a profile switch the cache lags, and targeting it would list/mutate
+    // the wrong profile.
+    let profile_id = ctx.app.current_profile.map(str::to_owned);
 
     let refresh_action = if can_list {
         MenuAction::send_appui(AppUiCommand::ProfileSubProvidersList(
@@ -4190,20 +4193,50 @@ fn research_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     }
     let mut items = vec![refresh];
 
-    let lanes = ctx
+    // Only show lanes we KNOW belong to the active profile. The server always
+    // echoes the resolved profile in the list result, so a cache left over from a
+    // different (e.g. pre-switch) profile is withheld rather than shown as if it
+    // were this profile's — otherwise selecting a row could stage a removal
+    // against a lane that isn't in the active profile at all.
+    let cached_matches_active = ctx
         .app
         .sub_providers_state
-        .map(|state| state.sub_providers.as_slice())
-        .unwrap_or_default();
+        .map(|state| {
+            // When we can't resolve the active profile locally (e.g. before
+            // runtime status arrives), we can't judge staleness — but the server
+            // resolves the SAME default for our list AND for any subsequent
+            // mutation, so trust its echoed cache instead of hiding lanes forever.
+            profile_id.is_none() || state.profile_id.as_deref() == profile_id.as_deref()
+        })
+        .unwrap_or(false);
+    let lanes: &[crate::model::SubProviderView] = if cached_matches_active {
+        ctx.app
+            .sub_providers_state
+            .map(|state| state.sub_providers.as_slice())
+            .unwrap_or_default()
+    } else {
+        &[]
+    };
     if lanes.is_empty() {
-        items.push(
+        // Distinguish "this profile has no lanes" from "we're showing a stale/
+        // unloaded cache" — the latter tells the user to Refresh rather than
+        // implying the profile is empty.
+        let item = if cached_matches_active {
             MenuItem::new(
                 "research.empty",
                 t!("menu.research.item.empty.label"),
                 MenuAction::Noop,
             )
-            .disabled(t!("menu.research.item.empty.desc").into_owned()),
-        );
+            .disabled(t!("menu.research.item.empty.desc").into_owned())
+        } else {
+            MenuItem::new(
+                "research.stale",
+                t!("menu.research.item.stale.label"),
+                MenuAction::Noop,
+            )
+            .disabled(t!("menu.research.item.stale.desc").into_owned())
+        };
+        items.push(item);
     } else {
         for (idx, lane) in lanes.iter().enumerate() {
             let label = format!(
@@ -4215,13 +4248,14 @@ fn research_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                     .map(|m| format!("/{m}"))
                     .unwrap_or_default()
             );
+            // Stage the removal in the composer rather than deleting on select —
+            // selecting a row is a single keystroke and a lane deletion needs a
+            // deliberate Enter to confirm.
             let action = if can_remove {
-                MenuAction::send_appui(AppUiCommand::ProfileSubProvidersRemove(
-                    crate::model::SubProvidersRemoveParams {
-                        profile_id: profile_id.clone(),
-                        key: lane.key.clone(),
-                    },
-                ))
+                MenuAction::Local(crate::menu::types::LocalAction::EditComposer(format!(
+                    "/research rm {}",
+                    lane.key
+                )))
             } else {
                 MenuAction::Noop
             };
@@ -4237,16 +4271,25 @@ fn research_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         }
     }
 
-    items.push(
-        MenuItem::new(
-            "research.add",
-            t!("menu.research.item.add.label"),
+    let mut add = MenuItem::new(
+        "research.add",
+        t!("menu.research.item.add.label"),
+        if can_upsert {
             MenuAction::Local(crate::menu::types::LocalAction::EditComposer(
                 "/research add ".to_string(),
-            )),
-        )
-        .with_description(t!("menu.research.item.add.desc")),
-    );
+            ))
+        } else {
+            MenuAction::Noop
+        },
+    )
+    .with_description(t!("menu.research.item.add.desc"));
+    if !can_upsert {
+        add = add.disabled(method_missing_reason(
+            ctx,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+        ));
+    }
+    items.push(add);
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(crate::menu::registry::MENU_RESEARCH),
@@ -9329,6 +9372,122 @@ mod tests {
             .find(|item| item.id == "model.remove")
             .expect("remove entry present");
         assert_eq!(remove_row.disabled_reason, None);
+    }
+
+    fn research_lane(key: &str) -> crate::model::SubProviderView {
+        crate::model::SubProviderView {
+            key: key.into(),
+            provider: Some("moonshot".into()),
+            model: Some("k3".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn research_menu_shows_active_profile_lanes_and_stages_removal() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+        ]);
+        let lanes = crate::model::SubProvidersListResult {
+            profile_id: Some("coding".into()),
+            sub_providers: vec![research_lane("cheap")],
+            runtime_policy_stamp: None,
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                sub_providers_state: Some(&lanes),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) =
+            registry.build(&MenuId::from(crate::menu::registry::MENU_RESEARCH), &ctx)
+        else {
+            panic!("expected research menu");
+        };
+        // The active-profile lane is shown, and selecting it STAGES a removal in
+        // the composer rather than deleting on select.
+        let lane = spec
+            .items
+            .iter()
+            .find(|item| item.id == "research.lane.0")
+            .expect("active-profile lane is listed");
+        assert!(matches!(
+            &lane.action,
+            MenuAction::Local(crate::menu::types::LocalAction::EditComposer(text))
+                if text == "/research rm cheap"
+        ));
+        // Refresh targets the active profile, and there is no stale hint.
+        let refresh = spec
+            .items
+            .iter()
+            .find(|item| item.id == "research.refresh")
+            .expect("refresh row present");
+        let AppUiCommand::ProfileSubProvidersList(params) = appui_command(&refresh.action) else {
+            panic!("expected list command");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+        assert!(spec.items.iter().all(|item| item.id != "research.stale"));
+    }
+
+    #[test]
+    fn research_menu_hides_lanes_from_a_different_profile() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+        ]);
+        // A cache left over from profile "other" while "coding" is active.
+        let lanes = crate::model::SubProvidersListResult {
+            profile_id: Some("other".into()),
+            sub_providers: vec![research_lane("cheap")],
+            runtime_policy_stamp: None,
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                sub_providers_state: Some(&lanes),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) =
+            registry.build(&MenuId::from(crate::menu::registry::MENU_RESEARCH), &ctx)
+        else {
+            panic!("expected research menu");
+        };
+        // The stale profile's lanes must NOT be shown as the active profile's —
+        // otherwise selecting one would stage `rm` against a lane not in `coding`.
+        assert!(
+            spec.items
+                .iter()
+                .all(|item| !item.id.starts_with("research.lane.")),
+            "stale-profile lanes must not be listed"
+        );
+        assert!(
+            spec.items.iter().any(|item| item.id == "research.stale"),
+            "a refresh-to-load hint is shown instead"
+        );
+        // Refresh still targets the ACTIVE profile, so it loads coding's lanes.
+        let refresh = spec
+            .items
+            .iter()
+            .find(|item| item.id == "research.refresh")
+            .expect("refresh row present");
+        let AppUiCommand::ProfileSubProvidersList(params) = appui_command(&refresh.action) else {
+            panic!("expected list command");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
     }
 
     /// `/model` absorbed the add-model flow: a trailing "Add a model…" row
