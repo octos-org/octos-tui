@@ -7753,10 +7753,32 @@ fn side_by_side_rows(lines: &[crate::model::DiffPreviewLine]) -> Vec<SideBySideR
     rows
 }
 
-/// Fixed columns in a side-by-side row besides the two content cells:
-/// 4 indent + 5 left line number + 2 left sign + 3 separator + 5 right line
-/// number + 2 right sign.
-const SIDE_BY_SIDE_CHROME_COLS: usize = 21;
+/// Minimum line-number gutter width in a side-by-side half (matches the
+/// unified view's `{n:>4}` gutter).
+const SIDE_BY_SIDE_MIN_GUTTER: usize = 4;
+
+/// Line-number gutter width for one hunk's side-by-side rows: wide enough
+/// for the LARGEST line number either side shows, never below
+/// [`SIDE_BY_SIDE_MIN_GUTTER`]. Computed per hunk — a fixed `{n:>4}` gutter
+/// silently widened only the rows with numbers >= 10000, shifting that
+/// row's separator out of column and breaking the hunk's shared-row
+/// alignment (#362 review).
+fn side_by_side_gutter_width(lines: &[crate::model::DiffPreviewLine]) -> usize {
+    lines
+        .iter()
+        .filter_map(|line| line.old_line.max(line.new_line))
+        .max()
+        .map(|max| max.to_string().len())
+        .unwrap_or(SIDE_BY_SIDE_MIN_GUTTER)
+        .max(SIDE_BY_SIDE_MIN_GUTTER)
+}
+
+/// Fixed columns in a side-by-side row besides the two content cells, for a
+/// given line-number gutter width: 4 indent + (gutter + 1 space + sign + 1
+/// space) per half + 3 separator.
+fn side_by_side_chrome_cols(gutter: usize) -> usize {
+    4 + 2 * (gutter + 3) + 3
+}
 
 /// Fit `content` into exactly `cell` display columns: truncate with a
 /// trailing `…` when too wide (no horizontal scroll in v1), pad with spaces
@@ -7809,6 +7831,7 @@ fn push_diff_half_spans(
     palette: Palette,
     line: Option<&crate::model::DiffPreviewLine>,
     line_no: fn(&crate::model::DiffPreviewLine) -> Option<u32>,
+    gutter_width: usize,
     cell: usize,
     leading_indent: bool,
 ) {
@@ -7821,7 +7844,7 @@ fn push_diff_half_spans(
             if leading_indent {
                 spans.push(Span::styled("    ", gutter));
             }
-            spans.push(Span::styled(format!("{number:>4} "), gutter));
+            spans.push(Span::styled(format!("{number:>gutter_width$} "), gutter));
             spans.push(Span::styled(
                 format!("{} ", diff_line_sign(&line.kind)),
                 diff_line_marker_style(&line.kind, palette),
@@ -7836,7 +7859,7 @@ fn push_diff_half_spans(
             if leading_indent {
                 spans.push(Span::styled("    ", blank));
             }
-            spans.push(Span::styled(" ".repeat(7 + cell), blank));
+            spans.push(Span::styled(" ".repeat(gutter_width + 3 + cell), blank));
         }
     }
 }
@@ -7847,18 +7870,28 @@ fn push_diff_side_by_side_row(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
     row: SideBySideRow<'_>,
+    gutter_width: usize,
     wrap_width: usize,
 ) {
     let (left, right) = row;
-    let cell = (wrap_width.saturating_sub(SIDE_BY_SIDE_CHROME_COLS) / 2).max(8);
+    let cell = (wrap_width.saturating_sub(side_by_side_chrome_cols(gutter_width)) / 2).max(8);
     let mut spans = Vec::with_capacity(9);
-    push_diff_half_spans(&mut spans, palette, left, |line| line.old_line, cell, true);
+    push_diff_half_spans(
+        &mut spans,
+        palette,
+        left,
+        |line| line.old_line,
+        gutter_width,
+        cell,
+        true,
+    );
     spans.push(Span::styled(" │ ", palette.muted()));
     push_diff_half_spans(
         &mut spans,
         palette,
         right,
         |line| line.new_line,
+        gutter_width,
         cell,
         false,
     );
@@ -7879,9 +7912,10 @@ fn push_diff_hunk_body(
 ) -> usize {
     if side_by_side {
         let rows = side_by_side_rows(hunk_lines);
+        let gutter_width = side_by_side_gutter_width(hunk_lines);
         let shown = max_rows.unwrap_or(rows.len()).min(rows.len());
         for row in rows.iter().take(shown) {
-            push_diff_side_by_side_row(lines, palette, *row, wrap_width);
+            push_diff_side_by_side_row(lines, palette, *row, gutter_width, wrap_width);
         }
         rows.len() - shown
     } else {
@@ -13348,6 +13382,81 @@ mod tests {
         assert!(
             widths.iter().all(|w| *w == widths[0] && *w <= wrap_width),
             "rows must share one exact width within the wrap budget: {widths:?}"
+        );
+    }
+
+    /// #362 review: alignment was only ever tested with surplus REMOVED
+    /// lines. Pin the opposite direction — surplus ADDED lines keep the
+    /// right column with a blank left half.
+    #[test]
+    fn side_by_side_rows_align_surplus_added_hunk() {
+        let hunk = vec![
+            mixed_hunk_line("removed", "let a = old();", Some(5), None),
+            mixed_hunk_line("added", "let a = new();", None, Some(5)),
+            mixed_hunk_line("added", "let extra = more();", None, Some(6)),
+        ];
+        let rows = side_by_side_rows(&hunk);
+        assert_eq!(rows.len(), 2, "1R/2A pairs into 2 rows");
+        assert_eq!(rows[0].0.expect("left removed").content, "let a = old();");
+        assert_eq!(rows[0].1.expect("right added").content, "let a = new();");
+        assert!(rows[1].0.is_none(), "no removed line to pair on the left");
+        assert_eq!(
+            rows[1].1.expect("surplus added").content,
+            "let extra = more();"
+        );
+    }
+
+    /// #362 review: a fixed `{n:>4}` gutter widened ONLY the rows whose
+    /// line numbers reached five digits, shifting their separator out of
+    /// column. The gutter now sizes to the hunk's largest line number, so
+    /// small- and five-digit-numbered rows share one exact width and one
+    /// separator column.
+    #[test]
+    fn side_by_side_rows_with_five_digit_line_numbers_stay_aligned() {
+        let wrap_width = 100usize;
+        let hunk = vec![
+            mixed_hunk_line("context", "fn before() {}", Some(9998), Some(9999)),
+            mixed_hunk_line("removed", "let x = old();", Some(9999), None),
+            mixed_hunk_line("added", "let x = new();", None, Some(10001)),
+        ];
+        assert_eq!(side_by_side_gutter_width(&hunk), 5, "sized to 10001");
+        let mut lines = Vec::new();
+        push_diff_hunk_body(
+            &mut lines,
+            Palette::for_theme(ThemeName::Codex),
+            &hunk,
+            true,
+            wrap_width,
+            None,
+        );
+        assert_eq!(lines.len(), 2, "context + paired change");
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let widths: Vec<usize> = rendered
+            .iter()
+            .map(|text| UnicodeWidthStr::width(text.as_str()))
+            .collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0] && *w <= wrap_width),
+            "rows must share one exact width: {widths:?}"
+        );
+        let separator_cols: Vec<usize> = rendered
+            .iter()
+            .map(|text| {
+                let at = text.find(" │ ").expect("separator present");
+                UnicodeWidthStr::width(&text[..at])
+            })
+            .collect();
+        assert!(
+            separator_cols.iter().all(|c| *c == separator_cols[0]),
+            "the old│new separator must sit in one column: {separator_cols:?}"
         );
     }
 
