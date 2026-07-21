@@ -1813,6 +1813,7 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ProfileLlmList(_)
                 | AppUiCommand::ProfileLlmFetchModels(_)
                 | AppUiCommand::ProfileSubProvidersList(_)
+                | AppUiCommand::SnapshotList(_)
                 | AppUiCommand::ProfileSkillsList(_)
                 | AppUiCommand::ProfileSkillsRegistrySearch(_)
                 // M15-E read-only autonomy inspection. Reconnect
@@ -2013,6 +2014,7 @@ impl ProtocolAppUiBackend {
             | AppUiCommand::ProfileLocalCreate(_)
             | AppUiCommand::ProfileLlmUpsert(_)
             | AppUiCommand::ProfileLlmDelete(_)
+            | AppUiCommand::SnapshotRestore(_)
             | AppUiCommand::ProfileSubProvidersUpsert(_)
             | AppUiCommand::ProfileSubProvidersRemove(_)
             | AppUiCommand::ProfileLlmSelect(_)
@@ -2686,6 +2688,8 @@ fn rpc_request_from_command(
         AppUiCommand::ProfileLlmUpsert(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmDelete(params) => serde_json::to_value(params),
         AppUiCommand::ProfileSubProvidersList(params) => serde_json::to_value(params),
+        AppUiCommand::SnapshotList(params) => serde_json::to_value(params),
+        AppUiCommand::SnapshotRestore(params) => serde_json::to_value(params),
         AppUiCommand::ProfileSubProvidersUpsert(params) => serde_json::to_value(params),
         AppUiCommand::ProfileSubProvidersRemove(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmSelect(params) => serde_json::to_value(params),
@@ -3115,6 +3119,20 @@ fn success_response_to_app_event(
                         "invalid_result",
                         format!(
                             "failed to decode UI protocol result for profile/llm mutation: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_SNAPSHOT_LIST | crate::model::APPUI_METHOD_SNAPSHOT_RESTORE => {
+            match serde_json::from_value::<crate::model::SnapshotListResult>(result) {
+                Ok(result) => Ok(Some(snapshot_list_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for snapshot list/restore: {err}"
                         ),
                     )
                     .into(),
@@ -3686,6 +3704,25 @@ fn profile_llm_mutation_event(result: ProfileLlmMutationResult) -> ClientEvent {
         _ => format!("Provider profile updated: {count} configured provider(s)"),
     };
     ClientEvent::ProfileLlmMutation(ProfileLlmMutationClientEvent { message, result })
+}
+
+fn snapshot_list_event(result: crate::model::SnapshotListResult) -> ClientEvent {
+    let count = result.snapshots.len();
+    let message = if let Some(restored) = result.restored.as_deref() {
+        format!(
+            "Workspace restored to snapshot {}",
+            &restored[..restored.len().min(8)]
+        )
+    } else if !result.available {
+        "Snapshots unavailable for this session".into()
+    } else {
+        match count {
+            0 => "No snapshots yet".into(),
+            1 => "1 snapshot".into(),
+            _ => format!("{count} snapshots"),
+        }
+    };
+    ClientEvent::SnapshotList(crate::client_event::SnapshotListClientEvent { message, result })
 }
 
 fn sub_providers_list_event(result: SubProvidersListResult) -> ClientEvent {

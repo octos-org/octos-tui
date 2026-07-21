@@ -468,6 +468,7 @@ thinking:
   display_off: Reasoning hidden from the transcript (spinner + inspector only).
 
 status:
+  undo_no_session: "No active session to undo in."
   research_usage: "Usage: /research | /research add <key> <provider> <model> [base_url] [api_key_env] | /research rm <key>"
   research_add_usage: "Usage: /research add <key> <provider> <model> [base_url] [api_key_env]"
   research_rm_usage: "Usage: /research rm <key>"
@@ -901,6 +902,8 @@ command:
     desc: List or configure server-owned MCP entries when supported.
   model:
     desc: Choose a server-returned profile LLM model.
+  undo:
+    desc: Roll workspace files back to a pre-mutation snapshot (#1768).
   research:
     desc: Manage research provider lanes (deep_research cheap/strong models).
   onboard:
@@ -952,6 +955,40 @@ menu:
         desc: "The scan found no listable files under the workspace root (`.git`, `target`, and `node_modules` are skipped)."
       truncated:
         label: "Showing the first %{count} files — type to narrow the search"
+  undo:
+    title: Workspace Snapshots
+    subtitle: "Undo points taken before agent file mutations. Select one to roll the workspace back."
+    footer: Enter restore a snapshot (asks to confirm) | Esc close
+    age:
+      just_now: just now
+    item:
+      refresh:
+        label: Refresh snapshots
+        desc: Uses snapshot/list for the active session.
+      stale:
+        label: Snapshots not loaded for this session
+        desc: Select Refresh to load the active session's snapshots.
+      unavailable:
+        label: Snapshots unavailable
+        desc: No workspace for this session, or git is not installed.
+      disabled:
+        label: "Snapshot capture is OFF (snapshots.enabled)"
+        desc: Existing snapshots below remain restorable; new edits are not being snapshotted.
+      empty:
+        label: No snapshots yet
+        desc: "Snapshots are taken automatically before agent file mutations (opt-in: snapshots.enabled)."
+      snap:
+        desc: Select to restore — asks to confirm first.
+  undo_confirm:
+    title: "Restore a snapshot"
+    subtitle: "Rolls the workspace files back. A pre-restore snapshot is taken first, so this is itself undoable."
+    confirm_title: "Restore %{snapshot}?"
+    "yes": "Yes, restore %{snapshot}"
+    yes_desc: "Uses snapshot/restore; refused while a turn is running."
+    "no": "No, keep current files"
+    item:
+      empty:
+        label: "No snapshot staged for restore"
   research:
     title: Research Provider Lanes
     subtitle: "Named provider lanes (cheap/strong) for the deep_research pipeline. Restart to apply."

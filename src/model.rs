@@ -67,6 +67,9 @@ pub const APPUI_METHOD_PROFILE_LLM_CATALOG: &str = "profile/llm/catalog";
 pub const APPUI_METHOD_PROFILE_LLM_UPSERT: &str = "profile/llm/upsert";
 pub const APPUI_METHOD_PROFILE_LLM_DELETE: &str = "profile/llm/delete";
 pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST: &str = "profile/sub_providers/list";
+/// #1768 workspace snapshot undo.
+pub const APPUI_METHOD_SNAPSHOT_LIST: &str = "snapshot/list";
+pub const APPUI_METHOD_SNAPSHOT_RESTORE: &str = "snapshot/restore";
 pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT: &str = "profile/sub_providers/upsert";
 pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE: &str = "profile/sub_providers/remove";
 pub const APPUI_METHOD_PROFILE_LLM_TEST: &str = "profile/llm/test";
@@ -750,6 +753,10 @@ pub enum AppUiCommand {
     ProfileLlmTest(ProfileLlmTestParams),
     ProfileLlmFetchModels(ProfileLlmFetchModelsParams),
     ProfileSubProvidersList(SubProvidersListParams),
+    /// #1768: list the session workspace's snapshot undo points.
+    SnapshotList(SnapshotListParams),
+    /// #1768: restore the session workspace to a snapshot.
+    SnapshotRestore(SnapshotRestoreParams),
     ProfileSubProvidersUpsert(SubProvidersUpsertParams),
     ProfileSubProvidersRemove(SubProvidersRemoveParams),
     ProfileSkillsList(ProfileSkillsListParams),
@@ -847,6 +854,8 @@ impl AppUiCommand {
             Self::ProfileLlmTest(_) => APPUI_METHOD_PROFILE_LLM_TEST,
             Self::ProfileLlmFetchModels(_) => APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
             Self::ProfileSubProvidersList(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+            Self::SnapshotList(_) => APPUI_METHOD_SNAPSHOT_LIST,
+            Self::SnapshotRestore(_) => APPUI_METHOD_SNAPSHOT_RESTORE,
             Self::ProfileSubProvidersUpsert(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
             Self::ProfileSubProvidersRemove(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
             Self::ProfileSkillsList(_) => APPUI_METHOD_PROFILE_SKILLS_LIST,
@@ -2442,6 +2451,9 @@ pub struct OnboardingWizardState {
     /// confirm menu (`MENU_RESEARCH_REMOVE_CONFIRM`), whose Yes row sends
     /// `profile/sub_providers/remove` with the captured `profile_id` + `key`.
     pub pending_research_lane_removal: Option<ResearchLaneRemoval>,
+    /// #1768: snapshot staged for restore by `/undo` — read by
+    /// `MENU_UNDO_CONFIRM`, whose Yes row sends `snapshot/restore`.
+    pub pending_snapshot_restore: Option<SnapshotRestoreRequest>,
     pub provider_save_target: Option<OnboardingProviderSaveTarget>,
     pub last_saved_provider_label: Option<String>,
     pub last_saved_provider_target: Option<OnboardingProviderSaveTarget>,
@@ -2494,6 +2506,7 @@ impl Default for OnboardingWizardState {
             provider_pending_since: None,
             pending_model_removal: None,
             pending_research_lane_removal: None,
+            pending_snapshot_restore: None,
             provider_save_target: None,
             last_saved_provider_label: None,
             last_saved_provider_target: None,
@@ -3263,6 +3276,17 @@ pub struct ModelRemovalRequest {
     pub label: String,
 }
 
+/// A snapshot restore staged from the `/undo` picker (#1768). `session_id`
+/// and `snapshot_id` are captured at menu-BUILD time and carried through the
+/// Yes/No confirm, so a session switch mid-confirm can never retarget the
+/// restore (same contract as [`ResearchLaneRemoval`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotRestoreRequest {
+    pub session_id: SessionKey,
+    pub snapshot_id: String,
+    pub label: String,
+}
+
 /// A research provider lane staged for removal (`/research` menu → lane row).
 /// The `profile_id` is captured at menu-BUILD time (the profile whose lanes are
 /// on screen) and carried through the Yes/No confirm, so a profile switch
@@ -3319,6 +3343,42 @@ pub struct SubProviderView {
     pub max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotListParams {
+    pub session_id: SessionKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotRestoreParams {
+    pub session_id: SessionKey,
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotInfoView {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub timestamp_unix: i64,
+}
+
+/// `snapshot/list` result — also the shape `snapshot/restore` echoes back
+/// (refreshed rows) so the picker updates in place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotListResult {
+    #[serde(default)]
+    pub session_id: Option<SessionKey>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub snapshots: Vec<SnapshotInfoView>,
+    #[serde(default)]
+    pub restored: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -4179,6 +4239,10 @@ pub struct AppState {
     /// Named provider lanes (`sub_providers`) shown by the `/research` menu,
     /// populated from `profile/sub_providers/list`.
     pub sub_providers_state: Option<SubProvidersListResult>,
+    /// #1768: last `snapshot/list` (or restore-echo) for the /undo picker.
+    /// Session-stamped by the server; the menu displays it only for the
+    /// session it belongs to.
+    pub snapshots_state: Option<SnapshotListResult>,
     pub profile_skills: Option<ProfileSkillsListResult>,
     pub profile_skill_registry: Option<ProfileSkillsRegistrySearchResult>,
     pub session_model_catalogs: Vec<SessionModelCatalog>,
@@ -6057,6 +6121,7 @@ impl AppState {
             profile_llm_catalog: None,
             profile_llm_state: None,
             sub_providers_state: None,
+            snapshots_state: None,
             profile_skills: None,
             profile_skill_registry: None,
             session_model_catalogs: Vec::new(),
