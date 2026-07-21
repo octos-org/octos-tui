@@ -4030,6 +4030,10 @@ pub struct AppState {
     /// so TYPED multi-line input is never collapsed, only pastes are.
     pub composer_pasted: bool,
     pub composer_drafts: Vec<ComposerDraft>,
+    /// Snapshot backing the `@` composer file picker (#363): the workspace
+    /// file list scanned when the picker was last opened. `Some` only feeds
+    /// the `file-picker` menu build; rebuilt on every `@` (never stale-served).
+    pub file_picker: Option<crate::file_picker::FilePickerState>,
     /// Cross-session command history for Up/Down recall (codex/claude-code
     /// style); persisted to `~/.config/octos-tui/history.jsonl`. See
     /// [`crate::history::ComposerHistory`].
@@ -5961,6 +5965,7 @@ impl AppState {
             composer_cursor: None,
             composer_pasted: false,
             composer_drafts: Vec::new(),
+            file_picker: None,
             composer_history: crate::history::ComposerHistory::default(),
             pending_messages: Vec::new(),
             pending_messages_by_session: std::collections::HashMap::new(),

@@ -14,6 +14,7 @@ pub mod client_event;
 pub mod clipboard;
 pub mod cmd;
 pub mod event_loop;
+pub mod file_picker;
 pub mod highlight;
 pub mod history;
 pub mod insert_history;
@@ -52,6 +53,38 @@ mod i18n_tests {
         let locales = rust_i18n::available_locales!();
         assert!(locales.contains(&"en"), "missing en: {locales:?}");
         assert!(locales.contains(&"zh"), "missing zh: {locales:?}");
+    }
+
+    /// #363/#364: the `@` file-picker menu + `!` shell-escape mode keys resolve
+    /// in BOTH locales (rust-i18n echoes the key back on a miss).
+    #[test]
+    fn composer_escape_and_file_picker_keys_resolve_in_en_and_zh() {
+        let keys = [
+            "menu.file_picker.title",
+            "menu.file_picker.search",
+            "menu.file_picker.footer",
+            "menu.file_picker.item.empty.label",
+            "menu.file_picker.item.empty.desc",
+            "menu.file_picker.item.truncated.label",
+            "status.bang_mode_hint",
+            "status.bang_mode_cancelled",
+            "status.bang_cwd",
+            "status.inserted_at_cursor",
+            "status.file_picker_closed",
+        ];
+        for key in keys {
+            for locale in ["en", "zh"] {
+                let value = t!(key, locale = locale);
+                assert_ne!(
+                    &*value, key,
+                    "missing {locale} translation for `{key}` (got the raw key back)"
+                );
+                assert!(
+                    !value.trim().is_empty(),
+                    "empty {locale} translation for `{key}`"
+                );
+            }
+        }
     }
 
     /// UX2 A.3/B.2: the new onboarding teaching-panel + workspace-step keys
