@@ -10072,6 +10072,40 @@ mod tests {
         );
     }
 
+    /// K3 review of the fix set (coverage): the picker must build with NO
+    /// onboarding snapshot (menus rebuild from the frame stack on theme/locale
+    /// refresh), and its rows go disabled — never silently Noop-enabled — when
+    /// the upsert capability drops mid-flow.
+    #[test]
+    fn research_lane_key_picker_survives_missing_snapshot_and_lost_capability() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods(["session/hydrate"]);
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot::default(),
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) = registry.build(
+            &MenuId::from(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+            &ctx,
+        ) else {
+            panic!("the picker must still build with no onboarding snapshot");
+        };
+        for key in ["cheap", "strong"] {
+            let row = spec
+                .items
+                .iter()
+                .find(|item| item.id == format!("research.lane_key.{key}"))
+                .expect("row present");
+            assert!(
+                row.disabled_reason.is_some(),
+                "{key} row must be disabled (with a reason) without the upsert capability"
+            );
+        }
+    }
+
     /// PR384 fix P3-g: in lane mode the wizard's Save row gates on the RPC it
     /// will actually use (`profile/sub_providers/upsert`), and the fallback
     /// save row is withheld — `SaveProviderFallback` writes a PROFILE

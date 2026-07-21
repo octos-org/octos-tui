@@ -4859,6 +4859,10 @@ impl Store {
                     self.state.status =
                         t!("status.menu_label", id = frame.id.to_string()).into_owned();
                 }
+                // A replace can swap MENU_ONBOARD itself out without a pop —
+                // the wizard-exit sweep must see that departure too (no
+                // production row does this today; latent-path hardening).
+                self.clear_research_lane_intent_if_wizard_closed();
                 fetch
             }
             MenuAction::Close => {
@@ -8413,7 +8417,26 @@ impl Store {
                 self.state.onboarding.provider_save_target,
                 Some(OnboardingProviderSaveTarget::ResearchLane)
             );
-            if lane_save_in_flight {
+            // Mutation events carry no request id (transport correlates by
+            // method only), so also require the echoed lane list to CONTAIN
+            // the key we saved: a concurrent unrelated mutation (inline add of
+            // another key, a lane remove) echoes a list without our key and is
+            // provably not our save's completion. An EMPTY echo can't disprove
+            // it, so it still consumes (a server that echoes no rows must not
+            // wedge the wizard for 30s).
+            let echo_matches_pending_key =
+                match self.state.onboarding.pending_research_lane_key.as_deref() {
+                    Some(key) => {
+                        event.result.sub_providers.is_empty()
+                            || event
+                                .result
+                                .sub_providers
+                                .iter()
+                                .any(|lane| lane.key == key)
+                    }
+                    None => true,
+                };
+            if lane_save_in_flight && echo_matches_pending_key {
                 let staged_provider_label = self.state.onboarding.provider_label();
                 let lane_key = self.state.onboarding.pending_research_lane_key.take();
                 self.state.onboarding.provider_pending = None;
@@ -32051,5 +32074,177 @@ mod tests {
             !store.state.onboarding.research_lane_intent,
             "close_all_menus abandons the wizard flow too"
         );
+    }
+
+    /// K3 review of the fix set (finding 1, refuted-but-pinned): the lane Save
+    /// path carries the same pending-RPC gate as the primary path — a Save
+    /// pressed while a Test is in flight must NOT open the key picker (and a
+    /// picker row must not dispatch), or the lane save would clobber the
+    /// pending Test slot and the Test response would complete "the lane save".
+    #[test]
+    fn lane_save_is_blocked_while_another_provider_rpc_is_pending() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(lane_capabilities());
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        store.state.onboarding.research_lane_intent = true;
+        stage_ready_lane_selection(&mut store);
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Test);
+
+        let cmd =
+            store.dispatch_onboarding_action(crate::model::OnboardingAction::SaveProvider, None);
+        assert!(cmd.is_none());
+        assert!(
+            !store.active_menu_id_is(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+            "the key picker must not open over an in-flight provider RPC"
+        );
+
+        // Even a directly-fired picker row is refused while pending.
+        let cmd = store.dispatch_menu_action(MenuAction::Local(LocalAction::SaveResearchLaneAs(
+            "cheap".into(),
+        )));
+        assert!(
+            cmd.is_none(),
+            "a picker row must not dispatch over an in-flight provider RPC"
+        );
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Test),
+            "the pending Test slot is not clobbered"
+        );
+    }
+
+    /// K3 review of the fix set (finding 2): mutation events have no request
+    /// id, so the consume also requires the echoed lane list to contain the
+    /// key we saved. A concurrent unrelated mutation (different key) echoes a
+    /// list without our key → provably not our completion → not consumed. An
+    /// empty echo can't disprove ownership → still consumes (no 30s wedge on
+    /// servers that echo no rows).
+    #[test]
+    fn lane_save_consume_requires_the_echo_to_contain_the_saved_key() {
+        let mut store = store_with_empty_session();
+        stage_ready_lane_selection(&mut store);
+        let event = |keys: &[&str]| SubProvidersMutationClientEvent {
+            result: crate::model::SubProvidersMutationResult {
+                profile_id: Some("coding".into()),
+                sub_providers: keys
+                    .iter()
+                    .map(|key| crate::model::SubProviderView {
+                        key: (*key).into(),
+                        provider: Some("moonshot".into()),
+                        model: Some("k3".into()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                applied: true,
+                runtime_policy_stamp: None,
+            },
+            message: "lanes updated".into(),
+        };
+        let arm_lane_save = |store: &mut Store| {
+            store.state.onboarding.research_lane_intent = true;
+            store.state.onboarding.provider_pending =
+                Some(crate::model::OnboardingProviderPending::Save);
+            store.state.onboarding.provider_save_target =
+                Some(OnboardingProviderSaveTarget::ResearchLane);
+            store.state.onboarding.pending_research_lane_key = Some("cheap".into());
+        };
+
+        // A non-empty echo WITHOUT our key: someone else's mutation — skip.
+        arm_lane_save(&mut store);
+        store.apply_sub_providers_mutation_event(event(&["strong"]));
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Save),
+            "an echo lacking the saved key must not complete the lane save"
+        );
+
+        // The echo containing our key: our completion — consume.
+        store.apply_sub_providers_mutation_event(event(&["strong", "cheap"]));
+        assert_eq!(store.state.onboarding.provider_pending, None);
+
+        // An EMPTY echo cannot disprove ownership — consume rather than wedge.
+        arm_lane_save(&mut store);
+        store.apply_sub_providers_mutation_event(event(&[]));
+        assert_eq!(
+            store.state.onboarding.provider_pending, None,
+            "an empty echo still completes (no 30s wedge on terse servers)"
+        );
+    }
+
+    /// K3 review of the fix set (coverage): the timeout sweep drops the
+    /// stashed lane key alongside the pending flag, so a later save can never
+    /// be labeled with a stale key.
+    #[test]
+    fn provider_pending_sweep_clears_stashed_lane_key() {
+        let mut store = store_with_empty_session();
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Save);
+        store.state.onboarding.provider_save_target =
+            Some(OnboardingProviderSaveTarget::ResearchLane);
+        store.state.onboarding.pending_research_lane_key = Some("cheap".into());
+
+        let start = std::time::Instant::now();
+        assert!(!store.sweep_provider_pending(start), "first tick stamps");
+        assert!(
+            store.sweep_provider_pending(
+                start + PROVIDER_PENDING_TIMEOUT + std::time::Duration::from_secs(1)
+            ),
+            "past the timeout the sweep clears the wedge"
+        );
+        assert_eq!(store.state.onboarding.provider_pending, None);
+        assert_eq!(
+            store.state.onboarding.pending_research_lane_key, None,
+            "the stashed lane key dies with the timed-out save"
+        );
+    }
+
+    /// K3 review of the fix set (coverage): the bare `/research add` entry —
+    /// per-verb capability gate, intent set, wizard open, and the prefetch
+    /// that is conditional on `profile/sub_providers/list`.
+    #[test]
+    fn bare_research_add_gates_sets_intent_and_prefetches_conditionally() {
+        // UPSERT + LIST: accepted, wizard open, intent set, lane list prefetched.
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+        ]));
+        let cmd = store
+            .dispatch_research_slash("/research add")
+            .into_command();
+        match cmd {
+            Some(AppUiCommand::ProfileSubProvidersList(params)) => {
+                assert_eq!(params.profile_id.as_deref(), Some("coding"));
+            }
+            other => panic!("expected a lane-list prefetch, got {other:?}"),
+        }
+        assert!(store.state.onboarding.research_lane_intent);
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+
+        // UPSERT only: accepted with NO prefetch (list not advertised — a
+        // request would just be rejected noise).
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(lane_capabilities());
+        let outcome = store.dispatch_research_slash("/research add");
+        assert!(
+            matches!(outcome, SlashDispatchOutcome::Accepted(None)),
+            "no lane-list prefetch without the list capability: {outcome:?}"
+        );
+        assert!(store.state.onboarding.research_lane_intent);
+
+        // LIST only (no upsert): refused up front — the wizard could never
+        // save, so it must not open (the F4 regression guard).
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+        ]));
+        let outcome = store.dispatch_research_slash("/research add");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+        assert!(
+            !store.state.onboarding.research_lane_intent,
+            "a refused entry must not leave a live lane intent behind"
+        );
+        assert!(!store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
     }
 }
