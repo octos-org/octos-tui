@@ -149,6 +149,37 @@ mod i18n_tests {
         }
     }
 
+    /// PR384 fixes: the research-lane wizard strings (lane-aware save row,
+    /// lane-key picker, saved status/target labels) resolve in BOTH locales.
+    #[test]
+    fn research_lane_wizard_keys_resolve_in_en_and_zh() {
+        let keys = [
+            "onboarding.provider.research_lane",
+            "onboarding.provider.save_research_lane",
+            "menu.onboard.item.save_research_lane.desc",
+            "menu.research_lane_key.title",
+            "menu.research_lane_key.subtitle",
+            "menu.research_lane_key.occupied",
+            "menu.research_lane_key.vacant",
+            "menu.research_lane_key.item.cheap.desc",
+            "menu.research_lane_key.item.strong.desc",
+            "status.research_lane_saved",
+        ];
+        for key in keys {
+            for locale in ["en", "zh"] {
+                let value = t!(key, locale = locale);
+                assert_ne!(
+                    &*value, key,
+                    "missing {locale} translation for `{key}` (got the raw key back)"
+                );
+                assert!(
+                    !value.trim().is_empty(),
+                    "empty {locale} translation for `{key}`"
+                );
+            }
+        }
+    }
+
     /// #362: the side-by-side diff view toggle strings (footer hints + status
     /// feedback) resolve in BOTH locales.
     #[test]

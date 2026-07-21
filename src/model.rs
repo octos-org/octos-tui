@@ -2227,6 +2227,11 @@ pub enum OnboardingProviderPending {
 pub enum OnboardingProviderSaveTarget {
     Primary,
     Fallback,
+    /// Save the staged provider as a research sub-provider lane (the `/research`
+    /// add flow reuses the model wizard, but the result lands in
+    /// `profile/sub_providers/upsert` as a named lane, not the profile's
+    /// primary/fallback provider).
+    ResearchLane,
 }
 
 /// M22-E: product-grade lifecycle status for the provider setup
@@ -2455,6 +2460,18 @@ pub struct OnboardingWizardState {
     /// `MENU_UNDO_CONFIRM`, whose Yes row sends `snapshot/restore`.
     pub pending_snapshot_restore: Option<SnapshotRestoreRequest>,
     pub provider_save_target: Option<OnboardingProviderSaveTarget>,
+    /// Persistent "this wizard session is creating a RESEARCH lane" intent, set
+    /// by bare `/research add` and kept for the WHOLE flow. Unlike
+    /// `provider_save_target` (a pending-op field cleared on every staged-input
+    /// edit), this is NOT cleared by `mark_onboarding_provider_dirty` /
+    /// `apply_selection` / key updates, so the Save routing stays lane-targeted
+    /// across normal wizard interaction (codex PR384 review).
+    pub research_lane_intent: bool,
+    /// The lane key ("cheap"/"strong") chosen in `MENU_RESEARCH_LANE_KEY` for
+    /// the lane save currently in flight. Stashed at dispatch so the applied
+    /// event can name the key in the confirmation; taken on consume, dropped
+    /// on error/timeout alongside `provider_pending`.
+    pub pending_research_lane_key: Option<String>,
     pub last_saved_provider_label: Option<String>,
     pub last_saved_provider_target: Option<OnboardingProviderSaveTarget>,
     pub saved_primary_provider_label: Option<String>,
@@ -2508,6 +2525,8 @@ impl Default for OnboardingWizardState {
             pending_research_lane_removal: None,
             pending_snapshot_restore: None,
             provider_save_target: None,
+            research_lane_intent: false,
+            pending_research_lane_key: None,
             last_saved_provider_label: None,
             last_saved_provider_target: None,
             saved_primary_provider_label: None,
@@ -2731,9 +2750,9 @@ impl OnboardingWizardState {
                 Some(OnboardingProviderSaveTarget::Fallback) => {
                     OnboardingProviderStatus::SavedFallback
                 }
-                Some(OnboardingProviderSaveTarget::Primary) | None => {
-                    OnboardingProviderStatus::SavedPrimary
-                }
+                Some(OnboardingProviderSaveTarget::Primary)
+                | Some(OnboardingProviderSaveTarget::ResearchLane)
+                | None => OnboardingProviderStatus::SavedPrimary,
             };
         }
         if !self.selection_ready() {
@@ -2806,6 +2825,48 @@ impl OnboardingWizardState {
         self.selection_ready().then(|| ProfileLlmFetchModelsParams {
             profile_id: self.effective_profile_id(current_profile),
             selection: self.provider.clone(),
+            api_key: self.api_key.clone(),
+        })
+    }
+
+    /// Build the `/research` sub-provider lane upsert from the wizard's staged
+    /// provider selection. Maps the wizard's `LlmSelectionConfig` onto a
+    /// `SubProviderView` (family→provider, model→model, route→base_url /
+    /// api_key_env / api_type) so the rich model-setting flow lands as a named
+    /// research lane instead of the profile's primary/fallback provider. The
+    /// lane `key` is the caller's explicit choice from `MENU_RESEARCH_LANE_KEY`
+    /// ("cheap"/"strong") — the deep_research palette requests lanes by those
+    /// LITERAL keys (`contract_for`), so a family-id key would produce a lane
+    /// the router never selects (PR384 review P1-b).
+    pub fn build_research_lane_params(
+        &self,
+        current_profile: Option<&str>,
+        key: &str,
+    ) -> Option<SubProvidersUpsertParams> {
+        if !self.selection_ready() {
+            return None;
+        }
+        let key = key.trim();
+        if key.is_empty() {
+            return None;
+        }
+        let route = &self.provider.route;
+        let key = key.to_string();
+        Some(SubProvidersUpsertParams {
+            // Use the caller-resolved ACTIVE profile directly (codex PR384 F3):
+            // do NOT fall back to `effective_profile_id`, which prefers a stale
+            // `onboarding.profile_id` and could retarget the lane to the wrong
+            // profile or the server default.
+            profile_id: current_profile.map(str::to_owned),
+            sub_provider: SubProviderView {
+                key,
+                provider: non_empty(self.provider.family_id.trim().to_string()),
+                model: non_empty(self.provider.model_id.trim().to_string()),
+                api_key_env: route.api_key_env.clone(),
+                base_url: route.base_url.clone(),
+                api_type: route.api_type.clone(),
+                ..Default::default()
+            },
             api_key: self.api_key.clone(),
         })
     }

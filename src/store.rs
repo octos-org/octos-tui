@@ -807,6 +807,40 @@ impl Store {
                 )))
             }
             Some("add") | Some("set") => {
+                // Bare `/research add` (no args) opens the model-setting wizard
+                // (the same flow as /model add-model) targeted at a research
+                // lane, instead of the terse inline form. Set the PERSISTENT
+                // lane intent (survives wizard edits) rather than the transient
+                // provider_save_target, which the dirty-marking paths clear.
+                if tokens.clone().next().is_none() {
+                    // Codex PR384 review (F4): gate on lane UPSERT, not just the
+                    // wizard. On a lane-list-only server the wizard couldn't save,
+                    // so block here with the friendly capability message instead.
+                    if !self.require_appui_method(
+                        crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+                    ) {
+                        return SlashDispatchOutcome::Rejected;
+                    }
+                    self.state.onboarding.research_lane_intent = true;
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                    // Prefetch the lane list (when the server can list) so the
+                    // Save-time key picker shows current cheap/strong occupancy
+                    // instead of a cold cache.
+                    let can_list = self
+                        .state
+                        .capabilities
+                        .as_ref()
+                        .is_some_and(|capabilities| {
+                            capabilities.supports_method(
+                                crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+                            )
+                        });
+                    return SlashDispatchOutcome::accepted(can_list.then_some(
+                        AppUiCommand::ProfileSubProvidersList(SubProvidersListParams {
+                            profile_id,
+                        }),
+                    ));
+                }
                 // Require key + provider + MODEL (a dropped model used to save a
                 // lane with no model), and reject trailing junk.
                 let (key, provider, model) = (tokens.next(), tokens.next(), tokens.next());
@@ -1668,6 +1702,7 @@ impl Store {
                 ));
                 None
             }
+            LocalAction::SaveResearchLaneAs(key) => self.dispatch_save_research_lane_as(&key),
             LocalAction::RequestRestoreSnapshot(request) => {
                 self.state.onboarding.pending_snapshot_restore = Some(*request);
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_UNDO_CONFIRM));
@@ -2838,6 +2873,11 @@ impl Store {
                 // create intent — otherwise `/onboard` after Esc-ing out of a
                 // create wizard would wrongly render the create step.
                 self.state.onboarding.creating_new_profile = false;
+                // Same stale-intent class for the research-lane flag (PR384
+                // review P1-a): `/onboard` is a PROVIDER save flow — a lane
+                // intent left over from an abandoned `/research add` must not
+                // silently reroute its Save into a sub-provider lane.
+                self.state.onboarding.research_lane_intent = false;
                 // From the Phase 3 startup picker's "Create a new profile" row,
                 // replace the picker rather than stacking onboarding over it.
                 if self.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER) {
@@ -3637,6 +3677,13 @@ impl Store {
     }
 
     fn onboarding_save_provider_command(&mut self) -> Option<AppUiCommand> {
+        // Route on the PERSISTENT lane intent: bare `/research add` sets
+        // `research_lane_intent`, which survives staged-input edits (unlike the
+        // transient provider_save_target). A lane save goes to
+        // `profile/sub_providers/upsert`, not the profile's primary provider.
+        if self.state.onboarding.research_lane_intent {
+            return self.onboarding_save_research_lane_command();
+        }
         if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT) {
             return None;
         }
@@ -3664,6 +3711,84 @@ impl Store {
         self.state.status = t!("status.saving_provider_config").into_owned();
         self.refresh_active_menu_if_open();
         Some(AppUiCommand::ProfileLlmUpsert(params))
+    }
+
+    /// Save the wizard's staged provider as a research sub-provider lane (the
+    /// `/research` add flow). Validates the staged selection, then opens the
+    /// lane-KEY picker (`MENU_RESEARCH_LANE_KEY`) instead of dispatching: the
+    /// deep_research palette requests lanes by the literal keys
+    /// `cheap`/`strong`, so the user must land the save on one of those — a
+    /// family-id key would produce a lane the router never selects (PR384
+    /// review P1-b). The picker row fires [`Self::dispatch_save_research_lane_as`].
+    fn onboarding_save_research_lane_command(&mut self) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT) {
+            return None;
+        }
+        if let Some(pending) = self.state.onboarding.provider_pending {
+            self.state.status = onboarding_pending_status(pending);
+            self.refresh_active_menu_if_open();
+            return None;
+        }
+        let profile_id = self.active_profile_id();
+        // Codex PR384 review (F3): use the RESOLVED active profile directly, not
+        // `effective_profile_id` (which prefers a stale `onboarding.profile_id`).
+        // Refuse to save when no active profile is resolved rather than silently
+        // targeting the server default.
+        if profile_id.is_none() {
+            self.state.status = t!("status.research_profile_unresolved").into_owned();
+            return None;
+        }
+        // Validate the staged selection BEFORE the picker so it never opens on
+        // an incomplete wizard (the key itself is chosen in the picker).
+        if self
+            .state
+            .onboarding
+            .build_research_lane_params(profile_id.as_deref(), "cheap")
+            .is_none()
+        {
+            self.state.status = t!("status.onboarding_provider_selection_incomplete").into_owned();
+            return None;
+        }
+        self.open_menu(MenuId::from(crate::menu::registry::MENU_RESEARCH_LANE_KEY));
+        None
+    }
+
+    /// `MENU_RESEARCH_LANE_KEY` row fired: dispatch the staged wizard selection
+    /// as the research lane `key` ("cheap"/"strong"). Re-runs the save gates —
+    /// the picker sat open, so re-checking costs nothing and keeps this path
+    /// safe even if a future surface reaches it directly.
+    fn dispatch_save_research_lane_as(&mut self, key: &str) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT) {
+            return None;
+        }
+        if let Some(pending) = self.state.onboarding.provider_pending {
+            self.state.status = onboarding_pending_status(pending);
+            self.refresh_active_menu_if_open();
+            return None;
+        }
+        let profile_id = self.active_profile_id();
+        if profile_id.is_none() {
+            self.state.status = t!("status.research_profile_unresolved").into_owned();
+            return None;
+        }
+        let Some(params) = self
+            .state
+            .onboarding
+            .build_research_lane_params(profile_id.as_deref(), key)
+        else {
+            self.state.status = t!("status.onboarding_provider_selection_incomplete").into_owned();
+            return None;
+        };
+        // Pop the picker so the wizard beneath shows the pending save spinner.
+        self.close_menu();
+        self.state.onboarding.last_message = Some(t!("status.saving_provider").into_owned());
+        self.state.onboarding.provider_pending = Some(OnboardingProviderPending::Save);
+        self.state.onboarding.provider_save_target =
+            Some(OnboardingProviderSaveTarget::ResearchLane);
+        self.state.onboarding.pending_research_lane_key = Some(params.sub_provider.key.clone());
+        self.state.status = t!("status.saving_provider_config").into_owned();
+        self.refresh_active_menu_if_open();
+        Some(AppUiCommand::ProfileSubProvidersUpsert(params))
     }
 
     fn onboarding_save_provider_fallback_command(&mut self) -> Option<AppUiCommand> {
@@ -4131,6 +4256,11 @@ impl Store {
     /// verbs; the `/model` → "Add a model" row reaches the same surface via
     /// the family→model→route chain (whose route pick also lands here).
     fn open_model_config_surface(&mut self) {
+        // `/model` → Add a model / `/add-model` is a PROVIDER save flow: a
+        // research-lane intent left over from an abandoned `/research add`
+        // must not hijack this surface's Save into a lane upsert (PR384
+        // review P1-a — same stale-intent class as `creating_new_profile`).
+        self.state.onboarding.research_lane_intent = false;
         // The mid-session surface operates on the ACTIVE session's profile. A
         // staged wizard `profile_id` left over from an earlier create/onboard
         // outranks `current_profile` in `effective_profile_id`, so Test/Save
@@ -4241,9 +4371,31 @@ impl Store {
             // The stack may just have emptied — apply a restore whose
             // terminal was deferred by the open menu.
             self.apply_settled_interrupt_restore_after_menu_close();
+            self.clear_research_lane_intent_if_wizard_closed();
             return true;
         }
         false
+    }
+
+    /// The research-lane intent (bare `/research add`) lives exactly as long
+    /// as the wizard surface it was set for: once `MENU_ONBOARD` is no longer
+    /// anywhere in the menu stack, the flow was abandoned and the intent must
+    /// die with it — otherwise a LATER `/model` → Add-model Save would be
+    /// silently rerouted into a lane upsert (PR384 review P1-a; the same
+    /// Esc-lifecycle rule `creating_new_profile` follows). Child menus (family
+    /// / model / route pickers, the lane-key picker) stack OVER `MENU_ONBOARD`,
+    /// so popping one keeps the intent alive.
+    fn clear_research_lane_intent_if_wizard_closed(&mut self) {
+        if self.state.onboarding.research_lane_intent
+            && !self
+                .state
+                .menu_stack
+                .frames()
+                .iter()
+                .any(|frame| frame.id.as_str() == crate::menu::registry::MENU_ONBOARD)
+        {
+            self.state.onboarding.research_lane_intent = false;
+        }
     }
 
     /// True while the first-launch onboarding wizard is still in progress: the
@@ -4282,6 +4434,7 @@ impl Store {
         self.state.active_menu = None;
         // Apply a restore whose terminal was deferred by the open menu.
         self.apply_settled_interrupt_restore_after_menu_close();
+        self.clear_research_lane_intent_if_wizard_closed();
         true
     }
 
@@ -4706,6 +4859,10 @@ impl Store {
                     self.state.status =
                         t!("status.menu_label", id = frame.id.to_string()).into_owned();
                 }
+                // A replace can swap MENU_ONBOARD itself out without a pop —
+                // the wizard-exit sweep must see that departure too (no
+                // production row does this today; latent-path hardening).
+                self.clear_research_lane_intent_if_wizard_closed();
                 fetch
             }
             MenuAction::Close => {
@@ -7109,6 +7266,12 @@ impl Store {
                     crate::model::APPUI_METHOD_PROFILE_LLM_TEST,
                     crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
                     crate::model::APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+                    // A research-lane save is a staged-wizard RPC too (PR384
+                    // review P2-c): without this, a rejected lane upsert (e.g.
+                    // the #1775 api_key-without-env rule on manual providers)
+                    // freezes the wizard for the full 30s sweep and then shows
+                    // a misleading "timeout" instead of the server's reason.
+                    crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
                 ]
                 .iter()
                 .any(|method| error.message.contains(method));
@@ -7118,6 +7281,7 @@ impl Store {
                 if cancels_in_flight_provider {
                     self.state.onboarding.provider_pending = None;
                     self.state.onboarding.provider_pending_since = None;
+                    self.state.onboarding.pending_research_lane_key = None;
                     self.state.onboarding.last_message = Some(
                         t!("status.provider_request_failed", message = error.message).into_owned(),
                     );
@@ -8233,8 +8397,71 @@ impl Store {
         // re-fire it (it survives snapshot replay along with the rest of
         // `onboarding`).
         self.state.onboarding.pending_research_lane_removal = None;
+        let mut lane_save_completed = false;
         if event.result.applied {
             self.state.sub_providers_state = Some(event.result.to_list_result());
+            // Codex PR384 review (F2): a lane SAVE round-trip must complete the
+            // wizard's pending save, not just refresh the lanes cache — otherwise
+            // the wizard wedges in `Saving(ResearchLane)` until the 30s timeout.
+            // Scope the consume to the wizard's OWN lane save (pending Save +
+            // ResearchLane target): an unrelated applied sub_providers mutation
+            // (inline `/research add`, a lane remove) must NOT swallow a pending
+            // Test/primary Save — that would drop the real response into the
+            // legacy `None` arm and falsely mark the provider saved (PR384
+            // review P2-d). On consume, finish like the fallback save does:
+            // reset the staged selection and record what was saved (P3-f).
+            let lane_save_in_flight = matches!(
+                self.state.onboarding.provider_pending,
+                Some(OnboardingProviderPending::Save)
+            ) && matches!(
+                self.state.onboarding.provider_save_target,
+                Some(OnboardingProviderSaveTarget::ResearchLane)
+            );
+            // Mutation events carry no request id (transport correlates by
+            // method only), so also require the echoed lane list to CONTAIN
+            // the key we saved: a concurrent unrelated mutation (inline add of
+            // another key, a lane remove) echoes a list without our key and is
+            // provably not our save's completion. An EMPTY echo can't disprove
+            // it, so it still consumes (a server that echoes no rows must not
+            // wedge the wizard for 30s).
+            let echo_matches_pending_key =
+                match self.state.onboarding.pending_research_lane_key.as_deref() {
+                    Some(key) => {
+                        event.result.sub_providers.is_empty()
+                            || event
+                                .result
+                                .sub_providers
+                                .iter()
+                                .any(|lane| lane.key == key)
+                    }
+                    None => true,
+                };
+            if lane_save_in_flight && echo_matches_pending_key {
+                let staged_provider_label = self.state.onboarding.provider_label();
+                let lane_key = self.state.onboarding.pending_research_lane_key.take();
+                self.state.onboarding.provider_pending = None;
+                self.state.onboarding.provider_pending_since = None;
+                self.state.onboarding.provider_save_target = None;
+                self.state.onboarding.provider_tested = false;
+                self.state.onboarding.provider_test_failure_reason = None;
+                self.state.onboarding.last_saved_provider_label =
+                    Some(staged_provider_label.clone());
+                self.state.onboarding.last_saved_provider_target =
+                    Some(OnboardingProviderSaveTarget::ResearchLane);
+                self.state.onboarding.research_lane_intent = false;
+                self.state.onboarding.reset_staged_provider();
+                // Post-save hint (P1-b UX): name the lane key so the user knows
+                // which routing slot deep_research will pick up.
+                self.state.onboarding.last_message = Some(
+                    t!(
+                        "status.research_lane_saved",
+                        key = lane_key.as_deref().unwrap_or("?"),
+                        label = staged_provider_label
+                    )
+                    .into_owned(),
+                );
+                lane_save_completed = true;
+            }
         }
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
@@ -8242,6 +8469,10 @@ impl Store {
             event.message.clone(),
         ));
         self.state.status = event.message;
+        if lane_save_completed {
+            self.refresh_active_menu_if_open();
+            self.focus_provider_start_row();
+        }
     }
 
     fn apply_profile_llm_mutation_event(&mut self, event: ProfileLlmMutationClientEvent) {
@@ -8269,7 +8500,8 @@ impl Store {
                             self.state.onboarding.saved_primary_provider_label =
                                 Some(staged_provider_label.clone());
                         }
-                        OnboardingProviderSaveTarget::Fallback => {
+                        OnboardingProviderSaveTarget::Fallback
+                        | OnboardingProviderSaveTarget::ResearchLane => {
                             self.state.onboarding.provider_tested = false;
                             reset_staged_provider = true;
                         }
@@ -11053,6 +11285,7 @@ impl Store {
         }
         self.state.onboarding.provider_pending = None;
         self.state.onboarding.provider_pending_since = None;
+        self.state.onboarding.pending_research_lane_key = None;
         self.state.onboarding.last_message =
             Some(t!("status.provider_request_timeout").into_owned());
         self.state.status = t!("status.provider_request_timeout").into_owned();
@@ -31505,5 +31738,513 @@ mod tests {
             vec!["early follow-up".to_string()],
             "the staged prompt stays queued behind the in-progress turn"
         );
+    }
+
+    /// Codex PR384 review (F1): the research-lane intent must SURVIVE normal
+    /// wizard interaction. `provider_save_target` is cleared on every
+    /// staged-input edit (dirty marking), so routing a lane save on it would
+    /// silently fall through to a primary-provider save after the user edits.
+    /// The separate `research_lane_intent` flag is NOT cleared by edits, so the
+    /// Save stays lane-targeted for the whole flow.
+    #[test]
+    fn research_lane_intent_survives_wizard_edits() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.onboarding.research_lane_intent = true;
+        store.state.onboarding.provider_save_target =
+            Some(OnboardingProviderSaveTarget::ResearchLane);
+
+        // A staged-input edit clears the transient save target but NOT the intent.
+        store.mark_onboarding_provider_dirty("edited");
+        assert!(
+            store.state.onboarding.provider_save_target.is_none(),
+            "edits clear the transient provider_save_target"
+        );
+        assert!(
+            store.state.onboarding.research_lane_intent,
+            "the persistent lane intent survives the edit"
+        );
+    }
+
+    /// Stage a complete provider selection so `selection_ready()` holds and a
+    /// lane save has everything it maps into `SubProviderView`.
+    fn stage_ready_lane_selection(store: &mut Store) {
+        store.state.onboarding.provider.family_id = "moonshot".into();
+        store.state.onboarding.provider.model_id = "k3".into();
+        store.state.onboarding.provider.route.route_id = "official".into();
+        store.state.onboarding.provider.route.base_url = Some("https://api.kimi.com/v1".into());
+        store.state.onboarding.provider.route.api_key_env = Some("KIMI_API_KEY".into());
+        store.state.onboarding.provider.route.api_type = Some("openai".into());
+    }
+
+    fn lane_capabilities() -> crate::menu::CapabilitySet {
+        crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+        ])
+    }
+
+    /// PR384 fix P1-b: the lane key is an explicit caller choice — an empty or
+    /// whitespace key never builds params (no silent family-id fallback), and
+    /// the chosen key is trimmed.
+    #[test]
+    fn research_lane_params_require_an_explicit_key() {
+        let mut store = store_with_empty_session();
+        stage_ready_lane_selection(&mut store);
+        let onboarding = &store.state.onboarding;
+        assert!(
+            onboarding
+                .build_research_lane_params(Some("coding"), "")
+                .is_none(),
+            "an empty key must not build lane params"
+        );
+        assert!(
+            onboarding
+                .build_research_lane_params(Some("coding"), "   ")
+                .is_none(),
+            "a whitespace key must not build lane params"
+        );
+        let params = onboarding
+            .build_research_lane_params(Some("coding"), " strong ")
+            .expect("ready selection + explicit key builds params");
+        assert_eq!(params.sub_provider.key, "strong");
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+        assert_eq!(params.sub_provider.provider.as_deref(), Some("moonshot"));
+        assert_eq!(params.sub_provider.model.as_deref(), Some("k3"));
+        assert_eq!(
+            params.sub_provider.api_key_env.as_deref(),
+            Some("KIMI_API_KEY")
+        );
+    }
+
+    /// PR384 fix P1-b: Save in lane mode opens the cheap/strong key picker
+    /// instead of dispatching an upsert keyed by the family id (which the
+    /// deep_research router would never select).
+    #[test]
+    fn lane_save_opens_key_picker_then_picker_row_dispatches_chosen_key() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(lane_capabilities());
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        store.state.onboarding.research_lane_intent = true;
+        stage_ready_lane_selection(&mut store);
+
+        let cmd =
+            store.dispatch_onboarding_action(crate::model::OnboardingAction::SaveProvider, None);
+        assert!(
+            cmd.is_none(),
+            "lane Save opens the key picker, it does not dispatch yet: {cmd:?}"
+        );
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+            "the lane-key picker is the active menu"
+        );
+        assert_eq!(
+            store.state.onboarding.provider_pending, None,
+            "nothing is pending while the picker is open"
+        );
+
+        // Picker row fired: the upsert carries the CHOSEN key, not the family.
+        let cmd = store.dispatch_menu_action(MenuAction::Local(LocalAction::SaveResearchLaneAs(
+            "cheap".into(),
+        )));
+        match cmd {
+            Some(AppUiCommand::ProfileSubProvidersUpsert(params)) => {
+                assert_eq!(params.sub_provider.key, "cheap");
+                assert_eq!(params.profile_id.as_deref(), Some("coding"));
+                assert_eq!(params.sub_provider.provider.as_deref(), Some("moonshot"));
+                assert_eq!(params.sub_provider.model.as_deref(), Some("k3"));
+            }
+            other => panic!("expected a ProfileSubProvidersUpsert command, got {other:?}"),
+        }
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Save)
+        );
+        assert_eq!(
+            store.state.onboarding.provider_save_target,
+            Some(OnboardingProviderSaveTarget::ResearchLane)
+        );
+        assert_eq!(
+            store.state.onboarding.pending_research_lane_key.as_deref(),
+            Some("cheap")
+        );
+        assert!(
+            !store.active_menu_id_is(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+            "the picker pops so the wizard shows the pending save"
+        );
+    }
+
+    /// PR384 fix F2 (corrected): an applied lane mutation completes the
+    /// wizard's OWN lane save — consumes the pending flag, records the save,
+    /// resets the staged selection (like a fallback save), clears the intent,
+    /// and names the lane key in the completion message.
+    #[test]
+    fn applied_lane_mutation_completes_the_wizard_lane_save() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(lane_capabilities());
+        stage_ready_lane_selection(&mut store);
+        store.state.onboarding.research_lane_intent = true;
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Save);
+        store.state.onboarding.provider_save_target =
+            Some(OnboardingProviderSaveTarget::ResearchLane);
+        store.state.onboarding.pending_research_lane_key = Some("cheap".into());
+
+        store.apply_sub_providers_mutation_event(SubProvidersMutationClientEvent {
+            result: crate::model::SubProvidersMutationResult {
+                profile_id: Some("coding".into()),
+                sub_providers: vec![crate::model::SubProviderView {
+                    key: "cheap".into(),
+                    provider: Some("moonshot".into()),
+                    model: Some("k3".into()),
+                    ..Default::default()
+                }],
+                applied: true,
+                runtime_policy_stamp: None,
+            },
+            message: "research lane saved".into(),
+        });
+
+        assert_eq!(store.state.onboarding.provider_pending, None);
+        assert_eq!(store.state.onboarding.provider_save_target, None);
+        assert_eq!(
+            store.state.onboarding.last_saved_provider_target,
+            Some(OnboardingProviderSaveTarget::ResearchLane)
+        );
+        assert!(
+            !store.state.onboarding.research_lane_intent,
+            "a completed lane save ends the lane flow"
+        );
+        assert_eq!(
+            store.state.onboarding.pending_research_lane_key, None,
+            "the stashed key is consumed"
+        );
+        assert!(
+            store.state.onboarding.provider.family_id.is_empty(),
+            "the staged selection resets after the lane save (like fallback)"
+        );
+        let message = store
+            .state
+            .onboarding
+            .last_message
+            .clone()
+            .expect("completion message set");
+        assert!(
+            message.contains("cheap"),
+            "the completion names the lane key: {message}"
+        );
+    }
+
+    /// PR384 fix P2-d: an applied sub_providers mutation that is NOT the
+    /// wizard's lane save (inline `/research add`, a lane remove confirm) must
+    /// not consume an unrelated pending wizard op — swallowing a pending Test
+    /// would drop the REAL test response into the legacy `None` arm, which
+    /// falsely marks the provider saved.
+    #[test]
+    fn applied_lane_mutation_leaves_unrelated_wizard_pending_alone() {
+        let mut store = store_with_empty_session();
+        stage_ready_lane_selection(&mut store);
+        let event = || SubProvidersMutationClientEvent {
+            result: crate::model::SubProvidersMutationResult {
+                profile_id: Some("coding".into()),
+                sub_providers: Vec::new(),
+                applied: true,
+                runtime_policy_stamp: None,
+            },
+            message: "lane removed".into(),
+        };
+
+        // Pending TEST: not a lane save — untouched.
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Test);
+        store.apply_sub_providers_mutation_event(event());
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Test),
+            "a lane mutation must not swallow a pending provider TEST"
+        );
+
+        // Pending PRIMARY save: also not a lane save — untouched.
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Save);
+        store.state.onboarding.provider_save_target = Some(OnboardingProviderSaveTarget::Primary);
+        store.apply_sub_providers_mutation_event(event());
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Save),
+            "a lane mutation must not swallow a pending PRIMARY save"
+        );
+        assert!(
+            !store.state.onboarding.provider_saved,
+            "no false 'provider saved' from the unrelated mutation"
+        );
+    }
+
+    /// PR384 fix P2-c: a rejected lane upsert (e.g. the octos#1775
+    /// api_key-without-env rule) must un-wedge `provider_pending` immediately
+    /// via error attribution — not freeze the wizard until the 30s sweep and
+    /// then report a misleading timeout.
+    #[test]
+    fn lane_upsert_error_frame_unwedges_pending_save() {
+        use octos_core::app_ui::AppUiError;
+        let mut store = store_with_empty_session();
+        store.state.onboarding.research_lane_intent = true;
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Save);
+        store.state.onboarding.provider_save_target =
+            Some(OnboardingProviderSaveTarget::ResearchLane);
+        store.state.onboarding.pending_research_lane_key = Some("cheap".into());
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "invalid_params".into(),
+            message: "profile/sub_providers/upsert request tui-7 failed: \
+                      sub_provider.api_key_env is required when an api_key is supplied"
+                .into(),
+        }));
+
+        assert_eq!(
+            store.state.onboarding.provider_pending, None,
+            "a failed lane upsert must un-wedge the staged surface"
+        );
+        assert_eq!(
+            store.state.onboarding.pending_research_lane_key, None,
+            "the stashed lane key drops with the failed save"
+        );
+        // The INTENT deliberately survives the error: the user is still in the
+        // lane flow and can fix the input and Save again as a lane.
+        assert!(
+            store.state.onboarding.research_lane_intent,
+            "a failed save keeps the lane flow active for a retry"
+        );
+    }
+
+    /// PR384 fix P1-a: the lane intent is scoped to the wizard surface it was
+    /// set for. Opening the PROVIDER save flows (`/onboard`, `/model` → config
+    /// surface) clears a stale intent so their Save is never silently rerouted
+    /// into a sub-provider lane.
+    #[test]
+    fn provider_flow_entries_clear_stale_research_lane_intent() {
+        // `/onboard` (OnboardingAction::Open)
+        let mut store = store_with_empty_session();
+        store.state.onboarding.research_lane_intent = true;
+        store.dispatch_onboarding_action(crate::model::OnboardingAction::Open, None);
+        assert!(
+            !store.state.onboarding.research_lane_intent,
+            "/onboard is a provider flow — a stale lane intent must not survive it"
+        );
+
+        // `/model` → Add a model (open_model_config_surface)
+        let mut store = store_with_empty_session();
+        store.state.onboarding.research_lane_intent = true;
+        store.open_model_config_surface();
+        assert!(
+            !store.state.onboarding.research_lane_intent,
+            "the model-config surface is a provider flow — same rule"
+        );
+    }
+
+    /// PR384 fix P1-a: abandoning the wizard (Esc / close-all) kills the lane
+    /// intent with it; popping a CHILD picker (family/model/route, the lane-key
+    /// picker) keeps the flow alive.
+    #[test]
+    fn research_lane_intent_dies_with_the_wizard_surface() {
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        store.state.onboarding.research_lane_intent = true;
+
+        // A child picker over the wizard: closing it keeps the intent.
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_RESEARCH_LANE_KEY));
+        store.close_menu();
+        assert!(
+            store.state.onboarding.research_lane_intent,
+            "popping a child picker keeps the wizard flow (and its intent) alive"
+        );
+
+        // Closing the wizard itself abandons the flow.
+        store.close_menu();
+        assert!(
+            !store.state.onboarding.research_lane_intent,
+            "the intent dies when MENU_ONBOARD leaves the stack"
+        );
+
+        // close_all_menus tears the surface down the same way.
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        store.state.onboarding.research_lane_intent = true;
+        store.close_all_menus();
+        assert!(
+            !store.state.onboarding.research_lane_intent,
+            "close_all_menus abandons the wizard flow too"
+        );
+    }
+
+    /// K3 review of the fix set (finding 1, refuted-but-pinned): the lane Save
+    /// path carries the same pending-RPC gate as the primary path — a Save
+    /// pressed while a Test is in flight must NOT open the key picker (and a
+    /// picker row must not dispatch), or the lane save would clobber the
+    /// pending Test slot and the Test response would complete "the lane save".
+    #[test]
+    fn lane_save_is_blocked_while_another_provider_rpc_is_pending() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(lane_capabilities());
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        store.state.onboarding.research_lane_intent = true;
+        stage_ready_lane_selection(&mut store);
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Test);
+
+        let cmd =
+            store.dispatch_onboarding_action(crate::model::OnboardingAction::SaveProvider, None);
+        assert!(cmd.is_none());
+        assert!(
+            !store.active_menu_id_is(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+            "the key picker must not open over an in-flight provider RPC"
+        );
+
+        // Even a directly-fired picker row is refused while pending.
+        let cmd = store.dispatch_menu_action(MenuAction::Local(LocalAction::SaveResearchLaneAs(
+            "cheap".into(),
+        )));
+        assert!(
+            cmd.is_none(),
+            "a picker row must not dispatch over an in-flight provider RPC"
+        );
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Test),
+            "the pending Test slot is not clobbered"
+        );
+    }
+
+    /// K3 review of the fix set (finding 2): mutation events have no request
+    /// id, so the consume also requires the echoed lane list to contain the
+    /// key we saved. A concurrent unrelated mutation (different key) echoes a
+    /// list without our key → provably not our completion → not consumed. An
+    /// empty echo can't disprove ownership → still consumes (no 30s wedge on
+    /// servers that echo no rows).
+    #[test]
+    fn lane_save_consume_requires_the_echo_to_contain_the_saved_key() {
+        let mut store = store_with_empty_session();
+        stage_ready_lane_selection(&mut store);
+        let event = |keys: &[&str]| SubProvidersMutationClientEvent {
+            result: crate::model::SubProvidersMutationResult {
+                profile_id: Some("coding".into()),
+                sub_providers: keys
+                    .iter()
+                    .map(|key| crate::model::SubProviderView {
+                        key: (*key).into(),
+                        provider: Some("moonshot".into()),
+                        model: Some("k3".into()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                applied: true,
+                runtime_policy_stamp: None,
+            },
+            message: "lanes updated".into(),
+        };
+        let arm_lane_save = |store: &mut Store| {
+            store.state.onboarding.research_lane_intent = true;
+            store.state.onboarding.provider_pending =
+                Some(crate::model::OnboardingProviderPending::Save);
+            store.state.onboarding.provider_save_target =
+                Some(OnboardingProviderSaveTarget::ResearchLane);
+            store.state.onboarding.pending_research_lane_key = Some("cheap".into());
+        };
+
+        // A non-empty echo WITHOUT our key: someone else's mutation — skip.
+        arm_lane_save(&mut store);
+        store.apply_sub_providers_mutation_event(event(&["strong"]));
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Save),
+            "an echo lacking the saved key must not complete the lane save"
+        );
+
+        // The echo containing our key: our completion — consume.
+        store.apply_sub_providers_mutation_event(event(&["strong", "cheap"]));
+        assert_eq!(store.state.onboarding.provider_pending, None);
+
+        // An EMPTY echo cannot disprove ownership — consume rather than wedge.
+        arm_lane_save(&mut store);
+        store.apply_sub_providers_mutation_event(event(&[]));
+        assert_eq!(
+            store.state.onboarding.provider_pending, None,
+            "an empty echo still completes (no 30s wedge on terse servers)"
+        );
+    }
+
+    /// K3 review of the fix set (coverage): the timeout sweep drops the
+    /// stashed lane key alongside the pending flag, so a later save can never
+    /// be labeled with a stale key.
+    #[test]
+    fn provider_pending_sweep_clears_stashed_lane_key() {
+        let mut store = store_with_empty_session();
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Save);
+        store.state.onboarding.provider_save_target =
+            Some(OnboardingProviderSaveTarget::ResearchLane);
+        store.state.onboarding.pending_research_lane_key = Some("cheap".into());
+
+        let start = std::time::Instant::now();
+        assert!(!store.sweep_provider_pending(start), "first tick stamps");
+        assert!(
+            store.sweep_provider_pending(
+                start + PROVIDER_PENDING_TIMEOUT + std::time::Duration::from_secs(1)
+            ),
+            "past the timeout the sweep clears the wedge"
+        );
+        assert_eq!(store.state.onboarding.provider_pending, None);
+        assert_eq!(
+            store.state.onboarding.pending_research_lane_key, None,
+            "the stashed lane key dies with the timed-out save"
+        );
+    }
+
+    /// K3 review of the fix set (coverage): the bare `/research add` entry —
+    /// per-verb capability gate, intent set, wizard open, and the prefetch
+    /// that is conditional on `profile/sub_providers/list`.
+    #[test]
+    fn bare_research_add_gates_sets_intent_and_prefetches_conditionally() {
+        // UPSERT + LIST: accepted, wizard open, intent set, lane list prefetched.
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+        ]));
+        let cmd = store
+            .dispatch_research_slash("/research add")
+            .into_command();
+        match cmd {
+            Some(AppUiCommand::ProfileSubProvidersList(params)) => {
+                assert_eq!(params.profile_id.as_deref(), Some("coding"));
+            }
+            other => panic!("expected a lane-list prefetch, got {other:?}"),
+        }
+        assert!(store.state.onboarding.research_lane_intent);
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+
+        // UPSERT only: accepted with NO prefetch (list not advertised — a
+        // request would just be rejected noise).
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(lane_capabilities());
+        let outcome = store.dispatch_research_slash("/research add");
+        assert!(
+            matches!(outcome, SlashDispatchOutcome::Accepted(None)),
+            "no lane-list prefetch without the list capability: {outcome:?}"
+        );
+        assert!(store.state.onboarding.research_lane_intent);
+
+        // LIST only (no upsert): refused up front — the wizard could never
+        // save, so it must not open (the F4 regression guard).
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+        ]));
+        let outcome = store.dispatch_research_slash("/research add");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+        assert!(
+            !store.state.onboarding.research_lane_intent,
+            "a refused entry must not leave a live lane intent behind"
+        );
+        assert!(!store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
     }
 }

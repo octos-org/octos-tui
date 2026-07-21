@@ -335,6 +335,8 @@ onboarding:
     saved_status_none: "已保存供应商：无"
     primary: "主供应商"
     fallback: "备用"
+    research_lane: "研究通道"
+    save_research_lane: "保存为研究通道"
   disabled:
     name_empty: "姓名为空"
     username_empty: "用户名为空"
@@ -586,6 +588,16 @@ menu:
       yes: "是，移除 %{lane}"
       yes_desc: "使用 profile/sub_providers/remove；完成后通道列表会刷新。"
       no: "否，保留"
+  research_lane_key:
+    title: "保存为哪个研究通道…"
+    subtitle: "深度研究按通道键路由 —— %{provider} 将成为你选择的通道。需重启生效。"
+    occupied: "当前为 %{current}（保存将替换它）"
+    vacant: "尚未配置"
+    item:
+      cheap:
+        desc: "快速/廉价通道 —— deep_research 用于扫描与摘要阶段。"
+      strong:
+        desc: "强推理通道 —— deep_research 用于深度推理与综合阶段。"
   agents:
     item:
       dock_collapse:
@@ -991,6 +1003,8 @@ menu:
       save_provider:
         desc: 使用 profile/llm/upsert 持久化到与仪表盘相同的档案 JSON。
         label: 保存供应商到档案
+      save_research_lane:
+        desc: "将已配置的供应商保存为深度研究通道（profile/sub_providers/upsert）—— 下一步选择通道：cheap 或 strong。"
       saved_provider:
         desc: 上次成功保存的主要或备用供应商
       selected_provider:
@@ -1206,6 +1220,7 @@ status:
   research_add_usage: "用法：/research add <key> <provider> <model> [base_url] [api_key_env]"
   research_rm_usage: "用法：/research rm <key>"
   research_profile_unresolved: "当前档案尚未就绪 —— 请在会话准备好后重试。"
+  research_lane_saved: "研究通道 %{key} 已保存：%{label} —— 需重启生效。"
   opening_diff_preview: "正在打开差异预览：%{operation} %{path}"
   opening_inline_diff_preview: "正在打开内联差异预览：%{title}"
   approval_requested: "请求审批：%{title}"
