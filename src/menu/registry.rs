@@ -58,6 +58,12 @@ pub const MENU_RESEARCH: &str = "research";
 /// Yes/No confirm for removing a staged research lane via
 /// `profile/sub_providers/remove`.
 pub const MENU_RESEARCH_REMOVE_CONFIRM: &str = "research-remove-confirm";
+/// `/undo` snapshot picker (#1768).
+pub const MENU_UNDO: &str = "undo";
+/// #324: Alt+S session switcher popup (open sessions, live/unread badges).
+pub const MENU_SESSIONS: &str = "sessions";
+/// Yes/No confirm for restoring the staged snapshot via `snapshot/restore`.
+pub const MENU_UNDO_CONFIRM: &str = "undo-confirm";
 pub const MENU_COST: &str = "cost";
 /// `/resume` session picker menu.
 pub const MENU_RESUME: &str = "resume";
@@ -649,6 +655,32 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         // back the isolated deep_research pipeline router. Bare opens the lanes
         // menu; `add`/`rm` mutate a lane inline (Custom, like the autonomy
         // verbs). Gated on the sub_providers list method so old servers hide it.
+        // `/undo` (#1768) — the workspace snapshot picker: roll agent file
+        // mutations back to a pre-mutation undo point. Gated on the snapshot
+        // list method so old servers hide it.
+        // #324: the session switcher popup (same surface as Alt+S).
+        CommandSpec {
+            name: "sessions",
+            aliases: &["ss"],
+            description: "command.sessions.desc",
+            category: CommandCategory::Session,
+            availability: CommandAvailability::always(),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::OpenMenu(MenuId::from(crate::menu::registry::MENU_SESSIONS)),
+        },
+        CommandSpec {
+            name: "undo",
+            aliases: &["snapshots"],
+            description: "command.undo.desc",
+            category: CommandCategory::Session,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_when_capabilities(&[
+                    crate::model::APPUI_METHOD_SNAPSHOT_LIST,
+                ]),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::LocalAction(LocalAction::Custom("undo")),
+        },
         CommandSpec {
             name: "research",
             aliases: &["lanes"],
@@ -727,7 +759,9 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         },
         CommandSpec {
             name: "resume",
-            aliases: &["sessions"],
+            // #324: the "sessions" alias moved to the Alt+S open-session
+            // switcher popup; /resume keeps its primary name.
+            aliases: &[],
             description: "Switch to a prior session and reload its transcript.",
             category: CommandCategory::Session,
             // Gated on ALL of `APPUI_RESUME_MENU_METHODS_ALL` (`session/list` +
@@ -1031,10 +1065,12 @@ mod tests {
         let resume = registry.find("resume").expect("/resume is registered");
         assert_eq!(resume.name, "resume");
         assert!(resume.history_safe(), "/resume must be history-safe");
+        // #324: the "sessions" name now belongs to the Alt+S open-session
+        // switcher popup, not /resume.
         assert_eq!(
             registry.find("/sessions").map(|command| command.name),
-            Some("resume"),
-            "/sessions must alias /resume"
+            Some("sessions"),
+            "/sessions is the open-session switcher popup"
         );
 
         // `/resume` fetches the list via `session/list` AND loads the chosen

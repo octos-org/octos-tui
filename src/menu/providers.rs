@@ -91,6 +91,9 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::Skills,
         Provider::Research,
         Provider::ResearchRemoveConfirm,
+        Provider::Undo,
+        Provider::UndoConfirm,
+        Provider::Sessions,
         Provider::FilePicker,
     ] {
         registry
@@ -139,6 +142,9 @@ enum Provider {
     Research,
     ResearchRemoveConfirm,
     FilePicker,
+    Undo,
+    UndoConfirm,
+    Sessions,
 }
 
 impl MenuProvider for Provider {
@@ -181,6 +187,9 @@ impl MenuProvider for Provider {
             Self::Research => crate::menu::registry::MENU_RESEARCH,
             Self::ResearchRemoveConfirm => crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM,
             Self::FilePicker => crate::menu::registry::MENU_FILE_PICKER,
+            Self::Undo => crate::menu::registry::MENU_UNDO,
+            Self::UndoConfirm => crate::menu::registry::MENU_UNDO_CONFIRM,
+            Self::Sessions => crate::menu::registry::MENU_SESSIONS,
         })
     }
 
@@ -223,6 +232,9 @@ impl MenuProvider for Provider {
             Self::Research => research_menu(ctx),
             Self::ResearchRemoveConfirm => research_remove_confirm_menu(ctx),
             Self::FilePicker => file_picker_menu(ctx),
+            Self::Undo => undo_menu(ctx),
+            Self::UndoConfirm => undo_confirm_menu(ctx),
+            Self::Sessions => sessions_menu(ctx),
         }
     }
 
@@ -4387,6 +4399,270 @@ fn research_remove_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         searchable: false,
         search_placeholder: None,
         footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// `/undo` picker (#1768): the ACTIVE session's workspace snapshot undo
+/// points, newest first. Selecting a row stages a restore and opens the
+/// Yes/No confirm with the session + snapshot CAPTURED at build time.
+fn undo_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let can_list = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_SNAPSHOT_LIST);
+    let can_restore = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_SNAPSHOT_RESTORE);
+    let session_id = ctx.app.selected_session_id.cloned();
+
+    let refresh_action = match (can_list, session_id.as_ref()) {
+        (true, Some(session_id)) => MenuAction::send_appui(AppUiCommand::SnapshotList(
+            crate::model::SnapshotListParams {
+                session_id: session_id.clone(),
+            },
+        )),
+        _ => MenuAction::Noop,
+    };
+    let mut refresh = MenuItem::new(
+        "undo.refresh",
+        t!("menu.undo.item.refresh.label"),
+        refresh_action,
+    )
+    .with_description(t!("menu.undo.item.refresh.desc"));
+    if !can_list {
+        refresh = refresh.disabled(method_missing_reason(
+            ctx,
+            crate::model::APPUI_METHOD_SNAPSHOT_LIST,
+        ));
+    }
+    let mut items = vec![refresh];
+
+    // Display-match: only show a cache that belongs to the ACTIVE session —
+    // a stale list from another session must never stage a restore here.
+    let cached = ctx.app.snapshots_state.filter(|state| {
+        state.session_id.is_some() && state.session_id.as_ref() == session_id.as_ref()
+    });
+    match cached {
+        None => {
+            items.push(
+                MenuItem::new(
+                    "undo.stale",
+                    t!("menu.undo.item.stale.label"),
+                    MenuAction::Noop,
+                )
+                .disabled(t!("menu.undo.item.stale.desc").into_owned()),
+            );
+        }
+        Some(state) if !state.available => {
+            items.push(
+                MenuItem::new(
+                    "undo.unavailable",
+                    t!("menu.undo.item.unavailable.label"),
+                    MenuAction::Noop,
+                )
+                .disabled(t!("menu.undo.item.unavailable.desc").into_owned()),
+            );
+        }
+        Some(state) => {
+            if !state.enabled {
+                items.push(
+                    MenuItem::new(
+                        "undo.disabled_hint",
+                        t!("menu.undo.item.disabled.label"),
+                        MenuAction::Noop,
+                    )
+                    .disabled(t!("menu.undo.item.disabled.desc").into_owned()),
+                );
+            }
+            if state.snapshots.is_empty() {
+                items.push(
+                    MenuItem::new(
+                        "undo.empty",
+                        t!("menu.undo.item.empty.label"),
+                        MenuAction::Noop,
+                    )
+                    .disabled(t!("menu.undo.item.empty.desc").into_owned()),
+                );
+            }
+            for (idx, snap) in state.snapshots.iter().enumerate() {
+                let short = &snap.id[..snap.id.len().min(8)];
+                let label = format!(
+                    "{} · {} · {}",
+                    short,
+                    if snap.label.is_empty() {
+                        "snapshot"
+                    } else {
+                        &snap.label
+                    },
+                    snapshot_age(snap.timestamp_unix)
+                );
+                let action = match (can_restore, session_id.as_ref()) {
+                    (true, Some(session_id)) => {
+                        MenuAction::Local(crate::menu::types::LocalAction::RequestRestoreSnapshot(
+                            Box::new(crate::model::SnapshotRestoreRequest {
+                                session_id: session_id.clone(),
+                                snapshot_id: snap.id.clone(),
+                                label: label.clone(),
+                            }),
+                        ))
+                    }
+                    _ => MenuAction::Noop,
+                };
+                let mut item = MenuItem::new(format!("undo.snap.{idx}"), label, action)
+                    .with_description(t!("menu.undo.item.snap.desc"));
+                if !can_restore {
+                    item = item.disabled(method_missing_reason(
+                        ctx,
+                        crate::model::APPUI_METHOD_SNAPSHOT_RESTORE,
+                    ));
+                }
+                items.push(item);
+            }
+        }
+    }
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_UNDO),
+        title: t!("menu.undo.title").into_owned(),
+        subtitle: Some(t!("menu.undo.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.undo.footer").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Rough relative age for a snapshot row ("just now" / "3m" / "2h" / "5d").
+fn snapshot_age(timestamp_unix: i64) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let delta = (now - timestamp_unix).max(0);
+    if delta < 60 {
+        t!("menu.undo.age.just_now").into_owned()
+    } else if delta < 3600 {
+        format!("{}m", delta / 60)
+    } else if delta < 86_400 {
+        format!("{}h", delta / 3600)
+    } else {
+        format!("{}d", delta / 86_400)
+    }
+}
+
+/// Yes/No confirm for the staged snapshot restore (#1768). Yes sends
+/// `snapshot/restore` with the session + snapshot CAPTURED when the row was
+/// selected — a session switch while the confirm is open cannot retarget it.
+fn undo_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let Some(request) = ctx
+        .app
+        .onboarding
+        .and_then(|onboarding| onboarding.pending_snapshot_restore.clone())
+    else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(crate::menu::registry::MENU_UNDO_CONFIRM),
+            title: t!("menu.undo_confirm.title").into_owned(),
+            message: t!("menu.undo_confirm.item.empty.label").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        });
+    };
+    let can_restore = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_SNAPSHOT_RESTORE);
+    let mut yes = MenuItem::new(
+        "undo.confirm.yes",
+        t!("menu.undo_confirm.yes", snapshot = request.label.clone()),
+        if can_restore {
+            MenuAction::send_appui(AppUiCommand::SnapshotRestore(
+                crate::model::SnapshotRestoreParams {
+                    session_id: request.session_id.clone(),
+                    snapshot_id: request.snapshot_id.clone(),
+                },
+            ))
+        } else {
+            MenuAction::Noop
+        },
+    )
+    .with_description(t!("menu.undo_confirm.yes_desc"));
+    if !can_restore {
+        yes = yes.disabled(method_missing_reason(
+            ctx,
+            crate::model::APPUI_METHOD_SNAPSHOT_RESTORE,
+        ));
+    }
+    let items = vec![
+        yes,
+        MenuItem::new(
+            "undo.confirm.no",
+            t!("menu.undo_confirm.no"),
+            MenuAction::Close,
+        ),
+    ];
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_UNDO_CONFIRM),
+        title: t!("menu.undo_confirm.confirm_title", snapshot = request.label).into_owned(),
+        subtitle: Some(t!("menu.undo_confirm.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// #324: Alt+S / `/sessions` — the open-session switcher popup. Rows carry
+/// the same live-turn `✻` and unread `(n)` annotations as the top strip;
+/// selecting a row switches through the resume path (full switch bundle).
+fn sessions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let mut items = Vec::new();
+    for (idx, chip) in ctx.app.session_chips.iter().enumerate() {
+        let mut label = format!("{} {}", if chip.focused { "●" } else { "○" }, chip.title);
+        if chip.live {
+            label.push_str(" ✻");
+        }
+        if chip.unread > 0 {
+            label.push_str(&format!(" ({})", chip.unread));
+        }
+        if chip.focused {
+            items.push(
+                MenuItem::new(format!("sessions.row.{idx}"), label, MenuAction::Noop)
+                    .disabled(t!("menu.sessions.item.current").into_owned()),
+            );
+        } else {
+            items.push(
+                MenuItem::new(
+                    format!("sessions.row.{idx}"),
+                    label,
+                    MenuAction::Local(crate::menu::types::LocalAction::ResumeSession(
+                        chip.session_id.0.clone(),
+                    )),
+                )
+                .with_description(t!("menu.sessions.item.switch_desc")),
+            );
+        }
+    }
+    if items.is_empty() {
+        items.push(
+            MenuItem::new(
+                "sessions.empty",
+                t!("menu.sessions.item.empty"),
+                MenuAction::Noop,
+            )
+            .disabled(t!("menu.sessions.item.empty_desc").into_owned()),
+        );
+    }
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_SESSIONS),
+        title: t!("menu.sessions.title").into_owned(),
+        subtitle: Some(t!("menu.sessions.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.sessions.footer").into_owned()),
         preview: None,
         mode: MenuMode::SingleSelect,
     })
@@ -9755,6 +10031,206 @@ mod tests {
             ),
             MenuBuildResult::Unavailable(_)
         ));
+    }
+
+    /// #324: the Alt+S popup lists open sessions — the focused row is
+    /// informational, background rows switch via the resume path and carry
+    /// the live `✻` / unread `(n)` annotations.
+    #[test]
+    fn sessions_popup_lists_chips_and_switches_background_rows() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods(["session/hydrate"]);
+        let chips = vec![
+            crate::model::SessionChipView {
+                session_id: octos_core::SessionKey("local:a".into()),
+                title: "api-work".into(),
+                focused: true,
+                live: false,
+                unread: 0,
+            },
+            crate::model::SessionChipView {
+                session_id: octos_core::SessionKey("local:b".into()),
+                title: "octos-web".into(),
+                focused: false,
+                live: true,
+                unread: 3,
+            },
+        ];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                session_chips: chips,
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) =
+            registry.build(&MenuId::from(crate::menu::registry::MENU_SESSIONS), &ctx)
+        else {
+            panic!("expected sessions menu");
+        };
+        let focused = spec
+            .items
+            .iter()
+            .find(|item| item.id == "sessions.row.0")
+            .expect("focused row");
+        assert!(
+            focused.disabled_reason.is_some(),
+            "focused row is informational"
+        );
+        let bg = spec
+            .items
+            .iter()
+            .find(|item| item.id == "sessions.row.1")
+            .expect("background row");
+        assert!(bg.label.contains("✻"), "live badge shown: {}", bg.label);
+        assert!(bg.label.contains("(3)"), "unread badge shown: {}", bg.label);
+        assert!(matches!(
+            &bg.action,
+            MenuAction::Local(crate::menu::types::LocalAction::ResumeSession(id))
+                if id == "local:b"
+        ));
+    }
+
+    fn snapshot_row(id: &str, label: &str) -> crate::model::SnapshotInfoView {
+        crate::model::SnapshotInfoView {
+            id: id.into(),
+            label: label.into(),
+            timestamp_unix: chrono::Utc::now().timestamp() - 120,
+        }
+    }
+
+    #[test]
+    fn undo_menu_lists_active_session_snapshots_and_captures_restore() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_SNAPSHOT_LIST,
+            crate::model::APPUI_METHOD_SNAPSHOT_RESTORE,
+        ]);
+        let session = octos_core::SessionKey("local:test".into());
+        let snapshots = crate::model::SnapshotListResult {
+            session_id: Some(session.clone()),
+            enabled: true,
+            available: true,
+            snapshots: vec![snapshot_row("deadbeefcafe", "edit_file batch")],
+            restored: None,
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                selected_session_id: Some(&session),
+                snapshots_state: Some(&snapshots),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) =
+            registry.build(&MenuId::from(crate::menu::registry::MENU_UNDO), &ctx)
+        else {
+            panic!("expected undo menu");
+        };
+        let row = spec
+            .items
+            .iter()
+            .find(|item| item.id == "undo.snap.0")
+            .expect("snapshot row listed");
+        let MenuAction::Local(crate::menu::types::LocalAction::RequestRestoreSnapshot(request)) =
+            &row.action
+        else {
+            panic!("expected RequestRestoreSnapshot, got {:?}", row.action);
+        };
+        // Captured at BUILD time: the displayed session + the exact snapshot.
+        assert_eq!(request.session_id, session);
+        assert_eq!(request.snapshot_id, "deadbeefcafe");
+    }
+
+    #[test]
+    fn undo_menu_hides_snapshots_from_a_different_session() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_SNAPSHOT_LIST,
+            crate::model::APPUI_METHOD_SNAPSHOT_RESTORE,
+        ]);
+        let active = octos_core::SessionKey("local:active".into());
+        let stale = crate::model::SnapshotListResult {
+            session_id: Some(octos_core::SessionKey("local:other".into())),
+            enabled: true,
+            available: true,
+            snapshots: vec![snapshot_row("deadbeefcafe", "other session's edit")],
+            restored: None,
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                selected_session_id: Some(&active),
+                snapshots_state: Some(&stale),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) =
+            registry.build(&MenuId::from(crate::menu::registry::MENU_UNDO), &ctx)
+        else {
+            panic!("expected undo menu");
+        };
+        assert!(
+            spec.items
+                .iter()
+                .all(|item| !item.id.starts_with("undo.snap.")),
+            "another session's snapshots must not be restorable here"
+        );
+        assert!(spec.items.iter().any(|item| item.id == "undo.stale"));
+    }
+
+    #[test]
+    fn undo_confirm_targets_the_captured_session_and_snapshot() {
+        let registry = core_menu_registry();
+        let capabilities =
+            CapabilitySet::from_methods([crate::model::APPUI_METHOD_SNAPSHOT_RESTORE]);
+        let onboarding = crate::model::OnboardingWizardState {
+            pending_snapshot_restore: Some(crate::model::SnapshotRestoreRequest {
+                session_id: octos_core::SessionKey("local:captured".into()),
+                snapshot_id: "deadbeefcafe".into(),
+                label: "deadbeef · edit · 2m".into(),
+            }),
+            ..crate::model::OnboardingWizardState::default()
+        };
+        // The active session has since changed — the confirm must still
+        // target the CAPTURED session, never the current one.
+        let active = octos_core::SessionKey("local:now-active".into());
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                selected_session_id: Some(&active),
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) = registry.build(
+            &MenuId::from(crate::menu::registry::MENU_UNDO_CONFIRM),
+            &ctx,
+        ) else {
+            panic!("expected undo confirm menu");
+        };
+        let yes = spec
+            .items
+            .iter()
+            .find(|item| item.id == "undo.confirm.yes")
+            .expect("Yes row");
+        let AppUiCommand::SnapshotRestore(params) = appui_command(&yes.action) else {
+            panic!("expected SnapshotRestore");
+        };
+        assert_eq!(params.session_id.0, "local:captured");
+        assert_eq!(params.snapshot_id, "deadbeefcafe");
     }
 
     /// `/model` absorbed the add-model flow: a trailing "Add a model…" row

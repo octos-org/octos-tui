@@ -87,6 +87,68 @@ mod i18n_tests {
         }
     }
 
+    /// #324: the session-switcher strings resolve in BOTH locales.
+    #[test]
+    fn sessions_popup_keys_resolve_in_en_and_zh() {
+        let keys = [
+            "command.sessions.desc",
+            "menu.sessions.title",
+            "menu.sessions.subtitle",
+            "menu.sessions.footer",
+            "menu.sessions.item.current",
+            "menu.sessions.item.switch_desc",
+            "menu.sessions.item.empty",
+            "menu.sessions.item.empty_desc",
+        ];
+        for key in keys {
+            for locale in ["en", "zh"] {
+                let value = t!(key, locale = locale);
+                assert_ne!(&*value, key, "missing {locale} translation for {key}");
+            }
+        }
+    }
+
+    /// #1768: the /undo snapshot picker strings resolve in BOTH locales.
+    #[test]
+    fn undo_picker_keys_resolve_in_en_and_zh() {
+        let keys = [
+            "command.undo.desc",
+            "status.undo_no_session",
+            "menu.undo.title",
+            "menu.undo.subtitle",
+            "menu.undo.footer",
+            "menu.undo.age.just_now",
+            "menu.undo.item.refresh.label",
+            "menu.undo.item.refresh.desc",
+            "menu.undo.item.stale.label",
+            "menu.undo.item.stale.desc",
+            "menu.undo.item.unavailable.label",
+            "menu.undo.item.unavailable.desc",
+            "menu.undo.item.disabled.label",
+            "menu.undo.item.disabled.desc",
+            "menu.undo.item.empty.label",
+            "menu.undo.item.empty.desc",
+            "menu.undo.item.snap.desc",
+            "menu.undo_confirm.title",
+            "menu.undo_confirm.subtitle",
+            "menu.undo_confirm.yes_desc",
+            "menu.undo_confirm.item.empty.label",
+        ];
+        for key in keys {
+            for locale in ["en", "zh"] {
+                let value = t!(key, locale = locale);
+                assert_ne!(
+                    &*value, key,
+                    "missing {locale} translation for `{key}` (got the raw key back)"
+                );
+                assert!(
+                    !value.trim().is_empty(),
+                    "empty {locale} translation for `{key}`"
+                );
+            }
+        }
+    }
+
     /// #362: the side-by-side diff view toggle strings (footer hints + status
     /// feedback) resolve in BOTH locales.
     #[test]

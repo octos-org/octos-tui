@@ -700,6 +700,14 @@ impl Store {
                 ) {
                     return self.dispatch_research_slash(draft);
                 }
+                if matches!(
+                    &command.entry,
+                    crate::menu::types::CommandEntry::LocalAction(
+                        crate::menu::types::LocalAction::Custom("undo"),
+                    )
+                ) {
+                    return self.dispatch_undo_slash();
+                }
                 self.dispatch_command_entry(&command.entry, Some(invocation.args))
             }
             CommandResolution::EmptyCommand => {
@@ -763,6 +771,23 @@ impl Store {
     /// opens the lanes menu and refreshes it; `add`/`rm` mutate a lane inline.
     /// Changes are RESTART-to-apply on a pinned solo profile (the router builds
     /// at ProfileRuntime bootstrap) — the mutation status says so.
+    /// `/undo` (#1768): open the snapshot picker and refresh it for the
+    /// ACTIVE session.
+    pub(crate) fn dispatch_undo_slash(&mut self) -> SlashDispatchOutcome {
+        let Some(session_id) = self
+            .state
+            .active_session()
+            .map(|session| session.id.clone())
+        else {
+            self.state.status = t!("status.undo_no_session").into_owned();
+            return SlashDispatchOutcome::Rejected;
+        };
+        self.open_menu(MenuId::from(crate::menu::registry::MENU_UNDO));
+        SlashDispatchOutcome::accepted(Some(AppUiCommand::SnapshotList(
+            crate::model::SnapshotListParams { session_id },
+        )))
+    }
+
     pub(crate) fn dispatch_research_slash(&mut self, draft: &str) -> SlashDispatchOutcome {
         // Target the ACTIVE profile — the same value the /research menu resolves
         // (`active_profile_id`), NOT the last list's cached profile and NOT the
@@ -1659,6 +1684,11 @@ impl Store {
                 self.open_menu(MenuId::from(
                     crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM,
                 ));
+                None
+            }
+            LocalAction::RequestRestoreSnapshot(request) => {
+                self.state.onboarding.pending_snapshot_restore = Some(*request);
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_UNDO_CONFIRM));
                 None
             }
             LocalAction::SetScrollMode => {
@@ -4922,6 +4952,25 @@ impl Store {
             profile_llm_catalog: self.state.profile_llm_catalog.as_ref(),
             profile_llm_state: self.state.profile_llm_state.as_ref(),
             sub_providers_state: self.state.sub_providers_state.as_ref(),
+            snapshots_state: self.state.snapshots_state.as_ref(),
+            session_chips: self
+                .state
+                .sessions
+                .iter()
+                .enumerate()
+                .map(|(idx, session)| crate::model::SessionChipView {
+                    session_id: session.id.clone(),
+                    title: session.title.clone(),
+                    focused: idx == self.state.selected_session,
+                    live: self.state.session_turn_live(&session.id),
+                    unread: self
+                        .state
+                        .unread_turns
+                        .get(&session.id)
+                        .copied()
+                        .unwrap_or(0),
+                })
+                .collect(),
             profile_skills: self.state.profile_skills.as_ref(),
             profile_skill_registry: self.state.profile_skill_registry.as_ref(),
             mcp_catalog,
@@ -6266,6 +6315,12 @@ impl Store {
                 self.refresh_active_menu_if_open();
                 None
             }
+            ClientEvent::SnapshotList(event) => {
+                self.state.snapshots_state = Some(event.result);
+                self.state.status = event.message;
+                self.refresh_active_menu_if_open();
+                None
+            }
             ClientEvent::SubProvidersMutation(event) => {
                 self.apply_sub_providers_mutation_event(event);
                 self.refresh_active_menu_if_open();
@@ -6733,6 +6788,7 @@ impl Store {
                 // lane) list on reconnect — `from_snapshot` would drop it and leave
                 // the /research menu blank until the user re-opens it. Carry it.
                 let sub_providers_state = self.state.sub_providers_state.clone();
+                let snapshots_state = self.state.snapshots_state.clone();
                 // Local-only: command history is a client-side ring the server
                 // never echoes; `from_snapshot` would drop it. Preserve the
                 // entries across replays (reconnect/refresh) and reset browsing.
@@ -6843,6 +6899,9 @@ impl Store {
                 }
                 if state.sub_providers_state.is_none() {
                     state.sub_providers_state = sub_providers_state;
+                    if state.snapshots_state.is_none() {
+                        state.snapshots_state = snapshots_state;
+                    }
                 }
                 state.set_composer_text(composer);
                 state.composer_drafts = composer_drafts;
@@ -10314,6 +10373,7 @@ impl Store {
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
         self.state.pre_token_turns.remove(&event.session_id);
+        self.bump_unread_for_background_terminal(&event.session_id);
         // The turn the user interrupted has settled — its deferred prompt
         // restore applies now (before the duplicate-terminal early returns:
         // any first terminal for the armed turn consumes the stash).
@@ -10515,6 +10575,7 @@ impl Store {
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
         self.state.pre_token_turns.remove(&event.session_id);
+        self.bump_unread_for_background_terminal(&event.session_id);
         // The interrupted turn has settled (an Esc/Ctrl+C typically lands here
         // as the server's `code == "interrupted"` terminal) — apply the
         // deferred prompt restore (mirror of `commit_live_reply`).
@@ -10914,6 +10975,23 @@ impl Store {
     /// queue (FIFO order survives the retry) and withdraw the optimistic
     /// transcript row so the re-submit cannot render a duplicate. Returns
     /// true when a prompt was re-staged (false for a backoff-only gate).
+    /// #324: a turn reaching its terminal in a NON-focused session bumps
+    /// that session's unread badge (strip + Alt+S popup). Focused sessions
+    /// never count — the user is watching.
+    fn bump_unread_for_background_terminal(&mut self, session_id: &SessionKey) {
+        let is_active = self
+            .state
+            .active_session()
+            .is_some_and(|session| &session.id == session_id);
+        if !is_active {
+            *self
+                .state
+                .unread_turns
+                .entry(session_id.clone())
+                .or_insert(0) += 1;
+        }
+    }
+
     fn restage_dead_staged_submit(
         &mut self,
         session_id: &SessionKey,
@@ -31279,6 +31357,74 @@ mod tests {
         assert_eq!(
             store.state.pending_messages,
             vec!["early follow-up".to_string()]
+        );
+    }
+
+    /// #324: a turn finishing in a NON-focused session bumps its unread
+    /// badge; finishing in the focused session does not; focusing clears.
+    #[test]
+    fn background_terminal_bumps_unread_and_focus_clears_it() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+        // A is focused; B's turn completes in the background.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: b.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert_eq!(store.state.unread_turns.get(&b).copied(), Some(1));
+
+        // The FOCUSED session's terminal never counts.
+        let a = SessionKey("local:a".into());
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: a.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(!store.state.unread_turns.contains_key(&a));
+
+        // Focusing B marks it read.
+        store.state.switch_selected_session(1);
+        assert!(!store.state.unread_turns.contains_key(&b));
+    }
+
+    /// #324: the live-turn signal covers both the streaming window
+    /// (live_reply bound) and the pre-first-token window (submit marker).
+    #[test]
+    fn session_turn_live_covers_streaming_and_pre_token_windows() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let a = SessionKey("local:a".into());
+        assert!(!store.state.session_turn_live(&a));
+
+        // Pre-token: submitted, no delta yet.
+        let command = store.queue_or_start_prompt_turn("go".into(), "sent".into());
+        assert!(command.is_some());
+        assert!(
+            store.state.session_turn_live(&a),
+            "pre-token window is live"
+        );
+
+        // Streaming: live_reply bound.
+        store.state.pre_token_turns.clear();
+        store.state.sessions[0].live_reply = Some(crate::model::LiveReply {
+            turn_id: TurnId::new(),
+            text: "streaming".into(),
+        });
+        assert!(
+            store.state.session_turn_live(&a),
+            "streaming window is live"
         );
     }
 

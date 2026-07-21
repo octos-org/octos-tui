@@ -1,6 +1,6 @@
 [package]
 name = "octos-tui"
-version = "0.2.2-rc.10"
+version = "0.2.2-rc.12"
 edition = "2024"
 rust-version = "1.85.0"
 license = "Apache-2.0"
@@ -51,6 +51,9 @@ semver = "1"
 # Optional + default-on via the `update` feature; with the feature OFF, `update`
 # still works as a pure advisor (detect method + print command + `--check`).
 axoupdater = { version = "0.10", default-features = false, features = ["github_releases", "blocking"], optional = true }
+zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
+sha2 = "0.11.0"
+tempfile = "3.27.0"
 
 [features]
 default = ["update"]

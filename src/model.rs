@@ -67,6 +67,9 @@ pub const APPUI_METHOD_PROFILE_LLM_CATALOG: &str = "profile/llm/catalog";
 pub const APPUI_METHOD_PROFILE_LLM_UPSERT: &str = "profile/llm/upsert";
 pub const APPUI_METHOD_PROFILE_LLM_DELETE: &str = "profile/llm/delete";
 pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST: &str = "profile/sub_providers/list";
+/// #1768 workspace snapshot undo.
+pub const APPUI_METHOD_SNAPSHOT_LIST: &str = "snapshot/list";
+pub const APPUI_METHOD_SNAPSHOT_RESTORE: &str = "snapshot/restore";
 pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT: &str = "profile/sub_providers/upsert";
 pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE: &str = "profile/sub_providers/remove";
 pub const APPUI_METHOD_PROFILE_LLM_TEST: &str = "profile/llm/test";
@@ -750,6 +753,10 @@ pub enum AppUiCommand {
     ProfileLlmTest(ProfileLlmTestParams),
     ProfileLlmFetchModels(ProfileLlmFetchModelsParams),
     ProfileSubProvidersList(SubProvidersListParams),
+    /// #1768: list the session workspace's snapshot undo points.
+    SnapshotList(SnapshotListParams),
+    /// #1768: restore the session workspace to a snapshot.
+    SnapshotRestore(SnapshotRestoreParams),
     ProfileSubProvidersUpsert(SubProvidersUpsertParams),
     ProfileSubProvidersRemove(SubProvidersRemoveParams),
     ProfileSkillsList(ProfileSkillsListParams),
@@ -847,6 +854,8 @@ impl AppUiCommand {
             Self::ProfileLlmTest(_) => APPUI_METHOD_PROFILE_LLM_TEST,
             Self::ProfileLlmFetchModels(_) => APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
             Self::ProfileSubProvidersList(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+            Self::SnapshotList(_) => APPUI_METHOD_SNAPSHOT_LIST,
+            Self::SnapshotRestore(_) => APPUI_METHOD_SNAPSHOT_RESTORE,
             Self::ProfileSubProvidersUpsert(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
             Self::ProfileSubProvidersRemove(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
             Self::ProfileSkillsList(_) => APPUI_METHOD_PROFILE_SKILLS_LIST,
@@ -2447,6 +2456,9 @@ pub struct OnboardingWizardState {
     /// confirm menu (`MENU_RESEARCH_REMOVE_CONFIRM`), whose Yes row sends
     /// `profile/sub_providers/remove` with the captured `profile_id` + `key`.
     pub pending_research_lane_removal: Option<ResearchLaneRemoval>,
+    /// #1768: snapshot staged for restore by `/undo` — read by
+    /// `MENU_UNDO_CONFIRM`, whose Yes row sends `snapshot/restore`.
+    pub pending_snapshot_restore: Option<SnapshotRestoreRequest>,
     pub provider_save_target: Option<OnboardingProviderSaveTarget>,
     /// Persistent "this wizard session is creating a RESEARCH lane" intent, set
     /// by bare `/research add` and kept for the WHOLE flow. Unlike
@@ -2506,6 +2518,7 @@ impl Default for OnboardingWizardState {
             provider_pending_since: None,
             pending_model_removal: None,
             pending_research_lane_removal: None,
+            pending_snapshot_restore: None,
             provider_save_target: None,
             research_lane_intent: false,
             last_saved_provider_label: None,
@@ -3317,6 +3330,28 @@ pub struct ModelRemovalRequest {
     pub label: String,
 }
 
+/// #324: one session-strip / Alt+S-popup chip, computed per frame from the
+/// live store state (focused flag, live-turn signal, unread count).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionChipView {
+    pub session_id: SessionKey,
+    pub title: String,
+    pub focused: bool,
+    pub live: bool,
+    pub unread: usize,
+}
+
+/// A snapshot restore staged from the `/undo` picker (#1768). `session_id`
+/// and `snapshot_id` are captured at menu-BUILD time and carried through the
+/// Yes/No confirm, so a session switch mid-confirm can never retarget the
+/// restore (same contract as [`ResearchLaneRemoval`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotRestoreRequest {
+    pub session_id: SessionKey,
+    pub snapshot_id: String,
+    pub label: String,
+}
+
 /// A research provider lane staged for removal (`/research` menu → lane row).
 /// The `profile_id` is captured at menu-BUILD time (the profile whose lanes are
 /// on screen) and carried through the Yes/No confirm, so a profile switch
@@ -3373,6 +3408,42 @@ pub struct SubProviderView {
     pub max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotListParams {
+    pub session_id: SessionKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotRestoreParams {
+    pub session_id: SessionKey,
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotInfoView {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub timestamp_unix: i64,
+}
+
+/// `snapshot/list` result — also the shape `snapshot/restore` echoes back
+/// (refreshed rows) so the picker updates in place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotListResult {
+    #[serde(default)]
+    pub session_id: Option<SessionKey>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub snapshots: Vec<SnapshotInfoView>,
+    #[serde(default)]
+    pub restored: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -4179,6 +4250,10 @@ pub struct AppState {
     /// older than [`PRE_TOKEN_TURN_TTL`] are ignored (dead submit — matches
     /// the staged-gate TTL self-heal).
     pub pre_token_turns: std::collections::HashMap<SessionKey, Instant>,
+    /// #324 Phase C: per-session unread counters — turns that reached a
+    /// terminal while the session was NOT focused. Incremented by the store's
+    /// terminal appliers, cleared when the session gains focus.
+    pub unread_turns: std::collections::HashMap<SessionKey, usize>,
     pub approval_auto_open: bool,
     pub approval: Option<ApprovalModalState>,
     /// Pending AskUserQuestion picker (UPCR-2026-023), mirroring `approval`.
@@ -4233,6 +4308,10 @@ pub struct AppState {
     /// Named provider lanes (`sub_providers`) shown by the `/research` menu,
     /// populated from `profile/sub_providers/list`.
     pub sub_providers_state: Option<SubProvidersListResult>,
+    /// #1768: last `snapshot/list` (or restore-echo) for the /undo picker.
+    /// Session-stamped by the server; the menu displays it only for the
+    /// session it belongs to.
+    pub snapshots_state: Option<SnapshotListResult>,
     pub profile_skills: Option<ProfileSkillsListResult>,
     pub profile_skill_registry: Option<ProfileSkillsRegistrySearchResult>,
     pub session_model_catalogs: Vec<SessionModelCatalog>,
@@ -6083,6 +6162,7 @@ impl AppState {
             run_state,
             run_state_started_at,
             pre_token_turns: std::collections::HashMap::new(),
+            unread_turns: std::collections::HashMap::new(),
             approval_auto_open: true,
             approval: None,
             user_question: None,
@@ -6111,6 +6191,7 @@ impl AppState {
             profile_llm_catalog: None,
             profile_llm_state: None,
             sub_providers_state: None,
+            snapshots_state: None,
             profile_skills: None,
             profile_skill_registry: None,
             session_model_catalogs: Vec::new(),
@@ -7518,6 +7599,10 @@ impl AppState {
         self.load_composer_draft_for_selected_session();
         self.load_pending_messages_for_selected_session();
         self.refresh_run_state_from_selection();
+        // #324: focusing a session marks it read.
+        if let Some(session_id) = self.active_session().map(|session| session.id.clone()) {
+            self.unread_turns.remove(&session_id);
+        }
         // A session that raced the capabilities response missed its open-time
         // status probe; probe it the moment it becomes active so the composer
         // footer's model/cwd reflect it (no-op once a status is cached).
@@ -8120,6 +8205,19 @@ impl AppState {
             message: message.into(),
         };
         self.run_state_started_at = None;
+    }
+
+    /// #324: whether `session_id`'s turn is live RIGHT NOW — streaming
+    /// (`live_reply` bound) or submitted-but-pre-first-token (fresh marker).
+    pub fn session_turn_live(&self, session_id: &SessionKey) -> bool {
+        self.sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .is_some_and(|session| session.live_reply.is_some())
+            || self
+                .pre_token_turns
+                .get(session_id)
+                .is_some_and(|armed| armed.elapsed() < PRE_TOKEN_TURN_TTL)
     }
 
     pub fn refresh_run_state_from_selection(&mut self) {

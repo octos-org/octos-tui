@@ -4,10 +4,14 @@
 //! octos-tui is a *client*: a local launch spawns `octos serve --stdio` as a
 //! child (`--stdio-command`). Before the TUI takes over the terminal, this
 //! module makes sure `octos` is available and, if it is missing, installs it —
-//! **binary-only via a package manager** (`brew`/`npm`). We deliberately do NOT
-//! run octos's `install.sh`: that is a server-deployment tool that registers +
-//! starts an `octos-serve` system service via `sudo`, which a stdio client
-//! neither needs nor should trigger (a password prompt / non-zero exit).
+//! **binary-only**. First choice is a package manager (`brew`/`npm`); on Windows,
+//! where `brew` never exists and `npm` is often absent on a fresh box, it falls
+//! back to downloading the prebuilt server bundle straight from the GitHub
+//! release (checksum-verified) into `~\.octos\bin`. We deliberately do NOT run
+//! octos's `install.sh` / `install.ps1`: those are server-deployment tools that
+//! register a background `octos-serve` service (a `sudo` daemon on Unix, an
+//! `OctosServe` scheduled task on Windows), which a stdio client neither needs
+//! nor should trigger.
 //!
 //! We resolve octos against BOTH `PATH` and the legacy installer dir
 //! `~/.octos/bin`. When it's usable only in that dir (not on `PATH`), we
@@ -30,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::cli::{Cli, Mode};
-use eyre::{Result, eyre};
+use eyre::{Result, WrapErr, eyre};
 
 /// The minimum `octos` server version this build is known to speak with.
 /// octos-tui pins `octos-core` (the UI-Protocol crate) by git rev; this is the
@@ -101,16 +105,18 @@ pub fn ensure_octos_backend(cli: &mut Cli) -> Result<()> {
         // Usable only in the install dir — rewrite the command to launch it
         // directly, since its dir isn't on this process's PATH.
         Resolved::AtPath(octos) => {
-            // On Windows the stdio transport runs the command via `cmd /C`, but
-            // `rewrite_program` re-serializes with POSIX (shlex) quoting, which
-            // cmd mangles (codex). This off-PATH rewrite is a Unix-only legacy
-            // (`install.sh`) case; on Windows, ask the user to fix PATH.
+            // On Windows, DON'T rewrite the command to an explicit path. The
+            // stdio transport spawns via `cmd /C <command>`, and a path embedded
+            // in that string — quoted or not — gets mangled by Rust's arg quoting
+            // plus cmd's own quirky quote parsing (the child then dies with exit
+            // 1). Instead the transport prepends this install dir to the child's
+            // PATH (see `install_bin_dir` / `shell_command`), so the bare `octos`
+            // in the command resolves to the exe the auto-installer dropped into
+            // `~\.octos\bin`. Nothing to rewrite here — `octos` is bound only for
+            // the non-Windows path below.
             if cfg!(windows) {
-                return Err(eyre!(
-                    "octos is installed at {} but isn't on PATH. Add its directory to PATH \
-                     and relaunch octos-tui.",
-                    octos.display()
-                ));
+                let _ = &octos;
+                return Ok(());
             }
             let rewritten = rewrite_program(&command, &octos).ok_or_else(|| {
                 eyre!(
@@ -291,6 +297,15 @@ fn install_dir_octos() -> Option<PathBuf> {
     };
     let name = if cfg!(windows) { "octos.exe" } else { "octos" };
     Some(dir.join(name))
+}
+
+/// The directory the auto-installer drops `octos` into (`$OCTOS_PREFIX` or
+/// `~/.octos/bin`). The stdio transport prepends this to the child's PATH so a
+/// bare `octos` in the launch command resolves to the auto-installed exe —
+/// without embedding a path in the command string, which `cmd /C` mangles on
+/// Windows. `None` if no home dir.
+pub(crate) fn install_bin_dir() -> Option<PathBuf> {
+    install_dir_octos().and_then(|exe| exe.parent().map(Path::to_path_buf))
 }
 
 /// Home directory, treating an empty `HOME` as absent so the Windows
@@ -477,6 +492,12 @@ fn installer_plan(
 fn run_installer() -> Result<()> {
     let (brew, npm) = (brew_formula(), npm_package());
     let Some(plan) = installer_plan(have("brew"), have("npm"), &brew, &npm) else {
+        // No package manager. On Windows — where `brew` never exists and `npm`
+        // is often absent on a fresh box — download the prebuilt server bundle
+        // directly (binary-only, never a service). Elsewhere, guide the user.
+        if cfg!(windows) {
+            return install_octos_windows_bundle();
+        }
         return Err(eyre!(
             "octos server not found and no supported installer (brew or npm) is available. \
              Install octos (binary only, no service) with one of:\n  \
@@ -529,9 +550,292 @@ fn have(program: &str) -> bool {
     }
 }
 
+/// The prebuilt octos server bundle for 64-bit Windows, served from the latest
+/// GitHub release. `7z a <zip> *` archives the build dir's contents, so
+/// `octos.exe` sits at the archive root beside its bundled skills.
+const WINDOWS_BUNDLE_URL: &str = "https://github.com/octos-org/octos/releases/latest/download/octos-bundle-x86_64-pc-windows-msvc.zip";
+/// Published SHA-256 for [`WINDOWS_BUNDLE_URL`] (a `"<hex>  <name>"` line).
+const WINDOWS_BUNDLE_SHA256_URL: &str = "https://github.com/octos-org/octos/releases/latest/download/octos-bundle-x86_64-pc-windows-msvc.zip.sha256";
+
+/// Windows fallback when neither `brew` nor `npm` is available (the common case
+/// on a fresh Windows box): download the prebuilt octos server bundle and
+/// extract it into the install dir, **binary-only — never a service** (unlike
+/// `install.ps1`, which registers an `OctosServe` scheduled task). Verifies the
+/// published SHA-256 before extracting an executable we are about to run, then
+/// places `octos.exe` (and its sibling bundled skills) under `~\.octos\bin` (or
+/// `OCTOS_PREFIX`). `resolve_backend` re-probes that dir and the caller rewrites
+/// the stdio command to the full path. Called pre-raw-mode so progress prints.
+fn install_octos_windows_bundle() -> Result<()> {
+    let octos = install_dir_octos().ok_or_else(|| {
+        eyre!("cannot determine the octos install directory (no HOME/USERPROFILE set)")
+    })?;
+    let install_dir = octos
+        .parent()
+        .ok_or_else(|| eyre!("octos install path {} has no parent", octos.display()))?
+        .to_path_buf();
+
+    eprintln!(
+        "octos-tui: octos backend not found and no brew/npm available; downloading the \
+         octos server bundle (set {OPT_OUT_ENV}=1 to skip)..."
+    );
+
+    let bytes = http_get_bytes(WINDOWS_BUNDLE_URL)
+        .wrap_err("failed to download the octos server bundle")?;
+
+    // Integrity-check before extracting an executable we're about to run. A
+    // missing checksum (older releases) warns but doesn't hard-fail; a mismatch
+    // does.
+    match http_get_string(WINDOWS_BUNDLE_SHA256_URL) {
+        Ok(published) => verify_sha256(&bytes, &published)?,
+        Err(err) => eprintln!(
+            "octos-tui: could not fetch the bundle checksum ({err}); skipping verification"
+        ),
+    }
+
+    extract_octos_bundle(&bytes, &install_dir)
+        .wrap_err("failed to extract the octos server bundle")?;
+
+    eprintln!(
+        "octos-tui: installed the octos server to {}",
+        install_dir.display()
+    );
+    Ok(())
+}
+
+/// Blocking GET returning the response body bytes, erroring on non-2xx. Follows
+/// GitHub's release-asset redirect (reqwest follows up to 10 by default).
+fn http_get_bytes(url: &str) -> Result<Vec<u8>> {
+    Ok(http_client()?
+        .get(url)
+        .send()?
+        .error_for_status()?
+        .bytes()?
+        .to_vec())
+}
+
+/// Blocking GET returning the response body as text, erroring on non-2xx.
+fn http_get_string(url: &str) -> Result<String> {
+    Ok(http_client()?.get(url).send()?.error_for_status()?.text()?)
+}
+
+fn http_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .user_agent(concat!("octos-tui/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(Into::into)
+}
+
+/// Verify `bytes` against a published `.sha256` line (`"<64-hex>  <filename>"`;
+/// the leading hex token is all we need). Case-insensitive.
+fn verify_sha256(bytes: &[u8], published: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let expected = published
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(eyre!(
+            "unexpected octos bundle checksum format: {published:?}"
+        ));
+    }
+    let actual = hex_lower(&Sha256::digest(bytes));
+    if actual != expected {
+        return Err(eyre!(
+            "octos bundle checksum mismatch (expected {expected}, got {actual}); \
+             refusing to install"
+        ));
+    }
+    Ok(())
+}
+
+/// Lowercase hex encoding (avoids a `hex` crate dep for one call site).
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Extract the octos bundle zip into `install_dir`, binary-only. Stages into a
+/// temp dir first (a partial extract never leaves a broken install), finds
+/// `octos.exe` anywhere in the tree (mirrors octos's own `deploy.ps1`), then
+/// copies that bundle root's files next to it under `install_dir`. `zip`'s
+/// `enclosed_name` drops zip-slip (`..`) paths.
+fn extract_octos_bundle(zip_bytes: &[u8], install_dir: &Path) -> Result<()> {
+    let staging = tempfile::tempdir()?;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let Some(rel) = entry.enclosed_name() else {
+            continue; // skip unsafe (`..`/absolute) entries
+        };
+        let out = staging.path().join(&rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out)?;
+        } else {
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut f = std::fs::File::create(&out)?;
+            std::io::copy(&mut entry, &mut f)?;
+        }
+    }
+
+    let exe = find_file_named(staging.path(), "octos.exe")
+        .ok_or_else(|| eyre!("octos.exe not found in the downloaded bundle"))?;
+    let bundle_root = exe.parent().unwrap_or_else(|| staging.path());
+    std::fs::create_dir_all(install_dir)?;
+    copy_dir_contents(bundle_root, install_dir)?;
+
+    // Sanity: the file the probe will look for must now exist.
+    let placed = install_dir.join("octos.exe");
+    if !placed.exists() {
+        return Err(eyre!(
+            "extracted the bundle but {} is missing",
+            placed.display()
+        ));
+    }
+    Ok(())
+}
+
+/// First file named `name` (case-insensitive) anywhere under `root`, depth-first.
+fn find_file_named(root: &Path, name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut dirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            dirs.push(path);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        {
+            return Some(path);
+        }
+    }
+    dirs.into_iter().find_map(|d| find_file_named(&d, name))
+}
+
+/// Recursively copy the files/subdirs directly inside `src` into `dst`.
+fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_contents(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_bin_dir_is_the_parent_of_the_probed_exe() {
+        // `install_bin_dir` (used by the transport to augment the child PATH)
+        // must be exactly the directory the exe is probed/installed in.
+        let exe = install_dir_octos();
+        let dir = install_bin_dir();
+        match (exe, dir) {
+            (Some(exe), Some(dir)) => assert_eq!(exe.parent(), Some(dir.as_path())),
+            (None, None) => {} // no HOME/USERPROFILE in this env — both absent
+            other => panic!("exe/dir presence mismatch: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_sha256_matches_and_rejects() {
+        let data = b"octos-bundle-bytes";
+        let good = {
+            use sha2::{Digest, Sha256};
+            hex_lower(&Sha256::digest(data))
+        };
+        // Real `.sha256` files are `"<hex>  <filename>"` — the trailing name must
+        // not matter.
+        verify_sha256(
+            data,
+            &format!("{good}  octos-bundle-x86_64-pc-windows-msvc.zip"),
+        )
+        .expect("matching checksum should pass");
+        assert!(
+            verify_sha256(data, &"0".repeat(64)).is_err(),
+            "mismatch must fail"
+        );
+        assert!(
+            verify_sha256(data, "not-a-checksum").is_err(),
+            "bad format must fail"
+        );
+    }
+
+    #[test]
+    fn extract_octos_bundle_places_exe_and_siblings() {
+        // Build an in-memory zip laid out like the real bundle (flat, `octos.exe`
+        // at the root beside a bundled-skill file) and extract it.
+        use std::io::Write as _;
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            w.start_file("octos.exe", opts).unwrap();
+            w.write_all(b"MZ fake octos").unwrap();
+            w.start_file("skills/weather/main", opts).unwrap();
+            w.write_all(b"#!skill").unwrap();
+            w.finish().unwrap();
+        }
+        let dst = tempfile::tempdir().unwrap();
+        extract_octos_bundle(&buf, dst.path()).expect("extraction should succeed");
+        assert!(dst.path().join("octos.exe").exists(), "octos.exe placed");
+        assert!(
+            dst.path().join("skills/weather/main").exists(),
+            "bundled skill placed beside it"
+        );
+    }
+
+    #[test]
+    fn extract_octos_bundle_finds_exe_under_a_top_level_dir() {
+        // Robust to a future layout that nests everything under a top dir.
+        use std::io::Write as _;
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            w.start_file("octos-bundle/octos.exe", opts).unwrap();
+            w.write_all(b"MZ").unwrap();
+            w.start_file("octos-bundle/skills/x", opts).unwrap();
+            w.write_all(b"x").unwrap();
+            w.finish().unwrap();
+        }
+        let dst = tempfile::tempdir().unwrap();
+        extract_octos_bundle(&buf, dst.path()).expect("extraction should succeed");
+        assert!(dst.path().join("octos.exe").exists());
+        assert!(dst.path().join("skills/x").exists());
+    }
+
+    #[test]
+    fn extract_octos_bundle_errors_without_an_exe() {
+        use std::io::Write as _;
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            w.start_file("readme.txt", opts).unwrap();
+            w.write_all(b"no exe here").unwrap();
+            w.finish().unwrap();
+        }
+        let dst = tempfile::tempdir().unwrap();
+        assert!(extract_octos_bundle(&buf, dst.path()).is_err());
+    }
 
     #[test]
     fn bare_octos_program_matches_the_standard_shapes() {

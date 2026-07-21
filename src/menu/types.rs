@@ -404,6 +404,10 @@ pub enum LocalAction {
     /// `profile/sub_providers/remove` — so a profile switch between select and
     /// confirm cannot retarget the delete.
     RequestRemoveResearchLane(Box<crate::model::ResearchLaneRemoval>),
+    /// Stage a workspace-snapshot restore and open its Yes/No confirm
+    /// (`/undo` picker row, #1768). The captured session + snapshot id are
+    /// carried to the confirm's Yes row (`snapshot/restore`).
+    RequestRestoreSnapshot(Box<crate::model::SnapshotRestoreRequest>),
     Custom(&'static str),
 }
 
@@ -701,6 +705,8 @@ pub struct MenuAppSnapshot<'a> {
     pub profile_llm_catalog: Option<&'a ProfileLlmCatalogResult>,
     pub profile_llm_state: Option<&'a ProfileLlmListResult>,
     pub sub_providers_state: Option<&'a SubProvidersListResult>,
+    /// #1768: last snapshot list for the /undo picker.
+    pub snapshots_state: Option<&'a crate::model::SnapshotListResult>,
     pub profile_skills: Option<&'a ProfileSkillsListResult>,
     pub profile_skill_registry: Option<&'a ProfileSkillsRegistrySearchResult>,
     pub mcp_catalog: Option<&'a SessionMcpCatalog>,
@@ -720,6 +726,8 @@ pub struct MenuAppSnapshot<'a> {
     /// render one row per session. Empty until the first fetch lands (the menu
     /// renders `Loading` in that window).
     pub resume_sessions: &'a [crate::model::ResumeSessionRow],
+    /// #324: open-session chips for the Alt+S switcher popup.
+    pub session_chips: Vec<crate::model::SessionChipView>,
     /// Whether a `session/list` result has landed, mirrored from
     /// `AppState::resume_list_loaded`. Lets `resume_menu` tell a genuinely
     /// in-flight fetch (render `Loading`) apart from a completed fetch that
