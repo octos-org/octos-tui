@@ -302,6 +302,10 @@ pub struct LocalShellResultEvent {
     pub local_id: String,
     /// The command line as typed (after the `!`), for display.
     pub cmdline: String,
+    /// Display form of the directory the command ran in (the TUI process cwd),
+    /// so the transcript card can label WHERE the local command executed.
+    /// `None` only when the cwd could not be resolved at spawn time.
+    pub cwd: Option<String>,
     /// Captured stdout (already truncated to fit the combined 10 KB cap).
     pub stdout: String,
     /// Captured stderr (already truncated to fit the combined 10 KB cap).

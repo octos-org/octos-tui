@@ -298,6 +298,10 @@ pub enum LocalAction {
     SaveKeymap,
     RefreshMenu(MenuId),
     EditComposer(String),
+    /// Insert `text` into the composer AT THE CURSOR (unlike `EditComposer`,
+    /// which replaces the whole draft). The `@` file picker's row action
+    /// (#363): the picked relative path lands where the user typed `@`.
+    InsertComposerText(String),
     /// Codex Enter semantics for the slash popup: dispatch the highlighted
     /// command IMMEDIATELY (one Enter goes straight to the command's
     /// page/menu/action) instead of completing its name into the composer
@@ -743,6 +747,10 @@ pub struct MenuAppSnapshot<'a> {
     /// Whether the Agent Dock is collapsed to its summary pill, so the
     /// picker's toggle row can label itself expand vs collapse.
     pub agent_dock_collapsed: bool,
+    /// Workspace file list scanned when the `@` composer file picker was
+    /// opened, mirrored from `AppState::file_picker` so `file_picker_menu`
+    /// can render one row per file. `None` when the picker is not open.
+    pub file_picker: Option<&'a crate::file_picker::FilePickerState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

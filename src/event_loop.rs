@@ -1204,6 +1204,12 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::Esc if store.state.focus != FocusPane::Composer => {
             store.state.focus = FocusPane::Composer;
         }
+        // Shell-escape mode (#364): Esc cancels the `!` draft — never runs it,
+        // never interrupts the turn. The NEXT Esc (composer now plain/empty)
+        // falls through to the ordinary interrupt semantics below.
+        KeyCode::Esc if store.shell_escape_mode_active() => {
+            store.cancel_shell_escape_mode();
+        }
         KeyCode::Esc => {
             if store.state.active_turn().is_some() {
                 let command = if store.state.has_pending_messages() {
@@ -1370,12 +1376,10 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             store.stage_selected_diff_context();
         }
         KeyCode::Char(ch) => {
-            let opens_slash_popup = ch == '/' && store.state.composer.is_empty();
-            store.state.insert_composer_char(ch);
-            store.state.focus = FocusPane::Composer;
-            if opens_slash_popup {
-                store.open_menu(crate::menu::MenuId::from(crate::menu::registry::MENU_HELP));
-            }
+            // Store-level composer input: inserts the char and runs the prefix
+            // triggers (`/` slash popup, `!` shell-escape hint #364, `@` file
+            // picker #363) so the trigger decisions stay store-testable.
+            store.handle_composer_char_input(ch);
         }
         _ => {}
     }
@@ -1759,6 +1763,11 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     }
 
     match key.code {
+        // `@` file picker (#363): Esc closes WITHOUT inserting and removes the
+        // auto-typed `@`, restoring the composer to its pre-`@` text.
+        KeyCode::Esc if file_picker_menu_active(store) => {
+            store.cancel_composer_file_picker();
+        }
         KeyCode::Esc => {
             // Esc on the slash popup dismisses its composer draft too (the
             // token that opened/filtered it — codex's dismiss semantics).
@@ -1791,6 +1800,12 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         }
         KeyCode::Backspace if active_menu_search_has_query(store) => {
             delete_active_menu_search_prev_char(store);
+        }
+        // Backspacing past an EMPTY picker filter deletes the `@` that opened
+        // it and closes the picker — the same dismiss the slash popup performs
+        // when the bare `/` is backspaced away.
+        KeyCode::Backspace if file_picker_menu_active(store) => {
+            store.cancel_composer_file_picker();
         }
         KeyCode::Char(ch) if slash_help_should_capture_char(store, ch) => {
             store.state.insert_composer_char(ch);
@@ -1841,6 +1856,19 @@ fn menu_composer_edit_active(store: &Store) -> bool {
         // `slash_help_should_capture_char` and syncs the search query, matching
         // codex's inline `/` behaviour.
         && !slash_help_capture_active(store)
+        // The `@` file picker freezes the composer the same way: the draft
+        // holds real prompt text (plus the `@` trigger), but every keystroke
+        // belongs to the picker's search filter until it closes.
+        && !file_picker_menu_active(store)
+}
+
+/// True while the `@` composer file picker (#363) is the active menu frame.
+fn file_picker_menu_active(store: &Store) -> bool {
+    store
+        .state
+        .menu_stack
+        .active()
+        .is_some_and(|frame| frame.id.as_str() == crate::menu::registry::MENU_FILE_PICKER)
 }
 
 /// True whenever the slash popup is open and the composer is a slash draft
@@ -1926,7 +1954,12 @@ fn sync_slash_help_search_query(store: &mut Store) {
 
 fn active_menu_should_capture_search_char(store: &Store, ch: char) -> bool {
     active_menu_searchable(store)
-        && (active_menu_search_has_query(store) || !matches!(ch, 'j' | 'k'))
+        && (active_menu_search_has_query(store)
+            // File names legitimately start with j/k (`justfile`,
+            // `keymap.rs`): in the `@` picker every printable char filters
+            // from the first keystroke; Up/Down still navigate.
+            || file_picker_menu_active(store)
+            || !matches!(ch, 'j' | 'k'))
 }
 
 /// Index of the ENABLED item in the active (search-filtered) menu spec whose
