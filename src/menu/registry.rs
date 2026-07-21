@@ -58,6 +58,10 @@ pub const MENU_RESEARCH: &str = "research";
 /// Yes/No confirm for removing a staged research lane via
 /// `profile/sub_providers/remove`.
 pub const MENU_RESEARCH_REMOVE_CONFIRM: &str = "research-remove-confirm";
+/// Lane-key picker for the wizard's research-lane Save: deep_research requests
+/// lanes by the literal keys `cheap`/`strong` (`contract_for`), so the Save
+/// must land on one of those — a family-id key would never be routed to.
+pub const MENU_RESEARCH_LANE_KEY: &str = "research-lane-key";
 /// `/undo` snapshot picker (#1768).
 pub const MENU_UNDO: &str = "undo";
 /// #324: Alt+S session switcher popup (open sessions, live/unread badges).

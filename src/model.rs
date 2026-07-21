@@ -2467,6 +2467,11 @@ pub struct OnboardingWizardState {
     /// `apply_selection` / key updates, so the Save routing stays lane-targeted
     /// across normal wizard interaction (codex PR384 review).
     pub research_lane_intent: bool,
+    /// The lane key ("cheap"/"strong") chosen in `MENU_RESEARCH_LANE_KEY` for
+    /// the lane save currently in flight. Stashed at dispatch so the applied
+    /// event can name the key in the confirmation; taken on consume, dropped
+    /// on error/timeout alongside `provider_pending`.
+    pub pending_research_lane_key: Option<String>,
     pub last_saved_provider_label: Option<String>,
     pub last_saved_provider_target: Option<OnboardingProviderSaveTarget>,
     pub saved_primary_provider_label: Option<String>,
@@ -2521,6 +2526,7 @@ impl Default for OnboardingWizardState {
             pending_snapshot_restore: None,
             provider_save_target: None,
             research_lane_intent: false,
+            pending_research_lane_key: None,
             last_saved_provider_label: None,
             last_saved_provider_target: None,
             saved_primary_provider_label: None,
@@ -2828,23 +2834,24 @@ impl OnboardingWizardState {
     /// `SubProviderView` (family→provider, model→model, route→base_url /
     /// api_key_env / api_type) so the rich model-setting flow lands as a named
     /// research lane instead of the profile's primary/fallback provider. The
-    /// lane `key` defaults to the family id when not explicitly set.
+    /// lane `key` is the caller's explicit choice from `MENU_RESEARCH_LANE_KEY`
+    /// ("cheap"/"strong") — the deep_research palette requests lanes by those
+    /// LITERAL keys (`contract_for`), so a family-id key would produce a lane
+    /// the router never selects (PR384 review P1-b).
     pub fn build_research_lane_params(
         &self,
         current_profile: Option<&str>,
+        key: &str,
     ) -> Option<SubProvidersUpsertParams> {
         if !self.selection_ready() {
             return None;
         }
+        let key = key.trim();
+        if key.is_empty() {
+            return None;
+        }
         let route = &self.provider.route;
-        let key = {
-            let family = self.provider.family_id.trim();
-            if family.is_empty() {
-                "research".to_string()
-            } else {
-                family.to_string()
-            }
-        };
+        let key = key.to_string();
         Some(SubProvidersUpsertParams {
             // Use the caller-resolved ACTIVE profile directly (codex PR384 F3):
             // do NOT fall back to `effective_profile_id`, which prefers a stale

@@ -347,6 +347,8 @@ onboarding:
     saved_status_none: "Saved provider: none"
     primary: "primary"
     fallback: "fallback"
+    research_lane: "research lane"
+    save_research_lane: "Save as research lane"
   disabled:
     name_empty: "name is empty"
     username_empty: "username is empty"
@@ -473,6 +475,7 @@ status:
   research_add_usage: "Usage: /research add <key> <provider> <model> [base_url] [api_key_env]"
   research_rm_usage: "Usage: /research rm <key>"
   research_profile_unresolved: "Active profile not resolved yet — try again once the session is ready."
+  research_lane_saved: "Research lane %{key} saved: %{label} — restart to apply."
   opening_diff_preview: "Opening diff preview: %{operation} %{path}"
   opening_inline_diff_preview: "Opening inline diff preview: %{title}"
   approval_requested: "Approval requested: %{title}"
@@ -1030,6 +1033,16 @@ menu:
       yes: "Yes, remove %{lane}"
       yes_desc: "Uses profile/sub_providers/remove; the lane list refreshes when it completes."
       no: "No, keep it"
+  research_lane_key:
+    title: "Save research lane as…"
+    subtitle: "Deep research routes by lane key — %{provider} becomes the lane you pick. Restart to apply."
+    occupied: "currently %{current} (saving replaces it)"
+    vacant: "not configured yet"
+    item:
+      cheap:
+        desc: "The fast/cheap lane — deep_research uses it for scanning and summarization stages."
+      strong:
+        desc: "The strong lane — deep_research uses it for deep-reasoning and synthesis stages."
   agents:
     item:
       dock_collapse:
@@ -1435,6 +1448,8 @@ menu:
       save_provider:
         desc: Uses profile/llm/upsert and persists to the same profile JSON as the dashboard.
         label: Save provider to profile
+      save_research_lane:
+        desc: "Saves the staged provider as a deep_research lane (profile/sub_providers/upsert) — you pick which lane next: cheap or strong."
       saved_provider:
         desc: Last successful primary or fallback save
       selected_provider:
