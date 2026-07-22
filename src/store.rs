@@ -113,6 +113,20 @@ fn looks_like_file_change_activity(activity: &ActivityItem) -> bool {
         || text.contains(" deleted")
 }
 
+/// Largest byte index ≤ `cap` that lands on a `char` boundary of `text`
+/// (std's `floor_char_boundary` is unstable). Used to truncate `/gather`
+/// result bodies without splitting a multi-byte char.
+fn floor_char_boundary(text: &str, cap: usize) -> usize {
+    if cap >= text.len() {
+        return text.len();
+    }
+    let mut cut = cap;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
+}
+
 fn compact_first_line(value: &str, max_chars: usize) -> String {
     let line = value
         .lines()
@@ -716,6 +730,14 @@ impl Store {
                 ) {
                     return self.dispatch_peer_slash(draft);
                 }
+                if matches!(
+                    &command.entry,
+                    crate::menu::types::CommandEntry::LocalAction(
+                        crate::menu::types::LocalAction::Custom("gather"),
+                    )
+                ) {
+                    return self.dispatch_gather_slash(draft);
+                }
                 self.dispatch_command_entry(&command.entry, Some(invocation.args))
             }
             CommandResolution::EmptyCommand => {
@@ -825,6 +847,7 @@ impl Store {
         let mut go = false;
         let mut worktree = false;
         let mut cwd: Option<String> = None;
+        let mut n: Option<u32> = None;
         let mut cursor = rest;
         loop {
             let token_end = cursor.find(char::is_whitespace).unwrap_or(cursor.len());
@@ -845,6 +868,24 @@ impl Store {
                     }
                     cwd = Some(value.to_owned());
                     cursor = cursor[value_end..].trim_start();
+                }
+                // octos#1801 v2: `--n <K>` stages a fleet of K peers from this
+                // ONE brief. 2..=8 client-side — `--n 1` is just `/peer` (and
+                // `--n 0`/oversized are nonsense), so anything else rejects
+                // with the usage line rather than shipping it to the server.
+                "--n" => {
+                    let value_end = cursor.find(char::is_whitespace).unwrap_or(cursor.len());
+                    let value = &cursor[..value_end];
+                    match value.parse::<u32>() {
+                        Ok(count) if (2..=8).contains(&count) => {
+                            n = Some(count);
+                            cursor = cursor[value_end..].trim_start();
+                        }
+                        _ => {
+                            self.state.status = t!("status.peer_usage").into_owned();
+                            return SlashDispatchOutcome::Rejected;
+                        }
+                    }
                 }
                 _ => {
                     self.state.status = t!("status.peer_usage").into_owned();
@@ -893,6 +934,7 @@ impl Store {
         SlashDispatchOutcome::accepted(Some(AppUiCommand::PeerPrepare(
             crate::model::PeerPrepareParams {
                 brief: brief.to_owned(),
+                n,
                 title: None,
                 worktree,
                 cwd,
@@ -958,6 +1000,62 @@ impl Store {
             return None;
         }
         let result = event.result;
+        // octos#1801 v2 fleet: >1 staged peers → mint EVERY session key, stash
+        // a per-member kickoff (the ONE shared brief suffixed with the member
+        // lens), open the FIRST session via this apply's return value and ride
+        // the remaining opens on the generic bounded follow-up queue
+        // (`pending_autonomy_hydration`, drained by the event loop right after
+        // this apply; fleet max 8 < queue cap 16). `--go` follows the FIRST
+        // peer only. A scalar/one-entry result (v1 server via the serde
+        // default, or n absent) takes the single-peer path below unchanged.
+        if result.peers.len() > 1 {
+            self.state.prune_stale_peer_kickoffs();
+            let total = result.peers.len();
+            let mut first_open: Option<AppUiCommand> = None;
+            for (index, entry) in result.peers.iter().enumerate() {
+                let session_id = octos_core::SessionKey::with_profile_topic(
+                    &entry.profile_id,
+                    "local",
+                    "tui",
+                    &entry.topic,
+                );
+                let member = index + 1;
+                let brief = format!(
+                    "{brief}\n\n(You are fleet member {member} of {total} — peers were given \
+                     this same brief; differentiate your angle.)",
+                    brief = pending.brief,
+                );
+                self.state.pending_peer_kickoffs.insert(
+                    session_id.clone(),
+                    crate::model::PeerKickoff {
+                        brief,
+                        brief_path: entry.brief_path.clone(),
+                        go: pending.go && index == 0,
+                        created: std::time::Instant::now(),
+                    },
+                );
+                let open = AppUiCommand::OpenSession(octos_core::ui_protocol::SessionOpenParams {
+                    session_id,
+                    topic: None,
+                    profile_id: Some(entry.profile_id.clone()),
+                    cwd: Some(entry.cwd.clone()),
+                    sandbox: None,
+                    after: None,
+                });
+                if first_open.is_none() {
+                    first_open = Some(open);
+                } else {
+                    self.state.enqueue_autonomy_hydration(open);
+                }
+            }
+            self.state.status = t!(
+                "status.peer_fleet_opening",
+                n = total,
+                slug = result.slug.clone()
+            )
+            .into_owned();
+            return first_open;
+        }
         let session_id = octos_core::SessionKey::with_profile_topic(
             &result.profile_id,
             "local",
@@ -1048,6 +1146,125 @@ impl Store {
             reasoning_effort: None,
             live_video: false,
         }))
+    }
+
+    /// octos#1801 v2: byte cap for the composed `/gather` synthesis prompt.
+    /// The server caps each result at 48 KiB, but 8 fleet peers of those would
+    /// compose to ~384 KiB — far past a sane single-turn injection.
+    const GATHER_PROMPT_MAX_BYTES: usize = 64 * 1024;
+
+    /// Compose the `/gather` synthesis prompt from the blackboard rows: a
+    /// header, then one section per peer — status-ish label, the brief's first
+    /// 200 chars, and the latest result (or a still-running marker). When the
+    /// full composition exceeds [`Self::GATHER_PROMPT_MAX_BYTES`], the
+    /// per-peer RESULT bodies are truncated evenly (the scaffolding and brief
+    /// heads are small by construction) and each cut section says so.
+    fn compose_gather_prompt(result: &crate::model::PeerGatherResult) -> String {
+        const BRIEF_HEAD_CHARS: usize = 200;
+        const TRUNCATION_NOTE: &str = "\n[…result truncated to fit the gather prompt cap]";
+        let build = |result_budget: Option<usize>| -> String {
+            let mut out = String::from("Peer results gathered from the blackboard:\n");
+            for peer in &result.peers {
+                let status = if peer.result.is_some() {
+                    "done"
+                } else {
+                    "no result yet"
+                };
+                let brief_head: String = peer.brief.chars().take(BRIEF_HEAD_CHARS).collect();
+                out.push_str(&format!(
+                    "\n## peer {slug} ({status})\nBrief: {brief_head}\n\n",
+                    slug = peer.slug,
+                ));
+                match peer.result.as_deref() {
+                    Some(body) => {
+                        let cut = result_budget
+                            .map(|budget| floor_char_boundary(body, budget))
+                            .unwrap_or(body.len());
+                        if cut < body.len() {
+                            out.push_str(&body[..cut]);
+                            out.push_str(TRUNCATION_NOTE);
+                        } else {
+                            out.push_str(body);
+                        }
+                        out.push('\n');
+                    }
+                    None => out.push_str("(still running — no result file yet)\n"),
+                }
+            }
+            out
+        };
+        let full = build(None);
+        if full.len() <= Self::GATHER_PROMPT_MAX_BYTES {
+            return full;
+        }
+        // Over cap: split what the fixed scaffolding (header, section heads,
+        // brief heads, truncation notes — measured by a zero-budget build)
+        // leaves EVENLY across the peers that have results.
+        let with_results = result
+            .peers
+            .iter()
+            .filter(|peer| peer.result.is_some())
+            .count()
+            .max(1);
+        let overhead = build(Some(0)).len();
+        let per_result = Self::GATHER_PROMPT_MAX_BYTES.saturating_sub(overhead) / with_results;
+        build(Some(per_result))
+    }
+
+    /// `/gather [all | <slug> …]` (octos#1801 v2): read the peer blackboard
+    /// and synthesize the briefs + results into the CURRENT session as a
+    /// prompt turn. Bare `/gather` (or `all`) gathers every staged peer;
+    /// naming slugs filters server-side. The RPC is a READ — allowed in
+    /// read-only mode (the follow-up SubmitPrompt is blocked there like any
+    /// other prompt, with the standard warning).
+    pub(crate) fn dispatch_gather_slash(&mut self, draft: &str) -> SlashDispatchOutcome {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PEER_GATHER) {
+            return SlashDispatchOutcome::Rejected;
+        }
+        let rest = draft.trim();
+        let rest = rest.strip_prefix("/gather").unwrap_or(rest).trim();
+        let slugs = if rest.is_empty() || rest.eq_ignore_ascii_case("all") {
+            None
+        } else {
+            Some(
+                rest.split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // The ACTIVE session rides along so the server scopes the profile
+        // (mirrors `peer/prepare`); profile_id stays None in the TUI flow.
+        let session_id = self
+            .state
+            .active_session()
+            .map(|session| session.id.clone());
+        self.state.status = t!("status.gather_requesting").into_owned();
+        SlashDispatchOutcome::accepted(Some(AppUiCommand::PeerGather(
+            crate::model::PeerGatherParams {
+                slugs,
+                session_id,
+                profile_id: None,
+            },
+        )))
+    }
+
+    /// `peer/gather` result (octos#1801 v2): compose the blackboard rows into
+    /// the synthesis prompt and submit it into the CURRENT session through the
+    /// staging-aware chokepoint — a live turn STAGES it (like any typed input
+    /// mid-turn) instead of racing a second `turn/start`. No staged peers at
+    /// all → a status line only, no turn.
+    fn apply_peer_gathered_event(
+        &mut self,
+        event: crate::client_event::PeerGatheredClientEvent,
+    ) -> Option<AppUiCommand> {
+        if event.result.peers.is_empty() {
+            self.state.status = t!("status.gather_no_peers").into_owned();
+            return None;
+        }
+        let prompt = Self::compose_gather_prompt(&event.result);
+        let queued_status =
+            t!("status.gather_submitted", n = event.result.peers.len()).into_owned();
+        self.queue_or_start_prompt_turn(prompt, queued_status)
     }
 
     pub(crate) fn dispatch_research_slash(&mut self, draft: &str) -> SlashDispatchOutcome {
@@ -6679,6 +6896,7 @@ impl Store {
                 None
             }
             ClientEvent::PeerPrepared(event) => self.apply_peer_prepared_event(event),
+            ClientEvent::PeerGathered(event) => self.apply_peer_gathered_event(event),
             ClientEvent::SubProvidersMutation(event) => {
                 self.apply_sub_providers_mutation_event(event);
                 self.refresh_active_menu_if_open();
@@ -13531,6 +13749,7 @@ mod tests {
                     cwd: "/repo".into(),
                     worktree_branch: None,
                     profile_id: "coding".into(),
+                    peers: Vec::new(),
                 },
             },
         ));
@@ -13677,6 +13896,7 @@ mod tests {
                     cwd: "/repo".into(),
                     worktree_branch: Some("peer/fix-nav".into()),
                     profile_id: "coding".into(),
+                    peers: Vec::new(),
                 },
             },
         ));
@@ -13722,6 +13942,7 @@ mod tests {
                     cwd: "/repo".into(),
                     worktree_branch: None,
                     profile_id: "coding".into(),
+                    peers: Vec::new(),
                 },
             },
         ));
@@ -13922,6 +14143,7 @@ mod tests {
                     cwd: "/repo".into(),
                     worktree_branch: None,
                     profile_id: "coding".into(),
+                    peers: Vec::new(),
                 },
             },
         ));
@@ -14014,6 +14236,402 @@ mod tests {
         assert!(
             store.state.pending_peer_kickoffs.contains_key(&peer_key),
             "the staged kickoff survives the replay"
+        );
+    }
+
+    // ── /peer --n fleets + /gather (octos#1801 v2) ──────────────────────────
+
+    fn gather_capable_store() -> Store {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PEER_GATHER,
+        ]));
+        store
+    }
+
+    fn fleet_entry(index: usize) -> crate::model::PeerFleetEntry {
+        let slug = if index == 0 {
+            "fix-nav".to_string()
+        } else {
+            format!("fix-nav-{}", index + 1)
+        };
+        crate::model::PeerFleetEntry {
+            topic: format!("peer-{slug}"),
+            brief_path: format!("/repo/.octos/peers/{slug}/brief.md"),
+            slug,
+            cwd: "/repo".into(),
+            worktree_branch: None,
+            profile_id: "coding".into(),
+        }
+    }
+
+    /// A prepared-fleet result for `n` peers whose scalar head mirrors the
+    /// first entry (the server contract).
+    fn fleet_prepared_event(n: usize) -> ClientEvent {
+        let peers: Vec<_> = (0..n).map(fleet_entry).collect();
+        let first = peers[0].clone();
+        ClientEvent::PeerPrepared(crate::client_event::PeerPreparedClientEvent {
+            message: format!("Peer session prepared: {}", first.slug),
+            result: crate::model::PeerPrepareResult {
+                slug: first.slug,
+                topic: first.topic,
+                brief_path: first.brief_path,
+                cwd: first.cwd,
+                worktree_branch: first.worktree_branch,
+                profile_id: first.profile_id,
+                peers,
+            },
+        })
+    }
+
+    #[test]
+    fn peer_slash_n_flag_passes_through_params() {
+        let mut store = peer_capable_store();
+        let command = store
+            .dispatch_peer_slash("/peer --n 3 --worktree fix the thing")
+            .into_command();
+        let Some(AppUiCommand::PeerPrepare(params)) = command else {
+            panic!("expected a PeerPrepare command, got {command:?}");
+        };
+        assert_eq!(params.n, Some(3));
+        assert_eq!(params.brief, "fix the thing");
+        assert!(params.worktree);
+    }
+
+    #[test]
+    fn peer_slash_rejects_bad_n_values_with_usage() {
+        // 0 and 1 are nonsense fleets, 9 exceeds the server's 1..=8, a bare
+        // `--n` has no value, and non-numeric values do not parse — all reject
+        // with the usage status and arm NO stash.
+        for draft in [
+            "/peer --n 0 fix the thing",
+            "/peer --n 1 fix the thing",
+            "/peer --n 9 fix the thing",
+            "/peer --n",
+            "/peer --n lots fix the thing",
+        ] {
+            let mut store = peer_capable_store();
+            let outcome = store.dispatch_peer_slash(draft);
+            assert!(
+                matches!(outcome, SlashDispatchOutcome::Rejected),
+                "{draft:?} must reject"
+            );
+            assert_eq!(store.state.status, t!("status.peer_usage"), "{draft:?}");
+            assert!(
+                store.state.pending_peer_prepare.is_none(),
+                "{draft:?} must not arm the stash"
+            );
+        }
+    }
+
+    /// octos#1801 v2: a 3-peer fleet result mints 3 session keys, stashes 3
+    /// kickoffs whose briefs carry the per-member lens suffix, opens the
+    /// FIRST session via the apply's return value, and rides the other two
+    /// opens on the generic follow-up queue (`pending_autonomy_hydration`) in
+    /// fleet order.
+    #[test]
+    fn peer_prepared_fleet_stashes_all_kickoffs_and_queues_extra_opens() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer --n 3 fix the nav");
+        assert!(matches!(outcome, SlashDispatchOutcome::Accepted(Some(_))));
+
+        let open = store.apply_client_event(fleet_prepared_event(3));
+
+        let keys: Vec<_> = (0..3)
+            .map(|index| {
+                octos_core::SessionKey::with_profile_topic(
+                    "coding",
+                    "local",
+                    "tui",
+                    &fleet_entry(index).topic,
+                )
+            })
+            .collect();
+        // The FIRST open is the apply's return value…
+        let Some(AppUiCommand::OpenSession(params)) = open else {
+            panic!("fleet result must open the first session, got {open:?}");
+        };
+        assert_eq!(params.session_id, keys[0]);
+        assert_eq!(params.cwd.as_deref(), Some("/repo"));
+        // …the remaining opens ride the generic follow-up queue, in order.
+        for expected in &keys[1..] {
+            let queued = store.state.dequeue_autonomy_hydration();
+            let Some(AppUiCommand::OpenSession(params)) = queued else {
+                panic!("expected a queued OpenSession for {expected:?}, got {queued:?}");
+            };
+            assert_eq!(&params.session_id, expected);
+        }
+        assert!(
+            store.state.dequeue_autonomy_hydration().is_none(),
+            "exactly n-1 opens ride the queue"
+        );
+
+        // Every member has a kickoff whose brief is the SHARED brief plus its
+        // own fleet-member suffix; no --go → none of them switch focus.
+        assert_eq!(store.state.pending_peer_kickoffs.len(), 3);
+        for (index, key) in keys.iter().enumerate() {
+            let kickoff = store
+                .state
+                .pending_peer_kickoffs
+                .get(key)
+                .unwrap_or_else(|| panic!("kickoff stashed for {key:?}"));
+            assert!(
+                kickoff.brief.starts_with("fix the nav"),
+                "{}",
+                kickoff.brief
+            );
+            assert!(
+                kickoff.brief.contains(&format!(
+                    "(You are fleet member {} of 3 — peers were given this same brief; \
+                     differentiate your angle.)",
+                    index + 1
+                )),
+                "member {} suffix missing in {:?}",
+                index + 1,
+                kickoff.brief
+            );
+            assert!(!kickoff.go, "no --go → background member");
+            assert_eq!(kickoff.brief_path, fleet_entry(index).brief_path);
+        }
+        assert!(store.state.pending_peer_prepare.is_none());
+    }
+
+    /// `--go` with a fleet follows the FIRST peer only — the rest stay
+    /// background members.
+    #[test]
+    fn peer_prepared_fleet_go_focuses_first_member_only() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer --go --n 2 fix the nav");
+        assert!(matches!(outcome, SlashDispatchOutcome::Accepted(Some(_))));
+        store.apply_client_event(fleet_prepared_event(2));
+
+        let go_flags: Vec<_> = (0..2)
+            .map(|index| {
+                let key = octos_core::SessionKey::with_profile_topic(
+                    "coding",
+                    "local",
+                    "tui",
+                    &fleet_entry(index).topic,
+                );
+                store
+                    .state
+                    .pending_peer_kickoffs
+                    .get(&key)
+                    .expect("kickoff stashed")
+                    .go
+            })
+            .collect();
+        assert_eq!(go_flags, vec![true, false]);
+    }
+
+    /// Old-server compat: a scalar-only result (peers empty via the serde
+    /// default) is EXACTLY today's single-peer flow — one unsuffixed kickoff,
+    /// one returned open, nothing on the follow-up queue.
+    #[test]
+    fn peer_prepared_empty_peers_result_behaves_like_single_peer() {
+        let mut store = peer_capable_store();
+        let peer_key = prepare_peer(&mut store, "/peer fix the nav");
+        assert_eq!(store.state.pending_peer_kickoffs.len(), 1);
+        let kickoff = store
+            .state
+            .pending_peer_kickoffs
+            .get(&peer_key)
+            .expect("kickoff stashed");
+        assert_eq!(
+            kickoff.brief, "fix the nav",
+            "no fleet suffix on the single-peer path"
+        );
+        assert!(
+            store.state.dequeue_autonomy_hydration().is_none(),
+            "nothing rides the follow-up queue for a single peer"
+        );
+    }
+
+    #[test]
+    fn gather_slash_requires_peer_gather_capability() {
+        // peer/prepare alone is not enough — /gather probes nothing on
+        // servers that do not advertise peer/gather.
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_gather_slash("/gather");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+        assert_eq!(
+            store.state.status,
+            t!(
+                "status.appui_method_not_advertised",
+                method = crate::model::APPUI_METHOD_PEER_GATHER
+            )
+        );
+    }
+
+    #[test]
+    fn gather_slash_bare_and_all_send_no_slug_filter() {
+        for draft in ["/gather", "/gather all", "/gather ALL"] {
+            let mut store = gather_capable_store();
+            let command = store.dispatch_gather_slash(draft).into_command();
+            let Some(AppUiCommand::PeerGather(params)) = command else {
+                panic!("{draft:?}: expected a PeerGather command, got {command:?}");
+            };
+            assert!(params.slugs.is_none(), "{draft:?} gathers every peer");
+            // The ACTIVE session rides along for server-side profile scoping.
+            assert_eq!(params.session_id, Some(SessionKey("local:test".into())));
+            assert!(params.profile_id.is_none());
+        }
+    }
+
+    #[test]
+    fn gather_slash_named_slugs_pass_through() {
+        let mut store = gather_capable_store();
+        let command = store
+            .dispatch_gather_slash("/gather fix-nav fix-nav-2")
+            .into_command();
+        let Some(AppUiCommand::PeerGather(params)) = command else {
+            panic!("expected a PeerGather command, got {command:?}");
+        };
+        assert_eq!(
+            params.slugs,
+            Some(vec!["fix-nav".to_string(), "fix-nav-2".to_string()])
+        );
+    }
+
+    fn gather_entry(
+        slug: &str,
+        brief: &str,
+        result: Option<&str>,
+    ) -> crate::model::PeerGatherEntry {
+        crate::model::PeerGatherEntry {
+            slug: slug.into(),
+            topic: format!("peer-{slug}"),
+            brief: brief.into(),
+            brief_truncated: false,
+            result: result.map(str::to_owned),
+            result_truncated: false,
+            result_updated_unix: result.map(|_| 1_753_000_000),
+            has_worktree: false,
+        }
+    }
+
+    /// The gather result composes one section per peer — finished peers carry
+    /// their result body, running ones the still-running marker — and submits
+    /// the synthesis prompt into the CURRENT session as an ordinary turn.
+    #[test]
+    fn gather_result_composes_sections_and_submits_prompt() {
+        let mut store = gather_capable_store();
+        let command = store.apply_client_event(ClientEvent::PeerGathered(
+            crate::client_event::PeerGatheredClientEvent {
+                message: "Gathered 1/2 peer result(s)".into(),
+                result: crate::model::PeerGatherResult {
+                    profile_id: "coding".into(),
+                    peers: vec![
+                        gather_entry(
+                            "fix-nav",
+                            "make the nav not flicker",
+                            Some("Nav fixed: it was a z-index war."),
+                        ),
+                        gather_entry("fix-nav-2", "make the nav not flicker", None),
+                    ],
+                },
+            },
+        ));
+        let Some(AppUiCommand::SubmitPrompt(params)) = command else {
+            panic!("expected the synthesis SubmitPrompt, got {command:?}");
+        };
+        assert_eq!(
+            params.session_id,
+            SessionKey("local:test".into()),
+            "the synthesis lands in the CURRENT session"
+        );
+        let InputItem::Text { text } = &params.input[0] else {
+            panic!("expected a text input item");
+        };
+        assert!(text.starts_with("Peer results gathered from the blackboard:"));
+        assert!(text.contains("## peer fix-nav (done)"));
+        assert!(text.contains("Nav fixed: it was a z-index war."));
+        assert!(text.contains("## peer fix-nav-2 (no result yet)"));
+        assert!(text.contains("(still running — no result file yet)"));
+        assert!(text.contains("Brief: make the nav not flicker"));
+    }
+
+    /// Zero staged peers → a status line only. No turn, nothing staged.
+    #[test]
+    fn gather_result_with_no_peers_sets_status_only() {
+        let mut store = gather_capable_store();
+        let command = store.apply_client_event(ClientEvent::PeerGathered(
+            crate::client_event::PeerGatheredClientEvent {
+                message: "No peers staged on the blackboard".into(),
+                result: crate::model::PeerGatherResult {
+                    profile_id: "coding".into(),
+                    peers: Vec::new(),
+                },
+            },
+        ));
+        assert!(command.is_none(), "no peers → no turn: {command:?}");
+        assert_eq!(store.state.status, t!("status.gather_no_peers"));
+        assert!(store.state.pending_messages.is_empty());
+    }
+
+    /// A live turn STAGES the synthesis prompt (the staging-aware chokepoint)
+    /// instead of racing a second `turn/start` into the active session.
+    #[test]
+    fn gather_result_stages_prompt_when_turn_live() {
+        let mut store = gather_capable_store();
+        let started = store.queue_or_start_prompt_turn("first".into(), "sent".into());
+        assert!(started.is_some(), "idle session starts the first turn");
+        assert!(store.state.run_state.is_active());
+
+        let command = store.apply_client_event(ClientEvent::PeerGathered(
+            crate::client_event::PeerGatheredClientEvent {
+                message: "Gathered 1/1 peer result(s)".into(),
+                result: crate::model::PeerGatherResult {
+                    profile_id: "coding".into(),
+                    peers: vec![gather_entry("fix-nav", "brief", Some("done"))],
+                },
+            },
+        ));
+        assert!(command.is_none(), "mid-turn gather stages, got {command:?}");
+        assert_eq!(store.state.pending_messages.len(), 1);
+        assert!(
+            store.state.pending_messages[0]
+                .starts_with("Peer results gathered from the blackboard:"),
+            "the staged prompt is the synthesis prompt"
+        );
+    }
+
+    /// Oversized results are truncated EVENLY so the composed prompt stays
+    /// within the ~64 KiB cap, and every cut section says so.
+    #[test]
+    fn gather_prompt_caps_total_size_with_even_truncation() {
+        let big_a = "a".repeat(60 * 1024);
+        let big_b = "b".repeat(60 * 1024);
+        let result = crate::model::PeerGatherResult {
+            profile_id: "coding".into(),
+            peers: vec![
+                gather_entry("peer-a", "brief a", Some(&big_a)),
+                gather_entry("peer-b", "brief b", Some(&big_b)),
+                gather_entry("peer-c", "brief c", None),
+            ],
+        };
+        let prompt = Store::compose_gather_prompt(&result);
+        assert!(
+            prompt.len() <= Store::GATHER_PROMPT_MAX_BYTES,
+            "composed prompt must fit the cap, got {} bytes",
+            prompt.len()
+        );
+        assert!(prompt.contains("## peer peer-a (done)"));
+        assert!(prompt.contains("## peer peer-b (done)"));
+        assert!(prompt.contains("## peer peer-c (no result yet)"));
+        assert_eq!(
+            prompt
+                .matches("[…result truncated to fit the gather prompt cap]")
+                .count(),
+            2,
+            "both oversized results carry the truncation note"
+        );
+        // Even split: both bodies survive at (roughly) equal length.
+        let kept_a = prompt.matches('a').count();
+        let kept_b = prompt.matches('b').count();
+        assert!(
+            kept_a.abs_diff(kept_b) <= 64,
+            "even truncation: kept {kept_a} vs {kept_b}"
         );
     }
 

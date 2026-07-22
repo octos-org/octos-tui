@@ -149,8 +149,9 @@ mod i18n_tests {
         }
     }
 
-    /// #395: the `/peer` command strings (registry description + dispatch /
-    /// kickoff status lines) resolve in BOTH locales.
+    /// #395 + octos#1801 v2: the `/peer` + `/gather` command strings
+    /// (registry descriptions + dispatch / kickoff / fan-in status lines)
+    /// resolve in BOTH locales.
     #[test]
     fn peer_command_keys_resolve_in_en_and_zh() {
         let keys = [
@@ -163,6 +164,11 @@ mod i18n_tests {
             "status.peer_opening",
             "status.peer_started",
             "status.peer_switched",
+            "status.peer_fleet_opening",
+            "command.gather.desc",
+            "status.gather_requesting",
+            "status.gather_no_peers",
+            "status.gather_submitted",
         ];
         for key in keys {
             for locale in ["en", "zh"] {

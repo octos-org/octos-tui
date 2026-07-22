@@ -703,6 +703,23 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             inline_args: InlineArgMode::Optional,
             entry: CommandEntry::LocalAction(LocalAction::Custom("peer")),
         },
+        // `/gather` (octos#1801 v2) — fan the peer blackboard (briefs +
+        // results) back into the current session as a synthesis prompt. Gated
+        // on `peer/gather` (same treatment as `/undo` on `snapshot/list`);
+        // `app_ui_read` because the RPC only READS the blackboard — the
+        // prompt turn it triggers afterwards is an ordinary submit, blocked
+        // in read-only mode by the transport like any other prompt.
+        CommandSpec {
+            name: "gather",
+            aliases: &[],
+            description: "command.gather.desc",
+            category: CommandCategory::Session,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_when_capabilities(&[crate::model::APPUI_METHOD_PEER_GATHER]),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::Custom("gather")),
+        },
         CommandSpec {
             name: "research",
             aliases: &["lanes"],
@@ -1259,6 +1276,61 @@ mod tests {
         assert!(
             !lists_peer(&readonly),
             "/peer hides in read-only mode (peer/prepare mutates)"
+        );
+    }
+
+    /// octos#1801 v2: `/gather` is gated on `peer/gather` (hidden on old
+    /// servers) but — unlike `/peer` — stays VISIBLE in read-only mode: the
+    /// RPC only reads the blackboard (the transport blocks the follow-up
+    /// prompt submit there, like any prompt).
+    #[test]
+    fn gather_command_gated_on_peer_gather_and_visible_in_readonly() {
+        let registry = CommandRegistry::with_core_commands();
+        assert_eq!(
+            registry.find("gather").map(|command| command.name),
+            Some("gather"),
+            "/gather is registered"
+        );
+
+        let base_caps = CapabilitySet::from_methods([crate::model::APPUI_METHOD_PEER_PREPARE]);
+        let gather_caps = CapabilitySet::from_methods([crate::model::APPUI_METHOD_PEER_GATHER]);
+        let without = AvailabilityContext {
+            task: TaskActivity::Idle,
+            approval_modal_visible: false,
+            readonly: false,
+            runtime: RuntimeMode::Protocol,
+            connection: ConnectionState::Connected,
+            capabilities: Some(&base_caps),
+            feature_flags: &[],
+            session_open: true,
+        };
+        let lists_gather = |ctx: &AvailabilityContext<'_>| {
+            registry
+                .available_commands(ctx)
+                .into_iter()
+                .any(|command| command.name == "gather")
+        };
+        assert!(
+            !lists_gather(&without),
+            "/gather hides without peer/gather (peer/prepare alone is not enough)"
+        );
+
+        let with = AvailabilityContext {
+            capabilities: Some(&gather_caps),
+            ..without
+        };
+        assert!(
+            lists_gather(&with),
+            "/gather appears once peer/gather is advertised"
+        );
+
+        let readonly = AvailabilityContext {
+            readonly: true,
+            ..with
+        };
+        assert!(
+            lists_gather(&readonly),
+            "/gather stays available in read-only mode (a pure read)"
         );
     }
 

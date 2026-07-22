@@ -1826,6 +1826,9 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ProfileLlmFetchModels(_)
                 | AppUiCommand::ProfileSubProvidersList(_)
                 | AppUiCommand::SnapshotList(_)
+                // octos#1801 v2: `peer/gather` only reads brief/result files
+                // off the peer blackboard — readonly viewers may gather.
+                | AppUiCommand::PeerGather(_)
                 | AppUiCommand::ProfileSkillsList(_)
                 | AppUiCommand::ProfileSkillsRegistrySearch(_)
                 // M15-E read-only autonomy inspection. Reconnect
@@ -2704,6 +2707,7 @@ fn rpc_request_from_command(
         AppUiCommand::SnapshotList(params) => serde_json::to_value(params),
         AppUiCommand::SnapshotRestore(params) => serde_json::to_value(params),
         AppUiCommand::PeerPrepare(params) => serde_json::to_value(params),
+        AppUiCommand::PeerGather(params) => serde_json::to_value(params),
         AppUiCommand::ProfileSubProvidersUpsert(params) => serde_json::to_value(params),
         AppUiCommand::ProfileSubProvidersRemove(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmSelect(params) => serde_json::to_value(params),
@@ -3162,6 +3166,21 @@ fn success_response_to_app_event(
                         format!(
                             "failed to decode UI protocol result for {}: {err}",
                             crate::model::APPUI_METHOD_PEER_PREPARE
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PEER_GATHER => {
+            match serde_json::from_value::<crate::model::PeerGatherResult>(result) {
+                Ok(result) => Ok(Some(peer_gather_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_PEER_GATHER
                         ),
                     )
                     .into(),
@@ -3757,6 +3776,19 @@ fn snapshot_list_event(result: crate::model::SnapshotListResult) -> ClientEvent 
 fn peer_prepare_event(result: crate::model::PeerPrepareResult) -> ClientEvent {
     let message = format!("Peer session prepared: {}", result.slug);
     ClientEvent::PeerPrepared(crate::client_event::PeerPreparedClientEvent { message, result })
+}
+
+fn peer_gather_event(result: crate::model::PeerGatherResult) -> ClientEvent {
+    let with_results = result
+        .peers
+        .iter()
+        .filter(|peer| peer.result.is_some())
+        .count();
+    let message = match result.peers.len() {
+        0 => "No peers staged on the blackboard".into(),
+        total => format!("Gathered {with_results}/{total} peer result(s)"),
+    };
+    ClientEvent::PeerGathered(crate::client_event::PeerGatheredClientEvent { message, result })
 }
 
 fn sub_providers_list_event(result: SubProvidersListResult) -> ClientEvent {
@@ -6832,6 +6864,7 @@ mod tests {
             "peer-1".into(),
             AppUiCommand::PeerPrepare(crate::model::PeerPrepareParams {
                 brief: "fix the nav flicker".into(),
+                n: None,
                 title: None,
                 worktree: true,
                 cwd: Some("/repo".into()),
@@ -6894,6 +6927,166 @@ mod tests {
         );
         assert_eq!(event.result.profile_id, "coding");
         assert!(event.message.contains("fix-nav-flicker"));
+        assert!(
+            event.result.peers.is_empty(),
+            "a v1 scalar-only result decodes with the serde-default empty fleet"
+        );
+    }
+
+    /// octos#1801 v2: `peer/prepare` fleet requests encode `n` (omitted when
+    /// absent), and fleet results decode the `peers` array alongside the
+    /// scalar head.
+    #[test]
+    fn peer_prepare_fleet_n_encodes_and_peers_decode() {
+        let request = rpc_request_from_command(
+            "peer-2".into(),
+            AppUiCommand::PeerPrepare(crate::model::PeerPrepareParams {
+                brief: "fix the nav".into(),
+                n: Some(3),
+                title: None,
+                worktree: false,
+                cwd: None,
+                session_id: None,
+                profile_id: None,
+            }),
+        )
+        .expect("peer/prepare fleet request encodes");
+        assert_eq!(request.params["n"], 3);
+
+        let mut pending = HashMap::new();
+        pending.insert(
+            "peer-2".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_PEER_PREPARE.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "peer-2",
+            "result": {
+                "slug": "fix-nav",
+                "topic": "peer-fix-nav",
+                "brief_path": "/repo/.octos/peers/fix-nav/brief.md",
+                "cwd": "/repo",
+                "worktree_branch": null,
+                "profile_id": "coding",
+                "peers": [
+                    {
+                        "slug": "fix-nav",
+                        "topic": "peer-fix-nav",
+                        "brief_path": "/repo/.octos/peers/fix-nav/brief.md",
+                        "cwd": "/repo",
+                        "worktree_branch": null,
+                        "profile_id": "coding"
+                    },
+                    {
+                        "slug": "fix-nav-2",
+                        "topic": "peer-fix-nav-2",
+                        "brief_path": "/repo/.octos/peers/fix-nav-2/brief.md",
+                        "cwd": "/repo",
+                        "worktree_branch": null,
+                        "profile_id": "coding"
+                    }
+                ]
+            }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::PeerPrepared(event) = event else {
+            panic!("expected peer prepared event, got {event:?}");
+        };
+        assert_eq!(event.result.peers.len(), 2);
+        assert_eq!(event.result.peers[1].slug, "fix-nav-2");
+        assert_eq!(event.result.peers[1].topic, "peer-fix-nav-2");
+    }
+
+    /// octos#1801 v2: `peer/gather` requests encode the slug filter (omitted
+    /// for gather-all) and results decode into
+    /// `ClientEvent::PeerGathered` — including a peer with no result yet.
+    #[test]
+    fn peer_gather_request_encodes_and_result_decodes_to_client_event() {
+        let request = rpc_request_from_command(
+            "gather-1".into(),
+            AppUiCommand::PeerGather(crate::model::PeerGatherParams {
+                slugs: None,
+                session_id: Some(SessionKey("coding:local:tui#coding".into())),
+                profile_id: None,
+            }),
+        )
+        .expect("peer/gather request encodes");
+        assert_eq!(request.method, crate::model::APPUI_METHOD_PEER_GATHER);
+        assert_eq!(request.params["session_id"], "coding:local:tui#coding");
+        assert!(
+            request.params.get("slugs").is_none(),
+            "slugs: None (gather all) must be omitted from the wire shape"
+        );
+        assert!(request.params.get("profile_id").is_none());
+
+        let filtered = rpc_request_from_command(
+            "gather-2".into(),
+            AppUiCommand::PeerGather(crate::model::PeerGatherParams {
+                slugs: Some(vec!["fix-nav".into()]),
+                session_id: None,
+                profile_id: None,
+            }),
+        )
+        .expect("filtered peer/gather request encodes");
+        assert_eq!(filtered.params["slugs"], json!(["fix-nav"]));
+
+        let mut pending = HashMap::new();
+        pending.insert(
+            "gather-1".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_PEER_GATHER.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "gather-1",
+            "result": {
+                "profile_id": "coding",
+                "peers": [
+                    {
+                        "slug": "fix-nav",
+                        "topic": "peer-fix-nav",
+                        "brief": "make the nav not flicker",
+                        "brief_truncated": false,
+                        "result": "Nav fixed.",
+                        "result_truncated": false,
+                        "result_updated_unix": 1753000000,
+                        "has_worktree": true
+                    },
+                    {
+                        "slug": "fix-nav-2",
+                        "topic": "peer-fix-nav-2",
+                        "brief": "make the nav not flicker",
+                        "brief_truncated": false,
+                        "result": null,
+                        "result_truncated": false,
+                        "result_updated_unix": null,
+                        "has_worktree": false
+                    }
+                ]
+            }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::PeerGathered(event) = event else {
+            panic!("expected peer gathered event, got {event:?}");
+        };
+        assert_eq!(event.result.profile_id, "coding");
+        assert_eq!(event.result.peers.len(), 2);
+        assert_eq!(event.result.peers[0].result.as_deref(), Some("Nav fixed."));
+        assert_eq!(event.result.peers[0].result_updated_unix, Some(1753000000));
+        assert!(event.result.peers[0].has_worktree);
+        assert!(event.result.peers[1].result.is_none());
+        assert!(event.message.contains("1/2"));
     }
 
     /// Realistic `session/status/read` result body as emitted by an octos
@@ -7161,6 +7354,14 @@ mod tests {
                 profile_id: Some("coding".into()),
                 q: Some("search".into()),
             }),
+            // octos#1801 v2: `peer/gather` only reads the blackboard —
+            // readonly viewers may gather (the follow-up SubmitPrompt is
+            // where readonly blocks).
+            AppUiCommand::PeerGather(crate::model::PeerGatherParams {
+                slugs: None,
+                session_id: Some(session_id.clone()),
+                profile_id: None,
+            }),
         ];
         for command in &read_style_commands {
             assert!(
@@ -7241,6 +7442,7 @@ mod tests {
             // worktree) server-side — a mutation, blocked in read-only mode.
             AppUiCommand::PeerPrepare(crate::model::PeerPrepareParams {
                 brief: "fix the thing".into(),
+                n: None,
                 title: None,
                 worktree: false,
                 cwd: None,
@@ -7355,6 +7557,7 @@ mod tests {
             // "unexpectedly blocked read-style" policy-bug arm.
             AppUiCommand::PeerPrepare(crate::model::PeerPrepareParams {
                 brief: "fix the thing".into(),
+                n: None,
                 title: None,
                 worktree: false,
                 cwd: None,

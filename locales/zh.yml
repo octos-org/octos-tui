@@ -461,7 +461,9 @@ command:
   undo:
     desc: 将工作区文件回滚到修改前的快照（#1768）。
   peer:
-    desc: "派生一个带持久任务简报的同伴智能体会话：/peer [--go] [--worktree] [--cwd <path>] <brief>。"
+    desc: "派生一个带持久任务简报的同伴智能体会话：/peer [--go] [--worktree] [--cwd <path>] [--n <2-8>] <brief>。"
+  gather:
+    desc: "把黑板上的同伴结果汇总进当前会话：/gather [all | <slug> …]。"
   research:
     desc: 管理研究模型通道（deep_research 的 cheap/strong 模型）。
   onboard:
@@ -1219,13 +1221,17 @@ menu:
   unavailable: 菜单不可用
 status:
   undo_no_session: "没有可撤销的活动会话。"
-  peer_usage: "用法：/peer [--go] [--worktree] [--cwd <path>] <brief>"
+  peer_usage: "用法：/peer [--go] [--worktree] [--cwd <path>] [--n <2-8>] <brief>"
   peer_preparing: "正在准备同伴会话…"
   session_blocked_hint: "%{session} 正在等待你的确认：%{reason} —— 按 Alt+S 处理。"
   peer_prepare_in_flight: "已有同伴会话正在准备中 —— 请等它打开（或约 30 秒后）再发起新的。"
   peer_opening: "正在打开同伴 %{slug}…"
   peer_started: "同伴 %{slug} 已在后台开始工作 —— 请留意会话栏中它的标记（Alt+S）。"
   peer_switched: "同伴 %{slug} 已启动 —— 您现在位于它的会话中。"
+  peer_fleet_opening: "正在打开 %{n} 个同伴组成的编队（第一个：%{slug}）…"
+  gather_requesting: "正在从黑板收集同伴结果…"
+  gather_no_peers: "黑板上还没有同伴 —— 先用 /peer 派生几个吧。"
+  gather_submitted: "已把 %{n} 个同伴的结果从黑板汇总进当前会话。"
   research_usage: "用法：/research | /research add <key> <provider> <model> [base_url] [api_key_env] | /research rm <key>"
   research_add_usage: "用法：/research add <key> <provider> <model> [base_url] [api_key_env]"
   research_rm_usage: "用法：/research rm <key>"
