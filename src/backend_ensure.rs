@@ -13,11 +13,17 @@
 //! `OctosServe` scheduled task on Windows), which a stdio client neither needs
 //! nor should trigger.
 //!
-//! We resolve octos against BOTH `PATH` and the legacy installer dir
-//! `~/.octos/bin`. When it's usable only in that dir (not on `PATH`), we
-//! **rewrite the stdio command to the full path** — octos-tui forbids `unsafe`,
-//! so we can't mutate the process `PATH`. A `brew`/`npm` install lands on
-//! `PATH`, so that rewrite is mainly for a pre-existing `install.sh` deployment.
+//! We resolve octos against BOTH `PATH` and the installer dir `~/.octos/bin`.
+//! When it's usable only in that dir (not on `PATH`): on Unix we rewrite the
+//! stdio command to the full path; on Windows we leave the command bare and the
+//! stdio transport prepends `~/.octos/bin` to the *child's* PATH (a quoted path
+//! in the command string is mangled by `cmd /C`). Either way we never mutate
+//! our own process PATH (octos-tui forbids `unsafe`).
+//!
+//! The Windows download targets the **exact octos release this octos-tui is
+//! built against** ([`REQUIRED_OCTOS_RELEASE`]) — pinned so client and server
+//! protocols always match, rather than the stale `releases/latest` (stable-only,
+//! and octos ships only prereleases) or a "newest" that could drift ahead.
 //!
 //! Scope — it acts on a `Mode::Protocol` launch whose `--stdio-command`'s
 //! **leading program** is a bare `octos` (PATH-resolved). Trailing args may
@@ -550,12 +556,33 @@ fn have(program: &str) -> bool {
     }
 }
 
-/// The prebuilt octos server bundle for 64-bit Windows, served from the latest
-/// GitHub release. `7z a <zip> *` archives the build dir's contents, so
-/// `octos.exe` sits at the archive root beside its bundled skills.
-const WINDOWS_BUNDLE_URL: &str = "https://github.com/octos-org/octos/releases/latest/download/octos-bundle-x86_64-pc-windows-msvc.zip";
-/// Published SHA-256 for [`WINDOWS_BUNDLE_URL`] (a `"<hex>  <name>"` line).
-const WINDOWS_BUNDLE_SHA256_URL: &str = "https://github.com/octos-org/octos/releases/latest/download/octos-bundle-x86_64-pc-windows-msvc.zip.sha256";
+/// The octos **server release this octos-tui is built against** — the tag whose
+/// bundle carries the exact `octos-core` protocol this client pins (see the
+/// `octos-core` rev in Cargo.toml). Each octos-tui dictates its matching octos:
+/// the Windows auto-installer downloads THIS exact release, so client and server
+/// protocols always agree — no stale `releases/latest` (too old) and no "newest"
+/// moving target (which could drift ahead of the pinned protocol).
+///
+/// **BUMP THIS whenever you bump the `octos-core` rev in Cargo.toml**, to the
+/// octos release tag that contains that rev. Override for a fork / pinned test
+/// build with [`OCTOS_RELEASE_ENV`].
+const REQUIRED_OCTOS_RELEASE: &str = "v2.0.2-rc.12";
+/// Env var overriding the octos release tag to install (fork / pinned build).
+const OCTOS_RELEASE_ENV: &str = "OCTOS_TUI_OCTOS_RELEASE";
+/// The Windows server-bundle asset name in each octos release. `7z a <zip> *`
+/// archives the build dir's contents, so `octos.exe` sits at the archive root
+/// beside its bundled skills.
+const WINDOWS_BUNDLE_ASSET: &str = "octos-bundle-x86_64-pc-windows-msvc.zip";
+
+/// Direct download URLs for the pinned release's Windows bundle + its checksum.
+fn windows_bundle_urls() -> (String, String, String) {
+    let tag = env_or(OCTOS_RELEASE_ENV, REQUIRED_OCTOS_RELEASE);
+    let bundle = format!(
+        "https://github.com/octos-org/octos/releases/download/{tag}/{WINDOWS_BUNDLE_ASSET}"
+    );
+    let sha = format!("{bundle}.sha256");
+    (bundle, sha, tag)
+}
 
 /// Windows fallback when neither `brew` nor `npm` is available (the common case
 /// on a fresh Windows box): download the prebuilt octos server bundle and
@@ -574,18 +601,20 @@ fn install_octos_windows_bundle() -> Result<()> {
         .ok_or_else(|| eyre!("octos install path {} has no parent", octos.display()))?
         .to_path_buf();
 
+    let (bundle_url, sha_url, tag) = windows_bundle_urls();
+
     eprintln!(
         "octos-tui: octos backend not found and no brew/npm available; downloading the \
-         octos server bundle (set {OPT_OUT_ENV}=1 to skip)..."
+         octos server bundle {tag} (set {OPT_OUT_ENV}=1 to skip)..."
     );
 
-    let bytes = http_get_bytes(WINDOWS_BUNDLE_URL)
-        .wrap_err("failed to download the octos server bundle")?;
+    let bytes =
+        http_get_bytes(&bundle_url).wrap_err("failed to download the octos server bundle")?;
 
     // Integrity-check before extracting an executable we're about to run. A
     // missing checksum (older releases) warns but doesn't hard-fail; a mismatch
     // does.
-    match http_get_string(WINDOWS_BUNDLE_SHA256_URL) {
+    match http_get_string(&sha_url) {
         Ok(published) => verify_sha256(&bytes, &published)?,
         Err(err) => eprintln!(
             "octos-tui: could not fetch the bundle checksum ({err}); skipping verification"
@@ -740,6 +769,22 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_bundle_urls_point_at_the_pinned_release() {
+        let (bundle, sha, tag) = windows_bundle_urls();
+        assert_eq!(tag, REQUIRED_OCTOS_RELEASE);
+        assert_eq!(
+            bundle,
+            format!(
+                "https://github.com/octos-org/octos/releases/download/{REQUIRED_OCTOS_RELEASE}/{WINDOWS_BUNDLE_ASSET}"
+            )
+        );
+        assert_eq!(sha, format!("{bundle}.sha256"));
+        // Sanity: the pin is a concrete release tag, not a floating alias.
+        assert!(REQUIRED_OCTOS_RELEASE.starts_with('v'));
+        assert!(!REQUIRED_OCTOS_RELEASE.contains("latest"));
+    }
 
     #[test]
     fn install_bin_dir_is_the_parent_of_the_probed_exe() {
