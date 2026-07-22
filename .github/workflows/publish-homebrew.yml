@@ -13,9 +13,18 @@ name: Publish Homebrew Formula
 #
 # It runs in parallel with release.yml and polls the release until dist has
 # uploaded all the tarballs (Rust cross-compiles for 4 targets can take a
-# while), then renders Formula/octos-tui.rb from their checksums and pushes it
-# to main (main is NOT branch-protected). Prereleases (tags with a '-') are
-# skipped so the stable formula never tracks an rc/beta. GITHUB_TOKEN only.
+# while), then renders the formula from their checksums and pushes it to main
+# (main is NOT branch-protected). GITHUB_TOKEN only.
+#
+# TWO-CHANNEL scheme (mirrors dist-workspace.toml + release.yml's npm publish):
+#   - STABLE tag (no '-'): render Formula/octos-tui.rb (class OctosTui) from
+#     packaging/homebrew/octos-tui.rb — the stable channel, unchanged.
+#   - PRERELEASE tag (has a '-', e.g. v0.2.2-rc.15): render the SEPARATE
+#     Formula/octos-tui-dev.rb (class OctosTuiDev) from
+#     packaging/homebrew/octos-tui-dev.rb, pointed at the prerelease assets.
+# A prerelease NEVER touches the stable Formula/octos-tui.rb, so
+# `brew install octos-org/octos-tui/octos-tui` stays STABLE while
+# `brew install octos-org/octos-tui/octos-tui-dev` tracks the latest prerelease.
 
 on:
   push:
@@ -38,23 +47,33 @@ jobs:
       TAG: ${{ inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Skip prereleases
+      - name: Select formula channel (stable vs prerelease)
         id: gate
         run: |
+          # A tag with a '-' (e.g. v0.2.2-rc.15) is a prerelease -> render the
+          # SEPARATE dev formula; otherwise render the stable formula. Either
+          # way we render + commit (no more skipping) so both channels stay live.
           if [[ "$TAG" == *-* ]]; then
-            echo "::notice::$TAG is a prerelease — Formula/octos-tui.rb tracks stable only; skipping."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG is a prerelease — rendering the dev formula (octos-tui-dev); stable octos-tui is untouched."
+            {
+              echo "channel=prerelease"
+              echo "formula_file=Formula/octos-tui-dev.rb"
+              echo "template_file=packaging/homebrew/octos-tui-dev.rb"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG is a stable release — rendering the stable formula (octos-tui)."
+            {
+              echo "channel=stable"
+              echo "formula_file=Formula/octos-tui.rb"
+              echo "template_file=packaging/homebrew/octos-tui.rb"
+            } >> "$GITHUB_OUTPUT"
           fi
 
       - uses: actions/checkout@v4
-        if: ${{ steps.gate.outputs.skip != 'true' }}
         with:
           ref: main
 
       - name: Download release tarballs for the tag
-        if: ${{ steps.gate.outputs.skip != 'true' }}
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -82,7 +101,12 @@ jobs:
           ls -la artifacts
 
       - name: Render formula and commit to main
-        if: ${{ steps.gate.outputs.skip != 'true' }}
+        env:
+          # The channel-specific source template and destination formula, chosen
+          # by the gate above (stable -> octos-tui, prerelease -> octos-tui-dev).
+          TEMPLATE_FILE: ${{ steps.gate.outputs.template_file }}
+          FORMULA_FILE: ${{ steps.gate.outputs.formula_file }}
+          CHANNEL: ${{ steps.gate.outputs.channel }}
         run: |
           set -euo pipefail
           version="${TAG#v}"
@@ -91,22 +115,22 @@ jobs:
           sha_linux_x64=$(sha256sum artifacts/octos-tui-x86_64-unknown-linux-gnu.tar.xz | awk '{print $1}')
 
           mkdir -p Formula
-          cp packaging/homebrew/octos-tui.rb Formula/octos-tui.rb
-          sed -i "s|__VERSION__|${version}|g" Formula/octos-tui.rb
-          sed -i "s|__TAG__|${TAG}|g" Formula/octos-tui.rb
-          sed -i "s|__SHA_DARWIN_ARM__|${sha_darwin_arm}|g" Formula/octos-tui.rb
-          sed -i "s|__SHA_LINUX_ARM__|${sha_linux_arm}|g" Formula/octos-tui.rb
-          sed -i "s|__SHA_LINUX_X64__|${sha_linux_x64}|g" Formula/octos-tui.rb
+          cp "$TEMPLATE_FILE" "$FORMULA_FILE"
+          sed -i "s|__VERSION__|${version}|g" "$FORMULA_FILE"
+          sed -i "s|__TAG__|${TAG}|g" "$FORMULA_FILE"
+          sed -i "s|__SHA_DARWIN_ARM__|${sha_darwin_arm}|g" "$FORMULA_FILE"
+          sed -i "s|__SHA_LINUX_ARM__|${sha_linux_arm}|g" "$FORMULA_FILE"
+          sed -i "s|__SHA_LINUX_X64__|${sha_linux_x64}|g" "$FORMULA_FILE"
 
-          echo "----- rendered Formula/octos-tui.rb -----"
-          cat Formula/octos-tui.rb
+          echo "----- rendered ${FORMULA_FILE} (${CHANNEL}) -----"
+          cat "$FORMULA_FILE"
 
-          if git diff --quiet -- Formula/octos-tui.rb; then
-            echo "Formula/octos-tui.rb unchanged; nothing to commit."
+          if git diff --quiet -- "$FORMULA_FILE"; then
+            echo "${FORMULA_FILE} unchanged; nothing to commit."
             exit 0
           fi
           git config user.name "octos-release-bot"
           git config user.email "151983+ymote@users.noreply.github.com"
-          git add Formula/octos-tui.rb
-          git commit -m "octos-tui ${TAG}: update Homebrew formula"
+          git add "$FORMULA_FILE"
+          git commit -m "octos-tui ${TAG}: update Homebrew formula (${CHANNEL})"
           git push origin HEAD:main

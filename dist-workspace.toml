@@ -25,10 +25,22 @@ install-updater = true
 # custom-job permissions to id-token/packages, and a reusable workflow cannot
 # elevate to the contents:write needed to commit Formula/octos-tui.rb to main.
 publish-jobs = ["npm"]
-# Prereleases (rc/beta tags) get a GitHub prerelease + installers but are NOT
-# pushed to npm/Homebrew, so they don't take the npm `latest` tag or move the
-# stable formula. (Flip to true temporarily when you want to test an rc's
-# npm/brew one-liners before a stable tag.)
+# Prereleases (rc/beta tags) publish to SEPARATE channels that never touch
+# stable, so `npm i -g @octos-org/octos-tui` and `brew install …/octos-tui`
+# always resolve to the latest STABLE build:
+#   - npm:  published under the `next` dist-tag -> `@octos-org/octos-tui@next`.
+#           The `publish-npm` job in .github/workflows/release.yml computes
+#           `--tag next` vs `--tag latest` from the plan's
+#           `announcement_is_prerelease`; a prerelease never takes `latest`.
+#   - brew: a SEPARATE `octos-tui-dev` formula (class OctosTuiDev), rendered by
+#           .github/workflows/publish-homebrew.yml. The stable `octos-tui`
+#           formula is never touched by a prerelease tag.
+# This flag stays FALSE on purpose: it governs cargo-dist's OWN npm publish,
+# which would push a prerelease to the `latest` dist-tag — exactly what the
+# two-channel scheme avoids. release.yml's `publish-npm` override does the
+# prerelease publish itself with `--tag next`, so cargo-dist's latest-publish
+# must stay off. (Do NOT flip this to true; it would re-enable latest-tagging
+# of prereleases alongside our `--tag next` publish.)
 publish-prereleases = false
 # Only dry-run ("plan") on PRs; full release artifacts run on tag pushes.
 pr-run-mode = "plan"
