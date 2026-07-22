@@ -1161,6 +1161,7 @@ impl Store {
                         brief,
                         brief_path: entry.brief_path.clone(),
                         go: pending.go && index == 0,
+                        agent_staged: false,
                         created: std::time::Instant::now(),
                     },
                 );
@@ -1199,6 +1200,7 @@ impl Store {
                 brief: pending.brief,
                 brief_path: result.brief_path,
                 go: pending.go,
+                agent_staged: false,
                 created: std::time::Instant::now(),
             },
         );
@@ -1256,6 +1258,7 @@ impl Store {
                 brief: event.brief,
                 brief_path: event.brief_path,
                 go: false,
+                agent_staged: true,
                 created: std::time::Instant::now(),
             },
         );
@@ -14167,7 +14170,36 @@ mod tests {
         assert_eq!(kickoff.brief, "fix the nav");
         assert_eq!(kickoff.brief_path, "/repo/.octos/peers/fix-nav/BRIEF.md");
         assert!(!kickoff.go);
+        assert!(
+            !kickoff.agent_staged,
+            "a user /peer is not agent-staged (#407 review P2)"
+        );
         assert!(store.state.pending_peer_prepare.is_none());
+
+        // The dock records the true origin (client), not a hardcoded true.
+        let opened_key = params.session_id.clone();
+        store.state.pending_peer_kickoffs.remove(&opened_key); // (re-take path)
+        let kickoff = crate::model::PeerKickoff {
+            brief: "fix the nav".into(),
+            brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
+            go: false,
+            agent_staged: false,
+            created: std::time::Instant::now(),
+        };
+        store
+            .state
+            .pending_peer_kickoffs
+            .insert(opened_key.clone(), kickoff);
+        store.state.take_pending_peer_kickoff(&opened_key);
+        assert_eq!(
+            store
+                .state
+                .peer_session_meta
+                .get(&opened_key)
+                .map(|m| m.agent_staged),
+            Some(false),
+            "the dock roster carries the client origin, not a hardcoded agent flag"
+        );
     }
 
     #[test]
@@ -14448,6 +14480,7 @@ mod tests {
                 brief: "fix the nav".into(),
                 brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
                 go: false,
+                agent_staged: false,
                 created: std::time::Instant::now(),
             },
         );

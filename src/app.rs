@@ -20,10 +20,10 @@ use crate::{
     model::{
         ActivityItem, ActivityKind, ActivityNavigatorFilter, AppState, ApprovalModalState,
         ArtifactDetailState, ComposerPresentation, DiffPreviewPaneState, FocusPane,
-        GoalObjectiveFold, PlanStep as RenderedPlanStep, SessionAutonomyState, SessionRunState,
-        SessionView, TaskOutputDetailState, TaskView, ThreadGraphDetailState, TurnActivityLog,
-        TurnPromptAnchor, TurnStateDetailState, UserQuestionEntry, UserQuestionPickerState,
-        extract_plan_steps, task_state_label,
+        GoalObjectiveFold, PeerMeta, PlanStep as RenderedPlanStep, SessionAutonomyState,
+        SessionRunState, SessionView, TaskOutputDetailState, TaskView, ThreadGraphDetailState,
+        TurnActivityLog, TurnPromptAnchor, TurnStateDetailState, UserQuestionEntry,
+        UserQuestionPickerState, extract_plan_steps, task_state_label,
     },
     theme::Palette,
     tui_terminal::FrameLike,
@@ -3860,6 +3860,237 @@ pub(crate) fn agent_dock_counts(app: &AppState) -> (usize, usize, usize) {
         .count();
     let unseen = app.active_session_unseen_agents().len();
     (agents.len(), running, unseen)
+}
+
+/// #407: the durable peer roster — sessions tracked for their whole lifetime,
+/// not just the open-in-flight window. Returns `(session_id, slug, meta)`
+/// triples sorted deterministically by `(created, session_key)` so a fleet
+/// staged in one burst (where `Instant::now()` can tie on coarse clocks)
+/// doesn't flicker row order across frames (review F10).
+pub(crate) fn peer_dock_roster(app: &AppState) -> Vec<(&octos_core::SessionKey, &PeerMeta)> {
+    let mut peers: Vec<_> = app.peer_session_meta.iter().collect();
+    // Stable tie-break on the session key string — deterministic regardless
+    // of HashMap iteration order or clock granularity.
+    peers.sort_by(|a, b| {
+        a.1.created
+            .cmp(&b.1.created)
+            .then_with(|| a.0.0.cmp(&b.0.0))
+    });
+    peers
+}
+
+/// #407: `(total, live, blocked, unread)` counts for the Peer Dock pill.
+/// - `total`   = durable roster size + still-pending (opening) peers
+/// - `live`    = peer's turn is streaming or pre-token-armed RIGHT NOW
+/// - `blocked` = peer has a stashed approval/question waiting on the user (⚠)
+/// - `unread`  = peer has turn-terminals the user hasn't focused since
+///
+/// Review F1: keys off the durable `peer_session_meta` roster, NOT
+/// `pending_peer_kickoffs` (which empties the moment a peer opens, making
+/// the old counts structurally ~0). Live/blocked/unread are looked up in
+/// `app.sessions`, which an opened peer IS in — so the counts are real.
+pub(crate) fn peer_dock_counts(app: &AppState) -> (usize, usize, usize, usize) {
+    let roster = peer_dock_roster(app);
+    let total = roster.len() + app.pending_peer_kickoffs.len();
+    if total == 0 {
+        return (0, 0, 0, 0);
+    }
+    let mut live = 0usize;
+    let mut blocked = 0usize;
+    let mut unread = 0usize;
+    for (session_id, _meta) in &roster {
+        if app.session_turn_live(session_id) {
+            live += 1;
+        }
+        if app.session_blocked_reason(session_id).is_some() {
+            blocked += 1;
+        }
+        if let Some(n) = app.unread_turns.get(*session_id).copied() {
+            if n > 0 {
+                unread += 1;
+            }
+        }
+    }
+    (total, live, blocked, unread)
+}
+
+/// #407: the collapsed Peer Dock pill — one glanceable line mirroring the
+/// agent dock pill: `👥 N peers · M live · K⚠ waiting · J● unread — Ctrl+J`.
+/// The `blocked` and `unread` segments appear only when non-zero so a calm
+/// fleet reads as just `👥 2 peers · 1 live`.
+pub(crate) fn peer_dock_pill_line(app: &AppState, palette: Palette) -> Line<'static> {
+    let (total, live, blocked, unread) = peer_dock_counts(app);
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(
+        t!(
+            "app.hint.peer_dock_pill",
+            count = total.to_string(),
+            live = live.to_string()
+        )
+        .into_owned(),
+        palette.text().bg(palette.surface),
+    )];
+    if blocked > 0 {
+        spans.push(Span::styled(
+            t!(
+                "app.hint.peer_dock_pill_blocked",
+                count = blocked.to_string()
+            )
+            .into_owned(),
+            Style::default()
+                .fg(palette.highlight)
+                .bg(palette.surface)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if unread > 0 {
+        spans.push(Span::styled(
+            t!("app.hint.peer_dock_pill_unread", count = unread.to_string()).into_owned(),
+            Style::default()
+                .fg(palette.highlight)
+                .bg(palette.surface)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(
+        format!("  {}", t!("app.hint.peer_dock_toggle_hint")),
+        palette.muted().bg(palette.surface),
+    ));
+    Line::from(spans)
+}
+
+/// #407: one-line activity summary for a peer row in the dock — blocked
+/// reason first (it needs the user), then the live stream tail, then the
+/// `opening…` placeholder for still-pending peers, else `idle`. Returns
+/// `String` (review F11: the prior `Cow<'a, str>` was a fiction — every
+/// arm allocated).
+pub(crate) fn peer_activity_line(app: &AppState, session_id: &octos_core::SessionKey) -> String {
+    // Blocked reason wins — a peer waiting on you is the row's whole point.
+    if let Some(reason) = app.session_blocked_reason(session_id) {
+        return t!(
+            "app.hint.peer_dock_row_blocked",
+            reason = reason.to_string()
+        )
+        .into_owned();
+    }
+    if app.sessions.iter().any(|s| &s.id == session_id) {
+        match app.session_activity_line(session_id) {
+            Some(line) => line,
+            None => t!("app.hint.peer_dock_row_idle").into_owned(),
+        }
+    } else {
+        // Pending open — brief staged, session/opened in flight. NOT idle.
+        t!("app.hint.peer_dock_row_opening").into_owned()
+    }
+}
+
+/// #407: terminal-height floor for the Peer Dock. Below this many rows the
+/// dock collapses to height 0 so a tiny terminal never corrupts the layout.
+/// Mirrors [`AGENT_STRIP_MIN_TERMINAL_ROWS`].
+const PEER_STRIP_MIN_TERMINAL_ROWS: u16 = 12;
+
+/// #407: max peer rows the dock may claim below its title row. Larger fleets
+/// stay fully reachable via `+N` on the title row + the session strip (Alt+S).
+/// Mirrors [`AGENT_STRIP_MAX_AGENT_ROWS`].
+const PEER_STRIP_MAX_PEER_ROWS: u16 = 4;
+
+/// #407: rows the Peer Dock occupies under the composer — mirrors
+/// [`agent_strip_height`]: 0 when no peers / transcript pager active /
+/// terminal too short, 1 when collapsed (the pill row — this IS the layout
+/// reservation for the collapsed fleet summary), or `1 + capped_rows` when
+/// expanded. Both the height reservation and the render pass call this with
+/// the same terminal height so they always agree.
+pub(crate) fn peer_strip_height(app: &AppState, terminal_height: u16) -> u16 {
+    if app.transcript_pager_active
+        || terminal_height < PEER_STRIP_MIN_TERMINAL_ROWS
+        || peer_dock_roster(app).is_empty()
+    {
+        0
+    } else if app.peer_dock_collapsed {
+        1
+    } else {
+        1 + peer_strip_peer_rows(app, terminal_height)
+    }
+}
+
+/// #407: visible peer rows — capped by [`PEER_STRIP_MAX_PEER_ROWS`] and by
+/// the rows the terminal can spare beyond [`PEER_STRIP_MIN_TERMINAL_ROWS`].
+/// Mirrors [`agent_strip_agent_rows`].
+fn peer_strip_peer_rows(app: &AppState, terminal_height: u16) -> u16 {
+    let roster = peer_dock_roster(app).len().min(u16::MAX as usize) as u16;
+    roster
+        .min(PEER_STRIP_MAX_PEER_ROWS)
+        .min(terminal_height.saturating_sub(PEER_STRIP_MIN_TERMINAL_ROWS))
+}
+
+/// #407: logical lines for the vertical Peer Dock. Row 0 is the title row
+/// (the collapsed pill when `peer_dock_collapsed`). Each following row is
+/// one peer: glyph (⚠ blocked / ✻ live / ○ idle) + slug + muted activity
+/// detail. Mirrors [`agent_strip_lines`]. Split from rendering so the layout
+/// logic is unit-testable without a frame; `peer_rows` must be the value the
+/// height reservation was computed with (`peer_strip_height` - 1).
+pub(crate) fn peer_strip_lines(
+    app: &AppState,
+    palette: Palette,
+    peer_rows: u16,
+) -> Vec<Line<'static>> {
+    if app.peer_dock_collapsed {
+        return vec![peer_dock_pill_line(app, palette)];
+    }
+    let roster = peer_dock_roster(app);
+    let total = roster.len();
+    let rows = (peer_rows as usize).min(total);
+    let hidden = total - rows;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Title row: peer dock title + overflow marker when the roster is larger
+    // than the visible window.
+    let mut title_spans: Vec<Span<'static>> = vec![Span::styled(
+        t!("app.hint.peer_dock_title").into_owned(),
+        palette.muted().bg(palette.surface),
+    )];
+    if hidden > 0 {
+        title_spans.push(Span::styled(
+            format!(" +{hidden} "),
+            palette.muted().bg(palette.surface),
+        ));
+    }
+    title_spans.push(Span::styled(
+        format!("  {}", t!("app.hint.peer_dock_toggle_hint")),
+        palette.muted().bg(palette.surface),
+    ));
+    lines.push(Line::from(title_spans));
+    // One row per visible peer.
+    for (session_id, meta) in roster.iter().take(rows) {
+        let blocked = app.session_blocked_reason(session_id).is_some();
+        let live = app.session_turn_live(session_id);
+        let glyph = if blocked {
+            "⚠"
+        } else if live {
+            "✻"
+        } else {
+            "○"
+        };
+        let glyph_style = if blocked {
+            Style::default()
+                .fg(palette.highlight)
+                .bg(palette.surface)
+                .add_modifier(Modifier::BOLD)
+        } else if live {
+            Style::default().fg(palette.accent).bg(palette.surface)
+        } else {
+            palette.muted().bg(palette.surface)
+        };
+        let detail = peer_activity_line(app, session_id);
+        let row = Line::from(vec![
+            Span::styled(format!(" {glyph} "), glyph_style),
+            Span::styled(
+                meta.slug.chars().take(20).collect::<String>(),
+                palette.text().bg(palette.surface),
+            ),
+            Span::styled(format!("  {detail}"), palette.muted().bg(palette.surface)),
+        ]);
+        lines.push(row);
+    }
+    lines
 }
 
 /// Spawn depth of `agent` within the visible roster, by walking
