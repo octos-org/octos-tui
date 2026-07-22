@@ -157,6 +157,7 @@ mod i18n_tests {
             "command.peer.desc",
             "status.peer_usage",
             "status.peer_preparing",
+            "status.peer_prepare_in_flight",
             "status.peer_opening",
             "status.peer_started",
             "status.peer_switched",

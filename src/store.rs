@@ -805,7 +805,10 @@ impl Store {
     /// prefills the composer for argument typing (the same
     /// `LocalAction::EditComposer` treatment the `/research` menu rows use).
     pub(crate) fn dispatch_peer_slash(&mut self, draft: &str) -> SlashDispatchOutcome {
-        if !self.require_appui_method(crate::model::APPUI_METHOD_PEER_PREPARE) {
+        // Mutating gate (readonly + capability): the transport would block the
+        // emitted command anyway, but rejecting here keeps the stash from
+        // being armed by a dispatch that can never complete (K3 review).
+        if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_PEER_PREPARE) {
             return SlashDispatchOutcome::Rejected;
         }
         let rest = draft.trim();
@@ -854,6 +857,22 @@ impl Store {
         let brief = cursor.trim_end();
         if brief.is_empty() {
             self.state.status = t!("status.peer_usage").into_owned();
+            return SlashDispatchOutcome::Rejected;
+        }
+
+        // Single-slot stash ⇒ single in-flight prepare (K3 review, high): a
+        // second `/peer` overwriting the stash would hand the FIRST result the
+        // SECOND brief — the first peer's session would run the wrong task and
+        // the second prepare's staged brief would be orphaned server-side.
+        // Refuse while a fresh prepare is in flight; a stale one (lost
+        // response) is replaced past [`PEER_PREPARE_TTL`].
+        if self
+            .state
+            .pending_peer_prepare
+            .as_ref()
+            .is_some_and(|pending| pending.created.elapsed() < crate::model::PEER_PREPARE_TTL)
+        {
+            self.state.status = t!("status.peer_prepare_in_flight").into_owned();
             return SlashDispatchOutcome::Rejected;
         }
 
@@ -919,6 +938,14 @@ impl Store {
             self.state.status = event.message;
             return None;
         };
+        // A result landing past the prepare TTL is as good as unsolicited
+        // (K3 review): the user has moved on, and a lost-then-recovered
+        // response minutes later must not pop a session open + an unprompted
+        // kickoff turn.
+        if pending.created.elapsed() >= crate::model::PEER_PREPARE_TTL {
+            self.state.status = event.message;
+            return None;
+        }
         let result = event.result;
         let session_id = octos_core::SessionKey::with_profile_topic(
             &result.profile_id,
@@ -9189,7 +9216,11 @@ impl Store {
                 if let Some(kickoff) = peer_kickoff {
                     let slug = Self::peer_slug_for_key(&session_id);
                     let prompt = Self::peer_kickoff_prompt(&kickoff.brief, &kickoff.brief_path);
-                    return self.start_prompt_turn(
+                    // Staging-aware submit (K3 review): a reused peer topic
+                    // whose session already has a live turn must STAGE the
+                    // kickoff like any other input-while-busy, not fire a
+                    // second turn/start into it.
+                    return self.queue_or_start_prompt_turn(
                         prompt,
                         t!("status.peer_switched", slug = slug).into_owned(),
                     );
@@ -13642,6 +13673,17 @@ mod tests {
             store.state.pre_token_turns.contains_key(&peer_key),
             "the strip's live marker is armed for the peer"
         );
+        // K3 review: the background path must leave the GLOBAL surfaces
+        // alone — run state belongs to the focused session, and the
+        // foreground workspace root must not be clobbered by the peer's cwd.
+        assert!(
+            !store.state.run_state.is_active(),
+            "the focused session's run state is untouched by a background kickoff"
+        );
+        assert_ne!(
+            store.state.workspace.root, "/repo",
+            "the peer's cwd must not overwrite the foreground workspace root"
+        );
     }
 
     #[test]
@@ -13674,14 +13716,15 @@ mod tests {
     fn stale_peer_kickoff_is_pruned_and_fires_no_kickoff_turn() {
         let mut store = peer_capable_store();
         let peer_key = prepare_peer(&mut store, "/peer fix the nav");
-        // Age the stash beyond the TTL (dead session/open).
+        // Age the stash beyond the TTL (dead session/open) — derived from the
+        // const so a TTL retune cannot silently un-stale this fixture.
         store
             .state
             .pending_peer_kickoffs
             .get_mut(&peer_key)
             .expect("kickoff stashed")
             .created = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(31))
+            .checked_sub(crate::model::PEER_KICKOFF_TTL + std::time::Duration::from_secs(1))
             .expect("instant in the past");
 
         let command = peer_session_opened(&mut store, &peer_key);
@@ -13692,6 +13735,178 @@ mod tests {
         assert!(
             store.state.pending_peer_kickoffs.is_empty(),
             "the stale stash is pruned"
+        );
+    }
+
+    /// K3 review (high): the prepare stash is single-slot — a second `/peer`
+    /// while one is in flight must be REFUSED, not overwrite the stash (the
+    /// first result would consume the second brief and cross-wire the peers).
+    /// A stale in-flight prepare (lost response) is replaceable.
+    #[test]
+    fn second_peer_command_rejected_while_prepare_in_flight() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer first brief");
+        assert!(matches!(outcome, SlashDispatchOutcome::Accepted(Some(_))));
+
+        let outcome = store.dispatch_peer_slash("/peer second brief");
+        assert!(
+            matches!(outcome, SlashDispatchOutcome::Rejected),
+            "a fresh in-flight prepare refuses a second /peer"
+        );
+        assert_eq!(store.state.status, t!("status.peer_prepare_in_flight"));
+        assert_eq!(
+            store
+                .state
+                .pending_peer_prepare
+                .as_ref()
+                .map(|pending| pending.brief.as_str()),
+            Some("first brief"),
+            "the in-flight stash is NOT overwritten"
+        );
+
+        // Past the prepare TTL the slot is dead — a new /peer may claim it.
+        store
+            .state
+            .pending_peer_prepare
+            .as_mut()
+            .expect("stash present")
+            .created = std::time::Instant::now()
+            .checked_sub(crate::model::PEER_PREPARE_TTL + std::time::Duration::from_secs(1))
+            .expect("instant in the past");
+        let outcome = store.dispatch_peer_slash("/peer third brief");
+        assert!(
+            matches!(outcome, SlashDispatchOutcome::Accepted(Some(_))),
+            "a stale prepare slot is reclaimable"
+        );
+        assert_eq!(
+            store
+                .state
+                .pending_peer_prepare
+                .as_ref()
+                .map(|pending| pending.brief.as_str()),
+            Some("third brief")
+        );
+    }
+
+    /// K3 review: a prepare result landing past [`PEER_PREPARE_TTL`] is as
+    /// good as unsolicited — it must not pop a session open (and later an
+    /// unprompted kickoff turn) minutes after the user moved on.
+    #[test]
+    fn stale_peer_prepared_result_opens_nothing() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer fix the nav");
+        assert!(matches!(outcome, SlashDispatchOutcome::Accepted(Some(_))));
+        store
+            .state
+            .pending_peer_prepare
+            .as_mut()
+            .expect("stash present")
+            .created = std::time::Instant::now()
+            .checked_sub(crate::model::PEER_PREPARE_TTL + std::time::Duration::from_secs(1))
+            .expect("instant in the past");
+
+        let open = store.apply_client_event(ClientEvent::PeerPrepared(
+            crate::client_event::PeerPreparedClientEvent {
+                message: "Peer session prepared: fix-nav".into(),
+                result: crate::model::PeerPrepareResult {
+                    slug: "fix-nav".into(),
+                    topic: "peer-fix-nav".into(),
+                    brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
+                    cwd: "/repo".into(),
+                    worktree_branch: None,
+                    profile_id: "coding".into(),
+                },
+            },
+        ));
+        assert!(open.is_none(), "a stale result must open nothing: {open:?}");
+        assert!(store.state.pending_peer_kickoffs.is_empty());
+        assert!(store.state.pending_peer_prepare.is_none());
+    }
+
+    /// K3 review: a replayed/duplicate `session/opened` for the peer key must
+    /// not fire a SECOND kickoff turn — the stash pop is the idempotency
+    /// guard, pinned here so a refactor cannot move the pop after the branch.
+    #[test]
+    fn duplicate_session_opened_fires_no_second_kickoff() {
+        let mut store = peer_capable_store();
+        let peer_key = prepare_peer(&mut store, "/peer fix the nav");
+
+        let first = peer_session_opened(&mut store, &peer_key);
+        assert!(matches!(first, Some(AppUiCommand::SubmitPrompt(_))));
+        let kickoff_rows = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == peer_key)
+            .map(|session| session.messages.len())
+            .expect("peer session landed");
+
+        let second = peer_session_opened(&mut store, &peer_key);
+        assert!(
+            !matches!(second, Some(AppUiCommand::SubmitPrompt(_))),
+            "a replayed session/opened must not re-fire the kickoff: {second:?}"
+        );
+        let rows_after = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == peer_key)
+            .map(|session| session.messages.len())
+            .expect("peer session still present");
+        assert_eq!(
+            rows_after, kickoff_rows,
+            "no duplicate optimistic kickoff row on replay"
+        );
+    }
+
+    /// K3 review (high): both peer stashes must survive a snapshot replay —
+    /// the brief has no other client-side copy, so a reconnect landing inside
+    /// the prepare→open window would otherwise permanently strand the peer
+    /// session with no kickoff.
+    #[test]
+    fn peer_stashes_survive_snapshot_replay() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer fix the nav");
+        assert!(matches!(outcome, SlashDispatchOutcome::Accepted(Some(_))));
+        let peer_key =
+            octos_core::SessionKey::with_profile_topic("coding", "local", "tui", "peer-fix-nav");
+        store.state.pending_peer_kickoffs.insert(
+            peer_key.clone(),
+            crate::model::PeerKickoff {
+                brief: "fix the nav".into(),
+                brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
+                go: false,
+                created: std::time::Instant::now(),
+            },
+        );
+
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            selected_session: 0,
+            status: "replayed".into(),
+            target: None,
+            readonly: false,
+        }));
+
+        assert_eq!(
+            store
+                .state
+                .pending_peer_prepare
+                .as_ref()
+                .map(|pending| pending.brief.as_str()),
+            Some("fix the nav"),
+            "the in-flight prepare survives the replay"
+        );
+        assert!(
+            store.state.pending_peer_kickoffs.contains_key(&peer_key),
+            "the staged kickoff survives the replay"
         );
     }
 

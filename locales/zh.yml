@@ -1220,6 +1220,7 @@ status:
   undo_no_session: "没有可撤销的活动会话。"
   peer_usage: "用法：/peer [--go] [--worktree] [--cwd <path>] <brief>"
   peer_preparing: "正在准备同伴会话…"
+  peer_prepare_in_flight: "已有同伴会话正在准备中 —— 请等它打开（或约 30 秒后）再发起新的。"
   peer_opening: "正在打开同伴 %{slug}…"
   peer_started: "同伴 %{slug} 已在后台开始工作 —— 请留意会话栏中它的标记（Alt+S）。"
   peer_switched: "同伴 %{slug} 已启动 —— 您现在位于它的会话中。"

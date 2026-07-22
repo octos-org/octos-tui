@@ -9252,7 +9252,21 @@ const PRE_TOKEN_TURN_TTL: std::time::Duration = std::time::Duration::from_secs(1
 /// prepared peer whose `session/opened` never arrives within this window is a
 /// dead open — the stash is pruned so a much-later open of the same key can
 /// never fire a stale kickoff turn (mirrors [`PRE_TOKEN_TURN_TTL`]).
-pub(crate) const PEER_KICKOFF_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Generous (2 min, not the prepare TTL): once pruned, a late `session/opened`
+/// for the peer key falls through to the NORMAL focused-open path — i.e. it
+/// steals focus — so a slow-but-alive open should be hard-pressed to outlive
+/// its kickoff (K3 review of #395).
+pub(crate) const PEER_KICKOFF_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long an in-flight [`AppState::pending_peer_prepare`] stash stays
+/// consumable (#395, K3 review). Bounds two hazards symmetrically: a SECOND
+/// `/peer` is refused while a fresh prepare is in flight (the stash is
+/// single-slot — letting the second dispatch overwrite it would cross-wire
+/// the first result's session with the second brief), and a STALE result
+/// landing past the window opens nothing (a lost-response prepare must not
+/// pop a session open + an unprompted turn minutes later). Short: a prepare
+/// is one RPC round-trip.
+pub(crate) const PEER_PREPARE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn initial_run_state(sessions: &[SessionView], selected_session: usize) -> SessionRunState {
     if sessions
