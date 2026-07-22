@@ -3654,6 +3654,11 @@ pub struct PeerKickoff {
     pub brief: String,
     pub brief_path: String,
     pub go: bool,
+    /// #407 review P2: origin of this peer — `true` when the model staged it
+    /// via `peer/staged` (agent-initiated), `false` for a user `/peer`. Read
+    /// by `take_pending_peer_kickoff` into `PeerMeta.agent_staged` so the dock
+    /// labels the origin correctly instead of hardcoding it.
+    pub agent_staged: bool,
     pub created: std::time::Instant,
 }
 
@@ -4379,8 +4384,9 @@ pub struct AppState {
     /// #407: Peer Dock collapsed state. Mirrors [`Self::agent_dock_collapsed`]:
     /// when true, the peer strip renders as a single-line summary pill
     /// (`Peers: N · M live · K⚠`) instead of per-peer chips. Toggled by
-    /// Alt+P. Distinct from the agent dock's collapse so the two surfaces
-    /// stay independently controllable.
+    /// Alt+P (or the Ctrl+L alias for terminals without Option-as-Meta).
+    /// Distinct from the agent dock's collapse so the two surfaces stay
+    /// independently controllable.
     pub peer_dock_collapsed: bool,
     /// ◆ Goal banner fold preference (Ctrl+P). See [`GoalObjectiveFold`]: a huge
     /// pasted objective folds to one compact row by default, a short one shows
@@ -8749,14 +8755,14 @@ impl AppState {
         let slug = session_id
             .topic()
             .and_then(|topic| topic.strip_prefix("peer-"))
-            .unwrap_or_else(|| session_id.0.as_str())
+            .unwrap_or(session_id.0.as_str())
             .to_owned();
         self.peer_session_meta.insert(
             session_id.clone(),
             PeerMeta {
                 slug,
                 brief_path: kickoff.brief_path.clone(),
-                agent_staged: true,
+                agent_staged: kickoff.agent_staged,
                 created: kickoff.created,
             },
         );

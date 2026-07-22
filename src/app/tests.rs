@@ -8125,6 +8125,31 @@ mod tests {
         );
     }
 
+    /// #407 review P1 (Blocker 2): the live-viewport reservation must include
+    /// the peer dock rows, or the inline layout over-subscribes and Ratatui
+    /// compresses a fixed row (clipped composer / scrollback ghosts).
+    #[test]
+    fn live_ui_height_reserves_peer_strip_rows() {
+        let mut app = autonomy_app_state();
+        let without = live_ui_height(&app, 80, 40);
+        app.peer_session_meta.insert(
+            SessionKey("local:tui#peer-ci-red".into()),
+            crate::model::PeerMeta {
+                slug: "ci-red".into(),
+                brief_path: "/tmp/brief.md".into(),
+                agent_staged: false,
+                created: std::time::Instant::now(),
+            },
+        );
+        let expected = peer_strip_height(&app, 40);
+        assert!(expected > 0, "an open peer occupies dock rows");
+        assert_eq!(
+            live_ui_height(&app, 80, 40),
+            without + expected,
+            "the reservation basis must grow by exactly the dock's rendered rows"
+        );
+    }
+
     #[test]
     fn agent_strip_height_reflects_agent_presence() {
         let mut app = autonomy_app_state();
@@ -9950,6 +9975,7 @@ mod tests {
                 brief: "refactor auth".into(),
                 brief_path: "/tmp/brief.md".into(),
                 go: false,
+                agent_staged: false,
                 created: std::time::Instant::now(),
             },
         );
@@ -9985,6 +10011,7 @@ mod tests {
                 brief: "ci-red".into(),
                 brief_path: "/tmp/brief.md".into(),
                 go: false,
+                agent_staged: false,
                 created: std::time::Instant::now(),
             },
         );

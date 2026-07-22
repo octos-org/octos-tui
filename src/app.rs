@@ -3871,7 +3871,11 @@ pub(crate) fn peer_dock_roster(app: &AppState) -> Vec<(&octos_core::SessionKey, 
     let mut peers: Vec<_> = app.peer_session_meta.iter().collect();
     // Stable tie-break on the session key string — deterministic regardless
     // of HashMap iteration order or clock granularity.
-    peers.sort_by(|a, b| a.1.created.cmp(&b.1.created).then_with(|| a.0 .0.cmp(&b.0 .0)));
+    peers.sort_by(|a, b| {
+        a.1.created
+            .cmp(&b.1.created)
+            .then_with(|| a.0.0.cmp(&b.0.0))
+    });
     peers
 }
 
@@ -3940,11 +3944,7 @@ pub(crate) fn peer_dock_pill_line(app: &AppState, palette: Palette) -> Line<'sta
     }
     if unread > 0 {
         spans.push(Span::styled(
-            t!(
-                "app.hint.peer_dock_pill_unread",
-                count = unread.to_string()
-            )
-            .into_owned(),
+            t!("app.hint.peer_dock_pill_unread", count = unread.to_string()).into_owned(),
             Style::default()
                 .fg(palette.highlight)
                 .bg(palette.surface)
@@ -4086,10 +4086,7 @@ pub(crate) fn peer_strip_lines(
                 meta.slug.chars().take(20).collect::<String>(),
                 palette.text().bg(palette.surface),
             ),
-            Span::styled(
-                format!("  {detail}"),
-                palette.muted().bg(palette.surface),
-            ),
+            Span::styled(format!("  {detail}"), palette.muted().bg(palette.surface)),
         ]);
         lines.push(row);
     }

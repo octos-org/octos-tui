@@ -27,6 +27,15 @@ pub fn live_ui_height_with_finalization(
     // Ratatui compresses a fixed row at the tail floor. Height-gated on the same
     // `height` the render pass uses, so reservation and layout never disagree.
     let agent_strip_height = agent_strip_height(app, height);
+    // #407: the Peer Dock renders between the agent strip and the status row
+    // (see `render_viewport_with_finalization`); reserve its rows here too or the
+    // live viewport is oversubscribed whenever peers exist. Unlike the one-row
+    // strips above, the expanded dock (the default) is several rows, so omitting
+    // it under-reserves by up to `peer_strip_height` — Ratatui then compresses a
+    // fixed row at the tail floor, clipping the composer / stranding scrollback
+    // ghosts. Height-gated on the same `height` the render pass uses, so
+    // reservation and layout never disagree.
+    let peer_strip_height = peer_strip_height(app, height);
     // The parked-decision watchdog banner reserves one row above the composer
     // (see `render_viewport_with_finalization`); reserve it here too or the live
     // viewport is oversubscribed by one row while the escalation is showing.
@@ -36,6 +45,7 @@ pub fn live_ui_height_with_finalization(
         + harness_height
         + decision_height
         + agent_strip_height
+        + peer_strip_height
         + composer_height
         + 1; // +1 status
 

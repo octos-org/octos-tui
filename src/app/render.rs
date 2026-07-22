@@ -149,8 +149,12 @@ pub fn render_viewport_with_finalization(
     if peer_strip_height > 0 {
         // #407: render the Peer Dock — collapsed pill or per-peer rows.
         frame.render_widget(
-            Paragraph::new(peer_strip_lines(app, palette, peer_strip_height.saturating_sub(1)))
-                .style(Style::default().bg(palette.surface)),
+            Paragraph::new(peer_strip_lines(
+                app,
+                palette,
+                peer_strip_height.saturating_sub(1),
+            ))
+            .style(Style::default().bg(palette.surface)),
             root[7],
         );
     }
@@ -228,13 +232,10 @@ pub(super) fn render_session_strip(
         )
         .into_owned();
         if blocked_p > 0 {
-            text.push_str(
-                &t!(
-                    "app.hint.peer_dock_pill_blocked",
-                    count = blocked_p.to_string()
-                )
-                .into_owned(),
-            );
+            text.push_str(&t!(
+                "app.hint.peer_dock_pill_blocked",
+                count = blocked_p.to_string()
+            ));
         }
         Some(text)
     } else {

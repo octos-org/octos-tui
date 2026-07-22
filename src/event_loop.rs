@@ -862,16 +862,25 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
-    // #407: Ctrl+J — toggle the Peer Dock's collapsed state. Mirrors Alt+G
-    // for the sub-agent dock, but uses Ctrl (not Alt) because Alt chords are
-    // awkward on Mac (Option sends dead accents on some layouts). Ctrl+J is
-    // free in the codebase (Ctrl+P is Goal fold, Ctrl+N is bash next-history,
-    // Ctrl+D is EOF, Ctrl+B/F/K/U/W are readline edits) and aligns with the
-    // j/k navigation convention used in TUIs. Only claimed when peers exist
-    // (durable `peer_session_meta` roster, not the transient
-    // `pending_peer_kickoffs` — review F1/F3) so the key stays free for
+    // #407: Alt+P / Ctrl+L — toggle the Peer Dock's collapsed state. Mirrors
+    // Alt+G / Ctrl+G (agent dock) and Alt+S / Ctrl+S (sessions): Alt+P is the
+    // primary bind (P = peer), with a Ctrl alias for terminals where Option
+    // doesn't send Meta. The alias is Ctrl+L — NOT Ctrl+J (that is the
+    // composer's portable newline, handled in `handle_composer_modified_key`
+    // which runs BEFORE this arm, so a Ctrl+J bind here was dead) and NOT
+    // Ctrl+P (that is the Goal-banner fold). Ctrl+L is the one genuinely-free
+    // Ctrl letter left after #408: unbound in both the global arms above and
+    // the composer readline map. Gated exactly like the #817 composer arm — no
+    // modal or `@` file picker owning the keyboard — so the toggle can't fire
+    // behind an approval/question dialog or the picker. Only claimed when peers
+    // exist (durable `peer_session_meta` roster, not the transient
+    // `pending_peer_kickoffs` — review F1/F3) so the keys stay free for
     // single-session users.
-    if is_control_char(&key, 'j') && !store.state.peer_session_meta.is_empty() {
+    if (is_alt_char(&key, 'p') || is_ctrl_char(&key, 'l'))
+        && !store.state.peer_session_meta.is_empty()
+        && !modal_owns_keyboard(store)
+        && store.state.file_picker.is_none()
+    {
         store.state.peer_dock_collapsed = !store.state.peer_dock_collapsed;
         return KeyAction::Continue;
     }
@@ -2750,6 +2759,86 @@ mod tests {
         Store {
             state: AppState::new(sessions, 0, "ready".into(), None, false),
         }
+    }
+
+    fn store_with_one_peer() -> Store {
+        let mut store = store_with_sessions(1);
+        store.state.peer_session_meta.insert(
+            SessionKey("local:tui#peer-ci-red".into()),
+            crate::model::PeerMeta {
+                slug: "ci-red".into(),
+                brief_path: "/tmp/brief.md".into(),
+                agent_staged: false,
+                created: std::time::Instant::now(),
+            },
+        );
+        store.state.focus = FocusPane::Composer;
+        store
+    }
+
+    /// #407 review P1: the dock toggle must fire on its ACTUAL bind (Alt+P and
+    /// the Ctrl+L alias) — NOT Ctrl+J, which the composer eats as a newline.
+    #[test]
+    fn peer_dock_toggle_flips_on_alt_p_and_ctrl_l() {
+        for chord in [
+            modified_key(KeyCode::Char('p'), KeyModifiers::ALT),
+            modified_key(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        ] {
+            let mut store = store_with_one_peer();
+            let before = store.state.peer_dock_collapsed;
+            assert!(matches!(handle_key(&mut store, chord), KeyAction::Continue));
+            assert_ne!(
+                store.state.peer_dock_collapsed, before,
+                "the dock toggle must flip on {chord:?}"
+            );
+        }
+    }
+
+    /// #407 review P1 regression: Ctrl+J stays the composer's portable newline
+    /// even with peers open — the old bind was dead AND would have stolen it.
+    #[test]
+    fn ctrl_j_still_inserts_newline_with_peers_present() {
+        let mut store = store_with_one_peer();
+        let dock_before = store.state.peer_dock_collapsed;
+        store.state.composer = "line one".into();
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+        assert!(
+            store.state.composer.contains('\n'),
+            "Ctrl+J must insert a newline: {:?}",
+            store.state.composer
+        );
+        assert_eq!(
+            store.state.peer_dock_collapsed, dock_before,
+            "Ctrl+J must not toggle the dock"
+        );
+    }
+
+    /// #407 review P1: the toggle must not fire behind a modal (it would land
+    /// on the dock hidden under an approval/question dialog).
+    #[test]
+    fn peer_dock_toggle_ignored_while_modal_open() {
+        let (mut store, _) = store_with_visible_approval();
+        store.state.peer_session_meta.insert(
+            SessionKey("local:tui#peer-ci-red".into()),
+            crate::model::PeerMeta {
+                slug: "ci-red".into(),
+                brief_path: "/tmp/brief.md".into(),
+                agent_staged: true,
+                created: std::time::Instant::now(),
+            },
+        );
+        let before = store.state.peer_dock_collapsed;
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            store.state.peer_dock_collapsed, before,
+            "the dock toggle must be inert while a modal owns the keyboard"
+        );
     }
 
     fn sample_agent_record(

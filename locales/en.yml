@@ -168,17 +168,16 @@ app:
     agent_dock_pill_unread: " · %{count}● unread"
     agent_dock_toggle_hint: "Ctrl+G/Alt+G"
     # Peer Dock (#407): collapsed fleet summary shown in place of per-peer
-    # chips when the session strip overflows, and the Alt+P peek overlay's
-    # per-row labels. Mirrors the agent-dock pill's shape.
+    # chips when the session strip overflows, and the expanded peer dock's
+    # (Alt+P / Ctrl+L) per-row labels. Mirrors the agent-dock pill's shape.
     peer_dock_pill: "👥 %{count} peers · %{live} live"
     peer_dock_pill_blocked: " · %{count}⚠ waiting"
     peer_dock_pill_unread: " · %{count}● unread"
-    peer_dock_toggle_hint: "Ctrl+J peek"
+    peer_dock_toggle_hint: "Alt+P/Ctrl+L peek"
     peer_dock_title: " peers "
     peer_dock_row_blocked: "waiting on you: %{reason}"
-    peer_dock_row_live_tail: "%{tail}"
-    peer_dock_row_opening: "opening…"
     peer_dock_row_idle: "idle"
+    peer_dock_row_opening: "opening…"
     agent_no_output: "(no output captured yet — this agent streams its result here as it works)"
     menu: "Menu | j/k move | Enter accept | Esc close"
     onboarding: "Onboarding | Enter continue | type to edit fields"
