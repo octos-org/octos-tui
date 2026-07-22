@@ -116,8 +116,8 @@ app:
     ps_to_view: "/ps to view"
     esc_interrupt: "Esc interrupt"
     stop_to_close: "/stop to close"
-    pending_decision_help: "Waiting on you — Alt+A answer · Ctrl+C interrupt"
-    parked_decision_banner: "⚠ Parked on you for %{elapsed} — Alt+A answer · Ctrl+C interrupt"
+    pending_decision_help: "Waiting on you — Ctrl+R/Alt+A answer · Ctrl+C interrupt"
+    parked_decision_banner: "⚠ Parked on you for %{elapsed} — Ctrl+R/Alt+A answer · Ctrl+C interrupt"
     tool_output_expanded: "tool output expanded"
   btw:
     answering: "Answering…"
@@ -166,7 +166,7 @@ app:
     agent_strip_more: "+%{count} more (Tab)"
     agent_dock_pill: "🐙 %{count} agents · %{running} running"
     agent_dock_pill_unread: " · %{count}● unread"
-    agent_dock_toggle_hint: "Alt+G"
+    agent_dock_toggle_hint: "Ctrl+G/Alt+G"
     agent_no_output: "(no output captured yet — this agent streams its result here as it works)"
     menu: "Menu | j/k move | Enter accept | Esc close"
     onboarding: "Onboarding | Enter continue | type to edit fields"
@@ -473,13 +473,13 @@ status:
   undo_no_session: "No active session to undo in."
   peer_usage: "Usage: /peer [--go] [--worktree] [--cwd <path>] [--n <2-8>] <brief>"
   peer_preparing: "Preparing peer session…"
-  session_blocked_hint: "%{session} is waiting on you: %{reason} — Alt+S to answer."
+  session_blocked_hint: "%{session} is waiting on you: %{reason} — Ctrl+S/Alt+S to answer."
   peer_prepare_in_flight: "A peer is already being prepared — wait for it to open (or ~30s) before starting another."
   peer_opening: "Opening peer %{slug}…"
-  peer_started: "Peer %{slug} is working in the background — watch its badge in the session strip (Alt+S)."
+  peer_started: "Peer %{slug} is working in the background — watch its badge in the session strip (Ctrl+S/Alt+S)."
   peer_switched: "Peer %{slug} started — you are in its session now."
   peer_fleet_opening: "Opening a fleet of %{n} peers (first: %{slug})…"
-  peer_staged_by_agent: "Agent spun off peer %{slug} — working in the background (Alt+S)."
+  peer_staged_by_agent: "Agent spun off peer %{slug} — working in the background (Ctrl+S/Alt+S)."
   peer_staged_known: "Peer %{slug} is already staged — duplicate notice ignored."
   gather_requesting: "Gathering peer results from the blackboard…"
   gather_no_peers: "No peers staged on the blackboard — /peer to spin some up first."
@@ -920,7 +920,7 @@ command:
   model:
     desc: Choose a server-returned profile LLM model.
   sessions:
-    desc: Switch between open sessions (Alt+S) — live turns and unread badges.
+    desc: Switch between open sessions (Ctrl+S/Alt+S) — live turns and unread badges.
   undo:
     desc: Roll workspace files back to a pre-mutation snapshot (#1768).
   peer:
@@ -1069,7 +1069,7 @@ menu:
       dock_expand:
         label: Expand the dock to per-agent rows
       dock_toggle:
-        desc: Same as Alt+G.
+        desc: Same as Ctrl+G/Alt+G.
       main:
         desc: Show the session transcript in the main pane.
         label: main session

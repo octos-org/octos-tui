@@ -2295,7 +2295,7 @@ pub(super) fn push_inline_user_question_card(
             // INFORMATIONAL card only — do NOT offer a "Type your answer"
             // affordance, since any input would be discarded and a submit cannot
             // form a valid (count-matched) respond (DO-NOT-SHIP #2). The card
-            // stays dismissible (Esc) and recoverable (Alt+a).
+            // stays dismissible (Esc) and recoverable (Ctrl+R/Alt+a).
             lines.push(Line::from(vec![
                 Span::styled("    ", palette.muted()),
                 Span::styled(t!("app.question.no_options").to_string(), palette.muted()),
