@@ -530,7 +530,7 @@ pub(super) fn activity_log_render_index(session: &SessionView, anchor_index: usi
 
 pub(super) fn activity_status_icon(item: &ActivityItem, palette: Palette) -> (&'static str, Style) {
     if is_running_activity(item) {
-        // Animate the marker for in-progress rows (octopus spinner) so a row
+        // Animate the marker for in-progress rows (galaxy spinner) so a row
         // like "Background work started for run_pipeline" visibly reads as
         // still-running rather than a static dot. Uses the shared
         // process-clock spinner (not terminal SGR blink, which is unreliable /

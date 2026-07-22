@@ -377,18 +377,46 @@ mod tests {
     }
 
     #[test]
-    fn in_progress_status_marker_is_the_octopus_spinner() {
+    fn in_progress_status_marker_is_the_galaxy_spinner() {
         // The pinned "still working" signal: the in-progress status marker is
-        // one of the octopus spinner frames (not a static bullet), so it stays
+        // one of the galaxy spinner frames (not a static bullet), so it stays
         // visible in the status bar even when the transcript chip scrolls off.
         let marker = run_state_marker(&SessionRunState::InProgress);
         assert!(
             SPINNER_FRAMES.contains(&marker),
-            "in-progress marker must be an octopus spinner frame, got {marker:?}"
+            "in-progress marker must be a galaxy spinner frame, got {marker:?}"
         );
         // Settled states keep their static, non-animated markers.
         assert_eq!(run_state_marker(&SessionRunState::Success), "✓");
         assert_eq!(run_state_marker(&SessionRunState::Idle), "·");
+    }
+
+    #[test]
+    fn galaxy_spinner_frames_swirl_and_stay_single_width() {
+        // Every frame must occupy exactly ONE terminal cell: the marker slots
+        // into fixed layout math (status bar, tool-card bullets, the
+        // "◠ Working…" gradient label), so a width-2 frame would shove the
+        // columns over once per cycle. Ambiguous-width-but-1 glyphs are fine —
+        // ✻ / ⚠ are already shipped precedent in this UI.
+        for frame in SPINNER_FRAMES {
+            assert_eq!(
+                UnicodeWidthStr::width(frame),
+                1,
+                "spinner frame {frame:?} must be exactly one cell wide"
+            );
+        }
+        // The swirl: a 6-frame arc sweeping one full clockwise revolution,
+        // then a 2-frame core glint (bright ✦ → fading ✧). At the 120ms tick
+        // that is a 720ms rotation + a 240ms sparkle per 960ms cycle.
+        assert_eq!(
+            SPINNER_FRAMES,
+            ["◜", "◠", "◝", "◞", "◡", "◟", "✦", "✧"],
+            "galaxy swirl = arc revolution + core glint"
+        );
+        // The ticker (`spinner_frame`) indexes `elapsed/120 % len()`, so
+        // whatever it returns must be a member of the cycle — no
+        // out-of-bounds step at any elapsed time or frame-list length.
+        assert!(SPINNER_FRAMES.contains(&spinner_frame()));
     }
 
     #[test]
@@ -2996,7 +3024,7 @@ mod tests {
             .sum::<usize>();
 
         assert!(text.contains("Working on it."));
-        // The in-progress status marker is the animated octopus spinner now
+        // The in-progress status marker is the animated galaxy spinner now
         // (pinned so it survives a transcript that scrolls the chip off).
         assert!(
             SPINNER_FRAMES
@@ -5109,7 +5137,7 @@ mod tests {
         // long `Bash($ sleep 45 …)` that keeps the turn live) was baked into
         // IMMUTABLE scrollback as "Orchestrating… (1 active)" with its spinner
         // frozen. That copy strands one frame behind the LIVE aggregate chip:
-        // two "Orchestrating" lines, same turn, different braille glyphs. The
+        // two "Orchestrating" lines, same turn, different spinner glyphs. The
         // finalized flush must record only TERMINAL activity; running items stay
         // in the live tail until they settle.
         let turn_id = TurnId::new();
@@ -6142,7 +6170,7 @@ mod tests {
     #[test]
     fn tool_card_children_are_indented_under_the_group_header() {
         // A tool activity renders as a `⏺ Bash(...)` card, but it is always a
-        // CHILD of the agent-task group header (`⣻ Orchestrating…` / `• Agent
+        // CHILD of the agent-task group header (`◠ Orchestrating…` / `• Agent
         // task …`). Its bullet must be indented so it nests under the header
         // instead of sitting flush at column 0 where it reads as a sibling
         // (user report: "bash commands should be indented").

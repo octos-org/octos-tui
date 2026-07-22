@@ -2460,8 +2460,13 @@ fn turn_summary_text(summary: &crate::model::TurnActivitySummary) -> String {
     }
 }
 
-/// "Tentacle pulse" octopus spinner frames (braille blob, all single-width).
-const SPINNER_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+/// "Swirling galaxy" spinner frames: a spiral arm sweeps one full clockwise
+/// revolution (6 arc frames), then the core glints (bright ✦ → fading ✧) —
+/// at the 120ms tick in [`spinner_frame`] that is a 720ms swirl + a 240ms
+/// sparkle per 960ms cycle. Every frame is exactly one terminal cell wide
+/// (ambiguous-width-but-1 glyphs; same shipped precedent as ✻ / ⚠), which the
+/// fixed marker layout math depends on.
+const SPINNER_FRAMES: [&str; 8] = ["◜", "◠", "◝", "◞", "◡", "◟", "✦", "✧"];
 
 /// Current spinner frame, advancing ~every 120ms off a process-lifetime clock
 /// (independent of any turn timer, so it keeps animating while background
@@ -2619,7 +2624,7 @@ fn tool_card_bullet(item: &ActivityItem, palette: Palette) -> (String, Style) {
 }
 
 /// Leading indent for a tool card rendered as an agent-task-group CHILD:
-/// the card is always emitted under a group header (`⣻ Orchestrating…`), so
+/// the card is always emitted under a group header (`◠ Orchestrating…`), so
 /// its bullet must nest instead of sitting flush at column 0 where it reads
 /// as a sibling of the header. Two columns puts the `⏺`/spinner bullet at the
 /// same tree level as the `⎿` connector of non-tool children.
@@ -4160,7 +4165,7 @@ fn harness_status_lines(
 
     // The whimsical persona status word (server `progress/updated{kind:
     // "status_word"}`, rotated ~every 8s — e.g. "Conjuring", "正在炼丹") wins
-    // over the flat "Working" phase so the gradient line reads `⣻ Conjuring…`
+    // over the flat "Working" phase so the gradient line reads `◠ Conjuring…`
     // like the web ThinkingIndicator. It replaces ONLY the generic working
     // phase; a real "orchestrating" / "re-entering" phase (sub-agents running,
     // master re-entry) still shows, since that is information the operator
@@ -4190,7 +4195,7 @@ fn harness_status_lines(
     };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    // Water-wave gradient on "spinner + phase" (e.g. "⣻ Working"): a bright crest
+    // Water-wave gradient on "spinner + phase" (e.g. "◠ Working"): a bright crest
     // ripples across the label, advanced by the ~25ms animation redraw via the
     // shared process clock. Uses Color::Rgb like the rest of octos-tui's themes
     // (truecolor-assuming, so it works over SSH where COLORTERM isn't forwarded);
@@ -4735,7 +4740,7 @@ fn run_state_style(state: &SessionRunState, palette: Palette) -> Style {
 
 fn run_state_marker(state: &SessionRunState) -> &'static str {
     match state {
-        // Pin the swimming octopus to the always-visible status bar: on a big
+        // Pin the swirling galaxy to the always-visible status bar: on a big
         // turn the transcript's "Orchestrating" chip scrolls above the fold, so
         // this is the reliable "still working" signal that never scrolls away.
         // Time-based like the transcript spinner; the status bar redraws every

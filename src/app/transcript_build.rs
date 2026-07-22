@@ -1116,13 +1116,13 @@ pub(super) fn push_turn_flow(
 
     // While a reserved-row menu (slash/command popup, model picker, …) is open
     // it squeezes the live tail down to its `Constraint::Min(1)` floor, so the
-    // in-flight activity chip renders as a single truncated "⣾ Orchestrating…"
+    // in-flight activity chip renders as a single truncated "◜ Orchestrating…"
     // HEADER row (no sub-agent child line). On the menu-open viewport GROW the
     // terminal scrolls that squeezed header up into REAL scrollback, where the
     // menu-close `clear_visible_screen` (`CSI 2J`) cannot reclaim it — leaving a
     // frozen, one-spinner-frame-behind duplicate stranded above the fresh live
     // chip (user report: "duplicated orchestrating after slash commands"; the
-    // two chips carry the same turn id but different braille glyphs). The scroll
+    // two chips carry the same turn id but different spinner glyphs). The scroll
     // itself is a deliberately conservative invariant (see
     // `viewport_growth_after_width_reset_scrolls_full_deficit` / #232 #267), so
     // the fix is here, not in the scroll geometry: don't paint the chip while a
@@ -2803,7 +2803,7 @@ pub(super) fn push_finalized_activity_items_section(
     // here makes the chip header read "Orchestrating… (N active)" with its
     // spinner frozen at flush time, and that copy strands one frame behind the
     // LIVE aggregate chip below: two "Orchestrating" lines for the same turn,
-    // different braille glyphs (the third face of the "duplicated
+    // different spinner glyphs (the third face of the "duplicated
     // orchestrating" bug, after #339/#342). It reaches here via the covered
     // late-activity flush (`finalized_late_activity_lines_for_coverages` /
     // `push_turn_activity_log_section_unflushed`), whose UNFLUSHED item set is
