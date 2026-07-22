@@ -708,6 +708,14 @@ impl Store {
                 ) {
                     return self.dispatch_undo_slash();
                 }
+                if matches!(
+                    &command.entry,
+                    crate::menu::types::CommandEntry::LocalAction(
+                        crate::menu::types::LocalAction::Custom("peer"),
+                    )
+                ) {
+                    return self.dispatch_peer_slash(draft);
+                }
                 self.dispatch_command_entry(&command.entry, Some(invocation.args))
             }
             CommandResolution::EmptyCommand => {
@@ -786,6 +794,222 @@ impl Store {
         SlashDispatchOutcome::accepted(Some(AppUiCommand::SnapshotList(
             crate::model::SnapshotListParams { session_id },
         )))
+    }
+
+    /// `/peer <brief…>` (#395): spin off a peer agent session seeded with a
+    /// durable brief. Grammar: `--` flags before the first non-flag token
+    /// (`--go` switch focus once opened, `--worktree`, `--cwd <path>` which
+    /// consumes the next token); everything from the first non-flag token on
+    /// is the brief VERBATIM. Unknown flags, a `--cwd` with no value, and an
+    /// empty brief after flags all reject with the usage status. Bare `/peer`
+    /// prefills the composer for argument typing (the same
+    /// `LocalAction::EditComposer` treatment the `/research` menu rows use).
+    pub(crate) fn dispatch_peer_slash(&mut self, draft: &str) -> SlashDispatchOutcome {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PEER_PREPARE) {
+            return SlashDispatchOutcome::Rejected;
+        }
+        let rest = draft.trim();
+        let rest = rest.strip_prefix("/peer").unwrap_or(rest).trim_start();
+        if rest.is_empty() {
+            // Bare `/peer`: drop the verb back into the composer so the user
+            // types the brief inline (mirrors the EditComposer prefill rows).
+            self.state.set_composer_text("/peer ");
+            self.state.focus = FocusPane::Composer;
+            self.state.status = t!("status.edit_field_prompt").into_owned();
+            return SlashDispatchOutcome::accepted(None);
+        }
+
+        let mut go = false;
+        let mut worktree = false;
+        let mut cwd: Option<String> = None;
+        let mut cursor = rest;
+        loop {
+            let token_end = cursor.find(char::is_whitespace).unwrap_or(cursor.len());
+            let token = &cursor[..token_end];
+            if !token.starts_with("--") {
+                break;
+            }
+            cursor = cursor[token_end..].trim_start();
+            match token {
+                "--go" => go = true,
+                "--worktree" => worktree = true,
+                "--cwd" => {
+                    let value_end = cursor.find(char::is_whitespace).unwrap_or(cursor.len());
+                    let value = &cursor[..value_end];
+                    if value.is_empty() {
+                        self.state.status = t!("status.peer_usage").into_owned();
+                        return SlashDispatchOutcome::Rejected;
+                    }
+                    cwd = Some(value.to_owned());
+                    cursor = cursor[value_end..].trim_start();
+                }
+                _ => {
+                    self.state.status = t!("status.peer_usage").into_owned();
+                    return SlashDispatchOutcome::Rejected;
+                }
+            }
+        }
+        // The brief is the remainder verbatim (internal whitespace preserved);
+        // only the flag prefix was consumed. Empty after flags → usage.
+        let brief = cursor.trim_end();
+        if brief.is_empty() {
+            self.state.status = t!("status.peer_usage").into_owned();
+            return SlashDispatchOutcome::Rejected;
+        }
+
+        // The ACTIVE session rides along so the server can default the
+        // workspace root and scope the peer to this profile.
+        let session_id = self
+            .state
+            .active_session()
+            .map(|session| session.id.clone());
+        // The result does not echo the brief, and `go` never crosses the
+        // wire — stash both for the `PeerPrepared` apply to consume.
+        self.state.pending_peer_prepare = Some(crate::model::PendingPeerPrepare {
+            brief: brief.to_owned(),
+            go,
+            created: std::time::Instant::now(),
+        });
+        self.state.status = t!("status.peer_preparing").into_owned();
+        SlashDispatchOutcome::accepted(Some(AppUiCommand::PeerPrepare(
+            crate::model::PeerPrepareParams {
+                brief: brief.to_owned(),
+                title: None,
+                worktree,
+                cwd,
+                session_id,
+                profile_id: None,
+            },
+        )))
+    }
+
+    /// The kickoff prompt submitted into a freshly opened peer session
+    /// (#395). Names the durable brief file so the peer can re-read it after
+    /// context compaction.
+    fn peer_kickoff_prompt(brief: &str, brief_path: &str) -> String {
+        format!(
+            "You are a peer agent. Your brief:\n\n{brief}\n\n(The durable copy of this brief is at {brief_path} — re-read it if your context is compacted.)"
+        )
+    }
+
+    /// The peer slug for a minted peer session key: the key's topic is
+    /// `peer-<slug>` by construction, so strip the prefix (fall back to the
+    /// full topic, then the raw key, for defensive rendering).
+    fn peer_slug_for_key(session_id: &SessionKey) -> String {
+        session_id
+            .topic()
+            .map(|topic| topic.strip_prefix("peer-").unwrap_or(topic))
+            .unwrap_or(session_id.0.as_str())
+            .to_owned()
+    }
+
+    /// `peer/prepare` result (#395): mint the peer session key from the
+    /// server's `profile_id` + `topic` (the same
+    /// `with_profile_topic(id, "local", "tui", …)` shape
+    /// [`Self::dispatch_switch_to_profile`] builds), stash the kickoff for
+    /// the `session/opened` that follows, and open the session. An
+    /// unsolicited result (no pending `/peer` — e.g. a stale reply after a
+    /// snapshot replay dropped nothing but the user moved on) opens nothing:
+    /// without the brief there is no kickoff to run.
+    fn apply_peer_prepared_event(
+        &mut self,
+        event: crate::client_event::PeerPreparedClientEvent,
+    ) -> Option<AppUiCommand> {
+        let Some(pending) = self.state.pending_peer_prepare.take() else {
+            self.state.status = event.message;
+            return None;
+        };
+        let result = event.result;
+        let session_id = octos_core::SessionKey::with_profile_topic(
+            &result.profile_id,
+            "local",
+            "tui",
+            &result.topic,
+        );
+        self.state.prune_stale_peer_kickoffs();
+        self.state.pending_peer_kickoffs.insert(
+            session_id.clone(),
+            crate::model::PeerKickoff {
+                brief: pending.brief,
+                brief_path: result.brief_path,
+                go: pending.go,
+                created: std::time::Instant::now(),
+            },
+        );
+        self.state.status = t!("status.peer_opening", slug = result.slug.clone()).into_owned();
+        Some(AppUiCommand::OpenSession(
+            octos_core::ui_protocol::SessionOpenParams {
+                session_id,
+                topic: None,
+                profile_id: Some(result.profile_id),
+                cwd: Some(result.cwd),
+                sandbox: None,
+                after: None,
+            },
+        ))
+    }
+
+    /// A peer session's `session/opened` landed with `go: false` (#395): land
+    /// the [`SessionView`] WITHOUT the focus-switch bundle (no
+    /// `switch_selected_session`, no global workspace/pane mutation — the
+    /// user stays where they are; the peer announces itself via the session
+    /// strip's live/unread markers) and submit the kickoff turn TO THE PEER
+    /// KEY. The direct `TurnStartParams` build mirrors
+    /// [`Self::start_prompt_turn`] minus its active-session coupling: the
+    /// optimistic prompt echo and the pre-token live marker are keyed to the
+    /// peer session, and the GLOBAL run state is left alone.
+    fn open_peer_session_in_background(
+        &mut self,
+        session_id: SessionKey,
+        profile_id: Option<String>,
+        kickoff: crate::model::PeerKickoff,
+    ) -> Option<AppUiCommand> {
+        if let Some(index) = self
+            .state
+            .sessions
+            .iter()
+            .position(|session| session.id == session_id)
+        {
+            self.state.sessions[index].profile_id = profile_id;
+        } else {
+            self.state.sessions.push(SessionView {
+                id: session_id.clone(),
+                // The topic (`peer-<slug>`) is a far better strip label than
+                // the raw profiled key.
+                title: session_id
+                    .topic()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| session_id.0.clone()),
+                profile_id,
+                messages: Vec::new(),
+                tasks: Vec::new(),
+                live_reply: None,
+            });
+        }
+        let prompt = Self::peer_kickoff_prompt(&kickoff.brief, &kickoff.brief_path);
+        let turn_id = octos_core::ui_protocol::TurnId::new();
+        self.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            prompt.clone(),
+        );
+        // Live marker for the strip (`session_turn_live`) — NOT the global
+        // run_state, which belongs to the focused session.
+        self.state
+            .pre_token_turns
+            .insert(session_id.clone(), std::time::Instant::now());
+        let slug = Self::peer_slug_for_key(&session_id);
+        self.state.status = t!("status.peer_started", slug = slug).into_owned();
+        Some(AppUiCommand::SubmitPrompt(TurnStartParams {
+            session_id,
+            turn_id,
+            input: vec![InputItem::Text { text: prompt }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            live_video: false,
+        }))
     }
 
     pub(crate) fn dispatch_research_slash(&mut self, draft: &str) -> SlashDispatchOutcome {
@@ -6414,6 +6638,7 @@ impl Store {
                 self.refresh_active_menu_if_open();
                 None
             }
+            ClientEvent::PeerPrepared(event) => self.apply_peer_prepared_event(event),
             ClientEvent::SubProvidersMutation(event) => {
                 self.apply_sub_providers_mutation_event(event);
                 self.refresh_active_menu_if_open();
@@ -6985,6 +7210,12 @@ impl Store {
                 // reconnect, or the tick backstop starts a second turn (K3
                 // review). Harmless when stale — TTL-pruned on refresh.
                 let pre_token_turns = self.state.pre_token_turns.clone();
+                // #395 local-only in-flight `/peer` state: the server never
+                // echoes it, and a replay landing inside the prepare→open
+                // window would otherwise drop the kickoff (its brief has no
+                // other copy). Harmless when stale — TTL-pruned on take.
+                let pending_peer_prepare = self.state.pending_peer_prepare.clone();
+                let pending_peer_kickoffs = self.state.pending_peer_kickoffs.clone();
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
@@ -7045,6 +7276,8 @@ impl Store {
                 state.session_context_window = session_context_window;
                 state.staged_submit_in_flight = staged_submit_in_flight;
                 state.pre_token_turns = pre_token_turns;
+                state.pending_peer_prepare = pending_peer_prepare;
+                state.pending_peer_kickoffs = pending_peer_kickoffs;
                 // Settle gates the snapshot already reflects BEFORE the
                 // optimistic restore below re-inserts un-echoed rows (which
                 // would inflate the echo count and mis-settle live gates).
@@ -8845,6 +9078,12 @@ impl Store {
             UiNotification::VoiceAudioChunk(_) => None,
             UiNotification::SessionOpened(event) => {
                 let session_id = event.session_id.clone();
+                // #395: a `/peer`-prepared session landing. Popped BEFORE the
+                // switch bundle so a `--go`-less peer never steals focus (and
+                // never clobbers the foreground workspace/pane state below).
+                // Stale entries (>TTL, dead open) were pruned by the take — a
+                // late open then degrades to a normal focused session open.
+                let mut peer_kickoff = self.state.take_pending_peer_kickoff(&session_id);
                 // Restore the server-persisted per-session reasoning effort so
                 // /thinking + its menu reflect it after a full restart (the server
                 // is the source of truth; `None` means no override is stored).
@@ -8857,6 +9096,16 @@ impl Store {
                     None => {
                         self.state.session_reasoning_effort.remove(&session_id);
                     }
+                }
+                if let Some(kickoff) = peer_kickoff.take_if(|kickoff| !kickoff.go) {
+                    // Background peer (default): land the session + fire the
+                    // kickoff without touching focus, panes, or the global
+                    // workspace root.
+                    return self.open_peer_session_in_background(
+                        session_id,
+                        event.active_profile_id,
+                        kickoff,
+                    );
                 }
                 if let Some(panes) = event.panes {
                     self.state.apply_pane_snapshot(panes);
@@ -8932,6 +9181,18 @@ impl Store {
                     caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ)
                 }) {
                     self.state.enqueue_session_status_probe(session_id.clone());
+                }
+                // #395 `--go`: the switch bundle above made the peer session
+                // ACTIVE, so the standard submit path (optimistic echo, run
+                // state, pre-token marker, gate housekeeping) targets it —
+                // submit the kickoff through it.
+                if let Some(kickoff) = peer_kickoff {
+                    let slug = Self::peer_slug_for_key(&session_id);
+                    let prompt = Self::peer_kickoff_prompt(&kickoff.brief, &kickoff.brief_path);
+                    return self.start_prompt_turn(
+                        prompt,
+                        t!("status.peer_switched", slug = slug).into_owned(),
+                    );
                 }
                 // M22-D: if the user staged a permission profile in
                 // onboarding, apply it now that we have a session id.
@@ -13101,6 +13362,337 @@ mod tests {
         ]));
         let outcome = store.dispatch_research_slash("/research add cheap moonshot k3");
         assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+    }
+
+    // ── /peer (#395) ────────────────────────────────────────────────────────
+
+    fn peer_capable_store() -> Store {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PEER_PREPARE,
+        ]));
+        store
+    }
+
+    /// Runs `/peer --go …` through dispatch and feeds back the prepared
+    /// result, returning the minted peer session key. Shared setup for the
+    /// session-appears tests.
+    fn prepare_peer(store: &mut Store, draft: &str) -> SessionKey {
+        let outcome = store.dispatch_peer_slash(draft);
+        assert!(
+            matches!(outcome, SlashDispatchOutcome::Accepted(Some(_))),
+            "dispatch must accept and emit peer/prepare"
+        );
+        let open = store.apply_client_event(ClientEvent::PeerPrepared(
+            crate::client_event::PeerPreparedClientEvent {
+                message: "Peer session prepared: fix-nav".into(),
+                result: crate::model::PeerPrepareResult {
+                    slug: "fix-nav".into(),
+                    topic: "peer-fix-nav".into(),
+                    brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
+                    cwd: "/repo".into(),
+                    worktree_branch: None,
+                    profile_id: "coding".into(),
+                },
+            },
+        ));
+        let Some(AppUiCommand::OpenSession(params)) = open else {
+            panic!("prepared result must emit session/open, got {open:?}");
+        };
+        params.session_id
+    }
+
+    fn peer_session_opened(store: &mut Store, session_id: &SessionKey) -> Option<AppUiCommand> {
+        let opened: octos_core::ui_protocol::SessionOpened =
+            serde_json::from_value(serde_json::json!({
+                "session_id": session_id,
+                "active_profile_id": "coding",
+            }))
+            .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)))
+    }
+
+    #[test]
+    fn peer_slash_parses_flags_and_brief_verbatim() {
+        let mut store = peer_capable_store();
+        let command = store
+            .dispatch_peer_slash("/peer --go --worktree --cwd /x fix the thing")
+            .into_command();
+        let Some(AppUiCommand::PeerPrepare(params)) = command else {
+            panic!("expected a PeerPrepare command, got {command:?}");
+        };
+        assert_eq!(params.brief, "fix the thing");
+        assert!(params.worktree);
+        assert_eq!(params.cwd.as_deref(), Some("/x"));
+        // The ACTIVE session rides along for server-side workspace/profile
+        // scoping; profile_id stays None in v1.
+        assert_eq!(params.session_id, Some(SessionKey("local:test".into())));
+        assert!(params.profile_id.is_none());
+        assert!(params.title.is_none());
+        // `--go` never crosses the wire — it is stashed client-side with the
+        // brief for the prepared-result apply.
+        let pending = store
+            .state
+            .pending_peer_prepare
+            .as_ref()
+            .expect("dispatch stashes the pending prepare");
+        assert!(pending.go);
+        assert_eq!(pending.brief, "fix the thing");
+    }
+
+    #[test]
+    fn peer_slash_brief_keeps_internal_whitespace_and_later_dashes() {
+        let mut store = peer_capable_store();
+        // Flags stop at the first non-flag token; a later `--flag`-looking
+        // token is part of the brief VERBATIM (internal spacing preserved).
+        let command = store
+            .dispatch_peer_slash("/peer fix  the --cwd thing")
+            .into_command();
+        let Some(AppUiCommand::PeerPrepare(params)) = command else {
+            panic!("expected a PeerPrepare command, got {command:?}");
+        };
+        assert_eq!(params.brief, "fix  the --cwd thing");
+        assert!(!params.worktree);
+        assert!(params.cwd.is_none());
+        assert!(
+            store
+                .state
+                .pending_peer_prepare
+                .as_ref()
+                .is_some_and(|pending| !pending.go),
+            "no --go → focus stays put"
+        );
+    }
+
+    #[test]
+    fn peer_slash_rejects_unknown_flag_with_usage() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer --nope fix the thing");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+        assert_eq!(store.state.status, t!("status.peer_usage"));
+        assert!(store.state.pending_peer_prepare.is_none());
+    }
+
+    #[test]
+    fn peer_slash_rejects_cwd_flag_without_value() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer --cwd");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+        assert_eq!(store.state.status, t!("status.peer_usage"));
+    }
+
+    #[test]
+    fn peer_slash_rejects_empty_brief_after_flags() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer --go --worktree");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+        assert_eq!(store.state.status, t!("status.peer_usage"));
+        assert!(store.state.pending_peer_prepare.is_none());
+    }
+
+    #[test]
+    fn peer_slash_bare_prefills_composer() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer");
+        assert!(
+            matches!(outcome, SlashDispatchOutcome::Accepted(None)),
+            "bare /peer is a client-only prefill, no backend command"
+        );
+        assert_eq!(store.state.composer, "/peer ");
+        assert_eq!(store.state.focus, FocusPane::Composer);
+        assert!(store.state.pending_peer_prepare.is_none());
+    }
+
+    #[test]
+    fn peer_slash_requires_peer_prepare_capability() {
+        // Capabilities present but WITHOUT peer/prepare → the standard
+        // method-not-advertised rejection (mirrors require_appui_method).
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_SNAPSHOT_LIST,
+        ]));
+        let outcome = store.dispatch_peer_slash("/peer fix the thing");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+        assert_eq!(
+            store.state.status,
+            t!(
+                "status.appui_method_not_advertised",
+                method = crate::model::APPUI_METHOD_PEER_PREPARE
+            )
+        );
+        assert!(store.state.pending_peer_prepare.is_none());
+    }
+
+    #[test]
+    fn peer_prepared_result_opens_session_and_stashes_kickoff() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer --worktree fix the nav");
+        assert!(matches!(outcome, SlashDispatchOutcome::Accepted(Some(_))));
+
+        let open = store.apply_client_event(ClientEvent::PeerPrepared(
+            crate::client_event::PeerPreparedClientEvent {
+                message: "Peer session prepared: fix-nav".into(),
+                result: crate::model::PeerPrepareResult {
+                    slug: "fix-nav".into(),
+                    topic: "peer-fix-nav".into(),
+                    brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
+                    cwd: "/repo".into(),
+                    worktree_branch: Some("peer/fix-nav".into()),
+                    profile_id: "coding".into(),
+                },
+            },
+        ));
+        let Some(AppUiCommand::OpenSession(params)) = open else {
+            panic!("prepared result must emit session/open, got {open:?}");
+        };
+        // The key is minted exactly like dispatch_switch_to_profile's:
+        // with_profile_topic(profile, "local", "tui", topic).
+        assert_eq!(
+            params.session_id,
+            octos_core::SessionKey::with_profile_topic("coding", "local", "tui", "peer-fix-nav")
+        );
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+        assert_eq!(params.cwd.as_deref(), Some("/repo"));
+        assert!(params.topic.is_none());
+        assert!(params.sandbox.is_none());
+
+        // The kickoff is stashed under the minted key and the pending
+        // prepare is consumed.
+        let kickoff = store
+            .state
+            .pending_peer_kickoffs
+            .get(&params.session_id)
+            .expect("kickoff stashed under the minted peer key");
+        assert_eq!(kickoff.brief, "fix the nav");
+        assert_eq!(kickoff.brief_path, "/repo/.octos/peers/fix-nav/BRIEF.md");
+        assert!(!kickoff.go);
+        assert!(store.state.pending_peer_prepare.is_none());
+    }
+
+    #[test]
+    fn peer_prepared_without_pending_dispatch_opens_nothing() {
+        // An unsolicited result (no /peer in flight) has no brief to kick off
+        // with — it must not open a session.
+        let mut store = peer_capable_store();
+        let open = store.apply_client_event(ClientEvent::PeerPrepared(
+            crate::client_event::PeerPreparedClientEvent {
+                message: "Peer session prepared: fix-nav".into(),
+                result: crate::model::PeerPrepareResult {
+                    slug: "fix-nav".into(),
+                    topic: "peer-fix-nav".into(),
+                    brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
+                    cwd: "/repo".into(),
+                    worktree_branch: None,
+                    profile_id: "coding".into(),
+                },
+            },
+        ));
+        assert!(open.is_none());
+        assert!(store.state.pending_peer_kickoffs.is_empty());
+    }
+
+    #[test]
+    fn peer_session_opened_without_go_submits_kickoff_in_background() {
+        let mut store = peer_capable_store();
+        let peer_key = prepare_peer(&mut store, "/peer fix the nav");
+
+        let command = peer_session_opened(&mut store, &peer_key);
+        let Some(AppUiCommand::SubmitPrompt(params)) = command else {
+            panic!("landing the peer session must submit the kickoff, got {command:?}");
+        };
+        // The kickoff targets the PEER key, not the active session.
+        assert_eq!(params.session_id, peer_key);
+        let [InputItem::Text { text }] = params.input.as_slice() else {
+            panic!("kickoff input is a single text item: {:?}", params.input);
+        };
+        assert!(text.starts_with("You are a peer agent. Your brief:\n\nfix the nav"));
+        assert!(text.contains("/repo/.octos/peers/fix-nav/BRIEF.md"));
+
+        // Focus unchanged (the peer announces itself via the strip), stash
+        // cleared, status names the slug, and the peer session view landed
+        // with the optimistic kickoff prompt + a live pre-token marker.
+        assert_eq!(
+            store
+                .state
+                .active_session()
+                .map(|session| session.id.clone()),
+            Some(SessionKey("local:test".into())),
+            "a --go-less peer must not steal focus"
+        );
+        assert!(store.state.pending_peer_kickoffs.is_empty());
+        assert_eq!(
+            store.state.status,
+            t!("status.peer_started", slug = "fix-nav")
+        );
+        let peer_session = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == peer_key)
+            .expect("peer session landed in state");
+        assert_eq!(peer_session.title, "peer-fix-nav");
+        assert!(
+            peer_session
+                .messages
+                .iter()
+                .any(|message| message.content.contains("fix the nav")),
+            "kickoff prompt echoes into the peer transcript"
+        );
+        assert!(
+            store.state.pre_token_turns.contains_key(&peer_key),
+            "the strip's live marker is armed for the peer"
+        );
+    }
+
+    #[test]
+    fn peer_session_opened_with_go_switches_focus_and_submits_kickoff() {
+        let mut store = peer_capable_store();
+        let peer_key = prepare_peer(&mut store, "/peer --go fix the nav");
+
+        let command = peer_session_opened(&mut store, &peer_key);
+        let Some(AppUiCommand::SubmitPrompt(params)) = command else {
+            panic!("landing the peer session must submit the kickoff, got {command:?}");
+        };
+        assert_eq!(params.session_id, peer_key);
+        // `--go` runs the full switch bundle: the peer session is ACTIVE.
+        assert_eq!(
+            store
+                .state
+                .active_session()
+                .map(|session| session.id.clone()),
+            Some(peer_key),
+            "--go switches focus to the peer session"
+        );
+        assert!(store.state.pending_peer_kickoffs.is_empty());
+        assert_eq!(
+            store.state.status,
+            t!("status.peer_switched", slug = "fix-nav")
+        );
+    }
+
+    #[test]
+    fn stale_peer_kickoff_is_pruned_and_fires_no_kickoff_turn() {
+        let mut store = peer_capable_store();
+        let peer_key = prepare_peer(&mut store, "/peer fix the nav");
+        // Age the stash beyond the TTL (dead session/open).
+        store
+            .state
+            .pending_peer_kickoffs
+            .get_mut(&peer_key)
+            .expect("kickoff stashed")
+            .created = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(31))
+            .expect("instant in the past");
+
+        let command = peer_session_opened(&mut store, &peer_key);
+        assert!(
+            !matches!(command, Some(AppUiCommand::SubmitPrompt(_))),
+            "a stale kickoff must not fire a turn, got {command:?}"
+        );
+        assert!(
+            store.state.pending_peer_kickoffs.is_empty(),
+            "the stale stash is pruned"
+        );
     }
 
     /// Build a store whose active-profile sources are set to the given tiers, so

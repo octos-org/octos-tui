@@ -460,6 +460,8 @@ command:
     desc: 在打开的会话间切换（Alt+S）—— 实时回合与未读标记。
   undo:
     desc: 将工作区文件回滚到修改前的快照（#1768）。
+  peer:
+    desc: "派生一个带持久任务简报的同伴智能体会话：/peer [--go] [--worktree] [--cwd <path>] <brief>。"
   research:
     desc: 管理研究模型通道（deep_research 的 cheap/strong 模型）。
   onboard:
@@ -1216,6 +1218,11 @@ menu:
   unavailable: 菜单不可用
 status:
   undo_no_session: "没有可撤销的活动会话。"
+  peer_usage: "用法：/peer [--go] [--worktree] [--cwd <path>] <brief>"
+  peer_preparing: "正在准备同伴会话…"
+  peer_opening: "正在打开同伴 %{slug}…"
+  peer_started: "同伴 %{slug} 已在后台开始工作 —— 请留意会话栏中它的标记（Alt+S）。"
+  peer_switched: "同伴 %{slug} 已启动 —— 您现在位于它的会话中。"
   research_usage: "用法：/research | /research add <key> <provider> <model> [base_url] [api_key_env] | /research rm <key>"
   research_add_usage: "用法：/research add <key> <provider> <model> [base_url] [api_key_env]"
   research_rm_usage: "用法：/research rm <key>"
