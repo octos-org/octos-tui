@@ -708,6 +708,14 @@ impl Store {
                 ) {
                     return self.dispatch_undo_slash();
                 }
+                if matches!(
+                    &command.entry,
+                    crate::menu::types::CommandEntry::LocalAction(
+                        crate::menu::types::LocalAction::Custom("peer"),
+                    )
+                ) {
+                    return self.dispatch_peer_slash(draft);
+                }
                 self.dispatch_command_entry(&command.entry, Some(invocation.args))
             }
             CommandResolution::EmptyCommand => {
@@ -788,6 +796,260 @@ impl Store {
         )))
     }
 
+    /// `/peer <brief…>` (#395): spin off a peer agent session seeded with a
+    /// durable brief. Grammar: `--` flags before the first non-flag token
+    /// (`--go` switch focus once opened, `--worktree`, `--cwd <path>` which
+    /// consumes the next token); everything from the first non-flag token on
+    /// is the brief VERBATIM. Unknown flags, a `--cwd` with no value, and an
+    /// empty brief after flags all reject with the usage status. Bare `/peer`
+    /// prefills the composer for argument typing (the same
+    /// `LocalAction::EditComposer` treatment the `/research` menu rows use).
+    pub(crate) fn dispatch_peer_slash(&mut self, draft: &str) -> SlashDispatchOutcome {
+        // Mutating gate (readonly + capability): the transport would block the
+        // emitted command anyway, but rejecting here keeps the stash from
+        // being armed by a dispatch that can never complete (K3 review).
+        if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_PEER_PREPARE) {
+            return SlashDispatchOutcome::Rejected;
+        }
+        let rest = draft.trim();
+        let rest = rest.strip_prefix("/peer").unwrap_or(rest).trim_start();
+        if rest.is_empty() {
+            // Bare `/peer`: drop the verb back into the composer so the user
+            // types the brief inline (mirrors the EditComposer prefill rows).
+            self.state.set_composer_text("/peer ");
+            self.state.focus = FocusPane::Composer;
+            self.state.status = t!("status.edit_field_prompt").into_owned();
+            return SlashDispatchOutcome::accepted(None);
+        }
+
+        let mut go = false;
+        let mut worktree = false;
+        let mut cwd: Option<String> = None;
+        let mut cursor = rest;
+        loop {
+            let token_end = cursor.find(char::is_whitespace).unwrap_or(cursor.len());
+            let token = &cursor[..token_end];
+            if !token.starts_with("--") {
+                break;
+            }
+            cursor = cursor[token_end..].trim_start();
+            match token {
+                "--go" => go = true,
+                "--worktree" => worktree = true,
+                "--cwd" => {
+                    let value_end = cursor.find(char::is_whitespace).unwrap_or(cursor.len());
+                    let value = &cursor[..value_end];
+                    if value.is_empty() {
+                        self.state.status = t!("status.peer_usage").into_owned();
+                        return SlashDispatchOutcome::Rejected;
+                    }
+                    cwd = Some(value.to_owned());
+                    cursor = cursor[value_end..].trim_start();
+                }
+                _ => {
+                    self.state.status = t!("status.peer_usage").into_owned();
+                    return SlashDispatchOutcome::Rejected;
+                }
+            }
+        }
+        // The brief is the remainder verbatim (internal whitespace preserved);
+        // only the flag prefix was consumed. Empty after flags → usage.
+        let brief = cursor.trim_end();
+        if brief.is_empty() {
+            self.state.status = t!("status.peer_usage").into_owned();
+            return SlashDispatchOutcome::Rejected;
+        }
+
+        // Single-slot stash ⇒ single in-flight prepare (K3 review, high): a
+        // second `/peer` overwriting the stash would hand the FIRST result the
+        // SECOND brief — the first peer's session would run the wrong task and
+        // the second prepare's staged brief would be orphaned server-side.
+        // Refuse while a fresh prepare is in flight; a stale one (lost
+        // response) is replaced past [`PEER_PREPARE_TTL`].
+        if self
+            .state
+            .pending_peer_prepare
+            .as_ref()
+            .is_some_and(|pending| pending.created.elapsed() < crate::model::PEER_PREPARE_TTL)
+        {
+            self.state.status = t!("status.peer_prepare_in_flight").into_owned();
+            return SlashDispatchOutcome::Rejected;
+        }
+
+        // The ACTIVE session rides along so the server can default the
+        // workspace root and scope the peer to this profile.
+        let session_id = self
+            .state
+            .active_session()
+            .map(|session| session.id.clone());
+        // The result does not echo the brief, and `go` never crosses the
+        // wire — stash both for the `PeerPrepared` apply to consume.
+        self.state.pending_peer_prepare = Some(crate::model::PendingPeerPrepare {
+            brief: brief.to_owned(),
+            go,
+            created: std::time::Instant::now(),
+        });
+        self.state.status = t!("status.peer_preparing").into_owned();
+        SlashDispatchOutcome::accepted(Some(AppUiCommand::PeerPrepare(
+            crate::model::PeerPrepareParams {
+                brief: brief.to_owned(),
+                title: None,
+                worktree,
+                cwd,
+                session_id,
+                profile_id: None,
+            },
+        )))
+    }
+
+    /// The kickoff prompt submitted into a freshly opened peer session
+    /// (#395). Names the durable brief file so the peer can re-read it after
+    /// context compaction.
+    fn peer_kickoff_prompt(brief: &str, brief_path: &str) -> String {
+        format!(
+            "You are a peer agent. Your brief:\n\n{brief}\n\n(The durable copy of this brief is at {brief_path} — re-read it if your context is compacted.)"
+        )
+    }
+
+    /// A session's display title for status-line hints (tui#398), falling
+    /// back to the raw key for sessions not (yet) in `state.sessions`.
+    fn session_title_for_hint(&self, session_id: &SessionKey) -> String {
+        self.state
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .map(|session| session.title.clone())
+            .unwrap_or_else(|| session_id.0.clone())
+    }
+
+    /// The peer slug for a minted peer session key: the key's topic is
+    /// `peer-<slug>` by construction, so strip the prefix (fall back to the
+    /// full topic, then the raw key, for defensive rendering).
+    fn peer_slug_for_key(session_id: &SessionKey) -> String {
+        session_id
+            .topic()
+            .map(|topic| topic.strip_prefix("peer-").unwrap_or(topic))
+            .unwrap_or(session_id.0.as_str())
+            .to_owned()
+    }
+
+    /// `peer/prepare` result (#395): mint the peer session key from the
+    /// server's `profile_id` + `topic` (the same
+    /// `with_profile_topic(id, "local", "tui", …)` shape
+    /// [`Self::dispatch_switch_to_profile`] builds), stash the kickoff for
+    /// the `session/opened` that follows, and open the session. An
+    /// unsolicited result (no pending `/peer` — e.g. a stale reply after a
+    /// snapshot replay dropped nothing but the user moved on) opens nothing:
+    /// without the brief there is no kickoff to run.
+    fn apply_peer_prepared_event(
+        &mut self,
+        event: crate::client_event::PeerPreparedClientEvent,
+    ) -> Option<AppUiCommand> {
+        let Some(pending) = self.state.pending_peer_prepare.take() else {
+            self.state.status = event.message;
+            return None;
+        };
+        // A result landing past the prepare TTL is as good as unsolicited
+        // (K3 review): the user has moved on, and a lost-then-recovered
+        // response minutes later must not pop a session open + an unprompted
+        // kickoff turn.
+        if pending.created.elapsed() >= crate::model::PEER_PREPARE_TTL {
+            self.state.status = event.message;
+            return None;
+        }
+        let result = event.result;
+        let session_id = octos_core::SessionKey::with_profile_topic(
+            &result.profile_id,
+            "local",
+            "tui",
+            &result.topic,
+        );
+        self.state.prune_stale_peer_kickoffs();
+        self.state.pending_peer_kickoffs.insert(
+            session_id.clone(),
+            crate::model::PeerKickoff {
+                brief: pending.brief,
+                brief_path: result.brief_path,
+                go: pending.go,
+                created: std::time::Instant::now(),
+            },
+        );
+        self.state.status = t!("status.peer_opening", slug = result.slug.clone()).into_owned();
+        Some(AppUiCommand::OpenSession(
+            octos_core::ui_protocol::SessionOpenParams {
+                session_id,
+                topic: None,
+                profile_id: Some(result.profile_id),
+                cwd: Some(result.cwd),
+                sandbox: None,
+                after: None,
+            },
+        ))
+    }
+
+    /// A peer session's `session/opened` landed with `go: false` (#395): land
+    /// the [`SessionView`] WITHOUT the focus-switch bundle (no
+    /// `switch_selected_session`, no global workspace/pane mutation — the
+    /// user stays where they are; the peer announces itself via the session
+    /// strip's live/unread markers) and submit the kickoff turn TO THE PEER
+    /// KEY. The direct `TurnStartParams` build mirrors
+    /// [`Self::start_prompt_turn`] minus its active-session coupling: the
+    /// optimistic prompt echo and the pre-token live marker are keyed to the
+    /// peer session, and the GLOBAL run state is left alone.
+    fn open_peer_session_in_background(
+        &mut self,
+        session_id: SessionKey,
+        profile_id: Option<String>,
+        kickoff: crate::model::PeerKickoff,
+    ) -> Option<AppUiCommand> {
+        if let Some(index) = self
+            .state
+            .sessions
+            .iter()
+            .position(|session| session.id == session_id)
+        {
+            self.state.sessions[index].profile_id = profile_id;
+        } else {
+            self.state.sessions.push(SessionView {
+                id: session_id.clone(),
+                // The topic (`peer-<slug>`) is a far better strip label than
+                // the raw profiled key.
+                title: session_id
+                    .topic()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| session_id.0.clone()),
+                profile_id,
+                messages: Vec::new(),
+                tasks: Vec::new(),
+                live_reply: None,
+            });
+        }
+        let prompt = Self::peer_kickoff_prompt(&kickoff.brief, &kickoff.brief_path);
+        let turn_id = octos_core::ui_protocol::TurnId::new();
+        self.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            prompt.clone(),
+        );
+        // Live marker for the strip (`session_turn_live`) — NOT the global
+        // run_state, which belongs to the focused session.
+        self.state
+            .pre_token_turns
+            .insert(session_id.clone(), std::time::Instant::now());
+        let slug = Self::peer_slug_for_key(&session_id);
+        self.state.status = t!("status.peer_started", slug = slug).into_owned();
+        Some(AppUiCommand::SubmitPrompt(TurnStartParams {
+            session_id,
+            turn_id,
+            input: vec![InputItem::Text { text: prompt }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            live_video: false,
+        }))
+    }
+
     pub(crate) fn dispatch_research_slash(&mut self, draft: &str) -> SlashDispatchOutcome {
         // Target the ACTIVE profile — the same value the /research menu resolves
         // (`active_profile_id`), NOT the last list's cached profile and NOT the
@@ -807,6 +1069,40 @@ impl Store {
                 )))
             }
             Some("add") | Some("set") => {
+                // Bare `/research add` (no args) opens the model-setting wizard
+                // (the same flow as /model add-model) targeted at a research
+                // lane, instead of the terse inline form. Set the PERSISTENT
+                // lane intent (survives wizard edits) rather than the transient
+                // provider_save_target, which the dirty-marking paths clear.
+                if tokens.clone().next().is_none() {
+                    // Codex PR384 review (F4): gate on lane UPSERT, not just the
+                    // wizard. On a lane-list-only server the wizard couldn't save,
+                    // so block here with the friendly capability message instead.
+                    if !self.require_appui_method(
+                        crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+                    ) {
+                        return SlashDispatchOutcome::Rejected;
+                    }
+                    self.state.onboarding.research_lane_intent = true;
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                    // Prefetch the lane list (when the server can list) so the
+                    // Save-time key picker shows current cheap/strong occupancy
+                    // instead of a cold cache.
+                    let can_list = self
+                        .state
+                        .capabilities
+                        .as_ref()
+                        .is_some_and(|capabilities| {
+                            capabilities.supports_method(
+                                crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+                            )
+                        });
+                    return SlashDispatchOutcome::accepted(can_list.then_some(
+                        AppUiCommand::ProfileSubProvidersList(SubProvidersListParams {
+                            profile_id,
+                        }),
+                    ));
+                }
                 // Require key + provider + MODEL (a dropped model used to save a
                 // lane with no model), and reject trailing junk.
                 let (key, provider, model) = (tokens.next(), tokens.next(), tokens.next());
@@ -1668,6 +1964,7 @@ impl Store {
                 ));
                 None
             }
+            LocalAction::SaveResearchLaneAs(key) => self.dispatch_save_research_lane_as(&key),
             LocalAction::RequestRestoreSnapshot(request) => {
                 self.state.onboarding.pending_snapshot_restore = Some(*request);
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_UNDO_CONFIRM));
@@ -2838,6 +3135,11 @@ impl Store {
                 // create intent — otherwise `/onboard` after Esc-ing out of a
                 // create wizard would wrongly render the create step.
                 self.state.onboarding.creating_new_profile = false;
+                // Same stale-intent class for the research-lane flag (PR384
+                // review P1-a): `/onboard` is a PROVIDER save flow — a lane
+                // intent left over from an abandoned `/research add` must not
+                // silently reroute its Save into a sub-provider lane.
+                self.state.onboarding.research_lane_intent = false;
                 // From the Phase 3 startup picker's "Create a new profile" row,
                 // replace the picker rather than stacking onboarding over it.
                 if self.active_menu_id_is(crate::menu::registry::MENU_PROFILE_PICKER) {
@@ -3637,6 +3939,13 @@ impl Store {
     }
 
     fn onboarding_save_provider_command(&mut self) -> Option<AppUiCommand> {
+        // Route on the PERSISTENT lane intent: bare `/research add` sets
+        // `research_lane_intent`, which survives staged-input edits (unlike the
+        // transient provider_save_target). A lane save goes to
+        // `profile/sub_providers/upsert`, not the profile's primary provider.
+        if self.state.onboarding.research_lane_intent {
+            return self.onboarding_save_research_lane_command();
+        }
         if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT) {
             return None;
         }
@@ -3664,6 +3973,84 @@ impl Store {
         self.state.status = t!("status.saving_provider_config").into_owned();
         self.refresh_active_menu_if_open();
         Some(AppUiCommand::ProfileLlmUpsert(params))
+    }
+
+    /// Save the wizard's staged provider as a research sub-provider lane (the
+    /// `/research` add flow). Validates the staged selection, then opens the
+    /// lane-KEY picker (`MENU_RESEARCH_LANE_KEY`) instead of dispatching: the
+    /// deep_research palette requests lanes by the literal keys
+    /// `cheap`/`strong`, so the user must land the save on one of those — a
+    /// family-id key would produce a lane the router never selects (PR384
+    /// review P1-b). The picker row fires [`Self::dispatch_save_research_lane_as`].
+    fn onboarding_save_research_lane_command(&mut self) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT) {
+            return None;
+        }
+        if let Some(pending) = self.state.onboarding.provider_pending {
+            self.state.status = onboarding_pending_status(pending);
+            self.refresh_active_menu_if_open();
+            return None;
+        }
+        let profile_id = self.active_profile_id();
+        // Codex PR384 review (F3): use the RESOLVED active profile directly, not
+        // `effective_profile_id` (which prefers a stale `onboarding.profile_id`).
+        // Refuse to save when no active profile is resolved rather than silently
+        // targeting the server default.
+        if profile_id.is_none() {
+            self.state.status = t!("status.research_profile_unresolved").into_owned();
+            return None;
+        }
+        // Validate the staged selection BEFORE the picker so it never opens on
+        // an incomplete wizard (the key itself is chosen in the picker).
+        if self
+            .state
+            .onboarding
+            .build_research_lane_params(profile_id.as_deref(), "cheap")
+            .is_none()
+        {
+            self.state.status = t!("status.onboarding_provider_selection_incomplete").into_owned();
+            return None;
+        }
+        self.open_menu(MenuId::from(crate::menu::registry::MENU_RESEARCH_LANE_KEY));
+        None
+    }
+
+    /// `MENU_RESEARCH_LANE_KEY` row fired: dispatch the staged wizard selection
+    /// as the research lane `key` ("cheap"/"strong"). Re-runs the save gates —
+    /// the picker sat open, so re-checking costs nothing and keeps this path
+    /// safe even if a future surface reaches it directly.
+    fn dispatch_save_research_lane_as(&mut self, key: &str) -> Option<AppUiCommand> {
+        if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT) {
+            return None;
+        }
+        if let Some(pending) = self.state.onboarding.provider_pending {
+            self.state.status = onboarding_pending_status(pending);
+            self.refresh_active_menu_if_open();
+            return None;
+        }
+        let profile_id = self.active_profile_id();
+        if profile_id.is_none() {
+            self.state.status = t!("status.research_profile_unresolved").into_owned();
+            return None;
+        }
+        let Some(params) = self
+            .state
+            .onboarding
+            .build_research_lane_params(profile_id.as_deref(), key)
+        else {
+            self.state.status = t!("status.onboarding_provider_selection_incomplete").into_owned();
+            return None;
+        };
+        // Pop the picker so the wizard beneath shows the pending save spinner.
+        self.close_menu();
+        self.state.onboarding.last_message = Some(t!("status.saving_provider").into_owned());
+        self.state.onboarding.provider_pending = Some(OnboardingProviderPending::Save);
+        self.state.onboarding.provider_save_target =
+            Some(OnboardingProviderSaveTarget::ResearchLane);
+        self.state.onboarding.pending_research_lane_key = Some(params.sub_provider.key.clone());
+        self.state.status = t!("status.saving_provider_config").into_owned();
+        self.refresh_active_menu_if_open();
+        Some(AppUiCommand::ProfileSubProvidersUpsert(params))
     }
 
     fn onboarding_save_provider_fallback_command(&mut self) -> Option<AppUiCommand> {
@@ -4131,6 +4518,11 @@ impl Store {
     /// verbs; the `/model` → "Add a model" row reaches the same surface via
     /// the family→model→route chain (whose route pick also lands here).
     fn open_model_config_surface(&mut self) {
+        // `/model` → Add a model / `/add-model` is a PROVIDER save flow: a
+        // research-lane intent left over from an abandoned `/research add`
+        // must not hijack this surface's Save into a lane upsert (PR384
+        // review P1-a — same stale-intent class as `creating_new_profile`).
+        self.state.onboarding.research_lane_intent = false;
         // The mid-session surface operates on the ACTIVE session's profile. A
         // staged wizard `profile_id` left over from an earlier create/onboard
         // outranks `current_profile` in `effective_profile_id`, so Test/Save
@@ -4241,9 +4633,31 @@ impl Store {
             // The stack may just have emptied — apply a restore whose
             // terminal was deferred by the open menu.
             self.apply_settled_interrupt_restore_after_menu_close();
+            self.clear_research_lane_intent_if_wizard_closed();
             return true;
         }
         false
+    }
+
+    /// The research-lane intent (bare `/research add`) lives exactly as long
+    /// as the wizard surface it was set for: once `MENU_ONBOARD` is no longer
+    /// anywhere in the menu stack, the flow was abandoned and the intent must
+    /// die with it — otherwise a LATER `/model` → Add-model Save would be
+    /// silently rerouted into a lane upsert (PR384 review P1-a; the same
+    /// Esc-lifecycle rule `creating_new_profile` follows). Child menus (family
+    /// / model / route pickers, the lane-key picker) stack OVER `MENU_ONBOARD`,
+    /// so popping one keeps the intent alive.
+    fn clear_research_lane_intent_if_wizard_closed(&mut self) {
+        if self.state.onboarding.research_lane_intent
+            && !self
+                .state
+                .menu_stack
+                .frames()
+                .iter()
+                .any(|frame| frame.id.as_str() == crate::menu::registry::MENU_ONBOARD)
+        {
+            self.state.onboarding.research_lane_intent = false;
+        }
     }
 
     /// True while the first-launch onboarding wizard is still in progress: the
@@ -4282,6 +4696,7 @@ impl Store {
         self.state.active_menu = None;
         // Apply a restore whose terminal was deferred by the open menu.
         self.apply_settled_interrupt_restore_after_menu_close();
+        self.clear_research_lane_intent_if_wizard_closed();
         true
     }
 
@@ -4706,6 +5121,10 @@ impl Store {
                     self.state.status =
                         t!("status.menu_label", id = frame.id.to_string()).into_owned();
                 }
+                // A replace can swap MENU_ONBOARD itself out without a pop —
+                // the wizard-exit sweep must see that departure too (no
+                // production row does this today; latent-path hardening).
+                self.clear_research_lane_intent_if_wizard_closed();
                 fetch
             }
             MenuAction::Close => {
@@ -4905,6 +5324,8 @@ impl Store {
                         .get(&session.id)
                         .copied()
                         .unwrap_or(0),
+                    blocked: self.state.session_blocked_reason(&session.id).is_some(),
+                    activity: self.state.session_activity_line(&session.id),
                 })
                 .collect(),
             profile_skills: self.state.profile_skills.as_ref(),
@@ -6257,6 +6678,7 @@ impl Store {
                 self.refresh_active_menu_if_open();
                 None
             }
+            ClientEvent::PeerPrepared(event) => self.apply_peer_prepared_event(event),
             ClientEvent::SubProvidersMutation(event) => {
                 self.apply_sub_providers_mutation_event(event);
                 self.refresh_active_menu_if_open();
@@ -6828,6 +7250,12 @@ impl Store {
                 // reconnect, or the tick backstop starts a second turn (K3
                 // review). Harmless when stale — TTL-pruned on refresh.
                 let pre_token_turns = self.state.pre_token_turns.clone();
+                // #395 local-only in-flight `/peer` state: the server never
+                // echoes it, and a replay landing inside the prepare→open
+                // window would otherwise drop the kickoff (its brief has no
+                // other copy). Harmless when stale — TTL-pruned on take.
+                let pending_peer_prepare = self.state.pending_peer_prepare.clone();
+                let pending_peer_kickoffs = self.state.pending_peer_kickoffs.clone();
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
@@ -6888,6 +7316,8 @@ impl Store {
                 state.session_context_window = session_context_window;
                 state.staged_submit_in_flight = staged_submit_in_flight;
                 state.pre_token_turns = pre_token_turns;
+                state.pending_peer_prepare = pending_peer_prepare;
+                state.pending_peer_kickoffs = pending_peer_kickoffs;
                 // Settle gates the snapshot already reflects BEFORE the
                 // optimistic restore below re-inserts un-echoed rows (which
                 // would inflate the echo count and mis-settle live gates).
@@ -7109,6 +7539,12 @@ impl Store {
                     crate::model::APPUI_METHOD_PROFILE_LLM_TEST,
                     crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
                     crate::model::APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+                    // A research-lane save is a staged-wizard RPC too (PR384
+                    // review P2-c): without this, a rejected lane upsert (e.g.
+                    // the #1775 api_key-without-env rule on manual providers)
+                    // freezes the wizard for the full 30s sweep and then shows
+                    // a misleading "timeout" instead of the server's reason.
+                    crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
                 ]
                 .iter()
                 .any(|method| error.message.contains(method));
@@ -7118,6 +7554,7 @@ impl Store {
                 if cancels_in_flight_provider {
                     self.state.onboarding.provider_pending = None;
                     self.state.onboarding.provider_pending_since = None;
+                    self.state.onboarding.pending_research_lane_key = None;
                     self.state.onboarding.last_message = Some(
                         t!("status.provider_request_failed", message = error.message).into_owned(),
                     );
@@ -8084,8 +8521,24 @@ impl Store {
                 self.state.approval = None;
                 self.state.set_run_state_idle();
             }
+            // tui#398: an empty hydrate is the reconnect-truth "nothing
+            // pending" for this session — clear its background stash too.
+            self.state.pending_session_approvals.remove(session_id);
             return;
         };
+        // tui#398: hydrate for a NON-focused session routes to the stash
+        // (chip ⚠), exactly like the live event — not the global modal.
+        if !self
+            .state
+            .active_session()
+            .is_some_and(|session| &session.id == session_id)
+        {
+            let approval = ApprovalModalState::from_event(event);
+            self.state
+                .pending_session_approvals
+                .insert(session_id.clone(), approval);
+            return;
+        }
         let title = event.title.clone();
         self.state.push_activity(
             ActivityItem::new(
@@ -8120,8 +8573,22 @@ impl Store {
                 self.state.user_question = None;
                 self.state.set_run_state_idle();
             }
+            // tui#398: reconnect-truth clear for the background stash too.
+            self.state.pending_session_questions.remove(session_id);
             return;
         };
+        // tui#398: hydrate for a NON-focused session routes to the stash.
+        if !self
+            .state
+            .active_session()
+            .is_some_and(|session| &session.id == session_id)
+        {
+            let picker = UserQuestionPickerState::from_event(event);
+            self.state
+                .pending_session_questions
+                .insert(session_id.clone(), picker);
+            return;
+        }
         let title = event.title.clone();
         self.state.push_activity(
             ActivityItem::new(
@@ -8233,8 +8700,71 @@ impl Store {
         // re-fire it (it survives snapshot replay along with the rest of
         // `onboarding`).
         self.state.onboarding.pending_research_lane_removal = None;
+        let mut lane_save_completed = false;
         if event.result.applied {
             self.state.sub_providers_state = Some(event.result.to_list_result());
+            // Codex PR384 review (F2): a lane SAVE round-trip must complete the
+            // wizard's pending save, not just refresh the lanes cache — otherwise
+            // the wizard wedges in `Saving(ResearchLane)` until the 30s timeout.
+            // Scope the consume to the wizard's OWN lane save (pending Save +
+            // ResearchLane target): an unrelated applied sub_providers mutation
+            // (inline `/research add`, a lane remove) must NOT swallow a pending
+            // Test/primary Save — that would drop the real response into the
+            // legacy `None` arm and falsely mark the provider saved (PR384
+            // review P2-d). On consume, finish like the fallback save does:
+            // reset the staged selection and record what was saved (P3-f).
+            let lane_save_in_flight = matches!(
+                self.state.onboarding.provider_pending,
+                Some(OnboardingProviderPending::Save)
+            ) && matches!(
+                self.state.onboarding.provider_save_target,
+                Some(OnboardingProviderSaveTarget::ResearchLane)
+            );
+            // Mutation events carry no request id (transport correlates by
+            // method only), so also require the echoed lane list to CONTAIN
+            // the key we saved: a concurrent unrelated mutation (inline add of
+            // another key, a lane remove) echoes a list without our key and is
+            // provably not our save's completion. An EMPTY echo can't disprove
+            // it, so it still consumes (a server that echoes no rows must not
+            // wedge the wizard for 30s).
+            let echo_matches_pending_key =
+                match self.state.onboarding.pending_research_lane_key.as_deref() {
+                    Some(key) => {
+                        event.result.sub_providers.is_empty()
+                            || event
+                                .result
+                                .sub_providers
+                                .iter()
+                                .any(|lane| lane.key == key)
+                    }
+                    None => true,
+                };
+            if lane_save_in_flight && echo_matches_pending_key {
+                let staged_provider_label = self.state.onboarding.provider_label();
+                let lane_key = self.state.onboarding.pending_research_lane_key.take();
+                self.state.onboarding.provider_pending = None;
+                self.state.onboarding.provider_pending_since = None;
+                self.state.onboarding.provider_save_target = None;
+                self.state.onboarding.provider_tested = false;
+                self.state.onboarding.provider_test_failure_reason = None;
+                self.state.onboarding.last_saved_provider_label =
+                    Some(staged_provider_label.clone());
+                self.state.onboarding.last_saved_provider_target =
+                    Some(OnboardingProviderSaveTarget::ResearchLane);
+                self.state.onboarding.research_lane_intent = false;
+                self.state.onboarding.reset_staged_provider();
+                // Post-save hint (P1-b UX): name the lane key so the user knows
+                // which routing slot deep_research will pick up.
+                self.state.onboarding.last_message = Some(
+                    t!(
+                        "status.research_lane_saved",
+                        key = lane_key.as_deref().unwrap_or("?"),
+                        label = staged_provider_label
+                    )
+                    .into_owned(),
+                );
+                lane_save_completed = true;
+            }
         }
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
@@ -8242,6 +8772,10 @@ impl Store {
             event.message.clone(),
         ));
         self.state.status = event.message;
+        if lane_save_completed {
+            self.refresh_active_menu_if_open();
+            self.focus_provider_start_row();
+        }
     }
 
     fn apply_profile_llm_mutation_event(&mut self, event: ProfileLlmMutationClientEvent) {
@@ -8269,7 +8803,8 @@ impl Store {
                             self.state.onboarding.saved_primary_provider_label =
                                 Some(staged_provider_label.clone());
                         }
-                        OnboardingProviderSaveTarget::Fallback => {
+                        OnboardingProviderSaveTarget::Fallback
+                        | OnboardingProviderSaveTarget::ResearchLane => {
                             self.state.onboarding.provider_tested = false;
                             reset_staged_provider = true;
                         }
@@ -8613,6 +9148,12 @@ impl Store {
             UiNotification::VoiceAudioChunk(_) => None,
             UiNotification::SessionOpened(event) => {
                 let session_id = event.session_id.clone();
+                // #395: a `/peer`-prepared session landing. Popped BEFORE the
+                // switch bundle so a `--go`-less peer never steals focus (and
+                // never clobbers the foreground workspace/pane state below).
+                // Stale entries (>TTL, dead open) were pruned by the take — a
+                // late open then degrades to a normal focused session open.
+                let mut peer_kickoff = self.state.take_pending_peer_kickoff(&session_id);
                 // Restore the server-persisted per-session reasoning effort so
                 // /thinking + its menu reflect it after a full restart (the server
                 // is the source of truth; `None` means no override is stored).
@@ -8625,6 +9166,16 @@ impl Store {
                     None => {
                         self.state.session_reasoning_effort.remove(&session_id);
                     }
+                }
+                if let Some(kickoff) = peer_kickoff.take_if(|kickoff| !kickoff.go) {
+                    // Background peer (default): land the session + fire the
+                    // kickoff without touching focus, panes, or the global
+                    // workspace root.
+                    return self.open_peer_session_in_background(
+                        session_id,
+                        event.active_profile_id,
+                        kickoff,
+                    );
                 }
                 if let Some(panes) = event.panes {
                     self.state.apply_pane_snapshot(panes);
@@ -8700,6 +9251,22 @@ impl Store {
                     caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ)
                 }) {
                     self.state.enqueue_session_status_probe(session_id.clone());
+                }
+                // #395 `--go`: the switch bundle above made the peer session
+                // ACTIVE, so the standard submit path (optimistic echo, run
+                // state, pre-token marker, gate housekeeping) targets it —
+                // submit the kickoff through it.
+                if let Some(kickoff) = peer_kickoff {
+                    let slug = Self::peer_slug_for_key(&session_id);
+                    let prompt = Self::peer_kickoff_prompt(&kickoff.brief, &kickoff.brief_path);
+                    // Staging-aware submit (K3 review): a reused peer topic
+                    // whose session already has a live turn must STAGE the
+                    // kickoff like any other input-while-busy, not fire a
+                    // second turn/start into it.
+                    return self.queue_or_start_prompt_turn(
+                        prompt,
+                        t!("status.peer_switched", slug = slug).into_owned(),
+                    );
                 }
                 // M22-D: if the user staged a permission profile in
                 // onboarding, apply it now that we have a session id.
@@ -8923,6 +9490,29 @@ impl Store {
                             .unwrap_or_else(|| "generic".into()),
                     ),
                 );
+                // tui#398: a BACKGROUND session's approval must not hijack the
+                // foreground — no global modal, no focus steal, no run-state
+                // block. Stash it (latest wins, like the hydrate replay),
+                // flag the strip chip ⚠, and hint in the status line; it is
+                // promoted when the session is focused.
+                if !self
+                    .state
+                    .active_session()
+                    .is_some_and(|session| session.id == session_id)
+                {
+                    let approval = ApprovalModalState::from_event(event);
+                    let session_title = self.session_title_for_hint(&session_id);
+                    self.state
+                        .pending_session_approvals
+                        .insert(session_id, approval);
+                    self.state.status = t!(
+                        "status.session_blocked_hint",
+                        session = session_title,
+                        reason = title
+                    )
+                    .into_owned();
+                    return None;
+                }
                 let mut approval = ApprovalModalState::from_event(event);
                 approval.visible = self.state.approval_auto_open;
                 let diff_preview_id = approval.diff_preview_id();
@@ -10160,6 +10750,29 @@ impl Store {
                 .with_turn(event.turn_id.clone())
                 .with_detail(detail),
         );
+        // tui#398: a question from a BACKGROUND session waits in the stash
+        // (chip ⚠ + status hint) instead of hijacking the foreground picker —
+        // the hard-visibility rule below applies when the session is FOCUSED
+        // (now, or at promotion time in `switch_selected_session`).
+        if !self
+            .state
+            .active_session()
+            .is_some_and(|session| session.id == event.session_id)
+        {
+            let session_id = event.session_id.clone();
+            let picker = UserQuestionPickerState::from_event(event);
+            let session_title = self.session_title_for_hint(&session_id);
+            self.state
+                .pending_session_questions
+                .insert(session_id, picker);
+            self.state.status = t!(
+                "status.session_blocked_hint",
+                session = session_title,
+                reason = title
+            )
+            .into_owned();
+            return None;
+        }
         let mut picker = UserQuestionPickerState::from_event(event);
         // A newly-arriving question is a HARD block: the turn is paused at the
         // tool boundary until it's answered, so it must be immediately visible
@@ -10296,6 +10909,15 @@ impl Store {
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
         self.state.pre_token_turns.remove(&event.session_id);
         self.bump_unread_for_background_terminal(&event.session_id);
+        // tui#398: a terminal for this session settles any stashed
+        // background approval/question — the server resolved or cancelled it
+        // (an unanswered block never produces a terminal), so drop the ⚠.
+        self.state
+            .pending_session_approvals
+            .remove(&event.session_id);
+        self.state
+            .pending_session_questions
+            .remove(&event.session_id);
         // The turn the user interrupted has settled — its deferred prompt
         // restore applies now (before the duplicate-terminal early returns:
         // any first terminal for the armed turn consumes the stash).
@@ -10498,6 +11120,15 @@ impl Store {
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
         self.state.pre_token_turns.remove(&event.session_id);
         self.bump_unread_for_background_terminal(&event.session_id);
+        // tui#398: a terminal for this session settles any stashed
+        // background approval/question — the server resolved or cancelled it
+        // (an unanswered block never produces a terminal), so drop the ⚠.
+        self.state
+            .pending_session_approvals
+            .remove(&event.session_id);
+        self.state
+            .pending_session_questions
+            .remove(&event.session_id);
         // The interrupted turn has settled (an Esc/Ctrl+C typically lands here
         // as the server's `code == "interrupted"` terminal) — apply the
         // deferred prompt restore (mirror of `commit_live_reply`).
@@ -11053,6 +11684,7 @@ impl Store {
         }
         self.state.onboarding.provider_pending = None;
         self.state.onboarding.provider_pending_since = None;
+        self.state.onboarding.pending_research_lane_key = None;
         self.state.onboarding.last_message =
             Some(t!("status.provider_request_timeout").into_owned());
         self.state.status = t!("status.provider_request_timeout").into_owned();
@@ -12868,6 +13500,766 @@ mod tests {
         ]));
         let outcome = store.dispatch_research_slash("/research add cheap moonshot k3");
         assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+    }
+
+    // ── /peer (#395) ────────────────────────────────────────────────────────
+
+    fn peer_capable_store() -> Store {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PEER_PREPARE,
+        ]));
+        store
+    }
+
+    /// Runs `/peer --go …` through dispatch and feeds back the prepared
+    /// result, returning the minted peer session key. Shared setup for the
+    /// session-appears tests.
+    fn prepare_peer(store: &mut Store, draft: &str) -> SessionKey {
+        let outcome = store.dispatch_peer_slash(draft);
+        assert!(
+            matches!(outcome, SlashDispatchOutcome::Accepted(Some(_))),
+            "dispatch must accept and emit peer/prepare"
+        );
+        let open = store.apply_client_event(ClientEvent::PeerPrepared(
+            crate::client_event::PeerPreparedClientEvent {
+                message: "Peer session prepared: fix-nav".into(),
+                result: crate::model::PeerPrepareResult {
+                    slug: "fix-nav".into(),
+                    topic: "peer-fix-nav".into(),
+                    brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
+                    cwd: "/repo".into(),
+                    worktree_branch: None,
+                    profile_id: "coding".into(),
+                },
+            },
+        ));
+        let Some(AppUiCommand::OpenSession(params)) = open else {
+            panic!("prepared result must emit session/open, got {open:?}");
+        };
+        params.session_id
+    }
+
+    fn peer_session_opened(store: &mut Store, session_id: &SessionKey) -> Option<AppUiCommand> {
+        let opened: octos_core::ui_protocol::SessionOpened =
+            serde_json::from_value(serde_json::json!({
+                "session_id": session_id,
+                "active_profile_id": "coding",
+            }))
+            .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)))
+    }
+
+    #[test]
+    fn peer_slash_parses_flags_and_brief_verbatim() {
+        let mut store = peer_capable_store();
+        let command = store
+            .dispatch_peer_slash("/peer --go --worktree --cwd /x fix the thing")
+            .into_command();
+        let Some(AppUiCommand::PeerPrepare(params)) = command else {
+            panic!("expected a PeerPrepare command, got {command:?}");
+        };
+        assert_eq!(params.brief, "fix the thing");
+        assert!(params.worktree);
+        assert_eq!(params.cwd.as_deref(), Some("/x"));
+        // The ACTIVE session rides along for server-side workspace/profile
+        // scoping; profile_id stays None in v1.
+        assert_eq!(params.session_id, Some(SessionKey("local:test".into())));
+        assert!(params.profile_id.is_none());
+        assert!(params.title.is_none());
+        // `--go` never crosses the wire — it is stashed client-side with the
+        // brief for the prepared-result apply.
+        let pending = store
+            .state
+            .pending_peer_prepare
+            .as_ref()
+            .expect("dispatch stashes the pending prepare");
+        assert!(pending.go);
+        assert_eq!(pending.brief, "fix the thing");
+    }
+
+    #[test]
+    fn peer_slash_brief_keeps_internal_whitespace_and_later_dashes() {
+        let mut store = peer_capable_store();
+        // Flags stop at the first non-flag token; a later `--flag`-looking
+        // token is part of the brief VERBATIM (internal spacing preserved).
+        let command = store
+            .dispatch_peer_slash("/peer fix  the --cwd thing")
+            .into_command();
+        let Some(AppUiCommand::PeerPrepare(params)) = command else {
+            panic!("expected a PeerPrepare command, got {command:?}");
+        };
+        assert_eq!(params.brief, "fix  the --cwd thing");
+        assert!(!params.worktree);
+        assert!(params.cwd.is_none());
+        assert!(
+            store
+                .state
+                .pending_peer_prepare
+                .as_ref()
+                .is_some_and(|pending| !pending.go),
+            "no --go → focus stays put"
+        );
+    }
+
+    #[test]
+    fn peer_slash_rejects_unknown_flag_with_usage() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer --nope fix the thing");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+        assert_eq!(store.state.status, t!("status.peer_usage"));
+        assert!(store.state.pending_peer_prepare.is_none());
+    }
+
+    #[test]
+    fn peer_slash_rejects_cwd_flag_without_value() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer --cwd");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+        assert_eq!(store.state.status, t!("status.peer_usage"));
+    }
+
+    #[test]
+    fn peer_slash_rejects_empty_brief_after_flags() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer --go --worktree");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+        assert_eq!(store.state.status, t!("status.peer_usage"));
+        assert!(store.state.pending_peer_prepare.is_none());
+    }
+
+    #[test]
+    fn peer_slash_bare_prefills_composer() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer");
+        assert!(
+            matches!(outcome, SlashDispatchOutcome::Accepted(None)),
+            "bare /peer is a client-only prefill, no backend command"
+        );
+        assert_eq!(store.state.composer, "/peer ");
+        assert_eq!(store.state.focus, FocusPane::Composer);
+        assert!(store.state.pending_peer_prepare.is_none());
+    }
+
+    #[test]
+    fn peer_slash_requires_peer_prepare_capability() {
+        // Capabilities present but WITHOUT peer/prepare → the standard
+        // method-not-advertised rejection (mirrors require_appui_method).
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_SNAPSHOT_LIST,
+        ]));
+        let outcome = store.dispatch_peer_slash("/peer fix the thing");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+        assert_eq!(
+            store.state.status,
+            t!(
+                "status.appui_method_not_advertised",
+                method = crate::model::APPUI_METHOD_PEER_PREPARE
+            )
+        );
+        assert!(store.state.pending_peer_prepare.is_none());
+    }
+
+    #[test]
+    fn peer_prepared_result_opens_session_and_stashes_kickoff() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer --worktree fix the nav");
+        assert!(matches!(outcome, SlashDispatchOutcome::Accepted(Some(_))));
+
+        let open = store.apply_client_event(ClientEvent::PeerPrepared(
+            crate::client_event::PeerPreparedClientEvent {
+                message: "Peer session prepared: fix-nav".into(),
+                result: crate::model::PeerPrepareResult {
+                    slug: "fix-nav".into(),
+                    topic: "peer-fix-nav".into(),
+                    brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
+                    cwd: "/repo".into(),
+                    worktree_branch: Some("peer/fix-nav".into()),
+                    profile_id: "coding".into(),
+                },
+            },
+        ));
+        let Some(AppUiCommand::OpenSession(params)) = open else {
+            panic!("prepared result must emit session/open, got {open:?}");
+        };
+        // The key is minted exactly like dispatch_switch_to_profile's:
+        // with_profile_topic(profile, "local", "tui", topic).
+        assert_eq!(
+            params.session_id,
+            octos_core::SessionKey::with_profile_topic("coding", "local", "tui", "peer-fix-nav")
+        );
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+        assert_eq!(params.cwd.as_deref(), Some("/repo"));
+        assert!(params.topic.is_none());
+        assert!(params.sandbox.is_none());
+
+        // The kickoff is stashed under the minted key and the pending
+        // prepare is consumed.
+        let kickoff = store
+            .state
+            .pending_peer_kickoffs
+            .get(&params.session_id)
+            .expect("kickoff stashed under the minted peer key");
+        assert_eq!(kickoff.brief, "fix the nav");
+        assert_eq!(kickoff.brief_path, "/repo/.octos/peers/fix-nav/BRIEF.md");
+        assert!(!kickoff.go);
+        assert!(store.state.pending_peer_prepare.is_none());
+    }
+
+    #[test]
+    fn peer_prepared_without_pending_dispatch_opens_nothing() {
+        // An unsolicited result (no /peer in flight) has no brief to kick off
+        // with — it must not open a session.
+        let mut store = peer_capable_store();
+        let open = store.apply_client_event(ClientEvent::PeerPrepared(
+            crate::client_event::PeerPreparedClientEvent {
+                message: "Peer session prepared: fix-nav".into(),
+                result: crate::model::PeerPrepareResult {
+                    slug: "fix-nav".into(),
+                    topic: "peer-fix-nav".into(),
+                    brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
+                    cwd: "/repo".into(),
+                    worktree_branch: None,
+                    profile_id: "coding".into(),
+                },
+            },
+        ));
+        assert!(open.is_none());
+        assert!(store.state.pending_peer_kickoffs.is_empty());
+    }
+
+    #[test]
+    fn peer_session_opened_without_go_submits_kickoff_in_background() {
+        let mut store = peer_capable_store();
+        let peer_key = prepare_peer(&mut store, "/peer fix the nav");
+
+        let command = peer_session_opened(&mut store, &peer_key);
+        let Some(AppUiCommand::SubmitPrompt(params)) = command else {
+            panic!("landing the peer session must submit the kickoff, got {command:?}");
+        };
+        // The kickoff targets the PEER key, not the active session.
+        assert_eq!(params.session_id, peer_key);
+        let [InputItem::Text { text }] = params.input.as_slice() else {
+            panic!("kickoff input is a single text item: {:?}", params.input);
+        };
+        assert!(text.starts_with("You are a peer agent. Your brief:\n\nfix the nav"));
+        assert!(text.contains("/repo/.octos/peers/fix-nav/BRIEF.md"));
+
+        // Focus unchanged (the peer announces itself via the strip), stash
+        // cleared, status names the slug, and the peer session view landed
+        // with the optimistic kickoff prompt + a live pre-token marker.
+        assert_eq!(
+            store
+                .state
+                .active_session()
+                .map(|session| session.id.clone()),
+            Some(SessionKey("local:test".into())),
+            "a --go-less peer must not steal focus"
+        );
+        assert!(store.state.pending_peer_kickoffs.is_empty());
+        assert_eq!(
+            store.state.status,
+            t!("status.peer_started", slug = "fix-nav")
+        );
+        let peer_session = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == peer_key)
+            .expect("peer session landed in state");
+        assert_eq!(peer_session.title, "peer-fix-nav");
+        assert!(
+            peer_session
+                .messages
+                .iter()
+                .any(|message| message.content.contains("fix the nav")),
+            "kickoff prompt echoes into the peer transcript"
+        );
+        assert!(
+            store.state.pre_token_turns.contains_key(&peer_key),
+            "the strip's live marker is armed for the peer"
+        );
+        // K3 review: the background path must leave the GLOBAL surfaces
+        // alone — run state belongs to the focused session, and the
+        // foreground workspace root must not be clobbered by the peer's cwd.
+        assert!(
+            !store.state.run_state.is_active(),
+            "the focused session's run state is untouched by a background kickoff"
+        );
+        assert_ne!(
+            store.state.workspace.root, "/repo",
+            "the peer's cwd must not overwrite the foreground workspace root"
+        );
+    }
+
+    #[test]
+    fn peer_session_opened_with_go_switches_focus_and_submits_kickoff() {
+        let mut store = peer_capable_store();
+        let peer_key = prepare_peer(&mut store, "/peer --go fix the nav");
+
+        let command = peer_session_opened(&mut store, &peer_key);
+        let Some(AppUiCommand::SubmitPrompt(params)) = command else {
+            panic!("landing the peer session must submit the kickoff, got {command:?}");
+        };
+        assert_eq!(params.session_id, peer_key);
+        // `--go` runs the full switch bundle: the peer session is ACTIVE.
+        assert_eq!(
+            store
+                .state
+                .active_session()
+                .map(|session| session.id.clone()),
+            Some(peer_key),
+            "--go switches focus to the peer session"
+        );
+        assert!(store.state.pending_peer_kickoffs.is_empty());
+        assert_eq!(
+            store.state.status,
+            t!("status.peer_switched", slug = "fix-nav")
+        );
+    }
+
+    #[test]
+    fn stale_peer_kickoff_is_pruned_and_fires_no_kickoff_turn() {
+        let mut store = peer_capable_store();
+        let peer_key = prepare_peer(&mut store, "/peer fix the nav");
+        // Age the stash beyond the TTL (dead session/open) — derived from the
+        // const so a TTL retune cannot silently un-stale this fixture.
+        store
+            .state
+            .pending_peer_kickoffs
+            .get_mut(&peer_key)
+            .expect("kickoff stashed")
+            .created = std::time::Instant::now()
+            .checked_sub(crate::model::PEER_KICKOFF_TTL + std::time::Duration::from_secs(1))
+            .expect("instant in the past");
+
+        let command = peer_session_opened(&mut store, &peer_key);
+        assert!(
+            !matches!(command, Some(AppUiCommand::SubmitPrompt(_))),
+            "a stale kickoff must not fire a turn, got {command:?}"
+        );
+        assert!(
+            store.state.pending_peer_kickoffs.is_empty(),
+            "the stale stash is pruned"
+        );
+    }
+
+    /// K3 review (high): the prepare stash is single-slot — a second `/peer`
+    /// while one is in flight must be REFUSED, not overwrite the stash (the
+    /// first result would consume the second brief and cross-wire the peers).
+    /// A stale in-flight prepare (lost response) is replaceable.
+    #[test]
+    fn second_peer_command_rejected_while_prepare_in_flight() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer first brief");
+        assert!(matches!(outcome, SlashDispatchOutcome::Accepted(Some(_))));
+
+        let outcome = store.dispatch_peer_slash("/peer second brief");
+        assert!(
+            matches!(outcome, SlashDispatchOutcome::Rejected),
+            "a fresh in-flight prepare refuses a second /peer"
+        );
+        assert_eq!(store.state.status, t!("status.peer_prepare_in_flight"));
+        assert_eq!(
+            store
+                .state
+                .pending_peer_prepare
+                .as_ref()
+                .map(|pending| pending.brief.as_str()),
+            Some("first brief"),
+            "the in-flight stash is NOT overwritten"
+        );
+
+        // Past the prepare TTL the slot is dead — a new /peer may claim it.
+        store
+            .state
+            .pending_peer_prepare
+            .as_mut()
+            .expect("stash present")
+            .created = std::time::Instant::now()
+            .checked_sub(crate::model::PEER_PREPARE_TTL + std::time::Duration::from_secs(1))
+            .expect("instant in the past");
+        let outcome = store.dispatch_peer_slash("/peer third brief");
+        assert!(
+            matches!(outcome, SlashDispatchOutcome::Accepted(Some(_))),
+            "a stale prepare slot is reclaimable"
+        );
+        assert_eq!(
+            store
+                .state
+                .pending_peer_prepare
+                .as_ref()
+                .map(|pending| pending.brief.as_str()),
+            Some("third brief")
+        );
+    }
+
+    /// K3 review: a prepare result landing past [`PEER_PREPARE_TTL`] is as
+    /// good as unsolicited — it must not pop a session open (and later an
+    /// unprompted kickoff turn) minutes after the user moved on.
+    #[test]
+    fn stale_peer_prepared_result_opens_nothing() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer fix the nav");
+        assert!(matches!(outcome, SlashDispatchOutcome::Accepted(Some(_))));
+        store
+            .state
+            .pending_peer_prepare
+            .as_mut()
+            .expect("stash present")
+            .created = std::time::Instant::now()
+            .checked_sub(crate::model::PEER_PREPARE_TTL + std::time::Duration::from_secs(1))
+            .expect("instant in the past");
+
+        let open = store.apply_client_event(ClientEvent::PeerPrepared(
+            crate::client_event::PeerPreparedClientEvent {
+                message: "Peer session prepared: fix-nav".into(),
+                result: crate::model::PeerPrepareResult {
+                    slug: "fix-nav".into(),
+                    topic: "peer-fix-nav".into(),
+                    brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
+                    cwd: "/repo".into(),
+                    worktree_branch: None,
+                    profile_id: "coding".into(),
+                },
+            },
+        ));
+        assert!(open.is_none(), "a stale result must open nothing: {open:?}");
+        assert!(store.state.pending_peer_kickoffs.is_empty());
+        assert!(store.state.pending_peer_prepare.is_none());
+    }
+
+    /// K3 review: a replayed/duplicate `session/opened` for the peer key must
+    /// not fire a SECOND kickoff turn — the stash pop is the idempotency
+    /// guard, pinned here so a refactor cannot move the pop after the branch.
+    #[test]
+    fn duplicate_session_opened_fires_no_second_kickoff() {
+        let mut store = peer_capable_store();
+        let peer_key = prepare_peer(&mut store, "/peer fix the nav");
+
+        let first = peer_session_opened(&mut store, &peer_key);
+        assert!(matches!(first, Some(AppUiCommand::SubmitPrompt(_))));
+        let kickoff_rows = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == peer_key)
+            .map(|session| session.messages.len())
+            .expect("peer session landed");
+
+        let second = peer_session_opened(&mut store, &peer_key);
+        assert!(
+            !matches!(second, Some(AppUiCommand::SubmitPrompt(_))),
+            "a replayed session/opened must not re-fire the kickoff: {second:?}"
+        );
+        let rows_after = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == peer_key)
+            .map(|session| session.messages.len())
+            .expect("peer session still present");
+        assert_eq!(
+            rows_after, kickoff_rows,
+            "no duplicate optimistic kickoff row on replay"
+        );
+    }
+
+    /// K3 review (high): both peer stashes must survive a snapshot replay —
+    /// the brief has no other client-side copy, so a reconnect landing inside
+    /// the prepare→open window would otherwise permanently strand the peer
+    /// session with no kickoff.
+    #[test]
+    fn peer_stashes_survive_snapshot_replay() {
+        let mut store = peer_capable_store();
+        let outcome = store.dispatch_peer_slash("/peer fix the nav");
+        assert!(matches!(outcome, SlashDispatchOutcome::Accepted(Some(_))));
+        let peer_key =
+            octos_core::SessionKey::with_profile_topic("coding", "local", "tui", "peer-fix-nav");
+        store.state.pending_peer_kickoffs.insert(
+            peer_key.clone(),
+            crate::model::PeerKickoff {
+                brief: "fix the nav".into(),
+                brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
+                go: false,
+                created: std::time::Instant::now(),
+            },
+        );
+
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            selected_session: 0,
+            status: "replayed".into(),
+            target: None,
+            readonly: false,
+        }));
+
+        assert_eq!(
+            store
+                .state
+                .pending_peer_prepare
+                .as_ref()
+                .map(|pending| pending.brief.as_str()),
+            Some("fix the nav"),
+            "the in-flight prepare survives the replay"
+        );
+        assert!(
+            store.state.pending_peer_kickoffs.contains_key(&peer_key),
+            "the staged kickoff survives the replay"
+        );
+    }
+
+    fn approval_for(session: &str, title: &str) -> octos_core::ui_protocol::ApprovalRequestedEvent {
+        octos_core::ui_protocol::ApprovalRequestedEvent::generic(
+            SessionKey(session.into()),
+            octos_core::ui_protocol::ApprovalId::new(),
+            octos_core::ui_protocol::TurnId::new(),
+            "shell",
+            title,
+            "run: rm -rf target",
+        )
+    }
+
+    /// tui#398: an approval for a BACKGROUND session must not hijack the
+    /// foreground — no global modal, no run-state block, no focus steal. It
+    /// stashes, flags the chip ⚠, and hints in the status line.
+    #[test]
+    fn background_approval_stashes_without_hijacking_foreground() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+
+        let command = store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            approval_for("local:b", "Run shell command?"),
+        )));
+        assert!(command.is_none());
+        assert!(
+            store.state.approval.is_none(),
+            "the foreground modal slot stays empty for a background approval"
+        );
+        assert!(
+            !matches!(
+                store.state.run_state,
+                crate::model::SessionRunState::Blocked { .. }
+            ),
+            "the FOREGROUND run state is untouched"
+        );
+        assert_eq!(
+            store.state.session_blocked_reason(&b),
+            Some("Run shell command?"),
+            "the background session reads as blocked (chip ⚠)"
+        );
+        assert!(
+            store.state.status.contains("local:b"),
+            "the status hint names the blocked session: {}",
+            store.state.status
+        );
+    }
+
+    /// tui#398: focusing the blocked session promotes the stash into the
+    /// global modal — hard-visible — and clears the ⚠.
+    #[test]
+    fn focusing_blocked_session_promotes_approval() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            approval_for("local:b", "Run shell command?"),
+        )));
+        assert!(store.state.session_blocked_reason(&b).is_some());
+
+        store.state.switch_selected_session(1);
+        let approval = store
+            .state
+            .approval
+            .as_ref()
+            .expect("promotion lands the approval in the global slot");
+        assert!(approval.visible, "promoted decisions are hard-visible");
+        assert_eq!(approval.session_id, b);
+        assert!(matches!(
+            store.state.run_state,
+            crate::model::SessionRunState::Blocked { .. }
+        ));
+        assert!(
+            store.state.session_blocked_reason(&b).is_none(),
+            "the ⚠ clears once the decision owns the foreground"
+        );
+    }
+
+    /// tui#398: same background routing for AskUserQuestion.
+    #[test]
+    fn background_question_stashes_and_promotes() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+        let command =
+            store.apply_event(AppUiEvent::Protocol(UiNotification::UserQuestionRequested(
+                octos_core::ui_protocol::UserQuestionRequestedEvent::new(
+                    b.clone(),
+                    octos_core::ui_protocol::QuestionId::new(),
+                    octos_core::ui_protocol::TurnId::new(),
+                    "Pick a strategy",
+                    "Which approach?",
+                    Vec::new(),
+                ),
+            )));
+        assert!(command.is_none());
+        assert!(store.state.user_question.is_none());
+        assert!(!matches!(
+            store.state.run_state,
+            crate::model::SessionRunState::Blocked { .. }
+        ));
+        assert_eq!(
+            store.state.session_blocked_reason(&b),
+            Some("Pick a strategy")
+        );
+
+        store.state.switch_selected_session(1);
+        let picker = store
+            .state
+            .user_question
+            .as_ref()
+            .expect("promotion lands the question picker");
+        assert!(picker.visible);
+        assert!(matches!(
+            store.state.run_state,
+            crate::model::SessionRunState::Blocked { .. }
+        ));
+        assert!(store.state.session_blocked_reason(&b).is_none());
+    }
+
+    /// Regression pin: an approval for the ACTIVE session keeps the existing
+    /// foreground behavior (global modal + blocked run state).
+    #[test]
+    fn active_session_approval_keeps_foreground_behavior() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            approval_for("local:a", "Write file?"),
+        )));
+        assert!(store.state.approval.is_some());
+        assert!(matches!(
+            store.state.run_state,
+            crate::model::SessionRunState::Blocked { .. }
+        ));
+        assert!(
+            store
+                .state
+                .session_blocked_reason(&SessionKey("local:a".into()))
+                .is_none(),
+            "the active session's decision lives in the modal, not the stash"
+        );
+    }
+
+    /// tui#398: a terminal for the blocked session settles the stash (the
+    /// server resolved/cancelled the request) — the ⚠ must not outlive it.
+    #[test]
+    fn terminal_clears_background_blocked_stash() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            approval_for("local:b", "Run shell command?"),
+        )));
+        assert!(store.state.session_blocked_reason(&b).is_some());
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            octos_core::ui_protocol::TurnErrorEvent {
+                session_id: b.clone(),
+                topic: None,
+                turn_id: octos_core::ui_protocol::TurnId::new(),
+                code: "interrupted".into(),
+                message: "cancelled".into(),
+            },
+        )));
+        assert!(
+            store.state.session_blocked_reason(&b).is_none(),
+            "a terminal settles the background block"
+        );
+    }
+
+    /// tui#398: an EMPTY hydrate for the session is reconnect-truth — it
+    /// clears a stale background stash.
+    #[test]
+    fn empty_hydrate_clears_background_blocked_stash() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            approval_for("local:b", "Run shell command?"),
+        )));
+        assert!(store.state.session_blocked_reason(&b).is_some());
+
+        store.apply_hydrated_pending_approvals(&b, Vec::new());
+        assert!(store.state.session_blocked_reason(&b).is_none());
+    }
+
+    /// tui#398: the Alt+S activity line prefers the blocked reason, then the
+    /// live stream tail, then the last transcript line — single-line, capped.
+    #[test]
+    fn session_activity_line_prefers_blocked_then_live_then_last_message() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+
+        // Last-message fallback.
+        if let Some(session) = store
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == b)
+        {
+            session.messages.push(octos_core::Message {
+                role: octos_core::MessageRole::Assistant,
+                content: "first line
+the final line of the reply"
+                    .into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        assert_eq!(
+            store.state.session_activity_line(&b).as_deref(),
+            Some("the final line of the reply")
+        );
+
+        // Live tail wins over the last message.
+        if let Some(session) = store
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == b)
+        {
+            session.live_reply = Some(octos_core::app_ui::AppUiLiveReply {
+                turn_id: octos_core::ui_protocol::TurnId::new(),
+                text: "streaming…
+now analyzing the bus module"
+                    .into(),
+            });
+        }
+        assert_eq!(
+            store.state.session_activity_line(&b).as_deref(),
+            Some("now analyzing the bus module")
+        );
+
+        // Blocked reason outranks everything.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            approval_for("local:b", "Run shell command?"),
+        )));
+        let line = store
+            .state
+            .session_activity_line(&b)
+            .expect("blocked line present");
+        assert!(
+            line.contains("Run shell command?"),
+            "blocked reason leads: {line}"
+        );
     }
 
     /// Build a store whose active-profile sources are set to the given tiers, so
@@ -31559,5 +32951,513 @@ mod tests {
             .active_agent_output_or_tail("task-0...[credential-redacted]")
             .expect("the fallback must surface the per-task tail");
         assert_eq!(text, "live sub-agent output");
+    }
+
+    /// Codex PR384 review (F1): the research-lane intent must SURVIVE normal
+    /// wizard interaction. `provider_save_target` is cleared on every
+    /// staged-input edit (dirty marking), so routing a lane save on it would
+    /// silently fall through to a primary-provider save after the user edits.
+    /// The separate `research_lane_intent` flag is NOT cleared by edits, so the
+    /// Save stays lane-targeted for the whole flow.
+    #[test]
+    fn research_lane_intent_survives_wizard_edits() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.onboarding.research_lane_intent = true;
+        store.state.onboarding.provider_save_target =
+            Some(OnboardingProviderSaveTarget::ResearchLane);
+
+        // A staged-input edit clears the transient save target but NOT the intent.
+        store.mark_onboarding_provider_dirty("edited");
+        assert!(
+            store.state.onboarding.provider_save_target.is_none(),
+            "edits clear the transient provider_save_target"
+        );
+        assert!(
+            store.state.onboarding.research_lane_intent,
+            "the persistent lane intent survives the edit"
+        );
+    }
+
+    /// Stage a complete provider selection so `selection_ready()` holds and a
+    /// lane save has everything it maps into `SubProviderView`.
+    fn stage_ready_lane_selection(store: &mut Store) {
+        store.state.onboarding.provider.family_id = "moonshot".into();
+        store.state.onboarding.provider.model_id = "k3".into();
+        store.state.onboarding.provider.route.route_id = "official".into();
+        store.state.onboarding.provider.route.base_url = Some("https://api.kimi.com/v1".into());
+        store.state.onboarding.provider.route.api_key_env = Some("KIMI_API_KEY".into());
+        store.state.onboarding.provider.route.api_type = Some("openai".into());
+    }
+
+    fn lane_capabilities() -> crate::menu::CapabilitySet {
+        crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+        ])
+    }
+
+    /// PR384 fix P1-b: the lane key is an explicit caller choice — an empty or
+    /// whitespace key never builds params (no silent family-id fallback), and
+    /// the chosen key is trimmed.
+    #[test]
+    fn research_lane_params_require_an_explicit_key() {
+        let mut store = store_with_empty_session();
+        stage_ready_lane_selection(&mut store);
+        let onboarding = &store.state.onboarding;
+        assert!(
+            onboarding
+                .build_research_lane_params(Some("coding"), "")
+                .is_none(),
+            "an empty key must not build lane params"
+        );
+        assert!(
+            onboarding
+                .build_research_lane_params(Some("coding"), "   ")
+                .is_none(),
+            "a whitespace key must not build lane params"
+        );
+        let params = onboarding
+            .build_research_lane_params(Some("coding"), " strong ")
+            .expect("ready selection + explicit key builds params");
+        assert_eq!(params.sub_provider.key, "strong");
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+        assert_eq!(params.sub_provider.provider.as_deref(), Some("moonshot"));
+        assert_eq!(params.sub_provider.model.as_deref(), Some("k3"));
+        assert_eq!(
+            params.sub_provider.api_key_env.as_deref(),
+            Some("KIMI_API_KEY")
+        );
+    }
+
+    /// PR384 fix P1-b: Save in lane mode opens the cheap/strong key picker
+    /// instead of dispatching an upsert keyed by the family id (which the
+    /// deep_research router would never select).
+    #[test]
+    fn lane_save_opens_key_picker_then_picker_row_dispatches_chosen_key() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(lane_capabilities());
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        store.state.onboarding.research_lane_intent = true;
+        stage_ready_lane_selection(&mut store);
+
+        let cmd =
+            store.dispatch_onboarding_action(crate::model::OnboardingAction::SaveProvider, None);
+        assert!(
+            cmd.is_none(),
+            "lane Save opens the key picker, it does not dispatch yet: {cmd:?}"
+        );
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+            "the lane-key picker is the active menu"
+        );
+        assert_eq!(
+            store.state.onboarding.provider_pending, None,
+            "nothing is pending while the picker is open"
+        );
+
+        // Picker row fired: the upsert carries the CHOSEN key, not the family.
+        let cmd = store.dispatch_menu_action(MenuAction::Local(LocalAction::SaveResearchLaneAs(
+            "cheap".into(),
+        )));
+        match cmd {
+            Some(AppUiCommand::ProfileSubProvidersUpsert(params)) => {
+                assert_eq!(params.sub_provider.key, "cheap");
+                assert_eq!(params.profile_id.as_deref(), Some("coding"));
+                assert_eq!(params.sub_provider.provider.as_deref(), Some("moonshot"));
+                assert_eq!(params.sub_provider.model.as_deref(), Some("k3"));
+            }
+            other => panic!("expected a ProfileSubProvidersUpsert command, got {other:?}"),
+        }
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Save)
+        );
+        assert_eq!(
+            store.state.onboarding.provider_save_target,
+            Some(OnboardingProviderSaveTarget::ResearchLane)
+        );
+        assert_eq!(
+            store.state.onboarding.pending_research_lane_key.as_deref(),
+            Some("cheap")
+        );
+        assert!(
+            !store.active_menu_id_is(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+            "the picker pops so the wizard shows the pending save"
+        );
+    }
+
+    /// PR384 fix F2 (corrected): an applied lane mutation completes the
+    /// wizard's OWN lane save — consumes the pending flag, records the save,
+    /// resets the staged selection (like a fallback save), clears the intent,
+    /// and names the lane key in the completion message.
+    #[test]
+    fn applied_lane_mutation_completes_the_wizard_lane_save() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(lane_capabilities());
+        stage_ready_lane_selection(&mut store);
+        store.state.onboarding.research_lane_intent = true;
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Save);
+        store.state.onboarding.provider_save_target =
+            Some(OnboardingProviderSaveTarget::ResearchLane);
+        store.state.onboarding.pending_research_lane_key = Some("cheap".into());
+
+        store.apply_sub_providers_mutation_event(SubProvidersMutationClientEvent {
+            result: crate::model::SubProvidersMutationResult {
+                profile_id: Some("coding".into()),
+                sub_providers: vec![crate::model::SubProviderView {
+                    key: "cheap".into(),
+                    provider: Some("moonshot".into()),
+                    model: Some("k3".into()),
+                    ..Default::default()
+                }],
+                applied: true,
+                runtime_policy_stamp: None,
+            },
+            message: "research lane saved".into(),
+        });
+
+        assert_eq!(store.state.onboarding.provider_pending, None);
+        assert_eq!(store.state.onboarding.provider_save_target, None);
+        assert_eq!(
+            store.state.onboarding.last_saved_provider_target,
+            Some(OnboardingProviderSaveTarget::ResearchLane)
+        );
+        assert!(
+            !store.state.onboarding.research_lane_intent,
+            "a completed lane save ends the lane flow"
+        );
+        assert_eq!(
+            store.state.onboarding.pending_research_lane_key, None,
+            "the stashed key is consumed"
+        );
+        assert!(
+            store.state.onboarding.provider.family_id.is_empty(),
+            "the staged selection resets after the lane save (like fallback)"
+        );
+        let message = store
+            .state
+            .onboarding
+            .last_message
+            .clone()
+            .expect("completion message set");
+        assert!(
+            message.contains("cheap"),
+            "the completion names the lane key: {message}"
+        );
+    }
+
+    /// PR384 fix P2-d: an applied sub_providers mutation that is NOT the
+    /// wizard's lane save (inline `/research add`, a lane remove confirm) must
+    /// not consume an unrelated pending wizard op — swallowing a pending Test
+    /// would drop the REAL test response into the legacy `None` arm, which
+    /// falsely marks the provider saved.
+    #[test]
+    fn applied_lane_mutation_leaves_unrelated_wizard_pending_alone() {
+        let mut store = store_with_empty_session();
+        stage_ready_lane_selection(&mut store);
+        let event = || SubProvidersMutationClientEvent {
+            result: crate::model::SubProvidersMutationResult {
+                profile_id: Some("coding".into()),
+                sub_providers: Vec::new(),
+                applied: true,
+                runtime_policy_stamp: None,
+            },
+            message: "lane removed".into(),
+        };
+
+        // Pending TEST: not a lane save — untouched.
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Test);
+        store.apply_sub_providers_mutation_event(event());
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Test),
+            "a lane mutation must not swallow a pending provider TEST"
+        );
+
+        // Pending PRIMARY save: also not a lane save — untouched.
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Save);
+        store.state.onboarding.provider_save_target = Some(OnboardingProviderSaveTarget::Primary);
+        store.apply_sub_providers_mutation_event(event());
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Save),
+            "a lane mutation must not swallow a pending PRIMARY save"
+        );
+        assert!(
+            !store.state.onboarding.provider_saved,
+            "no false 'provider saved' from the unrelated mutation"
+        );
+    }
+
+    /// PR384 fix P2-c: a rejected lane upsert (e.g. the octos#1775
+    /// api_key-without-env rule) must un-wedge `provider_pending` immediately
+    /// via error attribution — not freeze the wizard until the 30s sweep and
+    /// then report a misleading timeout.
+    #[test]
+    fn lane_upsert_error_frame_unwedges_pending_save() {
+        use octos_core::app_ui::AppUiError;
+        let mut store = store_with_empty_session();
+        store.state.onboarding.research_lane_intent = true;
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Save);
+        store.state.onboarding.provider_save_target =
+            Some(OnboardingProviderSaveTarget::ResearchLane);
+        store.state.onboarding.pending_research_lane_key = Some("cheap".into());
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "invalid_params".into(),
+            message: "profile/sub_providers/upsert request tui-7 failed: \
+                      sub_provider.api_key_env is required when an api_key is supplied"
+                .into(),
+        }));
+
+        assert_eq!(
+            store.state.onboarding.provider_pending, None,
+            "a failed lane upsert must un-wedge the staged surface"
+        );
+        assert_eq!(
+            store.state.onboarding.pending_research_lane_key, None,
+            "the stashed lane key drops with the failed save"
+        );
+        // The INTENT deliberately survives the error: the user is still in the
+        // lane flow and can fix the input and Save again as a lane.
+        assert!(
+            store.state.onboarding.research_lane_intent,
+            "a failed save keeps the lane flow active for a retry"
+        );
+    }
+
+    /// PR384 fix P1-a: the lane intent is scoped to the wizard surface it was
+    /// set for. Opening the PROVIDER save flows (`/onboard`, `/model` → config
+    /// surface) clears a stale intent so their Save is never silently rerouted
+    /// into a sub-provider lane.
+    #[test]
+    fn provider_flow_entries_clear_stale_research_lane_intent() {
+        // `/onboard` (OnboardingAction::Open)
+        let mut store = store_with_empty_session();
+        store.state.onboarding.research_lane_intent = true;
+        store.dispatch_onboarding_action(crate::model::OnboardingAction::Open, None);
+        assert!(
+            !store.state.onboarding.research_lane_intent,
+            "/onboard is a provider flow — a stale lane intent must not survive it"
+        );
+
+        // `/model` → Add a model (open_model_config_surface)
+        let mut store = store_with_empty_session();
+        store.state.onboarding.research_lane_intent = true;
+        store.open_model_config_surface();
+        assert!(
+            !store.state.onboarding.research_lane_intent,
+            "the model-config surface is a provider flow — same rule"
+        );
+    }
+
+    /// PR384 fix P1-a: abandoning the wizard (Esc / close-all) kills the lane
+    /// intent with it; popping a CHILD picker (family/model/route, the lane-key
+    /// picker) keeps the flow alive.
+    #[test]
+    fn research_lane_intent_dies_with_the_wizard_surface() {
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        store.state.onboarding.research_lane_intent = true;
+
+        // A child picker over the wizard: closing it keeps the intent.
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_RESEARCH_LANE_KEY));
+        store.close_menu();
+        assert!(
+            store.state.onboarding.research_lane_intent,
+            "popping a child picker keeps the wizard flow (and its intent) alive"
+        );
+
+        // Closing the wizard itself abandons the flow.
+        store.close_menu();
+        assert!(
+            !store.state.onboarding.research_lane_intent,
+            "the intent dies when MENU_ONBOARD leaves the stack"
+        );
+
+        // close_all_menus tears the surface down the same way.
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        store.state.onboarding.research_lane_intent = true;
+        store.close_all_menus();
+        assert!(
+            !store.state.onboarding.research_lane_intent,
+            "close_all_menus abandons the wizard flow too"
+        );
+    }
+
+    /// K3 review of the fix set (finding 1, refuted-but-pinned): the lane Save
+    /// path carries the same pending-RPC gate as the primary path — a Save
+    /// pressed while a Test is in flight must NOT open the key picker (and a
+    /// picker row must not dispatch), or the lane save would clobber the
+    /// pending Test slot and the Test response would complete "the lane save".
+    #[test]
+    fn lane_save_is_blocked_while_another_provider_rpc_is_pending() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(lane_capabilities());
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        store.state.onboarding.research_lane_intent = true;
+        stage_ready_lane_selection(&mut store);
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Test);
+
+        let cmd =
+            store.dispatch_onboarding_action(crate::model::OnboardingAction::SaveProvider, None);
+        assert!(cmd.is_none());
+        assert!(
+            !store.active_menu_id_is(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+            "the key picker must not open over an in-flight provider RPC"
+        );
+
+        // Even a directly-fired picker row is refused while pending.
+        let cmd = store.dispatch_menu_action(MenuAction::Local(LocalAction::SaveResearchLaneAs(
+            "cheap".into(),
+        )));
+        assert!(
+            cmd.is_none(),
+            "a picker row must not dispatch over an in-flight provider RPC"
+        );
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Test),
+            "the pending Test slot is not clobbered"
+        );
+    }
+
+    /// K3 review of the fix set (finding 2): mutation events have no request
+    /// id, so the consume also requires the echoed lane list to contain the
+    /// key we saved. A concurrent unrelated mutation (different key) echoes a
+    /// list without our key → provably not our completion → not consumed. An
+    /// empty echo can't disprove ownership → still consumes (no 30s wedge on
+    /// servers that echo no rows).
+    #[test]
+    fn lane_save_consume_requires_the_echo_to_contain_the_saved_key() {
+        let mut store = store_with_empty_session();
+        stage_ready_lane_selection(&mut store);
+        let event = |keys: &[&str]| SubProvidersMutationClientEvent {
+            result: crate::model::SubProvidersMutationResult {
+                profile_id: Some("coding".into()),
+                sub_providers: keys
+                    .iter()
+                    .map(|key| crate::model::SubProviderView {
+                        key: (*key).into(),
+                        provider: Some("moonshot".into()),
+                        model: Some("k3".into()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                applied: true,
+                runtime_policy_stamp: None,
+            },
+            message: "lanes updated".into(),
+        };
+        let arm_lane_save = |store: &mut Store| {
+            store.state.onboarding.research_lane_intent = true;
+            store.state.onboarding.provider_pending =
+                Some(crate::model::OnboardingProviderPending::Save);
+            store.state.onboarding.provider_save_target =
+                Some(OnboardingProviderSaveTarget::ResearchLane);
+            store.state.onboarding.pending_research_lane_key = Some("cheap".into());
+        };
+
+        // A non-empty echo WITHOUT our key: someone else's mutation — skip.
+        arm_lane_save(&mut store);
+        store.apply_sub_providers_mutation_event(event(&["strong"]));
+        assert_eq!(
+            store.state.onboarding.provider_pending,
+            Some(crate::model::OnboardingProviderPending::Save),
+            "an echo lacking the saved key must not complete the lane save"
+        );
+
+        // The echo containing our key: our completion — consume.
+        store.apply_sub_providers_mutation_event(event(&["strong", "cheap"]));
+        assert_eq!(store.state.onboarding.provider_pending, None);
+
+        // An EMPTY echo cannot disprove ownership — consume rather than wedge.
+        arm_lane_save(&mut store);
+        store.apply_sub_providers_mutation_event(event(&[]));
+        assert_eq!(
+            store.state.onboarding.provider_pending, None,
+            "an empty echo still completes (no 30s wedge on terse servers)"
+        );
+    }
+
+    /// K3 review of the fix set (coverage): the timeout sweep drops the
+    /// stashed lane key alongside the pending flag, so a later save can never
+    /// be labeled with a stale key.
+    #[test]
+    fn provider_pending_sweep_clears_stashed_lane_key() {
+        let mut store = store_with_empty_session();
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Save);
+        store.state.onboarding.provider_save_target =
+            Some(OnboardingProviderSaveTarget::ResearchLane);
+        store.state.onboarding.pending_research_lane_key = Some("cheap".into());
+
+        let start = std::time::Instant::now();
+        assert!(!store.sweep_provider_pending(start), "first tick stamps");
+        assert!(
+            store.sweep_provider_pending(
+                start + PROVIDER_PENDING_TIMEOUT + std::time::Duration::from_secs(1)
+            ),
+            "past the timeout the sweep clears the wedge"
+        );
+        assert_eq!(store.state.onboarding.provider_pending, None);
+        assert_eq!(
+            store.state.onboarding.pending_research_lane_key, None,
+            "the stashed lane key dies with the timed-out save"
+        );
+    }
+
+    /// K3 review of the fix set (coverage): the bare `/research add` entry —
+    /// per-verb capability gate, intent set, wizard open, and the prefetch
+    /// that is conditional on `profile/sub_providers/list`.
+    #[test]
+    fn bare_research_add_gates_sets_intent_and_prefetches_conditionally() {
+        // UPSERT + LIST: accepted, wizard open, intent set, lane list prefetched.
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+        ]));
+        let cmd = store
+            .dispatch_research_slash("/research add")
+            .into_command();
+        match cmd {
+            Some(AppUiCommand::ProfileSubProvidersList(params)) => {
+                assert_eq!(params.profile_id.as_deref(), Some("coding"));
+            }
+            other => panic!("expected a lane-list prefetch, got {other:?}"),
+        }
+        assert!(store.state.onboarding.research_lane_intent);
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+
+        // UPSERT only: accepted with NO prefetch (list not advertised — a
+        // request would just be rejected noise).
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(lane_capabilities());
+        let outcome = store.dispatch_research_slash("/research add");
+        assert!(
+            matches!(outcome, SlashDispatchOutcome::Accepted(None)),
+            "no lane-list prefetch without the list capability: {outcome:?}"
+        );
+        assert!(store.state.onboarding.research_lane_intent);
+
+        // LIST only (no upsert): refused up front — the wizard could never
+        // save, so it must not open (the F4 regression guard).
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+        ]));
+        let outcome = store.dispatch_research_slash("/research add");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+        assert!(
+            !store.state.onboarding.research_lane_intent,
+            "a refused entry must not leave a live lane intent behind"
+        );
+        assert!(!store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
     }
 }

@@ -335,6 +335,8 @@ onboarding:
     saved_status_none: "已保存供应商：无"
     primary: "主供应商"
     fallback: "备用"
+    research_lane: "研究通道"
+    save_research_lane: "保存为研究通道"
   disabled:
     name_empty: "姓名为空"
     username_empty: "用户名为空"
@@ -458,6 +460,8 @@ command:
     desc: 在打开的会话间切换（Alt+S）—— 实时回合与未读标记。
   undo:
     desc: 将工作区文件回滚到修改前的快照（#1768）。
+  peer:
+    desc: "派生一个带持久任务简报的同伴智能体会话：/peer [--go] [--worktree] [--cwd <path>] <brief>。"
   research:
     desc: 管理研究模型通道（deep_research 的 cheap/strong 模型）。
   onboard:
@@ -518,6 +522,7 @@ menu:
     subtitle: "✻ = 回合进行中 · (n) = 自上次查看后完成的回合数。"
     footer: Enter 切换 | Esc 关闭
     item:
+      blocked_reason: "⚠ 等待你的确认：%{reason}"
       current: 当前聚焦的会话。
       switch_desc: 切换到此会话。
       empty: 没有打开的会话
@@ -586,6 +591,16 @@ menu:
       yes: "是，移除 %{lane}"
       yes_desc: "使用 profile/sub_providers/remove；完成后通道列表会刷新。"
       no: "否，保留"
+  research_lane_key:
+    title: "保存为哪个研究通道…"
+    subtitle: "深度研究按通道键路由 —— %{provider} 将成为你选择的通道。需重启生效。"
+    occupied: "当前为 %{current}（保存将替换它）"
+    vacant: "尚未配置"
+    item:
+      cheap:
+        desc: "快速/廉价通道 —— deep_research 用于扫描与摘要阶段。"
+      strong:
+        desc: "强推理通道 —— deep_research 用于深度推理与综合阶段。"
   agents:
     item:
       dock_collapse:
@@ -991,6 +1006,8 @@ menu:
       save_provider:
         desc: 使用 profile/llm/upsert 持久化到与仪表盘相同的档案 JSON。
         label: 保存供应商到档案
+      save_research_lane:
+        desc: "将已配置的供应商保存为深度研究通道（profile/sub_providers/upsert）—— 下一步选择通道：cheap 或 strong。"
       saved_provider:
         desc: 上次成功保存的主要或备用供应商
       selected_provider:
@@ -1202,10 +1219,18 @@ menu:
   unavailable: 菜单不可用
 status:
   undo_no_session: "没有可撤销的活动会话。"
+  peer_usage: "用法：/peer [--go] [--worktree] [--cwd <path>] <brief>"
+  peer_preparing: "正在准备同伴会话…"
+  session_blocked_hint: "%{session} 正在等待你的确认：%{reason} —— 按 Alt+S 处理。"
+  peer_prepare_in_flight: "已有同伴会话正在准备中 —— 请等它打开（或约 30 秒后）再发起新的。"
+  peer_opening: "正在打开同伴 %{slug}…"
+  peer_started: "同伴 %{slug} 已在后台开始工作 —— 请留意会话栏中它的标记（Alt+S）。"
+  peer_switched: "同伴 %{slug} 已启动 —— 您现在位于它的会话中。"
   research_usage: "用法：/research | /research add <key> <provider> <model> [base_url] [api_key_env] | /research rm <key>"
   research_add_usage: "用法：/research add <key> <provider> <model> [base_url] [api_key_env]"
   research_rm_usage: "用法：/research rm <key>"
   research_profile_unresolved: "当前档案尚未就绪 —— 请在会话准备好后重试。"
+  research_lane_saved: "研究通道 %{key} 已保存：%{label} —— 需重启生效。"
   opening_diff_preview: "正在打开差异预览：%{operation} %{path}"
   opening_inline_diff_preview: "正在打开内联差异预览：%{title}"
   approval_requested: "请求审批：%{title}"

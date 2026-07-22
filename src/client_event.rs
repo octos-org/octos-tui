@@ -58,6 +58,10 @@ pub enum ClientEvent {
     SubProvidersList(SubProvidersListClientEvent),
     /// #1768: snapshot list/restore result (restore echoes refreshed rows).
     SnapshotList(SnapshotListClientEvent),
+    /// #395: `peer/prepare` result — the server minted a peer slug/topic and
+    /// wrote the durable brief; the store mints the peer session key, stashes
+    /// the kickoff, and follows up with `session/open`.
+    PeerPrepared(PeerPreparedClientEvent),
     SubProvidersMutation(SubProvidersMutationClientEvent),
     ProfileSkillsList(ProfileSkillsListClientEvent),
     ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchClientEvent),
@@ -199,6 +203,13 @@ pub struct ProfileLlmMutationClientEvent {
 pub struct SnapshotListClientEvent {
     pub message: String,
     pub result: crate::model::SnapshotListResult,
+}
+
+/// #395 `peer/prepare` result for the `/peer` flow.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerPreparedClientEvent {
+    pub message: String,
+    pub result: crate::model::PeerPrepareResult,
 }
 
 #[derive(Debug, Clone, PartialEq)]

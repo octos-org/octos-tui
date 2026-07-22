@@ -2027,6 +2027,7 @@ impl ProtocolAppUiBackend {
             | AppUiCommand::ProfileLlmUpsert(_)
             | AppUiCommand::ProfileLlmDelete(_)
             | AppUiCommand::SnapshotRestore(_)
+            | AppUiCommand::PeerPrepare(_)
             | AppUiCommand::ProfileSubProvidersUpsert(_)
             | AppUiCommand::ProfileSubProvidersRemove(_)
             | AppUiCommand::ProfileLlmSelect(_)
@@ -2702,6 +2703,7 @@ fn rpc_request_from_command(
         AppUiCommand::ProfileSubProvidersList(params) => serde_json::to_value(params),
         AppUiCommand::SnapshotList(params) => serde_json::to_value(params),
         AppUiCommand::SnapshotRestore(params) => serde_json::to_value(params),
+        AppUiCommand::PeerPrepare(params) => serde_json::to_value(params),
         AppUiCommand::ProfileSubProvidersUpsert(params) => serde_json::to_value(params),
         AppUiCommand::ProfileSubProvidersRemove(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmSelect(params) => serde_json::to_value(params),
@@ -3145,6 +3147,21 @@ fn success_response_to_app_event(
                         "invalid_result",
                         format!(
                             "failed to decode UI protocol result for snapshot list/restore: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PEER_PREPARE => {
+            match serde_json::from_value::<crate::model::PeerPrepareResult>(result) {
+                Ok(result) => Ok(Some(peer_prepare_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_PEER_PREPARE
                         ),
                     )
                     .into(),
@@ -3735,6 +3752,11 @@ fn snapshot_list_event(result: crate::model::SnapshotListResult) -> ClientEvent 
         }
     };
     ClientEvent::SnapshotList(crate::client_event::SnapshotListClientEvent { message, result })
+}
+
+fn peer_prepare_event(result: crate::model::PeerPrepareResult) -> ClientEvent {
+    let message = format!("Peer session prepared: {}", result.slug);
+    ClientEvent::PeerPrepared(crate::client_event::PeerPreparedClientEvent { message, result })
 }
 
 fn sub_providers_list_event(result: SubProvidersListResult) -> ClientEvent {
@@ -6801,6 +6823,79 @@ mod tests {
         assert_eq!(event.result.skills[0].status.as_deref(), Some("installed"));
     }
 
+    /// #395: `peer/prepare` requests encode brief/worktree/cwd/session_id and
+    /// omit the unused optionals; results decode into the typed
+    /// `ClientEvent::PeerPrepared` carrying the tui-local result struct.
+    #[test]
+    fn peer_prepare_request_encodes_and_result_decodes_to_client_event() {
+        let request = rpc_request_from_command(
+            "peer-1".into(),
+            AppUiCommand::PeerPrepare(crate::model::PeerPrepareParams {
+                brief: "fix the nav flicker".into(),
+                title: None,
+                worktree: true,
+                cwd: Some("/repo".into()),
+                session_id: Some(SessionKey("coding:local:tui#coding".into())),
+                profile_id: None,
+            }),
+        )
+        .expect("peer/prepare request encodes");
+        assert_eq!(request.method, crate::model::APPUI_METHOD_PEER_PREPARE);
+        assert_eq!(request.params["brief"], "fix the nav flicker");
+        assert_eq!(request.params["worktree"], true);
+        assert_eq!(request.params["cwd"], "/repo");
+        assert_eq!(request.params["session_id"], "coding:local:tui#coding");
+        assert!(
+            request.params.get("profile_id").is_none(),
+            "profile_id: None must be omitted from the wire shape"
+        );
+        assert!(
+            request.params.get("title").is_none(),
+            "title: None must be omitted from the wire shape"
+        );
+
+        let mut pending = HashMap::new();
+        pending.insert(
+            "peer-1".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_PEER_PREPARE.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "peer-1",
+            "result": {
+                "slug": "fix-nav-flicker",
+                "topic": "peer-fix-nav-flicker",
+                "brief_path": "/repo/.octos/peers/fix-nav-flicker/BRIEF.md",
+                "cwd": "/repo",
+                "worktree_branch": "peer/fix-nav-flicker",
+                "profile_id": "coding"
+            }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::PeerPrepared(event) = event else {
+            panic!("expected peer prepared event, got {event:?}");
+        };
+        assert_eq!(event.result.slug, "fix-nav-flicker");
+        assert_eq!(event.result.topic, "peer-fix-nav-flicker");
+        assert_eq!(
+            event.result.brief_path,
+            "/repo/.octos/peers/fix-nav-flicker/BRIEF.md"
+        );
+        assert_eq!(event.result.cwd, "/repo");
+        assert_eq!(
+            event.result.worktree_branch.as_deref(),
+            Some("peer/fix-nav-flicker")
+        );
+        assert_eq!(event.result.profile_id, "coding");
+        assert!(event.message.contains("fix-nav-flicker"));
+    }
+
     /// Realistic `session/status/read` result body as emitted by an octos
     /// server (protocol 1.1.0) for a fresh data dir where onboarding has not
     /// saved a provider yet — captured verbatim from `octos serve --stdio`
@@ -7142,6 +7237,16 @@ mod tests {
                 profile_id: Some("coding".into()),
                 name: "deep-search".into(),
             }),
+            // #395: `peer/prepare` writes the brief file (and may create a
+            // worktree) server-side — a mutation, blocked in read-only mode.
+            AppUiCommand::PeerPrepare(crate::model::PeerPrepareParams {
+                brief: "fix the thing".into(),
+                title: None,
+                worktree: false,
+                cwd: None,
+                session_id: None,
+                profile_id: None,
+            }),
         ];
         for command in &mutating_commands {
             assert!(
@@ -7245,6 +7350,16 @@ mod tests {
             AppUiCommand::FireLoopNow(crate::model::LoopIdParams {
                 session_id: session_id.clone(),
                 loop_id: "loop-1".into(),
+            }),
+            // #395: `/peer`'s prepare RPC — a labeled readonly block, not the
+            // "unexpectedly blocked read-style" policy-bug arm.
+            AppUiCommand::PeerPrepare(crate::model::PeerPrepareParams {
+                brief: "fix the thing".into(),
+                title: None,
+                worktree: false,
+                cwd: None,
+                session_id: Some(session_id.clone()),
+                profile_id: None,
             }),
         ];
 

@@ -58,6 +58,10 @@ pub const MENU_RESEARCH: &str = "research";
 /// Yes/No confirm for removing a staged research lane via
 /// `profile/sub_providers/remove`.
 pub const MENU_RESEARCH_REMOVE_CONFIRM: &str = "research-remove-confirm";
+/// Lane-key picker for the wizard's research-lane Save: deep_research requests
+/// lanes by the literal keys `cheap`/`strong` (`contract_for`), so the Save
+/// must land on one of those — a family-id key would never be routed to.
+pub const MENU_RESEARCH_LANE_KEY: &str = "research-lane-key";
 /// `/undo` snapshot picker (#1768).
 pub const MENU_UNDO: &str = "undo";
 /// #324: Alt+S session switcher popup (open sessions, live/unread badges).
@@ -681,6 +685,24 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             inline_args: InlineArgMode::None,
             entry: CommandEntry::LocalAction(LocalAction::Custom("undo")),
         },
+        // `/peer` (#395, octos#1800 peer agents v1) — spin off a peer agent
+        // session seeded with a durable brief. Gated on `peer/prepare` (same
+        // treatment as `/undo` on `snapshot/list`) so old servers hide it;
+        // `app_ui_mutating` because `peer/prepare` mutates server state, so
+        // read-only mode hides the command too.
+        CommandSpec {
+            name: "peer",
+            aliases: &[],
+            description: "command.peer.desc",
+            category: CommandCategory::Session,
+            availability: CommandAvailability::app_ui_mutating(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_when_capabilities(&[
+                    crate::model::APPUI_METHOD_PEER_PREPARE,
+                ]),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::Custom("peer")),
+        },
         CommandSpec {
             name: "research",
             aliases: &["lanes"],
@@ -1187,6 +1209,56 @@ mod tests {
                 .into_iter()
                 .any(|command| command.name == "rewind"),
             "/rewind hides in read-only mode (mutating command)"
+        );
+    }
+
+    /// #395: `/peer` is gated on `peer/prepare` (hidden on old servers) and,
+    /// because the method mutates server state, hidden in read-only mode too.
+    #[test]
+    fn peer_command_gated_on_peer_prepare_and_hidden_in_readonly() {
+        let registry = CommandRegistry::with_core_commands();
+        assert_eq!(
+            registry.find("peer").map(|command| command.name),
+            Some("peer"),
+            "/peer is registered"
+        );
+
+        let base_caps = CapabilitySet::from_methods([methods::TURN_INTERRUPT]);
+        let peer_caps = CapabilitySet::from_methods([crate::model::APPUI_METHOD_PEER_PREPARE]);
+        let without = AvailabilityContext {
+            task: TaskActivity::Idle,
+            approval_modal_visible: false,
+            readonly: false,
+            runtime: RuntimeMode::Protocol,
+            connection: ConnectionState::Connected,
+            capabilities: Some(&base_caps),
+            feature_flags: &[],
+            session_open: true,
+        };
+        let lists_peer = |ctx: &AvailabilityContext<'_>| {
+            registry
+                .available_commands(ctx)
+                .into_iter()
+                .any(|command| command.name == "peer")
+        };
+        assert!(!lists_peer(&without), "/peer hides without peer/prepare");
+
+        let with = AvailabilityContext {
+            capabilities: Some(&peer_caps),
+            ..without
+        };
+        assert!(
+            lists_peer(&with),
+            "/peer appears once peer/prepare is advertised"
+        );
+
+        let readonly = AvailabilityContext {
+            readonly: true,
+            ..with
+        };
+        assert!(
+            !lists_peer(&readonly),
+            "/peer hides in read-only mode (peer/prepare mutates)"
         );
     }
 

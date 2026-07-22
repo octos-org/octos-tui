@@ -91,6 +91,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::Skills,
         Provider::Research,
         Provider::ResearchRemoveConfirm,
+        Provider::ResearchLaneKey,
         Provider::Undo,
         Provider::UndoConfirm,
         Provider::Sessions,
@@ -141,6 +142,7 @@ enum Provider {
     Skills,
     Research,
     ResearchRemoveConfirm,
+    ResearchLaneKey,
     FilePicker,
     Undo,
     UndoConfirm,
@@ -186,6 +188,7 @@ impl MenuProvider for Provider {
             Self::Skills => MENU_SKILLS,
             Self::Research => crate::menu::registry::MENU_RESEARCH,
             Self::ResearchRemoveConfirm => crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM,
+            Self::ResearchLaneKey => crate::menu::registry::MENU_RESEARCH_LANE_KEY,
             Self::FilePicker => crate::menu::registry::MENU_FILE_PICKER,
             Self::Undo => crate::menu::registry::MENU_UNDO,
             Self::UndoConfirm => crate::menu::registry::MENU_UNDO_CONFIRM,
@@ -231,6 +234,7 @@ impl MenuProvider for Provider {
             Self::Skills => skills_menu(ctx),
             Self::Research => research_menu(ctx),
             Self::ResearchRemoveConfirm => research_remove_confirm_menu(ctx),
+            Self::ResearchLaneKey => research_lane_key_menu(ctx),
             Self::FilePicker => file_picker_menu(ctx),
             Self::Undo => undo_menu(ctx),
             Self::UndoConfirm => undo_confirm_menu(ctx),
@@ -1577,14 +1581,22 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         )),
         MenuItem::new(
             "onboard.provider.save",
-            t!("menu.onboard.item.save_provider.label"),
+            if state.research_lane_intent {
+                t!("onboarding.provider.save_research_lane").into_owned()
+            } else {
+                t!("menu.onboard.item.save_provider.label").into_owned()
+            },
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SaveProvider)),
         )
-        .with_description(t!("menu.onboard.item.save_provider.desc"))
+        .with_description(if state.research_lane_intent {
+            t!("menu.onboard.item.save_research_lane.desc").into_owned()
+        } else {
+            t!("menu.onboard.item.save_provider.desc").into_owned()
+        })
         .maybe_disabled(onboarding_provider_disabled_reason(
             ctx,
             state,
-            APPUI_METHOD_PROFILE_LLM_UPSERT,
+            onboarding_save_capability_method(state),
         )),
         MenuItem::new(
             "onboard.providers.refresh",
@@ -2359,16 +2371,25 @@ fn provider_config_rows(
                 onboarding_provider_save_label(state),
                 MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SaveProvider)),
             )
-            .with_description(t!("menu.onboard.item.persist_provider.desc"))
+            .with_description(if state.research_lane_intent {
+                t!("menu.onboard.item.save_research_lane.desc").into_owned()
+            } else {
+                t!("menu.onboard.item.persist_provider.desc").into_owned()
+            })
             .with_state(onboarding_provider_save_state(state))
             .maybe_disabled(onboarding_provider_disabled_reason(
                 ctx,
                 state,
-                APPUI_METHOD_PROFILE_LLM_UPSERT,
+                onboarding_save_capability_method(state),
             )),
         ]);
 
-        if opts.include_fallback {
+        // No fallback save inside the research-lane flow: `SaveProviderFallback`
+        // writes a PROFILE fallback regardless of the lane intent, which is
+        // never what the lane flow means (PR384 review P3-g). Entry-point
+        // clears make a live intent unreachable here today; the gate keeps the
+        // invariant local if surfaces are ever reshuffled.
+        if opts.include_fallback && !state.research_lane_intent {
             items.push(
                 MenuItem::new(
                     "onboard.provider.fallback",
@@ -3683,10 +3704,27 @@ fn onboarding_provider_save_label(state: &OnboardingWizardState) -> String {
         Some(OnboardingProviderPending::Test) => {
             t!("onboarding.provider.save_unavailable_testing").into_owned()
         }
+        // Lane mode (bare `/research add`): the Save routes to a sub-provider
+        // lane, and any earlier primary-save checkmark state is not about THIS
+        // flow — say what the button will actually do.
+        None if state.research_lane_intent => {
+            t!("onboarding.provider.save_research_lane").into_owned()
+        }
         None if state.provider_saved && state.provider_tested => {
             t!("onboarding.provider.saved").into_owned()
         }
         None => t!("onboarding.provider.save").into_owned(),
+    }
+}
+
+/// The RPC gating the wizard's Save row: a research-lane save dispatches
+/// `profile/sub_providers/upsert`, not `profile/llm/upsert` (PR384) — gate
+/// (and word the missing-capability reason around) the method it will use.
+fn onboarding_save_capability_method(state: &OnboardingWizardState) -> &'static str {
+    if state.research_lane_intent {
+        crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT
+    } else {
+        APPUI_METHOD_PROFILE_LLM_UPSERT
     }
 }
 
@@ -3722,6 +3760,9 @@ fn save_target_label(target: OnboardingProviderSaveTarget) -> String {
     match target {
         OnboardingProviderSaveTarget::Primary => t!("onboarding.provider.primary").into_owned(),
         OnboardingProviderSaveTarget::Fallback => t!("onboarding.provider.fallback").into_owned(),
+        OnboardingProviderSaveTarget::ResearchLane => {
+            t!("onboarding.provider.research_lane").into_owned()
+        }
     }
 }
 
@@ -4403,6 +4444,113 @@ fn research_remove_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     })
 }
 
+/// `key — provider/model` summary for a configured lane (occupancy line in the
+/// lane-key picker; same shape as the `/research` menu's lane rows).
+fn research_lane_summary(lane: &crate::model::SubProviderView) -> String {
+    format!(
+        "{}{}",
+        lane.provider.as_deref().unwrap_or("?"),
+        lane.model
+            .as_deref()
+            .map(|m| format!("/{m}"))
+            .unwrap_or_default()
+    )
+}
+
+/// Lane-key picker for the wizard's research-lane Save (PR384 review P1-b):
+/// deep_research's palette requests lanes by the LITERAL keys `cheap`/`strong`
+/// (octos `contract_for`), so the guided flow must land the save on one of
+/// those — a family-id key would create a lane the router never selects. Rows
+/// show current occupancy (display-matched to the active profile, same rule as
+/// `research_menu`) so replacing an existing lane is visible BEFORE the save
+/// fires (P3-e). Custom keys remain available via the inline
+/// `/research add <key> <provider> <model>` form.
+fn research_lane_key_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let staged_label = ctx
+        .app
+        .onboarding
+        .map(|onboarding| onboarding.provider_label())
+        .unwrap_or_default();
+    let can_upsert = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT);
+    // Occupancy: only trust the lane cache when it provably belongs to the
+    // active profile (the `research_menu` display-match). A cold or foreign
+    // cache renders the bare key rather than another profile's occupancy.
+    let profile_id = ctx.app.current_profile;
+    let cached_matches_active = profile_id.is_some()
+        && ctx
+            .app
+            .sub_providers_state
+            .map(|state| state.profile_id.as_deref() == profile_id)
+            .unwrap_or(false);
+    let occupancy = |key: &str| -> Option<String> {
+        if !cached_matches_active {
+            return None;
+        }
+        let lanes = ctx
+            .app
+            .sub_providers_state
+            .map(|state| state.sub_providers.as_slice())
+            .unwrap_or_default();
+        Some(match lanes.iter().find(|lane| lane.key == key) {
+            Some(lane) => t!(
+                "menu.research_lane_key.occupied",
+                current = research_lane_summary(lane)
+            )
+            .into_owned(),
+            None => t!("menu.research_lane_key.vacant").into_owned(),
+        })
+    };
+    let mut items = Vec::new();
+    for (key, desc) in [
+        (
+            "cheap",
+            t!("menu.research_lane_key.item.cheap.desc").into_owned(),
+        ),
+        (
+            "strong",
+            t!("menu.research_lane_key.item.strong.desc").into_owned(),
+        ),
+    ] {
+        let label = match occupancy(key) {
+            Some(occupancy) => format!("{key} — {occupancy}"),
+            None => key.to_string(),
+        };
+        let mut item = MenuItem::new(
+            format!("research.lane_key.{key}"),
+            label,
+            if can_upsert {
+                MenuAction::Local(crate::menu::types::LocalAction::SaveResearchLaneAs(
+                    key.to_string(),
+                ))
+            } else {
+                MenuAction::Noop
+            },
+        )
+        .with_description(desc);
+        if !can_upsert {
+            item = item.disabled(method_missing_reason(
+                ctx,
+                crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+            ));
+        }
+        items.push(item);
+    }
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+        title: t!("menu.research_lane_key.title").into_owned(),
+        subtitle: Some(t!("menu.research_lane_key.subtitle", provider = staged_label).into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
 /// `/undo` picker (#1768): the ACTIVE session's workspace snapshot undo
 /// points, newest first. Selecting a row stages a restore and opens the
 /// Yes/No confirm with the session + snapshot CAPTURED at build time.
@@ -4619,12 +4767,19 @@ fn sessions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let mut items = Vec::new();
     for (idx, chip) in ctx.app.session_chips.iter().enumerate() {
         let mut label = format!("{} {}", if chip.focused { "●" } else { "○" }, chip.title);
-        if chip.live {
+        if chip.blocked {
+            label.push_str(" ⚠");
+        } else if chip.live {
             label.push_str(" ✻");
         }
         if chip.unread > 0 {
             label.push_str(&format!(" ({})", chip.unread));
         }
+        // tui#398: the row's description is the session's one-line activity —
+        // blocked reason first (it needs the user), else the live tail / last
+        // transcript line — so "what is this one doing" is answerable without
+        // switching.
+        let activity = chip.activity.clone();
         if chip.focused {
             items.push(
                 MenuItem::new(format!("sessions.row.{idx}"), label, MenuAction::Noop)
@@ -4639,7 +4794,9 @@ fn sessions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                         chip.session_id.0.clone(),
                     )),
                 )
-                .with_description(t!("menu.sessions.item.switch_desc")),
+                .with_description(
+                    activity.unwrap_or_else(|| t!("menu.sessions.item.switch_desc").into_owned()),
+                ),
             );
         }
     }
@@ -9817,6 +9974,205 @@ mod tests {
         }
     }
 
+    /// PR384 fix P1-b/P3-e: the lane-key picker offers exactly cheap/strong
+    /// (the literal keys deep_research routes by), shows current occupancy for
+    /// the ACTIVE profile so a replace is visible before saving, and each row
+    /// fires the save with its key.
+    #[test]
+    fn research_lane_key_picker_offers_cheap_strong_with_occupancy() {
+        let registry = core_menu_registry();
+        let capabilities =
+            CapabilitySet::from_methods([crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT]);
+        let lanes = crate::model::SubProvidersListResult {
+            profile_id: Some("coding".into()),
+            sub_providers: vec![research_lane("cheap")],
+            runtime_policy_stamp: None,
+        };
+        let onboarding = crate::model::OnboardingWizardState::default();
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                sub_providers_state: Some(&lanes),
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) = registry.build(
+            &MenuId::from(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+            &ctx,
+        ) else {
+            panic!("expected the lane-key picker");
+        };
+        let cheap = spec
+            .items
+            .iter()
+            .find(|item| item.id == "research.lane_key.cheap")
+            .expect("cheap row");
+        let strong = spec
+            .items
+            .iter()
+            .find(|item| item.id == "research.lane_key.strong")
+            .expect("strong row");
+        // Occupancy: cheap exists on this profile (replace is visible), strong
+        // is vacant.
+        assert!(
+            cheap.label.contains("moonshot/k3"),
+            "occupied lane shows its current provider: {}",
+            cheap.label
+        );
+        assert_ne!(
+            strong.label, "strong",
+            "vacant lane still gets an explicit occupancy hint: {}",
+            strong.label
+        );
+        let MenuAction::Local(LocalAction::SaveResearchLaneAs(key)) = &cheap.action else {
+            panic!("cheap row fires SaveResearchLaneAs");
+        };
+        assert_eq!(key, "cheap");
+        let MenuAction::Local(LocalAction::SaveResearchLaneAs(key)) = &strong.action else {
+            panic!("strong row fires SaveResearchLaneAs");
+        };
+        assert_eq!(key, "strong");
+    }
+
+    /// A cold or foreign lane cache must NOT paint another profile's occupancy
+    /// onto the picker rows (same display-match rule as the /research menu).
+    #[test]
+    fn research_lane_key_picker_withholds_foreign_cache_occupancy() {
+        let registry = core_menu_registry();
+        let capabilities =
+            CapabilitySet::from_methods([crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT]);
+        let lanes = crate::model::SubProvidersListResult {
+            profile_id: Some("other-profile".into()),
+            sub_providers: vec![research_lane("cheap")],
+            runtime_policy_stamp: None,
+        };
+        let onboarding = crate::model::OnboardingWizardState::default();
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                sub_providers_state: Some(&lanes),
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) = registry.build(
+            &MenuId::from(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+            &ctx,
+        ) else {
+            panic!("expected the lane-key picker");
+        };
+        let cheap = spec
+            .items
+            .iter()
+            .find(|item| item.id == "research.lane_key.cheap")
+            .expect("cheap row");
+        assert_eq!(
+            cheap.label, "cheap",
+            "a foreign profile's cache paints no occupancy"
+        );
+    }
+
+    /// K3 review of the fix set (coverage): the picker must build with NO
+    /// onboarding snapshot (menus rebuild from the frame stack on theme/locale
+    /// refresh), and its rows go disabled — never silently Noop-enabled — when
+    /// the upsert capability drops mid-flow.
+    #[test]
+    fn research_lane_key_picker_survives_missing_snapshot_and_lost_capability() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods(["session/hydrate"]);
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot::default(),
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) = registry.build(
+            &MenuId::from(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+            &ctx,
+        ) else {
+            panic!("the picker must still build with no onboarding snapshot");
+        };
+        for key in ["cheap", "strong"] {
+            let row = spec
+                .items
+                .iter()
+                .find(|item| item.id == format!("research.lane_key.{key}"))
+                .expect("row present");
+            assert!(
+                row.disabled_reason.is_some(),
+                "{key} row must be disabled (with a reason) without the upsert capability"
+            );
+        }
+    }
+
+    /// PR384 fix P3-g: in lane mode the wizard's Save row gates on the RPC it
+    /// will actually use (`profile/sub_providers/upsert`), and the fallback
+    /// save row is withheld — `SaveProviderFallback` writes a PROFILE
+    /// fallback, which is never what the lane flow means.
+    #[test]
+    fn lane_intent_gates_save_row_on_sub_providers_and_hides_fallback() {
+        let mut state = crate::model::OnboardingWizardState::default();
+        assert_eq!(
+            onboarding_save_capability_method(&state),
+            APPUI_METHOD_PROFILE_LLM_UPSERT
+        );
+        state.research_lane_intent = true;
+        assert_eq!(
+            onboarding_save_capability_method(&state),
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT
+        );
+
+        // Staged selection so provider_config_rows renders the expanded form.
+        state.provider.family_id = "moonshot".into();
+        state.provider.model_id = "k3".into();
+        state.provider.route.route_id = "official".into();
+        let capabilities = CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+            APPUI_METHOD_PROFILE_LLM_TEST,
+        ]);
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                onboarding: Some(&state),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let rows = provider_config_rows(
+            &ctx,
+            &state,
+            Some("coding"),
+            ProviderConfigRowOpts {
+                include_fallback: true,
+                api_key_edit_prefix: "/add-model key ",
+            },
+        );
+        assert!(
+            rows.iter().any(|item| item.id == "onboard.provider.save"),
+            "the save row renders in lane mode"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|item| item.id == "onboard.provider.fallback"),
+            "the fallback save row is withheld in lane mode"
+        );
+    }
+
     #[test]
     fn research_menu_shows_active_profile_lanes_and_stages_removal() {
         let registry = core_menu_registry();
@@ -10046,6 +10402,8 @@ mod tests {
                 focused: true,
                 live: false,
                 unread: 0,
+                blocked: false,
+                activity: None,
             },
             crate::model::SessionChipView {
                 session_id: octos_core::SessionKey("local:b".into()),
@@ -10053,6 +10411,8 @@ mod tests {
                 focused: false,
                 live: true,
                 unread: 3,
+                blocked: false,
+                activity: Some("now analyzing the bus module".into()),
             },
         ];
         let ctx = MenuContext {

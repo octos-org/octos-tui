@@ -404,6 +404,12 @@ pub enum LocalAction {
     /// `profile/sub_providers/remove` — so a profile switch between select and
     /// confirm cannot retarget the delete.
     RequestRemoveResearchLane(Box<crate::model::ResearchLaneRemoval>),
+    /// Save the wizard's staged provider as the research lane with this key
+    /// (`MENU_RESEARCH_LANE_KEY` row: "cheap"/"strong"). Fires the
+    /// `profile/sub_providers/upsert` dispatch — the staged selection cannot
+    /// change while the picker is open (menus block composer + wizard edits),
+    /// so building the params at fire time reads exactly what the row showed.
+    SaveResearchLaneAs(String),
     /// Stage a workspace-snapshot restore and open its Yes/No confirm
     /// (`/undo` picker row, #1768). The captured session + snapshot id are
     /// carried to the confirm's Yes row (`snapshot/restore`).
