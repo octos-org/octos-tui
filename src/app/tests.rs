@@ -944,7 +944,7 @@ mod tests {
         // Regression: a turn parked on an approval/question locks the composer and
         // its card can scroll off the clipped live tail — leaving a bare "Waiting"
         // with only the (two-step) Esc hint. The work text must instead advertise
-        // Alt+A (bring the prompt back) and Ctrl+C (one-press interrupt).
+        // Ctrl+R/Alt+A (bring the prompt back) and Ctrl+C (one-press interrupt).
         let session_id = SessionKey("local:test".into());
         let mut app = AppState::new(
             vec![SessionView {
@@ -964,7 +964,7 @@ mod tests {
             message: "Run command".into(),
         };
         // No pending decision → no recovery hint.
-        assert!(!status_bar_work_text(&app).contains("Alt+A"));
+        assert!(!status_bar_work_text(&app).contains("Ctrl+R/Alt+A"));
 
         // Park the active session on an approval (even collapsed/hidden).
         app.approval = Some(ApprovalModalState {
@@ -982,7 +982,7 @@ mod tests {
         });
         let work = status_bar_work_text(&app);
         assert!(
-            work.contains("Alt+A") && work.contains("Ctrl+C"),
+            work.contains("Ctrl+R/Alt+A") && work.contains("Ctrl+C"),
             "a parked decision must advertise the recovery keys: {work:?}"
         );
         assert!(
@@ -994,7 +994,7 @@ mod tests {
         if let Some(approval) = app.approval.as_mut() {
             approval.session_id = SessionKey("local:other".into());
         }
-        assert!(!status_bar_work_text(&app).contains("Alt+A"));
+        assert!(!status_bar_work_text(&app).contains("Ctrl+R/Alt+A"));
     }
 
     #[test]
@@ -7075,7 +7075,7 @@ mod tests {
         let rows = rendered_rows(&rendered_buffer(&app, Palette::for_theme(ThemeName::Slate)));
         assert!(
             rows.iter()
-                .any(|row| row.contains("Parked on you") && row.contains("Alt+A")),
+                .any(|row| row.contains("Parked on you") && row.contains("Ctrl+R/Alt+A")),
             "the escalation banner must advertise the recovery keys: {rows:?}"
         );
 
@@ -8385,7 +8385,10 @@ mod tests {
         );
         // thomas transitioned to terminal while viewing Main -> unread.
         assert!(pill.contains("1●"), "pill shows the unread count: {pill}");
-        assert!(pill.contains("Alt+G"), "pill hints the toggle key: {pill}");
+        assert!(
+            pill.contains("Ctrl+G/Alt+G"),
+            "pill hints the toggle key: {pill}"
+        );
 
         // Peeking thomas clears the unread segment.
         app.set_chat_view(crate::model::ChatViewTarget::Agent("thomas".into()));
@@ -9781,7 +9784,7 @@ mod tests {
         assert!(pending_question_for_banner(&app).is_some());
         assert_eq!(decision_banner_height(&app), 1);
 
-        // Dismissed (Alt+A) → banner row released; the picker no longer owns the
+        // Dismissed (Ctrl+R/Alt+A) → banner row released; the picker no longer owns the
         // reserved chrome.
         app.user_question.as_mut().unwrap().visible = false;
         assert_eq!(decision_banner_height(&app), 0);

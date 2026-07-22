@@ -2327,7 +2327,7 @@ fn btw_overlay_height_hint(app: &AppState, area_width: u16) -> u16 {
 fn user_question_action_labels(picker: &UserQuestionPickerState) -> Vec<String> {
     // Garbled / 0-question event: nothing is answerable, so offer only a dismiss
     // hint — never a submit affordance that would form an invalid respond
-    // (DO-NOT-SHIP #2). Alt+a re-opens it if dismissed (DO-NOT-SHIP #1).
+    // (DO-NOT-SHIP #2). Ctrl+R/Alt+a re-opens it if dismissed (DO-NOT-SHIP #1).
     if picker.questions.is_empty() {
         return vec![t!("app.question.action_dismiss").to_string()];
     }
@@ -4620,7 +4620,7 @@ pub(crate) fn active_session_pending_decision_turn(app: &AppState) -> Option<(Se
 /// decision modal owns the keyboard (y/s/n) so the composer is locked; the modal
 /// can also scroll out of the height-clipped live tail, leaving the user with a
 /// bare "Waiting" and no visible prompt — so the status bar must advertise the
-/// recovery keys (Alt+A to bring the prompt back, Ctrl+C to interrupt).
+/// recovery keys (Ctrl+R/Alt+A to bring the prompt back, Ctrl+C to interrupt).
 pub(crate) fn active_session_has_pending_decision(app: &AppState) -> bool {
     active_session_pending_decision_turn(app).is_some()
 }

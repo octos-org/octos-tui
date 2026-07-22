@@ -64,7 +64,7 @@ pub const MENU_RESEARCH_REMOVE_CONFIRM: &str = "research-remove-confirm";
 pub const MENU_RESEARCH_LANE_KEY: &str = "research-lane-key";
 /// `/undo` snapshot picker (#1768).
 pub const MENU_UNDO: &str = "undo";
-/// #324: Alt+S session switcher popup (open sessions, live/unread badges).
+/// #324: Ctrl+S/Alt+S session switcher popup (open sessions, live/unread badges).
 pub const MENU_SESSIONS: &str = "sessions";
 /// Yes/No confirm for restoring the staged snapshot via `snapshot/restore`.
 pub const MENU_UNDO_CONFIRM: &str = "undo-confirm";
@@ -662,7 +662,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         // `/undo` (#1768) — the workspace snapshot picker: roll agent file
         // mutations back to a pre-mutation undo point. Gated on the snapshot
         // list method so old servers hide it.
-        // #324: the session switcher popup (same surface as Alt+S).
+        // #324: the session switcher popup (same surface as Ctrl+S/Alt+S).
         CommandSpec {
             name: "sessions",
             aliases: &["ss"],
@@ -798,7 +798,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         },
         CommandSpec {
             name: "resume",
-            // #324: the "sessions" alias moved to the Alt+S open-session
+            // #324: the "sessions" alias moved to the Ctrl+S/Alt+S open-session
             // switcher popup; /resume keeps its primary name.
             aliases: &[],
             description: "Switch to a prior session and reload its transcript.",
@@ -1104,7 +1104,7 @@ mod tests {
         let resume = registry.find("resume").expect("/resume is registered");
         assert_eq!(resume.name, "resume");
         assert!(resume.history_safe(), "/resume must be history-safe");
-        // #324: the "sessions" name now belongs to the Alt+S open-session
+        // #324: the "sessions" name now belongs to the Ctrl+S/Alt+S open-session
         // switcher popup, not /resume.
         assert_eq!(
             registry.find("/sessions").map(|command| command.name),

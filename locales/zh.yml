@@ -107,8 +107,8 @@ app:
     ps_to_view: "/ps 查看"
     esc_interrupt: "Esc 中断"
     stop_to_close: "/stop 关闭"
-    pending_decision_help: "等待你的确认 — Alt+A 应答 · Ctrl+C 中断"
-    parked_decision_banner: "⚠ 已等待你 %{elapsed} — Alt+A 应答 · Ctrl+C 中断"
+    pending_decision_help: "等待你的确认 — Ctrl+R/Alt+A 应答 · Ctrl+C 中断"
+    parked_decision_banner: "⚠ 已等待你 %{elapsed} — Ctrl+R/Alt+A 应答 · Ctrl+C 中断"
     tool_output_expanded: "工具输出已展开"
   btw:
     answering: "回答中…"
@@ -156,7 +156,7 @@ app:
     agent_strip_more: "还有 %{count} 个（Tab 切换）"
     agent_dock_pill: "🐙 %{count} 个智能体 · %{running} 运行中"
     agent_dock_pill_unread: " · %{count}● 未读"
-    agent_dock_toggle_hint: "Alt+G"
+    agent_dock_toggle_hint: "Ctrl+G/Alt+G"
     agent_no_output: "（暂无输出 —— 该智能体工作时会在此处流式输出结果）"
     menu: "菜单 | j/k 移动 | Enter 确认 | Esc 关闭"
     onboarding: "引导 | Enter 继续 | 输入可编辑字段"
@@ -457,7 +457,7 @@ command:
   model:
     desc: 选择服务器返回的档案 LLM 模型
   sessions:
-    desc: 在打开的会话间切换（Alt+S）—— 实时回合与未读标记。
+    desc: 在打开的会话间切换（Ctrl+S/Alt+S）—— 实时回合与未读标记。
   undo:
     desc: 将工作区文件回滚到修改前的快照（#1768）。
   peer:
@@ -610,7 +610,7 @@ menu:
       dock_expand:
         label: 展开为逐个智能体行
       dock_toggle:
-        desc: 等同于 Alt+G。
+        desc: 等同于 Ctrl+G/Alt+G。
       main:
         desc: 在主窗格显示会话记录。
         label: 主会话
@@ -1223,13 +1223,13 @@ status:
   undo_no_session: "没有可撤销的活动会话。"
   peer_usage: "用法：/peer [--go] [--worktree] [--cwd <path>] [--n <2-8>] <brief>"
   peer_preparing: "正在准备同伴会话…"
-  session_blocked_hint: "%{session} 正在等待你的确认：%{reason} —— 按 Alt+S 处理。"
+  session_blocked_hint: "%{session} 正在等待你的确认：%{reason} —— 按 Ctrl+S/Alt+S 处理。"
   peer_prepare_in_flight: "已有同伴会话正在准备中 —— 请等它打开（或约 30 秒后）再发起新的。"
   peer_opening: "正在打开同伴 %{slug}…"
-  peer_started: "同伴 %{slug} 已在后台开始工作 —— 请留意会话栏中它的标记（Alt+S）。"
+  peer_started: "同伴 %{slug} 已在后台开始工作 —— 请留意会话栏中它的标记（Ctrl+S/Alt+S）。"
   peer_switched: "同伴 %{slug} 已启动 —— 您现在位于它的会话中。"
   peer_fleet_opening: "正在打开 %{n} 个同伴组成的编队（第一个：%{slug}）…"
-  peer_staged_by_agent: "智能体派生了同伴 %{slug} —— 正在后台工作（Alt+S）。"
+  peer_staged_by_agent: "智能体派生了同伴 %{slug} —— 正在后台工作（Ctrl+S/Alt+S）。"
   peer_staged_known: "同伴 %{slug} 已经暂存 —— 重复通知已忽略。"
   gather_requesting: "正在从黑板收集同伴结果…"
   gather_no_peers: "黑板上还没有同伴 —— 先用 /peer 派生几个吧。"
