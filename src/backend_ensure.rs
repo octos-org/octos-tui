@@ -15,6 +15,16 @@
 //! service (a `sudo` daemon on Unix, an `OctosServe` scheduled task on Windows),
 //! which a stdio client neither needs nor should trigger.
 //!
+//! Two-channel note. octos-tui itself now ships prereleases on channels separate
+//! from stable — npm's `next` dist-tag (`@octos-org/octos-tui@next`) and a
+//! `octos-tui-dev` Homebrew formula (stable stays `latest` / `octos-tui`; see
+//! `dist-workspace.toml` and `cmd::update`). The octos SERVER installed HERE does
+//! NOT yet have that: its npm/brew publish only to `latest` / the stable formula,
+//! so a package manager can only ever fetch a stable server. That's another
+//! reason we pin the EXACT [`REQUIRED_OCTOS_RELEASE`] binary here rather than
+//! trusting `brew`/`npm` `latest`. Giving the server matching `@next` /
+//! `octos-serve-dev` channels (in the octos repo) is a tracked follow-up.
+//!
 //! We resolve octos against BOTH `PATH` and the installer dir `~/.octos/bin`.
 //! When it's usable only in that dir (not on `PATH`): on Unix we rewrite the
 //! stdio command to the full path; on Windows we leave the command bare and the
