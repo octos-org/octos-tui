@@ -158,6 +158,7 @@ app:
     list_nav: "j/k or Up/Down"
     composer_send: "Enter send | Shift+Enter / Ctrl+J newline | Tab agents"
     statusbar_keys: "Tab agents | Ctrl+O expand"
+    statusbar_keys_peers: "Tab agents | Ctrl+L peers | Ctrl+S sessions | Ctrl+O expand"
     agent_peek_keys: " Tab next · Shift+Tab prev · ↑/↓ scroll · x cancel · Esc back to chat "
     agent_task_prefix: "task: %{task}"
     agent_deliverables: "Deliverables"
