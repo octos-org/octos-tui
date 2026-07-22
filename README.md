@@ -27,39 +27,40 @@ background tasks — all without leaving the shell.
 
 ## Start here
 
-Two pieces: the Octos **server** (the brain) and this **TUI** (the terminal
-client). One command installs both:
+Install **just the TUI** — it auto-provisions the Octos **server** (the brain)
+on first launch, so there's nothing else to set up:
 
 ```bash
-npm install -g @octos-org/octos @octos-org/octos-tui
-# or with Homebrew (each repo is its own tap):
-#   brew tap octos-org/octos     https://github.com/octos-org/octos
+npm install -g @octos-org/octos-tui
+# or Homebrew (this repo is its own tap):
 #   brew tap octos-org/octos-tui https://github.com/octos-org/octos-tui
-#   brew install octos-org/octos/octos octos-org/octos-tui/octos-tui
+#   brew install octos-org/octos-tui/octos-tui
+# (or the shell / PowerShell installer — see Install below)
 ```
 
-Then start the TUI with its own private local server:
+Then just run it:
 
 ```bash
-octos-tui --mode protocol \
-  --stdio-command "octos serve --stdio --solo --data-dir ~/.octos-tui-data"
+octos-tui
 ```
 
-You'll land on the **"Welcome to Octos"** screen. In the next five minutes:
-create your local profile (three fields — the email is local metadata only),
-pick an AI provider, paste its API key, and open your first coding chat.
-The [Quickstart](#quickstart-solo-onboarding) below walks every screen.
+On first launch the TUI downloads the matching Octos server into `~/.octos/bin`
+(binary-only — **no** background service) and spawns it over stdio, then drops
+you on the **"Welcome to Octos"** screen. In the next five minutes: create your
+local profile (three fields — the email is local metadata only), pick an AI
+provider, paste its API key, and open your first coding chat. The
+[Quickstart](#quickstart-solo-onboarding) below walks every screen.
 
-> **Heads-up:** plain `octos-tui` with no flags opens a **mock demo** with
-> canned replies — nice for a look around, but not connected to anything.
-> Use the command above for the real thing.
+> **Just looking?** `octos-tui --mode mock` opens a mock demo with canned
+> replies — no server, connected to nothing. Plain `octos-tui` is the real
+> thing.
 
 ### If something looks wrong
 
 | Symptom | Fix |
 |---|---|
-| `command not found: octos` | The server isn't installed — `npm install -g @octos-org/octos` (or the [server install guide](https://github.com/octos-org/octos#start-here)). |
-| Replies are instant and feel canned | You're in mock mode (no flags). Start with the `--stdio-command ...` command above. |
+| First launch can't fetch the server | Auto-install needs network. Offline / behind a proxy? Install octos yourself (`npm i -g @octos-org/octos`, or the [server guide](https://github.com/octos-org/octos#start-here)) — the TUI then finds it. Set `OCTOS_TUI_NO_AUTO_INSTALL=1` to disable auto-install. |
+| Replies are instant and feel canned | You launched with `--mode mock`. Run plain `octos-tui` for the real backend. |
 | "Test provider" fails during onboarding | Re-check the API key and the provider choice; you can redo it anytime with `/onboard` or `/setup`. |
 
 More in the full [Troubleshooting](#troubleshooting) table below.
@@ -130,12 +131,13 @@ cargo install octos-tui
 A copy-pasteable, first-time walkthrough. By the end you have a local profile,
 an LLM provider, and a live coding session — no dashboard, no email OTP.
 
-### 1. Install the binaries
+### 1. Install the TUI
 
-Install the TUI and the server as shown in [Start here](#start-here) — the
-npm and brew routes install **both** pieces. (The shell/PowerShell installers
-in [Install](#install) ship the TUI **only**; pair them with a server install
-from the [octos repo](https://github.com/octos-org/octos#start-here).)
+Install `octos-tui` as shown in [Start here](#start-here) — that's all you need.
+On first launch it downloads the matching Octos **server** into `~/.octos/bin`
+automatically (binary-only, no service), so there's no separate server install.
+(Already have `octos` on your `PATH`? The TUI uses it, as long as it's a
+compatible version.)
 
 Building from source works too — `octos-core` (the shared protocol crate) is
 pulled automatically as a git dependency, so a plain clone builds with **no
@@ -156,14 +158,10 @@ cargo build --release
 
 ### 2. First run → the welcome screen
 
-For a true first run, spawn an `octos serve --stdio` backend with a **fresh,
-empty** data directory and pass **no** `--profile-id`. The TUI launches the
-server as a child process over stdio, so you only run one command:
+Just run it — the TUI provisions and launches the server for you:
 
 ```bash
-octos-tui \
-  --mode protocol \
-  --stdio-command "octos serve --stdio --solo --data-dir ./octos-data"
+octos-tui
 ```
 
 You land on the **"Welcome to Octos"** screen (subtitle *"Set up a local solo
@@ -171,12 +169,16 @@ profile to continue."*), with the OCTOS wordmark above the menu.
 
 Notes:
 
-- `--solo` and `--data-dir` are arguments to the spawned `octos serve --stdio`
-  child, **not** `octos-tui` flags.
-- Use a brand-new `--data-dir`; an existing one may already have a profile and
-  skip the welcome screen.
-- Do **not** pass `--profile-id` on first run — it selects an existing profile
-  and bypasses onboarding.
+- On first launch the TUI downloads the matching `octos` server into
+  `~/.octos/bin` and spawns it over stdio as a child — one command, no separate
+  install, no background service.
+- A fresh setup (no prior profile in `~/.octos`) lands on the welcome screen; if
+  you already have a profile there, it opens straight into a session.
+- **Advanced** — point at your own server instead: `--stdio-command "octos serve
+  --stdio --solo --data-dir <dir>"` for a custom local backend, or `--endpoint
+  ws://host:port/api/ui-protocol/ws` for a remote one. Do **not** pass
+  `--profile-id` on a true first run — it selects an existing profile and skips
+  onboarding.
 
 ### 3. Create your local profile
 
@@ -282,8 +284,9 @@ cargo run -- --mode mock
 cargo run -- --mode mock --theme claude
 ```
 
-`--mode mock` is also the default when no `--endpoint`/`--stdio-command` is
-given.
+`--mode mock` is an explicit opt-in. A bare launch (no `--mode`/`--endpoint`/
+`--stdio-command`) defaults to **protocol** and auto-provisions a local server —
+so plain `octos-tui` is the real thing, not the mock.
 
 ---
 
@@ -293,7 +296,8 @@ given.
 
 ```text
 --config <json-file>     JSON launch config; CLI flags override its values
---mode mock|protocol     mock (no server) or protocol (live). Default: mock
+--mode mock|protocol     mock (no server) or protocol (live). Default: protocol
+                         (a bare launch auto-provisions a local server)
 --endpoint <ws-url>      UI Protocol WebSocket (ws:// or wss://)
 --stdio-command "<cmd>"  spawn an `octos serve --stdio` child instead of --endpoint
 --session <session-id>   session to open first
