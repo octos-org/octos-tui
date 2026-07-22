@@ -1627,6 +1627,19 @@ fn handle_composer_vim_key(store: &mut Store, key: &KeyEvent) -> Option<KeyActio
         return Some(KeyAction::Continue);
     }
 
+    // `!` on an EMPTY composer is the shell-escape trigger (#364), not vim
+    // text entry: fall through (None) so the plain-char arm runs the prefix
+    // trigger (inserts the `!`, surfaces the cwd hint), and flip to Insert so
+    // the command text can be typed — mirroring the plain-composer flow.
+    // Normal mode swallowing it made `!` silently dead for vim users after
+    // any reflexive Esc ("`!` stopped working"). Only on empty: mid-text `!`
+    // stays a swallowed Normal-mode key (text entry requires Insert), and a
+    // pending operator above still owns the key (`d!` never triggers).
+    if c == '!' && store.state.composer.is_empty() {
+        store.state.composer_mode = ComposerMode::Insert;
+        return None;
+    }
+
     match c {
         // Motions.
         'h' => store.state.move_composer_cursor_left(),
@@ -5479,6 +5492,236 @@ mod tests {
             !store.state.transcript_pager_active,
             "Esc in vim Normal mode must still exit the transcript pager"
         );
+    }
+
+    // ----- `!` bang command — event-loop-level regression pins (user report:
+    // ----- "`!` stopped working"). The store-level dispatch is covered in
+    // ----- `store::tests`; these drive the REAL key pipeline (`handle_key`)
+    // ----- so no modal / focus / steer / vim gate can silently swallow the
+    // ----- draft between the keypress and `compose_command`.
+
+    /// Type `!echo hi` key-by-key and submit with Enter on an idle session:
+    /// the event loop must come back with the `LocalShellExec` send. The `!`
+    /// is delivered as Shift+Char (how Shift+1 layouts report it) to pin that
+    /// the SHIFT modifier routes through the plain-key path, not a modified-
+    /// key edit.
+    #[test]
+    fn bang_draft_enter_dispatches_local_shell_exec_when_idle() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+
+        handle_key(
+            &mut store,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT),
+        );
+        assert!(
+            store.shell_escape_mode_active(),
+            "`!` on an empty composer enters shell-escape mode"
+        );
+        for ch in "echo hi".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+
+        let command = sent_command(action);
+        let AppUiCommand::LocalShellExec { cmd, .. } = command else {
+            panic!("expected LocalShellExec, got {command:?}");
+        };
+        assert_eq!(cmd, "echo hi");
+        assert!(store.state.composer.is_empty(), "draft cleared on dispatch");
+    }
+
+    /// Enter with a `!` draft DURING a live steer-capable turn must still
+    /// dispatch the local exec — never a `TurnSteer`, never a staged message
+    /// (#406 interaction; the steer chokepoint sits after the bang intercept).
+    #[test]
+    fn bang_draft_enter_mid_turn_executes_locally_never_steers_or_stages() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_TURN_STEER,
+        ]));
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: TurnId::new(),
+            text: "streaming".into(),
+        });
+        assert!(
+            store.state.active_turn().is_some(),
+            "precondition: the turn is live, so a plain prompt WOULD steer"
+        );
+        store.state.set_composer_text("!git status");
+
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+
+        let command = sent_command(action);
+        let AppUiCommand::LocalShellExec { cmd, .. } = command else {
+            panic!("expected LocalShellExec, got {command:?}");
+        };
+        assert_eq!(cmd, "git status");
+        assert!(
+            store.state.pending_turn_steers.is_empty(),
+            "bang must not be steered into the live turn"
+        );
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "bang must not be staged behind the live turn"
+        );
+    }
+
+    /// `dispatch_bang_command` parks focus on the Tasks dock so the running
+    /// chip is visible. The NEXT `!` must still reach the composer (the
+    /// catch-all char arm refocuses it) — a bang after a bang keeps working.
+    #[test]
+    fn bang_after_bang_refocuses_composer_and_executes_again() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.set_composer_text("!pwd");
+        let first = sent_command(handle_key(&mut store, key(KeyCode::Enter)));
+        assert!(matches!(first, AppUiCommand::LocalShellExec { .. }));
+        assert_eq!(
+            store.state.focus,
+            FocusPane::Tasks,
+            "precondition: the first bang parked focus on the Tasks dock"
+        );
+
+        handle_key(&mut store, key(KeyCode::Char('!')));
+        assert_eq!(store.state.focus, FocusPane::Composer);
+        assert!(store.shell_escape_mode_active());
+        for ch in "pwd".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+        let command = sent_command(action);
+        let AppUiCommand::LocalShellExec { cmd, .. } = command else {
+            panic!("expected LocalShellExec, got {command:?}");
+        };
+        assert_eq!(cmd, "pwd");
+    }
+
+    // ----- `!` bang × Vim mode -----
+
+    /// Vim Insert mode behaves like the plain composer: `!` on an empty
+    /// composer enters shell-escape mode and Enter runs the command locally.
+    #[test]
+    fn vim_insert_mode_bang_flow_executes_end_to_end() {
+        let mut store = store_with_sessions(1);
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Insert;
+        store.state.focus = FocusPane::Composer;
+
+        handle_key(&mut store, key(KeyCode::Char('!')));
+        assert!(store.shell_escape_mode_active());
+        for ch in "ls".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+
+        let command = sent_command(action);
+        let AppUiCommand::LocalShellExec { cmd, .. } = command else {
+            panic!("expected LocalShellExec, got {command:?}");
+        };
+        assert_eq!(cmd, "ls");
+    }
+
+    /// THE regression (vim users): Normal mode swallowed EVERY unmapped char,
+    /// so after any reflexive Esc the `!` shell-escape trigger was silently
+    /// dead — "`!` stopped working". `!` on an EMPTY composer is the
+    /// shell-escape trigger, not text entry: it must fall through to the
+    /// prefix-trigger arm (insert + cwd hint) and flip to Insert mode so the
+    /// command text can be typed, exactly like the plain-composer flow.
+    #[test]
+    fn vim_normal_mode_bang_on_empty_composer_enters_shell_escape_and_insert() {
+        let mut store = store_with_sessions(1);
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Normal;
+        store.state.focus = FocusPane::Composer;
+
+        handle_key(&mut store, key(KeyCode::Char('!')));
+
+        assert_eq!(store.state.composer, "!");
+        assert!(store.shell_escape_mode_active());
+        assert_eq!(
+            store.state.composer_mode,
+            crate::model::ComposerMode::Insert,
+            "shell-escape entry must flip to Insert so the command can be typed"
+        );
+
+        // And the whole flow works: type the command, Enter dispatches it.
+        for ch in "ls".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+        let command = sent_command(action);
+        let AppUiCommand::LocalShellExec { cmd, .. } = command else {
+            panic!("expected LocalShellExec, got {command:?}");
+        };
+        assert_eq!(cmd, "ls");
+    }
+
+    /// Vim semantics preserved: `!` is only the shell-escape trigger on an
+    /// EMPTY composer. With draft text present, Normal mode still swallows it
+    /// (text entry requires Insert) and stays in Normal.
+    #[test]
+    fn vim_normal_mode_bang_mid_draft_stays_swallowed() {
+        let mut store = store_with_sessions(1);
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Normal;
+        store.state.focus = FocusPane::Composer;
+        store.state.set_composer_text("draft");
+
+        let action = handle_key(&mut store, key(KeyCode::Char('!')));
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(store.state.composer, "draft", "no stray `!` inserted");
+        assert_eq!(
+            store.state.composer_mode,
+            crate::model::ComposerMode::Normal
+        );
+        assert!(!store.shell_escape_mode_active());
+    }
+
+    /// A pending operator (`d` / `g` / `c`) owns the next key: `d!` resolves
+    /// (and discards) the unknown sequence instead of entering shell-escape
+    /// mode, even on an empty composer.
+    #[test]
+    fn vim_normal_pending_operator_consumes_bang_without_entering_shell_escape() {
+        let mut store = store_with_sessions(1);
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Normal;
+        store.state.focus = FocusPane::Composer;
+        store.state.composer_vim_pending = Some('d');
+
+        let action = handle_key(&mut store, key(KeyCode::Char('!')));
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert!(store.state.composer.is_empty());
+        assert!(!store.shell_escape_mode_active());
+        assert_eq!(store.state.composer_vim_pending, None, "sequence resolved");
+        assert_eq!(
+            store.state.composer_mode,
+            crate::model::ComposerMode::Normal
+        );
+    }
+
+    /// Enter in vim Normal mode still submits: an existing `!` draft (typed in
+    /// Insert, then Esc'd to Normal) dispatches the local exec.
+    #[test]
+    fn vim_normal_mode_enter_submits_bang_draft() {
+        let mut store = store_with_sessions(1);
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Normal;
+        store.state.focus = FocusPane::Composer;
+        store.state.set_composer_text("!pwd");
+
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+
+        let command = sent_command(action);
+        let AppUiCommand::LocalShellExec { cmd, .. } = command else {
+            panic!("expected LocalShellExec, got {command:?}");
+        };
+        assert_eq!(cmd, "pwd");
     }
 
     #[test]

@@ -23567,6 +23567,39 @@ now analyzing the bus module"
     }
 
     #[test]
+    fn bang_command_executes_locally_never_steered_on_steer_capable_live_turn() {
+        // #406 interaction pin (user report: "`!` stopped working"): with the
+        // server advertising `turn/steer`, a MID-TURN plain prompt steers into
+        // the live turn — but a `!`-bang draft is dispatched BEFORE the
+        // steer/staging chokepoint in `compose_command`, so a steer-capable
+        // live turn must never swallow it as steered/staged text.
+        let mut store = steer_capable_store();
+        start_live_turn(&mut store, "first prompt");
+        let messages_before = store.state.sessions[0].messages.len();
+        store.state.composer = "!echo hi".into();
+
+        let command = store.compose_command();
+
+        let Some(AppUiCommand::LocalShellExec { cmd, .. }) = command else {
+            panic!("expected LocalShellExec, got {command:?}");
+        };
+        assert_eq!(cmd, "echo hi");
+        assert!(
+            store.state.pending_turn_steers.is_empty(),
+            "a bang draft must never be steered into the live turn"
+        );
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "a bang draft must never be staged behind the live turn"
+        );
+        assert_eq!(
+            store.state.sessions[0].messages.len(),
+            messages_before,
+            "no optimistic user-row echo — the draft never became a prompt"
+        );
+    }
+
+    #[test]
     fn local_shell_result_completes_matching_chip_in_place() {
         let mut store = store_with_empty_session();
         store.state.composer = "!echo hi".into();
