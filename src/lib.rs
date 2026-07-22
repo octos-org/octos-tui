@@ -149,6 +149,34 @@ mod i18n_tests {
         }
     }
 
+    /// #395: the `/peer` command strings (registry description + dispatch /
+    /// kickoff status lines) resolve in BOTH locales.
+    #[test]
+    fn peer_command_keys_resolve_in_en_and_zh() {
+        let keys = [
+            "command.peer.desc",
+            "status.peer_usage",
+            "status.peer_preparing",
+            "status.peer_prepare_in_flight",
+            "status.peer_opening",
+            "status.peer_started",
+            "status.peer_switched",
+        ];
+        for key in keys {
+            for locale in ["en", "zh"] {
+                let value = t!(key, locale = locale);
+                assert_ne!(
+                    &*value, key,
+                    "missing {locale} translation for `{key}` (got the raw key back)"
+                );
+                assert!(
+                    !value.trim().is_empty(),
+                    "empty {locale} translation for `{key}`"
+                );
+            }
+        }
+    }
+
     /// PR384 fixes: the research-lane wizard strings (lane-aware save row,
     /// lane-key picker, saved status/target labels) resolve in BOTH locales.
     #[test]

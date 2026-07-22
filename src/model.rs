@@ -70,6 +70,9 @@ pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST: &str = "profile/sub_providers
 /// #1768 workspace snapshot undo.
 pub const APPUI_METHOD_SNAPSHOT_LIST: &str = "snapshot/list";
 pub const APPUI_METHOD_SNAPSHOT_RESTORE: &str = "snapshot/restore";
+/// #395 peer agents v1 (octos#1800): prepare a peer session (durable brief
+/// file + slug/topic + optional worktree) for `/peer`. A MUTATING method.
+pub const APPUI_METHOD_PEER_PREPARE: &str = "peer/prepare";
 pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT: &str = "profile/sub_providers/upsert";
 pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE: &str = "profile/sub_providers/remove";
 pub const APPUI_METHOD_PROFILE_LLM_TEST: &str = "profile/llm/test";
@@ -757,6 +760,11 @@ pub enum AppUiCommand {
     SnapshotList(SnapshotListParams),
     /// #1768: restore the session workspace to a snapshot.
     SnapshotRestore(SnapshotRestoreParams),
+    /// #395: prepare a peer session for `/peer` (durable brief + slug/topic).
+    /// A MUTATING method — intentionally NOT listed in
+    /// [`ProtocolAppUiBackend::readonly_allows_command`], so it is blocked in
+    /// read-only mode (like `SnapshotRestore` and the config upserts).
+    PeerPrepare(PeerPrepareParams),
     ProfileSubProvidersUpsert(SubProvidersUpsertParams),
     ProfileSubProvidersRemove(SubProvidersRemoveParams),
     ProfileSkillsList(ProfileSkillsListParams),
@@ -856,6 +864,7 @@ impl AppUiCommand {
             Self::ProfileSubProvidersList(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
             Self::SnapshotList(_) => APPUI_METHOD_SNAPSHOT_LIST,
             Self::SnapshotRestore(_) => APPUI_METHOD_SNAPSHOT_RESTORE,
+            Self::PeerPrepare(_) => APPUI_METHOD_PEER_PREPARE,
             Self::ProfileSubProvidersUpsert(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
             Self::ProfileSubProvidersRemove(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
             Self::ProfileSkillsList(_) => APPUI_METHOD_PROFILE_SKILLS_LIST,
@@ -3417,6 +3426,67 @@ pub struct SubProviderView {
     pub api_type: Option<String>,
 }
 
+/// `peer/prepare` request (#395, octos#1800 peer agents v1). `brief` is the
+/// raw peer brief text (required, non-empty, ≤64 KiB server-side); `worktree`
+/// asks the server to spin the peer up on its own git worktree; `cwd` pins an
+/// explicit workspace. `session_id` carries the ACTIVE session so the server
+/// can default the workspace root and scope the profile; `profile_id` stays
+/// `None` in v1 (the server derives it from the session).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerPrepareParams {
+    pub brief: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub worktree: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+/// `peer/prepare` result: the server-minted `slug`, its `topic`
+/// (`peer-<slug>`), the durable brief file path, the resolved workspace
+/// `cwd`, the worktree branch (when one was created), and the profile the
+/// peer session must open under.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerPrepareResult {
+    pub slug: String,
+    pub topic: String,
+    pub brief_path: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
+    pub profile_id: String,
+}
+
+/// An in-flight `/peer` dispatch (#395): the client-local halves of the flow
+/// (`brief` for the kickoff text, `go` for the focus decision) that
+/// `peer/prepare`'s result does NOT echo back. Stashed at dispatch, consumed
+/// when the [`crate::client_event::ClientEvent::PeerPrepared`] result lands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingPeerPrepare {
+    pub brief: String,
+    pub go: bool,
+    pub created: std::time::Instant,
+}
+
+/// A prepared peer session waiting for its `session/opened` to land
+/// (#395). Keyed by the minted peer [`SessionKey`] in
+/// [`AppState::pending_peer_kickoffs`]; popped when the session appears in
+/// `state.sessions`, at which point the kickoff turn is submitted TO THAT
+/// SESSION. Entries older than [`PEER_KICKOFF_TTL`] are pruned (dead open —
+/// matches the `pre_token_turns` TTL self-heal).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerKickoff {
+    pub brief: String,
+    pub brief_path: String,
+    pub go: bool,
+    pub created: std::time::Instant,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotListParams {
     pub session_id: SessionKey,
@@ -4261,6 +4331,17 @@ pub struct AppState {
     /// terminal while the session was NOT focused. Incremented by the store's
     /// terminal appliers, cleared when the session gains focus.
     pub unread_turns: std::collections::HashMap<SessionKey, usize>,
+    /// #395: the in-flight `/peer` dispatch. `peer/prepare`'s result does not
+    /// echo the brief (and `go` never crosses the wire), so the dispatcher
+    /// stashes them here; the `PeerPrepared` apply consumes the stash to build
+    /// the kickoff. A second `/peer` before the first result replaces it.
+    pub pending_peer_prepare: Option<PendingPeerPrepare>,
+    /// #395: prepared peer sessions waiting for their `session/opened`, keyed
+    /// by the minted peer session key. Popped when the session lands in
+    /// `sessions` (the kickoff turn is then submitted to the PEER key);
+    /// entries older than [`PEER_KICKOFF_TTL`] are pruned like
+    /// `pre_token_turns`.
+    pub pending_peer_kickoffs: std::collections::HashMap<SessionKey, PeerKickoff>,
     pub approval_auto_open: bool,
     pub approval: Option<ApprovalModalState>,
     /// Pending AskUserQuestion picker (UPCR-2026-023), mirroring `approval`.
@@ -6170,6 +6251,8 @@ impl AppState {
             run_state_started_at,
             pre_token_turns: std::collections::HashMap::new(),
             unread_turns: std::collections::HashMap::new(),
+            pending_peer_prepare: None,
+            pending_peer_kickoffs: std::collections::HashMap::new(),
             approval_auto_open: true,
             approval: None,
             user_question: None,
@@ -8214,6 +8297,22 @@ impl AppState {
         self.run_state_started_at = None;
     }
 
+    /// #395: pop the pending peer kickoff for `session_id`, pruning stale
+    /// entries first so an aged stash (dead `session/open`) can never fire a
+    /// kickoff turn into a session opened much later under the same key.
+    pub fn take_pending_peer_kickoff(&mut self, session_id: &SessionKey) -> Option<PeerKickoff> {
+        self.prune_stale_peer_kickoffs();
+        self.pending_peer_kickoffs.remove(session_id)
+    }
+
+    /// #395: drop peer kickoffs older than [`PEER_KICKOFF_TTL`] (the same
+    /// retain-by-age sweep `pre_token_turns` gets in
+    /// [`Self::refresh_run_state_from_selection`]).
+    pub fn prune_stale_peer_kickoffs(&mut self) {
+        self.pending_peer_kickoffs
+            .retain(|_, kickoff| kickoff.created.elapsed() < PEER_KICKOFF_TTL);
+    }
+
     /// #324: whether `session_id`'s turn is live RIGHT NOW — streaming
     /// (`live_reply` bound) or submitted-but-pre-first-token (fresh marker).
     pub fn session_turn_live(&self, session_id: &SessionKey) -> bool {
@@ -9148,6 +9247,26 @@ fn is_plan_heading(line: &str) -> bool {
 /// submit whose turn/started never arrives within this window is treated as
 /// dead (mirrors the staged-gate TTL in `store.rs`).
 const PRE_TOKEN_TURN_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a [`AppState::pending_peer_kickoffs`] entry stays live (#395). A
+/// prepared peer whose `session/opened` never arrives within this window is a
+/// dead open — the stash is pruned so a much-later open of the same key can
+/// never fire a stale kickoff turn (mirrors [`PRE_TOKEN_TURN_TTL`]).
+/// Generous (2 min, not the prepare TTL): once pruned, a late `session/opened`
+/// for the peer key falls through to the NORMAL focused-open path — i.e. it
+/// steals focus — so a slow-but-alive open should be hard-pressed to outlive
+/// its kickoff (K3 review of #395).
+pub(crate) const PEER_KICKOFF_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long an in-flight [`AppState::pending_peer_prepare`] stash stays
+/// consumable (#395, K3 review). Bounds two hazards symmetrically: a SECOND
+/// `/peer` is refused while a fresh prepare is in flight (the stash is
+/// single-slot — letting the second dispatch overwrite it would cross-wire
+/// the first result's session with the second brief), and a STALE result
+/// landing past the window opens nothing (a lost-response prepare must not
+/// pop a session open + an unprompted turn minutes later). Short: a prepare
+/// is one RPC round-trip.
+pub(crate) const PEER_PREPARE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn initial_run_state(sessions: &[SessionView], selected_session: usize) -> SessionRunState {
     if sessions

@@ -471,6 +471,12 @@ thinking:
 
 status:
   undo_no_session: "No active session to undo in."
+  peer_usage: "Usage: /peer [--go] [--worktree] [--cwd <path>] <brief>"
+  peer_preparing: "Preparing peer session…"
+  peer_prepare_in_flight: "A peer is already being prepared — wait for it to open (or ~30s) before starting another."
+  peer_opening: "Opening peer %{slug}…"
+  peer_started: "Peer %{slug} is working in the background — watch its badge in the session strip (Alt+S)."
+  peer_switched: "Peer %{slug} started — you are in its session now."
   research_usage: "Usage: /research | /research add <key> <provider> <model> [base_url] [api_key_env] | /research rm <key>"
   research_add_usage: "Usage: /research add <key> <provider> <model> [base_url] [api_key_env]"
   research_rm_usage: "Usage: /research rm <key>"
@@ -909,6 +915,8 @@ command:
     desc: Switch between open sessions (Alt+S) — live turns and unread badges.
   undo:
     desc: Roll workspace files back to a pre-mutation snapshot (#1768).
+  peer:
+    desc: "Spin off a peer agent session with a durable brief: /peer [--go] [--worktree] [--cwd <path>] <brief>."
   research:
     desc: Manage research provider lanes (deep_research cheap/strong models).
   onboard:
