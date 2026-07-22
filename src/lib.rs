@@ -187,6 +187,26 @@ mod i18n_tests {
         }
     }
 
+    /// octos#1807: the `turn/steer` status string resolves in BOTH locales
+    /// (rust-i18n echoes the key back on a miss).
+    #[test]
+    fn turn_steer_keys_resolve_in_en_and_zh() {
+        let keys = ["status.steered_into_turn"];
+        for key in keys {
+            for locale in ["en", "zh"] {
+                let value = t!(key, locale = locale);
+                assert_ne!(
+                    &*value, key,
+                    "missing {locale} translation for `{key}` (got the raw key back)"
+                );
+                assert!(
+                    !value.trim().is_empty(),
+                    "empty {locale} translation for `{key}`"
+                );
+            }
+        }
+    }
+
     /// PR384 fixes: the research-lane wizard strings (lane-aware save row,
     /// lane-key picker, saved status/target labels) resolve in BOTH locales.
     #[test]

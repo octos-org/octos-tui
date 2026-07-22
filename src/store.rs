@@ -609,16 +609,24 @@ impl Store {
     }
 
     /// Mid-turn staging chokepoint for every prompt submission (composer,
-    /// menu `SubmitPrompt`, `PromptTemplate`): an active turn stages the
-    /// prompt onto the session's queue — starting a SECOND `turn/start`
-    /// concurrently with the live turn corrupts run-state bookkeeping and
-    /// races the server — while an idle session starts the turn.
+    /// menu `SubmitPrompt`, `PromptTemplate`): an active turn STEERS the
+    /// prompt into the live turn when the server supports `turn/steer`
+    /// (octos#1807) and otherwise stages it onto the session's queue —
+    /// starting a SECOND `turn/start` concurrently with the live turn
+    /// corrupts run-state bookkeeping and races the server — while an idle
+    /// session starts the turn. Slash/bang inputs never reach here: the
+    /// composer dispatches them BEFORE this chokepoint (see
+    /// [`Self::compose_command`]), so they can never be steered as plain
+    /// text.
     fn queue_or_start_prompt_turn(
         &mut self,
         prompt: String,
         queued_status: String,
     ) -> Option<AppUiCommand> {
         if self.turn_in_progress() {
+            if let Some(command) = self.try_steer_live_turn(&prompt) {
+                return Some(command);
+            }
             self.state.pending_messages.push(prompt);
             self.state.status = t!("status.message_staged").into_owned();
             self.state.scroll_transcript_to_latest();
@@ -626,6 +634,74 @@ impl Store {
         }
 
         self.start_prompt_turn(prompt, queued_status)
+    }
+
+    /// octos#1807: steer a mid-turn prompt into the ACTIVE turn instead of
+    /// staging it. Returns the `turn/steer` command, or `None` to fall back
+    /// to EXACTLY today's staging path (every gate below is silent — no
+    /// status noise — so an old server stays byte-identical):
+    ///
+    /// * capability — the server must advertise `turn/steer`;
+    /// * read-only mode never steers (mirrors the `turn/start` block);
+    /// * FIFO — a non-empty staged queue means earlier text is still waiting
+    ///   for turn-end; steering the newer text PAST it would reorder the
+    ///   user's messages, so it stages behind them instead;
+    /// * a LIVE turn only (`active_turn()`, i.e. `live_reply` bound — which
+    ///   `TurnStarted` does for every turn, ours or server-initiated). In
+    ///   the pre-`TurnStarted` window after our own submit the turn is not
+    ///   admitted server-side yet: a steer there races the in-flight
+    ///   `turn/start` and can START a second real turn (the server's
+    ///   no-active-turn fallback), inverting submit order — so that window
+    ///   stages like today. This also makes `expected_turn_id` always
+    ///   known, never `None`.
+    ///
+    /// On steer: the optimistic transcript echo is recorded exactly like a
+    /// normal submit (the drain-time persisted `UserMessage` envelope echo
+    /// reconciles it — see [`AppState::apply_user_row_echo`]), and the
+    /// prompt is stashed FIFO in `pending_turn_steers` so an attributed
+    /// steer failure can re-stage it (the text must never be lost).
+    fn try_steer_live_turn(&mut self, prompt: &str) -> Option<AppUiCommand> {
+        if self.state.readonly {
+            return None;
+        }
+        if !self
+            .state
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| {
+                capabilities.supports_method(crate::model::APPUI_METHOD_TURN_STEER)
+            })
+        {
+            return None;
+        }
+        if !self.state.pending_messages.is_empty() {
+            return None;
+        }
+        let (session_id, turn_id) = self
+            .state
+            .active_turn()
+            .map(|(session_id, turn_id)| (session_id.clone(), turn_id.clone()))?;
+        self.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            prompt.to_owned(),
+        );
+        self.state.scroll_transcript_to_latest();
+        self.state.status = t!("status.steered_into_turn").into_owned();
+        self.state
+            .pending_turn_steers
+            .push_back(crate::model::PendingTurnSteer {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                prompt: prompt.to_owned(),
+            });
+        Some(AppUiCommand::TurnSteer(crate::model::TurnSteerParams {
+            session_id,
+            expected_turn_id: Some(turn_id),
+            input: vec![InputItem::Text {
+                text: prompt.to_owned(),
+            }],
+        }))
     }
 
     #[allow(dead_code)]
@@ -973,6 +1049,60 @@ impl Store {
             .map(|topic| topic.strip_prefix("peer-").unwrap_or(topic))
             .unwrap_or(session_id.0.as_str())
             .to_owned()
+    }
+
+    /// `turn/steer` result (octos#1807). `steered:true` — the text joined
+    /// the ACTIVE turn: status only; run-state and the pre-token marker are
+    /// deliberately untouched (the turn was already live and keeps
+    /// streaming), and the drain-time persisted `UserMessage` envelope echo
+    /// reconciles the optimistic row. `steered:false` — no active turn
+    /// existed server-side (the expected turn settled in flight) and the
+    /// server started a NEW REAL turn with the input: arm this client the
+    /// way a normal submit does post-dispatch (pre-token marker + run-state
+    /// in-progress) so the strip/gauge behave as if the user had submitted
+    /// normally, and re-key the optimistic row onto the returned turn id.
+    fn apply_turn_steered_event(
+        &mut self,
+        event: crate::client_event::TurnSteeredClientEvent,
+    ) -> Option<AppUiCommand> {
+        let pending = self.state.pending_turn_steers.pop_front();
+        if event.result.steered {
+            self.state.status = t!("status.steered_into_turn").into_owned();
+            return None;
+        }
+        let Some(session_id) = pending
+            .as_ref()
+            .map(|pending| pending.session_id.clone())
+            .or_else(|| {
+                self.state
+                    .active_session()
+                    .map(|session| session.id.clone())
+            })
+        else {
+            self.state.status = t!("status.queued_turn_start").into_owned();
+            return None;
+        };
+        if let Some(pending) = pending.as_ref() {
+            self.state.rekey_turn_prompt_records(
+                &session_id,
+                &pending.turn_id,
+                &pending.prompt,
+                &event.result.turn_id,
+            );
+        }
+        // Pre-first-token marker for the server-minted turn (mirrors
+        // `start_prompt_turn`): keyed per-session; `TurnStarted` clears it.
+        self.state
+            .pre_token_turns
+            .insert(session_id.clone(), std::time::Instant::now());
+        // The chip is global — only arm it when the steered session is the
+        // one on screen (a background session's new turn must not repaint
+        // the foreground chip; its `TurnStarted` handles its own strip row).
+        if self.event_targets_active_session(&session_id) {
+            self.state.set_run_state_in_progress();
+        }
+        self.state.status = t!("status.queued_turn_start").into_owned();
+        None
     }
 
     /// `peer/prepare` result (#395): mint the peer session key from the
@@ -6954,6 +7084,7 @@ impl Store {
                 None
             }
             ClientEvent::PeerPrepared(event) => self.apply_peer_prepared_event(event),
+            ClientEvent::TurnSteered(event) => self.apply_turn_steered_event(event),
             ClientEvent::PeerStaged(event) => self.apply_peer_staged_event(event),
             ClientEvent::PeerGathered(event) => self.apply_peer_gathered_event(event),
             ClientEvent::SubProvidersMutation(event) => {
@@ -7533,6 +7664,11 @@ impl Store {
                 // other copy). Harmless when stale — TTL-pruned on take.
                 let pending_peer_prepare = self.state.pending_peer_prepare.clone();
                 let pending_peer_kickoffs = self.state.pending_peer_kickoffs.clone();
+                // octos#1807 local-only in-flight `turn/steer` stash: between
+                // dispatch and result the steered text lives ONLY here (the
+                // error fallback re-stages from it), so a replay landing in
+                // that window must carry it over or the text is lost.
+                let pending_turn_steers = self.state.pending_turn_steers.clone();
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
@@ -7595,6 +7731,7 @@ impl Store {
                 state.pre_token_turns = pre_token_turns;
                 state.pending_peer_prepare = pending_peer_prepare;
                 state.pending_peer_kickoffs = pending_peer_kickoffs;
+                state.pending_turn_steers = pending_turn_steers;
                 // Settle gates the snapshot already reflects BEFORE the
                 // optimistic restore below re-inserts un-echoed rows (which
                 // would inflate the echo count and mis-settle live gates).
@@ -7640,6 +7777,55 @@ impl Store {
                         && error.message.starts_with("encoded session/btw request"));
                 if is_btw_error && self.state.fail_btw_answering(&error.message) > 0 {
                     self.state.status = t!("status.btw_failed").into_owned();
+                    return None;
+                }
+                // octos#1807: a dead `turn/steer` falls back to STAGING its
+                // prompt so the typed text is never lost. Same
+                // attribution discipline as `/btw` above — match ONLY the
+                // shapes the transport actually produces for this method
+                // (response error/cancel formats the method FIRST; the
+                // pre-send rejections carry fixed method-naming trailers) —
+                // and, crucially, EARLY-RETURN: a steer failing says nothing
+                // about the MAIN turn, which is still streaming; falling
+                // through would flip the run state to Error under a healthy
+                // turn. `invalid_result` means the response ARRIVED (the
+                // server acted — steered or started a turn) but did not
+                // decode: re-staging would submit the text twice, so only
+                // the stash entry is consumed (the optimistic row + the
+                // server's own echo keep the transcript truthful).
+                let is_steer_error = error.message.starts_with("turn/steer ")
+                    || (error.code == "too_many_pending_requests"
+                        && error.message.ends_with("enqueue turn/steer request"))
+                    || (error.code == "frame_too_large"
+                        && error.message.starts_with("encoded turn/steer request"))
+                    || (error.code == "transport_send"
+                        && error
+                            .message
+                            .starts_with("failed to send turn/steer request"))
+                    || (error.code == "invalid_result"
+                        && error
+                            .message
+                            .starts_with("failed to decode UI protocol result for turn/steer"));
+                if is_steer_error {
+                    if let Some(pending) = self.state.pending_turn_steers.pop_front() {
+                        if error.code != "invalid_result" {
+                            self.state.withdraw_steered_user_prompt(
+                                &pending.session_id,
+                                &pending.turn_id,
+                                &pending.prompt,
+                            );
+                            self.state
+                                .stage_prompt_back(&pending.session_id, pending.prompt);
+                            self.state.status = t!("status.message_staged").into_owned();
+                            return None;
+                        }
+                    }
+                    self.state.status = t!(
+                        "status.error_code_message",
+                        code = error.code,
+                        message = error.message
+                    )
+                    .into_owned();
                     return None;
                 }
                 // A staged-drain SubmitPrompt can die at the TRANSPORT layer —
@@ -10662,18 +10848,16 @@ impl Store {
         match envelope.payload {
             PayloadV2::UserMessage { text, files } => {
                 let _ = self.resolve_v2_turn_id(&session_id, &wire_turn_id, false);
-                if let Some(session) = self.find_session_mut(&session_id) {
-                    let already_present = session.messages.iter().any(|message| {
-                        message.role == MessageRole::User
-                            && message.thread_id.as_deref() == Some(thread_id.as_str())
-                    });
-                    if !already_present {
-                        let mut message =
-                            Message::user(text).with_thread_id(ThreadId::new(thread_id));
-                        message.media = files.into_iter().map(|file| file.path).collect();
-                        session.messages.push(message);
-                    }
-                }
+                // Thread-id replay dedup + optimistic-row promotion
+                // (octos#1807: the `turn/steer` drain-time echo must
+                // reconcile with the client's own optimistic row — the
+                // normal submit path's echo reconciles identically).
+                self.state.apply_user_row_echo(
+                    &session_id,
+                    thread_id,
+                    text,
+                    files.into_iter().map(|file| file.path).collect(),
+                );
                 None
             }
             PayloadV2::AssistantDelta {
@@ -14788,6 +14972,385 @@ mod tests {
             store.state.pending_messages[0]
                 .starts_with("Peer results gathered from the blackboard:"),
             "the staged prompt is the synthesis prompt"
+        );
+    }
+
+    // --- turn/steer client (octos#1807): mid-turn input steers into the
+    // --- running turn when the server advertises the method; otherwise (and
+    // --- on any steer death) it stages exactly like before.
+
+    fn steer_capable_store() -> Store {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_TURN_STEER,
+        ]));
+        store
+    }
+
+    /// Start a turn and deliver its `TurnStarted` so the turn is LIVE
+    /// (`live_reply` bound — the state `try_steer_live_turn` requires).
+    fn start_live_turn(store: &mut Store, prompt: &str) -> TurnId {
+        let session_id = store.state.sessions[0].id.clone();
+        let started = store.queue_or_start_prompt_turn(prompt.into(), "sent".into());
+        let Some(AppUiCommand::SubmitPrompt(params)) = started else {
+            panic!("idle session starts the first turn, got {started:?}");
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id,
+                turn_id: params.turn_id.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        params.turn_id
+    }
+
+    /// Live turn + capability → the typed prompt STEERS (expected_turn_id =
+    /// the live turn), the optimistic transcript row is recorded like a
+    /// normal submit, and NOTHING is staged.
+    #[test]
+    fn steer_sends_turn_steer_for_live_turn_instead_of_staging() {
+        let mut store = steer_capable_store();
+        let session_id = store.state.sessions[0].id.clone();
+        let live_turn = start_live_turn(&mut store, "first prompt");
+
+        let command =
+            store.queue_or_start_prompt_turn("also check the tests".into(), "queued".into());
+
+        let Some(AppUiCommand::TurnSteer(params)) = command else {
+            panic!("expected a TurnSteer command, got {command:?}");
+        };
+        assert_eq!(params.session_id, session_id);
+        assert_eq!(
+            params.expected_turn_id,
+            Some(live_turn.clone()),
+            "the steer pins the ACTIVE turn id"
+        );
+        assert!(params.input.iter().any(|item| matches!(
+            item,
+            InputItem::Text { text } if text == "also check the tests"
+        )));
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "steered input must not be staged"
+        );
+        assert!(
+            store.state.sessions[0].messages.iter().any(|message| {
+                message.role == MessageRole::User && message.content == "also check the tests"
+            }),
+            "the optimistic transcript echo is recorded like a normal submit"
+        );
+        assert_eq!(store.state.pending_turn_steers.len(), 1);
+        assert_eq!(store.state.status, t!("status.steered_into_turn"));
+    }
+
+    /// Live turn, NO capability → staged exactly as today (regression pin for
+    /// old servers: byte-identical path).
+    #[test]
+    fn steer_without_capability_stages_exactly_like_today() {
+        let mut store = store_with_empty_session();
+        start_live_turn(&mut store, "first prompt");
+
+        let command = store.queue_or_start_prompt_turn("later text".into(), "queued".into());
+
+        assert!(command.is_none(), "old server stages, got {command:?}");
+        assert_eq!(store.state.pending_messages, vec!["later text"]);
+        assert_eq!(store.state.status, t!("status.message_staged"));
+        assert!(store.state.pending_turn_steers.is_empty());
+    }
+
+    /// The pre-`TurnStarted` window (submit in flight, `live_reply` not yet
+    /// bound) STAGES even with the capability: the expected turn is not
+    /// admitted server-side yet, so a steer would race the in-flight
+    /// `turn/start` and could start a second real turn out of order.
+    #[test]
+    fn steer_stages_in_the_pre_token_window() {
+        let mut store = steer_capable_store();
+        let started = store.queue_or_start_prompt_turn("first prompt".into(), "sent".into());
+        assert!(matches!(started, Some(AppUiCommand::SubmitPrompt(_))));
+
+        let command = store.queue_or_start_prompt_turn("second".into(), "queued".into());
+
+        assert!(
+            command.is_none(),
+            "pre-token submits stage, got {command:?}"
+        );
+        assert_eq!(store.state.pending_messages, vec!["second"]);
+        assert!(store.state.pending_turn_steers.is_empty());
+    }
+
+    /// A non-empty staged queue wins over steering: earlier text is still
+    /// waiting for turn-end, and steering newer text PAST it would reorder
+    /// the user's messages.
+    #[test]
+    fn steer_defers_to_nonempty_staged_queue_for_fifo_order() {
+        let mut store = steer_capable_store();
+        start_live_turn(&mut store, "first prompt");
+        store.state.pending_messages.push("earlier staged".into());
+
+        let command = store.queue_or_start_prompt_turn("newer text".into(), "queued".into());
+
+        assert!(command.is_none(), "FIFO: stages behind, got {command:?}");
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["earlier staged", "newer text"]
+        );
+        assert!(store.state.pending_turn_steers.is_empty());
+    }
+
+    /// `steered:true` apply → status only; the run state and pre-token marker
+    /// are untouched (the turn was already live). The drain-time persisted
+    /// user-row echo then RECONCILES the optimistic row (promoted, not
+    /// duplicated), and a replay of the same envelope stays deduped.
+    #[test]
+    fn steered_true_sets_status_and_echo_does_not_duplicate_row() {
+        use octos_core::ui_protocol::PayloadV2;
+        let mut store = steer_capable_store();
+        let session_id = store.state.sessions[0].id.clone();
+        let live_turn = start_live_turn(&mut store, "first prompt");
+        let command = store.queue_or_start_prompt_turn("also do X".into(), "queued".into());
+        assert!(matches!(command, Some(AppUiCommand::TurnSteer(_))));
+        let pre_token_before = store.state.pre_token_turns.clone();
+
+        store.apply_client_event(ClientEvent::TurnSteered(
+            crate::client_event::TurnSteeredClientEvent {
+                message: "steered".into(),
+                result: crate::model::TurnSteerResult {
+                    turn_id: live_turn.clone(),
+                    steered: true,
+                },
+            },
+        ));
+
+        assert_eq!(store.state.status, t!("status.steered_into_turn"));
+        assert!(
+            matches!(
+                store.state.run_state,
+                crate::model::SessionRunState::InProgress
+            ),
+            "the already-live run state is untouched"
+        );
+        assert_eq!(
+            store.state.pre_token_turns, pre_token_before,
+            "steered:true must not re-arm the pre-token marker"
+        );
+        assert!(store.state.pending_turn_steers.is_empty());
+
+        // Drain-time persisted echo: a normal v2 UserMessage envelope for the
+        // same text — the optimistic row is PROMOTED (stamped with the
+        // canonical thread id), never duplicated.
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id.clone(),
+            1,
+            &live_turn.0.to_string(),
+            PayloadV2::UserMessage {
+                text: "also do X".into(),
+                files: vec![],
+            },
+        )));
+        fn steered_rows(store: &Store) -> usize {
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.role == MessageRole::User && message.content == "also do X"
+                })
+                .count()
+        }
+        assert_eq!(
+            steered_rows(&store),
+            1,
+            "the steered row must not appear twice"
+        );
+        assert!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .any(|message| { message.content == "also do X" && message.thread_id.is_some() }),
+            "the surviving row carries the canonical thread id"
+        );
+
+        // A replayed copy of the same envelope stays deduped by thread id.
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id,
+            2,
+            &live_turn.0.to_string(),
+            PayloadV2::UserMessage {
+                text: "also do X".into(),
+                files: vec![],
+            },
+        )));
+        assert_eq!(steered_rows(&store), 1, "replayed echo must stay deduped");
+    }
+
+    /// The NORMAL submit path's own live user-row echo reconciles through the
+    /// same promotion (pins the shared reconciliation the steer relies on).
+    #[test]
+    fn user_row_echo_reconciles_optimistic_row_on_normal_submit() {
+        use octos_core::ui_protocol::PayloadV2;
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.composer = "hello world".into();
+        let command = store.compose_command();
+        let Some(AppUiCommand::SubmitPrompt(params)) = command else {
+            panic!("expected SubmitPrompt, got {command:?}");
+        };
+
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id,
+            1,
+            &params.turn_id.0.to_string(),
+            PayloadV2::UserMessage {
+                text: "hello world".into(),
+                files: vec![],
+            },
+        )));
+
+        assert_eq!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.role == MessageRole::User && message.content == "hello world"
+                })
+                .count(),
+            1,
+            "the persisted echo promotes the optimistic row instead of duplicating it"
+        );
+    }
+
+    /// `steered:false` apply → the server started a NEW real turn with the
+    /// input: the client arms itself the way a normal submit does
+    /// post-dispatch (pre-token marker + run-state in progress) and re-keys
+    /// the optimistic prompt onto the returned turn id.
+    #[test]
+    fn steered_false_arms_client_like_a_normal_submit() {
+        let mut store = steer_capable_store();
+        let session_id = store.state.sessions[0].id.clone();
+        let live_turn = start_live_turn(&mut store, "first prompt");
+        let command = store.queue_or_start_prompt_turn("also do X".into(), "queued".into());
+        assert!(matches!(command, Some(AppUiCommand::TurnSteer(_))));
+
+        // The expected turn settles while the steer is in flight — exactly
+        // the race `steered:false` covers.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: live_turn,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            !store.state.run_state.is_active(),
+            "the expected turn settled"
+        );
+
+        let new_turn = TurnId::new();
+        store.apply_client_event(ClientEvent::TurnSteered(
+            crate::client_event::TurnSteeredClientEvent {
+                message: "started".into(),
+                result: crate::model::TurnSteerResult {
+                    turn_id: new_turn.clone(),
+                    steered: false,
+                },
+            },
+        ));
+
+        assert!(
+            store.state.pre_token_turns.contains_key(&session_id),
+            "pre-token marker armed for the server-minted turn"
+        );
+        assert!(
+            matches!(
+                store.state.run_state,
+                crate::model::SessionRunState::InProgress
+            ),
+            "run state armed like a normal submit"
+        );
+        assert_eq!(store.state.status, t!("status.queued_turn_start"));
+        assert!(store.state.pending_turn_steers.is_empty());
+        assert_eq!(
+            store
+                .state
+                .submitted_prompt_for_turn(&session_id, &new_turn),
+            Some("also do X".into()),
+            "the optimistic prompt is re-keyed onto the REAL new turn"
+        );
+    }
+
+    /// A steer error frame (mismatch/rejection/cancel) falls back to STAGING
+    /// the prompt — the typed text must never be lost — withdraws the
+    /// optimistic row (the staged re-submit will re-record it), and leaves
+    /// the still-healthy main turn's run state alone.
+    #[test]
+    fn steer_error_frame_restages_the_prompt() {
+        use octos_core::app_ui::AppUiError;
+        let mut store = steer_capable_store();
+        start_live_turn(&mut store, "first prompt");
+        let command = store.queue_or_start_prompt_turn("also do X".into(), "queued".into());
+        assert!(matches!(command, Some(AppUiCommand::TurnSteer(_))));
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "invalid_params".into(),
+            message: "turn/steer request tui-3 failed: expected_turn_id does not match the \
+                      active turn (t-2)"
+                .into(),
+        }));
+
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["also do X"],
+            "the dead steer's text lands in the staged queue"
+        );
+        assert!(store.state.pending_turn_steers.is_empty());
+        assert_eq!(store.state.status, t!("status.message_staged"));
+        assert!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .all(|message| message.content != "also do X"),
+            "the optimistic row is withdrawn so the staged re-submit cannot duplicate it"
+        );
+        assert!(
+            store.state.sessions[0].messages.iter().any(|message| {
+                message.role == MessageRole::User && message.content == "first prompt"
+            }),
+            "the LIVE turn's own optimistic prompt row survives the withdraw"
+        );
+        assert!(
+            store.state.run_state.is_active(),
+            "a steer failure says nothing about the main turn — no Error flip"
+        );
+    }
+
+    /// A slash command typed mid-turn dispatches as a SLASH (the composer
+    /// intercepts it before the steer chokepoint) — never steered as plain
+    /// text, never staged.
+    #[test]
+    fn slash_command_mid_turn_dispatches_as_slash_not_steer() {
+        let mut store = steer_capable_store();
+        start_live_turn(&mut store, "first prompt");
+        store.state.set_composer_text("/help");
+
+        let command = store.compose_command();
+
+        assert!(
+            !matches!(command, Some(AppUiCommand::TurnSteer(_))),
+            "a slash input must never be steered as plain text: {command:?}"
+        );
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "a slash input must not be staged as chat text"
+        );
+        assert!(store.state.pending_turn_steers.is_empty());
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_HELP),
+            "/help dispatched as a slash command (help menu open)"
         );
     }
 

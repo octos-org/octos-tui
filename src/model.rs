@@ -3,7 +3,7 @@ use std::time::Instant;
 use octos_core::app_ui::{APP_UI_API_V1, AppUiLiveReply, AppUiSession, AppUiSnapshot, AppUiTask};
 use octos_core::ui_protocol::{
     ApprovalDecision, ApprovalId, ApprovalRenderHints, ApprovalRequestedEvent,
-    ApprovalScopesListParams, ApprovalTypedDetails, DiffPreviewGetParams, OutputCursor,
+    ApprovalScopesListParams, ApprovalTypedDetails, DiffPreviewGetParams, InputItem, OutputCursor,
     PermissionProfileListParams, PermissionProfileSelection, PermissionProfileSetParams, PreviewId,
     QuestionId, SessionHydrateParams, SessionListParams, SessionOrchestrationEvent,
     SessionRollbackParams, TaskArtifactReadParams, TaskCancelParams, TaskListParams,
@@ -84,6 +84,16 @@ pub const APPUI_METHOD_PEER_GATHER: &str = "peer/gather";
 /// `AppUiCommand::method()`); decoded tui-locally in the transport because
 /// the vendored octos-core rev predates the variant.
 pub const APPUI_METHOD_PEER_STAGED: &str = "peer/staged";
+/// octos#1807: `turn/steer` — mid-turn prompt injection into the ACTIVE
+/// turn. Params `{session_id, expected_turn_id?, input}`; result
+/// `{turn_id, steered}`. `steered:true` = the text joined the live turn
+/// (the id echoes THAT turn; the server persists it at drain time as a
+/// normal v2 `UserMessage` envelope, so it echoes back like any persisted
+/// user row). `steered:false` = no active turn existed and the server
+/// started a NEW real turn with the input (the id names the new turn).
+/// `expected_turn_id` mismatch → `invalid_params`. A MUTATING method
+/// (blocked in read-only mode like `turn/start`).
+pub const APPUI_METHOD_TURN_STEER: &str = "turn/steer";
 pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT: &str = "profile/sub_providers/upsert";
 pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE: &str = "profile/sub_providers/remove";
 pub const APPUI_METHOD_PROFILE_LLM_TEST: &str = "profile/llm/test";
@@ -776,6 +786,11 @@ pub enum AppUiCommand {
     /// [`ProtocolAppUiBackend::readonly_allows_command`], so it is blocked in
     /// read-only mode (like `SnapshotRestore` and the config upserts).
     PeerPrepare(PeerPrepareParams),
+    /// octos#1807: steer typed input into the ACTIVE turn instead of staging
+    /// it until turn-end. A MUTATING method — NOT listed in
+    /// [`ProtocolAppUiBackend::readonly_allows_command`] (it injects input
+    /// into a running turn, the same class as `turn/start`).
+    TurnSteer(TurnSteerParams),
     /// octos#1801 v2: read the peer blackboard for `/gather`. A READ
     /// (non-mutating) method — listed in
     /// [`ProtocolAppUiBackend::readonly_allows_command`] like `SnapshotList`.
@@ -880,6 +895,7 @@ impl AppUiCommand {
             Self::SnapshotList(_) => APPUI_METHOD_SNAPSHOT_LIST,
             Self::SnapshotRestore(_) => APPUI_METHOD_SNAPSHOT_RESTORE,
             Self::PeerPrepare(_) => APPUI_METHOD_PEER_PREPARE,
+            Self::TurnSteer(_) => APPUI_METHOD_TURN_STEER,
             Self::PeerGather(_) => APPUI_METHOD_PEER_GATHER,
             Self::ProfileSubProvidersUpsert(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
             Self::ProfileSubProvidersRemove(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
@@ -3572,6 +3588,50 @@ pub struct PeerGatherEntry {
     pub has_worktree: bool,
 }
 
+/// `turn/steer` request (octos#1807): mid-turn prompt injection into the
+/// ACTIVE turn. `expected_turn_id` pins the turn the client believes is live
+/// — a mismatch is rejected server-side (`invalid_params`) and the client
+/// falls back to staging; an ABSENT id steers whatever turn is live. `input`
+/// mirrors `turn/start`'s items (text only in the TUI flow).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnSteerParams {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_turn_id: Option<TurnId>,
+    pub input: Vec<InputItem>,
+}
+
+/// `turn/steer` result (octos#1807). `steered:true` = appended into the
+/// ACTIVE turn (`turn_id` echoes that turn; the text is persisted
+/// server-side AT DRAIN TIME as a normal v2 `UserMessage` envelope, so it
+/// echoes back like any persisted user row). `steered:false` = no active
+/// turn existed; the server started a NEW real turn with the input
+/// (`turn_id` names the new turn).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnSteerResult {
+    pub turn_id: TurnId,
+    #[serde(default)]
+    pub steered: bool,
+}
+
+/// An in-flight `turn/steer` (octos#1807): the client-local copy of the
+/// steered text so a steer that positively DIES (server rejection /
+/// cancel-all / send-layer failure) can fall back to STAGING the prompt
+/// without losing what the user typed. FIFO — the `TurnSteered` result and
+/// the method-attributed error frames each consume exactly one entry from
+/// the front (every dead steer produces exactly one attributed error event,
+/// see the transport's send/cancel paths).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingTurnSteer {
+    pub session_id: SessionKey,
+    /// The EXPECTED (live) turn id the steer named — also the id the
+    /// optimistic transcript row was recorded under, so the error fallback
+    /// can withdraw precisely that row and the `steered:false` apply can
+    /// re-key it onto the real new turn.
+    pub turn_id: TurnId,
+    pub prompt: String,
+}
+
 /// An in-flight `/peer` dispatch (#395): the client-local halves of the flow
 /// (`brief` for the kickoff text, `go` for the focus decision) that
 /// `peer/prepare`'s result does NOT echo back. Stashed at dispatch, consumed
@@ -4441,6 +4501,15 @@ pub struct AppState {
     /// terminal while the session was NOT focused. Incremented by the store's
     /// terminal appliers, cleared when the session gains focus.
     pub unread_turns: std::collections::HashMap<SessionKey, usize>,
+    /// octos#1807: in-flight `turn/steer` dispatches, FIFO. Each steer's
+    /// prompt lives ONLY here between dispatch and its result/error — a steer
+    /// that positively dies (attributed error frame) is re-staged from this
+    /// stash so the typed text is never lost, and a `steered:false` result
+    /// re-keys its optimistic row onto the server's real new turn. Consumed
+    /// front-first by [`crate::client_event::ClientEvent::TurnSteered`] and
+    /// the attributed error fallback (exactly one of which arrives per
+    /// steer). Bounded by the transport's pending-request cap.
+    pub pending_turn_steers: std::collections::VecDeque<PendingTurnSteer>,
     /// #395: the in-flight `/peer` dispatch. `peer/prepare`'s result does not
     /// echo the brief (and `go` never crosses the wire), so the dispatcher
     /// stashes them here; the `PeerPrepared` apply consumes the stash to build
@@ -6372,6 +6441,7 @@ impl AppState {
             run_state_started_at,
             pre_token_turns: std::collections::HashMap::new(),
             unread_turns: std::collections::HashMap::new(),
+            pending_turn_steers: std::collections::VecDeque::new(),
             pending_peer_prepare: None,
             pending_peer_kickoffs: std::collections::HashMap::new(),
             pending_session_approvals: std::collections::HashMap::new(),
@@ -7321,6 +7391,173 @@ impl AppState {
                 .or_default()
                 .insert(0, prompt);
         }
+    }
+
+    /// Stage a prompt at the BACK of its session's queue — the `turn/steer`
+    /// error fallback (octos#1807). Unlike the dead staged-DRAIN re-stage
+    /// (front — the drain had already dequeued it), a failed steer's text was
+    /// typed AFTER anything already staged, so appending preserves the
+    /// chronological order the user produced it in.
+    pub fn stage_prompt_back(&mut self, session_id: &SessionKey, prompt: String) {
+        let is_active = self
+            .active_session()
+            .is_some_and(|session| &session.id == session_id);
+        if is_active {
+            self.pending_messages.push(prompt);
+        } else {
+            self.pending_messages_by_session
+                .entry(session_id.clone())
+                .or_default()
+                .push(prompt);
+        }
+    }
+
+    /// Withdraw the optimistic row a DEAD `turn/steer` recorded (octos#1807):
+    /// like [`Self::withdraw_optimistic_user_prompt`], but content-matched —
+    /// the steer shares its turn id with the LIVE turn, whose ORIGINAL
+    /// prompt's optimistic entry (same session + turn, different content)
+    /// must survive. The turn-prompt anchor is deliberately left alone too:
+    /// the turn it names is still running.
+    pub fn withdraw_steered_user_prompt(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+        content: &str,
+    ) {
+        let Some(position) = self
+            .optimistic_user_messages
+            .iter()
+            .rposition(|optimistic| {
+                &optimistic.session_id == session_id
+                    && &optimistic.turn_id == turn_id
+                    && optimistic.content == content
+            })
+        else {
+            return;
+        };
+        let optimistic = self.optimistic_user_messages.remove(position);
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| &session.id == session_id)
+        else {
+            return;
+        };
+        // Only remove a row that is genuinely OUR optimistic insert (count
+        // above the pre-insert baseline); take the LAST matching row — the
+        // optimistic row is the most recent insert of this content.
+        if matching_user_message_count(session, &optimistic.content)
+            > optimistic.prior_matching_user_count
+            && let Some(row) = session.messages.iter().rposition(|message| {
+                message.role.as_str() == "user" && message.content == optimistic.content
+            })
+        {
+            session.messages.remove(row);
+        }
+    }
+
+    /// Re-key the optimistic row (and its turn-prompt anchor) a steer
+    /// recorded under the EXPECTED turn onto the REAL turn the server minted
+    /// (octos#1807 `steered:false`): the expected turn had already settled
+    /// server-side, so the text actually started `to_turn` — interrupt
+    /// restore and the turn card must resolve it under that id.
+    pub fn rekey_turn_prompt_records(
+        &mut self,
+        session_id: &SessionKey,
+        from_turn: &TurnId,
+        content: &str,
+        to_turn: &TurnId,
+    ) {
+        if let Some(optimistic) =
+            self.optimistic_user_messages
+                .iter_mut()
+                .rev()
+                .find(|optimistic| {
+                    &optimistic.session_id == session_id
+                        && &optimistic.turn_id == from_turn
+                        && optimistic.content == content
+                })
+        {
+            optimistic.turn_id = to_turn.clone();
+        }
+        if let Some(anchor) = self.turn_prompt_anchors.iter_mut().rev().find(|anchor| {
+            &anchor.session_id == session_id
+                && &anchor.turn_id == from_turn
+                && anchor.content == content
+        }) {
+            anchor.turn_id = to_turn.clone();
+        }
+    }
+
+    /// Apply a persisted v2 `UserMessage` envelope row. Dedup is two-layer:
+    ///
+    /// 1. thread-id identity — a replayed envelope whose row is already
+    ///    present is a no-op (pre-existing replay dedup);
+    /// 2. optimistic reconciliation (the #381-era count-baseline scheme,
+    ///    extended to the LIVE echo lane for `turn/steer`): when the echo's
+    ///    content matches a row this client already rendered optimistically
+    ///    ([`Self::record_submitted_user_prompt`]), PROMOTE that row — stamp
+    ///    the canonical thread id (and media) onto it and drop the optimistic
+    ///    tracking entry — instead of appending a duplicate. This is what
+    ///    keeps a steered row from appearing twice when its drain-time echo
+    ///    arrives mid-turn (and reconciles the normal submit path's own echo
+    ///    identically).
+    ///
+    /// Without an optimistic match the canonical row appends as before.
+    pub fn apply_user_row_echo(
+        &mut self,
+        session_id: &SessionKey,
+        thread_id: String,
+        text: String,
+        media: Vec<String>,
+    ) {
+        let Some(session_index) = self
+            .sessions
+            .iter()
+            .position(|session| &session.id == session_id)
+        else {
+            return;
+        };
+        let already_present = self.sessions[session_index].messages.iter().any(|message| {
+            message.role == octos_core::MessageRole::User
+                && message.thread_id.as_deref() == Some(thread_id.as_str())
+        });
+        if already_present {
+            return;
+        }
+        if let Some(tracked) = self
+            .optimistic_user_messages
+            .iter()
+            .rposition(|optimistic| {
+                &optimistic.session_id == session_id && optimistic.content == text
+            })
+        {
+            let baseline = self.optimistic_user_messages[tracked].prior_matching_user_count;
+            let session = &mut self.sessions[session_index];
+            // Promote only when our optimistic insert is genuinely present
+            // (count above the pre-insert baseline) and still un-stamped.
+            if matching_user_message_count(session, &text) > baseline
+                && let Some(row) = session.messages.iter().rposition(|message| {
+                    message.role.as_str() == "user"
+                        && message.content == text
+                        && message.thread_id.is_none()
+                })
+            {
+                let message = &mut session.messages[row];
+                message.thread_id = Some(thread_id);
+                if !media.is_empty() {
+                    message.media = media;
+                }
+                self.optimistic_user_messages.remove(tracked);
+                return;
+            }
+            // Tracked but its row is gone (withdrawn/replaced) — drop the
+            // stale tracking entry and fall through to the canonical append.
+            self.optimistic_user_messages.remove(tracked);
+        }
+        let mut message = Message::user(text).with_thread_id(octos_core::ThreadId::new(thread_id));
+        message.media = media;
+        self.sessions[session_index].messages.push(message);
     }
 
     pub fn record_turn_prompt_anchor_from_latest_user(

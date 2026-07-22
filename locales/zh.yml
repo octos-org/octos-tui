@@ -1262,6 +1262,7 @@ status:
   list_more: "，+%{count} 项更多"
   no_session_send_prompt: "没有打开的编码会话。发送提示前请运行 /onboard open-session。"
   message_staged: "消息已暂存；将在当前回合结束后提交。按 Esc 可中断/发送。"
+  steered_into_turn: "已插入正在运行的回合。"
   btw_usage: "用法:/btw <问题> — 在当前回合继续运行时快速旁路提问"
   btw_answering: "btw:回答中…"
   btw_answered: "btw:已回答"
