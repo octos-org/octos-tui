@@ -62,6 +62,13 @@ pub enum ClientEvent {
     /// wrote the durable brief; the store mints the peer session key, stashes
     /// the kickoff, and follows up with `session/open`.
     PeerPrepared(PeerPreparedClientEvent),
+    /// octos#1807: `turn/steer` result. `steered:true` — the typed text
+    /// joined the ACTIVE turn (status only; run-state/pre-token untouched,
+    /// the turn was already live). `steered:false` — no active turn existed
+    /// server-side and a NEW real turn started with the input; the store arms
+    /// the client like a normal submit (pre-token marker + run-state
+    /// in-progress) for the returned turn id.
+    TurnSteered(TurnSteeredClientEvent),
     /// octos#1801 v3: durable `peer/staged` notification — a server-side
     /// agent staged a peer (its `peer_spawn` tool); the store auto-opens it
     /// in the background via the same stash → `session/opened` kickoff flow
@@ -221,6 +228,13 @@ pub struct SnapshotListClientEvent {
 pub struct PeerPreparedClientEvent {
     pub message: String,
     pub result: crate::model::PeerPrepareResult,
+}
+
+/// octos#1807 `turn/steer` result for the mid-turn steer flow.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnSteeredClientEvent {
+    pub message: String,
+    pub result: crate::model::TurnSteerResult,
 }
 
 /// octos#1801 v2 `peer/gather` result for the `/gather` fan-in flow.

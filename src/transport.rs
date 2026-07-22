@@ -2031,6 +2031,7 @@ impl ProtocolAppUiBackend {
             | AppUiCommand::ProfileLlmDelete(_)
             | AppUiCommand::SnapshotRestore(_)
             | AppUiCommand::PeerPrepare(_)
+            | AppUiCommand::TurnSteer(_)
             | AppUiCommand::ProfileSubProvidersUpsert(_)
             | AppUiCommand::ProfileSubProvidersRemove(_)
             | AppUiCommand::ProfileLlmSelect(_)
@@ -2707,6 +2708,7 @@ fn rpc_request_from_command(
         AppUiCommand::SnapshotList(params) => serde_json::to_value(params),
         AppUiCommand::SnapshotRestore(params) => serde_json::to_value(params),
         AppUiCommand::PeerPrepare(params) => serde_json::to_value(params),
+        AppUiCommand::TurnSteer(params) => serde_json::to_value(params),
         AppUiCommand::PeerGather(params) => serde_json::to_value(params),
         AppUiCommand::ProfileSubProvidersUpsert(params) => serde_json::to_value(params),
         AppUiCommand::ProfileSubProvidersRemove(params) => serde_json::to_value(params),
@@ -3189,6 +3191,21 @@ fn success_response_to_app_event(
                         format!(
                             "failed to decode UI protocol result for {}: {err}",
                             crate::model::APPUI_METHOD_PEER_GATHER
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_TURN_STEER => {
+            match serde_json::from_value::<crate::model::TurnSteerResult>(result) {
+                Ok(result) => Ok(Some(turn_steered_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_TURN_STEER
                         ),
                     )
                     .into(),
@@ -3784,6 +3801,18 @@ fn snapshot_list_event(result: crate::model::SnapshotListResult) -> ClientEvent 
 fn peer_prepare_event(result: crate::model::PeerPrepareResult) -> ClientEvent {
     let message = format!("Peer session prepared: {}", result.slug);
     ClientEvent::PeerPrepared(crate::client_event::PeerPreparedClientEvent { message, result })
+}
+
+/// octos#1807: decode a `turn/steer` result into the typed
+/// [`ClientEvent::TurnSteered`]. The store owns the user-facing status line;
+/// this message is diagnostic.
+fn turn_steered_event(result: crate::model::TurnSteerResult) -> ClientEvent {
+    let message = if result.steered {
+        format!("Steered into active turn {}", result.turn_id.0)
+    } else {
+        format!("No active turn; started turn {}", result.turn_id.0)
+    };
+    ClientEvent::TurnSteered(crate::client_event::TurnSteeredClientEvent { message, result })
 }
 
 fn peer_gather_event(result: crate::model::PeerGatherResult) -> ClientEvent {
@@ -7030,6 +7059,97 @@ mod tests {
         assert_eq!(event.result.peers[1].topic, "peer-fix-nav-2");
     }
 
+    /// octos#1807: `turn/steer` requests encode session/expected-turn/input
+    /// (`expected_turn_id: None` omitted from the wire), and both result
+    /// shapes decode into the typed `ClientEvent::TurnSteered`.
+    #[test]
+    fn turn_steer_request_encodes_and_result_decodes_to_client_event() {
+        let expected_turn = TurnId::new();
+        let request = rpc_request_from_command(
+            "steer-1".into(),
+            AppUiCommand::TurnSteer(crate::model::TurnSteerParams {
+                session_id: SessionKey("coding:local:tui#coding".into()),
+                expected_turn_id: Some(expected_turn.clone()),
+                input: vec![octos_core::ui_protocol::InputItem::Text {
+                    text: "also check the tests".into(),
+                }],
+            }),
+        )
+        .expect("turn/steer request encodes");
+        assert_eq!(request.method, crate::model::APPUI_METHOD_TURN_STEER);
+        assert_eq!(request.params["session_id"], "coding:local:tui#coding");
+        assert_eq!(
+            request.params["expected_turn_id"],
+            expected_turn.0.to_string()
+        );
+        assert_eq!(request.params["input"][0]["text"], "also check the tests");
+
+        let absent = rpc_request_from_command(
+            "steer-2".into(),
+            AppUiCommand::TurnSteer(crate::model::TurnSteerParams {
+                session_id: SessionKey("coding:local:tui#coding".into()),
+                expected_turn_id: None,
+                input: vec![octos_core::ui_protocol::InputItem::Text {
+                    text: "steer whatever is live".into(),
+                }],
+            }),
+        )
+        .expect("turn/steer request without expected turn encodes");
+        assert!(
+            absent.params.get("expected_turn_id").is_none(),
+            "expected_turn_id: None must be omitted from the wire shape"
+        );
+
+        // steered:true — the ACTIVE turn's id echoes back.
+        let mut pending = HashMap::new();
+        pending.insert(
+            "steer-1".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_TURN_STEER.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "steer-1",
+            "result": { "turn_id": expected_turn.0.to_string(), "steered": true }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::TurnSteered(event) = event else {
+            panic!("expected turn steered event, got {event:?}");
+        };
+        assert!(event.result.steered);
+        assert_eq!(event.result.turn_id, expected_turn);
+
+        // steered:false — the server-minted NEW turn id comes back.
+        let new_turn = TurnId::new();
+        let mut pending = HashMap::new();
+        pending.insert(
+            "steer-3".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_TURN_STEER.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "steer-3",
+            "result": { "turn_id": new_turn.0.to_string(), "steered": false }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::TurnSteered(event) = event else {
+            panic!("expected turn steered event, got {event:?}");
+        };
+        assert!(!event.result.steered);
+        assert_eq!(event.result.turn_id, new_turn);
+    }
+
     /// octos#1801 v3: the durable `peer/staged` NOTIFICATION decodes via the
     /// tui-local string-keyed match into `ClientEvent::PeerStaged` — the
     /// vendored octos-core rev predates the `UiNotification` variant, so
@@ -7540,6 +7660,15 @@ mod tests {
                 cwd: None,
                 session_id: None,
                 profile_id: None,
+            }),
+            // octos#1807: `turn/steer` injects input into a running turn —
+            // the same mutation class as `turn/start`, blocked in read-only.
+            AppUiCommand::TurnSteer(crate::model::TurnSteerParams {
+                session_id: SessionKey("local:test".into()),
+                expected_turn_id: Some(TurnId::new()),
+                input: vec![octos_core::ui_protocol::InputItem::Text {
+                    text: "steer".into(),
+                }],
             }),
         ];
         for command in &mutating_commands {
