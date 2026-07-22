@@ -7928,8 +7928,27 @@ impl AppState {
         {
             return Some(text);
         }
-        self.active_agent_record(agent_id)
-            .and_then(|agent| agent.output_tail.as_deref())
+        let agent = self.active_agent_record(agent_id)?;
+        if let Some(tail) = agent.output_tail.as_deref()
+            && !tail.is_empty()
+        {
+            return Some(tail);
+        }
+        // Fallback for `spawn`/`spawn_only` background children (deep review):
+        // their streaming output rides `task/output/delta` into the PER-TASK
+        // store (`AppUiTask.output_tail`), NOT the per-agent `agent_outputs`
+        // cache the dock reads first, and the per-agent `output_tail` snapshot
+        // only lands on the terminal `agent/updated`. While the child runs,
+        // surface its live per-task tail so the dock shows output instead of
+        // the empty placeholder.
+        let task_id = agent.task_id.as_deref()?.parse::<TaskId>().ok()?;
+        let session = self.active_session()?;
+        let task = session.tasks.iter().find(|task| task.id == task_id)?;
+        if task.output_tail.is_empty() {
+            None
+        } else {
+            Some(task.output_tail.as_str())
+        }
     }
 
     /// The record for a sub-agent of the active session, by id.
