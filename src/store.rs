@@ -9612,6 +9612,24 @@ impl Store {
             // Streamed voice audio (#1504) — the TUI has no audio surface;
             // ignore gracefully so newer servers don't wedge the client.
             UiNotification::VoiceAudioChunk(_) => None,
+            // #1801 v3: against an rc.13+ core the `peer/staged` frame decodes
+            // to this typed variant. (Older cores lacked it, so #405 routes
+            // the raw frame through a transport string-intercept →
+            // `ClientEvent::PeerStaged`.) Route both to the one handler; the
+            // dual idempotency in `apply_peer_staged_event` makes any overlap
+            // a no-op — an already-open peer session is never re-kicked.
+            UiNotification::PeerStaged(event) => {
+                self.apply_peer_staged_event(crate::model::PeerStagedParams {
+                    session_id: event.session_id,
+                    topic: event.topic,
+                    slug: event.slug,
+                    brief: event.brief,
+                    brief_path: event.brief_path,
+                    cwd: event.cwd,
+                    worktree_branch: event.worktree_branch,
+                    profile_id: event.profile_id,
+                })
+            }
             UiNotification::SessionOpened(event) => {
                 let session_id = event.session_id.clone();
                 // #395: a `/peer`-prepared session landing. Popped BEFORE the

@@ -1,6 +1,6 @@
 [package]
 name = "octos-tui"
-version = "0.2.2-rc.14"
+version = "0.2.2-rc.15"
 edition = "2024"
 rust-version = "1.85.0"
 license = "Apache-2.0"
@@ -23,7 +23,7 @@ path = "src/main.rs"
 # per-project `session/list` scoping below. This rev is a clean 1-commit
 # superset of the previous main pin `82b1abf11148`. RE-PIN to the merged main
 # rev once #1662 lands on octos `main`.
-octos-core = { git = "https://github.com/octos-org/octos", rev = "95ac58ad48c60df1e46cea429d618d20e7717c1f" }
+octos-core = { git = "https://github.com/octos-org/octos", rev = "8a9cb2c1efc08bdfc4cfaa220be090d8033f8187" }
 clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
 color-eyre = "0.6"
