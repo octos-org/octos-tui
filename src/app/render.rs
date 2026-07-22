@@ -757,6 +757,7 @@ pub(super) fn render_activity_navigator_overlay(
     frame.render_widget(
         Paragraph::new(hint_bar_text(HintBarModel {
             mode: HintBarMode::ActivityNavigator,
+            peers_present: false,
         }))
         .style(Style::default().fg(palette.text).bg(palette.surface_alt)),
         areas.hint,

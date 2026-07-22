@@ -9794,6 +9794,37 @@ mod tests {
     }
 
     #[test]
+    fn hint_bar_model_flags_peers_and_swaps_in_peer_keys() {
+        let mut app = chat_app(vec![Message::user("hi")]);
+        // No peers open: plain status keys, no peer hint.
+        let bare = hint_bar_model(&app);
+        assert_eq!(bare.mode, HintBarMode::StatusbarKeys);
+        assert!(!bare.peers_present);
+        assert!(!hint_bar_text(bare).contains("peers"));
+
+        // Open a peer: the idle status bar advertises the dock (Ctrl+L) and the
+        // session switcher (Ctrl+S) so a blocked peer is reachable from here.
+        app.peer_session_meta.insert(
+            SessionKey("local:tui#peer-ci-red".into()),
+            crate::model::PeerMeta {
+                slug: "ci-red".into(),
+                brief_path: "/tmp/brief.md".into(),
+                agent_staged: false,
+                created: std::time::Instant::now(),
+            },
+        );
+        let with_peer = hint_bar_model(&app);
+        assert_eq!(with_peer.mode, HintBarMode::StatusbarKeys);
+        assert!(with_peer.peers_present);
+        let hint = hint_bar_text(with_peer);
+        assert!(hint.contains("Ctrl+L"), "advertises the peer dock: {hint}");
+        assert!(
+            hint.contains("Ctrl+S"),
+            "advertises the session switcher: {hint}"
+        );
+    }
+
+    #[test]
     fn hint_bar_model_uses_pager_keys_at_bottom() {
         let mut app = chat_app(vec![Message::user("hi")]);
         app.transcript_pager_active = true;

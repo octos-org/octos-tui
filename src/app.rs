@@ -469,6 +469,10 @@ pub enum HintBarMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HintBarModel {
     pub mode: HintBarMode,
+    /// Whether any peer sessions are open. When true, the idle status bar swaps
+    /// in a peer-aware key hint (`Ctrl+L peers | Ctrl+S sessions`) so the fleet
+    /// and the way to reach a blocked peer are discoverable from the composer.
+    pub peers_present: bool,
 }
 
 pub fn hint_bar_model(app: &AppState) -> HintBarModel {
@@ -497,7 +501,10 @@ pub fn hint_bar_model(app: &AppState) -> HintBarModel {
     } else {
         HintBarMode::StatusbarKeys
     };
-    HintBarModel { mode }
+    HintBarModel {
+        mode,
+        peers_present: !app.peer_session_meta.is_empty(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2462,13 +2469,13 @@ fn turn_summary_text(summary: &crate::model::TurnActivitySummary) -> String {
 
 /// "Swirling galaxy" spinner frames: a spiral arm sweeps one full clockwise
 /// revolution (6 arc frames), then the core glints (bright ✦ → fading ✧) —
-/// at the 120ms tick in [`spinner_frame`] that is a 720ms swirl + a 240ms
-/// sparkle per 960ms cycle. Every frame is exactly one terminal cell wide
+/// at the 160ms tick in [`spinner_frame`] that is a 960ms swirl + a 320ms
+/// sparkle per 1280ms cycle. Every frame is exactly one terminal cell wide
 /// (ambiguous-width-but-1 glyphs; same shipped precedent as ✻ / ⚠), which the
 /// fixed marker layout math depends on.
 const SPINNER_FRAMES: [&str; 8] = ["◜", "◠", "◝", "◞", "◡", "◟", "✦", "✧"];
 
-/// Current spinner frame, advancing ~every 120ms off a process-lifetime clock
+/// Current spinner frame, advancing ~every 160ms off a process-lifetime clock
 /// (independent of any turn timer, so it keeps animating while background
 /// sub-agents run after the parent turn has finished). The event loop redraws
 /// every ~25ms, so this reads as smooth motion.
@@ -2477,7 +2484,7 @@ fn spinner_frame() -> &'static str {
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
     let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
-    SPINNER_FRAMES[(elapsed / 120) as usize % SPINNER_FRAMES.len()]
+    SPINNER_FRAMES[(elapsed / 160) as usize % SPINNER_FRAMES.len()]
 }
 
 /// Seconds since process start — the same process clock `spinner_frame` rides,
@@ -4828,6 +4835,9 @@ fn cursor_width_for_text(text: &str, width: usize) -> usize {
 
 fn hint_bar_text(model: HintBarModel) -> String {
     match model.mode {
+        HintBarMode::StatusbarKeys if model.peers_present => {
+            t!("app.hint.statusbar_keys_peers").into_owned()
+        }
         HintBarMode::StatusbarKeys => t!("app.hint.statusbar_keys").into_owned(),
         HintBarMode::Menu => t!("app.hint.menu").into_owned(),
         HintBarMode::Onboarding => t!("app.hint.onboarding").into_owned(),
