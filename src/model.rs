@@ -78,6 +78,12 @@ pub const APPUI_METHOD_PEER_PREPARE: &str = "peer/prepare";
 /// terminals). Backs `/gather`. A READ (non-mutating) method, allowed in
 /// read-only mode like [`APPUI_METHOD_SNAPSHOT_LIST`].
 pub const APPUI_METHOD_PEER_GATHER: &str = "peer/gather";
+/// octos#1801 peer v3: durable SERVER→CLIENT notification — a server-side
+/// agent staged a peer via its `peer_spawn` tool; the client auto-opens it in
+/// the background. Not a request method (never appears in
+/// `AppUiCommand::method()`); decoded tui-locally in the transport because
+/// the vendored octos-core rev predates the variant.
+pub const APPUI_METHOD_PEER_STAGED: &str = "peer/staged";
 pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT: &str = "profile/sub_providers/upsert";
 pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE: &str = "profile/sub_providers/remove";
 pub const APPUI_METHOD_PROFILE_LLM_TEST: &str = "profile/llm/test";
@@ -3494,6 +3500,28 @@ pub struct PeerPrepareResult {
 pub struct PeerFleetEntry {
     pub slug: String,
     pub topic: String,
+    pub brief_path: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
+    pub profile_id: String,
+}
+
+/// Params of the durable [`APPUI_METHOD_PEER_STAGED`] notification
+/// (octos#1801 v3): a server-side agent staged a peer and the client
+/// auto-opens it in the background. `session_id` is the ORIGINATING session
+/// (the one whose agent ran `peer_spawn`), NOT the peer's — the peer key is
+/// minted client-side from `profile_id` + `topic` exactly like the `/peer`
+/// flow. Tui-local wire mirror: the vendored octos-core rev predates the
+/// `UiNotification` variant, so the transport decodes the method string into
+/// this struct directly. Durable ⇒ replayed on reconnect; the store handler
+/// is idempotent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerStagedParams {
+    pub session_id: SessionKey,
+    pub topic: String,
+    pub slug: String,
+    pub brief: String,
     pub brief_path: String,
     pub cwd: String,
     #[serde(default)]

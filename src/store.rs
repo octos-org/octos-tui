@@ -1085,6 +1085,64 @@ impl Store {
         ))
     }
 
+    /// Durable `peer/staged` notification (octos#1801 v3): a server-side
+    /// agent staged a peer via its `peer_spawn` tool — auto-open it in the
+    /// background by riding the exact `/peer` flow: stash a go-less
+    /// [`crate::model::PeerKickoff`] under the minted peer key and emit
+    /// `session/open`; the `session/opened` arm then pops the stash and
+    /// fires the kickoff TO THE PEER KEY without touching focus (#401).
+    ///
+    /// Durable ⇒ REPLAYED on reconnect (and deliverable twice), so this is
+    /// idempotent: a peer whose session already exists — or whose kickoff is
+    /// already stashed (open still in flight) — sets no state and emits no
+    /// command, just a low-key status. Stale stashes are pruned FIRST
+    /// (mirrors [`Self::apply_peer_prepared_event`]) so a dead open past
+    /// [`crate::model::PEER_KICKOFF_TTL`] cannot block a fresh staging.
+    fn apply_peer_staged_event(
+        &mut self,
+        event: crate::model::PeerStagedParams,
+    ) -> Option<AppUiCommand> {
+        let session_id = octos_core::SessionKey::with_profile_topic(
+            &event.profile_id,
+            "local",
+            "tui",
+            &event.topic,
+        );
+        self.state.prune_stale_peer_kickoffs();
+        let session_exists = self
+            .state
+            .sessions
+            .iter()
+            .any(|session| session.id == session_id);
+        let open_in_flight = self.state.pending_peer_kickoffs.contains_key(&session_id);
+        if session_exists || open_in_flight {
+            self.state.status =
+                t!("status.peer_staged_known", slug = event.slug.clone()).into_owned();
+            return None;
+        }
+        self.state.pending_peer_kickoffs.insert(
+            session_id.clone(),
+            crate::model::PeerKickoff {
+                brief: event.brief,
+                brief_path: event.brief_path,
+                go: false,
+                created: std::time::Instant::now(),
+            },
+        );
+        self.state.status =
+            t!("status.peer_staged_by_agent", slug = event.slug.clone()).into_owned();
+        Some(AppUiCommand::OpenSession(
+            octos_core::ui_protocol::SessionOpenParams {
+                session_id,
+                topic: None,
+                profile_id: Some(event.profile_id),
+                cwd: Some(event.cwd),
+                sandbox: None,
+                after: None,
+            },
+        ))
+    }
+
     /// A peer session's `session/opened` landed with `go: false` (#395): land
     /// the [`SessionView`] WITHOUT the focus-switch bundle (no
     /// `switch_selected_session`, no global workspace/pane mutation — the
@@ -6896,6 +6954,7 @@ impl Store {
                 None
             }
             ClientEvent::PeerPrepared(event) => self.apply_peer_prepared_event(event),
+            ClientEvent::PeerStaged(event) => self.apply_peer_staged_event(event),
             ClientEvent::PeerGathered(event) => self.apply_peer_gathered_event(event),
             ClientEvent::SubProvidersMutation(event) => {
                 self.apply_sub_providers_mutation_event(event);
@@ -14444,6 +14503,142 @@ mod tests {
         assert!(
             store.state.dequeue_autonomy_hydration().is_none(),
             "nothing rides the follow-up queue for a single peer"
+        );
+    }
+
+    // ── peer/staged — LLM-initiated peers (octos#1801 v3) ───────────────────
+
+    /// The durable `peer/staged` notification params a server-side agent's
+    /// `peer_spawn` produces (the transport decodes the wire frame into this
+    /// same struct).
+    fn staged_peer_params() -> crate::model::PeerStagedParams {
+        crate::model::PeerStagedParams {
+            session_id: SessionKey("local:test".into()),
+            topic: "peer-fix-nav".into(),
+            slug: "fix-nav".into(),
+            brief: "fix the nav".into(),
+            brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
+            cwd: "/repo".into(),
+            worktree_branch: None,
+            profile_id: "coding".into(),
+        }
+    }
+
+    #[test]
+    fn peer_staged_stashes_kickoff_and_opens_in_background() {
+        let mut store = peer_capable_store();
+        let open = store.apply_client_event(ClientEvent::PeerStaged(staged_peer_params()));
+        let Some(AppUiCommand::OpenSession(params)) = open else {
+            panic!("staged peer must emit session/open, got {open:?}");
+        };
+        // The peer key is minted exactly like the `/peer` flow's:
+        // with_profile_topic(profile, "local", "tui", topic).
+        assert_eq!(
+            params.session_id,
+            octos_core::SessionKey::with_profile_topic("coding", "local", "tui", "peer-fix-nav")
+        );
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+        assert_eq!(params.cwd.as_deref(), Some("/repo"));
+        assert!(params.topic.is_none());
+        assert!(params.sandbox.is_none());
+        let kickoff = store
+            .state
+            .pending_peer_kickoffs
+            .get(&params.session_id)
+            .expect("kickoff stashed under the minted peer key");
+        assert_eq!(kickoff.brief, "fix the nav");
+        assert_eq!(kickoff.brief_path, "/repo/.octos/peers/fix-nav/BRIEF.md");
+        assert!(!kickoff.go, "agent-staged peers never steal focus");
+        assert_eq!(
+            store.state.status,
+            t!("status.peer_staged_by_agent", slug = "fix-nav")
+        );
+
+        // The existing `session/opened` arm (tui#401) pops the stash and
+        // fires the kickoff TO THE PEER KEY, leaving focus where it was.
+        let command = peer_session_opened(&mut store, &params.session_id);
+        let Some(AppUiCommand::SubmitPrompt(submit)) = command else {
+            panic!("landing the staged peer must submit the kickoff, got {command:?}");
+        };
+        assert_eq!(submit.session_id, params.session_id);
+        let [InputItem::Text { text }] = submit.input.as_slice() else {
+            panic!("kickoff input is a single text item: {:?}", submit.input);
+        };
+        assert!(text.starts_with("You are a peer agent. Your brief:\n\nfix the nav"));
+        assert!(text.contains("/repo/.octos/peers/fix-nav/BRIEF.md"));
+        assert_eq!(
+            store
+                .state
+                .active_session()
+                .map(|session| session.id.clone()),
+            Some(SessionKey("local:test".into())),
+            "an agent-staged peer must not steal focus"
+        );
+        assert!(store.state.pending_peer_kickoffs.is_empty());
+    }
+
+    #[test]
+    fn peer_staged_with_existing_session_is_idempotent_replay_noop() {
+        let mut store = peer_capable_store();
+        let open = store.apply_client_event(ClientEvent::PeerStaged(staged_peer_params()));
+        let Some(AppUiCommand::OpenSession(params)) = open else {
+            panic!("staged peer must emit session/open, got {open:?}");
+        };
+        peer_session_opened(&mut store, &params.session_id);
+        let focus_before = store
+            .state
+            .active_session()
+            .map(|session| session.id.clone());
+
+        // Reconnect replay of the durable notification: the peer session
+        // already exists → no command, no stash, no focus change.
+        let replay = store.apply_client_event(ClientEvent::PeerStaged(staged_peer_params()));
+        assert!(
+            replay.is_none(),
+            "replayed staging must not re-open, got {replay:?}"
+        );
+        assert!(
+            store.state.pending_peer_kickoffs.is_empty(),
+            "replayed staging must not re-stash a kickoff (it would re-fire the kickoff turn)"
+        );
+        assert_eq!(
+            store
+                .state
+                .active_session()
+                .map(|session| session.id.clone()),
+            focus_before,
+            "replayed staging must not touch focus"
+        );
+        assert_eq!(
+            store.state.status,
+            t!("status.peer_staged_known", slug = "fix-nav")
+        );
+    }
+
+    #[test]
+    fn peer_staged_double_delivery_stashes_and_opens_once() {
+        let mut store = peer_capable_store();
+        let first = store.apply_client_event(ClientEvent::PeerStaged(staged_peer_params()));
+        assert!(
+            matches!(first, Some(AppUiCommand::OpenSession(_))),
+            "first delivery opens the peer, got {first:?}"
+        );
+        // The duplicate lands BEFORE `session/opened` (back-to-back double
+        // delivery): the stashed kickoff marks the open as in flight, so the
+        // session-exists check alone would not catch it.
+        let second = store.apply_client_event(ClientEvent::PeerStaged(staged_peer_params()));
+        assert!(
+            second.is_none(),
+            "double delivery must not open twice, got {second:?}"
+        );
+        assert_eq!(
+            store.state.pending_peer_kickoffs.len(),
+            1,
+            "exactly one kickoff stays stashed"
+        );
+        assert_eq!(
+            store.state.status,
+            t!("status.peer_staged_known", slug = "fix-nav")
         );
     }
 

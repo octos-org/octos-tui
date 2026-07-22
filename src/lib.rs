@@ -165,6 +165,8 @@ mod i18n_tests {
             "status.peer_started",
             "status.peer_switched",
             "status.peer_fleet_opening",
+            "status.peer_staged_by_agent",
+            "status.peer_staged_known",
             "command.gather.desc",
             "status.gather_requesting",
             "status.gather_no_peers",

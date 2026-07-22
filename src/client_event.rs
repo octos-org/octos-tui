@@ -62,6 +62,12 @@ pub enum ClientEvent {
     /// wrote the durable brief; the store mints the peer session key, stashes
     /// the kickoff, and follows up with `session/open`.
     PeerPrepared(PeerPreparedClientEvent),
+    /// octos#1801 v3: durable `peer/staged` notification — a server-side
+    /// agent staged a peer (its `peer_spawn` tool); the store auto-opens it
+    /// in the background via the same stash → `session/opened` kickoff flow
+    /// as `/peer`. Durable ⇒ replayed on reconnect, so the store handler is
+    /// idempotent (a peer whose session already exists is a no-op).
+    PeerStaged(crate::model::PeerStagedParams),
     /// octos#1801 v2: `peer/gather` result — the peer blackboard rows
     /// (brief + latest result per staged peer). The store composes the
     /// `/gather` synthesis prompt from these and submits it into the CURRENT

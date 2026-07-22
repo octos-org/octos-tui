@@ -479,6 +479,8 @@ status:
   peer_started: "Peer %{slug} is working in the background — watch its badge in the session strip (Alt+S)."
   peer_switched: "Peer %{slug} started — you are in its session now."
   peer_fleet_opening: "Opening a fleet of %{n} peers (first: %{slug})…"
+  peer_staged_by_agent: "Agent spun off peer %{slug} — working in the background (Alt+S)."
+  peer_staged_known: "Peer %{slug} is already staged — duplicate notice ignored."
   gather_requesting: "Gathering peer results from the blackboard…"
   gather_no_peers: "No peers staged on the blackboard — /peer to spin some up first."
   gather_submitted: "Gathered %{n} peer(s) from the blackboard into this session."
