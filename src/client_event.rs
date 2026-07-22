@@ -62,6 +62,11 @@ pub enum ClientEvent {
     /// wrote the durable brief; the store mints the peer session key, stashes
     /// the kickoff, and follows up with `session/open`.
     PeerPrepared(PeerPreparedClientEvent),
+    /// octos#1801 v2: `peer/gather` result — the peer blackboard rows
+    /// (brief + latest result per staged peer). The store composes the
+    /// `/gather` synthesis prompt from these and submits it into the CURRENT
+    /// session (staging-aware).
+    PeerGathered(PeerGatheredClientEvent),
     SubProvidersMutation(SubProvidersMutationClientEvent),
     ProfileSkillsList(ProfileSkillsListClientEvent),
     ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchClientEvent),
@@ -210,6 +215,13 @@ pub struct SnapshotListClientEvent {
 pub struct PeerPreparedClientEvent {
     pub message: String,
     pub result: crate::model::PeerPrepareResult,
+}
+
+/// octos#1801 v2 `peer/gather` result for the `/gather` fan-in flow.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerGatheredClientEvent {
+    pub message: String,
+    pub result: crate::model::PeerGatherResult,
 }
 
 #[derive(Debug, Clone, PartialEq)]

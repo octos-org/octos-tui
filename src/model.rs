@@ -73,6 +73,11 @@ pub const APPUI_METHOD_SNAPSHOT_RESTORE: &str = "snapshot/restore";
 /// #395 peer agents v1 (octos#1800): prepare a peer session (durable brief
 /// file + slug/topic + optional worktree) for `/peer`. A MUTATING method.
 pub const APPUI_METHOD_PEER_PREPARE: &str = "peer/prepare";
+/// octos#1801 peer v2: read the profile's peer blackboard — every staged
+/// peer's brief + latest result file (written server-side on the peer's turn
+/// terminals). Backs `/gather`. A READ (non-mutating) method, allowed in
+/// read-only mode like [`APPUI_METHOD_SNAPSHOT_LIST`].
+pub const APPUI_METHOD_PEER_GATHER: &str = "peer/gather";
 pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT: &str = "profile/sub_providers/upsert";
 pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE: &str = "profile/sub_providers/remove";
 pub const APPUI_METHOD_PROFILE_LLM_TEST: &str = "profile/llm/test";
@@ -765,6 +770,10 @@ pub enum AppUiCommand {
     /// [`ProtocolAppUiBackend::readonly_allows_command`], so it is blocked in
     /// read-only mode (like `SnapshotRestore` and the config upserts).
     PeerPrepare(PeerPrepareParams),
+    /// octos#1801 v2: read the peer blackboard for `/gather`. A READ
+    /// (non-mutating) method — listed in
+    /// [`ProtocolAppUiBackend::readonly_allows_command`] like `SnapshotList`.
+    PeerGather(PeerGatherParams),
     ProfileSubProvidersUpsert(SubProvidersUpsertParams),
     ProfileSubProvidersRemove(SubProvidersRemoveParams),
     ProfileSkillsList(ProfileSkillsListParams),
@@ -865,6 +874,7 @@ impl AppUiCommand {
             Self::SnapshotList(_) => APPUI_METHOD_SNAPSHOT_LIST,
             Self::SnapshotRestore(_) => APPUI_METHOD_SNAPSHOT_RESTORE,
             Self::PeerPrepare(_) => APPUI_METHOD_PEER_PREPARE,
+            Self::PeerGather(_) => APPUI_METHOD_PEER_GATHER,
             Self::ProfileSubProvidersUpsert(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
             Self::ProfileSubProvidersRemove(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
             Self::ProfileSkillsList(_) => APPUI_METHOD_PROFILE_SKILLS_LIST,
@@ -3441,6 +3451,12 @@ pub struct SubProviderView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PeerPrepareParams {
     pub brief: String,
+    /// octos#1801 v2 fleet staging: ask the server for N peers from this ONE
+    /// brief (suffixed slugs, per-peer worktrees when `worktree`). `None`
+    /// keeps the v1 single-peer wire shape (omitted entirely, so old servers
+    /// never see an unknown field with `deny_unknown_fields`-style parsing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default)]
@@ -3456,7 +3472,9 @@ pub struct PeerPrepareParams {
 /// `peer/prepare` result: the server-minted `slug`, its `topic`
 /// (`peer-<slug>`), the durable brief file path, the resolved workspace
 /// `cwd`, the worktree branch (when one was created), and the profile the
-/// peer session must open under.
+/// peer session must open under. octos#1801 v2 adds `peers` — the whole
+/// staged fleet (the scalar fields mirror its FIRST entry); serde-defaulted
+/// to empty so v1 servers' scalar-only responses still decode.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PeerPrepareResult {
     pub slug: String,
@@ -3466,6 +3484,64 @@ pub struct PeerPrepareResult {
     #[serde(default)]
     pub worktree_branch: Option<String>,
     pub profile_id: String,
+    #[serde(default)]
+    pub peers: Vec<PeerFleetEntry>,
+}
+
+/// One staged peer of a `peer/prepare` fleet (octos#1801 v2) — the same
+/// fields as the scalar [`PeerPrepareResult`] head, per peer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerFleetEntry {
+    pub slug: String,
+    pub topic: String,
+    pub brief_path: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
+    pub profile_id: String,
+}
+
+/// `peer/gather` request (octos#1801 v2): read the peer blackboard.
+/// `slugs: None` = every staged peer; `session_id` carries the ACTIVE
+/// session so the server scopes the profile (mirrors
+/// [`PeerPrepareParams`]); `profile_id` stays `None` in the TUI flow.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerGatherParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slugs: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+/// `peer/gather` result: the resolved profile + per staged peer its brief
+/// and latest `result.md` (present only once a turn of that peer session has
+/// terminated). Truncation flags mark server-side caps.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerGatherResult {
+    pub profile_id: String,
+    #[serde(default)]
+    pub peers: Vec<PeerGatherEntry>,
+}
+
+/// One blackboard row of a `peer/gather` result (octos#1801 v2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerGatherEntry {
+    pub slug: String,
+    #[serde(default)]
+    pub topic: String,
+    pub brief: String,
+    #[serde(default)]
+    pub brief_truncated: bool,
+    #[serde(default)]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub result_truncated: bool,
+    #[serde(default)]
+    pub result_updated_unix: Option<u64>,
+    #[serde(default)]
+    pub has_worktree: bool,
 }
 
 /// An in-flight `/peer` dispatch (#395): the client-local halves of the flow
