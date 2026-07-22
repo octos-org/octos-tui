@@ -2340,6 +2340,7 @@ fn user_question_action_labels(picker: &UserQuestionPickerState) -> Vec<String> 
     labels
 }
 
+#[cfg(test)]
 fn fit_card_text(text: &str, width: usize) -> String {
     // Reserve the 4-space prefix added by the caller. The budget is DISPLAY
     // COLUMNS (unicode-width), not chars — CJK glyphs are double-width, so a

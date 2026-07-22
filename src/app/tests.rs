@@ -2740,6 +2740,68 @@ mod tests {
         assert_eq!(fit_card_text("四字选项", 12), "四字选项");
     }
 
+    /// User report: long question/option text was TRUNCATED with an ellipsis;
+    /// it must wrap to new lines instead (width-aware, CJK-safe).
+    #[test]
+    fn question_card_wraps_long_options_and_questions_instead_of_truncating() {
+        use super::transcript_build::{push_user_question_entry, wrap_display_width};
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let entry = crate::model::UserQuestionEntry {
+            header: String::new(),
+            question: "Which of these very long strategies should we adopt for the multi-region rollout considering budget, latency, and team capacity?".into(),
+            options: vec![octos_core::ui_protocol::UserQuestionOption {
+                label: "Adopt the fully incremental region-by-region strategy".into(),
+                description: "slower but derisks the migration and keeps rollback trivial at every stage of the multi-quarter plan".into(),
+            }],
+            multi_select: false,
+            option_selected: vec![false],
+            free_text: String::new(),
+            cursor: 0,
+            editing_free_text: false,
+        };
+        let mut lines = Vec::new();
+        push_user_question_entry(&mut lines, palette, &entry, 40);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            !rendered.iter().any(|row| row.contains('…')),
+            "no ellipsis truncation in the card: {rendered:?}"
+        );
+        let joined = rendered
+            .iter()
+            .map(|row| row.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("team capacity?"),
+            "the question tail survives via wrapping: {rendered:?}"
+        );
+        assert!(
+            joined.contains("multi-quarter plan"),
+            "the option tail survives via wrapping: {rendered:?}"
+        );
+        for row in &rendered {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(row.as_str()) <= 40,
+                "no rendered row exceeds the card width: {row:?}"
+            );
+        }
+
+        // Width math: budget counts display columns (CJK double-width).
+        let rows = wrap_display_width("宽宽宽宽 宽宽宽宽", 8);
+        assert_eq!(rows, vec!["宽宽宽宽".to_string(), "宽宽宽宽".to_string()]);
+        // A single over-budget word hard-breaks instead of overflowing.
+        let rows = wrap_display_width("abcdefghij", 4);
+        assert_eq!(rows, vec!["abcd", "efgh", "ij"]);
+    }
+
     #[test]
     fn render_inline_multi_select_user_question_shows_checkboxes() {
         let app = app_with_user_question(vec![user_question(
