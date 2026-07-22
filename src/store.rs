@@ -911,6 +911,17 @@ impl Store {
         )
     }
 
+    /// A session's display title for status-line hints (tui#398), falling
+    /// back to the raw key for sessions not (yet) in `state.sessions`.
+    fn session_title_for_hint(&self, session_id: &SessionKey) -> String {
+        self.state
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .map(|session| session.title.clone())
+            .unwrap_or_else(|| session_id.0.clone())
+    }
+
     /// The peer slug for a minted peer session key: the key's topic is
     /// `peer-<slug>` by construction, so strip the prefix (fall back to the
     /// full topic, then the raw key, for defensive rendering).
@@ -5313,6 +5324,8 @@ impl Store {
                         .get(&session.id)
                         .copied()
                         .unwrap_or(0),
+                    blocked: self.state.session_blocked_reason(&session.id).is_some(),
+                    activity: self.state.session_activity_line(&session.id),
                 })
                 .collect(),
             profile_skills: self.state.profile_skills.as_ref(),
@@ -8508,8 +8521,24 @@ impl Store {
                 self.state.approval = None;
                 self.state.set_run_state_idle();
             }
+            // tui#398: an empty hydrate is the reconnect-truth "nothing
+            // pending" for this session — clear its background stash too.
+            self.state.pending_session_approvals.remove(session_id);
             return;
         };
+        // tui#398: hydrate for a NON-focused session routes to the stash
+        // (chip ⚠), exactly like the live event — not the global modal.
+        if !self
+            .state
+            .active_session()
+            .is_some_and(|session| &session.id == session_id)
+        {
+            let approval = ApprovalModalState::from_event(event);
+            self.state
+                .pending_session_approvals
+                .insert(session_id.clone(), approval);
+            return;
+        }
         let title = event.title.clone();
         self.state.push_activity(
             ActivityItem::new(
@@ -8544,8 +8573,22 @@ impl Store {
                 self.state.user_question = None;
                 self.state.set_run_state_idle();
             }
+            // tui#398: reconnect-truth clear for the background stash too.
+            self.state.pending_session_questions.remove(session_id);
             return;
         };
+        // tui#398: hydrate for a NON-focused session routes to the stash.
+        if !self
+            .state
+            .active_session()
+            .is_some_and(|session| &session.id == session_id)
+        {
+            let picker = UserQuestionPickerState::from_event(event);
+            self.state
+                .pending_session_questions
+                .insert(session_id.clone(), picker);
+            return;
+        }
         let title = event.title.clone();
         self.state.push_activity(
             ActivityItem::new(
@@ -9447,6 +9490,29 @@ impl Store {
                             .unwrap_or_else(|| "generic".into()),
                     ),
                 );
+                // tui#398: a BACKGROUND session's approval must not hijack the
+                // foreground — no global modal, no focus steal, no run-state
+                // block. Stash it (latest wins, like the hydrate replay),
+                // flag the strip chip ⚠, and hint in the status line; it is
+                // promoted when the session is focused.
+                if !self
+                    .state
+                    .active_session()
+                    .is_some_and(|session| session.id == session_id)
+                {
+                    let approval = ApprovalModalState::from_event(event);
+                    let session_title = self.session_title_for_hint(&session_id);
+                    self.state
+                        .pending_session_approvals
+                        .insert(session_id, approval);
+                    self.state.status = t!(
+                        "status.session_blocked_hint",
+                        session = session_title,
+                        reason = title
+                    )
+                    .into_owned();
+                    return None;
+                }
                 let mut approval = ApprovalModalState::from_event(event);
                 approval.visible = self.state.approval_auto_open;
                 let diff_preview_id = approval.diff_preview_id();
@@ -10684,6 +10750,29 @@ impl Store {
                 .with_turn(event.turn_id.clone())
                 .with_detail(detail),
         );
+        // tui#398: a question from a BACKGROUND session waits in the stash
+        // (chip ⚠ + status hint) instead of hijacking the foreground picker —
+        // the hard-visibility rule below applies when the session is FOCUSED
+        // (now, or at promotion time in `switch_selected_session`).
+        if !self
+            .state
+            .active_session()
+            .is_some_and(|session| session.id == event.session_id)
+        {
+            let session_id = event.session_id.clone();
+            let picker = UserQuestionPickerState::from_event(event);
+            let session_title = self.session_title_for_hint(&session_id);
+            self.state
+                .pending_session_questions
+                .insert(session_id, picker);
+            self.state.status = t!(
+                "status.session_blocked_hint",
+                session = session_title,
+                reason = title
+            )
+            .into_owned();
+            return None;
+        }
         let mut picker = UserQuestionPickerState::from_event(event);
         // A newly-arriving question is a HARD block: the turn is paused at the
         // tool boundary until it's answered, so it must be immediately visible
@@ -10820,6 +10909,15 @@ impl Store {
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
         self.state.pre_token_turns.remove(&event.session_id);
         self.bump_unread_for_background_terminal(&event.session_id);
+        // tui#398: a terminal for this session settles any stashed
+        // background approval/question — the server resolved or cancelled it
+        // (an unanswered block never produces a terminal), so drop the ⚠.
+        self.state
+            .pending_session_approvals
+            .remove(&event.session_id);
+        self.state
+            .pending_session_questions
+            .remove(&event.session_id);
         // The turn the user interrupted has settled — its deferred prompt
         // restore applies now (before the duplicate-terminal early returns:
         // any first terminal for the armed turn consumes the stash).
@@ -11022,6 +11120,15 @@ impl Store {
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
         self.state.pre_token_turns.remove(&event.session_id);
         self.bump_unread_for_background_terminal(&event.session_id);
+        // tui#398: a terminal for this session settles any stashed
+        // background approval/question — the server resolved or cancelled it
+        // (an unanswered block never produces a terminal), so drop the ⚠.
+        self.state
+            .pending_session_approvals
+            .remove(&event.session_id);
+        self.state
+            .pending_session_questions
+            .remove(&event.session_id);
         // The interrupted turn has settled (an Esc/Ctrl+C typically lands here
         // as the server's `code == "interrupted"` terminal) — apply the
         // deferred prompt restore (mirror of `commit_live_reply`).
@@ -13907,6 +14014,251 @@ mod tests {
         assert!(
             store.state.pending_peer_kickoffs.contains_key(&peer_key),
             "the staged kickoff survives the replay"
+        );
+    }
+
+    fn approval_for(session: &str, title: &str) -> octos_core::ui_protocol::ApprovalRequestedEvent {
+        octos_core::ui_protocol::ApprovalRequestedEvent::generic(
+            SessionKey(session.into()),
+            octos_core::ui_protocol::ApprovalId::new(),
+            octos_core::ui_protocol::TurnId::new(),
+            "shell",
+            title,
+            "run: rm -rf target",
+        )
+    }
+
+    /// tui#398: an approval for a BACKGROUND session must not hijack the
+    /// foreground — no global modal, no run-state block, no focus steal. It
+    /// stashes, flags the chip ⚠, and hints in the status line.
+    #[test]
+    fn background_approval_stashes_without_hijacking_foreground() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+
+        let command = store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            approval_for("local:b", "Run shell command?"),
+        )));
+        assert!(command.is_none());
+        assert!(
+            store.state.approval.is_none(),
+            "the foreground modal slot stays empty for a background approval"
+        );
+        assert!(
+            !matches!(
+                store.state.run_state,
+                crate::model::SessionRunState::Blocked { .. }
+            ),
+            "the FOREGROUND run state is untouched"
+        );
+        assert_eq!(
+            store.state.session_blocked_reason(&b),
+            Some("Run shell command?"),
+            "the background session reads as blocked (chip ⚠)"
+        );
+        assert!(
+            store.state.status.contains("local:b"),
+            "the status hint names the blocked session: {}",
+            store.state.status
+        );
+    }
+
+    /// tui#398: focusing the blocked session promotes the stash into the
+    /// global modal — hard-visible — and clears the ⚠.
+    #[test]
+    fn focusing_blocked_session_promotes_approval() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            approval_for("local:b", "Run shell command?"),
+        )));
+        assert!(store.state.session_blocked_reason(&b).is_some());
+
+        store.state.switch_selected_session(1);
+        let approval = store
+            .state
+            .approval
+            .as_ref()
+            .expect("promotion lands the approval in the global slot");
+        assert!(approval.visible, "promoted decisions are hard-visible");
+        assert_eq!(approval.session_id, b);
+        assert!(matches!(
+            store.state.run_state,
+            crate::model::SessionRunState::Blocked { .. }
+        ));
+        assert!(
+            store.state.session_blocked_reason(&b).is_none(),
+            "the ⚠ clears once the decision owns the foreground"
+        );
+    }
+
+    /// tui#398: same background routing for AskUserQuestion.
+    #[test]
+    fn background_question_stashes_and_promotes() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+        let command =
+            store.apply_event(AppUiEvent::Protocol(UiNotification::UserQuestionRequested(
+                octos_core::ui_protocol::UserQuestionRequestedEvent::new(
+                    b.clone(),
+                    octos_core::ui_protocol::QuestionId::new(),
+                    octos_core::ui_protocol::TurnId::new(),
+                    "Pick a strategy",
+                    "Which approach?",
+                    Vec::new(),
+                ),
+            )));
+        assert!(command.is_none());
+        assert!(store.state.user_question.is_none());
+        assert!(!matches!(
+            store.state.run_state,
+            crate::model::SessionRunState::Blocked { .. }
+        ));
+        assert_eq!(
+            store.state.session_blocked_reason(&b),
+            Some("Pick a strategy")
+        );
+
+        store.state.switch_selected_session(1);
+        let picker = store
+            .state
+            .user_question
+            .as_ref()
+            .expect("promotion lands the question picker");
+        assert!(picker.visible);
+        assert!(matches!(
+            store.state.run_state,
+            crate::model::SessionRunState::Blocked { .. }
+        ));
+        assert!(store.state.session_blocked_reason(&b).is_none());
+    }
+
+    /// Regression pin: an approval for the ACTIVE session keeps the existing
+    /// foreground behavior (global modal + blocked run state).
+    #[test]
+    fn active_session_approval_keeps_foreground_behavior() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            approval_for("local:a", "Write file?"),
+        )));
+        assert!(store.state.approval.is_some());
+        assert!(matches!(
+            store.state.run_state,
+            crate::model::SessionRunState::Blocked { .. }
+        ));
+        assert!(
+            store
+                .state
+                .session_blocked_reason(&SessionKey("local:a".into()))
+                .is_none(),
+            "the active session's decision lives in the modal, not the stash"
+        );
+    }
+
+    /// tui#398: a terminal for the blocked session settles the stash (the
+    /// server resolved/cancelled the request) — the ⚠ must not outlive it.
+    #[test]
+    fn terminal_clears_background_blocked_stash() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            approval_for("local:b", "Run shell command?"),
+        )));
+        assert!(store.state.session_blocked_reason(&b).is_some());
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            octos_core::ui_protocol::TurnErrorEvent {
+                session_id: b.clone(),
+                topic: None,
+                turn_id: octos_core::ui_protocol::TurnId::new(),
+                code: "interrupted".into(),
+                message: "cancelled".into(),
+            },
+        )));
+        assert!(
+            store.state.session_blocked_reason(&b).is_none(),
+            "a terminal settles the background block"
+        );
+    }
+
+    /// tui#398: an EMPTY hydrate for the session is reconnect-truth — it
+    /// clears a stale background stash.
+    #[test]
+    fn empty_hydrate_clears_background_blocked_stash() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            approval_for("local:b", "Run shell command?"),
+        )));
+        assert!(store.state.session_blocked_reason(&b).is_some());
+
+        store.apply_hydrated_pending_approvals(&b, Vec::new());
+        assert!(store.state.session_blocked_reason(&b).is_none());
+    }
+
+    /// tui#398: the Alt+S activity line prefers the blocked reason, then the
+    /// live stream tail, then the last transcript line — single-line, capped.
+    #[test]
+    fn session_activity_line_prefers_blocked_then_live_then_last_message() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+
+        // Last-message fallback.
+        if let Some(session) = store
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == b)
+        {
+            session.messages.push(octos_core::Message {
+                role: octos_core::MessageRole::Assistant,
+                content: "first line
+the final line of the reply"
+                    .into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        assert_eq!(
+            store.state.session_activity_line(&b).as_deref(),
+            Some("the final line of the reply")
+        );
+
+        // Live tail wins over the last message.
+        if let Some(session) = store
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == b)
+        {
+            session.live_reply = Some(octos_core::app_ui::AppUiLiveReply {
+                turn_id: octos_core::ui_protocol::TurnId::new(),
+                text: "streaming…
+now analyzing the bus module"
+                    .into(),
+            });
+        }
+        assert_eq!(
+            store.state.session_activity_line(&b).as_deref(),
+            Some("now analyzing the bus module")
+        );
+
+        // Blocked reason outranks everything.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            approval_for("local:b", "Run shell command?"),
+        )));
+        let line = store
+            .state
+            .session_activity_line(&b)
+            .expect("blocked line present");
+        assert!(
+            line.contains("Run shell command?"),
+            "blocked reason leads: {line}"
         );
     }
 

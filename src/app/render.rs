@@ -205,8 +205,13 @@ pub(super) fn render_session_strip(
         if session.title.chars().count() > 14 {
             title.push('…');
         }
+        let blocked = app.session_blocked_reason(&session.id).is_some();
         let mut chip = format!("{} {}", if focused { "●" } else { "○" }, title);
-        if live {
+        // tui#398: a blocked session needs the user — ⚠ outranks the live
+        // marker (a blocked turn is paused, not streaming).
+        if blocked {
+            chip.push_str(" ⚠");
+        } else if live {
             chip.push_str(" ✻");
         }
         if unread > 0 && !focused {
@@ -224,7 +229,7 @@ pub(super) fn render_session_strip(
         }
         let style = if focused {
             palette.text().add_modifier(Modifier::BOLD)
-        } else if live || unread > 0 {
+        } else if blocked || live || unread > 0 {
             palette.text()
         } else {
             palette.muted()

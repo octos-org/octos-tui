@@ -473,6 +473,7 @@ status:
   undo_no_session: "No active session to undo in."
   peer_usage: "Usage: /peer [--go] [--worktree] [--cwd <path>] <brief>"
   peer_preparing: "Preparing peer session…"
+  session_blocked_hint: "%{session} is waiting on you: %{reason} — Alt+S to answer."
   peer_prepare_in_flight: "A peer is already being prepared — wait for it to open (or ~30s) before starting another."
   peer_opening: "Opening peer %{slug}…"
   peer_started: "Peer %{slug} is working in the background — watch its badge in the session strip (Alt+S)."
@@ -973,6 +974,7 @@ menu:
     subtitle: "✻ = turn running · (n) = turns finished since you last looked."
     footer: Enter switch | Esc close
     item:
+      blocked_reason: "⚠ waiting on you: %{reason}"
       current: This is the focused session.
       switch_desc: Switch to this session.
       empty: No open sessions
