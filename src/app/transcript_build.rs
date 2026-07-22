@@ -2267,19 +2267,23 @@ pub(super) fn push_inline_user_question_card(
     // Mandatory generic fallback text keeps the card actionable even when the
     // structured `questions` field is empty or unparsed.
     if !picker.title.is_empty() {
-        push_prefixed_line(
+        push_wrapped_card_text(
             lines,
-            "    ",
-            palette.muted(),
-            Line::from(Span::styled(picker.title.clone(), palette.text())),
+            vec![Span::styled("    ", palette.muted())],
+            "    ".to_string(),
+            &picker.title,
+            palette.text(),
+            width.saturating_sub(4).max(1),
         );
     }
     if !picker.body.is_empty() {
-        push_prefixed_line(
+        push_wrapped_card_text(
             lines,
-            "    ",
+            vec![Span::styled("    ", palette.muted())],
+            "    ".to_string(),
+            &picker.body,
             palette.muted(),
-            Line::from(Span::styled(picker.body.clone(), palette.muted())),
+            width.saturating_sub(4).max(1),
         );
     }
 
@@ -2324,11 +2328,13 @@ pub(super) fn push_user_question_entry(
             )),
         );
     }
-    push_prefixed_line(
+    push_wrapped_card_text(
         lines,
-        "    ",
-        palette.muted(),
-        Line::from(Span::styled(entry.question.clone(), palette.text())),
+        vec![Span::styled("    ", palette.muted())],
+        "    ".to_string(),
+        &entry.question,
+        palette.text(),
+        width.saturating_sub(4).max(1),
     );
 
     for (idx, option) in entry.options.iter().enumerate() {
@@ -2415,17 +2421,22 @@ pub(super) fn push_user_question_option_row(
     } else {
         palette.text()
     };
-    // Budget the label to the remaining width after the bar + marker prefixes
-    // (2 cols each). `fit_card_text` already reserves the 4-space indent, so
-    // subtract only the extra 4 columns here — subtracting 6 clipped labels
-    // two columns early (codex review).
-    let label = fit_card_text(text, width.saturating_sub(4));
-    lines.push(Line::from(vec![
-        Span::styled("    ", palette.muted()),
-        Span::styled(bar, bar_style),
-        Span::styled(marker, marker_style),
-        Span::styled(label, label_style),
-    ]));
+    // Budget = width minus the 4-space indent and the bar + marker prefixes
+    // (2 cols each). Long labels WRAP with a hanging indent aligned under the
+    // label start — truncation hid the tail of real questions (user report).
+    let budget = width.saturating_sub(8).max(1);
+    push_wrapped_card_text(
+        lines,
+        vec![
+            Span::styled("    ", palette.muted()),
+            Span::styled(bar, bar_style),
+            Span::styled(marker, marker_style),
+        ],
+        "        ".to_string(),
+        text,
+        label_style,
+        budget,
+    );
 }
 
 pub(super) fn push_prefixed_line(
@@ -2437,6 +2448,80 @@ pub(super) fn push_prefixed_line(
     let mut spans = vec![Span::styled(prefix, prefix_style)];
     spans.append(&mut line.spans);
     lines.push(Line::from(spans));
+}
+
+/// Word-wrap `text` into display-width-budgeted rows (unicode-width, so CJK
+/// double-width glyphs count as 2 — the `fit_card_text` lesson). Breaks on
+/// spaces; a single word wider than the budget hard-breaks mid-word rather
+/// than overflowing. Never returns an empty vec (empty text → one empty row).
+pub(super) fn wrap_display_width(text: &str, budget: usize) -> Vec<String> {
+    let budget = budget.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    let mut row_w = 0usize;
+    for word in text.split(' ') {
+        let word_w = word.width();
+        let sep_w = if row.is_empty() { 0 } else { 1 };
+        if row_w + sep_w + word_w <= budget {
+            if sep_w == 1 {
+                row.push(' ');
+            }
+            row.push_str(word);
+            row_w += sep_w + word_w;
+            continue;
+        }
+        if !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+        }
+        if word_w <= budget {
+            row.push_str(word);
+            row_w = word_w;
+        } else {
+            // Hard-break an over-budget word by display columns.
+            let mut piece = String::new();
+            let mut piece_w = 0usize;
+            for ch in word.chars() {
+                let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if piece_w + ch_w > budget && !piece.is_empty() {
+                    rows.push(std::mem::take(&mut piece));
+                    piece_w = 0;
+                }
+                piece.push(ch);
+                piece_w += ch_w;
+            }
+            row = piece;
+            row_w = piece_w;
+        }
+    }
+    rows.push(row);
+    rows
+}
+
+/// Push `text` wrapped to the card budget: every row carries the 4-space card
+/// indent; rows after the first get `extra_indent` more columns so
+/// continuations align under the first row's content (option-marker hanging
+/// indent). Replaces the old single-line `fit_card_text` truncation on the
+/// question card — questions and options must WRAP, not clip (user report).
+pub(super) fn push_wrapped_card_text(
+    lines: &mut Vec<Line<'static>>,
+    first_prefix_spans: Vec<Span<'static>>,
+    continuation_prefix: String,
+    text: &str,
+    style: Style,
+    budget: usize,
+) {
+    for (idx, row) in wrap_display_width(text, budget).into_iter().enumerate() {
+        if idx == 0 {
+            let mut spans = first_prefix_spans.clone();
+            spans.push(Span::styled(row, style));
+            lines.push(Line::from(spans));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(continuation_prefix.clone(), Style::default()),
+                Span::styled(row, style),
+            ]));
+        }
+    }
 }
 
 pub(super) fn push_activity_section_with_finalization(
