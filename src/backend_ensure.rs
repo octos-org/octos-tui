@@ -566,7 +566,7 @@ fn have(program: &str) -> bool {
 /// **BUMP THIS whenever you bump the `octos-core` rev in Cargo.toml**, to the
 /// octos release tag that contains that rev. Override for a fork / pinned test
 /// build with [`OCTOS_RELEASE_ENV`].
-const REQUIRED_OCTOS_RELEASE: &str = "v2.0.2-rc.12";
+const REQUIRED_OCTOS_RELEASE: &str = "v2.0.2-rc.13";
 /// Env var overriding the octos release tag to install (fork / pinned build).
 const OCTOS_RELEASE_ENV: &str = "OCTOS_TUI_OCTOS_RELEASE";
 /// The octos server-bundle asset name for THIS build's target platform, or
