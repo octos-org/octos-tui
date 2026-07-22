@@ -3657,6 +3657,25 @@ pub struct PeerKickoff {
     pub created: std::time::Instant,
 }
 
+/// #407 (review F1): durable peer roster entry. `PeerKickoff` is popped the
+/// moment `session/opened` lands, so keying "is this a peer" off
+/// `pending_peer_kickoffs` makes peers disappear from the dock the instant
+/// they start running. `PeerMeta` is recorded at the same chokepoint
+/// (`take_pending_peer_kickoff`) and lives for the session's whole lifetime —
+/// it carries the slug/brief-path the peek overlay needs, which `SessionView`
+/// does not. The dock reads union(this, pending_peer_kickoffs); pending-only
+/// peers (still opening) count toward `total` only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerMeta {
+    pub slug: String,
+    pub brief_path: String,
+    /// True if the peer was staged by the agent via `peer_handoff` (vs
+    /// `/peer --prepare` by the user). Reserved for future differentiated
+    /// rendering; not yet surfaced.
+    pub agent_staged: bool,
+    pub created: std::time::Instant,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotListParams {
     pub session_id: SessionKey,
@@ -4357,6 +4376,12 @@ pub struct AppState {
     /// rows. Toggled by Alt+D or the `/agents` menu; a UI preference, not
     /// per-session state.
     pub agent_dock_collapsed: bool,
+    /// #407: Peer Dock collapsed state. Mirrors [`Self::agent_dock_collapsed`]:
+    /// when true, the peer strip renders as a single-line summary pill
+    /// (`Peers: N · M live · K⚠`) instead of per-peer chips. Toggled by
+    /// Alt+P. Distinct from the agent dock's collapse so the two surfaces
+    /// stay independently controllable.
+    pub peer_dock_collapsed: bool,
     /// ◆ Goal banner fold preference (Ctrl+P). See [`GoalObjectiveFold`]: a huge
     /// pasted objective folds to one compact row by default, a short one shows
     /// in full, and an explicit Ctrl+P choice sticks. A global UI preference,
@@ -4521,6 +4546,16 @@ pub struct AppState {
     /// entries older than [`PEER_KICKOFF_TTL`] are pruned like
     /// `pre_token_turns`.
     pub pending_peer_kickoffs: std::collections::HashMap<SessionKey, PeerKickoff>,
+    /// #407 (review F1): durable peer roster — survives the
+    /// `session/opened` pop that empties `pending_peer_kickoffs`. Recorded
+    /// at [`Self::take_pending_peer_kickoff`] (the single chokepoint both
+    /// the background and `--go` paths flow through). The Peer Dock and
+    /// its pill read the UNION of this map and `pending_peer_kickoffs` so
+    /// a running fleet stays visible. Note: `app.sessions` entries are
+    /// never removed in-process today (no session-close path), so no
+    /// removal hook is wired here — if close ever lands, prune the
+    /// matching `PeerMeta` at the same site.
+    pub peer_session_meta: std::collections::HashMap<SessionKey, PeerMeta>,
     pub approval_auto_open: bool,
     pub approval: Option<ApprovalModalState>,
     /// Pending AskUserQuestion picker (UPCR-2026-023), mirroring `approval`.
@@ -6404,6 +6439,7 @@ impl AppState {
             agent_view_scroll_max: std::cell::Cell::new(usize::MAX),
             transcript_pager_active: false,
             agent_dock_collapsed: false,
+            peer_dock_collapsed: false,
             goal_objective_fold: GoalObjectiveFold::default(),
             goal_objective_folded_effective: std::cell::Cell::new(false),
             pinned_scroll: false,
@@ -6444,6 +6480,7 @@ impl AppState {
             pending_turn_steers: std::collections::VecDeque::new(),
             pending_peer_prepare: None,
             pending_peer_kickoffs: std::collections::HashMap::new(),
+            peer_session_meta: std::collections::HashMap::new(),
             pending_session_approvals: std::collections::HashMap::new(),
             pending_session_questions: std::collections::HashMap::new(),
             approval_auto_open: true,
@@ -8698,9 +8735,32 @@ impl AppState {
     /// #395: pop the pending peer kickoff for `session_id`, pruning stale
     /// entries first so an aged stash (dead `session/open`) can never fire a
     /// kickoff turn into a session opened much later under the same key.
+    ///
+    /// #407 (review F1): also records into the durable `peer_session_meta`
+    /// roster so the Peer Dock keeps tracking this session AFTER the pop —
+    /// `pending_peer_kickoffs` is the in-flight staging map, the roster is
+    /// the lifetime map. Both consumers (background open + `--go` focus)
+    /// flow through this single chokepoint.
     pub fn take_pending_peer_kickoff(&mut self, session_id: &SessionKey) -> Option<PeerKickoff> {
         self.prune_stale_peer_kickoffs();
-        self.pending_peer_kickoffs.remove(session_id)
+        let kickoff = self.pending_peer_kickoffs.remove(session_id)?;
+        // Slug derivation mirrors `Store::peer_slug_for_key` (store.rs): a
+        // peer session's topic is `peer-<slug>`; strip the prefix for display.
+        let slug = session_id
+            .topic()
+            .and_then(|topic| topic.strip_prefix("peer-"))
+            .unwrap_or_else(|| session_id.0.as_str())
+            .to_owned();
+        self.peer_session_meta.insert(
+            session_id.clone(),
+            PeerMeta {
+                slug,
+                brief_path: kickoff.brief_path.clone(),
+                agent_staged: true,
+                created: kickoff.created,
+            },
+        );
+        Some(kickoff)
     }
 
     /// #395: drop peer kickoffs older than [`PEER_KICKOFF_TTL`] (the same

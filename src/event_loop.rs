@@ -860,6 +860,20 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
+    // #407: Ctrl+J — toggle the Peer Dock's collapsed state. Mirrors Alt+G
+    // for the sub-agent dock, but uses Ctrl (not Alt) because Alt chords are
+    // awkward on Mac (Option sends dead accents on some layouts). Ctrl+J is
+    // free in the codebase (Ctrl+P is Goal fold, Ctrl+N is bash next-history,
+    // Ctrl+D is EOF, Ctrl+B/F/K/U/W are readline edits) and aligns with the
+    // j/k navigation convention used in TUIs. Only claimed when peers exist
+    // (durable `peer_session_meta` roster, not the transient
+    // `pending_peer_kickoffs` — review F1/F3) so the key stays free for
+    // single-session users.
+    if is_control_char(&key, 'j') && !store.state.peer_session_meta.is_empty() {
+        store.state.peer_dock_collapsed = !store.state.peer_dock_collapsed;
+        return KeyAction::Continue;
+    }
+
     // #324: Alt+S — the session switcher popup (open sessions with live-turn
     // and unread annotations). Only claimed with 2+ sessions so the key stays
     // free for single-session users.

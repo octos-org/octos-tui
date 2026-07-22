@@ -74,6 +74,10 @@ pub fn render_viewport_with_finalization(
     // Height-gated on `terminal_height` — the SAME basis `live_ui_height` used to
     // reserve the row — so the reservation and this layout always agree.
     let agent_strip_height = agent_strip_height(app, terminal_height);
+    // #407: Peer Dock — mirrors the agent strip. 0 when no peers exist or
+    // the terminal is too short; otherwise reserves rows for the per-peer
+    // view (or 1 for the collapsed pill).
+    let peer_strip_height = peer_strip_height(app, terminal_height);
     let active_menu = active_menu_surface(app);
     // Budget the menu against the room left AFTER every OTHER row in the root
     // layout: the `Min(1)` live-tail floor, composer, status, the
@@ -88,7 +92,8 @@ pub fn render_viewport_with_finalization(
             + autonomy_height
             + harness_height
             + decision_height
-            + agent_strip_height,
+            + agent_strip_height
+            + peer_strip_height,
     );
     let menu_height = menu_height_for_viewport(active_menu.as_ref(), area.width, menu_available);
 
@@ -102,6 +107,7 @@ pub fn render_viewport_with_finalization(
             Constraint::Length(decision_height),
             Constraint::Length(composer_height),
             Constraint::Length(agent_strip_height),
+            Constraint::Length(peer_strip_height),
             Constraint::Length(1),
         ])
         .split(area);
@@ -140,7 +146,15 @@ pub fn render_viewport_with_finalization(
             root[6],
         );
     }
-    frame.render_widget(render_status(app, palette), root[7]);
+    if peer_strip_height > 0 {
+        // #407: render the Peer Dock — collapsed pill or per-peer rows.
+        frame.render_widget(
+            Paragraph::new(peer_strip_lines(app, palette, peer_strip_height.saturating_sub(1)))
+                .style(Style::default().bg(palette.surface)),
+            root[7],
+        );
+    }
+    frame.render_widget(render_status(app, palette), root[8]);
 }
 
 /// The live (uncommitted / in-flight) transcript tail rendered inside the
@@ -193,6 +207,48 @@ pub(super) fn render_session_strip(
     width: u16,
 ) -> Paragraph<'static> {
     let budget = width as usize;
+    // #407 (review F4 + F5): decide the trailing overflow marker UP FRONT so
+    // the chip loop can reserve its exact width. The structured peer pill is
+    // shown UNCONDITIONALLY (not gated on `peer_dock_collapsed`) whenever the
+    // hidden tail contains at least one peer — it is strictly more informative
+    // than `+N` and needs no opt-in. When the tail mixes peers and non-peers,
+    // keep the non-peer remainder as `+K` (review F6: don't erase them).
+    let peer_tail_present = app
+        .peer_session_meta
+        .keys()
+        .any(|sid| app.sessions.iter().any(|s| &s.id == sid));
+    // The pill text the tail would render if it ends up peer-driven. Pre-compute
+    // so both the width reservation and the final render agree on the string.
+    let pill_text = if peer_tail_present {
+        let (total_p, live_p, blocked_p, _unread_p) = peer_dock_counts(app);
+        let mut text = t!(
+            "app.hint.peer_dock_pill",
+            count = total_p.to_string(),
+            live = live_p.to_string(),
+        )
+        .into_owned();
+        if blocked_p > 0 {
+            text.push_str(
+                &t!(
+                    "app.hint.peer_dock_pill_blocked",
+                    count = blocked_p.to_string()
+                )
+                .into_owned(),
+            );
+        }
+        Some(text)
+    } else {
+        None
+    };
+    // Reserve width for the trailing marker: the structured pill's measured
+    // width (most important — ⚠ must not clip), else the legacy "+N" constant
+    // (review F4: previously a fixed 4, which clipped the pill's most valuable
+    // segment in exactly the big-fleet case the pill exists for).
+    let trailing_reserve = pill_text
+        .as_ref()
+        .map(|text| UnicodeWidthStr::width(text.as_str()))
+        .unwrap_or(4);
+
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     let mut hidden = 0usize;
@@ -218,8 +274,8 @@ pub(super) fn render_session_strip(
             chip.push_str(&format!(" ({unread})"));
         }
         let chip_width = UnicodeWidthStr::width(chip.as_str()) + 3; // "   " gap
-        // Reserve room for a possible trailing "+N" marker.
-        if used + chip_width + 4 > budget && idx + 1 < total {
+        // Reserve room for the trailing marker computed above.
+        if used + chip_width + trailing_reserve > budget && idx + 1 < total {
             hidden = total - idx;
             break;
         }
@@ -239,7 +295,24 @@ pub(super) fn render_session_strip(
         used += chip_width;
     }
     if hidden > 0 {
-        spans.push(Span::styled(format!("+{hidden}"), palette.muted()));
+        // Count how many of the hidden tail are peers vs non-peers (review F6):
+        // keep the non-peer remainder as `+K` so a mixed overflow doesn't
+        // erase main/topic sessions from the strip.
+        let hidden_sessions = app.sessions.iter().skip(total - hidden);
+        let hidden_peer_count = hidden_sessions
+            .clone()
+            .filter(|s| app.peer_session_meta.contains_key(&s.id))
+            .count()
+            .min(hidden);
+        let hidden_non_peer = hidden - hidden_peer_count;
+        if hidden_non_peer > 0 {
+            spans.push(Span::styled(format!("+{hidden_non_peer}"), palette.muted()));
+        }
+        if let Some(text) = pill_text {
+            // Render the pre-computed pill text (same string the width
+            // reservation measured — review F9: single source of truth).
+            spans.push(Span::styled(text, palette.text()));
+        }
     }
     Paragraph::new(Line::from(spans)).style(Style::default().bg(palette.surface_alt))
 }

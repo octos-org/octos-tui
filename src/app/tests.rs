@@ -9775,6 +9775,118 @@ mod tests {
             .collect()
     }
 
+    /// #407 regression: peers must stay in the dock counts AFTER their
+    /// `session/opened` lands — the prior implementation keyed off
+    /// `pending_peer_kickoffs`, which is popped at open, so a running fleet
+    /// read `👥 0`. With the durable `peer_session_meta` roster, a peer
+    /// recorded via `take_pending_peer_kickoff` stays counted for life.
+    #[test]
+    fn peer_dock_counts_survive_session_opened() {
+        let mut app = autonomy_app_state();
+        // No peers yet → all counts zero, height 0.
+        assert_eq!(peer_dock_counts(&app), (0, 0, 0, 0));
+        assert_eq!(peer_strip_height(&app, 40), 0);
+
+        // Stage a peer: insert into pending (simulates peer/staged) AND pop
+        // it via take_pending_peer_kickoff (simulates session/opened landing).
+        let sid = SessionKey("local:tui#peer-refactor".into());
+        app.pending_peer_kickoffs.insert(
+            sid.clone(),
+            crate::model::PeerKickoff {
+                brief: "refactor auth".into(),
+                brief_path: "/tmp/brief.md".into(),
+                go: false,
+                created: std::time::Instant::now(),
+            },
+        );
+        let _ = app.take_pending_peer_kickoff(&sid);
+        // After the take, pending is empty BUT the durable roster has it.
+        assert!(app.pending_peer_kickoffs.is_empty());
+        assert_eq!(app.peer_session_meta.len(), 1, "durable roster recorded");
+
+        // total counts the opened peer (review F1: previously 0 here).
+        let (total, live, blocked, unread) = peer_dock_counts(&app);
+        assert_eq!(total, 1, "opened peer counts toward total");
+        assert_eq!(live, 0, "no live turn yet");
+        assert_eq!(blocked, 0);
+        assert_eq!(unread, 0);
+        // Dock reserves rows now that a peer exists.
+        assert_eq!(
+            peer_strip_height(&app, 40),
+            2,
+            "title row + one peer row once a peer exists"
+        );
+        let _ = (live, blocked, unread);
+    }
+
+    /// #407 regression: the collapsed pill renders structured peer counts
+    /// (not bare `+N`).
+    #[test]
+    fn peer_dock_pill_renders_total_segment() {
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:tui#peer-cired".into());
+        app.pending_peer_kickoffs.insert(
+            sid.clone(),
+            crate::model::PeerKickoff {
+                brief: "ci-red".into(),
+                brief_path: "/tmp/brief.md".into(),
+                go: false,
+                created: std::time::Instant::now(),
+            },
+        );
+        let _ = app.take_pending_peer_kickoff(&sid);
+
+        app.peer_dock_collapsed = true;
+        let pill = peer_dock_pill_line(&app, Palette::for_theme(app.theme));
+        let text: String = pill.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("1 peer") || text.contains("peers"),
+            "total segment renders; got: {text}"
+        );
+    }
+
+    /// #407 regression: `peer_sessions`/roster sort is deterministic on
+    /// `Instant` ties (review F10) — a fleet staged in one burst must not
+    /// flicker row order across frames.
+    #[test]
+    fn peer_dock_roster_sort_is_deterministic_on_ties() {
+        let mut app = autonomy_app_state();
+        let now = std::time::Instant::now();
+        // Three peers staged at the SAME instant (simulates a tight fleet
+        // loop where `Instant::now()` ties on coarse clocks).
+        for slug in ["zebra", "alpha", "mike"] {
+            let sid = SessionKey(format!("local:tui#peer-{slug}"));
+            app.peer_session_meta.insert(
+                sid,
+                crate::model::PeerMeta {
+                    slug: slug.into(),
+                    brief_path: "/tmp/brief.md".into(),
+                    agent_staged: true,
+                    created: now,
+                },
+            );
+        }
+        let order_a: Vec<&str> = peer_dock_roster(&app)
+            .iter()
+            .map(|(_, m)| m.slug.as_str())
+            .collect();
+        // Run again — stable order regardless of HashMap iteration.
+        let order_b: Vec<&str> = peer_dock_roster(&app)
+            .iter()
+            .map(|(_, m)| m.slug.as_str())
+            .collect();
+        assert_eq!(
+            order_a, order_b,
+            "roster order must not flicker across calls; got {order_a:?} vs {order_b:?}"
+        );
+        // Tie-break is by session key → alpha, mike, zebra (deterministic).
+        assert_eq!(
+            order_a,
+            vec!["alpha", "mike", "zebra"],
+            "tie-break on session key; got {order_a:?}"
+        );
+    }
+
     #[test]
     fn viewport_renders_live_ui_not_committed_history() {
         // Committed messages live in scrollback (finalized_history_lines), NOT
