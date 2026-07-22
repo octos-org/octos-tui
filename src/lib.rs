@@ -158,6 +158,8 @@ mod i18n_tests {
             "status.peer_usage",
             "status.peer_preparing",
             "status.peer_prepare_in_flight",
+            "status.session_blocked_hint",
+            "menu.sessions.item.blocked_reason",
             "status.peer_opening",
             "status.peer_started",
             "status.peer_switched",

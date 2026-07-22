@@ -522,6 +522,7 @@ menu:
     subtitle: "✻ = 回合进行中 · (n) = 自上次查看后完成的回合数。"
     footer: Enter 切换 | Esc 关闭
     item:
+      blocked_reason: "⚠ 等待你的确认：%{reason}"
       current: 当前聚焦的会话。
       switch_desc: 切换到此会话。
       empty: 没有打开的会话
@@ -1220,6 +1221,7 @@ status:
   undo_no_session: "没有可撤销的活动会话。"
   peer_usage: "用法：/peer [--go] [--worktree] [--cwd <path>] <brief>"
   peer_preparing: "正在准备同伴会话…"
+  session_blocked_hint: "%{session} 正在等待你的确认：%{reason} —— 按 Alt+S 处理。"
   peer_prepare_in_flight: "已有同伴会话正在准备中 —— 请等它打开（或约 30 秒后）再发起新的。"
   peer_opening: "正在打开同伴 %{slug}…"
   peer_started: "同伴 %{slug} 已在后台开始工作 —— 请留意会话栏中它的标记（Alt+S）。"

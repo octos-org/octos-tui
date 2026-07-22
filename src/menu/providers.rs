@@ -4767,12 +4767,19 @@ fn sessions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let mut items = Vec::new();
     for (idx, chip) in ctx.app.session_chips.iter().enumerate() {
         let mut label = format!("{} {}", if chip.focused { "●" } else { "○" }, chip.title);
-        if chip.live {
+        if chip.blocked {
+            label.push_str(" ⚠");
+        } else if chip.live {
             label.push_str(" ✻");
         }
         if chip.unread > 0 {
             label.push_str(&format!(" ({})", chip.unread));
         }
+        // tui#398: the row's description is the session's one-line activity —
+        // blocked reason first (it needs the user), else the live tail / last
+        // transcript line — so "what is this one doing" is answerable without
+        // switching.
+        let activity = chip.activity.clone();
         if chip.focused {
             items.push(
                 MenuItem::new(format!("sessions.row.{idx}"), label, MenuAction::Noop)
@@ -4787,7 +4794,9 @@ fn sessions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                         chip.session_id.0.clone(),
                     )),
                 )
-                .with_description(t!("menu.sessions.item.switch_desc")),
+                .with_description(
+                    activity.unwrap_or_else(|| t!("menu.sessions.item.switch_desc").into_owned()),
+                ),
             );
         }
     }
@@ -10393,6 +10402,8 @@ mod tests {
                 focused: true,
                 live: false,
                 unread: 0,
+                blocked: false,
+                activity: None,
             },
             crate::model::SessionChipView {
                 session_id: octos_core::SessionKey("local:b".into()),
@@ -10400,6 +10411,8 @@ mod tests {
                 focused: false,
                 live: true,
                 unread: 3,
+                blocked: false,
+                activity: Some("now analyzing the bus module".into()),
             },
         ];
         let ctx = MenuContext {

@@ -3355,6 +3355,12 @@ pub struct SessionChipView {
     pub focused: bool,
     pub live: bool,
     pub unread: usize,
+    /// tui#398: the session is waiting on an approval/question in the
+    /// background — strip renders `⚠`, the Alt+S row names the reason.
+    pub blocked: bool,
+    /// One-line activity summary for the Alt+S row: blocked reason, else the
+    /// live stream tail, else the last transcript line.
+    pub activity: Option<String>,
 }
 
 /// A snapshot restore staged from the `/undo` picker (#1768). `session_id`
@@ -4347,6 +4353,17 @@ pub struct AppState {
     /// Pending AskUserQuestion picker (UPCR-2026-023), mirroring `approval`.
     pub user_question: Option<UserQuestionPickerState>,
     pub user_question_auto_open: bool,
+    /// tui#398: approvals that arrived for a NON-focused session. The global
+    /// `approval` slot belongs to the focused session — a background session's
+    /// approval must not hijack the foreground modal/run-state; it waits here
+    /// (latest per session, mirroring the hydrate replay's `last()`), marks
+    /// the session's strip chip `⚠`, and is PROMOTED to the global slot when
+    /// the session is focused. NOT snapshot-carried: `session/hydrate` replays
+    /// pending approvals per session, so a reconnect repopulates these.
+    pub pending_session_approvals: std::collections::HashMap<SessionKey, ApprovalModalState>,
+    /// tui#398: AskUserQuestions for non-focused sessions, mirroring
+    /// [`Self::pending_session_approvals`].
+    pub pending_session_questions: std::collections::HashMap<SessionKey, UserQuestionPickerState>,
     pub task_output: TaskOutputDetailState,
     pub artifact_detail: ArtifactDetailState,
     pub thread_graph_detail: ThreadGraphDetailState,
@@ -6253,6 +6270,8 @@ impl AppState {
             unread_turns: std::collections::HashMap::new(),
             pending_peer_prepare: None,
             pending_peer_kickoffs: std::collections::HashMap::new(),
+            pending_session_approvals: std::collections::HashMap::new(),
+            pending_session_questions: std::collections::HashMap::new(),
             approval_auto_open: true,
             approval: None,
             user_question: None,
@@ -7692,6 +7711,25 @@ impl AppState {
         // #324: focusing a session marks it read.
         if let Some(session_id) = self.active_session().map(|session| session.id.clone()) {
             self.unread_turns.remove(&session_id);
+            // tui#398: promote the session's stashed approval/question into
+            // the global slots now that it owns the foreground — hard-visible
+            // (a pending decision is why the user came here; the render-last
+            // discipline keeps the card on screen).
+            if let Some(mut approval) = self.pending_session_approvals.remove(&session_id) {
+                approval.visible = true;
+                let title = approval.title.clone();
+                self.approval = Some(approval);
+                self.focus = FocusPane::Composer;
+                self.set_run_state_blocked(title);
+            }
+            if let Some(mut picker) = self.pending_session_questions.remove(&session_id) {
+                picker.visible = true;
+                self.user_question_auto_open = true;
+                let title = picker.title.clone();
+                self.user_question = Some(picker);
+                self.focus = FocusPane::Composer;
+                self.set_run_state_blocked(title);
+            }
         }
         // A session that raced the capabilities response missed its open-time
         // status probe; probe it the moment it becomes active so the composer
@@ -8324,6 +8362,61 @@ impl AppState {
                 .pre_token_turns
                 .get(session_id)
                 .is_some_and(|armed| armed.elapsed() < PRE_TOKEN_TURN_TTL)
+    }
+
+    /// tui#398: the reason a BACKGROUND session is waiting on the user (a
+    /// stashed approval or question), if any. Drives the strip's `⚠` and the
+    /// Alt+S row's blocked line. The focused session never reads as blocked
+    /// here — its pending decision lives in the global modal slots.
+    pub fn session_blocked_reason(&self, session_id: &SessionKey) -> Option<&str> {
+        self.pending_session_approvals
+            .get(session_id)
+            .map(|approval| approval.title.as_str())
+            .or_else(|| {
+                self.pending_session_questions
+                    .get(session_id)
+                    .map(|picker| picker.title.as_str())
+            })
+    }
+
+    /// One-line "what is this session doing" summary for the Alt+S rows
+    /// (tui#398): blocked reason first (it needs the user), then the live
+    /// stream's tail, then the last transcript line. Single-line, char-capped
+    /// for the menu row.
+    pub fn session_activity_line(&self, session_id: &SessionKey) -> Option<String> {
+        const ACTIVITY_CHARS: usize = 60;
+        fn last_line_tail(text: &str, cap: usize) -> Option<String> {
+            let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
+            let line = line.trim();
+            let chars = line.chars().count();
+            Some(if chars > cap {
+                let tail: String = line
+                    .chars()
+                    .skip(chars.saturating_sub(cap.saturating_sub(1)))
+                    .collect();
+                format!("…{tail}")
+            } else {
+                line.to_owned()
+            })
+        }
+        if let Some(reason) = self.session_blocked_reason(session_id) {
+            return Some(t!("menu.sessions.item.blocked_reason", reason = reason).into_owned());
+        }
+        let session = self
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)?;
+        if let Some(live) = session.live_reply.as_ref() {
+            if let Some(tail) = last_line_tail(&live.text, ACTIVITY_CHARS) {
+                return Some(tail);
+            }
+        }
+        session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| !message.content.trim().is_empty())
+            .and_then(|message| last_line_tail(&message.content, ACTIVITY_CHARS))
     }
 
     pub fn refresh_run_state_from_selection(&mut self) {
