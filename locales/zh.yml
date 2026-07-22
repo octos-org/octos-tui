@@ -1229,6 +1229,8 @@ status:
   peer_started: "同伴 %{slug} 已在后台开始工作 —— 请留意会话栏中它的标记（Alt+S）。"
   peer_switched: "同伴 %{slug} 已启动 —— 您现在位于它的会话中。"
   peer_fleet_opening: "正在打开 %{n} 个同伴组成的编队（第一个：%{slug}）…"
+  peer_staged_by_agent: "智能体派生了同伴 %{slug} —— 正在后台工作（Alt+S）。"
+  peer_staged_known: "同伴 %{slug} 已经暂存 —— 重复通知已忽略。"
   gather_requesting: "正在从黑板收集同伴结果…"
   gather_no_peers: "黑板上还没有同伴 —— 先用 /peer 派生几个吧。"
   gather_submitted: "已把 %{n} 个同伴的结果从黑板汇总进当前会话。"

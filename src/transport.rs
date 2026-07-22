@@ -2833,6 +2833,14 @@ fn rpc_value_to_app_event(
         if method == "server/heartbeat" {
             return Ok(None);
         }
+        // octos#1801 v3: `peer/staged` is decoded tui-locally BEFORE the
+        // vendored `UiNotification::from_method_and_params` — the pinned
+        // octos-core rev predates the variant, so routing it through the
+        // vendored decoder would degrade it to an `unknown_notification`
+        // error event.
+        if method == crate::model::APPUI_METHOD_PEER_STAGED {
+            return Ok(Some(peer_staged_notification_to_client_event(params)));
+        }
         return Ok(Some(notification_to_app_event(method, params).into()));
     }
 
@@ -4184,6 +4192,25 @@ fn response_id(
             "malformed_frame",
             "UI protocol response id must be a string, integer, or null",
         ))),
+    }
+}
+
+/// octos#1801 v3: decodes the durable `peer/staged` notification into the
+/// typed [`ClientEvent::PeerStaged`] via the tui-local
+/// [`crate::model::PeerStagedParams`] mirror (the vendored octos-core rev has
+/// no `UiNotification` variant for it yet). Malformed params surface as the
+/// standard `invalid_params` error event rather than wedging the stream.
+fn peer_staged_notification_to_client_event(params: Value) -> ClientEvent {
+    match serde_json::from_value::<crate::model::PeerStagedParams>(params) {
+        Ok(staged) => ClientEvent::PeerStaged(staged),
+        Err(err) => app_error(
+            "invalid_params",
+            format!(
+                "failed to decode UI protocol params for {}: {err}",
+                crate::model::APPUI_METHOD_PEER_STAGED
+            ),
+        )
+        .into(),
     }
 }
 
@@ -7001,6 +7028,71 @@ mod tests {
         assert_eq!(event.result.peers.len(), 2);
         assert_eq!(event.result.peers[1].slug, "fix-nav-2");
         assert_eq!(event.result.peers[1].topic, "peer-fix-nav-2");
+    }
+
+    /// octos#1801 v3: the durable `peer/staged` NOTIFICATION decodes via the
+    /// tui-local string-keyed match into `ClientEvent::PeerStaged` — the
+    /// vendored octos-core rev predates the `UiNotification` variant, so
+    /// routing it through `from_method_and_params` would degrade it to an
+    /// `unknown_notification` error event.
+    #[test]
+    fn peer_staged_notification_decodes_to_client_event() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "peer/staged",
+            "params": {
+                "session_id": "coding:local:tui#coding",
+                "topic": "peer-fix-nav",
+                "slug": "fix-nav",
+                "brief": "fix the nav",
+                "brief_path": "/repo/.octos/peers/fix-nav/BRIEF.md",
+                "cwd": "/repo",
+                "worktree_branch": null,
+                "profile_id": "coding"
+            }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut HashMap::new())
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::PeerStaged(staged) = event else {
+            panic!("expected peer staged event, got {event:?}");
+        };
+        assert_eq!(
+            staged.session_id,
+            SessionKey("coding:local:tui#coding".into())
+        );
+        assert_eq!(staged.topic, "peer-fix-nav");
+        assert_eq!(staged.slug, "fix-nav");
+        assert_eq!(staged.brief, "fix the nav");
+        assert_eq!(staged.brief_path, "/repo/.octos/peers/fix-nav/BRIEF.md");
+        assert_eq!(staged.cwd, "/repo");
+        assert!(staged.worktree_branch.is_none());
+        assert_eq!(staged.profile_id, "coding");
+    }
+
+    /// Malformed `peer/staged` params surface as the standard
+    /// `invalid_params` error event instead of wedging the stream (durable
+    /// replay would re-deliver the same frame on every reconnect).
+    #[test]
+    fn peer_staged_notification_with_bad_params_yields_invalid_params_error() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "peer/staged",
+            "params": { "topic": "peer-fix-nav" }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut HashMap::new())
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::App(event) = event else {
+            panic!("expected an app error event, got {event:?}");
+        };
+        let AppUiEvent::Error(error) = *event else {
+            panic!("expected an error event, got {event:?}");
+        };
+        assert_eq!(error.code, "invalid_params");
+        assert!(error.message.contains("peer/staged"));
     }
 
     /// octos#1801 v2: `peer/gather` requests encode the slug filter (omitted
