@@ -3820,6 +3820,67 @@ mod tests {
         );
     }
 
+    /// Live markdown highlighting in the composer is STYLE-ONLY: the draft's
+    /// characters render verbatim (markers included, no reflow), the terminal
+    /// cursor still lands exactly after the last typed char, and only span
+    /// styles change (heading → bold title color, inline code → highlight
+    /// color, prose → plain).
+    #[test]
+    fn composer_highlights_markdown_draft_without_changing_text_or_cursor() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.set_composer_text("# hi\n`code` tail");
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let (buffer, cursor) = rendered_buffer_and_cursor(&app, palette);
+        let rows = rendered_rows(&buffer);
+
+        // TEXT CONTENT unchanged: both draft lines render verbatim, markers
+        // and all.
+        let heading_row = row_index_containing(&rows, "› # hi");
+        let code_row = row_index_containing(&rows, "`code` tail");
+
+        // Cell-precise style checks. Columns are char-based, not byte-based:
+        // every glyph left of the draft (border, `›`, spaces) is width-1, so
+        // the char index equals the cell index.
+        let width = usize::from(buffer.area.width);
+        let cell_at = |row: usize, needle: &str| {
+            let byte = rows[row].find(needle).expect("needle in row");
+            let col = rows[row][..byte].chars().count();
+            &buffer.content[row * width + col]
+        };
+        let hash = cell_at(heading_row, "# hi");
+        assert_eq!(hash.fg, palette.accent, "heading takes the title color");
+        assert!(hash.modifier.contains(Modifier::BOLD), "heading is bold");
+        let backtick = cell_at(code_row, "`code`");
+        assert_eq!(
+            backtick.fg, palette.highlight,
+            "inline code (backticks included) takes the code color"
+        );
+        let tail = cell_at(code_row, "tail");
+        assert_eq!(tail.fg, palette.text, "text outside markers stays plain");
+        assert!(tail.modifier.is_empty(), "plain text gains no modifier");
+
+        // Cursor invariance: the terminal cursor sits exactly one cell after
+        // the draft's last char — the cursor math reads the raw text only and
+        // must be unaffected by highlighting.
+        let code_byte = rows[code_row].find("`code` tail").expect("draft row");
+        let after_tail =
+            rows[code_row][..code_byte].chars().count() + "`code` tail".chars().count();
+        assert_eq!(cursor, Position::new(after_tail as u16, code_row as u16));
+    }
+
     /// Regression: the harness-row context `LineGauge` label (`ctx …/… ~N%`)
     /// must inherit the theme `surface` background. `LineGauge` paints its whole
     /// area with the widget base style *before* writing the (unstyled) label,

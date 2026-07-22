@@ -3171,6 +3171,11 @@ struct ComposerInputView {
     hidden_prefix: bool,
     cursor_row: u16,
     cursor_width: usize,
+    /// Index (into the draft's logical lines) of the first VISIBLE line —
+    /// i.e. how many whole draft lines scrolled off above the window. Lets
+    /// the renderer replay markdown fence state over the hidden prefix so a
+    /// ``` block whose opener scrolled away keeps its interior styling.
+    first_line_index: usize,
 }
 
 /// Max width of a per-loop chip label before truncation. Keeps the
@@ -4437,6 +4442,7 @@ fn composer_input_view(
     let mut selected_cursor_line = 0usize;
     let mut cursor_width = 0usize;
     let mut cursor_row = 0usize;
+    let mut first_line_index = 0usize;
 
     for index in (0..=line_window_end).rev() {
         let line = &logical_lines[index];
@@ -4448,6 +4454,7 @@ fn composer_input_view(
             cursor_width = cursor_width_for_text(&visible.before_cursor, width);
             selected_cursor_line = 0;
             selected.push(visible.text);
+            first_line_index = index;
             hidden_prefix = true;
             break;
         }
@@ -4462,6 +4469,7 @@ fn composer_input_view(
             selected_cursor_line = selected.len();
         }
         selected.push(line.text.to_string());
+        first_line_index = index;
         used_rows += rows;
     }
 
@@ -4487,6 +4495,7 @@ fn composer_input_view(
         hidden_prefix,
         cursor_row: rows_before_cursor.saturating_add(cursor_row) as u16,
         cursor_width,
+        first_line_index,
     }
 }
 
@@ -5161,6 +5170,7 @@ mod render;
 #[allow(unused_imports)]
 pub(crate) use render::*;
 mod activity_nav;
+mod markdown_highlight;
 #[allow(unused_imports)]
 pub(crate) use activity_nav::*;
 
