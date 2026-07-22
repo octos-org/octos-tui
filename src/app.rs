@@ -2327,7 +2327,7 @@ fn btw_overlay_height_hint(app: &AppState, area_width: u16) -> u16 {
 fn user_question_action_labels(picker: &UserQuestionPickerState) -> Vec<String> {
     // Garbled / 0-question event: nothing is answerable, so offer only a dismiss
     // hint — never a submit affordance that would form an invalid respond
-    // (DO-NOT-SHIP #2). Alt+a re-opens it if dismissed (DO-NOT-SHIP #1).
+    // (DO-NOT-SHIP #2). Ctrl+R/Alt+a re-opens it if dismissed (DO-NOT-SHIP #1).
     if picker.questions.is_empty() {
         return vec![t!("app.question.action_dismiss").to_string()];
     }
@@ -2340,6 +2340,7 @@ fn user_question_action_labels(picker: &UserQuestionPickerState) -> Vec<String> 
     labels
 }
 
+#[cfg(test)]
 fn fit_card_text(text: &str, width: usize) -> String {
     // Reserve the 4-space prefix added by the caller. The budget is DISPLAY
     // COLUMNS (unicode-width), not chars — CJK glyphs are double-width, so a
@@ -2459,8 +2460,13 @@ fn turn_summary_text(summary: &crate::model::TurnActivitySummary) -> String {
     }
 }
 
-/// "Tentacle pulse" octopus spinner frames (braille blob, all single-width).
-const SPINNER_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+/// "Swirling galaxy" spinner frames: a spiral arm sweeps one full clockwise
+/// revolution (6 arc frames), then the core glints (bright ✦ → fading ✧) —
+/// at the 120ms tick in [`spinner_frame`] that is a 720ms swirl + a 240ms
+/// sparkle per 960ms cycle. Every frame is exactly one terminal cell wide
+/// (ambiguous-width-but-1 glyphs; same shipped precedent as ✻ / ⚠), which the
+/// fixed marker layout math depends on.
+const SPINNER_FRAMES: [&str; 8] = ["◜", "◠", "◝", "◞", "◡", "◟", "✦", "✧"];
 
 /// Current spinner frame, advancing ~every 120ms off a process-lifetime clock
 /// (independent of any turn timer, so it keeps animating while background
@@ -2618,7 +2624,7 @@ fn tool_card_bullet(item: &ActivityItem, palette: Palette) -> (String, Style) {
 }
 
 /// Leading indent for a tool card rendered as an agent-task-group CHILD:
-/// the card is always emitted under a group header (`⣻ Orchestrating…`), so
+/// the card is always emitted under a group header (`◠ Orchestrating…`), so
 /// its bullet must nest instead of sitting flush at column 0 where it reads
 /// as a sibling of the header. Two columns puts the `⏺`/spinner bullet at the
 /// same tree level as the `⎿` connector of non-tool children.
@@ -3170,6 +3176,11 @@ struct ComposerInputView {
     hidden_prefix: bool,
     cursor_row: u16,
     cursor_width: usize,
+    /// Index (into the draft's logical lines) of the first VISIBLE line —
+    /// i.e. how many whole draft lines scrolled off above the window. Lets
+    /// the renderer replay markdown fence state over the hidden prefix so a
+    /// ``` block whose opener scrolled away keeps its interior styling.
+    first_line_index: usize,
 }
 
 /// Max width of a per-loop chip label before truncation. Keeps the
@@ -4393,7 +4404,7 @@ fn harness_status_lines(
 
     // The whimsical persona status word (server `progress/updated{kind:
     // "status_word"}`, rotated ~every 8s — e.g. "Conjuring", "正在炼丹") wins
-    // over the flat "Working" phase so the gradient line reads `⣻ Conjuring…`
+    // over the flat "Working" phase so the gradient line reads `◠ Conjuring…`
     // like the web ThinkingIndicator. It replaces ONLY the generic working
     // phase; a real "orchestrating" / "re-entering" phase (sub-agents running,
     // master re-entry) still shows, since that is information the operator
@@ -4423,7 +4434,7 @@ fn harness_status_lines(
     };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    // Water-wave gradient on "spinner + phase" (e.g. "⣻ Working"): a bright crest
+    // Water-wave gradient on "spinner + phase" (e.g. "◠ Working"): a bright crest
     // ripples across the label, advanced by the ~25ms animation redraw via the
     // shared process clock. Uses Color::Rgb like the rest of octos-tui's themes
     // (truecolor-assuming, so it works over SSH where COLORTERM isn't forwarded);
@@ -4670,6 +4681,7 @@ fn composer_input_view(
     let mut selected_cursor_line = 0usize;
     let mut cursor_width = 0usize;
     let mut cursor_row = 0usize;
+    let mut first_line_index = 0usize;
 
     for index in (0..=line_window_end).rev() {
         let line = &logical_lines[index];
@@ -4681,6 +4693,7 @@ fn composer_input_view(
             cursor_width = cursor_width_for_text(&visible.before_cursor, width);
             selected_cursor_line = 0;
             selected.push(visible.text);
+            first_line_index = index;
             hidden_prefix = true;
             break;
         }
@@ -4695,6 +4708,7 @@ fn composer_input_view(
             selected_cursor_line = selected.len();
         }
         selected.push(line.text.to_string());
+        first_line_index = index;
         used_rows += rows;
     }
 
@@ -4720,6 +4734,7 @@ fn composer_input_view(
         hidden_prefix,
         cursor_row: rows_before_cursor.saturating_add(cursor_row) as u16,
         cursor_width,
+        first_line_index,
     }
 }
 
@@ -4853,7 +4868,7 @@ pub(crate) fn active_session_pending_decision_turn(app: &AppState) -> Option<(Se
 /// decision modal owns the keyboard (y/s/n) so the composer is locked; the modal
 /// can also scroll out of the height-clipped live tail, leaving the user with a
 /// bare "Waiting" and no visible prompt — so the status bar must advertise the
-/// recovery keys (Alt+A to bring the prompt back, Ctrl+C to interrupt).
+/// recovery keys (Ctrl+R/Alt+A to bring the prompt back, Ctrl+C to interrupt).
 pub(crate) fn active_session_has_pending_decision(app: &AppState) -> bool {
     active_session_pending_decision_turn(app).is_some()
 }
@@ -4968,7 +4983,7 @@ fn run_state_style(state: &SessionRunState, palette: Palette) -> Style {
 
 fn run_state_marker(state: &SessionRunState) -> &'static str {
     match state {
-        // Pin the swimming octopus to the always-visible status bar: on a big
+        // Pin the swirling galaxy to the always-visible status bar: on a big
         // turn the transcript's "Orchestrating" chip scrolls above the fold, so
         // this is the reliable "still working" signal that never scrolls away.
         // Time-based like the transcript spinner; the status bar redraws every
@@ -5394,6 +5409,7 @@ mod render;
 #[allow(unused_imports)]
 pub(crate) use render::*;
 mod activity_nav;
+mod markdown_highlight;
 #[allow(unused_imports)]
 pub(crate) use activity_nav::*;
 

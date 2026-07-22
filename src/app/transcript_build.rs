@@ -1116,13 +1116,13 @@ pub(super) fn push_turn_flow(
 
     // While a reserved-row menu (slash/command popup, model picker, …) is open
     // it squeezes the live tail down to its `Constraint::Min(1)` floor, so the
-    // in-flight activity chip renders as a single truncated "⣾ Orchestrating…"
+    // in-flight activity chip renders as a single truncated "◜ Orchestrating…"
     // HEADER row (no sub-agent child line). On the menu-open viewport GROW the
     // terminal scrolls that squeezed header up into REAL scrollback, where the
     // menu-close `clear_visible_screen` (`CSI 2J`) cannot reclaim it — leaving a
     // frozen, one-spinner-frame-behind duplicate stranded above the fresh live
     // chip (user report: "duplicated orchestrating after slash commands"; the
-    // two chips carry the same turn id but different braille glyphs). The scroll
+    // two chips carry the same turn id but different spinner glyphs). The scroll
     // itself is a deliberately conservative invariant (see
     // `viewport_growth_after_width_reset_scrolls_full_deficit` / #232 #267), so
     // the fix is here, not in the scroll geometry: don't paint the chip while a
@@ -2267,19 +2267,23 @@ pub(super) fn push_inline_user_question_card(
     // Mandatory generic fallback text keeps the card actionable even when the
     // structured `questions` field is empty or unparsed.
     if !picker.title.is_empty() {
-        push_prefixed_line(
+        push_wrapped_card_text(
             lines,
-            "    ",
-            palette.muted(),
-            Line::from(Span::styled(picker.title.clone(), palette.text())),
+            vec![Span::styled("    ", palette.muted())],
+            "    ".to_string(),
+            &picker.title,
+            palette.text(),
+            width.saturating_sub(4).max(1),
         );
     }
     if !picker.body.is_empty() {
-        push_prefixed_line(
+        push_wrapped_card_text(
             lines,
-            "    ",
+            vec![Span::styled("    ", palette.muted())],
+            "    ".to_string(),
+            &picker.body,
             palette.muted(),
-            Line::from(Span::styled(picker.body.clone(), palette.muted())),
+            width.saturating_sub(4).max(1),
         );
     }
 
@@ -2291,7 +2295,7 @@ pub(super) fn push_inline_user_question_card(
             // INFORMATIONAL card only — do NOT offer a "Type your answer"
             // affordance, since any input would be discarded and a submit cannot
             // form a valid (count-matched) respond (DO-NOT-SHIP #2). The card
-            // stays dismissible (Esc) and recoverable (Alt+a).
+            // stays dismissible (Esc) and recoverable (Ctrl+R/Alt+a).
             lines.push(Line::from(vec![
                 Span::styled("    ", palette.muted()),
                 Span::styled(t!("app.question.no_options").to_string(), palette.muted()),
@@ -2324,11 +2328,13 @@ pub(super) fn push_user_question_entry(
             )),
         );
     }
-    push_prefixed_line(
+    push_wrapped_card_text(
         lines,
-        "    ",
-        palette.muted(),
-        Line::from(Span::styled(entry.question.clone(), palette.text())),
+        vec![Span::styled("    ", palette.muted())],
+        "    ".to_string(),
+        &entry.question,
+        palette.text(),
+        width.saturating_sub(4).max(1),
     );
 
     for (idx, option) in entry.options.iter().enumerate() {
@@ -2415,17 +2421,22 @@ pub(super) fn push_user_question_option_row(
     } else {
         palette.text()
     };
-    // Budget the label to the remaining width after the bar + marker prefixes
-    // (2 cols each). `fit_card_text` already reserves the 4-space indent, so
-    // subtract only the extra 4 columns here — subtracting 6 clipped labels
-    // two columns early (codex review).
-    let label = fit_card_text(text, width.saturating_sub(4));
-    lines.push(Line::from(vec![
-        Span::styled("    ", palette.muted()),
-        Span::styled(bar, bar_style),
-        Span::styled(marker, marker_style),
-        Span::styled(label, label_style),
-    ]));
+    // Budget = width minus the 4-space indent and the bar + marker prefixes
+    // (2 cols each). Long labels WRAP with a hanging indent aligned under the
+    // label start — truncation hid the tail of real questions (user report).
+    let budget = width.saturating_sub(8).max(1);
+    push_wrapped_card_text(
+        lines,
+        vec![
+            Span::styled("    ", palette.muted()),
+            Span::styled(bar, bar_style),
+            Span::styled(marker, marker_style),
+        ],
+        "        ".to_string(),
+        text,
+        label_style,
+        budget,
+    );
 }
 
 pub(super) fn push_prefixed_line(
@@ -2437,6 +2448,80 @@ pub(super) fn push_prefixed_line(
     let mut spans = vec![Span::styled(prefix, prefix_style)];
     spans.append(&mut line.spans);
     lines.push(Line::from(spans));
+}
+
+/// Word-wrap `text` into display-width-budgeted rows (unicode-width, so CJK
+/// double-width glyphs count as 2 — the `fit_card_text` lesson). Breaks on
+/// spaces; a single word wider than the budget hard-breaks mid-word rather
+/// than overflowing. Never returns an empty vec (empty text → one empty row).
+pub(super) fn wrap_display_width(text: &str, budget: usize) -> Vec<String> {
+    let budget = budget.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    let mut row_w = 0usize;
+    for word in text.split(' ') {
+        let word_w = word.width();
+        let sep_w = if row.is_empty() { 0 } else { 1 };
+        if row_w + sep_w + word_w <= budget {
+            if sep_w == 1 {
+                row.push(' ');
+            }
+            row.push_str(word);
+            row_w += sep_w + word_w;
+            continue;
+        }
+        if !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+        }
+        if word_w <= budget {
+            row.push_str(word);
+            row_w = word_w;
+        } else {
+            // Hard-break an over-budget word by display columns.
+            let mut piece = String::new();
+            let mut piece_w = 0usize;
+            for ch in word.chars() {
+                let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if piece_w + ch_w > budget && !piece.is_empty() {
+                    rows.push(std::mem::take(&mut piece));
+                    piece_w = 0;
+                }
+                piece.push(ch);
+                piece_w += ch_w;
+            }
+            row = piece;
+            row_w = piece_w;
+        }
+    }
+    rows.push(row);
+    rows
+}
+
+/// Push `text` wrapped to the card budget: every row carries the 4-space card
+/// indent; rows after the first get `extra_indent` more columns so
+/// continuations align under the first row's content (option-marker hanging
+/// indent). Replaces the old single-line `fit_card_text` truncation on the
+/// question card — questions and options must WRAP, not clip (user report).
+pub(super) fn push_wrapped_card_text(
+    lines: &mut Vec<Line<'static>>,
+    first_prefix_spans: Vec<Span<'static>>,
+    continuation_prefix: String,
+    text: &str,
+    style: Style,
+    budget: usize,
+) {
+    for (idx, row) in wrap_display_width(text, budget).into_iter().enumerate() {
+        if idx == 0 {
+            let mut spans = first_prefix_spans.clone();
+            spans.push(Span::styled(row, style));
+            lines.push(Line::from(spans));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(continuation_prefix.clone(), Style::default()),
+                Span::styled(row, style),
+            ]));
+        }
+    }
 }
 
 pub(super) fn push_activity_section_with_finalization(
@@ -2718,7 +2803,7 @@ pub(super) fn push_finalized_activity_items_section(
     // here makes the chip header read "Orchestrating… (N active)" with its
     // spinner frozen at flush time, and that copy strands one frame behind the
     // LIVE aggregate chip below: two "Orchestrating" lines for the same turn,
-    // different braille glyphs (the third face of the "duplicated
+    // different spinner glyphs (the third face of the "duplicated
     // orchestrating" bug, after #339/#342). It reaches here via the covered
     // late-activity flush (`finalized_late_activity_lines_for_coverages` /
     // `push_turn_activity_log_section_unflushed`), whose UNFLUSHED item set is

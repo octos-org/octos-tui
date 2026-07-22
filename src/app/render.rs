@@ -1669,22 +1669,42 @@ pub(super) fn render_composer(app: &AppState, palette: Palette, area: Rect) -> P
                 palette.muted().bg(palette.surface),
             ),
         ])),
-        ComposerPresentation::Inline(_) => {
+        ComposerPresentation::Inline(draft) => {
             if let Some(view) = input_view.as_ref() {
                 let text_width = composer_text_width(area.width);
+                let base_style = palette.text().bg(palette.surface);
+                // Live markdown highlighting is STYLE-ONLY: the wrap chunks
+                // below are the exact strings the unstyled composer rendered,
+                // and `split_highlighted_spans` re-emits them verbatim (the
+                // highlight spans contribute styles, never text), so content,
+                // wrapping, and the cursor math stay byte-identical. The fence
+                // state is seeded from the draft lines scrolled off above the
+                // visible window so an open ``` block keeps its styling.
+                let mut in_fence = false;
+                for hidden in draft.split('\n').take(view.first_line_index) {
+                    if markdown_highlight::is_fence_line(hidden) {
+                        in_fence = !in_fence;
+                    }
+                }
                 let mut first_row = true;
                 for line in view.lines.iter() {
-                    for chunk in wrap_composer_line(line, text_width) {
+                    let highlighted =
+                        markdown_highlight::markdown_highlight_line(line, &mut in_fence, palette);
+                    let chunks = wrap_composer_line(line, text_width);
+                    for row_spans in markdown_highlight::split_highlighted_spans(
+                        &highlighted,
+                        &chunks,
+                        base_style,
+                    ) {
                         let prefix = if first_row { " › " } else { "   " };
                         let prefix_style = if first_row {
                             palette.selected().bg(palette.surface)
                         } else {
                             palette.muted().bg(palette.surface)
                         };
-                        lines.push(Line::from(vec![
-                            Span::styled(prefix, prefix_style),
-                            Span::styled(chunk, palette.text().bg(palette.surface)),
-                        ]));
+                        let mut spans = vec![Span::styled(prefix, prefix_style)];
+                        spans.extend(row_spans);
+                        lines.push(Line::from(spans));
                         first_row = false;
                     }
                 }

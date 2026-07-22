@@ -3378,7 +3378,7 @@ pub struct ModelRemovalRequest {
     pub label: String,
 }
 
-/// #324: one session-strip / Alt+S-popup chip, computed per frame from the
+/// #324: one session-strip / Ctrl+S/Alt+S-popup chip, computed per frame from the
 /// live store state (focused flag, live-turn signal, unread count).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionChipView {
@@ -3388,9 +3388,9 @@ pub struct SessionChipView {
     pub live: bool,
     pub unread: usize,
     /// tui#398: the session is waiting on an approval/question in the
-    /// background — strip renders `⚠`, the Alt+S row names the reason.
+    /// background — strip renders `⚠`, the Ctrl+S/Alt+S row names the reason.
     pub blocked: bool,
-    /// One-line activity summary for the Alt+S row: blocked reason, else the
+    /// One-line activity summary for the Ctrl+S/Alt+S row: blocked reason, else the
     /// live stream tail, else the last transcript line.
     pub activity: Option<String>,
 }
@@ -8786,7 +8786,7 @@ impl AppState {
 
     /// tui#398: the reason a BACKGROUND session is waiting on the user (a
     /// stashed approval or question), if any. Drives the strip's `⚠` and the
-    /// Alt+S row's blocked line. The focused session never reads as blocked
+    /// Ctrl+S/Alt+S row's blocked line. The focused session never reads as blocked
     /// here — its pending decision lives in the global modal slots.
     pub fn session_blocked_reason(&self, session_id: &SessionKey) -> Option<&str> {
         self.pending_session_approvals
@@ -8799,7 +8799,7 @@ impl AppState {
             })
     }
 
-    /// One-line "what is this session doing" summary for the Alt+S rows
+    /// One-line "what is this session doing" summary for the Ctrl+S/Alt+S rows
     /// (tui#398): blocked reason first (it needs the user), then the live
     /// stream's tail, then the last transcript line. Single-line, char-capped
     /// for the menu row.

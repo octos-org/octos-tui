@@ -377,18 +377,46 @@ mod tests {
     }
 
     #[test]
-    fn in_progress_status_marker_is_the_octopus_spinner() {
+    fn in_progress_status_marker_is_the_galaxy_spinner() {
         // The pinned "still working" signal: the in-progress status marker is
-        // one of the octopus spinner frames (not a static bullet), so it stays
+        // one of the galaxy spinner frames (not a static bullet), so it stays
         // visible in the status bar even when the transcript chip scrolls off.
         let marker = run_state_marker(&SessionRunState::InProgress);
         assert!(
             SPINNER_FRAMES.contains(&marker),
-            "in-progress marker must be an octopus spinner frame, got {marker:?}"
+            "in-progress marker must be a galaxy spinner frame, got {marker:?}"
         );
         // Settled states keep their static, non-animated markers.
         assert_eq!(run_state_marker(&SessionRunState::Success), "✓");
         assert_eq!(run_state_marker(&SessionRunState::Idle), "·");
+    }
+
+    #[test]
+    fn galaxy_spinner_frames_swirl_and_stay_single_width() {
+        // Every frame must occupy exactly ONE terminal cell: the marker slots
+        // into fixed layout math (status bar, tool-card bullets, the
+        // "◠ Working…" gradient label), so a width-2 frame would shove the
+        // columns over once per cycle. Ambiguous-width-but-1 glyphs are fine —
+        // ✻ / ⚠ are already shipped precedent in this UI.
+        for frame in SPINNER_FRAMES {
+            assert_eq!(
+                UnicodeWidthStr::width(frame),
+                1,
+                "spinner frame {frame:?} must be exactly one cell wide"
+            );
+        }
+        // The swirl: a 6-frame arc sweeping one full clockwise revolution,
+        // then a 2-frame core glint (bright ✦ → fading ✧). At the 120ms tick
+        // that is a 720ms rotation + a 240ms sparkle per 960ms cycle.
+        assert_eq!(
+            SPINNER_FRAMES,
+            ["◜", "◠", "◝", "◞", "◡", "◟", "✦", "✧"],
+            "galaxy swirl = arc revolution + core glint"
+        );
+        // The ticker (`spinner_frame`) indexes `elapsed/120 % len()`, so
+        // whatever it returns must be a member of the cycle — no
+        // out-of-bounds step at any elapsed time or frame-list length.
+        assert!(SPINNER_FRAMES.contains(&spinner_frame()));
     }
 
     #[test]
@@ -944,7 +972,7 @@ mod tests {
         // Regression: a turn parked on an approval/question locks the composer and
         // its card can scroll off the clipped live tail — leaving a bare "Waiting"
         // with only the (two-step) Esc hint. The work text must instead advertise
-        // Alt+A (bring the prompt back) and Ctrl+C (one-press interrupt).
+        // Ctrl+R/Alt+A (bring the prompt back) and Ctrl+C (one-press interrupt).
         let session_id = SessionKey("local:test".into());
         let mut app = AppState::new(
             vec![SessionView {
@@ -964,7 +992,7 @@ mod tests {
             message: "Run command".into(),
         };
         // No pending decision → no recovery hint.
-        assert!(!status_bar_work_text(&app).contains("Alt+A"));
+        assert!(!status_bar_work_text(&app).contains("Ctrl+R/Alt+A"));
 
         // Park the active session on an approval (even collapsed/hidden).
         app.approval = Some(ApprovalModalState {
@@ -982,7 +1010,7 @@ mod tests {
         });
         let work = status_bar_work_text(&app);
         assert!(
-            work.contains("Alt+A") && work.contains("Ctrl+C"),
+            work.contains("Ctrl+R/Alt+A") && work.contains("Ctrl+C"),
             "a parked decision must advertise the recovery keys: {work:?}"
         );
         assert!(
@@ -994,7 +1022,7 @@ mod tests {
         if let Some(approval) = app.approval.as_mut() {
             approval.session_id = SessionKey("local:other".into());
         }
-        assert!(!status_bar_work_text(&app).contains("Alt+A"));
+        assert!(!status_bar_work_text(&app).contains("Ctrl+R/Alt+A"));
     }
 
     #[test]
@@ -2740,6 +2768,68 @@ mod tests {
         assert_eq!(fit_card_text("四字选项", 12), "四字选项");
     }
 
+    /// User report: long question/option text was TRUNCATED with an ellipsis;
+    /// it must wrap to new lines instead (width-aware, CJK-safe).
+    #[test]
+    fn question_card_wraps_long_options_and_questions_instead_of_truncating() {
+        use super::transcript_build::{push_user_question_entry, wrap_display_width};
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let entry = crate::model::UserQuestionEntry {
+            header: String::new(),
+            question: "Which of these very long strategies should we adopt for the multi-region rollout considering budget, latency, and team capacity?".into(),
+            options: vec![octos_core::ui_protocol::UserQuestionOption {
+                label: "Adopt the fully incremental region-by-region strategy".into(),
+                description: "slower but derisks the migration and keeps rollback trivial at every stage of the multi-quarter plan".into(),
+            }],
+            multi_select: false,
+            option_selected: vec![false],
+            free_text: String::new(),
+            cursor: 0,
+            editing_free_text: false,
+        };
+        let mut lines = Vec::new();
+        push_user_question_entry(&mut lines, palette, &entry, 40);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            !rendered.iter().any(|row| row.contains('…')),
+            "no ellipsis truncation in the card: {rendered:?}"
+        );
+        let joined = rendered
+            .iter()
+            .map(|row| row.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("team capacity?"),
+            "the question tail survives via wrapping: {rendered:?}"
+        );
+        assert!(
+            joined.contains("multi-quarter plan"),
+            "the option tail survives via wrapping: {rendered:?}"
+        );
+        for row in &rendered {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(row.as_str()) <= 40,
+                "no rendered row exceeds the card width: {row:?}"
+            );
+        }
+
+        // Width math: budget counts display columns (CJK double-width).
+        let rows = wrap_display_width("宽宽宽宽 宽宽宽宽", 8);
+        assert_eq!(rows, vec!["宽宽宽宽".to_string(), "宽宽宽宽".to_string()]);
+        // A single over-budget word hard-breaks instead of overflowing.
+        let rows = wrap_display_width("abcdefghij", 4);
+        assert_eq!(rows, vec!["abcd", "efgh", "ij"]);
+    }
+
     #[test]
     fn render_inline_multi_select_user_question_shows_checkboxes() {
         let app = app_with_user_question(vec![user_question(
@@ -2934,7 +3024,7 @@ mod tests {
             .sum::<usize>();
 
         assert!(text.contains("Working on it."));
-        // The in-progress status marker is the animated octopus spinner now
+        // The in-progress status marker is the animated galaxy spinner now
         // (pinned so it survives a transcript that scrolls the chip off).
         assert!(
             SPINNER_FRAMES
@@ -3756,6 +3846,67 @@ mod tests {
             cursor,
             composer_cursor_position(&app, Rect::new(0, 36, 120, 5)).expect("cursor")
         );
+    }
+
+    /// Live markdown highlighting in the composer is STYLE-ONLY: the draft's
+    /// characters render verbatim (markers included, no reflow), the terminal
+    /// cursor still lands exactly after the last typed char, and only span
+    /// styles change (heading → bold title color, inline code → highlight
+    /// color, prose → plain).
+    #[test]
+    fn composer_highlights_markdown_draft_without_changing_text_or_cursor() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.set_composer_text("# hi\n`code` tail");
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let (buffer, cursor) = rendered_buffer_and_cursor(&app, palette);
+        let rows = rendered_rows(&buffer);
+
+        // TEXT CONTENT unchanged: both draft lines render verbatim, markers
+        // and all.
+        let heading_row = row_index_containing(&rows, "› # hi");
+        let code_row = row_index_containing(&rows, "`code` tail");
+
+        // Cell-precise style checks. Columns are char-based, not byte-based:
+        // every glyph left of the draft (border, `›`, spaces) is width-1, so
+        // the char index equals the cell index.
+        let width = usize::from(buffer.area.width);
+        let cell_at = |row: usize, needle: &str| {
+            let byte = rows[row].find(needle).expect("needle in row");
+            let col = rows[row][..byte].chars().count();
+            &buffer.content[row * width + col]
+        };
+        let hash = cell_at(heading_row, "# hi");
+        assert_eq!(hash.fg, palette.accent, "heading takes the title color");
+        assert!(hash.modifier.contains(Modifier::BOLD), "heading is bold");
+        let backtick = cell_at(code_row, "`code`");
+        assert_eq!(
+            backtick.fg, palette.highlight,
+            "inline code (backticks included) takes the code color"
+        );
+        let tail = cell_at(code_row, "tail");
+        assert_eq!(tail.fg, palette.text, "text outside markers stays plain");
+        assert!(tail.modifier.is_empty(), "plain text gains no modifier");
+
+        // Cursor invariance: the terminal cursor sits exactly one cell after
+        // the draft's last char — the cursor math reads the raw text only and
+        // must be unaffected by highlighting.
+        let code_byte = rows[code_row].find("`code` tail").expect("draft row");
+        let after_tail =
+            rows[code_row][..code_byte].chars().count() + "`code` tail".chars().count();
+        assert_eq!(cursor, Position::new(after_tail as u16, code_row as u16));
     }
 
     /// Regression: the harness-row context `LineGauge` label (`ctx …/… ~N%`)
@@ -5047,7 +5198,7 @@ mod tests {
         // long `Bash($ sleep 45 …)` that keeps the turn live) was baked into
         // IMMUTABLE scrollback as "Orchestrating… (1 active)" with its spinner
         // frozen. That copy strands one frame behind the LIVE aggregate chip:
-        // two "Orchestrating" lines, same turn, different braille glyphs. The
+        // two "Orchestrating" lines, same turn, different spinner glyphs. The
         // finalized flush must record only TERMINAL activity; running items stay
         // in the live tail until they settle.
         let turn_id = TurnId::new();
@@ -6080,7 +6231,7 @@ mod tests {
     #[test]
     fn tool_card_children_are_indented_under_the_group_header() {
         // A tool activity renders as a `⏺ Bash(...)` card, but it is always a
-        // CHILD of the agent-task group header (`⣻ Orchestrating…` / `• Agent
+        // CHILD of the agent-task group header (`◠ Orchestrating…` / `• Agent
         // task …`). Its bullet must be indented so it nests under the header
         // instead of sitting flush at column 0 where it reads as a sibling
         // (user report: "bash commands should be indented").
@@ -7013,7 +7164,7 @@ mod tests {
         let rows = rendered_rows(&rendered_buffer(&app, Palette::for_theme(ThemeName::Slate)));
         assert!(
             rows.iter()
-                .any(|row| row.contains("Parked on you") && row.contains("Alt+A")),
+                .any(|row| row.contains("Parked on you") && row.contains("Ctrl+R/Alt+A")),
             "the escalation banner must advertise the recovery keys: {rows:?}"
         );
 
@@ -8323,7 +8474,10 @@ mod tests {
         );
         // thomas transitioned to terminal while viewing Main -> unread.
         assert!(pill.contains("1●"), "pill shows the unread count: {pill}");
-        assert!(pill.contains("Alt+G"), "pill hints the toggle key: {pill}");
+        assert!(
+            pill.contains("Ctrl+G/Alt+G"),
+            "pill hints the toggle key: {pill}"
+        );
 
         // Peeking thomas clears the unread segment.
         app.set_chat_view(crate::model::ChatViewTarget::Agent("thomas".into()));
@@ -9719,7 +9873,7 @@ mod tests {
         assert!(pending_question_for_banner(&app).is_some());
         assert_eq!(decision_banner_height(&app), 1);
 
-        // Dismissed (Alt+A) → banner row released; the picker no longer owns the
+        // Dismissed (Ctrl+R/Alt+A) → banner row released; the picker no longer owns the
         // reserved chrome.
         app.user_question.as_mut().unwrap().visible = false;
         assert_eq!(decision_banner_height(&app), 0);

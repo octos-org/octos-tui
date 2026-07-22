@@ -4760,7 +4760,7 @@ fn undo_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     })
 }
 
-/// #324: Alt+S / `/sessions` — the open-session switcher popup. Rows carry
+/// #324: Ctrl+S/Alt+S / `/sessions` — the open-session switcher popup. Rows carry
 /// the same live-turn `✻` and unread `(n)` annotations as the top strip;
 /// selecting a row switches through the resume path (full switch bundle).
 fn sessions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
@@ -10388,7 +10388,7 @@ mod tests {
         ));
     }
 
-    /// #324: the Alt+S popup lists open sessions — the focused row is
+    /// #324: the Ctrl+S/Alt+S popup lists open sessions — the focused row is
     /// informational, background rows switch via the resume path and carry
     /// the live `✻` / unread `(n)` annotations.
     #[test]

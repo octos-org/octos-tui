@@ -6144,7 +6144,7 @@ impl Store {
         if crate::app::parked_decision_escalation_secs(&self.state).is_none() {
             return false;
         }
-        // Bring a hidden prompt back — question first, mirroring the Alt+A
+        // Bring a hidden prompt back — question first, mirroring the Ctrl+R/Alt+A
         // recovery precedence in `handle_key`.
         if self
             .state
@@ -11240,7 +11240,7 @@ impl Store {
         // and answerable. Previously `visible` tracked `user_question_auto_open`,
         // so a question could arrive HIDDEN — and if the user was viewing a
         // sub-agent (Tab peek), the peek owned the keyboard and swallowed every
-        // key except the obscure Alt+A recovery, so the user could not answer
+        // key except the obscure Ctrl+R/Alt+A recovery, so the user could not answer
         // and their answers never reached the model. Force it visible and mark
         // auto-open so the peek yields to it.
         picker.visible = true;
@@ -11990,7 +11990,7 @@ impl Store {
     /// transcript row so the re-submit cannot render a duplicate. Returns
     /// true when a prompt was re-staged (false for a backoff-only gate).
     /// #324: a turn reaching its terminal in a NON-focused session bumps
-    /// that session's unread badge (strip + Alt+S popup). Focused sessions
+    /// that session's unread badge (strip + Ctrl+S/Alt+S popup). Focused sessions
     /// never count — the user is watching.
     fn bump_unread_for_background_terminal(&mut self, session_id: &SessionKey) {
         let is_active = self
@@ -15572,7 +15572,7 @@ mod tests {
         assert!(store.state.session_blocked_reason(&b).is_none());
     }
 
-    /// tui#398: the Alt+S activity line prefers the blocked reason, then the
+    /// tui#398: the Ctrl+S/Alt+S activity line prefers the blocked reason, then the
     /// live stream tail, then the last transcript line — single-line, capped.
     #[test]
     fn session_activity_line_prefers_blocked_then_live_then_last_message() {
@@ -23567,6 +23567,39 @@ now analyzing the bus module"
     }
 
     #[test]
+    fn bang_command_executes_locally_never_steered_on_steer_capable_live_turn() {
+        // #406 interaction pin (user report: "`!` stopped working"): with the
+        // server advertising `turn/steer`, a MID-TURN plain prompt steers into
+        // the live turn — but a `!`-bang draft is dispatched BEFORE the
+        // steer/staging chokepoint in `compose_command`, so a steer-capable
+        // live turn must never swallow it as steered/staged text.
+        let mut store = steer_capable_store();
+        start_live_turn(&mut store, "first prompt");
+        let messages_before = store.state.sessions[0].messages.len();
+        store.state.composer = "!echo hi".into();
+
+        let command = store.compose_command();
+
+        let Some(AppUiCommand::LocalShellExec { cmd, .. }) = command else {
+            panic!("expected LocalShellExec, got {command:?}");
+        };
+        assert_eq!(cmd, "echo hi");
+        assert!(
+            store.state.pending_turn_steers.is_empty(),
+            "a bang draft must never be steered into the live turn"
+        );
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "a bang draft must never be staged behind the live turn"
+        );
+        assert_eq!(
+            store.state.sessions[0].messages.len(),
+            messages_before,
+            "no optimistic user-row echo — the draft never became a prompt"
+        );
+    }
+
+    #[test]
     fn local_shell_result_completes_matching_chip_in_place() {
         let mut store = store_with_empty_session();
         store.state.composer = "!echo hi".into();
@@ -28167,7 +28200,7 @@ now analyzing the bus module"
     /// peek) must INTERRUPT the peek: it shows visibly and exits the peek, so its
     /// keys reach the question handler instead of being swallowed by the peek.
     /// (Regression: a hidden picker + an active peek trapped the user — only the
-    /// obscure Alt+A recovered it — so answers never reached the model.)
+    /// obscure Ctrl+R/Alt+A recovered it — so answers never reached the model.)
     #[test]
     fn arriving_question_interrupts_a_sub_agent_peek() {
         let mut store = store_with_empty_session();
