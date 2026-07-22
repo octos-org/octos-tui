@@ -2,12 +2,6 @@
 
 <div align="center">
 <pre>
-             .---.
-            / o o \
-            \  ~  /
-        .-._/`---'\_.-.
-       ( ( (  ) (  ) ) )
-        `-´ (_) (_) `-´
 
  ██████╗  ██████╗████████╗ ██████╗ ███████╗
 ██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔════╝
@@ -16,7 +10,7 @@
 ╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
  ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝
 </pre>
-<em>Welcome to Octos — Your Coding Buddy</em>
+<em>Welcome to Octos-TUI — Your Coding Buddy</em>
 </div>
 
 `octos-tui` is the terminal app for [Octos](https://github.com/octos-org/octos)
