@@ -3390,6 +3390,10 @@ pub struct SessionChipView {
     /// tui#398: the session is waiting on an approval/question in the
     /// background — strip renders `⚠`, the Ctrl+S/Alt+S row names the reason.
     pub blocked: bool,
+    /// True when this session is a peer (present in `peer_session_meta`). The
+    /// switcher marks peers `↳` and non-peers (main/parent windows) `⌂` so a
+    /// user inside a peer can tell which row is the parent to return to.
+    pub is_peer: bool,
     /// One-line activity summary for the Ctrl+S/Alt+S row: blocked reason, else the
     /// live stream tail, else the last transcript line.
     pub activity: Option<String>,
@@ -8803,6 +8807,22 @@ impl AppState {
                     .get(session_id)
                     .map(|picker| picker.title.as_str())
             })
+    }
+
+    /// Row index in the session switcher (= index in `sessions`) of the parent
+    /// window to pre-highlight when the switcher is opened from a peer: the
+    /// first non-peer ("main") session. `None` when the focused session is not
+    /// a peer (nothing to return to) or no main session exists — the switcher
+    /// then keeps its default first-selectable cursor. Lets `Ctrl+S → Enter`
+    /// drop you home from a peer without hunting for the parent row.
+    pub fn parent_session_row_index(&self) -> Option<usize> {
+        let focused = self.sessions.get(self.selected_session)?;
+        if !self.peer_session_meta.contains_key(&focused.id) {
+            return None;
+        }
+        self.sessions
+            .iter()
+            .position(|session| !self.peer_session_meta.contains_key(&session.id))
     }
 
     /// One-line "what is this session doing" summary for the Ctrl+S/Alt+S rows

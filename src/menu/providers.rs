@@ -4766,7 +4766,15 @@ fn undo_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 fn sessions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let mut items = Vec::new();
     for (idx, chip) in ctx.app.session_chips.iter().enumerate() {
-        let mut label = format!("{} {}", if chip.focused { "●" } else { "○" }, chip.title);
+        // ⌂ marks a main/parent window, ↳ a peer — so a user inside a peer can
+        // tell at a glance which row is the parent to return to (the switcher
+        // also pre-highlights that parent row when opened from a peer).
+        let marker = if chip.is_peer { "↳" } else { "⌂" };
+        let mut label = format!(
+            "{marker} {} {}",
+            if chip.focused { "●" } else { "○" },
+            chip.title
+        );
         if chip.blocked {
             label.push_str(" ⚠");
         } else if chip.live {
@@ -10403,6 +10411,7 @@ mod tests {
                 live: false,
                 unread: 0,
                 blocked: false,
+                is_peer: false,
                 activity: None,
             },
             crate::model::SessionChipView {
@@ -10412,6 +10421,7 @@ mod tests {
                 live: true,
                 unread: 3,
                 blocked: false,
+                is_peer: true,
                 activity: Some("now analyzing the bus module".into()),
             },
         ];
@@ -10446,6 +10456,14 @@ mod tests {
             .expect("background row");
         assert!(bg.label.contains("✻"), "live badge shown: {}", bg.label);
         assert!(bg.label.contains("(3)"), "unread badge shown: {}", bg.label);
+        // The focused main window is marked ⌂, the peer row ↳, so a user inside
+        // a peer can tell which row is the parent to return to.
+        assert!(
+            focused.label.contains("⌂"),
+            "main marked: {}",
+            focused.label
+        );
+        assert!(bg.label.contains("↳"), "peer marked: {}", bg.label);
         assert!(matches!(
             &bg.action,
             MenuAction::Local(crate::menu::types::LocalAction::ResumeSession(id))

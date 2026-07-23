@@ -992,7 +992,7 @@ menu:
         label: "Showing the first %{count} files — type to narrow the search"
   sessions:
     title: Sessions
-    subtitle: "✻ = turn running · (n) = turns finished since you last looked."
+    subtitle: "⌂ main · ↳ peer · ✻ turn running · (n) turns finished since you last looked."
     footer: Enter switch | Esc close
     item:
       blocked_reason: "⚠ waiting on you: %{reason}"

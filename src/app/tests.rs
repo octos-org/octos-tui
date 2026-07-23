@@ -10097,6 +10097,50 @@ mod tests {
         );
     }
 
+    /// Return-to-parent pre-select: from a peer, the switcher points at the
+    /// first main (non-peer) session; from a main it stays put (`None`).
+    #[test]
+    fn parent_session_row_index_points_at_main_from_a_peer() {
+        let mut app = AppState::new(
+            vec![
+                SessionView {
+                    id: SessionKey("local:main".into()),
+                    title: "main".into(),
+                    profile_id: None,
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+                SessionView {
+                    id: SessionKey("local:peer".into()),
+                    title: "peer".into(),
+                    profile_id: None,
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+            ],
+            1, // focused on the peer (index 1)
+            "ready".into(),
+            None,
+            false,
+        );
+        app.peer_session_meta.insert(
+            SessionKey("local:peer".into()),
+            crate::model::PeerMeta {
+                slug: "peer".into(),
+                brief_path: "/tmp/brief.md".into(),
+                agent_staged: false,
+                created: std::time::Instant::now(),
+            },
+        );
+        // On the peer → return-to-parent points at the main (row 0).
+        assert_eq!(app.parent_session_row_index(), Some(0));
+        // On the main (not a peer) → nothing to jump back to.
+        app.selected_session = 0;
+        assert_eq!(app.parent_session_row_index(), None);
+    }
+
     /// #407 regression: `peer_sessions`/roster sort is deterministic on
     /// `Instant` ties (review F10) — a fleet staged in one burst must not
     /// flicker row order across frames.
