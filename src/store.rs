@@ -1365,7 +1365,7 @@ impl Store {
     /// octos#1801 v2: byte cap for the composed `/gather` synthesis prompt.
     /// The server caps each result at 48 KiB, but 8 fleet peers of those would
     /// compose to ~384 KiB — far past a sane single-turn injection.
-    const GATHER_PROMPT_MAX_BYTES: usize = 64 * 1024;
+    const GATHER_PROMPT_MAX_BYTES: usize = 128 * 1024;
 
     /// Compose the `/gather` synthesis prompt from the blackboard rows: a
     /// header, then one section per peer — status-ish label, the brief's first
