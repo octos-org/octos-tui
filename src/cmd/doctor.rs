@@ -293,6 +293,7 @@ impl Report {
 pub fn run(args: DoctorArgs) -> Result<i32> {
     let mut checks = Vec::new();
     checks.extend(binary_checks(&args));
+    checks.extend(installations_checks());
     checks.extend(terminal_checks());
     checks.extend(config_checks(&args));
     checks.extend(profiles_checks(&args));
@@ -536,6 +537,41 @@ pub fn locate_octos_tui() -> LocatedBinaries {
     } else {
         "octos-tui"
     };
+    locate_binary(exe_name, &default_install_dirs())
+}
+
+/// `octos` (the backend) discovered across `$PATH` + the known install prefixes,
+/// plus `~/.octos/bin` where octos-tui's auto-provisioner drops it. Same
+/// PATH-vs-off-PATH bookkeeping as [`locate_octos_tui`].
+fn locate_octos() -> LocatedBinaries {
+    let exe_name = if cfg!(windows) { "octos.exe" } else { "octos" };
+    let mut dirs = default_install_dirs();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(&home).join(".octos").join("bin"));
+    }
+    locate_binary(exe_name, &dirs)
+}
+
+/// Extra known-install prefixes to probe beyond `$PATH` (Homebrew, `/usr`,
+/// cargo's `~/.cargo/bin`, the shell-installer's `~/.local/bin`). Kept distinct
+/// from `$PATH` hits so "on PATH" reflects bare-name runnability, not mere
+/// on-disk presence.
+fn default_install_dirs() -> Vec<PathBuf> {
+    let mut extras: Vec<PathBuf> = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    if let Some(home) = std::env::var_os("HOME") {
+        extras.push(PathBuf::from(&home).join(".cargo").join("bin"));
+        extras.push(PathBuf::from(&home).join(".local").join("bin"));
+    }
+    extras
+}
+
+/// Enumerate every `exe_name` on `$PATH` plus `extra_dirs`, de-duplicated by
+/// canonical path, preserving PATH precedence (first wins). `$PATH` resolutions
+/// are tracked separately from the extra prefixes.
+fn locate_binary(exe_name: &str, extra_dirs: &[PathBuf]) -> LocatedBinaries {
     let mut located = LocatedBinaries::default();
     let mut seen: Vec<PathBuf> = Vec::new();
 
@@ -558,22 +594,124 @@ pub fn locate_octos_tui() -> LocatedBinaries {
             push_if_present(&dir, &mut located.on_path, &mut seen);
         }
     }
-
-    // Extra known-install prefixes that may NOT be on `$PATH`. These count for
-    // shadow detection but are kept distinct from `$PATH` hits.
-    let mut extras: Vec<PathBuf> = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
-        .iter()
-        .map(PathBuf::from)
-        .collect();
-    if let Some(home) = std::env::var_os("HOME") {
-        extras.push(PathBuf::from(&home).join(".cargo").join("bin"));
-        extras.push(PathBuf::from(&home).join(".local").join("bin"));
-    }
-    for dir in extras {
-        push_if_present(&dir, &mut located.off_path, &mut seen);
+    // Extra known-install prefixes that may NOT be on `$PATH`.
+    for dir in extra_dirs {
+        push_if_present(dir, &mut located.off_path, &mut seen);
     }
 
     located
+}
+
+// ---------------------------------------------------------------------------
+// Installations (every octos-tui + octos on the machine, with versions)
+// ---------------------------------------------------------------------------
+
+const CAT_INSTALLS: &str = "Installations";
+
+/// Best-effort install-method guess from a binary's on-disk path, so the user
+/// knows which package manager put each copy there when cleaning up duplicates.
+fn install_method_label(path: &Path) -> &'static str {
+    let p = path.to_string_lossy();
+    if p.contains("/.cargo/bin/") {
+        "cargo"
+    } else if p.contains("node_modules") {
+        "npm"
+    } else if p.contains("/homebrew/") || p.contains("/Cellar/") || p.starts_with("/usr/local/") {
+        "brew"
+    } else if p.contains("/.octos/bin/") {
+        "octos-tui auto-install"
+    } else if p.contains("/.local/bin/") {
+        "shell installer"
+    } else if p.starts_with("/usr/bin/") || p.starts_with("/bin/") {
+        "system"
+    } else {
+        "unknown"
+    }
+}
+
+/// Run `<path> --version` and return its first non-empty line, or `None` if the
+/// binary can't be run / prints nothing. No timeout — these are our own
+/// fast-responding binaries (same as the backend probe in `backend_ensure`).
+fn probe_version(path: &Path) -> Option<String> {
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+}
+
+/// One display row per located binary: `<path> [<method>, on/off PATH] → <version>`.
+fn install_rows(located: &LocatedBinaries) -> Vec<String> {
+    located
+        .all()
+        .iter()
+        .map(|p| {
+            let method = install_method_label(p);
+            let on = if located.on_path.contains(p) {
+                "on PATH"
+            } else {
+                "off PATH"
+            };
+            let version = probe_version(p).unwrap_or_else(|| "no --version".to_string());
+            format!("{} [{method}, {on}] → {version}", p.display())
+        })
+        .collect()
+}
+
+/// Summarize one binary's installs: PASS on exactly one, WARN on duplicates (so
+/// the user can clean them up — the first on `$PATH` wins and the rest can
+/// confuse updates), WARN on none.
+fn installs_check(display_name: &str, located: &LocatedBinaries) -> Check {
+    let rows = install_rows(located);
+    match rows.len() {
+        0 => Check::warn(
+            CAT_INSTALLS,
+            format!("{display_name} installs"),
+            "none found on $PATH or known install dirs",
+            format!("install {display_name}"),
+        ),
+        1 => Check::pass(
+            CAT_INSTALLS,
+            format!("{display_name} installs"),
+            rows[0].clone(),
+        ),
+        n => Check::warn(
+            CAT_INSTALLS,
+            format!("{display_name} installs"),
+            format!("{n} installs found — the first on $PATH wins; the rest can confuse updates"),
+            format!(
+                "remove the copies you don't want: {}",
+                rows[1..].join(" ; ")
+            ),
+        )
+        .with_value(rows.join(" | ")),
+    }
+}
+
+/// #5: enumerate every octos-tui AND octos on the machine (across `$PATH`,
+/// Homebrew, cargo, the shell installer's `~/.local/bin`, and octos-tui's
+/// `~/.octos/bin`), showing each copy's version + install method, plus the
+/// octos version this client needs — so duplicate/mismatched installs are
+/// visible at a glance.
+fn installations_checks() -> Vec<Check> {
+    vec![
+        Check::pass(
+            CAT_INSTALLS,
+            "octos-tui needs octos",
+            format!(
+                ">= {} (this is octos-tui v{}; auto-install bundle {})",
+                crate::backend_ensure::MIN_OCTOS_VERSION,
+                env!("CARGO_PKG_VERSION"),
+                crate::backend_ensure::REQUIRED_OCTOS_RELEASE,
+            ),
+        ),
+        installs_check("octos-tui", &locate_octos_tui()),
+        installs_check("octos", &locate_octos()),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -1738,6 +1876,80 @@ mod tests {
             UI_PROTOCOL_SCHEMA_VERSION
         );
         assert!(json["checks"].is_array());
+    }
+
+    #[test]
+    fn install_method_label_infers_from_path() {
+        assert_eq!(
+            install_method_label(Path::new("/home/u/.cargo/bin/octos")),
+            "cargo"
+        );
+        assert_eq!(
+            install_method_label(Path::new("/opt/homebrew/bin/octos-tui")),
+            "brew"
+        );
+        assert_eq!(
+            install_method_label(Path::new("/home/u/.local/bin/octos-tui")),
+            "shell installer"
+        );
+        assert_eq!(
+            install_method_label(Path::new("/home/u/.octos/bin/octos")),
+            "octos-tui auto-install"
+        );
+        assert_eq!(install_method_label(Path::new("/usr/bin/octos")), "system");
+        assert_eq!(
+            install_method_label(Path::new(
+                "/x/node_modules/@octos-org/octos-tui/.bin_real/octos-tui"
+            )),
+            "npm"
+        );
+    }
+
+    #[test]
+    fn installs_check_passes_on_one_and_warns_on_duplicates() {
+        // Exactly one → PASS.
+        let one = installs_check(
+            "octos",
+            &LocatedBinaries {
+                on_path: vec![PathBuf::from("/opt/homebrew/bin/octos")],
+                off_path: vec![],
+            },
+        );
+        assert_eq!(one.status, CheckStatus::Pass);
+
+        // Duplicates → WARN, and the fix names the extra copy to remove.
+        let dup = installs_check(
+            "octos",
+            &LocatedBinaries {
+                on_path: vec![PathBuf::from("/opt/homebrew/bin/octos")],
+                off_path: vec![PathBuf::from("/home/u/.cargo/bin/octos")],
+            },
+        );
+        assert_eq!(dup.status, CheckStatus::Warn);
+        assert!(dup.fix.as_deref().unwrap().contains(".cargo/bin/octos"));
+
+        // None → WARN.
+        assert_eq!(
+            installs_check("octos", &LocatedBinaries::default()).status,
+            CheckStatus::Warn
+        );
+    }
+
+    #[test]
+    fn installations_checks_surface_required_octos_and_both_binaries() {
+        let checks = installations_checks();
+        let needs = checks
+            .iter()
+            .find(|c| c.name == "octos-tui needs octos")
+            .expect("required-octos row present");
+        assert!(
+            needs
+                .detail
+                .contains(crate::backend_ensure::MIN_OCTOS_VERSION)
+        );
+        // Both binaries get an install-summary row.
+        assert!(checks.iter().any(|c| c.name == "octos-tui installs"));
+        assert!(checks.iter().any(|c| c.name == "octos installs"));
     }
 
     #[test]
