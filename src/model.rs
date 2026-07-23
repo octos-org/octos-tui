@@ -9025,15 +9025,25 @@ impl AppState {
     /// without a valid span the whole draft clears (the #380 behavior).
     /// Returns true when the delete was handled here.
     fn take_collapsed_paste_block(&mut self) -> bool {
-        if !(self.composer_pasted
-            && matches!(
-                self.composer_presentation(),
-                ComposerPresentation::Collapsed(_)
-            ))
-        {
+        // A collapsed block (the `[paste] N lines · M chars` chip) is an ATOMIC
+        // unit: one Backspace/Delete removes the whole block, never one char.
+        // Gate on the Collapsed PRESENTATION, not `composer_pasted` — a paste
+        // whose terminal delivered it as keystrokes (no bracketed-paste event,
+        // so the flag was never set / was cleared by the typed chars) still
+        // renders the chip, and Backspace on it must delete the block, not chip
+        // away one char at a time. With a real recorded paste span we drain just
+        // that span (keeping surrounding text); otherwise we clear the draft.
+        if !matches!(
+            self.composer_presentation(),
+            ComposerPresentation::Collapsed(_)
+        ) {
             return false;
         }
-        match self.composer_paste_span.take() {
+        match self
+            .composer_paste_span
+            .take()
+            .filter(|_| self.composer_pasted)
+        {
             Some(span)
                 if span.start < span.end
                     && span.end <= self.composer.len()
@@ -11346,5 +11356,36 @@ mod tests {
         state.delete_composer_prev_char();
         assert!(state.composer.is_empty(), "no span -> #380 full clear");
         assert!(!state.composer_pasted);
+    }
+
+    #[test]
+    fn backspace_on_a_typed_collapsed_block_clears_it_not_char_by_char() {
+        // A paste the terminal delivered as keystrokes (no bracketed-paste
+        // event) leaves `composer_pasted` FALSE, yet the text still collapses
+        // via the typed line/char threshold and renders the `[paste]` chip.
+        // Backspace on that chip must delete the WHOLE block — the user reported
+        // it chipping away one char at a time because the block-delete used to be
+        // gated on `composer_pasted`.
+        let mut state = paste_test_state();
+        state.composer = (0..40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.composer_pasted = false;
+        state.composer_paste_span = None;
+        state.composer_cursor = Some(state.composer.len());
+        assert!(
+            matches!(
+                state.composer_presentation(),
+                ComposerPresentation::Collapsed(_)
+            ),
+            "40 lines collapses via the typed threshold even without a paste flag"
+        );
+
+        state.delete_composer_prev_char();
+        assert!(
+            state.composer.is_empty(),
+            "one Backspace clears the whole collapsed block, not one char"
+        );
     }
 }
