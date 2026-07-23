@@ -15414,8 +15414,8 @@ mod tests {
     /// within the ~64 KiB cap, and every cut section says so.
     #[test]
     fn gather_prompt_caps_total_size_with_even_truncation() {
-        let big_a = "a".repeat(60 * 1024);
-        let big_b = "b".repeat(60 * 1024);
+        let big_a = "a".repeat(120 * 1024);
+        let big_b = "b".repeat(120 * 1024);
         let result = crate::model::PeerGatherResult {
             profile_id: "coding".into(),
             peers: vec![

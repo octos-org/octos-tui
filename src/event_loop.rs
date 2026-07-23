@@ -647,7 +647,10 @@ fn handle_terminal_event_with_input_state(
             && is_plain_composer_enter(store, &key)
             && input_state.should_insert_unbracketed_paste_newline(now, next_event_waiting)
         {
-            store.state.insert_composer_text("\n");
+            // #441: unbracketed-paste newline must also respect composer lock.
+            if !store.state.is_composer_locked_to_peer() {
+                store.state.insert_composer_text("\n");
+            }
             store.state.focus = FocusPane::Composer;
             return KeyAction::Continue;
         }
@@ -1380,22 +1383,39 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::End => match store.state.focus {
             FocusPane::Workspace => store.state.workspace.scroll = 0,
             FocusPane::Git => store.state.git.scroll = 0,
-            FocusPane::Composer => store.state.move_composer_cursor_line_end(),
+            FocusPane::Composer if !store.state.is_composer_locked_to_peer() => {
+                store.state.move_composer_cursor_line_end()
+            }
             _ => store.state.scroll_transcript_to_latest(),
         },
-        KeyCode::Home if store.state.focus == FocusPane::Composer => {
+        KeyCode::Home
+            if store.state.focus == FocusPane::Composer
+                && !store.state.is_composer_locked_to_peer() =>
+        {
             store.state.move_composer_cursor_line_start();
         }
-        KeyCode::Left if store.state.focus == FocusPane::Composer => {
+        KeyCode::Left
+            if store.state.focus == FocusPane::Composer
+                && !store.state.is_composer_locked_to_peer() =>
+        {
             store.state.move_composer_cursor_left();
         }
-        KeyCode::Right if store.state.focus == FocusPane::Composer => {
+        KeyCode::Right
+            if store.state.focus == FocusPane::Composer
+                && !store.state.is_composer_locked_to_peer() =>
+        {
             store.state.move_composer_cursor_right();
         }
-        KeyCode::Delete if store.state.focus == FocusPane::Composer => {
+        KeyCode::Delete
+            if store.state.focus == FocusPane::Composer
+                && !store.state.is_composer_locked_to_peer() =>
+        {
             store.state.delete_composer_next_char();
         }
-        KeyCode::Backspace if store.state.focus == FocusPane::Composer => {
+        KeyCode::Backspace
+            if store.state.focus == FocusPane::Composer
+                && !store.state.is_composer_locked_to_peer() =>
+        {
             store.state.delete_composer_prev_char();
         }
         KeyCode::Enter if store.state.focus == FocusPane::Composer => {
