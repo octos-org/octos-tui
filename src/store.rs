@@ -9259,7 +9259,14 @@ impl Store {
                     Some(staged_provider_label.clone());
                 self.state.onboarding.last_saved_provider_target =
                     Some(OnboardingProviderSaveTarget::ResearchLane);
-                self.state.onboarding.research_lane_intent = false;
+                // Do NOT clear `research_lane_intent` here. A completed lane save
+                // leaves the wizard OPEN and re-focuses "Add another model" (see
+                // `focus_provider_start_row` below), so the flag must stay true —
+                // else the NEXT lane added in the same wizard loses its intent and
+                // Saves as the profile's PRIMARY provider (no fast/strong picker,
+                // lane not persisted, onboarding-completion rows appear). The
+                // wizard-close guard (`clear_research_lane_intent_if_wizard_closed`)
+                // owns the flag's death when the user finally Escs/closes.
                 self.state.onboarding.reset_staged_provider();
                 // Post-save hint (P1-b UX): name the lane key so the user knows
                 // which routing slot deep_research will pick up.
@@ -34878,8 +34885,11 @@ now analyzing the bus module"
             Some(OnboardingProviderSaveTarget::ResearchLane)
         );
         assert!(
-            !store.state.onboarding.research_lane_intent,
-            "a completed lane save ends the lane flow"
+            store.state.onboarding.research_lane_intent,
+            "the intent SURVIVES a completed lane save: the wizard stays open and \
+             re-focuses 'Add another model', so a second lane keeps its intent \
+             (chatgpt-then-deepseek bug). The wizard-close guard clears it on \
+             Esc/close — see research_lane_intent_dies_with_the_wizard_surface."
         );
         assert_eq!(
             store.state.onboarding.pending_research_lane_key, None,

@@ -887,22 +887,42 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
 
     // #324: Ctrl+S/Alt+S — the session switcher popup (open sessions with live-turn
     // and unread annotations). Only claimed with 2+ sessions so the key stays
-    // free for single-session users.
-    if (is_alt_char(&key, 's') || is_ctrl_char(&key, 's')) && store.state.sessions.len() >= 2 {
-        store.open_menu(crate::menu::MenuId::from(
-            crate::menu::registry::MENU_SESSIONS,
-        ));
-        // Return-to-parent: opening the switcher from a peer pre-highlights the
-        // parent (first main/non-peer session), so Ctrl+S → Enter drops you
-        // home. `open_menu` already advanced the cursor to the first selectable
-        // row; override it to the parent (which is selectable — it isn't the
-        // focused peer). No-op when not on a peer.
-        if let Some(parent_idx) = store.state.parent_session_row_index() {
-            if let Some(frame) = store.state.menu_stack.active_mut() {
-                frame.selected_index = parent_idx;
-            }
+    // free for single-session users. `handle_key` runs BEFORE the menu-active
+    // routing, so without a guard a repeated Ctrl+S kept pushing duplicate
+    // MENU_SESSIONS frames ("sessions / sessions / …"). Make it a TOGGLE and
+    // never fire behind an approval/question modal.
+    if (is_alt_char(&key, 's') || is_ctrl_char(&key, 's'))
+        && store.state.sessions.len() >= 2
+        && !modal_owns_keyboard(store)
+    {
+        let sessions_menu_open = store
+            .state
+            .menu_stack
+            .active()
+            .is_some_and(|frame| frame.id.as_str() == crate::menu::registry::MENU_SESSIONS);
+        if sessions_menu_open {
+            // Second press dismisses the switcher instead of stacking a frame.
+            store.close_all_menus();
+            return KeyAction::Continue;
         }
-        return KeyAction::Continue;
+        // Open only from a clean state; if a DIFFERENT menu owns the keyboard,
+        // fall through so that menu handles the key.
+        if !store.state.menu_stack.is_active() {
+            store.open_menu(crate::menu::MenuId::from(
+                crate::menu::registry::MENU_SESSIONS,
+            ));
+            // Return-to-parent: opening the switcher from a peer pre-highlights the
+            // parent (first main/non-peer session), so Ctrl+S → Enter drops you
+            // home. `open_menu` already advanced the cursor to the first selectable
+            // row; override it to the parent (which is selectable — it isn't the
+            // focused peer). No-op when not on a peer.
+            if let Some(parent_idx) = store.state.parent_session_row_index() {
+                if let Some(frame) = store.state.menu_stack.active_mut() {
+                    frame.selected_index = parent_idx;
+                }
+            }
+            return KeyAction::Continue;
+        }
     }
 
     KeyAction::Continue
@@ -2802,6 +2822,40 @@ mod tests {
                 "the dock toggle must flip on {chord:?}"
             );
         }
+    }
+
+    /// Ctrl+S/Alt+S is a TOGGLE and must never stack duplicate MENU_SESSIONS
+    /// frames ("sessions / sessions / …" — user report): `handle_key` runs
+    /// before the menu-active routing, so an unguarded repeat kept pushing.
+    #[test]
+    fn ctrl_s_toggles_the_session_switcher_without_stacking() {
+        let mut store = store_with_sessions(2);
+        store.state.focus = FocusPane::Composer;
+        let ctrl_s = modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        // First press opens exactly one frame.
+        handle_key(&mut store, ctrl_s);
+        assert_eq!(store.state.menu_stack.len(), 1);
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|f| f.id.as_str().to_string()),
+            Some(crate::menu::registry::MENU_SESSIONS.to_string())
+        );
+
+        // Second press dismisses it — a toggle, NOT a second stacked frame.
+        handle_key(&mut store, ctrl_s);
+        assert_eq!(
+            store.state.menu_stack.len(),
+            0,
+            "a second Ctrl+S closes the switcher instead of stacking"
+        );
+
+        // Third press opens again.
+        handle_key(&mut store, ctrl_s);
+        assert_eq!(store.state.menu_stack.len(), 1);
     }
 
     /// #407 review P1 regression: Ctrl+J stays the composer's portable newline
