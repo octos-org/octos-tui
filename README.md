@@ -72,30 +72,41 @@ the terminal client. Architecture and ownership boundaries live in
 
 ---
 
-## Install
+## 📦 Install
 
 Every method installs a single self-contained `octos-tui` binary. Then run
 `octos-tui --help`.
 
-### Prebuilt binary — no Rust toolchain needed (recommended)
+### ⬇️ Prebuilt binary — no Rust toolchain needed (recommended)
 
 Same model as Claude Code and Codex: each [GitHub Release](https://github.com/octos-org/octos-tui/releases)
 ships prebuilt binaries for macOS (Apple Silicon), Linux (x86-64 +
-arm64), and Windows (x86-64), distributed via:
+arm64), and Windows (x86-64). Pick one — each block has its own **copy button**
+(top-right corner, on hover) that copies just that command:
+
+**📦 npm**
 
 ```bash
-# npm
 npm install -g @octos-org/octos-tui
+```
 
-# Homebrew (this repo is its own tap)
+**🍺 Homebrew** — this repo is its own tap
+
+```bash
 brew tap octos-org/octos-tui https://github.com/octos-org/octos-tui
 brew install octos-org/octos-tui/octos-tui
+```
 
-# shell installer (macOS / Linux)
+**🐚 Shell installer** — macOS / Linux
+
+```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/octos-org/octos-tui/releases/latest/download/octos-tui-installer.sh | sh
+```
 
-# PowerShell installer (Windows)
+**🪟 PowerShell installer** — Windows
+
+```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/octos-org/octos-tui/releases/latest/download/octos-tui-installer.ps1 | iex"
 ```
 
@@ -105,13 +116,17 @@ installs are owned by their package manager, so it prints the matching
 upgrade command instead. `octos-tui doctor` diagnoses the local environment
 and connection prerequisites.
 
-### From source with Cargo (needs Rust 1.85+)
+### 🔧 From source with Cargo (needs Rust 1.85+)
+
+**From git** — no crates.io publish required
 
 ```bash
-# straight from git — no crates.io publish required
 cargo install --git https://github.com/octos-org/octos-tui octos-tui
+```
 
-# or, once published to crates.io
+**From crates.io** — once published
+
+```bash
 cargo install octos-tui
 ```
 
