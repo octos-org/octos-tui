@@ -10057,6 +10057,46 @@ mod tests {
         );
     }
 
+    /// The expanded Peer Dock rows mirror the agent dock's run stats: elapsed
+    /// since the peer opened, plus cumulative received (↓) tokens for the peer's
+    /// session. Tokens come from `session_usage`, keyed per session, so a
+    /// background peer's usage surfaces here just like the focused session's.
+    #[test]
+    fn peer_strip_rows_show_elapsed_and_received_tokens() {
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:tui#peer-refactor".into());
+        app.pending_peer_kickoffs.insert(
+            sid.clone(),
+            crate::model::PeerKickoff {
+                brief: "refactor auth".into(),
+                brief_path: "/tmp/brief.md".into(),
+                go: false,
+                agent_staged: false,
+                created: std::time::Instant::now(),
+            },
+        );
+        let _ = app.take_pending_peer_kickoff(&sid);
+        // Cumulative usage for the peer session: 39,800 received tokens.
+        app.session_usage
+            .insert(sid.clone(), (Some(1_200), Some(39_800), None));
+
+        app.peer_dock_collapsed = false;
+        let lines = peer_strip_lines(&app, Palette::for_theme(app.theme), 4);
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            text.contains("↓ 39.8k"),
+            "peer row shows received tokens; got: {text}"
+        );
+        assert!(
+            text.contains("0s"),
+            "peer row shows elapsed-since-opened; got: {text}"
+        );
+    }
+
     /// #407 regression: `peer_sessions`/roster sort is deterministic on
     /// `Instant` ties (review F10) — a fleet staged in one burst must not
     /// flicker row order across frames.

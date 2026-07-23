@@ -4087,15 +4087,32 @@ pub(crate) fn peer_strip_lines(
             palette.muted().bg(palette.surface)
         };
         let detail = peer_activity_line(app, session_id);
-        let row = Line::from(vec![
+        let mut row_spans = vec![
             Span::styled(format!(" {glyph} "), glyph_style),
             Span::styled(
                 meta.slug.chars().take(20).collect::<String>(),
                 palette.text().bg(palette.surface),
             ),
             Span::styled(format!("  {detail}"), palette.muted().bg(palette.surface)),
-        ]);
-        lines.push(row);
+        ];
+        // Mirror the agent dock's run stats so the fleet's progress/cost reads
+        // at a glance without opening each peer: elapsed since the peer was
+        // opened, then cumulative received (↓) tokens for its session. Tokens
+        // come from `session_usage`, which `apply_progress` keys by the event's
+        // session_id — so a background peer's usage lands here just like the
+        // focused session's.
+        let elapsed = format_short_duration(meta.created.elapsed().as_millis() as i64);
+        row_spans.push(Span::styled(
+            format!("  · {elapsed}"),
+            palette.muted().bg(palette.surface),
+        ));
+        if let Some((_input, Some(output), _cost)) = app.session_usage.get(*session_id) {
+            row_spans.push(Span::styled(
+                format!(" · ↓ {}", humanize_token_count(*output)),
+                palette.muted().bg(palette.surface),
+            ));
+        }
+        lines.push(Line::from(row_spans));
     }
     lines
 }
