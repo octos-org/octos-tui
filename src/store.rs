@@ -8627,7 +8627,7 @@ impl Store {
         let approval_count = result.pending_approvals.as_ref().map_or(0, Vec::len);
 
         if let Some(messages) = projected_messages {
-            if let Some(session) = self.find_session_mut(&session_id) {
+            let replaced_existing = if let Some(session) = self.find_session_mut(&session_id) {
                 session.messages = messages;
                 // codex P1: do NOT clear `live_reply` here. The hydrate result
                 // is COMMITTED history only; `live_reply` holds the turn that is
@@ -8635,6 +8635,7 @@ impl Store {
                 // dropped the rest of that turn's deltas (the turn froze). Keep
                 // it — subsequent deltas keep appending and `TurnCompleted` still
                 // commits it normally.
+                true
             } else {
                 self.state.sessions.push(SessionView {
                     id: session_id.clone(),
@@ -8649,11 +8650,32 @@ impl Store {
                 self.close_file_picker_for_session_switch();
                 self.state
                     .switch_selected_session(self.state.sessions.len().saturating_sub(1));
-            }
+                false
+            };
             self.state
                 .optimistic_user_messages
                 .retain(|optimistic| optimistic.session_id != session_id);
             self.state.scroll_transcript_to_latest();
+            // Replacing an already-open, ACTIVE session's messages is a history
+            // discontinuity the ScrollbackTracker can't detect on its own (same
+            // session id, count merely grew), so a peer that accumulated K
+            // partial streamed messages in the background before you switched in
+            // would leave its true first K messages unflushed — a truncated tail
+            // ("only partial history on switch"). Force a committed re-flush
+            // (WithLive when a turn is still streaming) so the COMPLETE incoming
+            // history is re-emitted below the (unavoidably stale, un-erasable)
+            // prior block. Guarded to the ACTIVE session — a still-background
+            // peer's hydrate must not disturb the foreground — and to the
+            // existing-session branch (the new-session branch already switches
+            // sessions, which discontinuity-resets the tracker).
+            if replaced_existing
+                && self
+                    .state
+                    .active_session()
+                    .is_some_and(|active| active.id == session_id)
+            {
+                self.state.request_transcript_reflush(&session_id);
+            }
         }
 
         if let Some(context_state) = result.context_state.as_ref() {
@@ -33248,6 +33270,111 @@ now analyzing the bus module"
             "the same streaming turn is preserved across hydrate"
         );
         assert_eq!(live_reply.text, "streaming so far");
+    }
+
+    #[test]
+    fn hydrate_reflushes_committed_history_for_the_active_session_only() {
+        use crate::client_event::ClientEvent;
+        // A background peer accumulates a PARTIAL tail of streamed messages
+        // before you switch in; the ScrollbackTracker flushes those and sets its
+        // watermark to that count. The async hydrate then REPLACES messages with
+        // the full history — a discontinuity the tracker can't see (same session
+        // id, count merely grew), so without an explicit signal it emits only
+        // `messages[watermark..]` and strands the true prefix (the "only partial
+        // history on switch" bug). Hydrating the ACTIVE session must request a
+        // committed re-flush; hydrating a still-background session must NOT
+        // disturb the foreground.
+        let make_msgs = |texts: &[(&str, &str)]| {
+            Some(
+                texts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (role, content))| HydratedMessage {
+                        seq: i as u64 + 1,
+                        role: (*role).into(),
+                        content: (*content).into(),
+                        turn_id: None,
+                        thread_id: None,
+                        client_message_id: None,
+                        persisted_at: chrono::Utc::now(),
+                        message_id: None,
+                        source: None,
+                        media: Vec::new(),
+                        reasoning_content: None,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let result_for = |sid: &SessionKey, msgs| SessionHydrateResult {
+            replayed_tool_envelopes: None,
+            session_id: sid.clone(),
+            cursor: UiCursor {
+                stream: sid.0.clone(),
+                seq: 4,
+            },
+            context: None,
+            context_state: None,
+            messages: msgs,
+            threads: None,
+            turns: None,
+            pending_approvals: None,
+            pending_questions: None,
+            replayed_envelopes: None,
+        };
+
+        let active = SessionKey("local:peer-active".into());
+        let background = SessionKey("local:peer-bg".into());
+        let session = |id: &SessionKey, msgs: Vec<Message>| SessionView {
+            id: id.clone(),
+            title: id.0.clone(),
+            profile_id: None,
+            messages: msgs,
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: AppState::new(
+                vec![
+                    session(
+                        &active,
+                        vec![Message::user("partial-1"), Message::assistant("partial-2")],
+                    ),
+                    session(&background, vec![]),
+                ],
+                0, // active session is index 0
+                "ready".into(),
+                None,
+                false,
+            ),
+        };
+        let _ = store.state.take_transcript_reflush_request();
+
+        // Hydrating the BACKGROUND session must not touch the foreground tracker.
+        store.apply_client_event(ClientEvent::SessionHydrate(result_for(
+            &background,
+            make_msgs(&[("user", "bg-0"), ("assistant", "bg-1")]),
+        )));
+        assert!(
+            store.state.take_transcript_reflush_request().is_none(),
+            "a background-session hydrate must not re-flush the foreground"
+        );
+
+        // Hydrating the ACTIVE session replaces its partial tail with the full
+        // history AND forces a committed re-flush so the tracker re-emits it all.
+        store.apply_client_event(ClientEvent::SessionHydrate(result_for(
+            &active,
+            make_msgs(&[
+                ("user", "real-0"),
+                ("assistant", "real-1"),
+                ("user", "real-2"),
+                ("assistant", "real-3"),
+            ]),
+        )));
+        assert_eq!(store.state.sessions[0].messages.len(), 4);
+        assert!(
+            store.state.take_transcript_reflush_request().is_some(),
+            "active-session hydrate must force a committed transcript re-flush"
+        );
     }
 
     #[test]

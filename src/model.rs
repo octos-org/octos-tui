@@ -7901,7 +7901,7 @@ impl AppState {
     /// session means the frame must re-emit the coherent committed+live
     /// block, and that decision must survive the turn settling before the
     /// next draw.
-    fn request_transcript_reflush(&mut self, session_id: &SessionKey) {
+    pub(crate) fn request_transcript_reflush(&mut self, session_id: &SessionKey) {
         let live_streaming = self
             .sessions
             .iter()
