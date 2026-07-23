@@ -3683,6 +3683,12 @@ pub struct PeerMeta {
     /// rendering; not yet surfaced.
     pub agent_staged: bool,
     pub created: std::time::Instant,
+    /// When this peer's most recent turn TERMINATED (done/error/interrupted),
+    /// stamped by `mark_peer_finished`. Drives the dock's `✓ done` state (vs a
+    /// never-run `○ idle`) and freezes its elapsed at the run duration instead
+    /// of letting it tick up forever. `None` until the first turn ends; a
+    /// currently-live turn (`session_turn_live`) still renders `✻` regardless.
+    pub finished_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -8768,6 +8774,7 @@ impl AppState {
                 brief_path: kickoff.brief_path.clone(),
                 agent_staged: kickoff.agent_staged,
                 created: kickoff.created,
+                finished_at: None,
             },
         );
         Some(kickoff)
@@ -8792,6 +8799,29 @@ impl AppState {
                 .pre_token_turns
                 .get(session_id)
                 .is_some_and(|armed| armed.elapsed() < PRE_TOKEN_TURN_TTL)
+    }
+
+    /// Stamp a peer's most recent turn terminal (done/error/interrupted) so the
+    /// dock can render `✓ done` (vs a never-run `○ idle`) and freeze its
+    /// elapsed. No-op for non-peer sessions; called from every turn-terminal
+    /// handler. A subsequent live turn still renders `✻` — `peer_is_done`
+    /// checks `session_turn_live` first — and re-terminating refreshes the
+    /// stamp, so the frozen duration tracks the latest run.
+    pub(crate) fn mark_peer_finished(&mut self, session_id: &SessionKey) {
+        if let Some(meta) = self.peer_session_meta.get_mut(session_id) {
+            meta.finished_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// A peer is "done" when its last turn terminated and it is neither live nor
+    /// blocked — the dock renders `✓` + a frozen elapsed. `created→finished_at`
+    /// is the run duration; a never-run peer (`finished_at == None`) is `○ idle`.
+    pub(crate) fn peer_is_done(&self, session_id: &SessionKey) -> bool {
+        self.peer_session_meta
+            .get(session_id)
+            .is_some_and(|meta| meta.finished_at.is_some())
+            && !self.session_turn_live(session_id)
+            && self.session_blocked_reason(session_id).is_none()
     }
 
     /// tui#398: the reason a BACKGROUND session is waiting on the user (a

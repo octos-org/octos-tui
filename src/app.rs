@@ -4069,10 +4069,16 @@ pub(crate) fn peer_strip_lines(
     for (session_id, meta) in roster.iter().take(rows) {
         let blocked = app.session_blocked_reason(session_id).is_some();
         let live = app.session_turn_live(session_id);
+        let done = app.peer_is_done(session_id);
+        // Priority: blocked (needs you) > live (streaming) > done (finished) >
+        // idle (opened, never run). `✓` done reads distinctly from `○` idle so a
+        // finished fleet is obvious at a glance instead of looking un-started.
         let glyph = if blocked {
             "⚠"
         } else if live {
             "✻"
+        } else if done {
+            "✓"
         } else {
             "○"
         };
@@ -4083,6 +4089,8 @@ pub(crate) fn peer_strip_lines(
                 .add_modifier(Modifier::BOLD)
         } else if live {
             Style::default().fg(palette.accent).bg(palette.surface)
+        } else if done {
+            palette.text().bg(palette.surface)
         } else {
             palette.muted().bg(palette.surface)
         };
@@ -4101,7 +4109,16 @@ pub(crate) fn peer_strip_lines(
         // come from `session_usage`, which `apply_progress` keys by the event's
         // session_id — so a background peer's usage lands here just like the
         // focused session's.
-        let elapsed = format_short_duration(meta.created.elapsed().as_millis() as i64);
+        // Freeze the elapsed at the run duration (created→finished_at) once the
+        // peer is done, instead of letting "age since opened" tick up forever.
+        let elapsed_ms = if done {
+            meta.finished_at
+                .map(|finished| finished.saturating_duration_since(meta.created).as_millis() as i64)
+                .unwrap_or(0)
+        } else {
+            meta.created.elapsed().as_millis() as i64
+        };
+        let elapsed = format_short_duration(elapsed_ms);
         row_spans.push(Span::styled(
             format!("  · {elapsed}"),
             palette.muted().bg(palette.surface),

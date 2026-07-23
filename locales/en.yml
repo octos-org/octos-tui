@@ -496,6 +496,8 @@ status:
   gather_requesting: "Gathering peer results from the blackboard…"
   gather_no_peers: "No peers staged on the blackboard — /peer to spin some up first."
   gather_submitted: "Gathered %{n} peer(s) from the blackboard into this session."
+  peer_clear_none: "No finished peers to clear — running and waiting peers are kept."
+  peer_clear_removed: "Cleared %{n} finished peer(s) from the dock."
   research_usage: "Usage: /research | /research add <key> <provider> <model> [base_url] [api_key_env] | /research rm <key>"
   research_add_usage: "Usage: /research add <key> <provider> <model> [base_url] [api_key_env]"
   research_rm_usage: "Usage: /research rm <key>"

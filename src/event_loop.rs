@@ -2800,6 +2800,7 @@ mod tests {
                 brief_path: "/tmp/brief.md".into(),
                 agent_staged: false,
                 created: std::time::Instant::now(),
+                finished_at: None,
             },
         );
         store.state.focus = FocusPane::Composer;
@@ -2892,6 +2893,7 @@ mod tests {
                 brief_path: "/tmp/brief.md".into(),
                 agent_staged: true,
                 created: std::time::Instant::now(),
+                finished_at: None,
             },
         );
         let before = store.state.peer_dock_collapsed;
