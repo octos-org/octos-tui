@@ -531,7 +531,7 @@ menu:
         label: "仅显示前 %{count} 个文件 —— 输入以缩小范围"
   sessions:
     title: 会话
-    subtitle: "✻ = 回合进行中 · (n) = 自上次查看后完成的回合数。"
+    subtitle: "⌂ 主会话 · ↳ 同伴 · ✻ 回合进行中 · (n) 自上次查看后完成的回合数。"
     footer: Enter 切换 | Esc 关闭
     item:
       blocked_reason: "⚠ 等待你的确认：%{reason}"

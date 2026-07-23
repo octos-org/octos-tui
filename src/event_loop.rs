@@ -892,6 +892,16 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         store.open_menu(crate::menu::MenuId::from(
             crate::menu::registry::MENU_SESSIONS,
         ));
+        // Return-to-parent: opening the switcher from a peer pre-highlights the
+        // parent (first main/non-peer session), so Ctrl+S → Enter drops you
+        // home. `open_menu` already advanced the cursor to the first selectable
+        // row; override it to the parent (which is selectable — it isn't the
+        // focused peer). No-op when not on a peer.
+        if let Some(parent_idx) = store.state.parent_session_row_index() {
+            if let Some(frame) = store.state.menu_stack.active_mut() {
+                frame.selected_index = parent_idx;
+            }
+        }
         return KeyAction::Continue;
     }
 

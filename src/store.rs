@@ -5733,6 +5733,7 @@ impl Store {
                         .copied()
                         .unwrap_or(0),
                     blocked: self.state.session_blocked_reason(&session.id).is_some(),
+                    is_peer: self.state.peer_session_meta.contains_key(&session.id),
                     activity: self.state.session_activity_line(&session.id),
                 })
                 .collect(),
