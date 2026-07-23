@@ -7172,6 +7172,24 @@ impl AppState {
         self.sessions.get_mut(self.selected_session)
     }
 
+    /// Whether `session_id` is a peer session — checked against the durable
+    /// `peer_session_meta` roster (populated at session open by
+    /// [`Self::take_pending_peer_kickoff`]). Used to lock the composer and
+    /// route human input to the master agent (#441).
+    pub fn is_peer_session(&self, session_id: &SessionKey) -> bool {
+        self.peer_session_meta.contains_key(session_id)
+    }
+
+    /// #441: whether the composer is locked because the focused session is a
+    /// peer. When true, typed input should be routed to the master agent as a
+    /// `PeerHumanInput` event instead of processed locally.
+    pub fn is_composer_locked_to_peer(&self) -> bool {
+        self.focus == FocusPane::Composer
+            && self
+                .active_session()
+                .is_some_and(|session| self.is_peer_session(&session.id))
+    }
+
     pub fn active_turn(&self) -> Option<(&SessionKey, &TurnId)> {
         let session = self.active_session()?;
         let live_reply = session.live_reply.as_ref()?;

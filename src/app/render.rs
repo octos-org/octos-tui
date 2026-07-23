@@ -1607,6 +1607,37 @@ pub(super) fn render_harness_status_row(
 }
 
 pub(super) fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
+    // #441: when the focused session is a peer, the composer is locked —
+    // the peer is managed by the master agent, not the human. Show a
+    // watermark and block local input.
+    if let Some(session) = app.active_session() {
+        if app.is_peer_session(&session.id) {
+            let mut lines = Vec::new();
+            lines.push(Line::from(Span::styled(
+                " ",
+                palette.text().bg(palette.surface),
+            )));
+            lines.push(Line::from(vec![
+                Span::styled(" 🔒 ", palette.selected().bg(palette.surface)),
+                Span::styled(
+                    " This peer is managed by the master agent — type in the master session. ",
+                    palette.muted().bg(palette.surface),
+                ),
+            ]));
+            let title = t!("app.pane.composer").to_string();
+            let block = titled_block(
+                title,
+                palette,
+                false,
+                Some("peer session — composer locked".into()),
+            )
+            .border_style(palette.border());
+            return Paragraph::new(Text::from(lines))
+                .style(Style::default().fg(palette.text).bg(palette.surface))
+                .block(block);
+        }
+    }
+
     let mut lines = Vec::new();
     let composer = app.composer_presentation();
     let input_view = match &composer {

@@ -961,6 +961,14 @@ fn handle_paste(store: &mut Store, text: &str) -> KeyAction {
     // beginning with '/' is not a command. Unlike a typed leading '/', we do
     // not open the slash-command menu here. (Regression: pasting a path
     // opened/ran the slash menu.)
+
+    // #441: if the focused session is a peer, route the paste to the master
+    // agent instead of inserting into the hidden composer.
+    if store.state.is_composer_locked_to_peer() {
+        store.emit_peer_human_input_notification("<paste>");
+        return KeyAction::Continue;
+    }
+
     store.state.insert_pasted_text(&text);
     store.state.focus = FocusPane::Composer;
 
@@ -1391,6 +1399,12 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             store.state.delete_composer_prev_char();
         }
         KeyCode::Enter if store.state.focus == FocusPane::Composer => {
+            // #441: if the focused session is a peer, route the input to the
+            // master agent instead of processing locally.
+            if store.state.is_composer_locked_to_peer() {
+                store.emit_peer_human_input_notification("<Enter>");
+                return KeyAction::Continue;
+            }
             return handle_composer_enter(store);
         }
         KeyCode::Char('o') if store.state.focus == FocusPane::Tasks => {
@@ -1425,6 +1439,12 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             store.toggle_diff_view_mode();
         }
         KeyCode::Char(ch) => {
+            // #441: if the focused session is a peer, route the input to the
+            // master agent instead of processing locally.
+            if store.state.is_composer_locked_to_peer() {
+                store.emit_peer_human_input_notification(&ch.to_string());
+                return KeyAction::Continue;
+            }
             // Store-level composer input: inserts the char and runs the prefix
             // triggers (`/` slash popup, `!` shell-escape hint #364, `@` file
             // picker #363) so the trigger decisions stay store-testable.
@@ -1501,6 +1521,13 @@ fn handle_activity_navigator_key(store: &mut Store, key: KeyEvent) -> KeyAction 
 }
 
 fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
+    // #441: if the focused session is a peer, route all editing keys to the
+    // master agent instead of mutating the hidden composer.
+    if store.state.is_composer_locked_to_peer() {
+        store.emit_peer_human_input_notification("<edit>");
+        return true;
+    }
+
     // Shift+Enter is the primary, most intuitive newline key. It only reaches
     // the app when the terminal reports the modifier (the Kitty keyboard
     // protocol, or terminals like Warp that map it directly); otherwise plain

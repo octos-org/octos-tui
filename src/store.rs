@@ -1051,6 +1051,29 @@ impl Store {
             .to_owned()
     }
 
+    /// #441: emit a `PeerHumanInput` system notification when the user types
+    /// into a locked peer composer. The notification surfaces the peer slug
+    /// and the typed text so the master agent (or human watching the master
+    /// session) can see what was attempted.
+    pub fn emit_peer_human_input_notification(&mut self, input: &str) {
+        let slug = self
+            .state
+            .active_session()
+            .and_then(|session| {
+                let key = &session.id;
+                self.state.peer_session_meta.get(key)
+            })
+            .map(|meta| meta.slug.as_str())
+            .unwrap_or("unknown");
+        let display = if input.len() > 80 {
+            format!("{}…", &input[..80])
+        } else {
+            input.to_string()
+        };
+        self.state.status =
+            format!("[PEER_HUMAN_INPUT] peer={slug} · \"{display}\"", slug = slug, display = display);
+    }
+
     /// `turn/steer` result (octos#1807). `steered:true` — the text joined
     /// the ACTIVE turn: status only; run-state and the pre-token marker are
     /// deliberately untouched (the turn was already live and keeps
