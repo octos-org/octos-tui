@@ -5243,6 +5243,9 @@ impl UserQuestionEntry {
 
     pub fn move_cursor_up(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
+        if self.cursor < self.free_text_row() {
+            self.editing_free_text = false;
+        }
     }
 
     /// Selected option labels in option order.
