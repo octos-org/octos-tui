@@ -153,6 +153,7 @@ pub fn render_viewport_with_finalization(
                 app,
                 palette,
                 peer_strip_height.saturating_sub(1),
+                root[7].width,
             ))
             .style(Style::default().bg(palette.surface)),
             root[7],

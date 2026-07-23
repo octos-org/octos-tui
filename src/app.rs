@@ -3983,7 +3983,26 @@ pub(crate) fn peer_activity_line(app: &AppState, session_id: &octos_core::Sessio
     }
 }
 
-/// #407: terminal-height floor for the Peer Dock. Below this many rows the
+/// #407: combine elapsed time and token count into a right-aligned suffix
+/// for each peer dock row — `1m23s · ↓ 8.2k` for a live peer, empty string
+/// for ones with no measurable time yet. Elapsed: wall clock since the peer
+/// was created (the kickoff Instant). Tokens: total output tokens from the
+/// latest `session_usage` snapshot.
+fn peer_timing_suffix(app: &AppState, session_id: &octos_core::SessionKey, meta: &PeerMeta) -> String {
+    let elapsed = meta.created.elapsed();
+    let elapsed_str = format_short_duration(elapsed.as_millis() as i64);
+    let token_str = app
+        .session_usage
+        .get(session_id)
+        .and_then(|(_, output, _)| output.filter(|&t| t > 0))
+        .map(|tokens| format!("↓ {}", humanize_token_count(tokens)))
+        .unwrap_or_default();
+    if !token_str.is_empty() {
+        format!("{elapsed_str} · {token_str}")
+    } else {
+        elapsed_str
+    }
+}
 /// dock collapses to height 0 so a tiny terminal never corrupts the layout.
 /// Mirrors [`AGENT_STRIP_MIN_TERMINAL_ROWS`].
 const PEER_STRIP_MIN_TERMINAL_ROWS: u16 = 12;
@@ -4032,6 +4051,7 @@ pub(crate) fn peer_strip_lines(
     app: &AppState,
     palette: Palette,
     peer_rows: u16,
+    width: u16,
 ) -> Vec<Line<'static>> {
     if app.peer_dock_collapsed {
         return vec![peer_dock_pill_line(app, palette)];
@@ -4080,6 +4100,12 @@ pub(crate) fn peer_strip_lines(
             palette.muted().bg(palette.surface)
         };
         let detail = peer_activity_line(app, session_id);
+        // Right-aligned elapsed + token info.
+        let timing = peer_timing_suffix(app, session_id, meta);
+        let left_text = format!(" {glyph} {}  {detail}", meta.slug.chars().take(20).collect::<String>());
+        // Reserve 1 char for the space between left and right content.
+        let pad = width
+            .saturating_sub(left_text.chars().count() as u16 + timing.chars().count() as u16 + 1);
         let row = Line::from(vec![
             Span::styled(format!(" {glyph} "), glyph_style),
             Span::styled(
@@ -4087,6 +4113,10 @@ pub(crate) fn peer_strip_lines(
                 palette.text().bg(palette.surface),
             ),
             Span::styled(format!("  {detail}"), palette.muted().bg(palette.surface)),
+            Span::styled(
+                format!("{} {}", " ".repeat(pad as usize), timing),
+                palette.muted().bg(palette.surface),
+            ),
         ]);
         lines.push(row);
     }
