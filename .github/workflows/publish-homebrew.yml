@@ -39,6 +39,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   homebrew:
@@ -131,6 +132,18 @@ jobs:
           fi
           git config user.name "octos-release-bot"
           git config user.email "151983+ymote@users.noreply.github.com"
+          # `main` requires changes via a PR (ruleset `default-branch-protection`,
+          # 0 approvals required) — a direct `git push origin main` is rejected
+          # with GH013. Push the formula to a branch and SELF-MERGE a PR: that
+          # satisfies the rule with the built-in token and needs no approval.
+          BRANCH="homebrew/${TAG}-${CHANNEL}"
+          git checkout -b "$BRANCH"
           git add "$FORMULA_FILE"
           git commit -m "octos-tui ${TAG}: update Homebrew formula (${CHANNEL})"
-          git push origin HEAD:main
+          git push -f origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "octos-tui ${TAG}: update Homebrew formula (${CHANNEL})" \
+            --body "Automated Homebrew formula bump for ${TAG} (${CHANNEL} channel)."
+          # Mergeability is computed async — retry once after a short wait.
+          gh pr merge "$BRANCH" --squash --delete-branch \
+            || (sleep 12 && gh pr merge "$BRANCH" --squash --delete-branch)
