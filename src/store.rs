@@ -10659,11 +10659,21 @@ impl Store {
                 self.find_session(session_id)
                     .and_then(|session| session.live_reply.as_ref())
                     .map(|live_reply| live_reply.turn_id.clone())
-                    .filter(|turn_id| {
-                        self.state
-                            .v2_live_assistant_segments
-                            .contains_key(&(session_id.clone(), turn_id.clone()))
-                    })
+                    // Bind a divergent-id terminal (Stage-1 projects terminals
+                    // under the canonical turn UUID while content keeps a
+                    // thread-shaped id) to the session's sole live turn. This was
+                    // gated on a v2 assistant segment existing, which excluded
+                    // legacy- / reasoning-only- / hydrated live turns (they never
+                    // call `apply_v2_assistant_*`): their `TurnTerminal` fell
+                    // through to a mismatched parsed id, hit `commit_live_reply`'s
+                    // stale arm, and left `live_reply` set forever — a done peer
+                    // stuck at "· 1 live" in the Peer Dock. The live turn is by
+                    // definition not yet completed, so this is same-turn
+                    // resolution; `is_turn_completed` keeps a genuinely later
+                    // terminal from re-binding a finished turn, and the
+                    // `v2_turn_ids` cache + `matching_live_turn` above already
+                    // claim any terminal whose id was seen on the content lane.
+                    .filter(|turn_id| !self.state.is_turn_completed(session_id, turn_id))
             })
             .flatten();
         let turn_id = matching_live_turn
@@ -27178,6 +27188,51 @@ now analyzing the bus module"
             terminal_turn, content_turn,
             "the terminal UUID aliases the content stream's stable live turn"
         );
+    }
+
+    #[test]
+    fn envelope_v2_terminal_clears_segmentless_live_reply() {
+        // A background peer (or any legacy / hydrated / reasoning-only turn) can
+        // hold a `live_reply` that never recorded a v2 assistant segment — e.g.
+        // one bound via the legacy MessageDelta lane. Stage-1 then projects the
+        // turn's terminal under the CANONICAL turn UUID, divergent from the
+        // live_reply's id. Previously `resolve_v2_turn_id`'s alias was gated on a
+        // v2 assistant segment existing, so it could not bind this terminal to
+        // the live turn: the id mismatched, `commit_live_reply` hit its stale arm
+        // and put the live_reply BACK, and the session read as `live` forever —
+        // the "done peer stuck at · 1 live" in the Peer Dock pill. The terminal
+        // must still release the segment-less live turn.
+        use octos_core::ui_protocol::{PayloadV2, TurnTerminalOutcome};
+
+        let live_turn_id = TurnId::new();
+        let mut store = store_with_live_reply(live_turn_id.clone(), "peer answer");
+        let session_id = store.state.sessions[0].id.clone();
+        assert!(store.state.session_turn_live(&session_id));
+
+        let canonical_terminal_turn_id = TurnId::new().0.to_string();
+        assert_ne!(canonical_terminal_turn_id, live_turn_id.0.to_string());
+        store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+            session_id.clone(),
+            1,
+            &canonical_terminal_turn_id,
+            PayloadV2::TurnTerminal {
+                outcome: TurnTerminalOutcome::Completed,
+                error: None,
+                token_usage: None,
+            },
+        )));
+
+        let session = &store.state.sessions[0];
+        assert!(
+            session.live_reply.is_none(),
+            "segment-less live turn must be released by its terminal"
+        );
+        assert!(
+            !store.state.session_turn_live(&session_id),
+            "the Peer Dock must not read a finished peer as live"
+        );
+        assert!(!session.messages.is_empty());
+        assert!(session.messages[0].content.contains("peer answer"));
     }
 
     #[test]
