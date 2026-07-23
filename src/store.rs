@@ -3679,8 +3679,10 @@ impl Store {
                     // `/model` → "Add a model" (or `/add-model`) and lands on
                     // the mid-session model-config surface.
                     if self.menu_stack_contains_onboard() {
-                        self.close_all_menus();
-                        self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                        // Preserve the research-lane intent across this transient
+                        // wizard rebuild — see
+                        // `reopen_onboard_root_preserving_lane_intent`.
+                        self.reopen_onboard_root_preserving_lane_intent();
                     } else {
                         self.open_model_config_surface();
                     }
@@ -3718,8 +3720,7 @@ impl Store {
                         // post-create provider configuration. Only applies
                         // inside the wizard: entered from `/model` → "Add a
                         // model" the chain always advances to the model step.
-                        self.close_all_menus();
-                        self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+                        self.reopen_onboard_root_preserving_lane_intent();
                     } else {
                         self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
                     }
@@ -5066,6 +5067,24 @@ impl Store {
         {
             self.state.onboarding.research_lane_intent = false;
         }
+    }
+
+    /// Rebuild the wizard root after a staged-chain edit (route / family pick)
+    /// WITHOUT tripping [`Self::clear_research_lane_intent_if_wizard_closed`].
+    /// `close_all_menus` empties the stack — momentarily removing `MENU_ONBOARD`
+    /// — which the abandon-guard reads as "wizard abandoned" and clears the
+    /// research-lane intent mid-flight. That silently rerouted a `/research add`
+    /// Save from the sub-provider LANE upsert down to the profile's PRIMARY
+    /// `profile/llm/upsert`, so a wizard-added lane never persisted as a lane
+    /// (it showed as "No research lanes configured" and never opened the
+    /// cheap/strong picker). Capture the intent across the transient collapse
+    /// and restore it; real abandon-detection (Esc / genuine close) still runs
+    /// on the guard's own paths.
+    fn reopen_onboard_root_preserving_lane_intent(&mut self) {
+        let lane_intent = self.state.onboarding.research_lane_intent;
+        self.close_all_menus();
+        self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        self.state.onboarding.research_lane_intent = lane_intent;
     }
 
     /// True while the first-launch onboarding wizard is still in progress: the
@@ -34670,6 +34689,47 @@ now analyzing the bus module"
         assert!(
             store.state.onboarding.research_lane_intent,
             "the persistent lane intent survives the edit"
+        );
+    }
+
+    /// The critical `/research add` bug: picking the route from the guided chain
+    /// rebuilds the wizard root via `close_all_menus` + reopen, momentarily
+    /// removing `MENU_ONBOARD`, which trips the abandon-guard and cleared
+    /// `research_lane_intent` mid-flight — so Save routed to the profile's
+    /// PRIMARY provider and the lane never persisted (it showed "No research
+    /// lanes configured" and never opened the cheap/strong picker). The intent
+    /// must survive real route navigation. (Prior lane tests forced the flag
+    /// directly, bypassing the route menu, so none caught this.)
+    #[test]
+    fn research_lane_intent_survives_route_pick_in_the_wizard() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG]);
+        store.close_all_menus();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE));
+        store.state.onboarding.research_lane_intent = true;
+
+        store.dispatch_onboarding_action(
+            crate::model::OnboardingAction::SetProviderSelection(Box::new(sample_selection(
+                "moonshot", "k3",
+            ))),
+            None,
+        );
+
+        assert!(
+            store.state.onboarding.research_lane_intent,
+            "the lane intent must survive the wizard's route-pick rebuild"
+        );
+        assert!(
+            store
+                .state
+                .menu_stack
+                .frames()
+                .iter()
+                .any(|f| f.id.as_str() == crate::menu::registry::MENU_ONBOARD),
+            "the wizard root is rebuilt after the route pick"
         );
     }
 

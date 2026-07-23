@@ -1052,7 +1052,7 @@ menu:
         desc: Select to remove this lane — asks to confirm first.
       add:
         label: Add a lane…
-        desc: "Pre-fills /research add — then type <key> <provider> <model>."
+        desc: "Opens the model picker, then choose the fast or strong lane."
   research_remove:
     title: "Remove a research lane"
     item:
