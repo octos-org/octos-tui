@@ -591,7 +591,7 @@ menu:
         desc: 选择以移除此通道 —— 会先确认。
       add:
         label: 添加通道…
-        desc: "预填 /research add — 然后输入 <key> <provider> <model>。"
+        desc: "打开模型选择器，然后选择 fast 或 strong 通道。"
   research_remove:
     title: "移除研究通道"
     item:

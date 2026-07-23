@@ -2102,49 +2102,58 @@ fn onboarding_provider_setup_menu(
         },
     );
 
-    // Terminal step (always shown — collapsed or expanded). On a launch-flow
-    // server (Model A) the provider step ends at the launch-instructions screen
-    // (`MENU_ONBOARD_DONE`) — the redundant workspace/Activate screen is skipped
-    // and launch-time activation opens the session on the next start. Older
-    // servers keep the workspace step (`MENU_ONBOARD_WORKSPACE`), which owns the
-    // final Activate. Either way it is disabled until a provider is saved so the
-    // steps stay ordered.
-    items.push({
-        let blocked = (!onboarding_has_saved_primary_provider(ctx, state, current_profile))
-            .then(|| t!("onboarding.wizard.workspace_locked_reason").into_owned());
-        if launch_flow_supported(ctx) {
-            MenuItem::new(
-                "onboard.done.open",
-                t!("onboarding.wizard.finish_label"),
-                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_DONE)),
-            )
-            .with_description(t!("onboarding.wizard.finish_description"))
-            .maybe_disabled(blocked)
-        } else {
-            MenuItem::new(
-                "onboard.workspace.open",
-                t!("onboarding.wizard.workspace_open_label"),
-                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_WORKSPACE)),
-            )
-            .with_description(t!("onboarding.wizard.workspace_open_description"))
-            .with_state(MenuItemState::required(
-                state.workspace_validation.is_valid(),
-            ))
-            .maybe_disabled(blocked)
-        }
-    });
+    // Terminal workspace/Activate + Exit rows — SKIPPED in the `/research add`
+    // lane flow: a lane save has no workspace/Activate phase (it saves a lane,
+    // not a profile) and always runs with an active session, so Esc backs out
+    // normally and no Exit escape hatch is needed. Gated on `research_lane_intent`
+    // so first-launch onboarding (intent = false) is unchanged.
+    if !state.research_lane_intent {
+        // Terminal step (always shown — collapsed or expanded). On a launch-flow
+        // server (Model A) the provider step ends at the launch-instructions screen
+        // (`MENU_ONBOARD_DONE`) — the redundant workspace/Activate screen is skipped
+        // and launch-time activation opens the session on the next start. Older
+        // servers keep the workspace step (`MENU_ONBOARD_WORKSPACE`), which owns the
+        // final Activate. Either way it is disabled until a provider is saved so the
+        // steps stay ordered.
+        items.push({
+            let blocked = (!onboarding_has_saved_primary_provider(ctx, state, current_profile))
+                .then(|| t!("onboarding.wizard.workspace_locked_reason").into_owned());
+            if launch_flow_supported(ctx) {
+                MenuItem::new(
+                    "onboard.done.open",
+                    t!("onboarding.wizard.finish_label"),
+                    MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_DONE)),
+                )
+                .with_description(t!("onboarding.wizard.finish_description"))
+                .maybe_disabled(blocked)
+            } else {
+                MenuItem::new(
+                    "onboard.workspace.open",
+                    t!("onboarding.wizard.workspace_open_label"),
+                    MenuAction::OpenMenu(MenuId::from(
+                        crate::menu::registry::MENU_ONBOARD_WORKSPACE,
+                    )),
+                )
+                .with_description(t!("onboarding.wizard.workspace_open_description"))
+                .with_state(MenuItemState::required(
+                    state.workspace_validation.is_valid(),
+                ))
+                .maybe_disabled(blocked)
+            }
+        });
 
-    // Same escape hatch as the create-profile step: this menu also lives under
-    // the root MENU_ONBOARD id, where Esc is swallowed while no session is
-    // open — without a visible Exit row the user would be trapped here.
-    items.push(
-        MenuItem::new(
-            "onboard.local.exit",
-            t!("menu.onboard.item.exit.label"),
-            MenuAction::Local(LocalAction::Exit),
-        )
-        .with_description(t!("menu.onboard.item.exit.desc")),
-    );
+        // Same escape hatch as the create-profile step: this menu also lives under
+        // the root MENU_ONBOARD id, where Esc is swallowed while no session is
+        // open — without a visible Exit row the user would be trapped here.
+        items.push(
+            MenuItem::new(
+                "onboard.local.exit",
+                t!("menu.onboard.item.exit.label"),
+                MenuAction::Local(LocalAction::Exit),
+            )
+            .with_description(t!("menu.onboard.item.exit.desc")),
+        );
+    }
 
     for (idx, item) in items.iter_mut().enumerate() {
         if let Some(shortcut) = numeric_shortcut(idx) {
@@ -4340,8 +4349,12 @@ fn research_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         "research.add",
         t!("menu.research.item.add.label"),
         if can_upsert {
-            MenuAction::Local(crate::menu::types::LocalAction::EditComposer(
-                "/research add ".to_string(),
+            // Open the add-lane wizard directly (the bare `/research add` path:
+            // set research_lane_intent + open the model picker) instead of
+            // dumping "/research add " into the composer for the user to
+            // complete by hand.
+            MenuAction::Local(crate::menu::types::LocalAction::RunSlashCommand(
+                "/research add".to_string(),
             ))
         } else {
             MenuAction::Noop
