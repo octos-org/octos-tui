@@ -11400,6 +11400,26 @@ impl Store {
             ..
         } = event;
 
+        // A `task/output/delta` can arrive before the task's first
+        // `task/updated` (a background / spawn child streams output the moment
+        // it starts). Dropping it here left the per-task `output_tail` empty, so
+        // the sub-agent peek — whose only live source for a RUNNING child is this
+        // tail — rendered the empty placeholder even as tokens climbed.
+        // Materialize a minimal Running row so the output accumulates; the first
+        // `task/updated` fills in the real title / state / turn.
+        if self.find_task_mut(&session_id, &task_id).is_none() {
+            let Some(session) = self.find_session_mut(&session_id) else {
+                return;
+            };
+            session.tasks.push(TaskView {
+                id: task_id.clone(),
+                title: String::new(),
+                state: octos_core::ui_protocol::TaskRuntimeState::Running,
+                runtime_detail: None,
+                output_tail: String::new(),
+                turn_id: None,
+            });
+        }
         let Some(task) = self.find_task_mut(&session_id, &task_id) else {
             return;
         };
@@ -28797,6 +28817,38 @@ now analyzing the bus module"
         assert!(store.state.task_output.active);
         assert_eq!(store.state.task_output.title, "task");
         assert_eq!(store.state.task_output.output, "line one\n");
+    }
+
+    #[test]
+    fn task_output_delta_before_task_row_materializes_it_instead_of_dropping() {
+        // A background / spawn child can stream `task/output/delta` before its
+        // first `task/updated`. Previously the delta was DROPPED (no task row
+        // yet), so the per-task `output_tail` stayed empty and the sub-agent
+        // peek — whose only live source for a running child is that tail —
+        // showed the empty placeholder even as the chip's token count climbed.
+        // The delta must materialize a Running row so its output accumulates.
+        let present = TaskId::new();
+        let mut store = store_with_task(present);
+        let session_id = store.state.sessions[0].id.clone();
+        let streaming = TaskId::new();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TaskOutputDelta(
+            TaskOutputDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                task_id: streaming.clone(),
+                text: "child output line\n".into(),
+                cursor: OutputCursor { offset: 18 },
+            },
+        )));
+
+        let row = store.state.sessions[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == streaming)
+            .expect("an early delta must materialize the task row, not drop it");
+        assert_eq!(row.output_tail, "child output line\n");
+        assert_eq!(row.state, TaskRuntimeState::Running);
     }
 
     #[test]
