@@ -760,6 +760,20 @@ impl Store {
                 command,
                 invocation,
             } => {
+                // `/peer clear` is a purely client-side dock tidy (prune finished
+                // peers). It must stay reachable even when the server lost the
+                // peer/prepare capability — which is exactly when orphan peers
+                // from an earlier connection pile up. Route it before the
+                // capability gate below; every other `/peer …` verb still gates.
+                if matches!(
+                    &command.entry,
+                    crate::menu::types::CommandEntry::LocalAction(
+                        crate::menu::types::LocalAction::Custom("peer"),
+                    )
+                ) && draft.trim().strip_prefix("/peer").map(str::trim) == Some("clear")
+                {
+                    return self.dispatch_peer_slash(draft);
+                }
                 let availability = registry.evaluate(command, &self.state.availability_context());
                 if !availability.is_available() {
                     let command_name = command.slash_name();
@@ -902,15 +916,44 @@ impl Store {
     /// empty brief after flags all reject with the usage status. Bare `/peer`
     /// prefills the composer for argument typing (the same
     /// `LocalAction::EditComposer` treatment the `/research` menu rows use).
+    /// `/peer clear`: prune DONE peers (finished — not live, not blocked) from
+    /// the dock roster. Never removes a running or waiting peer. Client-side
+    /// only; `peer_session_meta` is otherwise insert-only, so this is how a user
+    /// tidies completed/orphaned peers left over from earlier work.
+    fn clear_finished_peers(&mut self) -> SlashDispatchOutcome {
+        let done: Vec<SessionKey> = self
+            .state
+            .peer_session_meta
+            .keys()
+            .filter(|sid| self.state.peer_is_done(sid))
+            .cloned()
+            .collect();
+        for sid in &done {
+            self.state.peer_session_meta.remove(sid);
+        }
+        self.state.status = if done.is_empty() {
+            t!("status.peer_clear_none").into_owned()
+        } else {
+            t!("status.peer_clear_removed", n = done.len().to_string()).into_owned()
+        };
+        SlashDispatchOutcome::accepted(None)
+    }
+
     pub(crate) fn dispatch_peer_slash(&mut self, draft: &str) -> SlashDispatchOutcome {
+        let rest = draft.trim();
+        let rest = rest.strip_prefix("/peer").unwrap_or(rest).trim_start();
+        // `/peer clear` tidies the dock by pruning FINISHED peers — a purely
+        // client-side roster edit (no server call), so it runs BEFORE the
+        // peer/prepare capability gate below.
+        if rest == "clear" {
+            return self.clear_finished_peers();
+        }
         // Mutating gate (readonly + capability): the transport would block the
         // emitted command anyway, but rejecting here keeps the stash from
         // being armed by a dispatch that can never complete (K3 review).
         if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_PEER_PREPARE) {
             return SlashDispatchOutcome::Rejected;
         }
-        let rest = draft.trim();
-        let rest = rest.strip_prefix("/peer").unwrap_or(rest).trim_start();
         if rest.is_empty() {
             // Bare `/peer`: drop the verb back into the composer so the user
             // types the brief inline (mirrors the EditComposer prefill rows).
@@ -8605,6 +8648,11 @@ impl Store {
             // `reconcile_after_backend_relaunch`) — nothing to finalize here.
             _ => return None,
         }
+        // Peer-dock lifecycle: a hydrate-reported terminal (the backend died
+        // mid-stream, so no live `TurnCompleted`/`TurnError` will ever arrive) is
+        // still this peer's turn ending — stamp it, or the peer reverts to a
+        // stale `○ idle` after reconnect and `/peer clear` can't prune it.
+        self.state.mark_peer_finished(session_id);
         // This IS the interrupted turn's settle when the backend restarted
         // under it (no `turn/completed`/`turn/error` will ever arrive) — the
         // deferred Esc/Ctrl+C prompt restore applies here too (codex P2), or
@@ -11559,6 +11607,20 @@ impl Store {
         {
             return None;
         }
+        // Peer-dock lifecycle: this terminal ends the peer's LIVE turn iff the
+        // current `live_reply` is for exactly this turn — computed BEFORE the
+        // match below consumes it. ONLY a live-turn terminal stamps `finished_at`
+        // (done + frozen elapsed): a stale / duplicate / switch-finalized /
+        // empty-`None`-arm terminal for a SUPERSEDED turn must not, or it would
+        // freeze the wrong time or mark a still-running peer done (codex review).
+        // Deliberate trade-off: this UNDER-stamps the rare turn that terminates
+        // before any delta binds `live_reply` (it stays `○ idle`, which is
+        // honest) rather than risk stale-stamping a running peer — the safe
+        // direction. Fully closing that needs turn-scoped run tracking.
+        let terminates_live_turn = self
+            .find_session(&event.session_id)
+            .and_then(|session| session.live_reply.as_ref())
+            .is_some_and(|live_reply| live_reply.turn_id == event.turn_id);
         // Streamed reasoning for this turn (legacy ReasoningDelta accumulator)
         // becomes the committed message's reasoning_content — the transcript
         // renders it as a separate "· reasoning" block above the answer.
@@ -11638,6 +11700,11 @@ impl Store {
             }
         }
         self.state.status = status;
+        if terminates_live_turn {
+            // Peer-dock lifecycle: the peer's live turn just ended → `✓ done` +
+            // frozen elapsed.
+            self.state.mark_peer_finished(&event.session_id);
+        }
         if completed_current_turn {
             // Blocking bug 2: terminal completion clears any stale retry/backoff
             // for the session. `session_retry` was only cleared on the next
@@ -11770,6 +11837,13 @@ impl Store {
         // in its own transcript without repainting them.
         let targets_active = self.event_targets_active_session(&event.session_id);
         let follow_tail = self.state.transcript_scroll == 0;
+        // Peer-dock lifecycle: this error/interrupt ends the peer's LIVE turn iff
+        // the current live_reply is for exactly this turn (computed before the
+        // match below consumes it) — see `commit_live_reply`.
+        let terminates_live_turn = self
+            .find_session(&event.session_id)
+            .and_then(|session| session.live_reply.as_ref())
+            .is_some_and(|live_reply| live_reply.turn_id == event.turn_id);
         let fallback_summary =
             self.turn_error_fallback_message(&event.turn_id, &event.code, &event.message);
         // A user-initiated interrupt (Esc/Ctrl+C → server `TurnError` with code
@@ -11885,6 +11959,11 @@ impl Store {
                 .capture_completed_turn_activity(&event.session_id, &event.turn_id);
         }
         self.state.status = status;
+        if terminates_live_turn {
+            // Peer-dock lifecycle: the peer's live turn just errored/interrupted
+            // → `✓ done` + frozen elapsed.
+            self.state.mark_peer_finished(&event.session_id);
+        }
         if failed_current_turn {
             // Blocking bug 2: terminal error also clears any stale retry/backoff
             // for the session (see `commit_live_reply`) so it can never linger
@@ -14071,6 +14150,113 @@ mod tests {
             crate::model::APPUI_METHOD_PEER_PREPARE,
         ]));
         store
+    }
+
+    #[test]
+    fn peer_clear_prunes_finished_peers_and_keeps_running_ones() {
+        let mut store = peer_capable_store();
+        let done = SessionKey("local:tui#peer-done".into());
+        let live = SessionKey("local:tui#peer-live".into());
+        for (sid, slug) in [(&done, "done"), (&live, "live")] {
+            store.state.peer_session_meta.insert(
+                sid.clone(),
+                crate::model::PeerMeta {
+                    slug: slug.into(),
+                    brief_path: "/tmp/b.md".into(),
+                    agent_staged: false,
+                    created: std::time::Instant::now(),
+                    finished_at: None,
+                },
+            );
+        }
+        // Both had a terminal, but `live` is running again (pre-token armed) — the
+        // live state overrides "done", so clear must keep it.
+        store.state.mark_peer_finished(&done);
+        store.state.mark_peer_finished(&live);
+        store
+            .state
+            .pre_token_turns
+            .insert(live.clone(), std::time::Instant::now());
+        assert!(store.state.peer_is_done(&done));
+        assert!(
+            !store.state.peer_is_done(&live),
+            "a re-running peer is not done despite an earlier terminal"
+        );
+
+        let outcome = store.dispatch_peer_slash("/peer clear");
+        assert!(matches!(outcome, SlashDispatchOutcome::Accepted(_)));
+        assert!(
+            !store.state.peer_session_meta.contains_key(&done),
+            "the finished peer is pruned"
+        );
+        assert!(
+            store.state.peer_session_meta.contains_key(&live),
+            "the still-running peer is kept"
+        );
+    }
+
+    #[test]
+    fn stale_terminal_does_not_mark_a_running_peer_done() {
+        // codex review (High #2): `mark_peer_finished` must fire only on a REAL
+        // terminal for the peer's LIVE turn. A stale/mismatched terminal (a
+        // replay for a superseded turn while a new turn streams) must NOT flip
+        // the peer to `✓ done` or corrupt its frozen elapsed.
+        let live_turn = TurnId::new();
+        let mut store = store_with_live_reply(live_turn.clone(), "streaming B");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.peer_session_meta.insert(
+            session_id.clone(),
+            crate::model::PeerMeta {
+                slug: "p".into(),
+                brief_path: "/tmp/b.md".into(),
+                agent_staged: false,
+                created: std::time::Instant::now(),
+                finished_at: None,
+            },
+        );
+
+        // Stale TurnCompleted for a DIFFERENT (older) turn while turn B is live.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            store.state.peer_session_meta[&session_id]
+                .finished_at
+                .is_none(),
+            "a stale terminal must not stamp the peer finished"
+        );
+        assert!(
+            !store.state.peer_is_done(&session_id),
+            "the peer is still running turn B"
+        );
+
+        // The REAL terminal for the live turn DOES stamp it done.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: live_turn,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            store.state.peer_session_meta[&session_id]
+                .finished_at
+                .is_some(),
+            "the real terminal for the live turn stamps finished"
+        );
+        assert!(store.state.peer_is_done(&session_id));
     }
 
     /// Runs `/peer --go …` through dispatch and feeds back the prepared

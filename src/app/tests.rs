@@ -8139,6 +8139,7 @@ mod tests {
                 brief_path: "/tmp/brief.md".into(),
                 agent_staged: false,
                 created: std::time::Instant::now(),
+                finished_at: None,
             },
         );
         let expected = peer_strip_height(&app, 40);
@@ -9811,6 +9812,7 @@ mod tests {
                 brief_path: "/tmp/brief.md".into(),
                 agent_staged: false,
                 created: std::time::Instant::now(),
+                finished_at: None,
             },
         );
         let with_peer = hint_bar_model(&app);
@@ -10097,6 +10099,55 @@ mod tests {
         );
     }
 
+    /// Peer-dock lifecycle: a peer that has NEVER run is `○ idle`; once its turn
+    /// terminates (`mark_peer_finished`) it becomes `✓ done`; a subsequent live
+    /// turn overrides that back to running (not done).
+    #[test]
+    fn peer_dock_shows_done_after_a_finished_turn_not_idle() {
+        let mut app = autonomy_app_state();
+        let sid = SessionKey("local:tui#peer-refactor".into());
+        app.pending_peer_kickoffs.insert(
+            sid.clone(),
+            crate::model::PeerKickoff {
+                brief: "refactor auth".into(),
+                brief_path: "/tmp/brief.md".into(),
+                go: false,
+                agent_staged: false,
+                created: std::time::Instant::now(),
+            },
+        );
+        let _ = app.take_pending_peer_kickoff(&sid);
+        app.peer_dock_collapsed = false;
+
+        let strip_text = |app: &AppState| -> String {
+            peer_strip_lines(app, Palette::for_theme(app.theme), 4)
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|s| s.content.as_ref().to_string())
+                .collect()
+        };
+
+        // Never run → idle, not done, ○ (no ✓).
+        assert!(!app.peer_is_done(&sid));
+        assert!(!strip_text(&app).contains('✓'), "un-run peer is not done");
+
+        // Turn terminated → done, ✓ in the dock.
+        app.mark_peer_finished(&sid);
+        assert!(app.peer_is_done(&sid));
+        assert!(
+            strip_text(&app).contains('✓'),
+            "a finished peer shows the done glyph"
+        );
+
+        // Running again (pre-token armed) → live overrides done.
+        app.pre_token_turns
+            .insert(sid.clone(), std::time::Instant::now());
+        assert!(
+            !app.peer_is_done(&sid),
+            "a live turn overrides the done state"
+        );
+    }
+
     /// Return-to-parent pre-select: from a peer, the switcher points at the
     /// first main (non-peer) session; from a main it stays put (`None`).
     #[test]
@@ -10132,6 +10183,7 @@ mod tests {
                 brief_path: "/tmp/brief.md".into(),
                 agent_staged: false,
                 created: std::time::Instant::now(),
+                finished_at: None,
             },
         );
         // On the peer → return-to-parent points at the main (row 0).
@@ -10159,6 +10211,7 @@ mod tests {
                     brief_path: "/tmp/brief.md".into(),
                     agent_staged: true,
                     created: now,
+                    finished_at: None,
                 },
             );
         }

@@ -1244,6 +1244,8 @@ status:
   gather_requesting: "正在从黑板收集同伴结果…"
   gather_no_peers: "黑板上还没有同伴 —— 先用 /peer 派生几个吧。"
   gather_submitted: "已把 %{n} 个同伴的结果从黑板汇总进当前会话。"
+  peer_clear_none: "没有已完成的同伴可清理 —— 运行中和等待中的同伴会保留。"
+  peer_clear_removed: "已从面板清理 %{n} 个已完成的同伴。"
   research_usage: "用法：/research | /research add <key> <provider> <model> [base_url] [api_key_env] | /research rm <key>"
   research_add_usage: "用法：/research add <key> <provider> <model> [base_url] [api_key_env]"
   research_rm_usage: "用法：/research rm <key>"
