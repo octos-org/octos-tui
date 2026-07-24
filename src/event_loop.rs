@@ -63,6 +63,13 @@ enum RenderMode {
 
 pub fn run(cli: Cli) -> Result<()> {
     enable_raw_mode()?;
+    // Warm the one-shot terminal background probe HERE — after raw mode is on
+    // (so the OSC 11 reply isn't line-buffered or echoed) but BEFORE the input
+    // loop begins. The probe reads `/dev/tty` and discards any non-OSC bytes;
+    // running it lazily on the first frame render (via `Palette::for_theme`)
+    // would race the live event loop and swallow early keystrokes. Caching in
+    // the `OnceLock` means `for_theme` reuses this result and never re-probes.
+    let _ = crate::terminal_probe::terminal_info();
     let mut stdout = io::stdout();
     // Inline-viewport model (codex-style): we do NOT enter the alternate screen
     // for the main chat. The terminal keeps its normal scrollback, so finalized

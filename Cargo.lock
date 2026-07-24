@@ -1624,6 +1624,7 @@ dependencies = [
  "ratatui",
  "reqwest 0.12.28",
  "rust-i18n",
+ "rustix 1.1.4",
  "semver",
  "serde",
  "serde_json",
