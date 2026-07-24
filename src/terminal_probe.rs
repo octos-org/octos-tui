@@ -74,6 +74,14 @@ pub fn query_default_colors(timeout: std::time::Duration) -> Option<DefaultColor
     }
 }
 
+/// Non-Unix stub: there's no `/dev/tty` OSC probe path, so the public API is
+/// kept platform-symmetric by always returning `None`. Callers fall back to
+/// the dark-background default.
+#[cfg(not(unix))]
+pub fn query_default_colors(_timeout: std::time::Duration) -> Option<DefaultColors> {
+    None
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DefaultColors {
     pub fg: (u8, u8, u8),
@@ -82,7 +90,12 @@ pub struct DefaultColors {
 
 /// Parse OSC 10/11 response: `ESC ] 1 0 ; rgb:RR/GG/BB ESC \` (or similar).
 /// Returns `None` if incomplete or malformed.
-#[cfg(unix)]
+///
+/// Pure/OS-independent (only the tty I/O in `query_default_colors` is
+/// Unix-gated), so it stays ungated to compile + unit-test on every platform.
+/// On non-Unix it's reachable only from tests (no probe caller), so allow the
+/// dead-code lint there.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn parse_osc_color_response(buf: &[u8]) -> Option<DefaultColors> {
     let text = String::from_utf8_lossy(buf);
     let mut fg = None;
@@ -108,7 +121,10 @@ fn parse_osc_color_response(buf: &[u8]) -> Option<DefaultColors> {
 /// Terminals commonly reply with 16-bit-per-channel values
 /// (`rgb:RRRR/GGGG/BBBB`, e.g. `rgb:ffff/8000/0000`); we take the TOP byte of
 /// each channel by reading only the first two hex digits.
-#[cfg(unix)]
+///
+/// Pure/OS-independent — ungated so it compiles + unit-tests on every platform;
+/// on non-Unix it's reachable only from tests, so allow dead-code there.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn parse_rgb_triplet(s: &str) -> Option<(u8, u8, u8)> {
     let s = s.trim_end_matches(['\x1B', '\x07', '\\']);
     let s = s.strip_prefix("rgb:").or_else(|| s.strip_prefix("rgba:"))?;
