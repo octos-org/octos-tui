@@ -4007,70 +4007,6 @@ fn peer_timing_suffix(
         elapsed_str
     }
 }
-/// #440: structured status table for all peers — slug, status, elapsed,
-/// output tokens, and model. Read-only scan of existing TUI state; no server
-/// calls needed. Output is a fixed-width table suitable for tool responses.
-pub(crate) fn peer_list_output(app: &AppState) -> String {
-    let roster = peer_dock_roster(app);
-    let pending = app.pending_peer_kickoffs.len();
-    if roster.is_empty() && pending == 0 {
-        return "No peers.".to_string();
-    }
-    let mut lines: Vec<String> = Vec::new();
-    // Header
-    lines.push(format!(
-        "{:<22} {:<10} {:<10} {:<8} {}",
-        "PEER", "STATUS", "ELAPSED", "TOKENS", "MODEL"
-    ));
-    lines.push("-".repeat(64));
-    // Opened peers (live / idle / blocked).
-    for (session_id, meta) in &roster {
-        let slug: String = meta.slug.chars().take(20).collect();
-        let status = if app.session_blocked_reason(session_id).is_some() {
-            "blocked"
-        } else if app.session_turn_live(session_id) {
-            "live"
-        } else {
-            "idle"
-        };
-        let elapsed = format_short_duration(meta.created.elapsed().as_millis() as i64);
-        let tokens = app
-            .session_usage
-            .get(session_id)
-            .and_then(|(_, output, _)| output.filter(|&t| t > 0))
-            .map(|t| humanize_token_count(t))
-            .unwrap_or_default();
-        let model = meta.model_id.clone().unwrap_or_else(|| "—".to_string());
-        lines.push(format!(
-            "{:<22} {:<10} {:<10} {:<8} {}",
-            slug,
-            status,
-            elapsed,
-            tokens,
-            model.chars().take(16).collect::<String>(),
-        ));
-    }
-    // Pending peers (staged but not yet opened).
-    for (_session_id, kickoff) in &app.pending_peer_kickoffs {
-        let slug: String = kickoff
-            .brief_path
-            .rsplit('/')
-            .next()
-            .unwrap_or("?")
-            .chars()
-            .take(20)
-            .collect();
-        lines.push(format!(
-            "{:<22} {:<10} {:<10} {:<8} {}",
-            slug, "opening", "—", "—", "—"
-        ));
-    }
-    let count = roster.len() + pending;
-    lines.push(String::new());
-    lines.push(format!("{count} peer(s) total"));
-    lines.join("\n")
-}
-
 /// dock collapses to height 0 so a tiny terminal never corrupts the layout.
 /// Mirrors [`AGENT_STRIP_MIN_TERMINAL_ROWS`].
 const PEER_STRIP_MIN_TERMINAL_ROWS: u16 = 12;
@@ -4202,10 +4138,7 @@ pub(crate) fn peer_strip_lines(
         } else {
             spans.push(Span::styled("  ", palette.muted().bg(palette.surface)));
         }
-        spans.push(Span::styled(
-            format!("{detail}"),
-            palette.muted().bg(palette.surface),
-        ));
+        spans.push(Span::styled(detail, palette.muted().bg(palette.surface)));
         spans.push(Span::styled(
             format!("{} {}", " ".repeat(pad as usize), timing),
             palette.muted().bg(palette.surface),
