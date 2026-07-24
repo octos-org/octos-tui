@@ -3988,7 +3988,11 @@ pub(crate) fn peer_activity_line(app: &AppState, session_id: &octos_core::Sessio
 /// for ones with no measurable time yet. Elapsed: wall clock since the peer
 /// was created (the kickoff Instant). Tokens: total output tokens from the
 /// latest `session_usage` snapshot.
-fn peer_timing_suffix(app: &AppState, session_id: &octos_core::SessionKey, meta: &PeerMeta) -> String {
+fn peer_timing_suffix(
+    app: &AppState,
+    session_id: &octos_core::SessionKey,
+    meta: &PeerMeta,
+) -> String {
     let elapsed = meta.created.elapsed();
     let elapsed_str = format_short_duration(elapsed.as_millis() as i64);
     let token_str = app
@@ -4036,10 +4040,7 @@ pub(crate) fn peer_list_output(app: &AppState) -> String {
             .and_then(|(_, output, _)| output.filter(|&t| t > 0))
             .map(|t| humanize_token_count(t))
             .unwrap_or_default();
-        let model = meta
-            .model_id
-            .clone()
-            .unwrap_or_else(|| "—".to_string());
+        let model = meta.model_id.clone().unwrap_or_else(|| "—".to_string());
         lines.push(format!(
             "{:<22} {:<10} {:<10} {:<8} {}",
             slug,
@@ -4172,9 +4173,15 @@ pub(crate) fn peer_strip_lines(
         // Model label (when available): shown between slug and activity detail.
         let model_label = meta.model_id.as_deref().unwrap_or("");
         let left_text = if model_label.is_empty() {
-            format!(" {glyph} {}  {detail}", meta.slug.chars().take(20).collect::<String>())
+            format!(
+                " {glyph} {}  {detail}",
+                meta.slug.chars().take(20).collect::<String>()
+            )
         } else {
-            format!(" {glyph} {}  {model_label} · {detail}", meta.slug.chars().take(20).collect::<String>())
+            format!(
+                " {glyph} {}  {model_label} · {detail}",
+                meta.slug.chars().take(20).collect::<String>()
+            )
         };
         // Reserve 1 char for the space between left and right content.
         let pad = width
@@ -4195,7 +4202,10 @@ pub(crate) fn peer_strip_lines(
         } else {
             spans.push(Span::styled("  ", palette.muted().bg(palette.surface)));
         }
-        spans.push(Span::styled(format!("{detail}"), palette.muted().bg(palette.surface)));
+        spans.push(Span::styled(
+            format!("{detail}"),
+            palette.muted().bg(palette.surface),
+        ));
         spans.push(Span::styled(
             format!("{} {}", " ".repeat(pad as usize), timing),
             palette.muted().bg(palette.surface),

@@ -1070,8 +1070,11 @@ impl Store {
         } else {
             input.to_string()
         };
-        self.state.status =
-            format!("[PEER_HUMAN_INPUT] peer={slug} · \"{display}\"", slug = slug, display = display);
+        self.state.status = format!(
+            "[PEER_HUMAN_INPUT] peer={slug} · \"{display}\"",
+            slug = slug,
+            display = display
+        );
     }
 
     /// `turn/steer` result (octos#1807). `steered:true` — the text joined

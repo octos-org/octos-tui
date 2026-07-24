@@ -2844,7 +2844,9 @@ fn rpc_value_to_app_event(
             return Ok(Some(peer_staged_notification_to_client_event(params)));
         }
         if method == crate::model::APPUI_METHOD_PEER_TURN_COMPLETED {
-            return Ok(Some(peer_turn_completed_notification_to_client_event(params)));
+            return Ok(Some(peer_turn_completed_notification_to_client_event(
+                params,
+            )));
         }
 
         return Ok(Some(notification_to_app_event(method, params).into()));
@@ -4264,7 +4266,6 @@ fn peer_turn_completed_notification_to_client_event(params: Value) -> ClientEven
         .into(),
     }
 }
-
 
 fn notification_to_app_event(method: &str, params: Value) -> AppUiEvent {
     match UiNotification::from_method_and_params(method, params) {

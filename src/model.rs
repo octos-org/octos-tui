@@ -3556,7 +3556,6 @@ pub struct PeerStagedParams {
     pub model_id: Option<String>,
 }
 
-
 /// Params of the durable [`APPUI_METHOD_PEER_TURN_COMPLETED`] notification:
 /// a peer session completed a turn. The TUI injects a system message into
 /// the origin session so the user sees peer progress inline.
@@ -3573,7 +3572,6 @@ pub struct PeerTurnCompletedEvent {
     pub outcome: String,
     #[serde(default)]
     pub model_id: Option<String>,
-
 }
 /// `peer/gather` request (octos#1801 v2): read the peer blackboard.
 /// `slugs: None` = every staged peer; `session_id` carries the ACTIVE

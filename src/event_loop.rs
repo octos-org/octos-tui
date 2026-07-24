@@ -1308,7 +1308,10 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         // In the composer, Up/Down move the cursor between logical lines; at the
         // first/last line they fall back to the existing transcript scroll so
         // that affordance isn't lost.
-        KeyCode::Down if store.state.focus == FocusPane::Composer => {
+        KeyCode::Down
+            if store.state.focus == FocusPane::Composer
+                && !store.state.is_composer_locked_to_peer() =>
+        {
             // Mirror of Up: while browsing, step to a newer entry first (past the
             // newest, recall_next returns an empty draft); recall_next returns
             // None once the entry is edited, then ordinary cursor movement
@@ -1328,7 +1331,10 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
                 }
             }
         }
-        KeyCode::Up if store.state.focus == FocusPane::Composer => {
+        KeyCode::Up
+            if store.state.focus == FocusPane::Composer
+                && !store.state.is_composer_locked_to_peer() =>
+        {
             // While browsing history, Up steps to an older entry FIRST, so a
             // recalled multiline entry doesn't trap the cursor inside it;
             // recall_prev returns None once the entry is edited, and ordinary
@@ -1645,6 +1651,13 @@ fn handle_composer_vim_key(store: &mut Store, key: &KeyEvent) -> Option<KeyActio
     use crate::model::ComposerMode;
 
     if !store.state.vim_mode || store.state.focus != FocusPane::Composer {
+        return None;
+    }
+
+    // When the composer is locked to a focused peer, editing is diverted to the
+    // peer (PeerHumanInput); vim modal editing must not mutate the hidden
+    // composer — bypass it so keys fall through to the peer-routing arms.
+    if store.state.is_composer_locked_to_peer() {
         return None;
     }
 
