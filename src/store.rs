@@ -8,7 +8,7 @@ use octos_core::ui_protocol::{
     ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult, SessionOpenParams,
     TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState,
     TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent, TurnId,
-    TurnInterruptParams, TurnLifecycleState, TurnSpawnCompleteEvent, TurnStartParams,
+    TurnInterruptParams, TurnLifecycleState, TurnStartParams,
     TurnStateGetParams, UiContextState, UiNotification, UiProgressEvent,
     UserQuestionRequestedEvent,
 };
@@ -6415,7 +6415,7 @@ impl Store {
                 status,
                 error,
                 reason,
-                output_preview,
+                output_preview: _,
                 duration_ms: _,
             } => {
                 let (label, success) = match status {
