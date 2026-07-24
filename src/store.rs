@@ -6168,6 +6168,13 @@ impl Store {
                 });
         }
 
+        // Optimistic idle: stop the spinner and freeze the live reply NOW,
+        // without waiting for the server's terminal to round-trip back (the
+        // server interrupt is cooperative and can lag seconds). `interrupted_turns`
+        // keeps this turn idle + frozen until the terminal reconciles.
+        self.state
+            .mark_turn_interrupted(session_id.clone(), turn_id.clone());
+        self.state.set_run_state_idle();
         self.state.status = t!("status.interrupt_requested_active_turn").into_owned();
         Some(AppUiCommand::InterruptTurn(TurnInterruptParams {
             session_id,
@@ -10667,6 +10674,13 @@ impl Store {
         if self.state.is_turn_completed(session_id, turn_id) {
             return None;
         }
+        // The user locally interrupted this turn (Esc/Ctrl+C): freeze the reply
+        // at what already streamed. Dropping trailing deltas keeps the turn from
+        // visibly "resuming" after Esc while the server winds down; the terminal
+        // reconciles and clears `interrupted_turns`.
+        if self.state.turn_locally_interrupted(session_id, turn_id) {
+            return None;
+        }
         let targets_active = self.event_targets_active_session(session_id);
         let follow_tail = self.state.transcript_scroll == 0;
         // Lazy-bind a delta-first continuation, first committing any prior
@@ -11517,6 +11531,9 @@ impl Store {
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
         self.state.pre_token_turns.remove(&event.session_id);
+        // The turn reached its terminal — drop any optimistic-idle interrupt
+        // marker so a fresh turn on this session is never gated.
+        self.state.interrupted_turns.remove(&event.session_id);
         self.bump_unread_for_background_terminal(&event.session_id);
         // tui#398: a terminal for this session settles any stashed
         // background approval/question — the server resolved or cancelled it
@@ -11747,6 +11764,9 @@ impl Store {
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
         self.state.pre_token_turns.remove(&event.session_id);
+        // The turn reached its terminal — drop any optimistic-idle interrupt
+        // marker so a fresh turn on this session is never gated.
+        self.state.interrupted_turns.remove(&event.session_id);
         self.bump_unread_for_background_terminal(&event.session_id);
         // tui#398: a terminal for this session settles any stashed
         // background approval/question — the server resolved or cancelled it
@@ -29407,6 +29427,112 @@ now analyzing the bus module"
         assert_eq!(
             store.state.status,
             "Turn error provider_error: upstream 500"
+        );
+    }
+
+    #[test]
+    fn interrupt_optimistically_idles_the_run_state_immediately() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streaming");
+        assert!(
+            store.state.run_state.is_active(),
+            "a live turn starts in progress"
+        );
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.interrupt_command().expect("active turn interrupts");
+
+        // The spinner / run chip must stop the instant Esc is pressed — not
+        // after the server terminal round-trips back (optimistic idle).
+        assert_eq!(
+            store.state.run_state,
+            SessionRunState::Idle,
+            "run-state idles optimistically on interrupt"
+        );
+        assert!(
+            store.state.turn_locally_interrupted(&session_id, &turn_id),
+            "the interrupted turn is marked"
+        );
+    }
+
+    #[test]
+    fn post_interrupt_deltas_are_frozen_and_keep_the_turn_idle() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "partial");
+        let session_id = store.state.sessions[0].id.clone();
+        store.interrupt_command().expect("interrupts");
+
+        // A trailing delta arrives before the cooperative server cancel lands.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                text: " MORE".into(),
+            },
+        )));
+
+        let live_text = store.state.sessions[0]
+            .live_reply
+            .as_ref()
+            .map(|reply| reply.text.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            live_text, "partial",
+            "the trailing delta is dropped (frozen)"
+        );
+        assert_eq!(
+            store.state.run_state,
+            SessionRunState::Idle,
+            "a post-interrupt delta must not un-idle the turn"
+        );
+    }
+
+    #[test]
+    fn terminal_clears_the_interrupt_marker_and_a_new_turn_streams() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "partial");
+        let session_id = store.state.sessions[0].id.clone();
+        store.interrupt_command().expect("interrupts");
+
+        // The interrupt's terminal lands and reconciles.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                code: "interrupted".into(),
+                message: "turn interrupted by client".into(),
+            },
+        )));
+        assert!(
+            !store.state.turn_locally_interrupted(&session_id, &turn_id),
+            "the terminal clears the interrupt marker"
+        );
+
+        // A brand-new turn on the SAME session streams normally — the stale
+        // interrupt must not gate it.
+        let next_turn = TurnId::new();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: next_turn,
+                text: "fresh".into(),
+            },
+        )));
+        let live_text = store.state.sessions[0]
+            .live_reply
+            .as_ref()
+            .map(|reply| reply.text.clone())
+            .unwrap_or_default();
+        assert!(
+            live_text.contains("fresh"),
+            "a new turn after the interrupt streams normally"
+        );
+        assert!(
+            store.state.run_state.is_active(),
+            "the new turn is in progress again"
         );
     }
 

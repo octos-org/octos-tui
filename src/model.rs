@@ -4538,6 +4538,16 @@ pub struct AppState {
     /// older than [`PRE_TOKEN_TURN_TTL`] are ignored (dead submit — matches
     /// the staged-gate TTL self-heal).
     pub pre_token_turns: std::collections::HashMap<SessionKey, Instant>,
+
+    /// Turns the user has locally interrupted (Esc/Ctrl+C) whose server
+    /// terminal has not yet landed. The mirror image of `pre_token_turns`:
+    /// where that FORCES the run-state in-progress, this FORCES it idle and
+    /// freezes the live reply, so a turn stops on screen the instant Esc is
+    /// pressed instead of after a full client→server→terminal round trip (the
+    /// server interrupt is cooperative and can lag seconds). Keyed by session;
+    /// the value is the interrupted turn id, so a LATER turn on the same
+    /// session is never gated. Cleared on the turn's terminal.
+    pub interrupted_turns: std::collections::HashMap<SessionKey, TurnId>,
     /// #324 Phase C: per-session unread counters — turns that reached a
     /// terminal while the session was NOT focused. Incremented by the store's
     /// terminal appliers, cleared when the session gains focus.
@@ -6492,6 +6502,7 @@ impl AppState {
             run_state,
             run_state_started_at,
             pre_token_turns: std::collections::HashMap::new(),
+            interrupted_turns: std::collections::HashMap::new(),
             unread_turns: std::collections::HashMap::new(),
             pending_turn_steers: std::collections::VecDeque::new(),
             pending_peer_prepare: None,
@@ -8721,10 +8732,44 @@ impl AppState {
     }
 
     pub fn set_run_state_in_progress(&mut self) {
+        // Optimistic-idle guard: once the user interrupts the active session's
+        // live turn, no event may flip the spinner back on until the terminal
+        // reconciles. This is the single chokepoint every in-progress source
+        // funnels through (delta-first bind, tool starts, reasoning, …), so
+        // gating it here covers all of them at once.
+        if self.active_live_turn_interrupted() {
+            return;
+        }
         if !self.run_state.is_active() {
             self.run_state_started_at = Some(Instant::now());
         }
         self.run_state = SessionRunState::InProgress;
+    }
+
+    /// True when the user has locally interrupted `turn_id` on `session_id`
+    /// (Esc/Ctrl+C) and the server terminal has not yet reconciled it. Used to
+    /// freeze the live reply and keep the run-state idle.
+    pub fn turn_locally_interrupted(&self, session_id: &SessionKey, turn_id: &TurnId) -> bool {
+        self.interrupted_turns.get(session_id) == Some(turn_id)
+    }
+
+    /// True when the ACTIVE session's live turn is one the user just
+    /// interrupted — the signal that keeps the run-state optimistically idle
+    /// (spinner off) until the terminal lands.
+    pub fn active_live_turn_interrupted(&self) -> bool {
+        let Some(session) = self.active_session() else {
+            return false;
+        };
+        match session.live_reply.as_ref() {
+            Some(live) => self.interrupted_turns.get(&session.id) == Some(&live.turn_id),
+            None => false,
+        }
+    }
+
+    /// Record a user interrupt so the turn stops on screen immediately. Cleared
+    /// on the turn's terminal (`commit_live_reply` / `fail_live_reply`).
+    pub fn mark_turn_interrupted(&mut self, session_id: SessionKey, turn_id: TurnId) {
+        self.interrupted_turns.insert(session_id, turn_id);
     }
 
     pub fn set_run_state_blocked(&mut self, message: impl Into<String>) {
@@ -8908,6 +8953,12 @@ impl AppState {
             && self.pre_token_turns.contains_key(&session_id)
         {
             self.run_state = SessionRunState::InProgress;
+        }
+        // An interrupted live turn wins over the in-progress derivation, so it
+        // stays optimistically idle across a session switch too, until the
+        // terminal lands.
+        if self.active_live_turn_interrupted() {
+            self.run_state = SessionRunState::Idle;
         }
         self.run_state_started_at = self.run_state.is_active().then(Instant::now);
     }
