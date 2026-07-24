@@ -4365,6 +4365,20 @@ pub struct AppState {
     /// selected sub-agent's live output. Resets to `Main` on session switch.
     pub chat_view: ChatViewTarget,
     pub transcript_scroll: usize,
+    /// Number of committed messages the inline-viewport scrollback tracker has
+    /// already flushed into native scrollback (the `ScrollbackTracker`'s
+    /// post-sync watermark), stamped by the event loop after each
+    /// `ScrollbackTracker::sync`. `None` until the first inline draw (and in
+    /// unit tests that never sync a tracker), which the live-tail builder reads
+    /// as "assume everything committed is already in scrollback" so the legacy
+    /// no-pin behavior holds. The live tail uses it to decide whether a
+    /// just-submitted user prompt is still awaiting its scrollback flush — in
+    /// goal mode the committed prompt often is not flushed promptly, so pinning
+    /// it in the live tail until the flush catches up keeps it visible without
+    /// duplicating the eventual scrollback copy (the pin retracts the frame the
+    /// watermark advances past it). Transient render bookkeeping, not session
+    /// state — deliberately excluded from snapshot save/restore.
+    pub scrollback_flushed_watermark: Option<usize>,
     /// Scroll offset (rows from the bottom) for the sub-agent peek overlay. Kept
     /// separate from `transcript_scroll` so the main view's scroll is preserved
     /// across a peek, and — critically — so incoming activity rows that bump the
@@ -6451,6 +6465,7 @@ impl AppState {
             selected_task: 0,
             chat_view: ChatViewTarget::Main,
             transcript_scroll: 0,
+            scrollback_flushed_watermark: None,
             agent_view_scroll: 0,
             agent_view_scroll_max: std::cell::Cell::new(usize::MAX),
             transcript_pager_active: false,

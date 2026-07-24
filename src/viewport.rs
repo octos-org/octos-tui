@@ -64,6 +64,16 @@ impl ScrollbackTracker {
         Self::default()
     }
 
+    /// Number of committed messages currently reflected in native scrollback —
+    /// the running flush watermark. The event loop stamps this onto
+    /// [`crate::model::AppState::scrollback_flushed_watermark`] after each
+    /// [`Self::sync`] so the live-tail builder can tell whether a just-submitted
+    /// user prompt has reached scrollback yet (goal mode often flushes it a few
+    /// frames late).
+    pub fn committed_flushed_len(&self) -> usize {
+        self.flushed_messages
+    }
+
     /// Forget the COMMITTED flush watermark only, so the next [`Self::sync`]
     /// re-emits the entire committed history — while PRESERVING the live-turn
     /// watermarks (`active_live` / `completed_live`). Used when a `/btw`
