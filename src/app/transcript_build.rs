@@ -162,15 +162,26 @@ pub(super) fn live_tail_lines_with_finalization(
                 .user_question
                 .as_ref()
                 .is_some_and(|picker| picker.visible);
-        // The recent-user-context pin is only needed while an interactive overlay
-        // (approval / question) is visible — there it shows which prompt you're
-        // acting on. Otherwise the committed prompt is already in native scrollback
-        // just above the live tail, so pinning it again duplicates it (bug 2A: most
-        // visibly for a mid-turn-submitted prompt whose turn hasn't replied yet —
-        // the pin and the scrollback copy both sit on screen). The old
-        // `!has_flushed_content` clause showed the pin for every just-started turn,
-        // which is exactly the redundant case.
-        let show_recent_context = interactive_context_visible;
+        // The recent-user-context pin is shown in two cases:
+        //
+        // 1. An interactive overlay (approval / question) is visible — there it
+        //    shows which prompt you're acting on.
+        // 2. There is a live turn AND the latest committed user prompt has NOT
+        //    yet been flushed into native scrollback (its index is still at/after
+        //    the event loop's `scrollback_flushed_watermark`). This is the
+        //    goal-mode window: an active goal keeps the session busy and the
+        //    committed prompt is often flushed a few frames late (or a mid-turn
+        //    prompt is staged), so without the pin the user's prompt is on screen
+        //    NOWHERE — not in scrollback yet, and #389 had dropped the live-tail
+        //    fallback entirely. Guarding on the flush watermark is what keeps this
+        //    from re-introducing bug 2A: the moment the prompt reaches scrollback
+        //    the watermark advances past it and the pin retracts, so the pin and
+        //    the scrollback copy are never on screen at once. (The old
+        //    `!has_flushed_content` clause keyed off the REPLY flush instead, so it
+        //    kept the pin up for the whole slow reply and duplicated the prompt.)
+        let show_recent_context = interactive_context_visible
+            || (should_pin_recent_user_context(app, session)
+                && latest_user_prompt_awaiting_scrollback_flush(app, session));
         if show_recent_context
             && let Some(prompt) = latest_user_message(session)
                 .filter(|prompt| !pending_messages_contains(&app.pending_messages, prompt))

@@ -10367,6 +10367,151 @@ mod tests {
         }
     }
 
+    /// Bug 2A guard: a normal idle submit must render the prompt EXACTLY ONCE.
+    /// The event loop flushes the committed prompt into native scrollback and
+    /// stamps the watermark past it, so the live tail must NOT also pin it (that
+    /// was the #389-era duplicate). Reproduces the real handoff: sync a tracker,
+    /// stamp `scrollback_flushed_watermark`, then compare scrollback vs tail.
+    #[test]
+    fn idle_submit_prompt_renders_once_and_is_not_repinned_after_flush() {
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("please summarize the log")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+
+        let mut tracker = ScrollbackTracker::new();
+        let update = tracker.sync(&app, palette, 100);
+        // Event loop stamps the post-sync flush watermark before rendering.
+        app.scrollback_flushed_watermark = Some(tracker.committed_flushed_len());
+
+        let scrollback = lines_text(&update.lines_to_insert);
+        let tail = lines_text(&live_tail_lines_with_finalization(
+            &app,
+            palette,
+            98,
+            update.live_tail_finalization.as_ref(),
+        ));
+        assert!(
+            scrollback.contains("please summarize the log"),
+            "the committed prompt must reach native scrollback:\n{scrollback}"
+        );
+        assert!(
+            !tail.contains("please summarize the log"),
+            "a flushed prompt must NOT be re-pinned in the live tail (no bug-2A dup):\n{tail}"
+        );
+    }
+
+    /// Regression for the goal-mode "prompt not rendered" bug (#389 narrowed the
+    /// pin to interactive overlays only). While a goal keeps the session busy the
+    /// committed prompt is often flushed a few frames LATE — the scrollback
+    /// watermark still trails it — and without the live-tail pin the prompt is on
+    /// screen nowhere. The pin must show it exactly once until the flush catches
+    /// up, then retract (so it never duplicates the eventual scrollback copy).
+    #[test]
+    fn goal_mode_prompt_pinned_until_scrollback_flush_catches_up() {
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let turn = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("kick off the goal"),
+                    Message::assistant("working on it"),
+                    Message::user("also check the failing tests"),
+                ],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn,
+                    text: "still working".into(),
+                }),
+            }],
+            0,
+            "Working".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+
+        // Late-flush frame: only 2 of the 3 committed messages have reached
+        // scrollback, so the trailing prompt (index 2) is not there yet.
+        app.scrollback_flushed_watermark = Some(2);
+        let tail = lines_text(&live_tail_lines_with_finalization(&app, palette, 98, None));
+        assert_eq!(
+            tail.matches("also check the failing tests").count(),
+            1,
+            "the un-flushed goal-mode prompt must be pinned exactly once:\n{tail}"
+        );
+
+        // Flush catches up (watermark now covers all 3 messages) → pin retracts,
+        // leaving only the eventual scrollback copy (no duplicate).
+        app.scrollback_flushed_watermark = Some(3);
+        let tail_after = lines_text(&live_tail_lines_with_finalization(&app, palette, 98, None));
+        assert!(
+            !tail_after.contains("also check the failing tests"),
+            "once flushed to scrollback the prompt must not stay pinned (no dup):\n{tail_after}"
+        );
+    }
+
+    /// The staged (queued) mid-turn prompt must also render exactly once. It is
+    /// not a committed message, so it never reaches scrollback here; the
+    /// pending-messages block shows it as a single queued entry, and the pin —
+    /// which reads the LATEST COMMITTED user message — must not also surface it.
+    #[test]
+    fn staged_goal_prompt_renders_exactly_once() {
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let turn = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("start the goal"), Message::assistant("on it")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn,
+                    text: "still on it".into(),
+                }),
+            }],
+            0,
+            "Working".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+        app.pending_messages.push("check the failing tests".into());
+
+        let mut tracker = ScrollbackTracker::new();
+        let update = tracker.sync(&app, palette, 100);
+        app.scrollback_flushed_watermark = Some(tracker.committed_flushed_len());
+        let scrollback = lines_text(&update.lines_to_insert);
+        let tail = lines_text(&live_tail_lines_with_finalization(
+            &app,
+            palette,
+            98,
+            update.live_tail_finalization.as_ref(),
+        ));
+        let total = scrollback.matches("check the failing tests").count()
+            + tail.matches("check the failing tests").count();
+        assert_eq!(
+            total, 1,
+            "a staged goal-mode prompt renders exactly once:\nSCROLLBACK:\n{scrollback}\nTAIL:\n{tail}"
+        );
+    }
+
     #[test]
     fn glued_completed_segment_flushes_via_boundary_so_live_tail_holds_only_current_segment() {
         // Agentic narration segments are glued in live_reply (no blank line

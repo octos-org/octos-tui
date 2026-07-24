@@ -627,7 +627,25 @@ impl Store {
             if let Some(command) = self.try_steer_live_turn(&prompt) {
                 return Some(command);
             }
-            self.state.pending_messages.push(prompt);
+            // Capture the live turn (if any) BEFORE `prompt` is moved into the
+            // queue so the optimistic echo below can be attributed to it, exactly
+            // like the steer path.
+            let live_turn = self
+                .state
+                .active_turn()
+                .map(|(session_id, turn_id)| (session_id.clone(), turn_id.clone()));
+            self.state.pending_messages.push(prompt.clone());
+            // Complementary to the recent-prompt pin: mirror the steer path and
+            // record the optimistic echo so the staged prompt is tracked
+            // consistently with the steer/start paths (and any stale optimistic
+            // row for the same text is reaped). `record_submitted_user_prompt`
+            // dedups by content — it early-returns because we JUST staged this
+            // prompt — so it can never double-render the queued entry that the
+            // pending-messages block already shows.
+            if let Some((session_id, turn_id)) = live_turn {
+                self.state
+                    .record_submitted_user_prompt(session_id, turn_id, prompt);
+            }
             self.state.status = t!("status.message_staged").into_owned();
             self.state.scroll_transcript_to_latest();
             return None;
@@ -13773,6 +13791,36 @@ mod tests {
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
         }
+    }
+
+    /// Complementary to the recent-prompt pin: a mid-turn prompt that stages
+    /// (steer unsupported) queues exactly once and its optimistic echo dedups by
+    /// content, so no duplicate optimistic user row is created for the queued
+    /// text.
+    #[test]
+    fn staged_prompt_queues_once_without_duplicate_optimistic_echo() {
+        let turn = TurnId::new();
+        let mut store = store_with_live_reply(turn, "streaming reply");
+        // A goal keeps the turn busy; with no steer capability advertised the
+        // mid-turn prompt takes the staging branch.
+        let out =
+            store.queue_or_start_prompt_turn("check the failing tests".into(), "queued".into());
+        assert!(out.is_none(), "a staged prompt starts no new turn");
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["check the failing tests".to_string()],
+            "the prompt is queued exactly once"
+        );
+        let optimistic_dupes = store
+            .state
+            .optimistic_user_messages
+            .iter()
+            .filter(|echo| echo.content == "check the failing tests")
+            .count();
+        assert_eq!(
+            optimistic_dupes, 0,
+            "the content-dedup must not create a duplicate optimistic echo for a queued prompt"
+        );
     }
 
     fn open_session_on(profile: &str) -> SessionView {

@@ -395,6 +395,12 @@ where
     let wrap_width = usize::from(width).max(1);
 
     let update = scrollback.sync(&store.state, palette, wrap_width);
+    // Stamp the post-sync flush watermark so the live-tail builder can tell
+    // whether the latest user prompt has reached native scrollback yet. In goal
+    // mode the committed prompt is often flushed a few frames late; until the
+    // watermark advances past it, the live tail pins it so it stays visible
+    // (the pin retracts the frame the flush catches up, so no duplicate).
+    store.state.scrollback_flushed_watermark = Some(scrollback.committed_flushed_len());
     let live_tail_finalization = update.live_tail_finalization.clone();
     let height = app::live_ui_height_with_finalization(
         &store.state,

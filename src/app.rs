@@ -1024,6 +1024,36 @@ fn latest_user_message(session: &SessionView) -> Option<&str> {
         .filter(|content| !content.trim().is_empty())
 }
 
+/// Index of the latest committed user message in `session.messages`, if any.
+/// Paired with [`AppState::scrollback_flushed_watermark`] the live-tail builder
+/// can decide whether that prompt has already been flushed into native
+/// scrollback (index `<` watermark) or is still awaiting its flush (index `>=`
+/// watermark) — the latter is the goal-mode window where the pin keeps it
+/// visible.
+fn latest_user_message_index(session: &SessionView) -> Option<usize> {
+    session
+        .messages
+        .iter()
+        .rposition(|message| message.role.as_str() == "user")
+}
+
+/// Whether the latest committed user prompt has NOT yet been flushed into
+/// native scrollback, so the live tail must pin it to keep it on screen. `None`
+/// watermark (pre-first-inline-draw, and render-less unit tests) is read
+/// conservatively as "already flushed" so the default behavior stays the
+/// codex-style no-pin — the pin only widens once the event loop has stamped a
+/// real watermark and it still trails the prompt (the goal-mode late-flush
+/// window).
+fn latest_user_prompt_awaiting_scrollback_flush(app: &AppState, session: &SessionView) -> bool {
+    match (
+        latest_user_message_index(session),
+        app.scrollback_flushed_watermark,
+    ) {
+        (Some(index), Some(flushed)) => index >= flushed,
+        _ => false,
+    }
+}
+
 fn pending_messages_contains(pending: &[String], content: &str) -> bool {
     pending.iter().any(|pending| pending == content)
 }
