@@ -3370,6 +3370,64 @@ mod tests {
         assert_eq!(store.state.composer, "newest");
     }
 
+    /// #441 composer-lock coverage: when the composer is locked to a focused
+    /// peer, Up/Down must NOT recall composer history into the hidden composer,
+    /// and vim normal-mode keys must NOT mutate it — they scroll the transcript
+    /// / route to the peer instead. Pins the guards added to the Up/Down arms
+    /// and `handle_composer_vim_key`. Unlocked, `Up` recalls "newest" (see
+    /// `clearing_composer_resets_history_navigation`); locked, it must not.
+    #[test]
+    fn locked_to_peer_keys_do_not_mutate_composer() {
+        let mut store = composer_store_with_history(&["older", "newest"]);
+        // Lock: make the focused active session a peer.
+        let active = store
+            .state
+            .active_session()
+            .expect("active session")
+            .id
+            .clone();
+        store.state.peer_session_meta.insert(
+            active,
+            crate::model::PeerMeta {
+                slug: "lock-slug".into(),
+                brief_path: "/tmp/brief.md".into(),
+                agent_staged: true,
+                model_id: None,
+                created: std::time::Instant::now(),
+            },
+        );
+        assert!(
+            store.state.is_composer_locked_to_peer(),
+            "precondition: composer locked to the focused peer"
+        );
+
+        store.state.set_composer_text("draft");
+        handle_key(&mut store, key(KeyCode::Up));
+        assert_eq!(
+            store.state.composer, "draft",
+            "Up must not recall history into the composer when locked to a peer"
+        );
+        assert!(
+            !store.state.composer_history.is_navigating(),
+            "Up must not start history navigation when locked"
+        );
+        handle_key(&mut store, key(KeyCode::Down));
+        assert_eq!(
+            store.state.composer, "draft",
+            "Down must not recall history into the composer when locked to a peer"
+        );
+
+        // Vim normal-mode `dd` must not delete the composer line when locked.
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Normal;
+        handle_key(&mut store, key(KeyCode::Char('d')));
+        handle_key(&mut store, key(KeyCode::Char('d')));
+        assert_eq!(
+            store.state.composer, "draft",
+            "vim `dd` must not delete the composer when locked to a peer"
+        );
+    }
+
     #[test]
     fn accepted_plain_prompt_is_recorded() {
         let mut store = store_with_sessions(1);
