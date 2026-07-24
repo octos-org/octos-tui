@@ -1299,6 +1299,31 @@ impl Store {
         ))
     }
 
+    /// `peer/turn_completed` notification: a peer session completed a turn.
+    /// Formats a system message `[PEER_TURN_COMPLETED] {slug} · turn {n} ·
+    /// {kb} KB · {model}` and injects it into the origin session's pending
+    /// context via [`AppState::stage_prompt_back`].
+    fn apply_peer_turn_completed(
+        &mut self,
+        event: crate::model::PeerTurnCompletedEvent,
+    ) -> Option<AppUiCommand> {
+        let result_kb = event.result_bytes / 1024;
+        let model_part = event
+            .model_id
+            .as_deref()
+            .map(|m| format!(" · {m}"))
+            .unwrap_or_default();
+        let msg = format!(
+            "[PEER_TURN_COMPLETED] {slug} · turn {turn} · {kb} KB{model}",
+            slug = event.slug,
+            turn = event.turn_count,
+            kb = result_kb,
+            model = model_part,
+        );
+        self.state.stage_prompt_back(&event.origin_session_id, msg);
+        None
+    }
+
     /// A peer session's `session/opened` landed with `go: false` (#395): land
     /// the [`SessionView`] WITHOUT the focus-switch bundle (no
     /// `switch_selected_session`, no global workspace/pane mutation — the
@@ -7112,6 +7137,8 @@ impl Store {
             ClientEvent::PeerPrepared(event) => self.apply_peer_prepared_event(event),
             ClientEvent::TurnSteered(event) => self.apply_turn_steered_event(event),
             ClientEvent::PeerStaged(event) => self.apply_peer_staged_event(event),
+            ClientEvent::PeerTurnCompleted(event) => self.apply_peer_turn_completed(event),
+
             ClientEvent::PeerGathered(event) => self.apply_peer_gathered_event(event),
             ClientEvent::SubProvidersMutation(event) => {
                 self.apply_sub_providers_mutation_event(event);

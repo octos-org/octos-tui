@@ -75,6 +75,11 @@ pub enum ClientEvent {
     /// as `/peer`. Durable ⇒ replayed on reconnect, so the store handler is
     /// idempotent (a peer whose session already exists is a no-op).
     PeerStaged(crate::model::PeerStagedParams),
+    /// octos#xxx: `peer/turn_completed` notification — a peer session
+    /// completed a turn. The store injects a system message into the origin
+    /// session so the user sees peer progress inline. Tui-local decode
+    /// (same pattern as `peer/staged`).
+    PeerTurnCompleted(crate::model::PeerTurnCompletedEvent),
     /// octos#1801 v2: `peer/gather` result — the peer blackboard rows
     /// (brief + latest result per staged peer). The store composes the
     /// `/gather` synthesis prompt from these and submits it into the CURRENT

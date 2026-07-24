@@ -2843,6 +2843,10 @@ fn rpc_value_to_app_event(
         if method == crate::model::APPUI_METHOD_PEER_STAGED {
             return Ok(Some(peer_staged_notification_to_client_event(params)));
         }
+        if method == crate::model::APPUI_METHOD_PEER_TURN_COMPLETED {
+            return Ok(Some(peer_turn_completed_notification_to_client_event(params)));
+        }
+
         return Ok(Some(notification_to_app_event(method, params).into()));
     }
 
@@ -4242,6 +4246,25 @@ fn peer_staged_notification_to_client_event(params: Value) -> ClientEvent {
         .into(),
     }
 }
+/// octos#xxx: decodes the durable `peer/turn_completed` notification into the
+/// typed [`ClientEvent::PeerTurnCompleted`] via the tui-local
+/// [`crate::model::PeerTurnCompletedEvent`] mirror (same pattern as
+/// `peer/staged`). Malformed params surface as the standard `invalid_params`
+/// error event rather than wedging the stream.
+fn peer_turn_completed_notification_to_client_event(params: Value) -> ClientEvent {
+    match serde_json::from_value::<crate::model::PeerTurnCompletedEvent>(params) {
+        Ok(event) => ClientEvent::PeerTurnCompleted(event),
+        Err(err) => app_error(
+            "invalid_params",
+            format!(
+                "failed to decode UI protocol params for {}: {err}",
+                crate::model::APPUI_METHOD_PEER_TURN_COMPLETED
+            ),
+        )
+        .into(),
+    }
+}
+
 
 fn notification_to_app_event(method: &str, params: Value) -> AppUiEvent {
     match UiNotification::from_method_and_params(method, params) {

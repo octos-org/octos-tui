@@ -84,6 +84,11 @@ pub const APPUI_METHOD_PEER_GATHER: &str = "peer/gather";
 /// `AppUiCommand::method()`); decoded tui-locally in the transport because
 /// the vendored octos-core rev predates the variant.
 pub const APPUI_METHOD_PEER_STAGED: &str = "peer/staged";
+/// octos#xxx: durable SERVER→CLIENT notification — a peer session completed
+/// a turn. The TUI decodes this tui-locally (same pattern as `peer/staged`)
+/// and injects a system message into the origin (master) session's context.
+pub const APPUI_METHOD_PEER_TURN_COMPLETED: &str = "peer/turn_completed";
+
 /// octos#1807: `turn/steer` — mid-turn prompt injection into the ACTIVE
 /// turn. Params `{session_id, expected_turn_id?, input}`; result
 /// `{turn_id, steered}`. `steered:true` = the text joined the live turn
@@ -3545,6 +3550,25 @@ pub struct PeerStagedParams {
     pub profile_id: String,
 }
 
+
+/// Params of the durable [`APPUI_METHOD_PEER_TURN_COMPLETED`] notification:
+/// a peer session completed a turn. The TUI injects a system message into
+/// the origin session so the user sees peer progress inline.
+/// `origin_session_id` is the session that spawned the peer (via
+/// `peer_spawn`), so the store can route the message correctly.
+/// Tui-local wire mirror (same pattern as `peer/staged`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerTurnCompletedEvent {
+    pub origin_session_id: SessionKey,
+    pub slug: String,
+    pub turn_id: String,
+    pub turn_count: u32,
+    pub result_bytes: u64,
+    pub outcome: String,
+    #[serde(default)]
+    pub model_id: Option<String>,
+
+}
 /// `peer/gather` request (octos#1801 v2): read the peer blackboard.
 /// `slugs: None` = every staged peer; `session_id` carries the ACTIVE
 /// session so the server scopes the profile (mirrors
