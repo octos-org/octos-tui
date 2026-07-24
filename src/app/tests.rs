@@ -1388,6 +1388,182 @@ mod tests {
     }
 
     #[test]
+    fn should_render_markdown_in_btw_aside_via_shared_transcript_renderer() {
+        // The `/btw` aside answer must render as MARKDOWN, not plain text. It
+        // reuses the exact transcript renderer (`push_btw_aside_card` ->
+        // `push_message_block("btw", ..)` -> `push_formatted_body_marked`), so
+        // headings, inline bold/code, bullets, and syntect-highlighted fenced
+        // code blocks all format identically to an assistant message. This test
+        // exercises the aside's real overlay render path
+        // (`btw_overlay_wrapped_lines`) and asserts the styled spans, not text.
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("do the thing"), Message::assistant("on it")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.set_btw_answering(&session_id, "status?".into());
+        let answer = "# Heading Alpha\n\nProse with **BoldToken** and `CodeToken` here.\n\n\
+             - BulletOne\n- BulletTwo\n\n```rust\nlet fence_probe = 7;\n```\n";
+        assert!(
+            app.resolve_btw_answer(&session_id, answer.into()),
+            "answer resolves the answering aside"
+        );
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let aside = app.btw_aside_for(&session_id).expect("btw aside present");
+        let lines = btw_overlay_wrapped_lines(palette, aside, 100);
+        let joined: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        let span_eq = |needle: &str| {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content.as_ref() == needle)
+                .cloned()
+        };
+
+        // Inline bold: `**BoldToken**` -> "BoldToken" (markers stripped) + BOLD.
+        let bold = span_eq("BoldToken").expect("bold span rendered with markers stripped");
+        assert!(
+            bold.style.add_modifier.contains(Modifier::BOLD),
+            "**bold** must carry the BOLD modifier, not render as plain text"
+        );
+
+        // Inline code: `` `CodeToken` `` -> "CodeToken" in the code color.
+        let code = span_eq("CodeToken").expect("inline-code span rendered with backticks stripped");
+        assert_eq!(
+            code.style.fg,
+            palette.selected().fg,
+            "inline code uses the transcript's code color"
+        );
+
+        // Heading: `# Heading Alpha` -> bold, title color, marker stripped.
+        let heading = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("Heading Alpha"))
+            .expect("heading span rendered");
+        assert!(
+            heading.style.add_modifier.contains(Modifier::BOLD),
+            "heading renders bold"
+        );
+        assert_eq!(
+            heading.style.fg,
+            palette.title().fg,
+            "heading uses the transcript's title color"
+        );
+
+        // Fenced code block goes through syntect (`push_code_block_lines`): a
+        // language label, a gutter, and the highlighted body all appear.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.spans.iter().any(|span| span.content.contains("rust"))),
+            "fenced block renders its language label:\n{joined}"
+        );
+        assert!(
+            joined.contains("let fence_probe = 7"),
+            "fenced code body renders:\n{joined}"
+        );
+        assert!(
+            joined.contains('│'),
+            "fenced block draws a gutter:\n{joined}"
+        );
+
+        // Bullets render as list items.
+        assert!(
+            joined.contains("BulletOne") && joined.contains("BulletTwo"),
+            "bullet items render:\n{joined}"
+        );
+
+        // No raw markdown markers leak into the rendered aside.
+        assert!(!joined.contains("**"), "bold markers stripped:\n{joined}");
+        assert!(
+            !joined.contains("```"),
+            "fence delimiters consumed:\n{joined}"
+        );
+        assert!(
+            !joined.contains("# Heading"),
+            "heading marker stripped:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn should_render_partial_markdown_in_btw_aside_without_panicking() {
+        // A `/btw` aside is a LIVE draft: the answer can arrive mid-stream with
+        // an UNCLOSED code fence. The shared renderer flushes the open block at
+        // end of input (complete=false) instead of dropping it or panicking.
+        // Empty content and narrow/changing widths must also render cleanly.
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: None,
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let palette = Palette::for_theme(ThemeName::Codex);
+
+        // Unclosed fence mid-stream.
+        app.set_btw_answering(&session_id, "q".into());
+        app.resolve_btw_answer(
+            &session_id,
+            "Working on it:\n\n```rust\nlet partial = ".into(),
+        );
+        let aside = app.btw_aside_for(&session_id).expect("aside present");
+        let joined: String = btw_overlay_wrapped_lines(palette, aside, 60)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            joined.contains("rust"),
+            "in-flight fence still shows its language:\n{joined}"
+        );
+        assert!(
+            joined.contains("let partial ="),
+            "in-flight code body renders while the fence is still open:\n{joined}"
+        );
+
+        // Empty answer must not panic (renders an <empty> placeholder).
+        app.set_btw_answering(&session_id, "q2".into());
+        app.resolve_btw_answer(&session_id, String::new());
+        let aside = app.btw_aside_for(&session_id).expect("aside present");
+        let _ = btw_overlay_wrapped_lines(palette, aside, 40);
+
+        // Width changes across frames must not panic (re-wrap narrow then wide).
+        app.set_btw_answering(&session_id, "q3".into());
+        app.resolve_btw_answer(
+            &session_id,
+            "Some **bold** prose with a `code` token and a longer trailing sentence.".into(),
+        );
+        let aside = app.btw_aside_for(&session_id).expect("aside present");
+        for width in [8usize, 24, 80] {
+            let _ = btw_overlay_wrapped_lines(palette, aside, width);
+        }
+    }
+
+    #[test]
     fn collapse_home_prefix_replaces_home_with_tilde() {
         assert_eq!(
             collapse_home_prefix("/Users/me/proj/octos", Some("/Users/me")),
