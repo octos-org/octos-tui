@@ -4,7 +4,7 @@ use octos_core::app_ui::{AppUiEvent, AppUiSnapshot};
 use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
     ApprovalRespondParams, DiffPreviewGetParams, EnvelopeNotification, EnvelopeToolEndStatus,
-    HydratedMessage, InputItem, MessageDeltaEvent, MessagePersistedEvent, Payload,
+    EnvelopeV2, HydratedMessage, InputItem, MessageDeltaEvent, Payload, PayloadV2,
     ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult, SessionOpenParams,
     TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState,
     TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent, TurnId,
@@ -4876,6 +4876,54 @@ impl Store {
                     )
                     .with_detail("app-ui error"),
                 );
+                // When `turn/start` is rejected at the RPC level the server
+                // never sees the turn, so no `TurnStarted` fires and
+                // `active_turn()` stays `None`. The optimistic user message is
+                // orphaned — retract it and return the text to the composer.
+                if error.message.contains("turn/start") && self.state.active_turn().is_none() {
+                    if let Some(session_id) = self.state.active_session().map(|s| s.id.clone()) {
+                        if let Some(pos) = self
+                            .state
+                            .optimistic_user_messages
+                            .iter()
+                            .rposition(|o| o.session_id == session_id)
+                        {
+                            let optimistic =
+                                self.state.optimistic_user_messages.remove(pos);
+                            if let Some(session) = self
+                                .state
+                                .sessions
+                                .iter_mut()
+                                .find(|s| s.id == session_id)
+                            {
+                                let idx =
+                                    optimistic.anchor_index.min(session.messages.len());
+                                if session
+                                    .messages
+                                    .get(idx)
+                                    .map(|m| m.role == MessageRole::User)
+                                    .unwrap_or(false)
+                                {
+                                    session.messages.remove(idx);
+                                }
+                            }
+                            if self.state.composer.trim().is_empty() {
+                                self.state.set_composer_text(optimistic.content);
+                            }
+                        }
+                    }
+                }
+                // When `session/open` fails, any messages queued while
+                // waiting for the session to open are orphaned. Restore the
+                // first one to the composer so the user can correct and retry.
+                if error.message.contains("session/open") {
+                    let pending = std::mem::take(&mut self.state.pending_messages);
+                    if let Some(first) = pending.into_iter().next() {
+                        if self.state.composer.trim().is_empty() {
+                            self.state.set_composer_text(first);
+                        }
+                    }
+                }
                 if error.code == "frame_too_large" {
                     // Recoverable — keep the session usable (idle) instead of
                     // wedging it in Error on an oversized inline send.
@@ -5962,7 +6010,6 @@ impl Store {
             UiNotification::ApprovalCancelled(event) => self.apply_approval_cancelled(event),
             UiNotification::ProgressUpdated(event) => self.apply_progress(event),
             UiNotification::ReplayLossy(event) => self.apply_replay_lossy(event),
-            UiNotification::MessagePersisted(event) => self.apply_message_persisted(event),
             UiNotification::TurnSpawnComplete(event) => self.apply_turn_spawn_complete(event),
             UiNotification::FileAttached(event) => self.apply_file_attached(event),
             UiNotification::Envelope(event) => self.apply_envelope(event),
@@ -6487,20 +6534,6 @@ impl Store {
                 .with_detail("legacy session event"),
         );
         self.state.status = format!("Session event: {}", event.kind);
-        None
-    }
-
-    fn apply_message_persisted(&mut self, event: MessagePersistedEvent) -> Option<AppUiCommand> {
-        let attachment_count = event.media.len();
-        let attachment_hint = match attachment_count {
-            0 => String::new(),
-            1 => " with 1 attachment".into(),
-            count => format!(" with {count} attachments"),
-        };
-        self.state.status = format!(
-            "Persisted {} message seq {}{}",
-            event.role, event.seq, attachment_hint
-        );
         None
     }
 
@@ -7672,7 +7705,7 @@ fn short_id(id: &str) -> String {
 
 enum HydratedProjection {
     Message(HydratedMessage),
-    SpawnComplete(TurnSpawnCompleteEvent),
+    SpawnComplete(EnvelopeV2),
 }
 
 impl HydratedProjection {
@@ -7689,7 +7722,10 @@ fn hydrated_projection_messages(result: &SessionHydrateResult) -> Option<Vec<Mes
     let envelopes = result.replayed_envelopes.as_deref().unwrap_or_default();
     let envelope_message_ids = envelopes
         .iter()
-        .map(|event| event.message_id.clone())
+        .filter_map(|event| match &event.payload {
+            PayloadV2::BackgroundChildCompleted { message_id, .. } => Some(message_id.clone()),
+            _ => None,
+        })
         .collect::<BTreeSet<_>>();
 
     let mut projections = rows
@@ -7734,7 +7770,7 @@ fn hydrated_row_is_displayable(row: &HydratedMessage) -> bool {
 
 fn hydrated_row_is_covered_by_envelope(
     row: &HydratedMessage,
-    envelopes: &[TurnSpawnCompleteEvent],
+    envelopes: &[EnvelopeV2],
     envelope_message_ids: &BTreeSet<String>,
 ) -> bool {
     if row
@@ -7751,7 +7787,7 @@ fn hydrated_row_is_covered_by_envelope(
         return false;
     };
     envelopes.iter().any(|event| {
-        event.thread_id.as_deref() == Some(thread_id)
+        event.thread_id.as_str() == thread_id
             && row.seq < event.seq
             && row
                 .message_id
@@ -7774,14 +7810,22 @@ fn hydrated_row_to_message(row: HydratedMessage) -> Message {
     }
 }
 
-fn spawn_complete_to_message(event: TurnSpawnCompleteEvent) -> Message {
-    let mut message = match event.thread_id {
-        Some(thread_id) => Message::assistant_with_thread(event.content, ThreadId::new(thread_id)),
-        None => Message::assistant(event.content),
-    };
-    message.media = event.media;
-    message.timestamp = event.persisted_at;
-    message
+fn spawn_complete_to_message(event: EnvelopeV2) -> Message {
+    match event.payload {
+        PayloadV2::BackgroundChildCompleted {
+            content,
+            media,
+            persisted_at,
+            ..
+        } => {
+            let mut message =
+                Message::assistant_with_thread(content, ThreadId::new(event.thread_id));
+            message.media = media;
+            message.timestamp = persisted_at;
+            message
+        }
+        _ => Message::assistant(String::new()),
+    }
 }
 
 fn hydrated_role(role: &str) -> MessageRole {
@@ -13688,6 +13732,7 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-leaked".into(),
                 name: "run_pipeline".into(),
+                arguments_preview: None,
             },
         )));
         // Terminal barrier for the thread — no ToolEnd ever came for call-leaked.
@@ -13731,6 +13776,7 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-done".into(),
                 name: "run_pipeline".into(),
+                arguments_preview: None,
             },
         )));
         store.apply_event(AppUiEvent::Protocol(envelope_notification(
@@ -13741,6 +13787,8 @@ mod tests {
                 status: EnvelopeToolEndStatus::Complete,
                 error: None,
                 reason: None,
+                output_preview: None,
+                duration_ms: None,
             },
         )));
         store.apply_event(AppUiEvent::Protocol(envelope_notification(
@@ -13785,6 +13833,7 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-a".into(),
                 name: "run_pipeline".into(),
+                arguments_preview: None,
             },
         )));
         store.apply_event(AppUiEvent::Protocol(envelope_notification(
@@ -13793,6 +13842,7 @@ mod tests {
             Payload::ToolStart {
                 tool_call_id: "call-b".into(),
                 name: "run_pipeline".into(),
+                arguments_preview: None,
             },
         )));
 
@@ -14083,6 +14133,7 @@ mod tests {
                 Payload::ToolStart {
                     tool_call_id: "call-topic".into(),
                     name: "run_pipeline".into(),
+                    arguments_preview: None,
                 },
             ),
         );
@@ -17871,6 +17922,7 @@ mod tests {
             thread_id: None,
             client_message_id: None,
             persisted_at: now,
+            reasoning_content: None,
             message_id: None,
             source: None,
             media: Vec::new(),
@@ -17919,6 +17971,7 @@ mod tests {
                 thread_id: None,
                 client_message_id: None,
                 persisted_at: chrono::Utc::now(),
+                reasoning_content: None,
                 message_id: None,
                 source: None,
                 media: Vec::new(),
@@ -17928,6 +17981,7 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
+            replayed_tool_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -17985,6 +18039,7 @@ mod tests {
                     thread_id: Some("thread-1".into()),
                     client_message_id: Some("cmid-1".into()),
                     persisted_at: now,
+                    reasoning_content: None,
                     message_id: Some("msg-user".into()),
                     source: Some("user".into()),
                     media: Vec::new(),
@@ -17997,6 +18052,7 @@ mod tests {
                     thread_id: Some("thread-1".into()),
                     client_message_id: None,
                     persisted_at: now,
+                    reasoning_content: None,
                     message_id: Some("companion".into()),
                     source: Some("background".into()),
                     media: vec!["companion.md".into()],
@@ -18009,6 +18065,7 @@ mod tests {
                     thread_id: Some("thread-1".into()),
                     client_message_id: None,
                     persisted_at: now,
+                    reasoning_content: None,
                     message_id: Some("spawn-ack".into()),
                     source: Some("background".into()),
                     media: Vec::new(),
@@ -18031,25 +18088,28 @@ mod tests {
             }]),
             pending_approvals: Some(vec![approval]),
             pending_questions: None,
-            replayed_envelopes: Some(vec![TurnSpawnCompleteEvent {
-                session_id: session_id.clone(),
-                topic: None,
-                turn_id: Some(turn_id.clone()),
-                thread_id: Some("thread-1".into()),
-                task_id: "task-1".into(),
-                tool_call_id: None,
-                response_to_client_message_id: Some("cmid-1".into()),
+            replayed_envelopes: Some(vec![EnvelopeV2 {
+                thread_id: "thread-1".into(),
                 seq: 3,
-                message_id: "spawn-ack".into(),
-                source: "background".into(),
-                cursor: UiCursor {
+                cursor: Some(UiCursor {
                     stream: "session".into(),
                     seq: 3,
+                }),
+                turn_id: turn_id.0.to_string(),
+                client_message_id: Some("cmid-1".into()),
+                payload: PayloadV2::BackgroundChildCompleted {
+                    parent_turn_id: turn_id.0.to_string(),
+                    response_to_client_message_id: Some("cmid-1".into()),
+                    task_id: "task-1".into(),
+                    content: "background result".into(),
+                    tool_call_id: None,
+                    message_id: "spawn-ack".into(),
+                    source: "background".into(),
+                    persisted_at: now,
+                    media: vec!["out.md".into()],
                 },
-                persisted_at: now,
-                content: "background result".into(),
-                media: vec!["out.md".into()],
             }]),
+            replayed_tool_envelopes: None,
         };
 
         store.apply_client_event(ClientEvent::SessionHydrate(result));
@@ -18115,6 +18175,7 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
+            replayed_tool_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -18171,6 +18232,7 @@ mod tests {
             pending_approvals: None,
             pending_questions: None,
             replayed_envelopes: None,
+            replayed_tool_envelopes: None,
         };
         store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -18222,6 +18284,7 @@ mod tests {
                 pending_approvals: None,
                 pending_questions: None,
                 replayed_envelopes: None,
+                replayed_tool_envelopes: None,
             };
             store.apply_client_event(ClientEvent::SessionHydrate(result));
 
@@ -18527,5 +18590,83 @@ mod tests {
         assert_eq!(store.state.selected_task, 1, "prev skipped from 2 to {}", store.state.selected_task);
         store.state.select_prev_task();
         assert_eq!(store.state.selected_task, 0, "prev skipped from 1 to {}", store.state.selected_task);
+    }
+
+    /// UPCR-2026-009 guard: when `turn/start` is rejected at the RPC level
+    /// (server never sees the turn), the optimistic user message must be
+    /// retracted from the transcript and the composer must be restored.
+    #[test]
+    fn turn_start_rpc_failure_retracts_optimistic_message_and_restores_composer() {
+        use octos_core::app_ui::AppUiError;
+        use crate::model::SessionRunState;
+
+        let mut store = store_with_empty_session();
+        let prompt = "hello, what can you do?";
+
+        store.state.set_composer_text(prompt);
+        let _cmd = store.compose_command();
+
+        assert_eq!(
+            store.state.active_session().unwrap().messages.len(),
+            1,
+            "optimistic user message must appear in transcript"
+        );
+        assert!(
+            store.state.composer.trim().is_empty(),
+            "composer must be cleared after submit"
+        );
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "rpc_error".into(),
+            message: "turn/start request tui-6 failed: No ProfileRuntime registered for profile 'coding'".into(),
+        }));
+
+        assert_eq!(
+            store.state.active_session().unwrap().messages.len(),
+            0,
+            "optimistic message must be retracted on turn/start RPC failure"
+        );
+        assert_eq!(
+            store.state.composer.trim(),
+            prompt,
+            "original prompt must be restored to composer after retraction"
+        );
+        assert!(
+            matches!(store.state.run_state, SessionRunState::Error { .. }),
+            "run state must be Error after turn/start failure"
+        );
+    }
+
+    /// When `session/open` is rejected, any pending user messages that were
+    /// queued while waiting for the session must be restored to the composer.
+    #[test]
+    fn session_open_rpc_failure_restores_pending_message_to_composer() {
+        use octos_core::app_ui::AppUiError;
+        use crate::model::SessionRunState;
+
+        let mut store = protocol_store_without_sessions();
+        let prompt = "hello, is there anyone there?";
+
+        // Simulate what compose_command() does: clear composer, push to pending.
+        store.state.pending_messages.push(prompt.to_string());
+
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "rpc_error".into(),
+            message: "session/open request tui-3 failed: profile 'alan' is not configured for this server".into(),
+        }));
+
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "pending messages must be cleared on session/open failure"
+        );
+        assert_eq!(
+            store.state.composer.trim(),
+            prompt,
+            "pending message must be restored to composer after session/open failure"
+        );
+        assert!(
+            matches!(store.state.run_state, SessionRunState::Error { .. }),
+            "run state must be Error after session/open failure"
+        );
     }
 }
