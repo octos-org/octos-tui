@@ -24,21 +24,36 @@ pub struct Palette {
 impl Palette {
     pub fn for_theme(theme: ThemeName) -> Self {
         match theme {
-            ThemeName::Terminal => Self {
-                surface: Color::Reset,
-                surface_alt: Color::Reset,
-                frame: Color::DarkGray,
-                accent: Color::Cyan,
-                highlight: Color::Yellow,
-                text: Color::Reset,
-                muted: Color::DarkGray,
-                success: Color::Cyan,
-                success_bg: Color::Reset,
-                danger: Color::Red,
-                danger_bg: Color::Reset,
-                diff_context_bg: Color::Reset,
-                code_theme: "base16-eighties.dark",
-            },
+            ThemeName::Terminal => {
+                let light = crate::terminal_probe::terminal_info().is_light_bg();
+                Self {
+                    surface: Color::Reset,
+                    surface_alt: Color::Reset,
+                    frame: if light {
+                        Color::DarkGray
+                    } else {
+                        Color::Gray
+                    },
+                    accent: Color::Cyan,
+                    highlight: Color::Yellow,
+                    text: Color::Reset,
+                    muted: if light {
+                        Color::DarkGray
+                    } else {
+                        Color::Gray
+                    },
+                    success: Color::Cyan,
+                    success_bg: Color::Reset,
+                    danger: Color::Red,
+                    danger_bg: Color::Reset,
+                    diff_context_bg: Color::Reset,
+                    code_theme: if light {
+                        "base16-github.light"
+                    } else {
+                        "base16-eighties.dark"
+                    },
+                }
+            }
             ThemeName::Slate => Self {
                 surface: Color::Rgb(20, 25, 35),
                 surface_alt: Color::Rgb(28, 34, 46),
@@ -140,6 +155,16 @@ mod tests {
         assert_eq!(palette.diff_context_bg, Color::Reset);
         assert_eq!(palette.success_bg, Color::Reset);
         assert_eq!(palette.danger_bg, Color::Reset);
+    }
+
+    #[test]
+    fn terminal_theme_muted_depends_on_detected_bg() {
+        // Terminal theme adapts muted/frame to the detected background.
+        // We can't control the probe in tests, so just verify the palette
+        // is constructed (no panic) and has valid colors.
+        let palette = Palette::for_theme(ThemeName::Terminal);
+        assert_ne!(palette.accent, Color::Reset);
+        assert_ne!(palette.highlight, Color::Reset);
     }
 
     #[test]

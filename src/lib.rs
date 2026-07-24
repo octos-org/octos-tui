@@ -24,6 +24,7 @@ pub mod model;
 pub mod profiles;
 pub mod sanitize;
 pub mod store;
+pub mod terminal_probe;
 pub mod theme;
 pub mod transport;
 pub mod tui_terminal;
