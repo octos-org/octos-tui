@@ -6271,6 +6271,18 @@ impl Store {
                 }
                 None
             }
+            UiNotification::ReasoningDelta(_) => {
+                // Reasoning deltas are a background stream for the inspector;
+                // they are not surfaced in the status bar or transcript.
+                None
+            }
+            UiNotification::VisualGenerating(_) => {
+                None
+            }
+            UiNotification::VisualSucceeded(_) => {
+                None
+            }
+            _ => None
         }
     }
 
@@ -6283,6 +6295,11 @@ impl Store {
         let thread_id = envelope.thread_id.clone();
 
         match envelope.payload {
+            Payload::ReasoningDelta{ .. } => {
+                // Reasoning deltas are a background stream for the inspector;
+                // they are not surfaced in the status bar or transcript.
+                None
+            }
             Payload::UserMessage { text, files } => {
                 if let Some(session) = self.find_session_mut(&session_id) {
                     let already_present = session.messages.iter().any(|message| {
@@ -6315,7 +6332,7 @@ impl Store {
                 // Same as AssistantDelta: internal projection, not status-bar news.
                 None
             }
-            Payload::ToolStart { tool_call_id, name } => {
+            Payload::ToolStart { tool_call_id, name, arguments_preview: _ } => {
                 self.state.push_activity(
                     ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
                         .with_tool_call(tool_call_id.clone())
@@ -6348,6 +6365,8 @@ impl Store {
                 status,
                 error,
                 reason,
+                output_preview,
+                duration_ms: _,
             } => {
                 let (label, success) = match status {
                     EnvelopeToolEndStatus::Complete => ("complete", Some(true)),
@@ -18400,5 +18419,113 @@ mod tests {
             json.get("action").is_none(),
             "action must NOT appear on the wire: {json}"
         );
+    }
+
+    /// Guard test: after a roster update that deduplicates tasks (multiple
+    /// `TaskUpdatedEvent`s arrive for the same task_id, collapsing to one
+    /// entry), `select_next_task` must visit every remaining unique task
+    /// exactly once per cycle with no index jumps.
+    ///
+    /// The failure mode this pins: if the selection index is computed against
+    /// a stale pre-dedup count, modular arithmetic skips one or more tasks.
+    #[test]
+    fn select_next_task_visits_all_roster_deduped_tasks_without_skipping() {
+        use octos_core::ui_protocol::{TaskRuntimeState, TaskUpdatedEvent, UiNotification};
+
+        let session_id = SessionKey("local:test".into());
+        let task_a = TaskId::new();
+        let task_b = TaskId::new();
+        let task_c = TaskId::new();
+
+        let mut store = store_with_empty_session();
+
+        let fire = |store: &mut Store, task_id: TaskId, title: &str, state: TaskRuntimeState| {
+            store.apply_event(AppUiEvent::Protocol(UiNotification::TaskUpdated(
+                TaskUpdatedEvent {
+                    session_id: SessionKey("local:test".into()),
+                    topic: None,
+                    task_id,
+                    tool_call_id: None,
+                    title: title.into(),
+                    state,
+                    runtime_detail: None,
+                    source: None,
+                    role: None,
+                    summary: None,
+                    artifact_count: None,
+                    runtime_policy_stamp: None,
+                    turn_id: None,
+                },
+            )));
+        };
+
+        fire(&mut store, task_a.clone(), "task-a", TaskRuntimeState::Running);
+        fire(&mut store, task_b.clone(), "task-b", TaskRuntimeState::Running);
+        fire(&mut store, task_c.clone(), "task-c", TaskRuntimeState::Running);
+        // Roster dedup: task_a arrives again as an update, must not insert a duplicate.
+        fire(&mut store, task_a.clone(), "task-a", TaskRuntimeState::Pending);
+
+        let tasks = &store.state.active_session().unwrap().tasks;
+        assert_eq!(tasks.len(), 3, "roster dedup must yield exactly 3 unique tasks");
+
+        // Starting at index 0, three `next` calls must visit 1, 2, then wrap to 0.
+        assert_eq!(store.state.selected_task, 0);
+        store.state.select_next_task();
+        assert_eq!(store.state.selected_task, 1, "next skipped from 0 to {}", store.state.selected_task);
+        store.state.select_next_task();
+        assert_eq!(store.state.selected_task, 2, "next skipped from 1 to {}", store.state.selected_task);
+        store.state.select_next_task();
+        assert_eq!(store.state.selected_task, 0, "next did not wrap 2 -> 0");
+    }
+
+    /// Guard test: mirrors `select_next_task_visits_all_roster_deduped_tasks_without_skipping`
+    /// for the reverse direction.
+    #[test]
+    fn select_prev_task_visits_all_roster_deduped_tasks_without_skipping() {
+        use octos_core::ui_protocol::{TaskRuntimeState, TaskUpdatedEvent, UiNotification};
+
+        let task_a = TaskId::new();
+        let task_b = TaskId::new();
+        let task_c = TaskId::new();
+
+        let mut store = store_with_empty_session();
+
+        let fire = |store: &mut Store, task_id: TaskId, title: &str, state: TaskRuntimeState| {
+            store.apply_event(AppUiEvent::Protocol(UiNotification::TaskUpdated(
+                TaskUpdatedEvent {
+                    session_id: SessionKey("local:test".into()),
+                    topic: None,
+                    task_id,
+                    tool_call_id: None,
+                    title: title.into(),
+                    state,
+                    runtime_detail: None,
+                    source: None,
+                    role: None,
+                    summary: None,
+                    artifact_count: None,
+                    runtime_policy_stamp: None,
+                    turn_id: None,
+                },
+            )));
+        };
+
+        fire(&mut store, task_a.clone(), "task-a", TaskRuntimeState::Running);
+        fire(&mut store, task_b.clone(), "task-b", TaskRuntimeState::Running);
+        fire(&mut store, task_c.clone(), "task-c", TaskRuntimeState::Running);
+        // Roster dedup: task_b arrives again as an update, must not insert a duplicate.
+        fire(&mut store, task_b.clone(), "task-b", TaskRuntimeState::Pending);
+
+        let tasks = &store.state.active_session().unwrap().tasks;
+        assert_eq!(tasks.len(), 3, "roster dedup must yield exactly 3 unique tasks");
+
+        // Starting at index 0, three `prev` calls must wrap to 2, then 1, then back to 0.
+        assert_eq!(store.state.selected_task, 0);
+        store.state.select_prev_task();
+        assert_eq!(store.state.selected_task, 2, "prev did not wrap 0 -> 2");
+        store.state.select_prev_task();
+        assert_eq!(store.state.selected_task, 1, "prev skipped from 2 to {}", store.state.selected_task);
+        store.state.select_prev_task();
+        assert_eq!(store.state.selected_task, 0, "prev skipped from 1 to {}", store.state.selected_task);
     }
 }
