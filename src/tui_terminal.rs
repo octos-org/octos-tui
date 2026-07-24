@@ -48,6 +48,7 @@ use ratatui::layout::Rect;
 use ratatui::layout::Size;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
+use ratatui::widgets::StatefulWidget;
 use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
@@ -59,6 +60,7 @@ use unicode_width::UnicodeWidthStr;
 pub trait FrameLike {
     fn area(&self) -> Rect;
     fn render_widget<W: Widget>(&mut self, widget: W, area: Rect);
+    fn render_stateful_widget<W: StatefulWidget>(&mut self, widget: W, area: Rect, state: &mut W::State);
     fn set_cursor_position<P: Into<Position>>(&mut self, position: P);
     fn buffer_mut(&mut self) -> &mut Buffer;
 }
@@ -69,6 +71,9 @@ impl FrameLike for ratatui::Frame<'_> {
     }
     fn render_widget<W: Widget>(&mut self, widget: W, area: Rect) {
         ratatui::Frame::render_widget(self, widget, area);
+    }
+    fn render_stateful_widget<W: StatefulWidget>(&mut self, widget: W, area: Rect, state: &mut W::State) {
+        ratatui::Frame::render_stateful_widget(self, widget, area, state);
     }
     fn set_cursor_position<P: Into<Position>>(&mut self, position: P) {
         ratatui::Frame::set_cursor_position(self, position);
@@ -106,6 +111,11 @@ impl FrameLike for Frame<'_> {
     #[allow(clippy::needless_pass_by_value)]
     fn render_widget<W: Widget>(&mut self, widget: W, area: Rect) {
         widget.render(area, self.buffer);
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn render_stateful_widget<W: StatefulWidget>(&mut self, widget: W, area: Rect, state: &mut W::State) {
+        widget.render(area, self.buffer, state);
     }
 
     fn set_cursor_position<P: Into<Position>>(&mut self, position: P) {

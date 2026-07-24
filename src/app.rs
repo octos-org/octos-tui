@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, LineGauge, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, LineGauge, List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -1911,7 +1911,12 @@ fn render_activity_navigator_overlay(frame: &mut impl FrameLike, app: &AppState,
         render_activity_navigator_toolbar(&model, palette),
         areas.toolbar,
     );
-    frame.render_widget(render_activity_navigator_list(&model, palette), areas.list);
+    let mut list_state = ListState::default().with_selected(Some(model.selected));
+    frame.render_stateful_widget(
+        render_activity_navigator_list(&model, palette),
+        areas.list,
+        &mut list_state,
+    );
     frame.render_widget(
         render_activity_navigator_detail(&model, palette),
         areas.detail,
