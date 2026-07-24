@@ -54,6 +54,7 @@ axoupdater = { version = "0.10", default-features = false, features = ["github_r
 zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 sha2 = "0.11.0"
 tempfile = "3.27.0"
+rustix = "1.1.4"
 
 [features]
 default = ["update"]
