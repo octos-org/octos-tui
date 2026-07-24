@@ -10367,148 +10367,195 @@ mod tests {
         }
     }
 
-    /// Bug 2A guard: a normal idle submit must render the prompt EXACTLY ONCE.
-    /// The event loop flushes the committed prompt into native scrollback and
-    /// stamps the watermark past it, so the live tail must NOT also pin it (that
-    /// was the #389-era duplicate). Reproduces the real handoff: sync a tracker,
-    /// stamp `scrollback_flushed_watermark`, then compare scrollback vs tail.
+    /// Goal-echo regression, driven through the REAL path: submit + the
+    /// scrollback-sync + the inline live-tail render. A just-submitted prompt
+    /// must render EXACTLY ONCE across native scrollback and the live tail, for
+    /// every mid-turn disposition — staged (queued behind a busy goal), steered
+    /// (injected into the live turn), and the idle start. An earlier attempt
+    /// pinned on the flush-message COUNT, but `sync` advances that count to the
+    /// full committed length in the SAME frame, so the pin could never fire;
+    /// this drives the real path and shows the prompt is already rendered once,
+    /// which is what actually needs guarding.
     #[test]
-    fn idle_submit_prompt_renders_once_and_is_not_repinned_after_flush() {
+    fn submitted_prompt_renders_exactly_once_through_real_path() {
+        use crate::store::Store;
         let palette = Palette::for_theme(ThemeName::Slate);
-        let mut app = AppState::new(
-            vec![SessionView {
-                id: SessionKey("local:test".into()),
-                title: "test".into(),
-                profile_id: Some("coding".into()),
-                messages: vec![Message::user("please summarize the log")],
-                tasks: vec![],
-                live_reply: None,
-            }],
-            0,
-            "Thinking".into(),
-            None,
-            false,
-        );
-        app.set_run_state_in_progress();
+        const PROMPT: &str = "check the failing tests";
 
-        let mut tracker = ScrollbackTracker::new();
-        let update = tracker.sync(&app, palette, 100);
-        // Event loop stamps the post-sync flush watermark before rendering.
-        app.scrollback_flushed_watermark = Some(tracker.committed_flushed_len());
+        // Real event-loop tail: flush committed history to scrollback, then
+        // render the inline live tail with that frame's finalization.
+        fn render_counts(state: &AppState, palette: Palette) -> (usize, usize) {
+            let mut tracker = ScrollbackTracker::new();
+            let update = tracker.sync(state, palette, 100);
+            let scrollback = lines_text(&update.lines_to_insert);
+            let tail = viewport_rows_with_finalization(
+                state,
+                100,
+                40,
+                update.live_tail_finalization.as_ref(),
+            )
+            .join("\n");
+            (
+                scrollback.matches(PROMPT).count(),
+                tail.matches(PROMPT).count(),
+            )
+        }
 
-        let scrollback = lines_text(&update.lines_to_insert);
-        let tail = lines_text(&live_tail_lines_with_finalization(
-            &app,
-            palette,
-            98,
-            update.live_tail_finalization.as_ref(),
-        ));
+        fn running_goal_store() -> Store {
+            let turn = TurnId::new();
+            let mut store = Store {
+                state: AppState::new(
+                    vec![SessionView {
+                        id: SessionKey("local:test".into()),
+                        title: "t".into(),
+                        profile_id: Some("coding".into()),
+                        messages: vec![
+                            Message::user("run the goal"),
+                            Message::assistant("working"),
+                        ],
+                        tasks: vec![],
+                        live_reply: Some(crate::model::LiveReply {
+                            turn_id: turn,
+                            text: "still working".into(),
+                        }),
+                    }],
+                    0,
+                    "Working".into(),
+                    None,
+                    false,
+                ),
+            };
+            store.state.set_run_state_in_progress();
+            store
+        }
+
+        // Staged: a busy goal + no steer capability → the prompt queues.
+        let mut staged = running_goal_store();
+        staged.state.composer = PROMPT.into();
         assert!(
-            scrollback.contains("please summarize the log"),
-            "the committed prompt must reach native scrollback:\n{scrollback}"
+            staged.compose_command().is_none(),
+            "a mid-turn prompt with no steer support must stage"
         );
-        assert!(
-            !tail.contains("please summarize the log"),
-            "a flushed prompt must NOT be re-pinned in the live tail (no bug-2A dup):\n{tail}"
-        );
-    }
-
-    /// Regression for the goal-mode "prompt not rendered" bug (#389 narrowed the
-    /// pin to interactive overlays only). While a goal keeps the session busy the
-    /// committed prompt is often flushed a few frames LATE — the scrollback
-    /// watermark still trails it — and without the live-tail pin the prompt is on
-    /// screen nowhere. The pin must show it exactly once until the flush catches
-    /// up, then retract (so it never duplicates the eventual scrollback copy).
-    #[test]
-    fn goal_mode_prompt_pinned_until_scrollback_flush_catches_up() {
-        let palette = Palette::for_theme(ThemeName::Slate);
-        let turn = TurnId::new();
-        let mut app = AppState::new(
-            vec![SessionView {
-                id: SessionKey("local:test".into()),
-                title: "test".into(),
-                profile_id: Some("coding".into()),
-                messages: vec![
-                    Message::user("kick off the goal"),
-                    Message::assistant("working on it"),
-                    Message::user("also check the failing tests"),
-                ],
-                tasks: vec![],
-                live_reply: Some(crate::model::LiveReply {
-                    turn_id: turn,
-                    text: "still working".into(),
-                }),
-            }],
-            0,
-            "Working".into(),
-            None,
-            false,
-        );
-        app.set_run_state_in_progress();
-
-        // Late-flush frame: only 2 of the 3 committed messages have reached
-        // scrollback, so the trailing prompt (index 2) is not there yet.
-        app.scrollback_flushed_watermark = Some(2);
-        let tail = lines_text(&live_tail_lines_with_finalization(&app, palette, 98, None));
+        let (s, t) = render_counts(&staged.state, palette);
         assert_eq!(
-            tail.matches("also check the failing tests").count(),
+            s + t,
             1,
-            "the un-flushed goal-mode prompt must be pinned exactly once:\n{tail}"
+            "staged mid-turn prompt renders exactly once (scrollback={s}, tail={t})"
         );
 
-        // Flush catches up (watermark now covers all 3 messages) → pin retracts,
-        // leaving only the eventual scrollback copy (no duplicate).
-        app.scrollback_flushed_watermark = Some(3);
-        let tail_after = lines_text(&live_tail_lines_with_finalization(&app, palette, 98, None));
+        // Steered: a busy goal + turn/steer advertised → the prompt is injected.
+        let mut steered = running_goal_store();
+        steered.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_TURN_STEER,
+        ]));
+        steered.state.composer = PROMPT.into();
         assert!(
-            !tail_after.contains("also check the failing tests"),
-            "once flushed to scrollback the prompt must not stay pinned (no dup):\n{tail_after}"
+            steered.compose_command().is_some(),
+            "a mid-turn prompt with steer support must emit a steer command"
+        );
+        let (s, t) = render_counts(&steered.state, palette);
+        assert_eq!(
+            s + t,
+            1,
+            "steered mid-turn prompt renders exactly once (scrollback={s}, tail={t})"
+        );
+
+        // Idle: no active turn → the prompt starts a fresh turn.
+        let mut idle = Store {
+            state: AppState::new(
+                vec![SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "t".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::user("prior")],
+                    tasks: vec![],
+                    live_reply: None,
+                }],
+                0,
+                "ready".into(),
+                None,
+                false,
+            ),
+        };
+        idle.state.composer = PROMPT.into();
+        assert!(
+            idle.compose_command().is_some(),
+            "an idle prompt starts a turn"
+        );
+        let (s, t) = render_counts(&idle.state, palette);
+        assert_eq!(
+            s + t,
+            1,
+            "idle prompt renders exactly once (scrollback={s}, tail={t})"
         );
     }
 
-    /// The staged (queued) mid-turn prompt must also render exactly once. It is
-    /// not a committed message, so it never reaches scrollback here; the
-    /// pending-messages block shows it as a single queued entry, and the pin —
-    /// which reads the LATEST COMMITTED user message — must not also surface it.
+    /// Guards against the duplicate an over-eager staging echo would cause:
+    /// staging text IDENTICAL to the active turn's still-unreconciled optimistic
+    /// prompt must NOT delete that prompt's optimistic tracker
+    /// (`record_submitted_user_prompt`'s content-dedup would remove ALL matching
+    /// trackers), or the server's canonical `UserMessage` echo appends a SECOND
+    /// row instead of promoting the existing one.
     #[test]
-    fn staged_goal_prompt_renders_exactly_once() {
-        let palette = Palette::for_theme(ThemeName::Slate);
+    fn staging_identical_text_does_not_duplicate_the_active_prompt() {
+        use crate::store::Store;
         let turn = TurnId::new();
-        let mut app = AppState::new(
-            vec![SessionView {
-                id: SessionKey("local:test".into()),
-                title: "test".into(),
-                profile_id: Some("coding".into()),
-                messages: vec![Message::user("start the goal"), Message::assistant("on it")],
-                tasks: vec![],
-                live_reply: Some(crate::model::LiveReply {
-                    turn_id: turn,
-                    text: "still on it".into(),
-                }),
-            }],
-            0,
-            "Working".into(),
-            None,
-            false,
-        );
-        app.set_run_state_in_progress();
-        app.pending_messages.push("check the failing tests".into());
-
-        let mut tracker = ScrollbackTracker::new();
-        let update = tracker.sync(&app, palette, 100);
-        app.scrollback_flushed_watermark = Some(tracker.committed_flushed_len());
-        let scrollback = lines_text(&update.lines_to_insert);
-        let tail = lines_text(&live_tail_lines_with_finalization(
-            &app,
-            palette,
-            98,
-            update.live_tail_finalization.as_ref(),
-        ));
-        let total = scrollback.matches("check the failing tests").count()
-            + tail.matches("check the failing tests").count();
+        let sess = SessionKey("local:test".into());
+        let mut store = Store {
+            state: AppState::new(
+                vec![SessionView {
+                    id: sess.clone(),
+                    title: "t".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::assistant("working")],
+                    tasks: vec![],
+                    live_reply: Some(crate::model::LiveReply {
+                        turn_id: turn.clone(),
+                        text: "still working".into(),
+                    }),
+                }],
+                0,
+                "Working".into(),
+                None,
+                false,
+            ),
+        };
+        store.state.set_run_state_in_progress();
+        // The ACTIVE turn's prompt is optimistically echoed, awaiting the
+        // server's canonical UserMessage.
+        store
+            .state
+            .record_submitted_user_prompt(sess.clone(), turn, "duplicate me".into());
         assert_eq!(
-            total, 1,
-            "a staged goal-mode prompt renders exactly once:\nSCROLLBACK:\n{scrollback}\nTAIL:\n{tail}"
+            store.state.optimistic_user_messages.len(),
+            1,
+            "precondition: the active prompt has one optimistic tracker"
+        );
+
+        // User stages IDENTICAL text mid-turn, via the real submit path.
+        store.state.composer = "duplicate me".into();
+        assert!(store.compose_command().is_none(), "identical text stages");
+        assert_eq!(
+            store.state.optimistic_user_messages.len(),
+            1,
+            "staging identical text must not delete the active prompt's optimistic tracker"
+        );
+
+        // The server's canonical echo for the ACTIVE prompt arrives.
+        store
+            .state
+            .apply_user_row_echo(&sess, "thread-1".into(), "duplicate me".into(), vec![]);
+        let user_rows = store
+            .state
+            .active_session()
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|m| m.role.as_str() == "user" && m.content == "duplicate me")
+            .count();
+        assert_eq!(
+            user_rows, 1,
+            "the canonical echo must promote the existing row, not append a duplicate"
         );
     }
 
