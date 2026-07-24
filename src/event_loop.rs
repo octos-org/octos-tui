@@ -753,12 +753,16 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         // that affordance isn't lost.
         KeyCode::Down if store.state.focus == FocusPane::Composer => {
             if !store.state.move_composer_cursor_down() {
-                store.state.scroll_transcript_down(1);
+                if !store.state.history_cursor_down() {
+                    store.state.scroll_transcript_down(1);
+                }
             }
         }
         KeyCode::Up if store.state.focus == FocusPane::Composer => {
             if !store.state.move_composer_cursor_up() {
-                store.state.scroll_transcript_up(1);
+                if !store.state.history_cursor_up() {
+                    store.state.scroll_transcript_up(1);
+                }
             }
         }
         KeyCode::Down => {
@@ -803,9 +807,11 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             store.state.move_composer_cursor_right();
         }
         KeyCode::Delete if store.state.focus == FocusPane::Composer => {
+            store.state.exit_history_mode();
             store.state.delete_composer_next_char();
         }
         KeyCode::Backspace if store.state.focus == FocusPane::Composer => {
+            store.state.exit_history_mode();
             store.state.delete_composer_prev_char();
         }
         KeyCode::Enter if store.state.focus == FocusPane::Composer => {
@@ -839,6 +845,7 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         }
         KeyCode::Char(ch) => {
             let opens_slash_popup = ch == '/' && store.state.composer.is_empty();
+            store.state.exit_history_mode();
             store.state.insert_composer_char(ch);
             store.state.focus = FocusPane::Composer;
             if opens_slash_popup {

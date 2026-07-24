@@ -3241,6 +3241,9 @@ pub struct AppState {
     pub composer: String,
     pub composer_cursor: Option<usize>,
     pub composer_drafts: Vec<ComposerDraft>,
+    pub prompt_history: Vec<String>,
+    pub history_cursor: Option<usize>,
+    pub history_draft: String,
     pub pending_messages: Vec<String>,
     pub optimistic_user_messages: Vec<OptimisticUserMessage>,
     pub status: String,
@@ -4854,6 +4857,9 @@ impl AppState {
             composer: String::new(),
             composer_cursor: None,
             composer_drafts: Vec::new(),
+            prompt_history: Vec::new(),
+            history_cursor: None,
+            history_draft: String::new(),
             pending_messages: Vec::new(),
             optimistic_user_messages: Vec::new(),
             status,
@@ -5406,16 +5412,24 @@ impl AppState {
         turn_id: TurnId,
         content: String,
     ) {
-        let Some(session) = self
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-        else {
-            return;
+        let (prior_matching_user_count, anchor_index) = {
+            let Some(session) = self
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+            else {
+                return;
+            };
+            (
+                matching_user_message_count(session, &content),
+                session.messages.len(),
+            )
         };
+        self.record_prompt_history(&content);
+        self.exit_history_mode();
         let optimistic = OptimisticUserMessage {
-            prior_matching_user_count: matching_user_message_count(session, &content),
-            anchor_index: session.messages.len(),
+            prior_matching_user_count,
+            anchor_index,
             session_id,
             turn_id,
             content,
@@ -5918,6 +5932,66 @@ impl AppState {
     pub fn set_composer_text(&mut self, text: impl Into<String>) {
         self.composer = text.into();
         self.composer_cursor = None;
+    }
+
+    pub fn record_prompt_history(&mut self, prompt: &str) {
+        if prompt.is_empty() {
+            return;
+        }
+        if self.prompt_history.last().map(String::as_str) == Some(prompt) {
+            return;
+        }
+        self.prompt_history.push(prompt.to_string());
+        const MAX_HISTORY: usize = 100;
+        if self.prompt_history.len() > MAX_HISTORY {
+            self.prompt_history.remove(0);
+        }
+    }
+
+    /// Navigate to the previous (older) history entry. Returns `true` if the
+    /// composer was updated, `false` if there is nothing older to show.
+    pub fn history_cursor_up(&mut self) -> bool {
+        if self.prompt_history.is_empty() {
+            return false;
+        }
+        let idx = match self.history_cursor {
+            None => {
+                self.history_draft = self.composer.clone();
+                self.prompt_history.len() - 1
+            }
+            Some(0) => return false,
+            Some(i) => i - 1,
+        };
+        self.history_cursor = Some(idx);
+        let text = self.prompt_history[idx].clone();
+        self.set_composer_text(text);
+        true
+    }
+
+    /// Navigate to the next (newer) history entry, or restore the in-progress
+    /// draft when past the newest entry. Returns `true` if handled.
+    pub fn history_cursor_down(&mut self) -> bool {
+        let Some(i) = self.history_cursor else {
+            return false;
+        };
+        if i + 1 >= self.prompt_history.len() {
+            self.history_cursor = None;
+            let draft = std::mem::take(&mut self.history_draft);
+            self.set_composer_text(draft);
+        } else {
+            let idx = i + 1;
+            self.history_cursor = Some(idx);
+            let text = self.prompt_history[idx].clone();
+            self.set_composer_text(text);
+        }
+        true
+    }
+
+    /// Exit history navigation without changing the composer content.
+    /// Call this when the user types any character while browsing history.
+    pub fn exit_history_mode(&mut self) {
+        self.history_cursor = None;
+        self.history_draft.clear();
     }
 
     pub fn composer_cursor_index(&self) -> usize {
