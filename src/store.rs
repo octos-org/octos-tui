@@ -4924,9 +4924,12 @@ impl Store {
                         }
                     }
                 }
-                if error.code == "frame_too_large" {
-                    // Recoverable — keep the session usable (idle) instead of
-                    // wedging it in Error on an oversized inline send.
+                let session_open_rejected = error.message.contains("session/open");
+                if error.code == "frame_too_large" || session_open_rejected {
+                    // Recoverable — keep the TUI usable (idle) instead of
+                    // wedging it in Error. For frame_too_large the channel is
+                    // fine; for session/open rejection the session simply never
+                    // opened but the connection and TUI are otherwise healthy.
                     self.state.set_run_state_idle();
                 } else {
                     self.state.set_run_state_error(error.message);
@@ -18665,8 +18668,8 @@ mod tests {
             "pending message must be restored to composer after session/open failure"
         );
         assert!(
-            matches!(store.state.run_state, SessionRunState::Error { .. }),
-            "run state must be Error after session/open failure"
+            matches!(store.state.run_state, SessionRunState::Idle),
+            "run state must be Idle after session/open failure so the TUI stays usable"
         );
     }
 }
