@@ -3511,6 +3511,8 @@ pub struct PeerPrepareResult {
     #[serde(default)]
     pub worktree_branch: Option<String>,
     pub profile_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
     #[serde(default)]
     pub peers: Vec<PeerFleetEntry>,
 }
@@ -3526,6 +3528,8 @@ pub struct PeerFleetEntry {
     #[serde(default)]
     pub worktree_branch: Option<String>,
     pub profile_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
 }
 
 /// Params of the durable [`APPUI_METHOD_PEER_STAGED`] notification
@@ -3548,6 +3552,8 @@ pub struct PeerStagedParams {
     #[serde(default)]
     pub worktree_branch: Option<String>,
     pub profile_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
 }
 
 
@@ -3610,6 +3616,8 @@ pub struct PeerGatherEntry {
     pub result_updated_unix: Option<u64>,
     #[serde(default)]
     pub has_worktree: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
 }
 
 /// `turn/steer` request (octos#1807): mid-turn prompt injection into the
@@ -3683,6 +3691,7 @@ pub struct PeerKickoff {
     /// by `take_pending_peer_kickoff` into `PeerMeta.agent_staged` so the dock
     /// labels the origin correctly instead of hardcoding it.
     pub agent_staged: bool,
+    pub model_id: Option<String>,
     pub created: std::time::Instant,
 }
 
@@ -3702,6 +3711,7 @@ pub struct PeerMeta {
     /// `/peer --prepare` by the user). Reserved for future differentiated
     /// rendering; not yet surfaced.
     pub agent_staged: bool,
+    pub model_id: Option<String>,
     pub created: std::time::Instant,
 }
 
@@ -8805,6 +8815,7 @@ impl AppState {
                 slug,
                 brief_path: kickoff.brief_path.clone(),
                 agent_staged: kickoff.agent_staged,
+                model_id: kickoff.model_id.clone(),
                 created: kickoff.created,
             },
         );

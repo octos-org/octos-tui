@@ -4036,10 +4036,9 @@ pub(crate) fn peer_list_output(app: &AppState) -> String {
             .and_then(|(_, output, _)| output.filter(|&t| t > 0))
             .map(|t| humanize_token_count(t))
             .unwrap_or_default();
-        let model = app
-            .model_catalog_for(session_id)
-            .and_then(|catalog| catalog.models.iter().find(|m| m.selected))
-            .map(|m| m.model.clone())
+        let model = meta
+            .model_id
+            .clone()
             .unwrap_or_else(|| "—".to_string());
         lines.push(format!(
             "{:<22} {:<10} {:<10} {:<8} {}",
@@ -4170,22 +4169,38 @@ pub(crate) fn peer_strip_lines(
         let detail = peer_activity_line(app, session_id);
         // Right-aligned elapsed + token info.
         let timing = peer_timing_suffix(app, session_id, meta);
-        let left_text = format!(" {glyph} {}  {detail}", meta.slug.chars().take(20).collect::<String>());
+        // Model label (when available): shown between slug and activity detail.
+        let model_label = meta.model_id.as_deref().unwrap_or("");
+        let left_text = if model_label.is_empty() {
+            format!(" {glyph} {}  {detail}", meta.slug.chars().take(20).collect::<String>())
+        } else {
+            format!(" {glyph} {}  {model_label} · {detail}", meta.slug.chars().take(20).collect::<String>())
+        };
         // Reserve 1 char for the space between left and right content.
         let pad = width
             .saturating_sub(left_text.chars().count() as u16 + timing.chars().count() as u16 + 1);
-        let row = Line::from(vec![
+        let mut spans: Vec<Span<'static>> = vec![
             Span::styled(format!(" {glyph} "), glyph_style),
             Span::styled(
                 meta.slug.chars().take(20).collect::<String>(),
                 palette.text().bg(palette.surface),
             ),
-            Span::styled(format!("  {detail}"), palette.muted().bg(palette.surface)),
-            Span::styled(
-                format!("{} {}", " ".repeat(pad as usize), timing),
-                palette.muted().bg(palette.surface),
-            ),
-        ]);
+        ];
+        if !model_label.is_empty() {
+            spans.push(Span::styled(
+                format!("  {model_label}"),
+                Style::default().fg(palette.highlight).bg(palette.surface),
+            ));
+            spans.push(Span::styled(" · ", palette.muted().bg(palette.surface)));
+        } else {
+            spans.push(Span::styled("  ", palette.muted().bg(palette.surface)));
+        }
+        spans.push(Span::styled(format!("{detail}"), palette.muted().bg(palette.surface)));
+        spans.push(Span::styled(
+            format!("{} {}", " ".repeat(pad as usize), timing),
+            palette.muted().bg(palette.surface),
+        ));
+        let row = Line::from(spans);
         lines.push(row);
     }
     lines

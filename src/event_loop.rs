@@ -2816,6 +2816,7 @@ mod tests {
                 slug: "ci-red".into(),
                 brief_path: "/tmp/brief.md".into(),
                 agent_staged: false,
+                model_id: None,
                 created: std::time::Instant::now(),
             },
         );
@@ -2874,6 +2875,7 @@ mod tests {
                 slug: "ci-red".into(),
                 brief_path: "/tmp/brief.md".into(),
                 agent_staged: true,
+                model_id: None,
                 created: std::time::Instant::now(),
             },
         );

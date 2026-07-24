@@ -1185,6 +1185,7 @@ impl Store {
                         brief_path: entry.brief_path.clone(),
                         go: pending.go && index == 0,
                         agent_staged: false,
+                        model_id: entry.model_id.clone(),
                         created: std::time::Instant::now(),
                     },
                 );
@@ -1224,6 +1225,7 @@ impl Store {
                 brief_path: result.brief_path,
                 go: pending.go,
                 agent_staged: false,
+                model_id: result.model_id.clone(),
                 created: std::time::Instant::now(),
             },
         );
@@ -1282,6 +1284,7 @@ impl Store {
                 brief_path: event.brief_path,
                 go: false,
                 agent_staged: true,
+                model_id: event.model_id.clone(),
                 created: std::time::Instant::now(),
             },
         );
@@ -14045,6 +14048,7 @@ mod tests {
                     cwd: "/repo".into(),
                     worktree_branch: None,
                     profile_id: "coding".into(),
+                    model_id: None,
                     peers: Vec::new(),
                 },
             },
@@ -14192,6 +14196,7 @@ mod tests {
                     cwd: "/repo".into(),
                     worktree_branch: Some("peer/fix-nav".into()),
                     profile_id: "coding".into(),
+                    model_id: None,
                     peers: Vec::new(),
                 },
             },
@@ -14234,6 +14239,7 @@ mod tests {
             brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
             go: false,
             agent_staged: false,
+            model_id: None,
             created: std::time::Instant::now(),
         };
         store
@@ -14267,6 +14273,7 @@ mod tests {
                     cwd: "/repo".into(),
                     worktree_branch: None,
                     profile_id: "coding".into(),
+                    model_id: None,
                     peers: Vec::new(),
                 },
             },
@@ -14468,6 +14475,7 @@ mod tests {
                     cwd: "/repo".into(),
                     worktree_branch: None,
                     profile_id: "coding".into(),
+                    model_id: None,
                     peers: Vec::new(),
                 },
             },
@@ -14531,6 +14539,7 @@ mod tests {
                 brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
                 go: false,
                 agent_staged: false,
+                model_id: None,
                 created: std::time::Instant::now(),
             },
         );
@@ -14588,6 +14597,7 @@ mod tests {
             cwd: "/repo".into(),
             worktree_branch: None,
             profile_id: "coding".into(),
+            model_id: None,
         }
     }
 
@@ -14605,6 +14615,7 @@ mod tests {
                 cwd: first.cwd,
                 worktree_branch: first.worktree_branch,
                 profile_id: first.profile_id,
+                model_id: None,
                 peers,
             },
         })
@@ -14788,6 +14799,7 @@ mod tests {
             cwd: "/repo".into(),
             worktree_branch: None,
             profile_id: "coding".into(),
+            model_id: None,
         }
     }
 
@@ -14969,6 +14981,7 @@ mod tests {
             result_truncated: false,
             result_updated_unix: result.map(|_| 1_753_000_000),
             has_worktree: false,
+            model_id: None,
         }
     }
 
