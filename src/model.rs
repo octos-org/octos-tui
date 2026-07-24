@@ -8772,6 +8772,17 @@ impl AppState {
         self.interrupted_turns.insert(session_id, turn_id);
     }
 
+    /// Clear a turn's interrupt marker once its terminal lands — but ONLY when
+    /// the marker still belongs to THIS turn. A stale / duplicate / reconnect-
+    /// replayed terminal for an OLD turn must not clear a NEWER interrupted
+    /// turn's marker on the same session (that would resurrect the killed turn:
+    /// its trailing deltas un-freeze and the spinner re-arms). (review P2)
+    pub fn clear_interrupted_turn(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        if self.interrupted_turns.get(session_id) == Some(turn_id) {
+            self.interrupted_turns.remove(session_id);
+        }
+    }
+
     pub fn set_run_state_blocked(&mut self, message: impl Into<String>) {
         if !self.run_state.is_active() {
             self.run_state_started_at = Some(Instant::now());

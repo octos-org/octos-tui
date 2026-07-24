@@ -6174,7 +6174,15 @@ impl Store {
         // keeps this turn idle + frozen until the terminal reconciles.
         self.state
             .mark_turn_interrupted(session_id.clone(), turn_id.clone());
-        self.state.set_run_state_idle();
+        // Only downgrade an actively-STREAMING (spinning) turn. A turn parked on
+        // an approval/question is Blocked (no spinner) — leave its state so the
+        // chip keeps showing the pending decision until the terminal (review P3).
+        if matches!(
+            self.state.run_state,
+            crate::model::SessionRunState::InProgress
+        ) {
+            self.state.set_run_state_idle();
+        }
         self.state.status = t!("status.interrupt_requested_active_turn").into_owned();
         Some(AppUiCommand::InterruptTurn(TurnInterruptParams {
             session_id,
@@ -10874,6 +10882,15 @@ impl Store {
         assistant_segment_id: String,
         text: String,
     ) {
+        // A user-interrupted turn is frozen at what already streamed (optimistic
+        // idle). Do NOT reconcile it against a late canonical/persisted frame:
+        // the clear + re-seed below would WIPE it (the re-seed is dropped by the
+        // freeze in `append_live_reply_delta`) and the v2 segment-replace would
+        // un-freeze it. Keep exactly what the user saw at Esc; the terminal
+        // commits that. (review P2)
+        if self.state.turn_locally_interrupted(session_id, turn_id) {
+            return;
+        }
         let key = (session_id.clone(), turn_id.clone());
         let known_segment = self
             .state
@@ -11531,9 +11548,12 @@ impl Store {
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
         self.state.pre_token_turns.remove(&event.session_id);
-        // The turn reached its terminal — drop any optimistic-idle interrupt
-        // marker so a fresh turn on this session is never gated.
-        self.state.interrupted_turns.remove(&event.session_id);
+        // The turn reached its terminal — drop THIS turn's optimistic-idle
+        // interrupt marker. Turn-matched: a stale / duplicate / reconnect-
+        // replayed terminal for an OLD turn must not clear a newer interrupted
+        // turn's marker on this session (review P2).
+        self.state
+            .clear_interrupted_turn(&event.session_id, &event.turn_id);
         self.bump_unread_for_background_terminal(&event.session_id);
         // tui#398: a terminal for this session settles any stashed
         // background approval/question — the server resolved or cancelled it
@@ -11764,9 +11784,12 @@ impl Store {
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
         self.state.pre_token_turns.remove(&event.session_id);
-        // The turn reached its terminal — drop any optimistic-idle interrupt
-        // marker so a fresh turn on this session is never gated.
-        self.state.interrupted_turns.remove(&event.session_id);
+        // The turn reached its terminal — drop THIS turn's optimistic-idle
+        // interrupt marker. Turn-matched: a stale / duplicate / reconnect-
+        // replayed terminal for an OLD turn must not clear a newer interrupted
+        // turn's marker on this session (review P2).
+        self.state
+            .clear_interrupted_turn(&event.session_id, &event.turn_id);
         self.bump_unread_for_background_terminal(&event.session_id);
         // tui#398: a terminal for this session settles any stashed
         // background approval/question — the server resolved or cancelled it
@@ -29427,6 +29450,105 @@ now analyzing the bus module"
         assert_eq!(
             store.state.status,
             "Turn error provider_error: upstream 500"
+        );
+    }
+
+    #[test]
+    fn stale_terminal_for_a_prior_turn_keeps_the_newer_interrupt_marker() {
+        // Review P2: the terminal clear must be turn-matched. Reconnect-replay /
+        // out-of-order streams mean an OLD turn's terminal can arrive after a
+        // NEWER turn on the same session was interrupted — it must NOT clear the
+        // newer turn's marker (which would resurrect the killed turn).
+        let turn_a = TurnId::new();
+        let mut store = store_with_live_reply(turn_a.clone(), "A partial");
+        let session_id = store.state.sessions[0].id.clone();
+        store.interrupt_command().expect("interrupt A");
+        // B supersedes A as the interrupted turn on the same session.
+        let turn_b = TurnId::new();
+        store
+            .state
+            .mark_turn_interrupted(session_id.clone(), turn_b.clone());
+
+        // A's late / stale terminal lands.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a,
+                code: "interrupted".into(),
+                message: "late terminal".into(),
+            },
+        )));
+
+        assert!(
+            store.state.turn_locally_interrupted(&session_id, &turn_b),
+            "a prior turn's terminal must not clear a newer interrupted turn's marker"
+        );
+    }
+
+    #[test]
+    fn assistant_persisted_does_not_wipe_a_frozen_interrupted_reply() {
+        // Review P2: a late canonical/persisted frame for an interrupted turn
+        // must not clear/replace the frozen partial (the re-seed is dropped by
+        // the freeze, so clear-then-reseed = wipe).
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streamed partial");
+        let session_id = store.state.sessions[0].id.clone();
+        store.interrupt_command().expect("interrupt");
+
+        store.apply_v2_assistant_persisted(
+            &session_id,
+            &turn_id,
+            "seg-1".into(),
+            "the full server answer".into(),
+        );
+
+        let live_text = store.state.sessions[0]
+            .live_reply
+            .as_ref()
+            .map(|reply| reply.text.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            live_text, "streamed partial",
+            "the frozen partial must survive a late persisted frame"
+        );
+    }
+
+    #[test]
+    fn interrupt_leaves_a_blocked_turn_blocked() {
+        // Review P3: only a spinning (InProgress) turn is optimistically idled.
+        // A turn parked on an approval/question is Blocked (no spinner) — keep
+        // its state until the terminal so the chip still shows the decision.
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streamed, then parked");
+        store.state.set_run_state_blocked("approval");
+        store.interrupt_command().expect("interrupt");
+
+        assert!(
+            matches!(store.state.run_state, SessionRunState::Blocked { .. }),
+            "interrupting a parked/blocked turn must not flatten it to Idle"
+        );
+        let session_id = store.state.sessions[0].id.clone();
+        assert!(
+            store.state.turn_locally_interrupted(&session_id, &turn_id),
+            "the freeze marker still applies to a blocked interrupted turn"
+        );
+    }
+
+    #[test]
+    fn backend_relaunch_clears_interrupt_markers() {
+        // Review P3: mirror pre_token_turns — don't leak markers across a
+        // backend relaunch (a wedged turn that never terminates).
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "partial");
+        store.interrupt_command().expect("interrupt");
+        assert!(!store.state.interrupted_turns.is_empty());
+
+        store.reconcile_after_backend_relaunch();
+
+        assert!(
+            store.state.interrupted_turns.is_empty(),
+            "a backend relaunch resets stale interrupt markers"
         );
     }
 
