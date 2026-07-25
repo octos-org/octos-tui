@@ -4548,6 +4548,16 @@ pub struct AppState {
     /// the value is the interrupted turn id, so a LATER turn on the same
     /// session is never gated. Cleared on the turn's terminal.
     pub interrupted_turns: std::collections::HashMap<SessionKey, TurnId>,
+
+    /// Turns whose output the freeze above ACTUALLY suppressed: a delta or a
+    /// canonical persisted frame arrived after the Esc and was dropped.
+    ///
+    /// Only these turns can have lost content, so only these earn the
+    /// "incomplete" marker when the turn goes on to complete normally. Esc at
+    /// 99% — where nothing further arrived — commits clean, with no false
+    /// warning. Cleared with the turn's terminal (and on backend relaunch,
+    /// like `interrupted_turns`).
+    pub interrupt_dropped_output: std::collections::HashSet<(SessionKey, TurnId)>,
     /// #324 Phase C: per-session unread counters — turns that reached a
     /// terminal while the session was NOT focused. Incremented by the store's
     /// terminal appliers, cleared when the session gains focus.
@@ -6503,6 +6513,7 @@ impl AppState {
             run_state_started_at,
             pre_token_turns: std::collections::HashMap::new(),
             interrupted_turns: std::collections::HashMap::new(),
+            interrupt_dropped_output: std::collections::HashSet::new(),
             unread_turns: std::collections::HashMap::new(),
             pending_turn_steers: std::collections::VecDeque::new(),
             pending_peer_prepare: None,
@@ -8783,7 +8794,38 @@ impl AppState {
         }
     }
 
+    /// Record that the freeze dropped output for this turn — a delta or a
+    /// canonical frame that arrived after the user's Esc. See
+    /// [`Self::interrupt_dropped_output`].
+    pub fn mark_interrupt_dropped_output(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        self.interrupt_dropped_output
+            .insert((session_id.clone(), turn_id.clone()));
+    }
+
+    /// Consume the "freeze dropped output" flag for this turn, if any. Called
+    /// from both terminals so the entry can never outlive its turn.
+    pub fn take_interrupt_dropped_output(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> bool {
+        self.interrupt_dropped_output
+            .remove(&(session_id.clone(), turn_id.clone()))
+    }
+
     pub fn set_run_state_blocked(&mut self, message: impl Into<String>) {
+        // Same optimistic-idle guard as `set_run_state_in_progress`. An
+        // `approval/requested` / `user_question/requested` frame already on the
+        // wire when the user hits Esc must not flip the killed turn's chip from
+        // Idle back to Blocked: a re-Esc could not clear that state either
+        // (`interrupt_command` only downgrades an InProgress turn), so the user
+        // was wedged on a stale `Blocked{…}` until the terminal landed. The
+        // decision's own modal still opens — suppressing that would risk hiding
+        // a real approval when the interrupt does not land — but it is torn down
+        // by the server's `approval/cancelled` moments later.
+        if self.active_live_turn_interrupted() {
+            return;
+        }
         if !self.run_state.is_active() {
             self.run_state_started_at = Some(Instant::now());
         }

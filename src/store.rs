@@ -10721,6 +10721,12 @@ impl Store {
         // visibly "resuming" after Esc while the server winds down; the terminal
         // reconciles and clears `interrupted_turns`.
         if self.state.turn_locally_interrupted(session_id, turn_id) {
+            // Remember that content was actually withheld, so a turn that then
+            // completes NORMALLY can say its committed answer is incomplete.
+            if !text.is_empty() {
+                self.state
+                    .mark_interrupt_dropped_output(session_id, turn_id);
+            }
             return None;
         }
         let targets_active = self.event_targets_active_session(session_id);
@@ -10923,6 +10929,20 @@ impl Store {
         // un-freeze it. Keep exactly what the user saw at Esc; the terminal
         // commits that. (review P2)
         if self.state.turn_locally_interrupted(session_id, turn_id) {
+            // The canonical text is the server's full answer for this turn. We
+            // deliberately keep showing the frozen partial instead — but record
+            // that the fuller text was withheld, so a natural completion can be
+            // committed with an "incomplete" marker rather than a clean ✓.
+            let frozen = self
+                .find_session(session_id)
+                .and_then(|session| session.live_reply.as_ref())
+                .filter(|live| &live.turn_id == turn_id)
+                .map(|live| live.text.clone())
+                .unwrap_or_default();
+            if crate::sanitize::strip_terminal_controls(&text).trim() != frozen.trim() {
+                self.state
+                    .mark_interrupt_dropped_output(session_id, turn_id);
+            }
             return;
         }
         let key = (session_id.clone(), turn_id.clone());
@@ -11316,6 +11336,26 @@ impl Store {
         None
     }
 
+    /// Settle the run-state after a parked decision clears.
+    ///
+    /// Normally the turn resumes, so the chip goes back to in-progress. But when
+    /// the user has interrupted this turn, `set_run_state_in_progress` is a
+    /// no-op under the optimistic-idle guard — which stranded the chip on the
+    /// stale `Blocked{…}` of a decision that had just been torn down, with no
+    /// way out until the terminal landed (a re-Esc could not clear it either:
+    /// `interrupt_command` only downgrades an InProgress turn). A user stop
+    /// settles to Idle, matching every other interrupt path.
+    fn resume_run_state_after_decision(&mut self, session_id: &SessionKey) {
+        if !self.event_targets_active_session(session_id) {
+            return;
+        }
+        if self.state.active_live_turn_interrupted() {
+            self.state.set_run_state_idle();
+            return;
+        }
+        self.state.set_run_state_in_progress();
+    }
+
     fn apply_approval_auto_resolved(
         &mut self,
         event: ApprovalAutoResolvedEvent,
@@ -11334,11 +11374,8 @@ impl Store {
             .with_turn(event.turn_id)
             .with_detail(format!("scope={scope} match={scope_match}")),
         );
-        if cleared
-            .as_ref()
-            .is_some_and(|session_id| self.event_targets_active_session(session_id))
-        {
-            self.state.set_run_state_in_progress();
+        if let Some(session_id) = cleared.as_ref() {
+            self.resume_run_state_after_decision(session_id);
         }
         self.state.status = format!("Approval auto-resolved ({decision}) by scope policy");
         None
@@ -11357,11 +11394,8 @@ impl Store {
                 .with_turn(event.turn_id)
                 .with_detail(detail.clone()),
         );
-        if cleared
-            .as_ref()
-            .is_some_and(|session_id| self.event_targets_active_session(session_id))
-        {
-            self.state.set_run_state_in_progress();
+        if let Some(session_id) = cleared.as_ref() {
+            self.resume_run_state_after_decision(session_id);
         }
         self.state.status = format!("Approval decided: {decision} ({detail})");
         None
@@ -11374,11 +11408,8 @@ impl Store {
             ActivityItem::new(ActivityKind::Approval, "cancelled", reason.clone())
                 .with_turn(event.turn_id),
         );
-        if cleared
-            .as_ref()
-            .is_some_and(|session_id| self.event_targets_active_session(session_id))
-        {
-            self.state.set_run_state_in_progress();
+        if let Some(session_id) = cleared.as_ref() {
+            self.resume_run_state_after_decision(session_id);
         }
         self.state.status = format!("Approval cancelled: {reason}");
         None
@@ -11582,6 +11613,19 @@ impl Store {
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
         self.state.pre_token_turns.remove(&event.session_id);
+        // A NORMAL completion for a turn the user interrupted means the
+        // interrupt never took effect — declined, blocked before it was sent
+        // (read-only mode), or simply beaten by the completion. The freeze
+        // dropped everything that arrived after the Esc, so the frozen
+        // `live_reply` is a truncated view of an answer the server finished in
+        // full. Committing that as a clean success made the loss invisible and
+        // left the transcript permanently disagreeing with persisted history.
+        //
+        // Flagged only when content was ACTUALLY withheld, so an Esc at 99% —
+        // where nothing further arrived — still commits clean.
+        let lost_output_to_interrupt = self
+            .state
+            .take_interrupt_dropped_output(&event.session_id, &event.turn_id);
         // The turn reached its terminal — drop THIS turn's optimistic-idle
         // interrupt marker. Turn-matched: a stale / duplicate / reconnect-
         // replayed terminal for an OLD turn must not clear a newer interrupted
@@ -11710,6 +11754,8 @@ impl Store {
         let fallback_summary = self.turn_completion_fallback_message(&event.turn_id);
         let partial_fallback_summary =
             self.turn_partial_completion_fallback_message(&event.turn_id);
+        let interrupt_truncation_note =
+            lost_output_to_interrupt.then(|| t!("status.turn_interrupted_truncated").into_owned());
         let (status, reset_scroll, completed_current_turn, restore_reasoning) = {
             let session = self.find_session_mut(&event.session_id)?;
             let title = session.title.clone();
@@ -11721,6 +11767,12 @@ impl Store {
                         &fallback_summary,
                         &partial_fallback_summary,
                     );
+                    // The freeze withheld part of this answer — say so on the
+                    // committed row rather than passing it off as the whole one.
+                    let text = match &interrupt_truncation_note {
+                        Some(note) => format!("{}\n\n{note}", text.trim_end()),
+                        None => text,
+                    };
                     let mut message = Message::assistant(text);
                     message.reasoning_content = reasoning;
                     session.messages.push(message);
@@ -11810,7 +11862,13 @@ impl Store {
                 );
             }
             if targets_active {
-                self.state.set_run_state_success();
+                if lost_output_to_interrupt {
+                    // A user stop that swallowed part of the answer is not a
+                    // success — a ✓ next to truncated text is the misreport.
+                    self.state.set_run_state_idle();
+                } else {
+                    self.state.set_run_state_success();
+                }
             }
         }
         self.submit_next_pending_if_idle()
@@ -11818,6 +11876,12 @@ impl Store {
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
         self.state.pre_token_turns.remove(&event.session_id);
+        // The interrupt landed (this IS its terminal), so the withheld-output
+        // flag has done its job — drop it so it can never outlive the turn. No
+        // marker is needed here: `turn_interrupted_note` below already says the
+        // turn was stopped.
+        self.state
+            .take_interrupt_dropped_output(&event.session_id, &event.turn_id);
         // The turn reached its terminal — drop THIS turn's optimistic-idle
         // interrupt marker. Turn-matched: a stale / duplicate / reconnect-
         // replayed terminal for an OLD turn must not clear a newer interrupted
@@ -12450,6 +12514,14 @@ impl Store {
         // orchestration tick re-asserts any session that is genuinely active.
         self.state.orchestration.clear();
         self.state.session_retry.clear();
+        // Optimistic-idle interrupt bookkeeping dies with the old child for the
+        // same reason: the NEW child never knew these turns and will never emit
+        // their terminals, so a marker for a turn that never latched a
+        // `live_reply` (the loop below only reconciles latched ones) would pin
+        // the freeze forever. Both maps are cleared together so they can never
+        // drift apart.
+        self.state.interrupted_turns.clear();
+        self.state.interrupt_dropped_output.clear();
         // The old child's spawned sub-agents died with it too. The NEW child
         // will never emit their terminal `agent/updated`, so keeping the
         // roster would pin dead chips on "running"/"spawned" forever (the
@@ -29679,6 +29751,172 @@ now analyzing the bus module"
         assert!(
             !store.state.run_state.is_active(),
             "the run chip idles as before"
+        );
+    }
+
+    /// Review finding 3 (and the correctness half of finding 2): a NORMAL
+    /// `TurnCompleted` for an interrupted turn means the interrupt never took
+    /// effect — declined, never sent, or beaten by the completion. Everything
+    /// after the Esc was dropped by the freeze, so committing the frozen partial
+    /// as a clean ✓ hid the loss and desynced the transcript from server
+    /// history. It must be marked, and must not read "success".
+    #[test]
+    fn natural_completion_after_interrupt_flags_the_truncated_answer() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "first half");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.set_run_state_in_progress();
+        store.interrupt_command().expect("interrupt");
+
+        // The turn keeps streaming: the freeze drops this, so content IS lost.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                text: " and the second half".into(),
+            },
+        )));
+        // …and then finishes NORMALLY — the interrupt never landed.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let committed = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("a message was committed")
+            .content
+            .clone();
+        assert!(
+            committed.contains("first half"),
+            "the text the user actually saw is still committed: {committed}"
+        );
+        assert!(
+            committed.contains("incomplete"),
+            "the committed answer must say it is truncated: {committed}"
+        );
+        assert!(
+            !matches!(store.state.run_state, SessionRunState::Success),
+            "a truncated answer must not be reported as a clean success (got {:?})",
+            store.state.run_state
+        );
+        assert!(
+            store.state.interrupt_dropped_output.is_empty(),
+            "the withheld-output flag must not outlive the turn"
+        );
+    }
+
+    /// The other side of that: Esc that lands after the last token withheld
+    /// nothing, so the answer is whole and must commit clean. A warning here
+    /// would cry wolf on every near-completion interrupt.
+    #[test]
+    fn interrupt_after_the_last_token_commits_clean_without_a_false_warning() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "the whole answer");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.set_run_state_in_progress();
+        store.interrupt_command().expect("interrupt");
+        // No further delta — nothing was dropped.
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let committed = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("a message was committed")
+            .content
+            .clone();
+        assert_eq!(
+            committed, "the whole answer",
+            "nothing was withheld, so the answer commits verbatim: {committed}"
+        );
+        assert!(
+            matches!(store.state.run_state, SessionRunState::Success),
+            "a whole answer still reports success (got {:?})",
+            store.state.run_state
+        );
+    }
+
+    /// Review finding N1: an `approval/requested` already on the wire when the
+    /// user hits Esc must not flip the killed turn's chip from Idle back to
+    /// Blocked — a re-Esc could not clear that (only an InProgress turn is
+    /// downgraded), so the user was wedged until the terminal.
+    #[test]
+    fn approval_requested_after_interrupt_does_not_reblock_the_killed_turn() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.set_run_state_in_progress();
+        store.interrupt_command().expect("interrupt");
+        assert!(!store.state.run_state.is_active(), "Esc idles the chip");
+
+        let mut approval = approval_for("test", "rm -rf target");
+        approval.session_id = session_id;
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            approval,
+        )));
+
+        assert!(
+            !matches!(store.state.run_state, SessionRunState::Blocked { .. }),
+            "an in-flight approval must not re-block a turn the user just killed"
+        );
+    }
+
+    /// Review finding 7: when the decision IS torn down, the resume path used
+    /// `set_run_state_in_progress`, which the optimistic-idle guard silently
+    /// no-ops — stranding the chip on the stale `Blocked{…}` of an approval that
+    /// no longer exists. A user stop settles to Idle instead.
+    #[test]
+    fn approval_cancelled_after_interrupt_settles_idle_not_blocked() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streamed, then parked");
+        let session_id = store.state.sessions[0].id.clone();
+        // Parked on an approval, THEN interrupted (P3 keeps it Blocked).
+        let approval_id = octos_core::ui_protocol::ApprovalId::new();
+        let mut approval = approval_for("test", "rm -rf target");
+        approval.session_id = session_id.clone();
+        approval.approval_id = approval_id.clone();
+        approval.turn_id = turn_id.clone();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            approval,
+        )));
+        store.interrupt_command().expect("interrupt");
+        assert!(
+            matches!(store.state.run_state, SessionRunState::Blocked { .. }),
+            "P3: interrupting a parked turn leaves it Blocked"
+        );
+
+        // The server tears the waiter down in response to the interrupt.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalCancelled(
+            ApprovalCancelledEvent::turn_interrupted(session_id, approval_id, turn_id),
+        )));
+
+        assert!(
+            !matches!(store.state.run_state, SessionRunState::Blocked { .. }),
+            "the chip must not stay Blocked on a decision that is gone"
+        );
+        assert!(
+            !store.state.run_state.is_active(),
+            "a user stop settles to Idle, not back to Working"
         );
     }
 

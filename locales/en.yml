@@ -895,6 +895,12 @@ status:
   # own turn (Esc/Ctrl+C). Deliberately terse: a user stop is not a failure, so
   # it does not get the verbose Session-Summary card that genuine errors do.
   turn_interrupted: "Turn interrupted"
+  # Appended to the committed answer when a turn the user interrupted went on to
+  # COMPLETE normally on the server — the interrupt was declined, never sent, or
+  # simply lost the race. The client froze its view at the Esc, so the text above
+  # is a truncated view of an answer that did finish. Only shown when output was
+  # genuinely withheld, never for an Esc that arrived after the last token.
+  turn_interrupted_truncated: "⚠ Interrupted — output after this point was dropped, so this answer is incomplete. The turn finished on the server; re-ask to see the rest."
 
 # --- menu chrome + command descriptions (full i18n pass) ---
 command:
