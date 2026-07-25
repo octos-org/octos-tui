@@ -681,6 +681,23 @@ impl Store {
             .state
             .active_turn()
             .map(|(session_id, turn_id)| (session_id.clone(), turn_id.clone()))?;
+        // The user just Esc'd THIS turn. `live_reply` stays bound through the
+        // optimistic-idle freeze, so `active_turn()` is still `Some` and the
+        // gates above all pass — but the turn is being torn down. The server
+        // counts `Interrupting` as still-live and ACCEPTS the steer, then
+        // aborts the turn without draining its input buffer, so the prompt is
+        // dropped with only a server-side warning. Because the RPC succeeded,
+        // `pending_turn_steers` is popped with no attributed failure and the
+        // text is never re-staged — while the transcript already shows it as
+        // sent. Stage instead: `queue_or_start_prompt_turn` pushes to
+        // `pending_messages`, which drains into the NEXT turn.
+        //
+        // This is exactly the window the optimistic idle invites: the chip
+        // reads Idle after Esc, so typing the corrected prompt immediately is
+        // the natural next gesture.
+        if self.state.turn_locally_interrupted(&session_id, &turn_id) {
+            return None;
+        }
         self.state.record_submitted_user_prompt(
             session_id.clone(),
             turn_id.clone(),
@@ -6174,6 +6191,23 @@ impl Store {
         // keeps this turn idle + frozen until the terminal reconciles.
         self.state
             .mark_turn_interrupted(session_id.clone(), turn_id.clone());
+        // Drop the whole-job "Working"/octopus indicator too. `run_state` alone
+        // does NOT control it: `harness_status_active` is
+        // `orchestration[session].active || run_state == InProgress`, so on any
+        // ORCHESTRATING session (sub-agents, continuations — precisely the long
+        // turns people interrupt) idling the run-state left the harness line and
+        // its spinner on screen, and the optimistic idle silenced only the run
+        // chip. Worse, the event loop drives its animation tick off
+        // `run_state.is_active()`, so that still-visible spinner froze
+        // mid-glyph instead of disappearing.
+        //
+        // `fail_live_reply` already does exactly this on the terminal, for the
+        // same reason (the server sends orchestration `active:false` late or not
+        // at all) — this just stops waiting for the round-trip, matching the
+        // run-state above. Safe if the interrupt never lands: the periodic
+        // `session/orchestration` tick re-inserts any session that is genuinely
+        // still active.
+        self.state.orchestration.remove(&session_id);
         // Only downgrade an actively-STREAMING (spinning) turn. A turn parked on
         // an approval/question is Blocked (no spinner) — leave its state so the
         // chip keeps showing the pending decision until the terminal (review P3).
@@ -29532,6 +29566,119 @@ now analyzing the bus module"
         assert!(
             store.state.turn_locally_interrupted(&session_id, &turn_id),
             "the freeze marker still applies to a blocked interrupted turn"
+        );
+    }
+
+    /// Control for the interrupt gate below: on a healthy live turn a mid-turn
+    /// prompt still steers, so the next test proves the GATE changed behaviour
+    /// and not the surrounding setup.
+    #[test]
+    fn mid_turn_prompt_steers_into_a_live_turn_that_was_not_interrupted() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming");
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_TURN_STEER,
+        ]));
+        store.state.set_run_state_in_progress();
+
+        let command = store.queue_or_start_prompt_turn("more detail please".into(), "sent".into());
+
+        assert!(
+            matches!(command, Some(AppUiCommand::TurnSteer(_))),
+            "a live, non-interrupted turn still steers"
+        );
+        assert!(store.state.pending_messages.is_empty());
+        assert_eq!(store.state.pending_turn_steers.len(), 1);
+    }
+
+    /// Review finding 1: after Esc the run chip reads Idle, which invites the
+    /// user to immediately type a corrected prompt — but `live_reply` stays
+    /// bound through the freeze, so `active_turn()` was still `Some` and the
+    /// prompt STEERED into the turn the server is tearing down. The server
+    /// accepts a steer while `Interrupting`, then aborts without draining its
+    /// input buffer; because the RPC succeeded there is no attributed failure to
+    /// re-stage from, so the text was painted into the transcript as sent and
+    /// then silently dropped. It must stage for the next turn instead.
+    #[test]
+    fn submit_after_interrupt_stages_instead_of_steering_into_the_killed_turn() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_TURN_STEER,
+        ]));
+        store.state.set_run_state_in_progress();
+        store.interrupt_command().expect("interrupt");
+        // The freeze deliberately keeps the live reply bound, so every other
+        // steer gate still passes — the interrupt marker is the only thing
+        // standing between this prompt and the killed turn.
+        assert!(store.state.sessions[0].live_reply.is_some());
+        assert!(store.state.turn_locally_interrupted(&session_id, &turn_id));
+
+        let command =
+            store.queue_or_start_prompt_turn("fix the typo instead".into(), "sent".into());
+
+        assert!(
+            command.is_none(),
+            "no steer may be emitted into an interrupted turn"
+        );
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["fix the typo instead".to_string()],
+            "the prompt must stage for the NEXT turn"
+        );
+        assert!(
+            store.state.pending_turn_steers.is_empty(),
+            "nothing was steered, so nothing may sit in the steer stash"
+        );
+        // The transcript must not claim the prompt was sent — that echo is what
+        // made the loss invisible.
+        assert!(
+            store.state.optimistic_user_messages.is_empty(),
+            "a staged prompt must not be echoed as an already-sent user row"
+        );
+        assert!(
+            store.state.sessions[0]
+                .messages
+                .iter()
+                .all(|message| !message.content.contains("fix the typo instead")),
+            "the staged prompt must not appear in the transcript as sent"
+        );
+    }
+
+    /// Review finding N2: `harness_status_active` is
+    /// `orchestration[session].active || run_state == InProgress`, so idling the
+    /// run-state alone left the whole-job "Working" line and its spinner on
+    /// screen for orchestrating sessions — and because the event loop drives its
+    /// animation tick off `run_state.is_active()`, that spinner then froze
+    /// mid-glyph rather than disappearing. The optimistic idle has to drop the
+    /// orchestration indicator too, exactly as the terminal path already does.
+    #[test]
+    fn interrupt_clears_the_orchestration_working_indicator() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "streaming");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.orchestration.insert(
+            session_id.clone(),
+            octos_core::ui_protocol::SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 1,
+                pending_continuations: 0,
+                phase: Some("working".into()),
+            },
+        );
+        store.state.set_run_state_in_progress();
+
+        store.interrupt_command().expect("interrupt");
+
+        assert!(
+            !store.state.orchestration.contains_key(&session_id),
+            "Esc must drop the whole-job Working indicator, not just the run chip"
+        );
+        assert!(
+            !store.state.run_state.is_active(),
+            "the run chip idles as before"
         );
     }
 
