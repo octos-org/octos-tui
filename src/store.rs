@@ -456,6 +456,18 @@ impl Store {
             return None;
         }
 
+        // A focused peer is a read-only WATCH surface: plain prompts are refused
+        // (the operator steers peers from the master via `peer_send_input`), and
+        // the draft is KEPT (not cleared) so the text isn't lost when the user
+        // switches back to the master to send it. Slash/bang were handled above,
+        // so client-local commands (`/resume`, `!ls`, …) still work on a peer.
+        if self.state.focused_session_is_peer() {
+            self.state.status =
+                "Peer sessions are read-only — steer peers from the master with peer_send_input."
+                    .into();
+            return None;
+        }
+
         self.state.clear_current_composer_draft();
         // Accepted plain prompt — record before staging/sending. Slash/bang
         // returned above; readonly/empty/no-session were rejected above, so only
@@ -1334,6 +1346,87 @@ impl Store {
                 after: None,
             },
         ))
+    }
+
+    /// Durable `peer/closed` notification (octos#1801 v3): a peer session the
+    /// server tore down must vanish from the peer dock (Ctrl+L) and the session
+    /// switcher (Ctrl+S). Mirror of [`Self::apply_peer_staged_event`]'s
+    /// tui-local decode path — the vendored octos-core rev predates the
+    /// `UiNotification` variant, so the transport decodes the method string into
+    /// [`crate::model::PeerClosedParams`] directly.
+    ///
+    /// The peer is matched by its `peer-<slug>` TOPIC (`id.topic()`), the exact
+    /// identity `apply_peer_staged_event` mints. Durable ⇒ REPLAYED on reconnect
+    /// (and deliverable twice), so this is idempotent: when no open session
+    /// carries the topic it is a no-op — a replay after the row was already
+    /// dropped finds nothing and returns.
+    ///
+    /// Focus safety: a peer is a read-only WATCH surface with no composer draft
+    /// or staged-message queue, so unlike [`AppState::switch_selected_session`]
+    /// this removes the row and re-points focus directly (that shared switch
+    /// chokepoint cannot run here — the outgoing session no longer exists to
+    /// switch AWAY from, and its draft-persist bundle would attribute the live
+    /// composer to the wrong session). When the CLOSED peer was focused, focus
+    /// falls back to the master (first non-`peer-` session, else index 0) with a
+    /// Main chat view and a reset scroll — exactly the switch-visible fields
+    /// `switch_selected_session` resets. The transcript re-flushes on the next
+    /// draw the same way a normal switch does: the active session's id changed,
+    /// so the viewport's fingerprint check treats it as a full re-flush (no
+    /// store-side scrollback call — the store never reaches the scrollback).
+    fn apply_peer_closed_event(
+        &mut self,
+        event: crate::model::PeerClosedParams,
+    ) -> Option<AppUiCommand> {
+        // (a) Locate the peer row by its `peer-<slug>` topic. Absent ⇒ nothing
+        // to do (idempotent durable replay after the row was already dropped).
+        let idx = self
+            .state
+            .sessions
+            .iter()
+            .position(|session| session.id.topic() == Some(event.topic.as_str()))?;
+        let peer_key = self.state.sessions[idx].id.clone();
+
+        // (b) Drop the peer from every per-session map keyed by its key.
+        self.state.peer_session_meta.remove(&peer_key);
+        self.state.opened_peer_sessions.remove(&peer_key);
+        self.state.pending_session_approvals.remove(&peer_key);
+        self.state.pending_session_questions.remove(&peer_key);
+        self.state.pending_peer_kickoffs.remove(&peer_key);
+
+        // (c) Remove the row with focus safety. Capture the focus relationship
+        // BEFORE the Vec shifts under the removal.
+        let selected = self.state.selected_session;
+        let was_focused = idx == selected;
+        let removed_before_selected = idx < selected;
+        self.state.sessions.remove(idx);
+
+        if was_focused {
+            // Re-point focus at the master (first non-`peer-` session, else 0).
+            let master = self
+                .state
+                .sessions
+                .iter()
+                .position(|session| {
+                    !session
+                        .id
+                        .topic()
+                        .is_some_and(|topic| topic.starts_with("peer-"))
+                })
+                .unwrap_or(0);
+            self.state.selected_session = master;
+            self.state.chat_view = crate::model::ChatViewTarget::Main;
+            self.state.transcript_scroll = 0;
+        } else if removed_before_selected {
+            self.state.selected_session -= 1;
+        }
+
+        // Clamp: a removal can leave `selected_session` past the last row.
+        let max_index = self.state.sessions.len().saturating_sub(1);
+        if self.state.selected_session > max_index {
+            self.state.selected_session = max_index;
+        }
+
+        None
     }
 
     /// A peer session's `session/opened` landed with `go: false` (#395): land
@@ -2779,17 +2872,16 @@ impl Store {
     }
 
     /// Switch the active session to `session_id` and hydrate its transcript via
-    /// the existing `session/hydrate` render path. Reuses the active-turn guard
-    /// (`/stop`'s check): resuming mid-turn would swap the transcript out from
-    /// under a streaming reply, so while a turn is live this refuses — status
-    /// only, no command. Shared by the `/resume` picker selection and the
-    /// `/resume <query>` inline shortcut.
+    /// the existing `session/hydrate` render path. Shared by the `/resume`
+    /// picker selection and the `/resume <query>` inline shortcut.
+    ///
+    /// Switching the VIEW must NOT require the current turn to end: background
+    /// peers stream concurrently on their own `SessionView`, so an active
+    /// `live_reply` on the outgoing session is not a reason to refuse — it keeps
+    /// streaming after the switch. `switch_selected_session` stashes the
+    /// outgoing composer draft/queue and refreshes the incoming run-state; the
+    /// menu-close scrollback re-hydration handles the transcript swap.
     fn resume_session_command(&mut self, session_id: String) -> Option<AppUiCommand> {
-        if self.state.active_turn().is_some() {
-            self.state.status =
-                "Finish or stop the active turn before resuming another session.".into();
-            return None;
-        }
         let session_id = SessionKey(session_id);
         // Select the existing SessionView, or create a placeholder so the
         // switch is immediate; `apply_session_hydrate_result` also
@@ -6457,6 +6549,41 @@ impl Store {
         Some(AppUiCommand::RespondApproval(params))
     }
 
+    /// Sibling of [`Self::respond_approval_command`] for a BACKGROUND peer's
+    /// stashed approval (Peer Dock approve/deny): answer it WITHOUT switching to
+    /// the peer. Removes the entry from `pending_session_approvals` and builds
+    /// the SAME session-addressed [`ApprovalRespondParams`] — addressed to the
+    /// peer's OWN `session_id`/`approval_id`, exactly like the global path — so
+    /// the server routes the decision to that peer. No protocol change. Returns
+    /// `None` (with a status line) when the peer no longer has a pending
+    /// approval (already answered / raced).
+    pub fn respond_peer_approval_command(
+        &mut self,
+        session: &SessionKey,
+        action: ApprovalModalAction,
+    ) -> Option<AppUiCommand> {
+        let Some(approval) = self.state.pending_session_approvals.remove(session) else {
+            self.state.status = t!("status.no_active_approval").into_owned();
+            return None;
+        };
+
+        self.state.status = t!(
+            "status.approval_action",
+            action = action.status_label(),
+            title = approval.title
+        )
+        .into_owned();
+
+        let mut params = ApprovalRespondParams::new(
+            approval.session_id,
+            approval.approval_id,
+            action.decision(),
+        );
+        params.approval_scope = Some(action.approval_scope().into());
+
+        Some(AppUiCommand::RespondApproval(params))
+    }
+
     pub fn clear_composer_or_staged_messages(&mut self) {
         if !self.state.pending_messages.is_empty() {
             let cleared = self.state.pending_messages.len();
@@ -7201,6 +7328,7 @@ impl Store {
             ClientEvent::PeerPrepared(event) => self.apply_peer_prepared_event(event),
             ClientEvent::TurnSteered(event) => self.apply_turn_steered_event(event),
             ClientEvent::PeerStaged(event) => self.apply_peer_staged_event(event),
+            ClientEvent::PeerClosed(e) => self.apply_peer_closed_event(e),
             ClientEvent::PeerGathered(event) => self.apply_peer_gathered_event(event),
             ClientEvent::SubProvidersMutation(event) => {
                 self.apply_sub_providers_mutation_event(event);
@@ -14307,6 +14435,9 @@ mod tests {
         let done = SessionKey("local:tui#peer-done".into());
         let live = SessionKey("local:tui#peer-live".into());
         for (sid, slug) in [(&done, "done"), (&live, "live")] {
+            // A real peer is registered in BOTH the durable identity set and the
+            // mutable dock roster.
+            store.state.opened_peer_sessions.insert(sid.clone());
             store.state.peer_session_meta.insert(
                 sid.clone(),
                 crate::model::PeerMeta {
@@ -14336,11 +14467,18 @@ mod tests {
         assert!(matches!(outcome, SlashDispatchOutcome::Accepted(_)));
         assert!(
             !store.state.peer_session_meta.contains_key(&done),
-            "the finished peer is pruned"
+            "the finished peer is pruned from the dock roster"
         );
         assert!(
             store.state.peer_session_meta.contains_key(&live),
             "the still-running peer is kept"
+        );
+        // BUG A: `/peer clear` must NOT touch the durable identity set — a
+        // cleared done-peer stays a read-only peer, consistently.
+        assert!(
+            store.state.opened_peer_sessions.contains(&done)
+                && store.state.opened_peer_sessions.contains(&live),
+            "durable peer identity survives `/peer clear`"
         );
     }
 
@@ -14353,6 +14491,7 @@ mod tests {
         let live_turn = TurnId::new();
         let mut store = store_with_live_reply(live_turn.clone(), "streaming B");
         let session_id = store.state.sessions[0].id.clone();
+        store.state.opened_peer_sessions.insert(session_id.clone());
         store.state.peer_session_meta.insert(
             session_id.clone(),
             crate::model::PeerMeta {
@@ -15291,6 +15430,155 @@ mod tests {
         );
     }
 
+    // ── peer/closed — teardown removal (octos#1801 v3) ──────────────────────
+
+    /// A store with a master session (index 0, non-peer topic) plus one peer
+    /// row per slug, each registered in the durable identity set AND the dock
+    /// roster exactly as a real `session/opened` landing does. Returns the peer
+    /// keys in order.
+    fn store_with_master_and_peers(slugs: &[&str]) -> (Store, Vec<SessionKey>) {
+        let mut store = store_with_empty_session();
+        let mut peer_keys = Vec::new();
+        for slug in slugs {
+            let key = SessionKey(format!("coding:local:tui#peer-{slug}"));
+            store.state.sessions.push(SessionView {
+                id: key.clone(),
+                title: format!("peer-{slug}"),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            });
+            store.state.opened_peer_sessions.insert(key.clone());
+            store.state.peer_session_meta.insert(
+                key.clone(),
+                crate::model::PeerMeta {
+                    slug: (*slug).into(),
+                    brief_path: "/tmp/b.md".into(),
+                    agent_staged: true,
+                    created: std::time::Instant::now(),
+                    finished_at: None,
+                },
+            );
+            peer_keys.push(key);
+        }
+        (store, peer_keys)
+    }
+
+    /// The `peer/closed` notification params a server-side teardown produces
+    /// (the transport decodes the wire frame into this same struct). `topic`
+    /// carries the `peer-<slug>` identity used to locate the row.
+    fn closed_params(slug: &str) -> crate::model::PeerClosedParams {
+        crate::model::PeerClosedParams {
+            session_id: SessionKey("coding:local:tui#coding".into()),
+            topic: format!("peer-{slug}"),
+            slug: slug.into(),
+            profile_id: "coding".into(),
+        }
+    }
+
+    #[test]
+    fn peer_closed_removes_peer_from_dock_and_sessions() {
+        let (mut store, peers) = store_with_master_and_peers(&["alpha"]);
+        let peer = peers[0].clone();
+        assert!(store.state.peer_session_meta.contains_key(&peer));
+
+        let closed = store.apply_client_event(ClientEvent::PeerClosed(closed_params("alpha")));
+        assert!(
+            closed.is_none(),
+            "peer/closed emits no command, got {closed:?}"
+        );
+        assert!(
+            !store.state.peer_session_meta.contains_key(&peer),
+            "closed peer is gone from the dock roster"
+        );
+        assert!(
+            !store.state.opened_peer_sessions.contains(&peer),
+            "closed peer is gone from the durable identity set"
+        );
+        assert!(
+            !store
+                .state
+                .sessions
+                .iter()
+                .any(|session| session.id == peer),
+            "closed peer row is gone from the switcher list"
+        );
+    }
+
+    #[test]
+    fn peer_closed_focused_peer_falls_back_to_master() {
+        let (mut store, _peers) = store_with_master_and_peers(&["alpha"]);
+        // Focus the peer (index 1) inside a non-Main, scrolled view.
+        store.state.selected_session = 1;
+        store.state.transcript_scroll = 7;
+        store.state.chat_view = crate::model::ChatViewTarget::Agent("sub".into());
+
+        store.apply_client_event(ClientEvent::PeerClosed(closed_params("alpha")));
+
+        assert_eq!(
+            store.state.selected_session, 0,
+            "focus falls back to the master when the focused peer closes"
+        );
+        assert!(
+            store.state.selected_session < store.state.sessions.len(),
+            "selected_session stays in range"
+        );
+        assert_eq!(store.state.chat_view, crate::model::ChatViewTarget::Main);
+        assert_eq!(store.state.transcript_scroll, 0);
+        assert_eq!(
+            store
+                .state
+                .active_session()
+                .map(|session| session.id.clone()),
+            Some(SessionKey("local:test".into())),
+            "the master is now active"
+        );
+    }
+
+    #[test]
+    fn peer_closed_before_focused_decrements_selection() {
+        // [master(0), alpha(1), beta(2)], focused on beta.
+        let (mut store, peers) = store_with_master_and_peers(&["alpha", "beta"]);
+        let beta = peers[1].clone();
+        store.state.selected_session = 2;
+
+        // Close alpha (index 1 < 2) — the earlier row's removal shifts beta down.
+        store.apply_client_event(ClientEvent::PeerClosed(closed_params("alpha")));
+
+        assert_eq!(
+            store.state.selected_session, 1,
+            "removing a row before the focused one decrements the index"
+        );
+        assert_eq!(
+            store
+                .state
+                .active_session()
+                .map(|session| session.id.clone()),
+            Some(beta),
+            "the still-focused peer stays focused after the earlier row is removed"
+        );
+    }
+
+    #[test]
+    fn peer_closed_is_idempotent_on_replay() {
+        let (mut store, _peers) = store_with_master_and_peers(&["alpha"]);
+        let first = store.apply_client_event(ClientEvent::PeerClosed(closed_params("alpha")));
+        assert!(first.is_none());
+        let sessions_after = store.state.sessions.len();
+        let selected_after = store.state.selected_session;
+
+        // Durable reconnect replay after the row is already gone: no matching
+        // session → no panic, no command, no state change.
+        let replay = store.apply_client_event(ClientEvent::PeerClosed(closed_params("alpha")));
+        assert!(
+            replay.is_none(),
+            "replayed close is a no-op, got {replay:?}"
+        );
+        assert_eq!(store.state.sessions.len(), sessions_after);
+        assert_eq!(store.state.selected_session, selected_after);
+    }
+
     #[test]
     fn gather_slash_requires_peer_gather_capability() {
         // peer/prepare alone is not enough — /gather probes nothing on
@@ -15933,6 +16221,201 @@ mod tests {
         );
     }
 
+    /// Peer operator console (FIX 1): switching the VIEW must NOT be refused
+    /// while the focused session has a live turn — a background peer keeps
+    /// streaming on its own `SessionView` after the switch.
+    #[test]
+    fn resume_not_refused_while_current_session_has_live_reply() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: TurnId::new(),
+            text: "streaming…".into(),
+        });
+        assert!(
+            store.state.active_turn().is_some(),
+            "precondition: the focused session has a live turn"
+        );
+
+        let command = store.resume_session_command("local:b".into());
+        assert!(
+            matches!(command, Some(AppUiCommand::HydrateSession(_))),
+            "the switch proceeds (hydrate) instead of being refused"
+        );
+        assert_eq!(
+            store.state.selected_session, 1,
+            "focus moved to the resumed session"
+        );
+        assert!(
+            store.state.sessions[0].live_reply.is_some(),
+            "the outgoing session keeps streaming on its own SessionView"
+        );
+    }
+
+    /// Peer operator console (FIX 2): a peer view is read-only — a plain prompt
+    /// is refused and the draft is KEPT (so the operator can switch to the
+    /// master and send it there).
+    #[test]
+    fn compose_on_peer_focused_session_is_read_only() {
+        // Durable peer identity via the insert-only `opened_peer_sessions` set
+        // (populated at the peer-open chokepoint), not the mutable dock roster.
+        let peer = SessionKey("local:main#peer-refactor".into());
+        let mut store = store_with_two_sessions("local:a", "local:main#peer-refactor");
+        store.state.opened_peer_sessions.insert(peer);
+        store.state.selected_session = 1;
+        assert!(
+            store.state.focused_session_is_peer(),
+            "a focused opened-peer session is read-only"
+        );
+        store.state.composer = "hello peer".into();
+
+        let command = store.compose_command();
+        assert!(command.is_none(), "no turn starts on a read-only peer");
+        assert_eq!(
+            store.state.composer, "hello peer",
+            "the draft is KEPT for the operator to send from the master"
+        );
+        assert!(
+            store.state.status.contains("read-only"),
+            "the status explains the peer is read-only: {}",
+            store.state.status
+        );
+    }
+
+    /// Peer operator console (BUG A): peer identity is DURABLE and unambiguous —
+    /// keyed off the insert-only `opened_peer_sessions` set, NOT the mutable
+    /// `peer_session_meta` dock roster that `/peer clear` empties, and NOT a
+    /// topic-string check that would false-positive on an ordinary session whose
+    /// API topic merely starts with `peer-`.
+    #[test]
+    fn cleared_peer_stays_read_only_and_topic_lookalike_is_not_a_peer() {
+        let peer = SessionKey("local:main#peer-refactor".into());
+        let mut store = store_with_two_sessions("local:a", "local:main#peer-refactor");
+        // Registered as a peer in BOTH maps, as the open chokepoint does.
+        store.state.opened_peer_sessions.insert(peer.clone());
+        store.state.peer_session_meta.insert(
+            peer.clone(),
+            crate::model::PeerMeta {
+                slug: "refactor".into(),
+                brief_path: "/tmp/b.md".into(),
+                agent_staged: false,
+                created: std::time::Instant::now(),
+                finished_at: None,
+            },
+        );
+        store.state.selected_session = 1;
+
+        // `/peer clear` empties the dock roster, NOT the durable identity set.
+        store.state.peer_session_meta.clear();
+        assert!(
+            store.state.peer_session_meta.is_empty(),
+            "the dock roster is empty (post `/peer clear`)"
+        );
+        assert!(
+            store.state.opened_peer_sessions.contains(&peer),
+            "the durable identity set is NOT pruned by `/peer clear`"
+        );
+        assert!(
+            store.state.focused_session_is_peer(),
+            "a cleared-but-focused peer is STILL read-only"
+        );
+        store.state.composer = "hello".into();
+        assert!(store.compose_command().is_none(), "still read-only");
+        assert_eq!(store.state.composer, "hello", "the draft is kept");
+
+        // False-positive guard: an ORDINARY session whose API topic merely
+        // starts with `peer-` was never OPENED as a peer, so it is NOT one.
+        let lookalike = SessionKey("local:x#peer-manual".into());
+        store.state.sessions.push(SessionView {
+            id: lookalike.clone(),
+            title: "manual".into(),
+            profile_id: None,
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        });
+        store.state.selected_session = store.state.sessions.len() - 1;
+        assert_eq!(
+            lookalike.topic(),
+            Some("peer-manual"),
+            "its topic looks peer-ish"
+        );
+        assert!(
+            !store.state.focused_session_is_peer(),
+            "a topic-lookalike never opened as a peer is NOT read-only"
+        );
+    }
+
+    /// Peer operator console (FIX 3): a peer's stashed approval is answered from
+    /// the master dock WITHOUT switching — the command is addressed to the
+    /// peer's OWN session_id/approval_id, and the stash entry is removed.
+    #[test]
+    fn respond_peer_approval_targets_the_peer_and_clears_the_stash() {
+        let mut store = store_with_two_sessions("local:a", "local:tui#peer-refactor");
+        let peer = SessionKey("local:tui#peer-refactor".into());
+        store.state.opened_peer_sessions.insert(peer.clone());
+        store.state.peer_session_meta.insert(
+            peer.clone(),
+            crate::model::PeerMeta {
+                slug: "refactor".into(),
+                brief_path: "/tmp/b.md".into(),
+                agent_staged: false,
+                created: std::time::Instant::now(),
+                finished_at: None,
+            },
+        );
+        // Focused on the master (index 0) → the peer's approval stashes.
+        let event = approval_for("local:tui#peer-refactor", "Run shell command?");
+        let approval_id = event.approval_id.clone();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            event,
+        )));
+        assert!(
+            store.state.pending_session_approvals.contains_key(&peer),
+            "precondition: the peer's approval is stashed (chip-only)"
+        );
+        // BUG C: only actionable when the dock row is actually DRAWN. Tall
+        // terminal + expanded dock → the peer's row is visible → target it.
+        assert_eq!(
+            store.state.first_blocked_peer_with_approval(24),
+            Some(peer.clone()),
+            "a drawn peer row is the approve/deny target"
+        );
+        // Height too short (dock height-0) → no drawn affordance → not actionable.
+        assert_eq!(
+            store.state.first_blocked_peer_with_approval(5),
+            None,
+            "an off-screen affordance (dock height 0) is NOT actionable"
+        );
+        // Collapsed dock (pill only) → no per-row affordance → not actionable.
+        store.state.peer_dock_collapsed = true;
+        assert_eq!(
+            store.state.first_blocked_peer_with_approval(24),
+            None,
+            "a collapsed dock shows no per-row affordance"
+        );
+        store.state.peer_dock_collapsed = false;
+
+        let command =
+            store.respond_peer_approval_command(&peer, ApprovalModalAction::ApproveRequest);
+        let params = match command {
+            Some(AppUiCommand::RespondApproval(params)) => params,
+            other => panic!("expected RespondApproval, got {other:?}"),
+        };
+        assert_eq!(
+            params.session_id, peer,
+            "addressed to the peer's own session"
+        );
+        assert_eq!(
+            params.approval_id, approval_id,
+            "carries the peer's own approval id"
+        );
+        assert!(matches!(params.decision, ApprovalDecision::Approve));
+        assert!(
+            !store.state.pending_session_approvals.contains_key(&peer),
+            "the stash entry is removed once answered"
+        );
+    }
+
     /// tui#398: same background routing for AskUserQuestion.
     #[test]
     fn background_question_stashes_and_promotes() {
@@ -16480,7 +16963,12 @@ now analyzing the bus module"
     }
 
     #[test]
-    fn resume_session_is_refused_while_a_turn_is_active() {
+    fn resume_switches_view_even_while_a_turn_is_active() {
+        // FIX 1 (peer operator console): switching the VIEW must not require the
+        // active turn to end — a background peer keeps streaming on its own
+        // SessionView. Resuming a not-yet-open session mid-turn creates its
+        // placeholder and hydrates it rather than refusing (the old guard trapped
+        // focus on a peer that was mid-stream).
         let mut store = store_with_live_reply(TurnId::new(), "streaming");
         let before = store.state.sessions.len();
 
@@ -16488,11 +16976,22 @@ now analyzing the bus module"
             .dispatch_local_action(LocalAction::ResumeSession("coding:api:other".into()), None)
             .into_command();
 
-        assert!(command.is_none(), "resume must not hydrate mid-turn");
+        assert!(
+            matches!(command, Some(AppUiCommand::HydrateSession(_))),
+            "resume proceeds (hydrate) mid-turn instead of being refused"
+        );
         assert_eq!(
             store.state.sessions.len(),
-            before,
-            "no placeholder session is created while a turn is live"
+            before + 1,
+            "a placeholder session is created for the incoming session"
+        );
+        assert_eq!(
+            store
+                .state
+                .active_session()
+                .map(|session| session.id.0.as_str()),
+            Some("coding:api:other"),
+            "focus moved to the resumed session"
         );
     }
 

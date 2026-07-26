@@ -1618,7 +1618,14 @@ pub(super) fn render_composer(app: &AppState, palette: Palette, area: Rect) -> P
         )),
         ComposerPresentation::Empty | ComposerPresentation::Collapsed(_) => None,
     };
-    if !app.pending_messages.is_empty() {
+    if app.focused_session_is_peer() {
+        // Peer views are read-only watch surfaces — mirror the queued-messages
+        // hint's dimmed styling so the composer visibly reads as non-writable.
+        lines.push(Line::from(vec![Span::styled(
+            "peer · read-only — steer from the master".to_string(),
+            palette.muted().bg(palette.surface),
+        )]));
+    } else if !app.pending_messages.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             t!(
                 "app.composer_hint.queued_messages",

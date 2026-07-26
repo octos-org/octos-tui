@@ -75,6 +75,11 @@ pub enum ClientEvent {
     /// as `/peer`. Durable ⇒ replayed on reconnect, so the store handler is
     /// idempotent (a peer whose session already exists is a no-op).
     PeerStaged(crate::model::PeerStagedParams),
+    /// octos#1801 v3: durable `peer/closed` notification — a peer session the
+    /// server tore down; the store removes it from the peer dock (Ctrl+L) and
+    /// the session switcher (Ctrl+S). Durable ⇒ replayed on reconnect, so the
+    /// store handler is idempotent (an already-removed peer is a no-op).
+    PeerClosed(crate::model::PeerClosedParams),
     /// octos#1801 v2: `peer/gather` result — the peer blackboard rows
     /// (brief + latest result per staged peer). The store composes the
     /// `/gather` synthesis prompt from these and submits it into the CURRENT

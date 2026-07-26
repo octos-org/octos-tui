@@ -4029,6 +4029,27 @@ fn peer_strip_peer_rows(app: &AppState, terminal_height: u16) -> u16 {
         .min(terminal_height.saturating_sub(PEER_STRIP_MIN_TERMINAL_ROWS))
 }
 
+/// The peer session keys whose rows the Peer Dock ACTUALLY DRAWS at
+/// `terminal_height` this frame — the roster prefix `peer_strip_lines` renders
+/// (`roster.iter().take(rows)`), or empty when the dock is collapsed (the pill
+/// shows no per-peer affordance) or height-0 (pager active / terminal too short
+/// / no peers). Used to gate the dock's approve/deny keys so a peer whose ⚠
+/// affordance is off-screen (below the row cap) or hidden can't be actioned.
+pub(crate) fn visible_peer_dock_keys(
+    app: &AppState,
+    terminal_height: u16,
+) -> Vec<octos_core::SessionKey> {
+    if app.peer_dock_collapsed || peer_strip_height(app, terminal_height) == 0 {
+        return Vec::new();
+    }
+    let rows = peer_strip_peer_rows(app, terminal_height) as usize;
+    peer_dock_roster(app)
+        .into_iter()
+        .take(rows)
+        .map(|(session_id, _)| session_id.clone())
+        .collect()
+}
+
 /// #407: logical lines for the vertical Peer Dock. Row 0 is the title row
 /// (the collapsed pill when `peer_dock_collapsed`). Each following row is
 /// one peer: glyph (⚠ blocked / ✻ live / ○ idle) + slug + muted activity
@@ -4127,6 +4148,22 @@ pub(crate) fn peer_strip_lines(
             row_spans.push(Span::styled(
                 format!(" · ↓ {}", humanize_token_count(*output)),
                 palette.muted().bg(palette.surface),
+            ));
+        }
+        // Peer operator console: a peer with a stashed approval gets an
+        // actionable affordance on its row so the operator answers it from the
+        // master via Alt+Y / Alt+N (see the event loop) WITHOUT switching to the
+        // peer. Only APPROVALS get the yes/no affordance (a question-blocked peer
+        // needs the picker); the ⚠ glyph + `peer_activity_line` already carry the
+        // reason. Kept INLINE — no extra line — so the one-row-per-peer height
+        // reservation (`peer_strip_height`) stays exact.
+        if app.pending_session_approvals.contains_key(*session_id) {
+            row_spans.push(Span::styled(
+                "  [Alt+Y approve · Alt+N deny]".to_string(),
+                Style::default()
+                    .fg(palette.highlight)
+                    .bg(palette.surface)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
         lines.push(Line::from(row_spans));

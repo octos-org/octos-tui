@@ -10236,6 +10236,54 @@ mod tests {
         );
     }
 
+    /// Peer operator console (FIX 3): a peer with a stashed approval renders an
+    /// actionable `[Alt+Y approve · Alt+N deny]` affordance on its dock row, so
+    /// the operator answers it from the master WITHOUT switching to the peer.
+    #[test]
+    fn peer_dock_row_shows_approve_deny_affordance_for_a_stashed_approval() {
+        let mut app = autonomy_app_state();
+        let peer = SessionKey("local:tui#peer-blocked".into());
+        app.peer_session_meta.insert(
+            peer.clone(),
+            crate::model::PeerMeta {
+                slug: "blocked".into(),
+                brief_path: "/tmp/brief.md".into(),
+                agent_staged: false,
+                created: std::time::Instant::now(),
+                finished_at: None,
+            },
+        );
+        app.peer_dock_collapsed = false;
+
+        // No approval yet → no affordance on the row.
+        let before = lines_text(&peer_strip_lines(&app, Palette::for_theme(app.theme), 4));
+        assert!(
+            !before.contains("Alt+Y approve"),
+            "no affordance until an approval is stashed; got: {before}"
+        );
+
+        // Stash an approval for the peer (background — the master is focused).
+        app.pending_session_approvals.insert(
+            peer.clone(),
+            crate::model::ApprovalModalState::from_event(
+                octos_core::ui_protocol::ApprovalRequestedEvent::generic(
+                    peer.clone(),
+                    octos_core::ui_protocol::ApprovalId::new(),
+                    octos_core::ui_protocol::TurnId::new(),
+                    "shell",
+                    "Run shell command?",
+                    "run: rm -rf target",
+                ),
+            ),
+        );
+
+        let after = lines_text(&peer_strip_lines(&app, Palette::for_theme(app.theme), 4));
+        assert!(
+            after.contains("Alt+Y approve · Alt+N deny"),
+            "a stashed peer approval renders the approve/deny affordance; got: {after}"
+        );
+    }
+
     #[test]
     fn viewport_renders_live_ui_not_committed_history() {
         // Committed messages live in scrollback (finalized_history_lines), NOT
