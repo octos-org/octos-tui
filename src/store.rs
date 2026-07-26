@@ -10045,6 +10045,40 @@ impl Store {
                         kickoff,
                     );
                 }
+                // A kickoff-LESS `session/opened` for a PEER must NOT steal focus
+                // — it is a BACKGROUND peer re-open (e.g. a second open after the
+                // kickoff was already consumed on the first) NOT a user switch.
+                // The only opens that focus here are `--go` peers (kickoff still
+                // `Some(go=true)`, so `peer_kickoff.is_none()` is false) and
+                // genuine non-peer sessions. Land/refresh the row silently and
+                // leave the master focused. Mirror of the Bug-2 closed-peer guard.
+                let is_peer_open = session_id
+                    .topic()
+                    .is_some_and(|topic| topic.starts_with("peer-"))
+                    || self.state.opened_peer_sessions.contains(&session_id);
+                if peer_kickoff.is_none() && is_peer_open {
+                    if let Some(index) = self
+                        .state
+                        .sessions
+                        .iter()
+                        .position(|session| session.id == session_id)
+                    {
+                        self.state.sessions[index].profile_id = event.active_profile_id.clone();
+                    } else {
+                        self.state.sessions.push(SessionView {
+                            id: session_id.clone(),
+                            title: session_id
+                                .topic()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| session_id.0.clone()),
+                            profile_id: event.active_profile_id.clone(),
+                            messages: Vec::new(),
+                            tasks: Vec::new(),
+                            live_reply: None,
+                        });
+                    }
+                    return None;
+                }
                 if let Some(panes) = event.panes {
                     self.state.apply_pane_snapshot(panes);
                 }
@@ -15941,6 +15975,33 @@ mod tests {
         assert_eq!(
             store.state.selected_session, 0,
             "focus falls back to the master"
+        );
+    }
+
+    #[test]
+    fn peer_session_reopen_without_kickoff_does_not_steal_focus() {
+        // A background peer's kickoff is consumed on its FIRST open; a SECOND
+        // `session/opened` (kickoff-less) must NOT switch focus away from the
+        // master. Without the guard the fallthrough calls
+        // `switch_selected_session(peer)` and dumps the user on a read-only peer.
+        let (mut store, peers) = store_with_master_and_peers(&["alpha"]);
+        let peer = peers[0].clone();
+        assert_eq!(store.state.selected_session, 0, "master focused");
+        assert!(store.state.opened_peer_sessions.contains(&peer));
+        assert!(
+            !store.state.pending_peer_kickoffs.contains_key(&peer),
+            "no kickoff staged — this is a re-open, not a first open"
+        );
+
+        let command = peer_session_opened(&mut store, &peer);
+
+        assert_eq!(
+            store.state.selected_session, 0,
+            "a kickoff-less peer re-open leaves the master focused"
+        );
+        assert!(
+            !matches!(command, Some(AppUiCommand::SubmitPrompt(_))),
+            "no kickoff turn re-fires on a re-open"
         );
     }
 
