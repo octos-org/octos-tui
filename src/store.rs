@@ -1324,6 +1324,11 @@ impl Store {
                 t!("status.peer_staged_known", slug = event.slug.clone()).into_owned();
             return None;
         }
+        // A slug legitimately REUSED after a `peer/closed` restages here: clear
+        // any lingering close-stamp so this peer's own `session/opened` is not
+        // swallowed by the Bug 2 guard (the stamp only defends against a stale
+        // open from the PREVIOUS peer that shared this key).
+        self.state.recently_closed_peers.remove(&session_id);
         self.state.pending_peer_kickoffs.insert(
             session_id.clone(),
             crate::model::PeerKickoff {
@@ -1348,6 +1353,11 @@ impl Store {
         ))
     }
 
+    /// Window after a `peer/closed` during which a `session/opened` for the same
+    /// key is treated as a stale in-flight open and swallowed (Bug 2). Generous
+    /// enough to cover a delayed/replayed open, far below any real slug-reuse gap.
+    const RECENTLY_CLOSED_PEER_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Durable `peer/closed` notification (octos#1801 v3): a peer session the
     /// server tore down must vanish from the peer dock (Ctrl+L) and the session
     /// switcher (Ctrl+S). Mirror of [`Self::apply_peer_staged_event`]'s
@@ -1363,23 +1373,29 @@ impl Store {
     /// `opened_peer_sessions` identity set), is left untouched.
     ///
     /// Durable ⇒ REPLAYED on reconnect and deliverable twice — possibly BEFORE
-    /// the peer's `session/opened` lands — so the teardown of every durable map
-    /// runs UNCONDITIONALLY and idempotently. In particular the stashed
-    /// `pending_peer_kickoffs` entry is dropped so a late `session/opened`
-    /// cannot re-fire the kickoff and resurrect the peer. Only the `sessions`
-    /// row removal + focus recompute are gated on the row (and identity) being
-    /// present.
+    /// the peer's `session/opened` lands — so the IDENTITY teardown
+    /// (`pending_peer_kickoffs`, `opened_peer_sessions`, `peer_session_meta`)
+    /// runs UNCONDITIONALLY and idempotently. Dropping the stashed kickoff stops
+    /// a late `session/opened` from re-FIRING it; a stamp in
+    /// `recently_closed_peers` additionally makes that stale open a no-op so it
+    /// cannot land as a generic focused row (Bug 2). The `sessions` row removal,
+    /// the focus switch, AND the transient-state teardown are all gated on the
+    /// row + identity being present — a lookalike / wrong-profile / never-opened
+    /// key keeps its draft, stashed decisions, and modal.
     ///
     /// Focus: when the CLOSED peer was the FOCUSED session, refocus the master
     /// (first non-`peer-` session, else index 0) THROUGH the shared
     /// [`AppState::switch_selected_session`] bundle so the master's run-state,
     /// composer draft / staged queue, and any stashed pending decision all load.
     /// The switch runs WHILE the peer row is still present — keeping the Vec
-    /// consistent so the bundle's outgoing-draft persist targets the peer
-    /// itself (harmless: read-only, no draft), not a row that would shift under
-    /// an earlier removal — and the row is removed immediately after. A GLOBAL
-    /// approval/question modal still pointing at the closed peer is torn down
-    /// too (the switch would only overwrite it when the master has its own).
+    /// consistent so the bundle's outgoing-draft persist targets the peer, not a
+    /// row that would shift under an earlier removal — and the row is removed
+    /// immediately after. The peer's transient state (composer draft — which the
+    /// read-only composer RETAINS on refused input, so it can be non-empty —
+    /// plus stashed decisions) is then cleared, AFTER the switch's draft-persist
+    /// has re-written it. A GLOBAL approval/question modal still pointing at the
+    /// closed peer is torn down too (the switch only overwrites it when the
+    /// master has its own).
     fn apply_peer_closed_event(
         &mut self,
         event: crate::model::PeerClosedParams,
@@ -1393,47 +1409,36 @@ impl Store {
             &event.topic,
         );
         // Capture the durable peer identity BEFORE the teardown empties the set:
-        // the `sessions` row is removed only for a session that really WAS an
+        // the row AND its transient foreground state (draft / stashed decisions /
+        // global modal) are torn down only for a session that really WAS an
         // opened peer (guards a topic lookalike sharing the minted key).
         let was_opened_peer = self.state.opened_peer_sessions.contains(&peer_key);
 
-        // Bug 2: UNCONDITIONAL, idempotent teardown of every durable map keyed
-        // by the peer — runs even when no `sessions` row exists yet, so a close
-        // that races AHEAD of `session/opened` drops the stashed kickoff and a
-        // later open cannot resurrect the peer.
+        // Bug 2: stamp the retired key so a `session/opened` racing BEHIND this
+        // close (its kickoff dropped just below) is swallowed by the guard in
+        // `SessionOpened` rather than resurrected as a generic focused row.
+        // Pruned on access so it stays bounded even when no stale open follows.
+        self.state
+            .recently_closed_peers
+            .retain(|_, closed_at| closed_at.elapsed() < Self::RECENTLY_CLOSED_PEER_TTL);
+        self.state
+            .recently_closed_peers
+            .insert(peer_key.clone(), std::time::Instant::now());
+
+        // Bug 2: UNCONDITIONAL, idempotent teardown of the durable IDENTITY maps
+        // — runs even when no `sessions` row exists yet (durable replay /
+        // close-before-open), so the stashed kickoff is dropped and a later open
+        // cannot re-fire it. All peer-keyed, so a lookalike (never in these maps)
+        // is untouched regardless.
         self.state.pending_peer_kickoffs.remove(&peer_key);
         self.state.opened_peer_sessions.remove(&peer_key);
         self.state.peer_session_meta.remove(&peer_key);
-        self.state.pending_session_approvals.remove(&peer_key);
-        self.state.pending_session_questions.remove(&peer_key);
-        self.state
-            .composer_drafts
-            .retain(|draft| draft.session_id != peer_key);
-        // Bug 3: a GLOBAL approval/question modal is always the FOCUSED
-        // session's — tear it down when that session is the peer being closed
-        // (guarded by id, so another session's modal is untouched). The refocus
-        // switch below recomputes run-state, clearing the stale blocked latch.
-        if self
-            .state
-            .approval
-            .as_ref()
-            .is_some_and(|approval| approval.session_id == peer_key)
-        {
-            self.state.approval = None;
-        }
-        if self
-            .state
-            .user_question
-            .as_ref()
-            .is_some_and(|picker| picker.session_id == peer_key)
-        {
-            self.state.user_question = None;
-        }
 
-        // Bug 1: remove the `sessions` row only for a session that is the exact
-        // minted key AND a real opened peer. Absent ⇒ the unconditional teardown
-        // above was the whole job (durable replay / close-before-open / a
-        // lookalike or wrong-profile session that must NOT be removed).
+        // Bug 1: the `sessions` row — and the transient foreground teardown at
+        // the tail — apply ONLY to a session that is the exact minted key AND a
+        // real opened peer. Absent ⇒ the identity teardown above was the whole
+        // job (durable replay / close-before-open / a lookalike or wrong-profile
+        // session whose draft / decisions / modal must NOT be touched).
         let idx = self
             .state
             .sessions
@@ -1443,10 +1448,10 @@ impl Store {
 
         let was_focused = idx == self.state.selected_session;
         if was_focused {
-            // Bug 3: refocus the master THROUGH the switch bundle WHILE the peer
-            // row is still present (so the bundle's outgoing-draft persist
-            // targets the peer, not a row that an earlier removal would shift).
-            // Master = first non-`peer-` session, else index 0.
+            // Refocus the master THROUGH the switch bundle WHILE the peer row is
+            // still present (so the bundle's outgoing-draft persist targets the
+            // peer — cleared at the tail — not a row an earlier removal would
+            // shift under it). Master = first non-`peer-` session, else index 0.
             let master = self
                 .state
                 .sessions
@@ -1472,6 +1477,38 @@ impl Store {
         let max_index = self.state.sessions.len().saturating_sub(1);
         if self.state.selected_session > max_index {
             self.state.selected_session = max_index;
+        }
+
+        // Bug 3: tear down the peer's TRANSIENT foreground state AFTER the switch
+        // — the switch bundle's `persist_composer_draft_for_selected_session`
+        // re-writes the outgoing peer's composer draft (peer text is RETAINED on
+        // refused input, so it can be non-empty); clearing it BEFORE the switch
+        // would leave a stale draft keyed to the now-removed session. The stashed
+        // per-session decisions are dropped here too.
+        self.state
+            .composer_drafts
+            .retain(|draft| draft.session_id != peer_key);
+        self.state.pending_session_approvals.remove(&peer_key);
+        self.state.pending_session_questions.remove(&peer_key);
+        // A GLOBAL approval/question modal is the FOCUSED session's; after the
+        // switch it is the master's (promoted from its stash) or — when the
+        // master had none — still the closed peer's. Tear it down only in the
+        // latter case (guarded by id), so a master-owned modal is preserved.
+        if self
+            .state
+            .approval
+            .as_ref()
+            .is_some_and(|approval| approval.session_id == peer_key)
+        {
+            self.state.approval = None;
+        }
+        if self
+            .state
+            .user_question
+            .as_ref()
+            .is_some_and(|picker| picker.session_id == peer_key)
+        {
+            self.state.user_question = None;
         }
 
         None
@@ -9954,6 +9991,24 @@ impl Store {
             }
             UiNotification::SessionOpened(event) => {
                 let session_id = event.session_id.clone();
+                // Bug 2: a `session/opened` for a peer we JUST closed (its
+                // kickoff already dropped) would otherwise fall through to the
+                // generic open path below and resurrect it as a focused generic
+                // row. Swallow it within the close window; a legitimate slug
+                // REUSE either restages past the TTL or was un-stamped on restage
+                // (`apply_peer_staged_event`), so it is never suppressed. Pruned
+                // on access to stay bounded.
+                self.state
+                    .recently_closed_peers
+                    .retain(|_, closed_at| closed_at.elapsed() < Self::RECENTLY_CLOSED_PEER_TTL);
+                if self
+                    .state
+                    .recently_closed_peers
+                    .remove(&session_id)
+                    .is_some()
+                {
+                    return None;
+                }
                 // #395: a `/peer`-prepared session landing. Popped BEFORE the
                 // switch bundle so a `--go`-less peer never steals focus (and
                 // never clobbers the foreground workspace/pane state below).
@@ -15772,6 +15827,113 @@ mod tests {
             store.state.run_state,
             crate::model::SessionRunState::Idle,
             "master's run-state loaded via the switch bundle"
+        );
+    }
+
+    #[test]
+    fn peer_closed_then_late_open_is_swallowed_not_resurrected() {
+        // Bug 2: a `session/opened` that races BEHIND the peer's `peer/closed`
+        // must not fall through the generic open path and re-land the peer as a
+        // focused generic row.
+        let (mut store, peers) = store_with_master_and_peers(&["alpha"]);
+        let peer = peers[0].clone();
+        let rows_before = store.state.sessions.len();
+
+        store.apply_client_event(ClientEvent::PeerClosed(closed_params("alpha")));
+        assert_eq!(
+            store.state.sessions.len(),
+            rows_before - 1,
+            "close removes the peer row"
+        );
+        assert!(
+            store.state.recently_closed_peers.contains_key(&peer),
+            "close stamps the retired key"
+        );
+
+        let command = peer_session_opened(&mut store, &peer);
+        assert!(
+            command.is_none(),
+            "the stale open is swallowed (no submit, no open), got {command:?}"
+        );
+        assert!(
+            !store
+                .state
+                .sessions
+                .iter()
+                .any(|session| session.id == peer),
+            "the stale open must not resurrect the peer row"
+        );
+        assert_eq!(
+            store.state.selected_session, 0,
+            "focus stays on the master — the stale open never stole it"
+        );
+        // The stamp is consumed on the swallow so it cannot suppress twice.
+        assert!(
+            !store.state.recently_closed_peers.contains_key(&peer),
+            "the swallow consumes the stamp"
+        );
+    }
+
+    #[test]
+    fn peer_closed_slug_reuse_restages_and_reopens_normally() {
+        // Bug 2 corollary: a slug legitimately REUSED after a close must reopen —
+        // restaging un-stamps the key so its own `session/opened` is not swallowed.
+        let mut store = peer_capable_store();
+        let open = store.apply_client_event(ClientEvent::PeerStaged(staged_peer_params()));
+        let Some(AppUiCommand::OpenSession(params)) = open else {
+            panic!("staged peer must emit session/open, got {open:?}");
+        };
+        let peer_key = params.session_id.clone();
+        peer_session_opened(&mut store, &peer_key);
+
+        store.apply_client_event(ClientEvent::PeerClosed(crate::model::PeerClosedParams {
+            session_id: SessionKey("coding:local:test".into()),
+            topic: "peer-fix-nav".into(),
+            slug: "fix-nav".into(),
+            profile_id: "coding".into(),
+        }));
+        assert!(
+            store.state.recently_closed_peers.contains_key(&peer_key),
+            "close stamps the key"
+        );
+
+        // Restage the SAME slug: this must clear the stamp.
+        store.apply_client_event(ClientEvent::PeerStaged(staged_peer_params()));
+        assert!(
+            !store.state.recently_closed_peers.contains_key(&peer_key),
+            "restage of a reused slug clears the close-stamp"
+        );
+        let command = peer_session_opened(&mut store, &peer_key);
+        assert!(
+            matches!(command, Some(AppUiCommand::SubmitPrompt(_))),
+            "the reused peer reopens and fires its kickoff, got {command:?}"
+        );
+    }
+
+    #[test]
+    fn peer_closed_focused_clears_retained_composer_draft() {
+        // Bug 3: closing a FOCUSED peer refocuses the master THROUGH the switch
+        // bundle, whose outgoing-draft persist re-writes the peer's composer text
+        // (the read-only composer RETAINS refused input). The teardown runs AFTER
+        // the switch, so no stale draft survives keyed to the removed session.
+        let (mut store, peers) = store_with_master_and_peers(&["alpha"]);
+        let peer = peers[0].clone();
+        store.state.selected_session = 1;
+        store.state.composer = "half-typed steer".into();
+
+        store.apply_client_event(ClientEvent::PeerClosed(closed_params("alpha")));
+
+        assert!(
+            !store
+                .state
+                .composer_drafts
+                .iter()
+                .any(|draft| draft.session_id == peer),
+            "the closed peer leaves no composer draft keyed to its removed session"
+        );
+        assert_eq!(
+            store.state.selected_session, 0,
+            "focus falls back to the master"
         );
     }
 

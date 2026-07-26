@@ -4616,12 +4616,23 @@ pub struct AppState {
     pub peer_session_meta: std::collections::HashMap<SessionKey, PeerMeta>,
     /// Durable set of session keys EVER registered as a peer (via the
     /// `take_pending_peer_kickoff` open chokepoint). Unlike `peer_session_meta`
-    /// — the mutable DOCK roster that `/peer clear` prunes — this is INSERT-ONLY
-    /// (never removed), so a cleared done-peer STAYS a read-only peer; and unlike
-    /// a `topic().starts_with("peer-")` string check it cannot false-positive on
-    /// an ordinary session whose API-supplied topic merely starts with `peer-`.
-    /// This is the identity `focused_session_is_peer` reads.
+    /// — the mutable DOCK roster that `/peer clear` prunes — a `/peer clear` (dock
+    /// prune) NEVER removes from this set, so a cleared done-peer STAYS a
+    /// read-only peer; only a full `peer/closed` teardown (which also removes the
+    /// `sessions` row) drops the key. And unlike a `topic().starts_with("peer-")`
+    /// string check it cannot false-positive on an ordinary session whose
+    /// API-supplied topic merely starts with `peer-`. This is the identity
+    /// `focused_session_is_peer` reads.
     pub opened_peer_sessions: std::collections::HashSet<SessionKey>,
+    /// Peer keys retired by a recent `peer/closed`, each stamped at close time.
+    /// A `session/opened` that races BEHIND its `peer/closed` (the kickoff
+    /// already dropped) would otherwise fall through to the generic open path and
+    /// resurrect the peer as a focused generic row; a hit here within
+    /// `RECENTLY_CLOSED_PEER_TTL` swallows that stale open. Time-bounded (pruned
+    /// on access) so it stays small AND so a later peer that legitimately REUSES
+    /// the slug — restaged past the TTL, or explicitly un-stamped on restage — is
+    /// never suppressed.
+    pub recently_closed_peers: std::collections::HashMap<SessionKey, Instant>,
     pub approval_auto_open: bool,
     pub approval: Option<ApprovalModalState>,
     /// Pending AskUserQuestion picker (UPCR-2026-023), mirroring `approval`.
@@ -6555,6 +6566,7 @@ impl AppState {
             pending_peer_kickoffs: std::collections::HashMap::new(),
             peer_session_meta: std::collections::HashMap::new(),
             opened_peer_sessions: std::collections::HashSet::new(),
+            recently_closed_peers: std::collections::HashMap::new(),
             pending_session_approvals: std::collections::HashMap::new(),
             pending_session_questions: std::collections::HashMap::new(),
             approval_auto_open: true,
