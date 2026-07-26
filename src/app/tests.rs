@@ -3810,6 +3810,74 @@ mod tests {
     }
 
     #[test]
+    fn render_composer_peer_is_readonly_bar_not_editable_box() {
+        // Option B: a focused peer is a READ-ONLY watch surface — a single dim
+        // status row, not the bordered composer. No placeholder, no caret, and
+        // the reclaimed rows go to the transcript (1 reserved row, not 5).
+        let peer = SessionKey("coding:local:tui#peer-alpha".into());
+        let mut app = AppState::new(
+            vec![
+                SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "master".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+                SessionView {
+                    id: peer.clone(),
+                    title: "peer-alpha".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::assistant("peer output")],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+            ],
+            1, // focus the peer
+            "ready".into(),
+            None,
+            false,
+        );
+        app.opened_peer_sessions.insert(peer.clone());
+        // Focus on the composer pane makes the no-caret assertion meaningful:
+        // even here the peer bar must not place a cursor.
+        app.focus = crate::model::FocusPane::Composer;
+        assert!(app.focused_session_is_peer(), "precondition: peer focused");
+
+        assert_eq!(
+            composer_height(&app),
+            1,
+            "peer reserves a slim 1-row bar, not the 5-row composer box"
+        );
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let (buffer, cursor) = rendered_buffer_and_cursor(&app, palette);
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(
+            text.contains("read-only peer"),
+            "shows the read-only bar: {text:?}"
+        );
+        assert!(text.contains("steer from the master"));
+        assert!(
+            !text.contains("Ask Octos"),
+            "no editable-composer placeholder on a peer"
+        );
+        // render never placed a caret, so the backend cursor stays at its
+        // top-left default — not down in the (absent) composer input.
+        assert_eq!(
+            (cursor.x, cursor.y),
+            (0, 0),
+            "no caret placed for a read-only peer"
+        );
+    }
+
+    #[test]
     fn render_composer_is_tall_and_places_cursor_in_input() {
         let mut app = AppState::new(
             vec![SessionView {

@@ -153,6 +153,7 @@ app:
     large_paste: "Large paste collapsed | Enter sends full text | Ctrl+U clear"
     multiline_tail_lines: "Multiline input | showing tail, %{count} earlier line(s) hidden | Enter sends full text | Ctrl+U clear"
     multiline_tail_line: "Multiline input | showing tail of long line | Enter sends full text | Ctrl+U clear"
+    peer_readonly: "↳ read-only peer · steer from the master · Ctrl+S switch · Ctrl+C interrupt"
   hint:
     # Pane/modal footer hints (keyboard keys kept literal).
     list_nav: "j/k or Up/Down"

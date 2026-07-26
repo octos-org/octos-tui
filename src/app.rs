@@ -899,8 +899,15 @@ const COMPOSER_CHROME_ROWS: u16 = 4;
 const COMPOSER_MIN_HEIGHT: u16 = 5;
 const COMPOSER_MAX_INPUT_ROWS: u16 = 12;
 const COMPOSER_SIDE_COLUMNS: u16 = 6;
+/// A focused peer is a READ-ONLY watch surface: it has no editable composer, so
+/// it reserves a single dim status row (steer peers from the master) instead of
+/// the full bordered box — the reclaimed rows go to the peer's transcript.
+const PEER_READONLY_BAR_ROWS: u16 = 1;
 
 fn composer_height_for_size(app: &AppState, terminal_width: u16, terminal_height: u16) -> u16 {
+    if app.focused_session_is_peer() {
+        return PEER_READONLY_BAR_ROWS;
+    }
     match app.composer_presentation() {
         ComposerPresentation::Inline(text) => {
             COMPOSER_CHROME_ROWS
@@ -4680,7 +4687,10 @@ fn model_context_window_hint(app: &AppState, session_id: &SessionKey) -> u64 {
 }
 
 fn set_composer_cursor(frame: &mut impl FrameLike, app: &AppState, area: Rect) {
-    if app.focus != FocusPane::Composer {
+    // No caret on a read-only peer bar (there is no input surface). The height-1
+    // area already yields None from `composer_cursor_position`; this is the
+    // explicit intent guard.
+    if app.focus != FocusPane::Composer || app.focused_session_is_peer() {
         return;
     }
     if let Some(position) = composer_cursor_position(app, area) {
