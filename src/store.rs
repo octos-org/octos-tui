@@ -7992,6 +7992,12 @@ impl Store {
                 // other copy). Harmless when stale — TTL-pruned on take.
                 let pending_peer_prepare = self.state.pending_peer_prepare.clone();
                 let pending_peer_kickoffs = self.state.pending_peer_kickoffs.clone();
+                // Local-only close-stamps (Bug 2): the server never echoes them,
+                // so a snapshot rebuild would drop the late-open guard and let a
+                // durably-replayed `session/opened` for a just-closed peer land as
+                // a generic focused row. Carry them over like the kickoffs;
+                // TTL-pruned on next access.
+                let recently_closed_peers = self.state.recently_closed_peers.clone();
                 // octos#1807 local-only in-flight `turn/steer` stash: between
                 // dispatch and result the steered text lives ONLY here (the
                 // error fallback re-stages from it), so a replay landing in
@@ -8059,6 +8065,7 @@ impl Store {
                 state.pre_token_turns = pre_token_turns;
                 state.pending_peer_prepare = pending_peer_prepare;
                 state.pending_peer_kickoffs = pending_peer_kickoffs;
+                state.recently_closed_peers = recently_closed_peers;
                 state.pending_turn_steers = pending_turn_steers;
                 // Settle gates the snapshot already reflects BEFORE the
                 // optimistic restore below re-inserts un-echoed rows (which
@@ -19578,6 +19585,55 @@ now analyzing the bus module"
             store.state.session_reasoning_effort.get(&key),
             Some(&L::Max),
             "/thinking level must survive a snapshot replay"
+        );
+    }
+
+    #[test]
+    fn recently_closed_peer_stamp_survives_snapshot_replay() {
+        // Bug 2 across a reconnect: the close-stamp is local-only (never echoed),
+        // so a snapshot rebuild must carry it over — else a durably-replayed
+        // `session/opened` for the just-closed peer resurrects a generic focused
+        // row.
+        let (mut store, peers) = store_with_master_and_peers(&["alpha"]);
+        let peer = peers[0].clone();
+        let master = SessionKey("local:test".into());
+        store.apply_client_event(ClientEvent::PeerClosed(closed_params("alpha")));
+        assert!(store.state.recently_closed_peers.contains_key(&peer));
+
+        // Reconnect: the snapshot reflects only the surviving master (the peer is
+        // gone server-side); the local close-stamp must persist.
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![SessionView {
+                id: master.clone(),
+                title: "master".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            selected_session: 0,
+            status: "replayed".into(),
+            target: None,
+            readonly: false,
+        }));
+        assert!(
+            store.state.recently_closed_peers.contains_key(&peer),
+            "the close-stamp must survive a snapshot replay"
+        );
+
+        // A replayed `session/opened` for the closed peer is still swallowed.
+        let command = peer_session_opened(&mut store, &peer);
+        assert!(
+            command.is_none(),
+            "post-reconnect stale open is swallowed, got {command:?}"
+        );
+        assert!(
+            !store
+                .state
+                .sessions
+                .iter()
+                .any(|session| session.id == peer),
+            "the closed peer is not resurrected after reconnect"
         );
     }
 
