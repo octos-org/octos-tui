@@ -1355,53 +1355,98 @@ impl Store {
     /// `UiNotification` variant, so the transport decodes the method string into
     /// [`crate::model::PeerClosedParams`] directly.
     ///
-    /// The peer is matched by its `peer-<slug>` TOPIC (`id.topic()`), the exact
-    /// identity `apply_peer_staged_event` mints. Durable ⇒ REPLAYED on reconnect
-    /// (and deliverable twice), so this is idempotent: when no open session
-    /// carries the topic it is a no-op — a replay after the row was already
-    /// dropped finds nothing and returns.
+    /// Identity is the EXACT key `apply_peer_staged_event` mints —
+    /// `with_profile_topic(profile_id, "local", "tui", topic)` — so a session
+    /// matches only when BOTH its profile AND topic agree (plain key equality
+    /// encodes both). A same-topic peer in another profile, or a `peer-*` topic
+    /// lookalike never opened as a peer (absent from the durable
+    /// `opened_peer_sessions` identity set), is left untouched.
     ///
-    /// Focus safety: a peer is a read-only WATCH surface with no composer draft
-    /// or staged-message queue, so unlike [`AppState::switch_selected_session`]
-    /// this removes the row and re-points focus directly (that shared switch
-    /// chokepoint cannot run here — the outgoing session no longer exists to
-    /// switch AWAY from, and its draft-persist bundle would attribute the live
-    /// composer to the wrong session). When the CLOSED peer was focused, focus
-    /// falls back to the master (first non-`peer-` session, else index 0) with a
-    /// Main chat view and a reset scroll — exactly the switch-visible fields
-    /// `switch_selected_session` resets. The transcript re-flushes on the next
-    /// draw the same way a normal switch does: the active session's id changed,
-    /// so the viewport's fingerprint check treats it as a full re-flush (no
-    /// store-side scrollback call — the store never reaches the scrollback).
+    /// Durable ⇒ REPLAYED on reconnect and deliverable twice — possibly BEFORE
+    /// the peer's `session/opened` lands — so the teardown of every durable map
+    /// runs UNCONDITIONALLY and idempotently. In particular the stashed
+    /// `pending_peer_kickoffs` entry is dropped so a late `session/opened`
+    /// cannot re-fire the kickoff and resurrect the peer. Only the `sessions`
+    /// row removal + focus recompute are gated on the row (and identity) being
+    /// present.
+    ///
+    /// Focus: when the CLOSED peer was the FOCUSED session, refocus the master
+    /// (first non-`peer-` session, else index 0) THROUGH the shared
+    /// [`AppState::switch_selected_session`] bundle so the master's run-state,
+    /// composer draft / staged queue, and any stashed pending decision all load.
+    /// The switch runs WHILE the peer row is still present — keeping the Vec
+    /// consistent so the bundle's outgoing-draft persist targets the peer
+    /// itself (harmless: read-only, no draft), not a row that would shift under
+    /// an earlier removal — and the row is removed immediately after. A GLOBAL
+    /// approval/question modal still pointing at the closed peer is torn down
+    /// too (the switch would only overwrite it when the master has its own).
     fn apply_peer_closed_event(
         &mut self,
         event: crate::model::PeerClosedParams,
     ) -> Option<AppUiCommand> {
-        // (a) Locate the peer row by its `peer-<slug>` topic. Absent ⇒ nothing
-        // to do (idempotent durable replay after the row was already dropped).
+        // The peer key is minted EXACTLY as `apply_peer_staged_event` does, so
+        // profile + topic are both pinned by plain key equality below.
+        let peer_key = octos_core::SessionKey::with_profile_topic(
+            &event.profile_id,
+            "local",
+            "tui",
+            &event.topic,
+        );
+        // Capture the durable peer identity BEFORE the teardown empties the set:
+        // the `sessions` row is removed only for a session that really WAS an
+        // opened peer (guards a topic lookalike sharing the minted key).
+        let was_opened_peer = self.state.opened_peer_sessions.contains(&peer_key);
+
+        // Bug 2: UNCONDITIONAL, idempotent teardown of every durable map keyed
+        // by the peer — runs even when no `sessions` row exists yet, so a close
+        // that races AHEAD of `session/opened` drops the stashed kickoff and a
+        // later open cannot resurrect the peer.
+        self.state.pending_peer_kickoffs.remove(&peer_key);
+        self.state.opened_peer_sessions.remove(&peer_key);
+        self.state.peer_session_meta.remove(&peer_key);
+        self.state.pending_session_approvals.remove(&peer_key);
+        self.state.pending_session_questions.remove(&peer_key);
+        self.state
+            .composer_drafts
+            .retain(|draft| draft.session_id != peer_key);
+        // Bug 3: a GLOBAL approval/question modal is always the FOCUSED
+        // session's — tear it down when that session is the peer being closed
+        // (guarded by id, so another session's modal is untouched). The refocus
+        // switch below recomputes run-state, clearing the stale blocked latch.
+        if self
+            .state
+            .approval
+            .as_ref()
+            .is_some_and(|approval| approval.session_id == peer_key)
+        {
+            self.state.approval = None;
+        }
+        if self
+            .state
+            .user_question
+            .as_ref()
+            .is_some_and(|picker| picker.session_id == peer_key)
+        {
+            self.state.user_question = None;
+        }
+
+        // Bug 1: remove the `sessions` row only for a session that is the exact
+        // minted key AND a real opened peer. Absent ⇒ the unconditional teardown
+        // above was the whole job (durable replay / close-before-open / a
+        // lookalike or wrong-profile session that must NOT be removed).
         let idx = self
             .state
             .sessions
             .iter()
-            .position(|session| session.id.topic() == Some(event.topic.as_str()))?;
-        let peer_key = self.state.sessions[idx].id.clone();
+            .position(|session| session.id == peer_key)
+            .filter(|_| was_opened_peer)?;
 
-        // (b) Drop the peer from every per-session map keyed by its key.
-        self.state.peer_session_meta.remove(&peer_key);
-        self.state.opened_peer_sessions.remove(&peer_key);
-        self.state.pending_session_approvals.remove(&peer_key);
-        self.state.pending_session_questions.remove(&peer_key);
-        self.state.pending_peer_kickoffs.remove(&peer_key);
-
-        // (c) Remove the row with focus safety. Capture the focus relationship
-        // BEFORE the Vec shifts under the removal.
-        let selected = self.state.selected_session;
-        let was_focused = idx == selected;
-        let removed_before_selected = idx < selected;
-        self.state.sessions.remove(idx);
-
+        let was_focused = idx == self.state.selected_session;
         if was_focused {
-            // Re-point focus at the master (first non-`peer-` session, else 0).
+            // Bug 3: refocus the master THROUGH the switch bundle WHILE the peer
+            // row is still present (so the bundle's outgoing-draft persist
+            // targets the peer, not a row that an earlier removal would shift).
+            // Master = first non-`peer-` session, else index 0.
             let master = self
                 .state
                 .sessions
@@ -1413,14 +1458,17 @@ impl Store {
                         .is_some_and(|topic| topic.starts_with("peer-"))
                 })
                 .unwrap_or(0);
-            self.state.selected_session = master;
-            self.state.chat_view = crate::model::ChatViewTarget::Main;
-            self.state.transcript_scroll = 0;
-        } else if removed_before_selected {
-            self.state.selected_session -= 1;
+            self.state.switch_selected_session(master);
         }
 
-        // Clamp: a removal can leave `selected_session` past the last row.
+        // Remove the row, then repair the selection for the shift: any row at or
+        // before the current selection shifts it down by one. Bug 4: an empty
+        // `sessions` (a sole-row removal that should never happen — the master
+        // always exists) clamps to a safe 0 rather than dangling past the end.
+        self.state.sessions.remove(idx);
+        if idx < self.state.selected_session {
+            self.state.selected_session -= 1;
+        }
         let max_index = self.state.sessions.len().saturating_sub(1);
         if self.state.selected_session > max_index {
             self.state.selected_session = max_index;
@@ -15577,6 +15625,154 @@ mod tests {
         );
         assert_eq!(store.state.sessions.len(), sessions_after);
         assert_eq!(store.state.selected_session, selected_after);
+    }
+
+    #[test]
+    fn peer_closed_ignores_same_topic_in_a_different_profile() {
+        // A real peer under the "coding" profile.
+        let (mut store, peers) = store_with_master_and_peers(&["shared"]);
+        let coding_peer = peers[0].clone(); // coding:local:tui#peer-shared
+
+        // A close for the SAME topic but a DIFFERENT profile mints a different
+        // key (with_profile_topic pins the profile), so it must not match.
+        let event = crate::model::PeerClosedParams {
+            session_id: SessionKey("other:local:tui#coding".into()),
+            topic: "peer-shared".into(),
+            slug: "shared".into(),
+            profile_id: "other".into(),
+        };
+        let out = store.apply_client_event(ClientEvent::PeerClosed(event));
+        assert!(out.is_none());
+        assert!(
+            store.state.sessions.iter().any(|s| s.id == coding_peer),
+            "a same-topic peer in another profile must NOT be removed"
+        );
+        assert!(store.state.peer_session_meta.contains_key(&coding_peer));
+        assert!(store.state.opened_peer_sessions.contains(&coding_peer));
+    }
+
+    #[test]
+    fn peer_closed_ignores_a_peer_topic_lookalike_never_opened() {
+        let mut store = store_with_empty_session(); // master at index 0
+        // A session whose key IS the exact minted peer key but that was never
+        // opened AS a peer (absent from `opened_peer_sessions`) — a lookalike.
+        let lookalike =
+            octos_core::SessionKey::with_profile_topic("coding", "local", "tui", "peer-manual");
+        store.state.sessions.push(SessionView {
+            id: lookalike.clone(),
+            title: "manual".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        });
+        // NOT inserted into opened_peer_sessions.
+
+        let event = crate::model::PeerClosedParams {
+            session_id: SessionKey("coding:local:tui#coding".into()),
+            topic: "peer-manual".into(),
+            slug: "manual".into(),
+            profile_id: "coding".into(),
+        };
+        store.apply_client_event(ClientEvent::PeerClosed(event));
+        assert!(
+            store.state.sessions.iter().any(|s| s.id == lookalike),
+            "a peer-topic lookalike never opened as a peer must NOT be removed"
+        );
+    }
+
+    #[test]
+    fn peer_closed_before_open_clears_kickoff_so_a_later_open_does_not_resurrect() {
+        let mut store = peer_capable_store();
+        // Stage the peer: stashes the kickoff + emits session/open (no row yet).
+        let open = store.apply_client_event(ClientEvent::PeerStaged(staged_peer_params()));
+        let Some(AppUiCommand::OpenSession(params)) = open else {
+            panic!("staged peer must emit session/open, got {open:?}");
+        };
+        let peer_key = params.session_id.clone();
+        assert!(store.state.pending_peer_kickoffs.contains_key(&peer_key));
+
+        // Close arrives BEFORE session/opened — same profile+topic the stage
+        // minted ("coding" / "peer-fix-nav").
+        let closed =
+            store.apply_client_event(ClientEvent::PeerClosed(crate::model::PeerClosedParams {
+                session_id: SessionKey("coding:local:test".into()),
+                topic: "peer-fix-nav".into(),
+                slug: "fix-nav".into(),
+                profile_id: "coding".into(),
+            }));
+        assert!(closed.is_none());
+        assert!(
+            !store.state.pending_peer_kickoffs.contains_key(&peer_key),
+            "close before open must drop the stashed kickoff"
+        );
+
+        // The delayed session/opened lands: with no kickoff it must NOT re-fire
+        // a peer kickoff turn or re-register the peer.
+        let command = peer_session_opened(&mut store, &peer_key);
+        assert!(
+            !matches!(command, Some(AppUiCommand::SubmitPrompt(_))),
+            "a kickoff-less open must not resurrect the peer, got {command:?}"
+        );
+        assert!(
+            !store.state.opened_peer_sessions.contains(&peer_key),
+            "the closed peer must not re-enter the durable identity set"
+        );
+        assert!(
+            !store.state.peer_session_meta.contains_key(&peer_key),
+            "the closed peer must not reappear in the dock roster"
+        );
+    }
+
+    #[test]
+    fn peer_closed_focused_with_pending_approval_clears_modal_and_switches() {
+        let (mut store, peers) = store_with_master_and_peers(&["alpha"]);
+        let peer = peers[0].clone();
+        // Focus the peer and give it a GLOBAL approval modal + blocked run-state,
+        // exactly as a real approval promoted for the focused session would.
+        store.state.selected_session = 1;
+        store.state.approval = Some(crate::model::ApprovalModalState {
+            session_id: peer.clone(),
+            approval_id: octos_core::ui_protocol::ApprovalId::new(),
+            turn_id: octos_core::ui_protocol::TurnId::new(),
+            tool_name: "shell".into(),
+            title: "Run command".into(),
+            body: "approve?".into(),
+            approval_kind: None,
+            risk: None,
+            typed_details: None,
+            render_hints: None,
+            visible: true,
+        });
+        store.state.set_run_state_blocked("approve?");
+        assert!(store.state.run_state.is_active(), "blocked precondition");
+
+        store.apply_client_event(ClientEvent::PeerClosed(closed_params("alpha")));
+
+        assert!(
+            store.state.approval.is_none(),
+            "the closed focused peer's global approval modal is torn down"
+        );
+        assert_eq!(
+            store.state.selected_session, 0,
+            "focus falls back to the master"
+        );
+        assert_eq!(
+            store
+                .state
+                .active_session()
+                .map(|session| session.id.clone()),
+            Some(SessionKey("local:test".into())),
+            "the master is now active"
+        );
+        // The refocus went THROUGH switch_selected_session, so the master's
+        // run-state was recomputed — the stale blocked latch is cleared. A
+        // manual selected_session poke would have left it Blocked.
+        assert_eq!(
+            store.state.run_state,
+            crate::model::SessionRunState::Idle,
+            "master's run-state loaded via the switch bundle"
+        );
     }
 
     #[test]
