@@ -33,7 +33,9 @@ use crate::model::{
 pub enum WizardStep {
     /// Choose the UI language for onboarding and the current session.
     Language,
-    /// Create the local profile (name / username / email).
+    /// Create the local profile. On a nameable-profiles server this is a single
+    /// "Name this profile" prompt (`requested_id`); on older servers it falls
+    /// back to name / username / email.
     Profile,
     /// Choose the model family + model + provider route.
     Provider,

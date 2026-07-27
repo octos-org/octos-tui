@@ -78,7 +78,7 @@ fn typing_slash_scrollmode_filters_help_popup() {
 }
 
 #[test]
-fn typing_slash_onboard_filters_help_popup() {
+fn typing_a_slash_prefix_filters_the_help_popup() {
     // Session open (normal chat), capabilities advertised.
     let mut store = Store {
         state: AppState::new(
@@ -110,7 +110,7 @@ fn typing_slash_onboard_filters_help_popup() {
         message: "caps".into(),
     }));
 
-    for ch in "/onbo".chars() {
+    for ch in "/hel".chars() {
         handle_terminal_event(
             &mut store,
             Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
@@ -129,8 +129,21 @@ fn typing_slash_onboard_filters_help_popup() {
     eprintln!("COMPOSER: {:?}", store.state.composer);
     eprintln!("ITEMS: {ids:#?}");
     assert!(
-        spec.items.iter().any(|i| i.label.contains("onboard")),
-        "onboard should appear in the filtered popup"
+        spec.items.iter().any(|i| i.label.contains("help")),
+        "a visible command matching the typed prefix must appear in the popup"
+    );
+    // The probe used to be `/onbo`, but onboarding is now deliberately HIDDEN
+    // from the `/` menu while staying dispatchable by name (see
+    // `store::tests::onboard_is_hidden_from_menu_but_still_dispatchable`), so
+    // that prefix filters to an EMPTY popup and this contract tested nothing.
+    // Pin the hiding here too, so re-listing it is a deliberate change.
+    assert!(
+        !spec.items.iter().any(|i| i.label.contains("onboard")),
+        "onboarding is hidden from the `/` menu; items: {:?}",
+        spec.items
+            .iter()
+            .map(|i| i.label.as_str())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -186,7 +199,7 @@ fn slash_popup_renders_in_short_viewport() {
         },
         message: "caps".into(),
     }));
-    for ch in "/onbo".chars() {
+    for ch in "/hel".chars() {
         handle_terminal_event(
             &mut store,
             Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
@@ -211,7 +224,7 @@ fn slash_popup_renders_in_short_viewport() {
         .collect();
     eprintln!("ROWS: {rows:#?}");
     assert!(
-        rows.iter().any(|r| r.contains("/onboard")),
+        rows.iter().any(|r| r.contains("/help")),
         "the popup must be visible in the inline viewport"
     );
 }

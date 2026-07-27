@@ -4,7 +4,7 @@ use crate::menu::availability::{AvailabilityContext, CommandAvailability};
 use crate::model::{
     AppUiCommand, OnboardingAction, OnboardingWizardState, ProfileLlmCatalogResult,
     ProfileLlmListResult, ProfileSkillsListResult, ProfileSkillsRegistrySearchResult,
-    SessionMcpCatalog, SessionModelCatalog, SessionRuntimeStatus,
+    SessionMcpCatalog, SessionModelCatalog, SessionRuntimeStatus, SubProvidersListResult,
 };
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -108,6 +108,47 @@ impl CommandSpec {
 
     pub fn slash_name(&self) -> String {
         format!("/{}", self.name)
+    }
+
+    /// Whether a successful invocation may be persisted to the plaintext
+    /// command-history file (and recalled with Up). FAIL-CLOSED: only the
+    /// commands listed here are recorded; everything else — auth/credential
+    /// families (`onboard`/`login`/`provider`), config-upsert that can carry
+    /// tokens (`mcp`/`tools` upsert, `skills install <repo-url>`), and any newly
+    /// added command — defaults to NOT recorded, so it can never leak secrets/PII
+    /// to history before review. Checked on the canonical `name`, so aliases
+    /// (`/auth`=`/login`, `/setup`=`/onboard`) are covered too.
+    pub fn history_safe(&self) -> bool {
+        matches!(
+            self.name,
+            "ps" | "stop"
+                | "help"
+                | "activity"
+                | "copy"
+                | "exit"
+                | "model"
+                | "status"
+                | "cost"
+                | "resume"
+                | "rewind"
+                | "theme"
+                | "lang"
+                | "thinking"
+                | "scrollmode"
+                | "saveconfig"
+                | "vimmode"
+                | "statusline"
+                | "title"
+                | "keymap"
+                | "permissions"
+                | "task"
+                | "threads"
+                | "turn"
+                | "review"
+                | "agents"
+                | "goal"
+                | "loop"
+        )
     }
 }
 
@@ -239,6 +280,13 @@ impl AppUiActionKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocalAction {
+    /// Switch the main pane to a sub-agent's live view (`Some(agent_id)`) or
+    /// back to the session transcript (`None`) — the `/agents` picker's row
+    /// action (#323).
+    SwitchChatView(Option<String>),
+    /// Toggle the Agent Dock between the summary pill and per-agent rows
+    /// (#323); same effect as Alt+D.
+    ToggleAgentDock,
     ShowProcessStatus,
     ActivityNavigator,
     StopActiveTurn,
@@ -250,6 +298,16 @@ pub enum LocalAction {
     SaveKeymap,
     RefreshMenu(MenuId),
     EditComposer(String),
+    /// Insert `text` into the composer AT THE CURSOR (unlike `EditComposer`,
+    /// which replaces the whole draft). The `@` file picker's row action
+    /// (#363): the picked relative path lands where the user typed `@`.
+    InsertComposerText(String),
+    /// Codex Enter semantics for the slash popup: dispatch the highlighted
+    /// command IMMEDIATELY (one Enter goes straight to the command's
+    /// page/menu/action) instead of completing its name into the composer
+    /// and requiring a second Enter. The string is the full slash draft to
+    /// run (e.g. "/theme").
+    RunSlashCommand(String),
     Onboarding(OnboardingAction),
     Skills,
     McpConfig,
@@ -269,6 +327,9 @@ pub enum LocalAction {
     /// Set the per-session reasoning effort to a specific level from the
     /// `/thinking` selection menu. `None` clears the override (server default).
     SetThinkingLevel(Option<octos_core::ui_protocol::ReasoningEffortLevel>),
+    /// Toggle whether committed reasoning renders as a transcript block
+    /// for the active session (`/thinking` display row).
+    ToggleReasoningDisplay,
     /// Persist the runtime UI settings (theme/lang/scroll-mode/vim-mode) back to
     /// the launch config file (`/saveconfig`).
     SaveConfig,
@@ -284,6 +345,75 @@ pub enum LocalAction {
     /// `AppState::pending_clipboard`; the event loop emits the OSC 52 escape
     /// sequence so the copy works over SSH against the fleet minis.
     CopyLastReply,
+    /// Open the `/resume` session picker. Fetches `session/list` and opens the
+    /// resume selection menu, which renders `Loading` until the `SessionList`
+    /// result lands and refreshes it (same async pattern as `/cost`).
+    OpenResumePicker,
+    /// Resume a specific session chosen from the `/resume` picker: switch the
+    /// active session to `session_id` and hydrate its prior transcript through
+    /// the existing `session/hydrate` render path.
+    ResumeSession(String),
+    /// Open the `/rewind` turn picker. Snapshots the ACTIVE session's user
+    /// messages (newest-first) into `AppState::rewind_turns` and opens the
+    /// rewind selection menu. Unlike `/resume` this needs no fetch — the turns
+    /// are already in the local transcript — so the menu renders `Ready`
+    /// immediately (or `Unavailable` when there are no user turns to rewind to).
+    OpenRewindPicker,
+    /// Rewind the active session to an earlier user turn chosen from the
+    /// `/rewind` picker. `num_turns` trailing user turns are dropped server-side
+    /// via `session/rollback`; `prefill` (that turn's full text) is stashed and,
+    /// once the rollback result lands, put back in the composer to edit and
+    /// resend (rewind-and-edit). `session_id` is the session the picker rows
+    /// were built from: dispatch refuses when it no longer matches the active
+    /// session (the user switched sessions while the picker was open), so a
+    /// stale pick can never roll back the wrong session's turns.
+    RewindToTurn {
+        session_id: String,
+        num_turns: u32,
+        prefill: String,
+    },
+    /// `/btw <question>` — ask a quick aside answered out-of-band while the
+    /// current turn keeps working (no tools, ephemeral). The question is taken
+    /// from the command's inline args.
+    Btw,
+    /// `/profiles` — refresh the on-disk profile list + default pointer into
+    /// state and open the profiles surface (the picker, now a manager).
+    OpenProfilesSurface,
+    /// "Create a new profile" from the profiles surface: reset the create/wizard
+    /// state to a clean slate (so it doesn't resume the ACTIVE profile's setup
+    /// mid-session) and open onboarding at the "Name this profile" step.
+    CreateNewProfile,
+    /// Drill into the per-profile action menu for the given profile id.
+    SelectProfileForActions(String),
+    /// Set the given profile as the machine default (writes `default-profile`).
+    SetProfileDefault(String),
+    /// "Use this profile" from the profiles surface: switch the active session to
+    /// this profile by opening (or resuming) its session in the current folder.
+    SwitchToProfile(String),
+    /// Open the Yes/No delete confirm for the given profile id.
+    RequestDeleteProfile(String),
+    /// Confirmed: delete the given profile (descriptor + data dir) from disk.
+    ConfirmDeleteProfile(String),
+    /// Stage a configured model for removal and open its Yes/No confirm
+    /// (`/model` → "Remove a model…" picker row). The confirmed Yes row sends
+    /// `profile/llm/delete`.
+    RequestRemoveModel(Box<crate::model::ModelRemovalRequest>),
+    /// Stage a research provider lane for removal and open its Yes/No confirm
+    /// (`/research` menu → lane row). The captured `profile_id` + `key` are
+    /// carried to the confirm's Yes row, which sends
+    /// `profile/sub_providers/remove` — so a profile switch between select and
+    /// confirm cannot retarget the delete.
+    RequestRemoveResearchLane(Box<crate::model::ResearchLaneRemoval>),
+    /// Save the wizard's staged provider as the research lane with this key
+    /// (`MENU_RESEARCH_LANE_KEY` row: "cheap"/"strong"). Fires the
+    /// `profile/sub_providers/upsert` dispatch — the staged selection cannot
+    /// change while the picker is open (menus block composer + wizard edits),
+    /// so building the params at fire time reads exactly what the row showed.
+    SaveResearchLaneAs(String),
+    /// Stage a workspace-snapshot restore and open its Yes/No confirm
+    /// (`/undo` picker row, #1768). The captured session + snapshot id are
+    /// carried to the confirm's Yes row (`snapshot/restore`).
+    RequestRestoreSnapshot(Box<crate::model::SnapshotRestoreRequest>),
     Custom(&'static str),
 }
 
@@ -393,6 +523,10 @@ pub struct MenuItemState {
     pub loading: bool,
     pub destructive: bool,
     pub required_valid: Option<bool>,
+    /// A non-interactive display row (e.g. a section divider): rendered but
+    /// skipped by menu navigation and inert on Enter. Defaults to `false`
+    /// (every existing item stays selectable).
+    pub non_selectable: bool,
 }
 
 impl MenuItemState {
@@ -568,11 +702,17 @@ pub struct MenuAppSnapshot<'a> {
     /// Active session's reasoning effort, for marking the current `/thinking`
     /// menu item. `None` = server default (no per-session override).
     pub reasoning_effort: Option<octos_core::ui_protocol::ReasoningEffortLevel>,
+    /// Whether the active session renders reasoning as a transcript block,
+    /// for the `/thinking` display toggle row's on/off state.
+    pub reasoning_display: bool,
     pub permission_profile: Option<octos_core::ui_protocol::PermissionProfileSelection>,
     pub runtime_status: Option<&'a SessionRuntimeStatus>,
     pub model_catalog: Option<&'a SessionModelCatalog>,
     pub profile_llm_catalog: Option<&'a ProfileLlmCatalogResult>,
     pub profile_llm_state: Option<&'a ProfileLlmListResult>,
+    pub sub_providers_state: Option<&'a SubProvidersListResult>,
+    /// #1768: last snapshot list for the /undo picker.
+    pub snapshots_state: Option<&'a crate::model::SnapshotListResult>,
     pub profile_skills: Option<&'a ProfileSkillsListResult>,
     pub profile_skill_registry: Option<&'a ProfileSkillsRegistrySearchResult>,
     pub mcp_catalog: Option<&'a SessionMcpCatalog>,
@@ -587,6 +727,44 @@ pub struct MenuAppSnapshot<'a> {
     /// Current wheel-scroll mode, so the `/scrollmode` help entry can show
     /// which mode is active before the user toggles blindly.
     pub pinned_scroll: bool,
+    /// Prior sessions fetched via `session/list`, mirrored from
+    /// `AppState::resume_sessions` so the `/resume` picker (`resume_menu`) can
+    /// render one row per session. Empty until the first fetch lands (the menu
+    /// renders `Loading` in that window).
+    pub resume_sessions: &'a [crate::model::ResumeSessionRow],
+    /// #324: open-session chips for the Ctrl+S/Alt+S switcher popup.
+    pub session_chips: Vec<crate::model::SessionChipView>,
+    /// Whether a `session/list` result has landed, mirrored from
+    /// `AppState::resume_list_loaded`. Lets `resume_menu` tell a genuinely
+    /// in-flight fetch (render `Loading`) apart from a completed fetch that
+    /// returned zero sessions (render a "No sessions" placeholder), instead of
+    /// showing `Loading` forever whenever `resume_sessions` is empty.
+    pub resume_list_loaded: bool,
+    /// Active-session user turns for the `/rewind` picker, mirrored from
+    /// `AppState::rewind_turns` so `rewind_menu` can render one row per turn.
+    /// Empty when the active session has no user messages (the menu renders
+    /// `Unavailable` in that case).
+    pub rewind_turns: &'a [crate::model::RewindTurnRow],
+    /// `(used_tokens, window_tokens)` for the selected session — the numbers
+    /// behind the harness `ctx N%` gauge — so the `/context` menu can render
+    /// the live `used / max (pct%)` context-window usage. `None` until a token
+    /// estimate is known for the session.
+    pub context_window_usage: Option<(u64, u64)>,
+    /// Active-session sub-agent roster for the `/agents` picker (#323),
+    /// mirrored from `AppState::active_session_agents`.
+    pub agents: &'a [octos_core::ui_protocol::UiAgentRecord],
+    /// Agent ids with unread terminal outcomes (Agent Dock badges, #323).
+    pub unseen_agent_ids: &'a [String],
+    /// The agent currently shown in the main pane, when peeking one —
+    /// lets the picker mark the active row.
+    pub chat_view_agent_id: Option<&'a str>,
+    /// Whether the Agent Dock is collapsed to its summary pill, so the
+    /// picker's toggle row can label itself expand vs collapse.
+    pub agent_dock_collapsed: bool,
+    /// Workspace file list scanned when the `@` composer file picker was
+    /// opened, mirrored from `AppState::file_picker` so `file_picker_menu`
+    /// can render one row per file. `None` when the picker is not open.
+    pub file_picker: Option<&'a crate::file_picker::FilePickerState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

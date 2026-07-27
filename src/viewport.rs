@@ -39,6 +39,10 @@ pub struct ScrollbackTracker {
     /// the seam (per-flush collapse can't see across flushes). Seeds the next
     /// flush's blank-run collapse so cross-flush seams close to one blank.
     last_flushed_ends_blank: bool,
+    /// Whether the previous live tail had guarded sections (activity or pending
+    /// messages) whose separator rows can become orphaned when that tail settles
+    /// and shrinks away.
+    live_tail_had_guarded_sections: bool,
 }
 
 /// What the event loop should do with scrollback before drawing the viewport.
@@ -60,6 +64,37 @@ impl ScrollbackTracker {
         Self::default()
     }
 
+    /// Forget the COMMITTED flush watermark only, so the next [`Self::sync`]
+    /// re-emits the entire committed history — while PRESERVING the live-turn
+    /// watermarks (`active_live` / `completed_live`). Used when a `/btw`
+    /// aside is dismissed: the viewport shrink strands a blank band that a
+    /// committed re-flush fills, but the main turn may still be STREAMING —
+    /// wiping the live watermarks would re-emit its already-streamed rows
+    /// (they survive on screen; only the old viewport region was cleared)
+    /// and duplicate them in scrollback (codex P2 on #288). The preserved
+    /// `completed_live` also keeps the committed re-flush deduped against
+    /// content that already streamed live.
+    pub fn mark_committed_flush_stale(&mut self) {
+        self.last = CommittedFingerprint::default();
+        self.flushed_messages = 0;
+        self.last_flushed_ends_blank = false;
+    }
+
+    /// Forget everything already flushed, so the next [`Self::sync`] re-emits
+    /// the ENTIRE committed history (plus any already-streamed live-turn
+    /// content) as a fresh first flush.
+    ///
+    /// Used when the terminal takes the full viewport reset path on a resize
+    /// (width change either direction, or terminal-height shrink — see
+    /// `Terminal::resize_viewport_to`): that reset clears the whole visible
+    /// screen, erasing the transcript rows this tracker had flushed there.
+    /// Without a re-flush the chat visually vanishes — a bare composer on an
+    /// empty screen — with the pre-resize copy reachable only by scrolling
+    /// real scrollback, wrapped at the old width.
+    pub fn mark_flushed_stale(&mut self) {
+        *self = Self::new();
+    }
+
     /// Reconcile the tracker against the current app state and return the lines
     /// to push into scrollback. `wrap_width` is the inline-viewport width.
     pub fn sync(
@@ -69,6 +104,7 @@ impl ScrollbackTracker {
         wrap_width: usize,
     ) -> ScrollbackUpdate {
         let fingerprint = app::committed_messages_fingerprint(app);
+        let previous_live_tail_had_guarded_sections = self.live_tail_had_guarded_sections;
         let (previous_live, next_live) = self.reconcile_active_live(app);
         let mut lines_to_insert = Vec::new();
         let mut reset = false;
@@ -144,6 +180,8 @@ impl ScrollbackTracker {
             ));
         }
         self.active_live = next_live.filter(LiveTurnFinalization::has_flushed_content);
+        self.live_tail_had_guarded_sections =
+            app::live_tail_has_guarded_sections(app, self.active_live.as_ref());
 
         // A single flush concatenates committed history + live-turn deltas, each
         // of which guards only its own separators; their seam can stack into a
@@ -153,8 +191,14 @@ impl ScrollbackTracker {
         // single blank. On a reset the prior scrollback is stale, so don't carry
         // the seam across it.
         let seam_seed = !reset && self.last_flushed_ends_blank;
-        self.last_flushed_ends_blank =
-            app::collapse_blank_runs_seeded(&mut lines_to_insert, seam_seed);
+        let drop_orphaned_leading_blank_run = !reset
+            && previous_live_tail_had_guarded_sections
+            && !self.live_tail_had_guarded_sections;
+        self.last_flushed_ends_blank = app::collapse_blank_runs_seeded_orphan_guard(
+            &mut lines_to_insert,
+            seam_seed,
+            drop_orphaned_leading_blank_run,
+        );
 
         ScrollbackUpdate {
             lines_to_insert,
@@ -298,6 +342,129 @@ mod tests {
         );
     }
 
+    /// Peer operator console (FIX-4 reverted, user-found empty-view bug):
+    /// switching focus to a peer — even a FINISHED one (committed messages,
+    /// `live_reply == None`, so no live tail to render) — must show that peer's
+    /// transcript, NOT an empty view. On a session switch the tracker is
+    /// `mark_flushed_stale` (the menu-close path), so it re-syncs against the
+    /// now-focused peer; that sync must flush the peer's committed history.
+    #[test]
+    fn focused_finished_peer_flushes_its_committed_transcript() {
+        let master = AppUiSession {
+            id: SessionKey("local:main".into()),
+            title: "master".into(),
+            profile_id: None,
+            messages: vec![Message::user("master q"), Message::assistant("master a")],
+            tasks: Vec::new(),
+            live_reply: None,
+        };
+        let peer = AppUiSession {
+            id: SessionKey("local:main#peer-refactor".into()),
+            title: "peer".into(),
+            profile_id: None,
+            messages: vec![
+                Message::user("peer question"),
+                Message::assistant("peer answer text"),
+            ],
+            tasks: Vec::new(),
+            live_reply: None, // FINISHED: no live tail.
+        };
+        let mut app = AppState::new(vec![master, peer], 1, "ready".into(), None, false);
+        app.opened_peer_sessions
+            .insert(SessionKey("local:main#peer-refactor".into()));
+        assert!(
+            app.focused_session_is_peer(),
+            "focused on the finished peer"
+        );
+
+        // A session switch stales the tracker (menu-close `mark_flushed_stale`);
+        // a fresh tracker models that. The re-sync must flush the peer's history.
+        let mut tracker = ScrollbackTracker::new();
+        let update = tracker.sync(&app, palette(), 60);
+        let flushed: String = update
+            .lines_to_insert
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            flushed.contains("peer question") && flushed.contains("peer answer text"),
+            "a focused finished peer's committed transcript is flushed, not empty; got: {flushed}"
+        );
+    }
+
+    #[test]
+    fn mark_committed_flush_stale_preserves_live_watermarks() {
+        // A /btw dismissal re-flushes committed history while the main turn
+        // may still be streaming: the live watermarks must survive so (a)
+        // already-streamed live rows are not re-emitted (they survive on
+        // screen — only the old viewport region is cleared on shrink) and
+        // (b) the committed re-flush stays deduped against content that
+        // already streamed live.
+        let mut tracker = ScrollbackTracker::new();
+        let app = state(vec![Message::user("hi"), Message::assistant("a1")]);
+        let first = tracker.sync(&app, palette(), 60);
+        assert!(!first.lines_to_insert.is_empty());
+
+        let live = LiveTurnFinalization {
+            session_id: "local:test".into(),
+            turn_id: "turn-1".into(),
+            reply_flushed_text: "streamed so far".into(),
+            activity_flushed_items: 2,
+            activity_flushed_keys: vec!["k1".into(), "k2".into()],
+        };
+        tracker.active_live = Some(live.clone());
+        tracker.completed_live = vec![live.clone()];
+        tracker.live_tail_had_guarded_sections = true;
+
+        tracker.mark_committed_flush_stale();
+
+        assert_eq!(
+            tracker.active_live.as_ref().map(|l| l.turn_id.as_str()),
+            Some("turn-1"),
+            "active live watermark must survive"
+        );
+        assert_eq!(
+            tracker.completed_live.len(),
+            1,
+            "completed live dedup watermarks must survive"
+        );
+        assert!(tracker.live_tail_had_guarded_sections);
+        assert_eq!(tracker.flushed_messages, 0, "committed watermark reset");
+    }
+
+    #[test]
+    fn mark_flushed_stale_reflushes_the_whole_transcript() {
+        // The width-change full viewport reset clears the visible screen,
+        // erasing the transcript rows already flushed there. After
+        // mark_flushed_stale the next sync must re-emit the ENTIRE committed
+        // history (as a plain flush, not a reset — the screen was already
+        // cleared by the terminal), so the chat reappears freshly wrapped.
+        let mut tracker = ScrollbackTracker::new();
+        let app = state(vec![Message::user("hi"), Message::assistant("a1")]);
+        let first = tracker.sync(&app, palette(), 60);
+        assert!(!first.lines_to_insert.is_empty());
+
+        let settled = tracker.sync(&app, palette(), 60);
+        assert!(
+            settled.lines_to_insert.is_empty(),
+            "no growth -> nothing to flush"
+        );
+
+        tracker.mark_flushed_stale();
+        let reflushed = tracker.sync(&app, palette(), 50);
+        assert!(!reflushed.reset, "the terminal reset already cleared");
+        assert_eq!(
+            reflushed.lines_to_insert.len(),
+            app::finalized_history_lines(&app, palette(), 50).len(),
+            "must re-emit the full committed history at the new width"
+        );
+
+        // ...and the tracker keeps working incrementally afterwards.
+        let after = tracker.sync(&app, palette(), 50);
+        assert!(after.lines_to_insert.is_empty());
+    }
+
     #[test]
     fn appending_a_message_flushes_only_the_new_one() {
         let mut tracker = ScrollbackTracker::new();
@@ -373,7 +540,7 @@ mod tests {
             .join("");
         assert!(update.reset, "late activity log changes finalized history");
         assert!(
-            text.contains("Agent task completed") && text.contains("$ cargo test"),
+            text.contains("Agent task completed") && text.contains("Bash($ cargo test"),
             "reflush should include archived activity log: {text:?}"
         );
     }

@@ -163,11 +163,12 @@ fn default_config_path_resolves_under_config_dir() {
 }
 
 #[test]
-fn partial_prefix_completes_into_composer_then_executes() {
-    // The user's report: typing a partial name and pressing Enter must COMPLETE
-    // the full command into the composer (consistent with argful commands), not
-    // execute immediately. A no-arg command like /saveconfig is the case that
-    // used to diverge.
+fn partial_prefix_enter_dispatches_the_command() {
+    // Codex Enter semantics (slash-popup Enter dispatches the selection):
+    // `/saveconfig` takes no argument, so a partial prefix + ONE Enter
+    // dispatches it immediately — composer cleared, save executed. The old
+    // complete-into-composer + second-Enter round trip is gone; only
+    // REQUIRED-arg commands still complete into the composer (as "/name ").
     let path = unique_dir("complete").join("config.json");
     std::fs::write(&path, "{}").unwrap();
     let mut store = chat_store();
@@ -180,27 +181,19 @@ fn partial_prefix_completes_into_composer_then_executes() {
             Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
         );
     }
-    // First Enter: completes into the composer, does NOT run yet.
+    // Enter dispatches the highlighted argument-less command directly.
     handle_terminal_event(
         &mut store,
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
     assert_eq!(
-        store.state.composer, "/saveconfig",
-        "partial prefix + Enter completes the full command into the composer"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&path).unwrap().trim(),
-        "{}",
-        "completion must not execute the command yet"
-    );
-
-    // Second Enter: now it runs.
-    handle_terminal_event(
-        &mut store,
-        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        store.state.composer, "",
+        "dispatch clears the composer instead of completing into it"
     );
     let raw: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert!(raw.get("theme").is_some(), "second Enter executes the save");
+    assert!(
+        raw.get("theme").is_some(),
+        "one Enter from partial prefix executes the save"
+    );
 }

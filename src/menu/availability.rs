@@ -16,6 +16,12 @@ pub struct CommandAvailability {
     pub required_features: &'static [&'static str],
     pub required_feature_flags: &'static [&'static str],
     pub unavailable: UnavailablePolicy,
+    /// When `true`, the command is still fully dispatchable (typed by name,
+    /// resolved via `find`) but is omitted from the `/` slash-menu listing.
+    /// Used for commands whose inline sub-forms are internal plumbing (e.g.
+    /// `/onboard <field>` driving the first-launch wizard) that shouldn't
+    /// clutter a normal session's menu.
+    pub menu_hidden: bool,
 }
 
 impl CommandAvailability {
@@ -33,7 +39,14 @@ impl CommandAvailability {
             required_features: &[],
             required_feature_flags: &[],
             unavailable: UnavailablePolicy::Hide,
+            menu_hidden: false,
         }
+    }
+
+    /// Keep the command dispatchable but drop it from the `/` slash-menu list.
+    pub fn hidden_from_menu(mut self) -> Self {
+        self.menu_hidden = true;
+        self
     }
 
     pub fn local_mutating() -> Self {
@@ -107,7 +120,9 @@ impl CommandAvailability {
 
     pub fn evaluate(&self, ctx: &AvailabilityContext<'_>) -> AvailabilityStatus {
         if self.session == SessionRequirement::Open && !ctx.session_open {
-            return self.unavailable.status("requires an open session");
+            return self
+                .unavailable
+                .status(t!("menu.availability.requires_open_session"));
         }
 
         match self.task {
@@ -117,12 +132,12 @@ impl CommandAvailability {
             TaskRequirement::Idle => {
                 return self
                     .unavailable
-                    .status("requires the current turn to be idle");
+                    .status(t!("menu.availability.requires_idle_turn"));
             }
             TaskRequirement::Running => {
                 return self
                     .unavailable
-                    .status("requires an active turn or background task");
+                    .status(t!("menu.availability.requires_active_turn"));
             }
         }
 
@@ -131,10 +146,14 @@ impl CommandAvailability {
             ApprovalRequirement::NoApprovalModal if !ctx.approval_modal_visible => {}
             ApprovalRequirement::ApprovalModalVisible if ctx.approval_modal_visible => {}
             ApprovalRequirement::NoApprovalModal => {
-                return self.unavailable.status("approval modal has keyboard focus");
+                return self
+                    .unavailable
+                    .status(t!("menu.availability.approval_has_focus"));
             }
             ApprovalRequirement::ApprovalModalVisible => {
-                return self.unavailable.status("requires a visible approval modal");
+                return self
+                    .unavailable
+                    .status(t!("menu.availability.requires_approval_modal"));
             }
         }
 
@@ -142,9 +161,15 @@ impl CommandAvailability {
             RuntimeRequirement::Any => {}
             RuntimeRequirement::Mock if ctx.runtime == RuntimeMode::Mock => {}
             RuntimeRequirement::Protocol if ctx.runtime == RuntimeMode::Protocol => {}
-            RuntimeRequirement::Mock => return self.unavailable.status("requires mock mode"),
+            RuntimeRequirement::Mock => {
+                return self
+                    .unavailable
+                    .status(t!("menu.availability.requires_mock_mode"));
+            }
             RuntimeRequirement::Protocol => {
-                return self.unavailable.status("requires protocol mode");
+                return self
+                    .unavailable
+                    .status(t!("menu.availability.requires_protocol_mode"));
             }
         }
 
@@ -156,10 +181,12 @@ impl CommandAvailability {
             ConnectionRequirement::Connected => {
                 return self
                     .unavailable
-                    .status("requires a connected Octos UI server");
+                    .status(t!("menu.availability.requires_ui_server"));
             }
             ConnectionRequirement::Disconnected => {
-                return self.unavailable.status("requires disconnected mode");
+                return self
+                    .unavailable
+                    .status(t!("menu.availability.requires_disconnected"));
             }
         }
 
@@ -170,26 +197,28 @@ impl CommandAvailability {
         {
             return self
                 .unavailable
-                .status(format!("feature flag `{flag}` is disabled"));
+                .status(t!("menu.availability.feature_flag_disabled", flag = flag));
         }
 
         if !self.required_methods.is_empty() && ctx.capabilities.is_none() {
             return self
                 .unavailable
-                .status("Octos UI capabilities are not available");
+                .status(t!("menu.availability.ui_unavailable"));
         }
 
         if let Some(method) = self.required_methods.iter().find(|method| {
             ctx.unsupported_method_reason(method).is_some() || !ctx.supports_method(method)
         }) {
             if let Some(reason) = ctx.unsupported_method_reason(method) {
-                return self.unavailable.status(format!(
-                    "Octos UI method `{method}` is unsupported: {reason}"
+                return self.unavailable.status(t!(
+                    "menu.availability.method_unsupported",
+                    method = method,
+                    reason = reason
                 ));
             }
             return self
                 .unavailable
-                .status(format!("Octos UI method `{method}` is not available"));
+                .status(t!("menu.availability.method_unavailable", method = method));
         }
 
         if let Some(capabilities) = ctx.capabilities
@@ -206,17 +235,19 @@ impl CommandAvailability {
                 UnavailablePolicy::Disable
             };
             if let Some(reason) = ctx.unsupported_method_reason(method) {
-                return unavailable.status(format!(
-                    "Octos UI method `{method}` is unsupported: {reason}"
+                return unavailable.status(t!(
+                    "menu.availability.method_unsupported",
+                    method = method,
+                    reason = reason
                 ));
             }
-            return unavailable.status(format!("Octos UI method `{method}` is not available"));
+            return unavailable.status(t!("menu.availability.method_unavailable", method = method));
         }
 
         if !self.required_methods_any.is_empty() && ctx.capabilities.is_none() {
             return self
                 .unavailable
-                .status("Octos UI capabilities are not available");
+                .status(t!("menu.availability.ui_unavailable"));
         }
 
         if !self.required_methods_any.is_empty()
@@ -229,8 +260,10 @@ impl CommandAvailability {
                 ctx.unsupported_method_reason(method)
                     .map(|reason| (*method, reason))
             }) {
-                return self.unavailable.status(format!(
-                    "Octos UI method `{method}` is unsupported: {reason}"
+                return self.unavailable.status(t!(
+                    "menu.availability.method_unsupported",
+                    method = method,
+                    reason = reason
                 ));
             }
 
@@ -242,13 +275,13 @@ impl CommandAvailability {
                 .join(", ");
             return self
                 .unavailable
-                .status(format!("requires one of {methods}"));
+                .status(t!("menu.availability.requires_one_of", methods = methods));
         }
 
         if !self.required_features.is_empty() && ctx.capabilities.is_none() {
             return self
                 .unavailable
-                .status("Octos UI capabilities are not available");
+                .status(t!("menu.availability.ui_unavailable"));
         }
 
         if let Some(feature) = self
@@ -256,13 +289,16 @@ impl CommandAvailability {
             .iter()
             .find(|feature| !ctx.supports_feature(feature))
         {
-            return self
-                .unavailable
-                .status(format!("Octos UI feature `{feature}` is not available"));
+            return self.unavailable.status(t!(
+                "menu.availability.feature_unavailable",
+                feature = feature
+            ));
         }
 
         if self.readonly == ReadonlyPolicy::BlockMutating && ctx.readonly {
-            return self.unavailable.status("blocked in read-only mode");
+            return self
+                .unavailable
+                .status(t!("menu.availability.blocked_read_only"));
         }
 
         AvailabilityStatus::available()

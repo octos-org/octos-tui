@@ -10,27 +10,31 @@ use octos_core::ui_protocol::{
     ApprovalCommandDetails, ApprovalDiffDetails, ApprovalFilesystemDetails, ApprovalNetworkDetails,
     ApprovalRequestedEvent, ApprovalSandboxDetails, ApprovalSandboxEscalationDetails,
     ApprovalSandboxEscalationEndpoint, ApprovalScopesListResult, ApprovalTypedDetails,
-    MessageDeltaEvent, OutputCursor, PermissionProfileListResult, PermissionProfileSelection,
-    PermissionProfileSetResult, PreviewId, SessionHydrateResult, SessionOpenParams,
-    SessionOpenResult, SessionOpened, TaskArtifactReadResult, TaskOutputDeltaEvent,
-    TaskOutputReadResult, TaskRuntimeState, TaskUpdatedEvent, ThreadGraphGetResult,
-    ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnId,
-    TurnStartedEvent, TurnStateGetResult, UiCursor, UiNotification, UiPaneSnapshot,
-    UiProtocolCapabilities, WarningEvent, approval_kinds, methods, rpc_error_codes,
+    HydratedMessage, MessageDeltaEvent, OutputCursor, PermissionProfileListResult,
+    PermissionProfileSelection, PermissionProfileSetResult, PreviewId, SessionHydrateResult,
+    SessionListResult, SessionOpenParams, SessionOpenResult, SessionOpened, SessionRollbackResult,
+    TaskArtifactReadResult, TaskOutputDeltaEvent, TaskOutputReadResult, TaskRuntimeState,
+    TaskUpdatedEvent, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
+    ToolStartedEvent, TurnCompletedEvent, TurnId, TurnStartedEvent, TurnStateGetResult, UiCursor,
+    UiNotification, UiPaneSnapshot, UiProtocolCapabilities, WarningEvent, approval_kinds, methods,
+    rpc_error_codes,
 };
 use octos_core::ui_protocol::{
     JSON_RPC_VERSION, MAX_TEXT_FRAME_BYTES, RpcRequest, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
-    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
-    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    UI_PROTOCOL_V1,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde_json::Value;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncWriteExt, BufReader},
     process::Command,
     runtime::Runtime,
     sync::mpsc,
@@ -52,7 +56,8 @@ use crate::{
         PermissionProfileClientEvent, ProfileLlmCatalogClientEvent, ProfileLlmListClientEvent,
         ProfileLlmMutationClientEvent, ProfileLocalCreateClientEvent, ProfileSkillsListClientEvent,
         ProfileSkillsMutationClientEvent, ProfileSkillsRegistrySearchClientEvent,
-        SessionStatusClientEvent, ToolConfigListClientEvent, ToolConfigMutationClientEvent,
+        SessionBtwClientEvent, SessionStatusClientEvent, SubProvidersListClientEvent,
+        SubProvidersMutationClientEvent, ToolConfigListClientEvent, ToolConfigMutationClientEvent,
         ToolStatusClientEvent,
     },
     model::{
@@ -66,8 +71,9 @@ use crate::{
         ProfileSkillEntry, ProfileSkillRegistryPackage, ProfileSkillsListResult,
         ProfileSkillsMutationResult, ProfileSkillsRegistrySearchResult, ReviewStartResult,
         RuntimeHealthStatus, RuntimePolicyMcpServer, RuntimePolicyStamp, SessionStatusReadResult,
-        ToolConfigEntry, ToolConfigListResult, ToolConfigMutationResult, ToolPolicyDenial,
-        ToolStatus, ToolStatusListResult, ToolStatusSummary, auth_me_email, auth_me_profile_id,
+        SubProvidersListResult, SubProvidersMutationResult, ToolConfigEntry, ToolConfigListResult,
+        ToolConfigMutationResult, ToolPolicyDenial, ToolStatus, ToolStatusListResult,
+        ToolStatusSummary, auth_me_email, auth_me_profile_id,
     },
 };
 
@@ -195,13 +201,39 @@ fn clean_auth_token(token: String) -> Option<String> {
     (!token.is_empty()).then(|| token.to_owned())
 }
 
+/// Stable marker the `octos serve` backend prints to stderr when it refuses to
+/// start because another serve already owns the data directory (redb is
+/// single-writer-single-process). We spawn `octos serve --stdio` as a child; on
+/// its exit we grep the captured stderr for this token to recognize the conflict
+/// and STOP relaunching — instead of respawning it in a silent crash-loop. MUST
+/// match the server verbatim (octos `commands/serve.rs` DATA_DIR_LOCKED_MARKER).
+const DATA_DIR_LOCKED_MARKER: &str = "OCTOS_DATA_DIR_LOCKED";
+
+/// User-facing explanation shown (once, as an error) when [`DATA_DIR_LOCKED_MARKER`]
+/// is seen — and the code the store keys on to render it terminally.
+const DATA_DIR_LOCKED_CODE: &str = "data_dir_locked";
+
 pub struct ProtocolAppUiBackend {
     launch: AppUiLaunch,
     runtime: Option<Runtime>,
     runtime_error: Option<String>,
     driver: Option<ProtocolTransportDriver>,
     connection_state: ProtocolConnectionState,
+    reconnect: ReconnectBackoff,
     disconnected_status_reported: bool,
+    /// Latched when the spawned backend refuses to start because another serve
+    /// owns the data dir ([`DATA_DIR_LOCKED_MARKER`]). While set, reconnect is
+    /// suppressed so we don't respawn a backend that will only crash again —
+    /// the fix for the "two octos-tui competing for the DB" silent crash-loop.
+    fatal_error: Option<String>,
+    /// The session to re-open after a reconnect: the MOST RECENTLY opened
+    /// session, which tracks the user's current selection (set by `/resume`, a
+    /// tab-switch, or the initial launch open) — NOT the fixed launch
+    /// `--session`. Reopening the launch session instead silently yanked the
+    /// selection back to it (and, with no launch `--session`, never re-opened
+    /// the current session at all). Falls back to the launch session when
+    /// nothing has been opened yet.
+    reopen_session: Option<SessionOpenParams>,
     refresh_capabilities_on_reconnect: bool,
     queue: VecDeque<ClientEvent>,
     protocol: ProtocolExchange,
@@ -219,9 +251,120 @@ enum ProtocolConnectionState {
     Connected,
 }
 
+/// Delay before the first reconnect retry; doubles per consecutive failure.
+const RECONNECT_BACKOFF_BASE: Duration = Duration::from_millis(500);
+/// Ceiling for the exponential reconnect delay.
+const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(5);
+/// A connection that dies within this window of connecting counts as a
+/// failed attempt even though `connect()` itself succeeded — an instantly
+/// exiting stdio child (typo'd `--stdio-command`, crash-looping server)
+/// "connects" successfully every time, so a reset-on-connect policy would
+/// never let the backoff grow.
+const RECONNECT_SHORT_LIVED_WINDOW: Duration = Duration::from_secs(1);
+/// Wall-clock budget for the WebSocket connect + handshake. Without it, a
+/// blackholed endpoint blocks the UI thread for the OS TCP timeout on every
+/// reconnect attempt.
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Reconnect backoff state machine for the protocol transport.
+///
+/// `ensure_connected` runs on every event-loop tick (~25 ms) *and* on every
+/// send, so without gating, a dead endpoint is re-dialed tens of times per
+/// second forever. This struct schedules attempts at
+/// `RECONNECT_BACKOFF_BASE * 2^(failures-1)` (capped at
+/// `RECONNECT_BACKOFF_CAP`) after each consecutive failure.
+///
+/// Failure-reset choice (documented per review): failures are **not** reset
+/// merely because `connect()` succeeded — a spawn that exits instantly still
+/// "connects". Instead a connection proves itself by either
+///  - delivering a data frame ([`Self::record_frame`]), or
+///  - surviving at least [`RECONNECT_SHORT_LIVED_WINDOW`] before dying
+///    (checked in [`Self::record_disconnect`]).
+///
+/// Until proven, a connection that dies young counts as one more consecutive
+/// failure, so a spawn/exit crash-loop keeps backing off exponentially.
+#[derive(Debug, Default)]
+struct ReconnectBackoff {
+    last_attempt: Option<Instant>,
+    consecutive_failures: u32,
+    connected_at: Option<Instant>,
+}
+
+impl ReconnectBackoff {
+    /// Whether a reconnect may be attempted at `now`. Never blocks the first
+    /// attempt; afterwards gates on the failure-scaled delay since the last
+    /// attempt.
+    fn should_attempt(&self, now: Instant) -> bool {
+        match self.last_attempt {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= self.current_delay(),
+        }
+    }
+
+    /// Delay implied by the current consecutive-failure count.
+    fn current_delay(&self) -> Duration {
+        if self.consecutive_failures == 0 {
+            return Duration::ZERO;
+        }
+        // Exponent is clamped so the shift cannot overflow; the cap keeps
+        // the effective delay at RECONNECT_BACKOFF_CAP anyway.
+        let exponent = self.consecutive_failures.saturating_sub(1).min(8);
+        RECONNECT_BACKOFF_BASE
+            .saturating_mul(1u32 << exponent)
+            .min(RECONNECT_BACKOFF_CAP)
+    }
+
+    /// A connect attempt failed outright (spawn error, TCP/WS failure).
+    fn record_failure(&mut self, now: Instant) {
+        self.last_attempt = Some(now);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.connected_at = None;
+    }
+
+    /// A connect attempt succeeded. Does NOT reset the failure count — see
+    /// the type docs; the connection still has to prove itself.
+    fn record_success(&mut self, now: Instant) {
+        self.last_attempt = Some(now);
+        self.connected_at = Some(now);
+    }
+
+    /// The connection delivered a data frame: it is proven good, so the
+    /// failure streak resets and a later death is treated as fresh.
+    fn record_frame(&mut self) {
+        self.consecutive_failures = 0;
+        self.connected_at = None;
+    }
+
+    /// An established connection dropped. Deaths within
+    /// [`RECONNECT_SHORT_LIVED_WINDOW`] of the connect count as one more
+    /// consecutive failure (crash-loop); longer-lived connections reset the
+    /// streak so a healthy server restart reconnects immediately. Calls
+    /// while already disconnected are no-ops, so the quiet backing-off
+    /// `ensure_connected` error path cannot push the schedule forward.
+    fn record_disconnect(&mut self, now: Instant) {
+        let Some(connected_at) = self.connected_at.take() else {
+            return;
+        };
+        if now.saturating_duration_since(connected_at) < RECONNECT_SHORT_LIVED_WINDOW {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            self.last_attempt = Some(now);
+        } else {
+            self.consecutive_failures = 0;
+        }
+    }
+
+    fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingRequest {
     method: String,
+    /// For `profile/llm/select`: the session that initiated the request, so
+    /// the response updates exactly that session's caches — correlation by
+    /// JSON-RPC request id, immune to reply reordering and queue drift.
+    select_session: Option<SessionKey>,
 }
 
 #[derive(Debug, Default)]
@@ -245,6 +388,16 @@ impl CancelledRequest {
 enum ProtocolTransportDriver {
     WebSocket(WebSocketTransportDriver),
     Stdio(StdioTransportDriver),
+}
+
+impl ProtocolTransportDriver {
+    /// True for the stdio child-process driver. A reconnect on this driver
+    /// means the previous `serve --stdio` child is GONE (a new process was
+    /// spawned), unlike a WebSocket reconnect where the server — and any
+    /// in-flight turn — kept running across the socket drop.
+    fn is_stdio_child(&self) -> bool {
+        matches!(self, Self::Stdio(_))
+    }
 }
 
 enum TransportCommand {
@@ -302,11 +455,20 @@ impl ProtocolExchange {
     ) -> Result<RpcRequest<serde_json::Value>> {
         let command = self.command_with_resume_cursor(command);
         let method = command.method().to_string();
+        let select_session = match &command {
+            AppUiCommand::ProfileLlmSelect(params) => params.session_id.clone(),
+            _ => None,
+        };
         let request_id = self.next_request_id();
         let request = rpc_request_from_command(request_id.clone(), command)?;
 
-        self.pending_requests
-            .insert(request_id, PendingRequest { method });
+        self.pending_requests.insert(
+            request_id,
+            PendingRequest {
+                method,
+                select_session,
+            },
+        );
 
         Ok(request)
     }
@@ -475,8 +637,18 @@ impl WebSocketTransportDriver {
             self.auth_token.as_deref(),
             self.profile_id.as_deref(),
         )?;
+        // `connect` runs on the UI thread (block_on), so the TCP connect +
+        // WS handshake must be time-bounded: a blackholed endpoint would
+        // otherwise freeze the interface for the OS TCP timeout.
         let (stream, _) = runtime
-            .block_on(async { connect_async(request).await })
+            .block_on(async {
+                tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(request))
+                    .await
+                    .map_err(|_| {
+                        eyre!("connect timed out after {}s", WS_CONNECT_TIMEOUT.as_secs())
+                    })?
+                    .map_err(eyre::Report::from)
+            })
             .wrap_err_with(|| {
                 format!("failed to connect UI protocol endpoint {}", self.endpoint)
             })?;
@@ -673,6 +845,19 @@ impl StdioTransportDriver {
         let mut child = runtime
             .block_on(async {
                 let mut command = shell_command(&self.command);
+                // Multi-instance stdio: isolate this window's runtime (redb
+                // stores, sessions, goals, the serve flock) under a per-cwd
+                // instance dir so several octos-tui windows can run at once
+                // while sharing one profile registry. No-op for explicit
+                // --data-dir launches, remote launches, or when opted out via
+                // OCTOS_TUI_SHARED_INSTANCE. Re-spawns (reconnects) resolve to
+                // the same dir, so a reconnect re-attaches, not forks.
+                if let Some(instance_dir) = crate::profiles::instance_data_dir_for_launch(
+                    Some(&self.command),
+                    &std::env::current_dir().unwrap_or_default(),
+                ) {
+                    command.env("OCTOS_INSTANCE_DATA_DIR", &instance_dir);
+                }
                 command
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
@@ -700,9 +885,14 @@ impl StdioTransportDriver {
             .take()
             .ok_or_else(|| eyre!("UI protocol stdio child stderr was not piped"))?;
         let mut stdin = stdin;
-        let mut lines = BufReader::new(stdout).lines();
-        let mut stderr_lines = BufReader::new(stderr).lines();
+        // Capped line readers instead of `lines()`: `next_line()` accumulates
+        // a whole line in memory before any size check can run, so a single
+        // giant (or endless, never-newline) stdout line would balloon the
+        // process before the MAX_TEXT_FRAME_BYTES check ever saw it.
+        let mut stdout_lines = CappedLineReader::new(BufReader::new(stdout), MAX_TEXT_FRAME_BYTES);
+        let mut stderr_lines = CappedLineReader::new(BufReader::new(stderr), STDIO_STDERR_LINE_CAP);
         let mut stderr_open = true;
+        let mut stderr_ring = StderrRing::default();
         let (command_tx, mut command_rx) = mpsc::channel(PROTOCOL_TRANSPORT_QUEUE_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(PROTOCOL_TRANSPORT_QUEUE_CAPACITY);
 
@@ -735,17 +925,59 @@ impl StdioTransportDriver {
                             break;
                         }
                     }
-                    line = lines.next_line() => {
+                    line = stdout_lines.next_line() => {
                         match line {
-                            Ok(Some(text)) => {
+                            Ok(CappedLine::Line(text)) => {
                                 if event_tx.send(stdio_text_frame_event(text)).await.is_err() {
                                     break;
                                 }
                             }
-                            Ok(None) => {
-                                let _ = event_tx.send(TransportEvent::Disconnected(
-                                    "UI protocol stdio stdout closed; reconnect will relaunch on next send/read.".into(),
-                                )).await;
+                            Ok(CappedLine::TooLong { discarded }) => {
+                                // One oversized frame is dropped, not fatal: a
+                                // stdio disconnect respawns a FRESH server and
+                                // loses all session state, which is strictly
+                                // worse than skipping a single frame.
+                                if event_tx
+                                    .send(stdio_frame_too_large_skipped_event(discarded))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(CappedLine::NotUtf8 { lossy }) => {
+                                // A mangled frame's request id is unknowable;
+                                // forwarding the lossy text would just decode
+                                // as malformed_json and silently leak its
+                                // pending-request entry. Skip it like TooLong
+                                // (the backend cancels pending requests).
+                                if event_tx
+                                    .send(stdio_frame_not_utf8_skipped_event(lossy.len()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(CappedLine::Eof) => {
+                                // stdout closed: the child is usually exiting.
+                                // Reap it (bounded) so the disconnect message
+                                // carries exit status + stderr tail instead of
+                                // a bare "closed".
+                                let status =
+                                    tokio::time::timeout(STDIO_EXIT_DRAIN_BUDGET, child.wait())
+                                        .await;
+                                if stderr_open {
+                                    drain_stderr_to_eof(&mut stderr_lines, &mut stderr_ring).await;
+                                }
+                                let message = match status {
+                                    Ok(status) => stdio_exit_disconnect_message(
+                                        &status,
+                                        stderr_ring.tail(),
+                                    ),
+                                    Err(_) => "UI protocol stdio stdout closed; reconnect will relaunch on next send/read.".to_string(),
+                                };
+                                let _ = event_tx.send(TransportEvent::Disconnected(message)).await;
                                 break;
                             }
                             Err(err) => {
@@ -760,8 +992,17 @@ impl StdioTransportDriver {
                     }
                     line = stderr_lines.next_line(), if stderr_open => {
                         match line {
-                            Ok(Some(_)) => {}
-                            Ok(None) => {
+                            Ok(CappedLine::Line(text)) => {
+                                stderr_ring.push(text);
+                            }
+                            Ok(CappedLine::TooLong { discarded }) => {
+                                stderr_ring.push(format!("[stderr line dropped: {discarded} bytes]"));
+                            }
+                            Ok(CappedLine::NotUtf8 { lossy }) => {
+                                // Diagnostics keep best-effort text.
+                                stderr_ring.push(lossy);
+                            }
+                            Ok(CappedLine::Eof) => {
                                 stderr_open = false;
                             }
                             Err(err) => {
@@ -775,15 +1016,17 @@ impl StdioTransportDriver {
                         }
                     }
                     status = child.wait() => {
-                        let message = match status {
-                            Ok(status) => format!(
-                                "UI protocol stdio child exited with {status}; reconnect will relaunch on next send/read."
-                            ),
-                            Err(err) => format!(
-                                "failed to wait for UI protocol stdio child: {err}; reconnect will relaunch on next send/read."
-                            ),
-                        };
-                        let _ = event_tx.send(TransportEvent::Disconnected(message)).await;
+                        // Pipe contents survive child death: drain buffered
+                        // stdout to EOF first (bounded) so final responses are
+                        // delivered before the disconnect, then collect the
+                        // stderr tail for the exit report.
+                        drain_stdout_to_eof(&mut stdout_lines, &event_tx).await;
+                        if stderr_open {
+                            drain_stderr_to_eof(&mut stderr_lines, &mut stderr_ring).await;
+                        }
+                        let _ = event_tx.send(TransportEvent::Disconnected(
+                            stdio_exit_disconnect_message(&status, stderr_ring.tail()),
+                        )).await;
                         break;
                     }
                 }
@@ -864,6 +1107,297 @@ fn stdio_text_frame_event(text: String) -> TransportEvent {
     TransportEvent::Frame(TransportFrame::Text(text))
 }
 
+/// Per-line cap for child stderr: diagnostics only, so a small bound is fine.
+const STDIO_STDERR_LINE_CAP: usize = 8 * 1024;
+/// Ring bounds for retained child stderr (most recent wins).
+const STDIO_STDERR_RING_MAX_LINES: usize = 20;
+const STDIO_STDERR_RING_MAX_BYTES: usize = 8 * 1024;
+/// Wall-clock budget for post-exit pipe drains and the bounded `child.wait()`
+/// reap. Pipe data survives child death, but a grandchild inheriting the
+/// write end could keep the pipe open forever — the budget guarantees the
+/// Disconnected event is still emitted promptly.
+const STDIO_EXIT_DRAIN_BUDGET: Duration = Duration::from_secs(2);
+
+/// Outcome of reading one line through [`CappedLineReader`].
+#[derive(Debug, PartialEq, Eq)]
+enum CappedLine {
+    /// A complete line (newline / trailing `\r` stripped, strict UTF-8).
+    Line(String),
+    /// The line exceeded the cap and was discarded up to (and including) its
+    /// terminating newline; `discarded` counts the dropped bytes.
+    TooLong { discarded: u64 },
+    /// A complete line whose bytes were not valid UTF-8. Carries the lossy
+    /// decoding for DIAGNOSTIC consumers (the stderr ring); the stdout frame
+    /// path must NOT forward it as a frame — a mangled response's id is
+    /// untrustworthy, so it is skipped with pending requests cancelled
+    /// (same treatment as `TooLong`, codex round-2 P2).
+    NotUtf8 { lossy: String },
+    /// End of stream.
+    Eof,
+}
+
+/// Line reader that never buffers more than `cap` bytes for a single line,
+/// unlike `AsyncBufReadExt::lines()`, which accumulates the entire line in
+/// memory before any size check can run. Once a line crosses the cap the
+/// remainder is discarded (streamed, not buffered) until the next newline
+/// and reported as [`CappedLine::TooLong`], so the reader recovers on the
+/// following line.
+///
+/// Cancel-safe by construction: partial-line state lives in the struct, not
+/// the future, so dropping a `next_line` future at a `select!` never loses
+/// consumed bytes — the same guarantee `tokio::io::Lines` documents.
+///
+/// Non-UTF-8 bytes are decoded lossily (U+FFFD) instead of erroring the
+/// transport down: one bad byte in a frame surfaces as a JSON decode error
+/// for that frame rather than killing the child session.
+struct CappedLineReader<R> {
+    reader: R,
+    cap: usize,
+    buf: Vec<u8>,
+    /// `Some(bytes_discarded_so_far)` while skipping an over-cap line to its
+    /// terminating newline.
+    discarding: Option<u64>,
+}
+
+impl<R: tokio::io::AsyncBufRead + Unpin> CappedLineReader<R> {
+    fn new(reader: R, cap: usize) -> Self {
+        Self {
+            reader,
+            cap,
+            buf: Vec::new(),
+            discarding: None,
+        }
+    }
+
+    async fn next_line(&mut self) -> std::io::Result<CappedLine> {
+        use tokio::io::AsyncBufReadExt;
+
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                // EOF: flush discard state, then any final unterminated line.
+                if let Some(discarded) = self.discarding.take() {
+                    return Ok(CappedLine::TooLong { discarded });
+                }
+                if self.buf.is_empty() {
+                    return Ok(CappedLine::Eof);
+                }
+                return Ok(take_line(&mut self.buf));
+            }
+
+            let newline = available.iter().position(|&byte| byte == b'\n');
+            match (self.discarding.is_some(), newline) {
+                (true, Some(pos)) => {
+                    let discarded = self.discarding.take().unwrap_or(0) + (pos as u64) + 1;
+                    self.reader.consume(pos + 1);
+                    return Ok(CappedLine::TooLong { discarded });
+                }
+                (true, None) => {
+                    let chunk = available.len();
+                    if let Some(discarded) = self.discarding.as_mut() {
+                        *discarded += chunk as u64;
+                    }
+                    self.reader.consume(chunk);
+                }
+                (false, Some(pos)) => {
+                    if self.buf.len() + pos > self.cap {
+                        // Complete line, but over cap: drop it without ever
+                        // materializing the full copy.
+                        let discarded = (self.buf.len() + pos + 1) as u64;
+                        self.buf = Vec::new();
+                        self.reader.consume(pos + 1);
+                        return Ok(CappedLine::TooLong { discarded });
+                    }
+                    self.buf.extend_from_slice(&available[..pos]);
+                    self.reader.consume(pos + 1);
+                    return Ok(take_line(&mut self.buf));
+                }
+                (false, None) => {
+                    let chunk = available.len();
+                    if self.buf.len() + chunk > self.cap {
+                        // Crossed the cap mid-line: release the partial buffer
+                        // and stream-discard until the newline.
+                        self.discarding = Some((self.buf.len() + chunk) as u64);
+                        self.buf = Vec::new();
+                    } else {
+                        self.buf.extend_from_slice(available);
+                    }
+                    self.reader.consume(chunk);
+                }
+            }
+        }
+    }
+}
+
+/// Take the accumulated line bytes: strips one trailing `\r` (CRLF input).
+/// Strict UTF-8 yields [`CappedLine::Line`]; invalid bytes yield
+/// [`CappedLine::NotUtf8`] with a lossy decoding for diagnostic consumers —
+/// forwarding a lossily-mangled frame would decode as `malformed_json` with
+/// an unknowable request id, silently leaking its pending-request entry.
+fn take_line(buf: &mut Vec<u8>) -> CappedLine {
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    let bytes = std::mem::take(buf);
+    match String::from_utf8(bytes) {
+        Ok(line) => CappedLine::Line(line),
+        Err(err) => CappedLine::NotUtf8 {
+            lossy: String::from_utf8_lossy(err.as_bytes()).into_owned(),
+        },
+    }
+}
+
+/// Error event for a skipped over-cap stdio line. `disconnect: false` on
+/// purpose: the child stays alive and the reader has already resynced to the
+/// next line.
+fn stdio_frame_too_large_skipped_event(discarded: u64) -> TransportEvent {
+    TransportEvent::Error {
+        code: "frame_too_large".into(),
+        message: format!(
+            "UI protocol stdio frame exceeded {MAX_TEXT_FRAME_BYTES} bytes ({discarded} bytes discarded); skipped to next line"
+        ),
+        disconnect: false,
+    }
+}
+
+/// Error event for a skipped invalid-UTF-8 stdio line. Same non-fatal
+/// semantics as [`stdio_frame_too_large_skipped_event`], and the same
+/// pending-request cancellation in the backend: the frame may have been a
+/// response whose id is now unknowable.
+fn stdio_frame_not_utf8_skipped_event(lossy_len: usize) -> TransportEvent {
+    TransportEvent::Error {
+        code: "frame_not_utf8".into(),
+        message: format!(
+            "UI protocol stdio frame was not valid UTF-8 (~{lossy_len} bytes); skipped to next line"
+        ),
+        disconnect: false,
+    }
+}
+
+/// Bounded ring of the most recent child stderr lines, kept so a nonzero
+/// exit can report *why* the child died (previously stderr was read and
+/// dropped).
+#[derive(Debug, Default)]
+struct StderrRing {
+    lines: VecDeque<String>,
+    bytes: usize,
+}
+
+impl StderrRing {
+    fn push(&mut self, line: String) {
+        self.bytes += line.len();
+        self.lines.push_back(line);
+        // Always keep at least the newest line, even if it alone exceeds the
+        // byte budget.
+        while self.lines.len() > 1
+            && (self.lines.len() > STDIO_STDERR_RING_MAX_LINES
+                || self.bytes > STDIO_STDERR_RING_MAX_BYTES)
+        {
+            if let Some(evicted) = self.lines.pop_front() {
+                self.bytes -= evicted.len();
+            }
+        }
+    }
+
+    fn tail(&self) -> Option<String> {
+        (!self.lines.is_empty()).then(|| {
+            self.lines
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    }
+}
+
+/// Disconnect message for a reaped stdio child: exit status plus, on failure,
+/// the retained stderr tail (the actionable part of "my server won't start").
+fn stdio_exit_disconnect_message(
+    status: &std::io::Result<std::process::ExitStatus>,
+    stderr_tail: Option<String>,
+) -> String {
+    let (base, failed) = match status {
+        Ok(status) => (
+            format!(
+                "UI protocol stdio child exited with {status}; reconnect will relaunch on next send/read."
+            ),
+            !status.success(),
+        ),
+        Err(err) => (
+            format!(
+                "failed to wait for UI protocol stdio child: {err}; reconnect will relaunch on next send/read."
+            ),
+            true,
+        ),
+    };
+    match stderr_tail {
+        Some(tail) if failed => format!("{base}\nstderr tail:\n{tail}"),
+        _ => base,
+    }
+}
+
+/// Drain remaining stdout lines to EOF after child exit, forwarding them as
+/// frames so responses already written to the pipe are not dropped. Bounded
+/// by [`STDIO_EXIT_DRAIN_BUDGET`].
+async fn drain_stdout_to_eof<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut CappedLineReader<R>,
+    event_tx: &mpsc::Sender<TransportEvent>,
+) {
+    let _ = tokio::time::timeout(STDIO_EXIT_DRAIN_BUDGET, async {
+        loop {
+            match reader.next_line().await {
+                Ok(CappedLine::Line(text)) => {
+                    if event_tx.send(stdio_text_frame_event(text)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(CappedLine::TooLong { discarded }) => {
+                    if event_tx
+                        .send(stdio_frame_too_large_skipped_event(discarded))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(CappedLine::NotUtf8 { lossy }) => {
+                    if event_tx
+                        .send(stdio_frame_not_utf8_skipped_event(lossy.len()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(CappedLine::Eof) | Err(_) => break,
+            }
+        }
+    })
+    .await;
+}
+
+/// Drain remaining stderr lines to EOF into the ring after child exit so the
+/// final error output (written just before death) reaches the disconnect
+/// message. Bounded by [`STDIO_EXIT_DRAIN_BUDGET`].
+async fn drain_stderr_to_eof<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut CappedLineReader<R>,
+    ring: &mut StderrRing,
+) {
+    let _ = tokio::time::timeout(STDIO_EXIT_DRAIN_BUDGET, async {
+        loop {
+            match reader.next_line().await {
+                Ok(CappedLine::Line(text)) => ring.push(text),
+                Ok(CappedLine::TooLong { discarded }) => {
+                    ring.push(format!("[stderr line dropped: {discarded} bytes]"));
+                }
+                Ok(CappedLine::NotUtf8 { lossy }) => ring.push(lossy),
+                Ok(CappedLine::Eof) | Err(_) => break,
+            }
+        }
+    })
+    .await;
+}
+
 fn bounded_send_error(
     label: &str,
     err: mpsc::error::TrySendError<TransportCommand>,
@@ -877,15 +1411,27 @@ fn bounded_send_error(
 }
 
 fn shell_command(command: &str) -> Command {
-    #[cfg(windows)]
-    {
+    // `cfg!(windows)` (runtime) rather than `#[cfg(windows)]` so BOTH branches
+    // type-check on every host — the Windows path can't be cross-compiled from
+    // macOS/Linux, so keeping it compiled everywhere is our only static check.
+    if cfg!(windows) {
         let mut process = Command::new("cmd");
         process.arg("/C").arg(command);
+        // Prepend the auto-installer's dir (`~\.octos\bin`) to the CHILD's PATH
+        // so a bare `octos` in `command` resolves to the exe `backend_ensure`
+        // dropped there — WITHOUT embedding a path in the command string, which
+        // `cmd /C` + Rust arg-quoting mangle (that was the exit-1 launch bug).
+        // Setting the child's env is not `unsafe` and never touches our own PATH.
+        if let Some(bin) = crate::backend_ensure::install_bin_dir() {
+            let mut path = bin.into_os_string();
+            if let Some(existing) = std::env::var_os("PATH") {
+                path.push(";"); // Windows PATH separator (this branch is Windows-only at runtime)
+                path.push(existing);
+            }
+            process.env("PATH", path);
+        }
         process
-    }
-
-    #[cfg(not(windows))]
-    {
+    } else {
         let mut process = Command::new("sh");
         process.arg("-c").arg(command);
         process
@@ -907,7 +1453,10 @@ impl ProtocolAppUiBackend {
             runtime_error,
             driver: None,
             connection_state: ProtocolConnectionState::Disconnected,
+            reconnect: ReconnectBackoff::default(),
             disconnected_status_reported: false,
+            fatal_error: None,
+            reopen_session: None,
             refresh_capabilities_on_reconnect: false,
             queue: VecDeque::new(),
             protocol: ProtocolExchange::default(),
@@ -947,6 +1496,7 @@ impl ProtocolAppUiBackend {
             let _ = tx.send(LocalShellResultEvent {
                 local_id,
                 cmdline: cmd,
+                cwd: cwd.as_ref().map(|path| path.display().to_string()),
                 stdout: String::new(),
                 stderr: runtime_unavailable(self.runtime_error.as_deref()).to_string(),
                 exit_code: None,
@@ -984,7 +1534,33 @@ impl ProtocolAppUiBackend {
             return Ok(());
         }
 
+        // Fatal, non-retryable: the backend refused to start because another
+        // serve owns the data dir. Never respawn — that was the crash-loop. The
+        // user-facing error was already emitted once in `mark_disconnected`; keep
+        // this return quiet (like the backoff gate below).
+        if let Some(reason) = &self.fatal_error {
+            return Err(eyre!("{reason}"));
+        }
+
+        // Backoff gate: `ensure_connected` runs on every event-loop tick and
+        // every send, so a dead endpoint must not be re-dialed each time —
+        // return a quiet error without attempting until the schedule allows.
+        let now = Instant::now();
+        if !self.reconnect.should_attempt(now) {
+            return Err(eyre!(
+                "reconnect is backing off after {} consecutive failure(s)",
+                self.reconnect.consecutive_failures()
+            ));
+        }
+
         self.ensure_driver()?;
+        // Compute the reconnect reopen target BEFORE borrowing `driver` mutably
+        // (and before `mark_connected` clears `disconnected_status_reported`).
+        let reopen_command = if self.disconnected_status_reported {
+            self.reopen_session_open_command()
+        } else {
+            None
+        };
         let runtime = self
             .runtime
             .as_ref()
@@ -994,14 +1570,16 @@ impl ProtocolAppUiBackend {
             .as_mut()
             .ok_or_else(|| eyre!("UI protocol transport driver is not initialized"))?;
 
-        let should_reopen_session =
-            self.disconnected_status_reported && self.launch.session_id.is_some();
-        driver.connect(runtime)?;
+        if let Err(err) = driver.connect(runtime) {
+            self.reconnect.record_failure(now);
+            return Err(err);
+        }
+        self.reconnect.record_success(now);
         let endpoint = driver.label().to_string();
         self.mark_connected(&endpoint);
         self.refresh_capabilities_after_reconnect()?;
-        if should_reopen_session {
-            self.send_launch_session_open()?;
+        if let Some(command) = reopen_command {
+            self.send(command)?;
         }
         Ok(())
     }
@@ -1025,14 +1603,56 @@ impl ProtocolAppUiBackend {
                 })
                 .into(),
             );
+            // A stdio reconnect spawned a NEW child process: no turn can be
+            // in flight there, but the app may still show one as live from
+            // the dead child (its terminal event died with the process).
+            // Tell the store to reconcile, or the composer queues every
+            // subsequent prompt behind the phantom turn.
+            if self
+                .driver
+                .as_ref()
+                .is_some_and(ProtocolTransportDriver::is_stdio_child)
+            {
+                self.queue.push_back(ClientEvent::BackendRelaunched);
+            }
         }
     }
 
     fn mark_disconnected(&mut self, message: impl Into<String>) {
         let message = message.into();
+
+        // The backend refused to start because another octos serve already owns
+        // this data directory (redb single-writer). Respawning it would only
+        // crash again — the silent ~5s loop the user hit with two octos-tui
+        // windows. Latch a fatal state (suppresses reconnect in
+        // `ensure_connected`) and surface one clear, terminal error INSTEAD OF
+        // the raw stderr status (suppressed below). Latch once so a
+        // backoff-driven repeat is quiet.
+        let is_fatal_conflict = message.contains(DATA_DIR_LOCKED_MARKER);
+        if is_fatal_conflict && self.fatal_error.is_none() {
+            let explanation =
+                "Another octos-tui is already running and using this data directory, so this \
+                 window can't start its own backend (the database allows only one at a time). \
+                 Close the other octos-tui window (or any `octos serve`), then restart this one. \
+                 To run two at once, start this one in a workspace with its own data directory."
+                    .to_string();
+            self.fatal_error = Some(explanation.clone());
+            self.queue.push_back(
+                AppUiEvent::Error(AppUiError {
+                    code: DATA_DIR_LOCKED_CODE.to_string(),
+                    message: explanation,
+                })
+                .into(),
+            );
+        }
+
         if let Some(driver) = self.driver.as_mut() {
             driver.disconnect();
         }
+        // No-op when there was no live connection, so the repeated
+        // mark_disconnected calls made while backing off cannot push the
+        // reconnect schedule forward.
+        self.reconnect.record_disconnect(Instant::now());
         self.refresh_capabilities_on_reconnect = true;
         let cancelled_requests = self.protocol.cancel_pending_requests(&message);
 
@@ -1041,8 +1661,13 @@ impl ProtocolAppUiBackend {
         self.connection_state = ProtocolConnectionState::Disconnected;
 
         if should_report {
-            self.queue
-                .push_back(AppUiEvent::Status(AppUiStatus { message }).into());
+            // Suppress the raw stderr-tail status for the fatal-conflict case:
+            // the clean, actionable error above is what the user should read, and
+            // a following Status would overwrite it in the status line.
+            if !is_fatal_conflict {
+                self.queue
+                    .push_back(AppUiEvent::Status(AppUiStatus { message }).into());
+            }
             self.disconnected_status_reported = true;
         }
         self.queue
@@ -1064,11 +1689,53 @@ impl ProtocolAppUiBackend {
         })
     }
 
-    fn send_launch_session_open(&mut self) -> Result<()> {
-        let Some(command) = self.launch_session_open_command() else {
-            return Ok(());
+    /// Record the reconnect reopen target from an outgoing command so a
+    /// reconnect re-opens the user's CURRENT session, not the fixed launch
+    /// `--session`.
+    ///
+    /// Both `OpenSession` (initial launch open, explicit open) and
+    /// `HydrateSession` (the `/resume` path — store.rs returns a
+    /// `HydrateSession`, never an `OpenSession`) mark the session the user has
+    /// switched their attention to. The reconnect always re-subscribes via
+    /// `OpenSession`, so a recorded `HydrateSession` is stored as an
+    /// `OpenSession` carrying the launch profile/cwd (a hydrate request does not
+    /// carry them; the server keys an existing session on its id).
+    ///
+    /// The resume cursor is reset — `command_with_resume_cursor` refills it from
+    /// `session_cursors` at reopen time so we resume from the latest seq rather
+    /// than a stale one captured here.
+    ///
+    /// Known gap: a purely-local session-pane tab-switch to an already-loaded
+    /// session sends no command, so the transport cannot observe it here; a
+    /// reconnect then reopens the last EXPLICITLY opened/resumed session. The
+    /// reported wedge (/resume then backend restart) is covered.
+    fn record_reopen_target(&mut self, command: &AppUiCommand) {
+        let params = match command {
+            AppUiCommand::OpenSession(params) => SessionOpenParams {
+                after: None,
+                ..params.clone()
+            },
+            AppUiCommand::HydrateSession(params) => SessionOpenParams {
+                session_id: params.session_id.clone(),
+                topic: None,
+                profile_id: self.launch.profile_id.clone(),
+                cwd: self.launch.cwd.clone(),
+                sandbox: None,
+                after: None,
+            },
+            _ => return,
         };
-        self.send(command)
+        self.reopen_session = Some(params);
+    }
+
+    /// The session to re-open after a reconnect: the most recently opened
+    /// session (tracks the current selection), falling back to the launch
+    /// `--session` when nothing has been opened yet.
+    fn reopen_session_open_command(&self) -> Option<AppUiCommand> {
+        self.reopen_session
+            .clone()
+            .map(AppUiCommand::OpenSession)
+            .or_else(|| self.launch_session_open_command())
     }
 
     fn send_capabilities_request(&mut self) -> Result<()> {
@@ -1093,7 +1760,36 @@ impl ProtocolAppUiBackend {
         &mut self,
         command: AppUiCommand,
     ) -> Result<RpcRequest<serde_json::Value>> {
+        let command = self.fill_session_list_cwd(command);
         self.protocol.build_tracked_request(command)
+    }
+
+    /// Stamp the launch workspace cwd onto an outgoing `session/list` request
+    /// so a server with per-project session storage (`appui.sessions_in_cwd`)
+    /// lists THIS project's sessions rather than the global/per-profile store.
+    ///
+    /// Reuses the exact same `self.launch.cwd` the client already sends on
+    /// `session/open` (see [`Self::launch_session_open_command`] and
+    /// `bootstrap`), so `/resume` and the `/sessions` picker scope to the
+    /// current project. Only fills when the caller left `cwd` unset — the
+    /// store always constructs `SessionListParams { cwd: None }`, and an
+    /// explicit cwd (e.g. a test) is preserved.
+    ///
+    /// Backward compatible with old servers: when `launch.cwd` is `None` the
+    /// params still serialize to the historical empty object `{}`, and a
+    /// server without the `appui.sessions_in_cwd` flag (or one that never
+    /// negotiated `session.workspace_cwd.v1`) simply ignores the field. This
+    /// mirrors how `session/open` already sends `cwd` unconditionally from
+    /// this layer — the transport does not track the negotiated capability
+    /// set (the store does), and sending an ignored `cwd` is harmless.
+    fn fill_session_list_cwd(&self, command: AppUiCommand) -> AppUiCommand {
+        let AppUiCommand::ListSessions(mut params) = command else {
+            return command;
+        };
+        if params.cwd.is_none() {
+            params.cwd = self.launch.cwd.clone();
+        }
+        AppUiCommand::ListSessions(params)
     }
 
     fn decode_rpc_text(&mut self, text: &str) -> Result<Option<ClientEvent>> {
@@ -1106,6 +1802,7 @@ impl ProtocolAppUiBackend {
             AppUiCommand::ListConfigCapabilities(_)
                 | AppUiCommand::OpenSession(_)
                 | AppUiCommand::ReadSessionStatus(_)
+                | AppUiCommand::SessionBtw(_)
                 | AppUiCommand::ListModels(_)
                 | AppUiCommand::ListApprovalScopes(_)
                 | AppUiCommand::ListPermissionProfiles(_)
@@ -1117,6 +1814,9 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ReadTaskOutput(_)
                 | AppUiCommand::ReadTaskArtifact(_)
                 | AppUiCommand::HydrateSession(_)
+                | AppUiCommand::ListSessions(_)
+                | AppUiCommand::LaunchResolve(_)
+                | AppUiCommand::ListTasks(_)
                 | AppUiCommand::GetThreadGraph(_)
                 | AppUiCommand::GetTurnState(_)
                 | AppUiCommand::AuthStatus(_)
@@ -1124,6 +1824,11 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ProfileLlmCatalog(_)
                 | AppUiCommand::ProfileLlmList(_)
                 | AppUiCommand::ProfileLlmFetchModels(_)
+                | AppUiCommand::ProfileSubProvidersList(_)
+                | AppUiCommand::SnapshotList(_)
+                // octos#1801 v2: `peer/gather` only reads brief/result files
+                // off the peer blackboard — readonly viewers may gather.
+                | AppUiCommand::PeerGather(_)
                 | AppUiCommand::ProfileSkillsList(_)
                 | AppUiCommand::ProfileSkillsRegistrySearch(_)
                 // M15-E read-only autonomy inspection. Reconnect
@@ -1173,7 +1878,21 @@ impl ProtocolAppUiBackend {
             .poll_event();
 
         match read_result {
-            Ok(event) => Ok(event),
+            Ok(event) => {
+                // A delivered data frame proves the connection is real, so
+                // the reconnect failure streak resets (control frames such as
+                // WS Close don't count — a connect/close loop must still back
+                // off).
+                if matches!(
+                    event,
+                    Some(TransportEvent::Frame(
+                        TransportFrame::Text(_) | TransportFrame::Binary(_)
+                    ))
+                ) {
+                    self.reconnect.record_frame();
+                }
+                Ok(event)
+            }
             Err(err) => {
                 self.mark_disconnected(
                     "UI protocol disconnected while reading; reconnect will retry on next send/read.",
@@ -1206,6 +1925,25 @@ impl ProtocolAppUiBackend {
                     self.mark_disconnected(
                         "UI protocol disconnected; reconnect will retry on next send/read.",
                     );
+                } else if code == "frame_too_large" || code == "frame_not_utf8" {
+                    // A skipped stdio line (over-cap, or invalid UTF-8) may
+                    // have BEEN the response to an in-flight request — its id
+                    // is unknowable (the frame was discarded before decode),
+                    // so the matching `pending_requests` entry would otherwise
+                    // leak forever and repeated bad responses would wedge
+                    // sends at MAX_PENDING_REQUESTS. Cancel pending requests
+                    // like the disconnect path does, but keep the connection
+                    // up.
+                    let reason = if code == "frame_not_utf8" {
+                        "response may have been discarded (frame was not valid UTF-8)"
+                    } else {
+                        "response may have been discarded (frame too large)"
+                    };
+                    let cancelled = self.protocol.cancel_pending_requests(reason);
+                    self.queue
+                        .extend(cancelled.into_iter().filter_map(|cancelled| {
+                            (!cancelled.is_capabilities_probe()).then_some(cancelled.event.into())
+                        }));
                 }
                 self.queue
                     .push_back(AppUiEvent::Error(AppUiError { code, message }).into());
@@ -1291,6 +2029,11 @@ impl ProtocolAppUiBackend {
             | AppUiCommand::ProfileLocalCreate(_)
             | AppUiCommand::ProfileLlmUpsert(_)
             | AppUiCommand::ProfileLlmDelete(_)
+            | AppUiCommand::SnapshotRestore(_)
+            | AppUiCommand::PeerPrepare(_)
+            | AppUiCommand::TurnSteer(_)
+            | AppUiCommand::ProfileSubProvidersUpsert(_)
+            | AppUiCommand::ProfileSubProvidersRemove(_)
             | AppUiCommand::ProfileLlmSelect(_)
             | AppUiCommand::ProfileLlmTest(_)
             | AppUiCommand::ProfileSkillsInstall(_)
@@ -1302,7 +2045,27 @@ impl ProtocolAppUiBackend {
             | AppUiCommand::SetToolConfigEnabled(_)
             | AppUiCommand::UpsertToolConfig(_)
             | AppUiCommand::DeleteToolConfig(_)
-            | AppUiCommand::TestToolConfig(_) => {
+            | AppUiCommand::TestToolConfig(_)
+            // M15-era + session/review/model mutations: expected readonly
+            // blocks, labeled like the set above. Without these arms they
+            // fell into the `_` fallback, which mislabels the block as an
+            // "unexpectedly blocked read-style" readonly_policy bug.
+            | AppUiCommand::SessionRollback(_)
+            | AppUiCommand::StartReview(_)
+            | AppUiCommand::SelectModel(_)
+            | AppUiCommand::CancelTask(_)
+            | AppUiCommand::RestartTaskFromNode(_)
+            | AppUiCommand::InterruptAgent(_)
+            | AppUiCommand::CloseAgent(_)
+            | AppUiCommand::SetSessionGoal(_)
+            | AppUiCommand::ClearSessionGoal(_)
+            | AppUiCommand::CreateLoop(_)
+            | AppUiCommand::DeleteLoop(_)
+            | AppUiCommand::PauseLoop(_)
+            | AppUiCommand::ResumeLoop(_)
+            | AppUiCommand::FireLoopNow(_)
+            | AppUiCommand::CompactContext(_)
+            | AppUiCommand::SetCompactionMode(_) => {
                 self.queue.push_back(
                     AppUiEvent::Error(AppUiError {
                         code: "readonly".into(),
@@ -1402,6 +2165,11 @@ impl AppUiBackend for ProtocolAppUiBackend {
             );
             return Ok(());
         }
+
+        // Record the reconnect reopen target AFTER the readonly/pending-cap
+        // gates (so a genuinely-rejected command never becomes the reopen
+        // target) and before `build_tracked_request` consumes `command`.
+        self.record_reopen_target(&command);
 
         let request = self.build_tracked_request(command)?;
         let request_id = request.id.clone();
@@ -1532,6 +2300,17 @@ async fn run_local_shell_command(
     local_id: String,
 ) -> LocalShellResultEvent {
     let started = std::time::Instant::now();
+    // Display form of the directory the command runs in, for the transcript
+    // card's cwd label. An explicit `cwd` wins; otherwise the child inherits
+    // this process's working directory, so resolve that for the label.
+    let cwd_display = cwd
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.display().to_string())
+        });
     let (program, args) = local_shell_command_args(&cmd);
 
     let mut builder = Command::new(program);
@@ -1555,6 +2334,7 @@ async fn run_local_shell_command(
             return LocalShellResultEvent {
                 local_id,
                 cmdline: cmd,
+                cwd: cwd_display,
                 stdout: String::new(),
                 stderr: format!("failed to spawn local shell command: {err}"),
                 exit_code: None,
@@ -1602,6 +2382,7 @@ async fn run_local_shell_command(
             return LocalShellResultEvent {
                 local_id,
                 cmdline: cmd,
+                cwd: cwd_display,
                 stdout: String::new(),
                 stderr: format!("local shell command failed: {err}"),
                 exit_code: None,
@@ -1657,6 +2438,7 @@ async fn run_local_shell_command(
     LocalShellResultEvent {
         local_id,
         cmdline: cmd,
+        cwd: cwd_display,
         stdout,
         stderr,
         exit_code,
@@ -1721,7 +2503,7 @@ fn appui_feature_header_for(old_server: bool) -> String {
         );
     }
     format!(
-        "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1}, {UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1}, {UI_PROTOCOL_FEATURE_USER_QUESTION_V1}"
+        "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1}, {UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1}, {UI_PROTOCOL_FEATURE_USER_QUESTION_V1}, {UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1}, {UI_PROTOCOL_FEATURE_PLAN_TODOS_V1}, {UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2}"
     )
 }
 
@@ -1812,6 +2594,15 @@ fn protocol_transport_description(endpoint: &str) -> &'static str {
 
 fn tui_capabilities() -> UiProtocolCapabilities {
     let mut capabilities = UiProtocolCapabilities::first_server_slice();
+    if !capabilities
+        .supported_features
+        .iter()
+        .any(|feature| feature == UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
+    {
+        capabilities
+            .supported_features
+            .push(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2.into());
+    }
     for method in [
         crate::model::APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
         crate::model::APPUI_METHOD_SESSION_STATUS_READ,
@@ -1866,6 +2657,9 @@ fn rpc_request_from_command(
         AppUiCommand::OpenSession(params) => serde_json::to_value(params),
         AppUiCommand::ListConfigCapabilities(params) => serde_json::to_value(params),
         AppUiCommand::ReadSessionStatus(params) => serde_json::to_value(params),
+        AppUiCommand::SessionBtw(params) => serde_json::to_value(params),
+        AppUiCommand::CompactContext(params) => serde_json::to_value(params),
+        AppUiCommand::SetCompactionMode(params) => serde_json::to_value(params),
         AppUiCommand::SubmitPrompt(params) => serde_json::to_value(params),
         AppUiCommand::InterruptTurn(params) => serde_json::to_value(params),
         AppUiCommand::ListModels(params) => serde_json::to_value(params),
@@ -1894,6 +2688,8 @@ fn rpc_request_from_command(
         AppUiCommand::ReadTaskOutput(params) => serde_json::to_value(params),
         AppUiCommand::ReadTaskArtifact(params) => serde_json::to_value(params),
         AppUiCommand::HydrateSession(params) => serde_json::to_value(params),
+        AppUiCommand::ListSessions(params) => serde_json::to_value(params),
+        AppUiCommand::SessionRollback(params) => serde_json::to_value(params),
         AppUiCommand::GetThreadGraph(params) => serde_json::to_value(params),
         AppUiCommand::GetTurnState(params) => serde_json::to_value(params),
         AppUiCommand::StartReview(params) => serde_json::to_value(params),
@@ -1903,10 +2699,19 @@ fn rpc_request_from_command(
         AppUiCommand::AuthMe(params) => serde_json::to_value(params),
         AppUiCommand::AuthLogout(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLocalCreate(params) => serde_json::to_value(params),
+        AppUiCommand::LaunchResolve(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmCatalog(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmList(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmUpsert(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmDelete(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileSubProvidersList(params) => serde_json::to_value(params),
+        AppUiCommand::SnapshotList(params) => serde_json::to_value(params),
+        AppUiCommand::SnapshotRestore(params) => serde_json::to_value(params),
+        AppUiCommand::PeerPrepare(params) => serde_json::to_value(params),
+        AppUiCommand::TurnSteer(params) => serde_json::to_value(params),
+        AppUiCommand::PeerGather(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileSubProvidersUpsert(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileSubProvidersRemove(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmSelect(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmTest(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmFetchModels(params) => serde_json::to_value(params),
@@ -2029,6 +2834,17 @@ fn rpc_value_to_app_event(
         let params = frame.get("params").cloned().unwrap_or(Value::Null);
         if method == "server/heartbeat" {
             return Ok(None);
+        }
+        // octos#1801 v3: `peer/staged` is decoded tui-locally BEFORE the
+        // vendored `UiNotification::from_method_and_params` — the pinned
+        // octos-core rev predates the variant, so routing it through the
+        // vendored decoder would degrade it to an `unknown_notification`
+        // error event.
+        if method == crate::model::APPUI_METHOD_PEER_STAGED {
+            return Ok(Some(peer_staged_notification_to_client_event(params)));
+        }
+        if method == crate::model::APPUI_METHOD_PEER_CLOSED {
+            return Ok(Some(peer_closed_notification_to_client_event(params)));
         }
         return Ok(Some(notification_to_app_event(method, params).into()));
     }
@@ -2164,6 +2980,23 @@ fn success_response_to_app_event(
                 )),
             }
         }
+        octos_core::ui_protocol::methods::SESSION_BTW => {
+            match serde_json::from_value::<octos_core::ui_protocol::SessionBtwResult>(result) {
+                Ok(result) => Ok(Some(ClientEvent::SessionBtw(SessionBtwClientEvent {
+                    result,
+                }))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            octos_core::ui_protocol::methods::SESSION_BTW
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
         crate::model::APPUI_METHOD_MODEL_LIST => {
             if result.get("models").is_none()
                 && let Ok(result) = serde_json::from_value::<ProfileLlmListResult>(result.clone())
@@ -2187,7 +3020,10 @@ fn success_response_to_app_event(
         }
         crate::model::APPUI_METHOD_MODEL_SELECT => {
             match serde_json::from_value::<ModelSelectResult>(result) {
-                Ok(result) => Ok(Some(model_select_event(result))),
+                Ok(result) => Ok(Some(model_select_event(
+                    result,
+                    pending_request.select_session.clone(),
+                ))),
                 Err(err) => Ok(Some(
                     app_error(
                         "invalid_result",
@@ -2275,6 +3111,21 @@ fn success_response_to_app_event(
                 )),
             }
         }
+        crate::model::APPUI_METHOD_LAUNCH_RESOLVE => {
+            match serde_json::from_value::<crate::model::LaunchResolveResult>(result) {
+                Ok(result) => Ok(Some(ClientEvent::LaunchResolve(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_LAUNCH_RESOLVE
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
         crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG => {
             match serde_json::from_value::<ProfileLlmCatalogResult>(result) {
                 Ok(result) => Ok(Some(profile_llm_catalog_event(result))),
@@ -2299,6 +3150,94 @@ fn success_response_to_app_event(
                         "invalid_result",
                         format!(
                             "failed to decode UI protocol result for profile/llm mutation: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_SNAPSHOT_LIST | crate::model::APPUI_METHOD_SNAPSHOT_RESTORE => {
+            match serde_json::from_value::<crate::model::SnapshotListResult>(result) {
+                Ok(result) => Ok(Some(snapshot_list_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for snapshot list/restore: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PEER_PREPARE => {
+            match serde_json::from_value::<crate::model::PeerPrepareResult>(result) {
+                Ok(result) => Ok(Some(peer_prepare_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_PEER_PREPARE
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PEER_GATHER => {
+            match serde_json::from_value::<crate::model::PeerGatherResult>(result) {
+                Ok(result) => Ok(Some(peer_gather_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_PEER_GATHER
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_TURN_STEER => {
+            match serde_json::from_value::<crate::model::TurnSteerResult>(result) {
+                Ok(result) => Ok(Some(turn_steered_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_TURN_STEER
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST => {
+            match serde_json::from_value::<SubProvidersListResult>(result) {
+                Ok(result) => Ok(Some(sub_providers_list_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for profile/sub_providers/list: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT
+        | crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE => {
+            match serde_json::from_value::<SubProvidersMutationResult>(result) {
+                Ok(result) => Ok(Some(sub_providers_mutation_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for profile/sub_providers mutation: {err}"
                         ),
                     )
                     .into(),
@@ -2401,6 +3340,16 @@ fn success_response_to_app_event(
             Ok(result) => Ok(Some(ClientEvent::SessionHydrate(result))),
             Err(err) => Ok(Some(autonomy_decode_error(methods::SESSION_HYDRATE, err))),
         },
+        methods::SESSION_LIST => match serde_json::from_value::<SessionListResult>(result) {
+            Ok(result) => Ok(Some(ClientEvent::SessionList(result))),
+            Err(err) => Ok(Some(autonomy_decode_error(methods::SESSION_LIST, err))),
+        },
+        methods::SESSION_ROLLBACK => {
+            match serde_json::from_value::<SessionRollbackResult>(result) {
+                Ok(result) => Ok(Some(ClientEvent::SessionRollback(result))),
+                Err(err) => Ok(Some(autonomy_decode_error(methods::SESSION_ROLLBACK, err))),
+            }
+        }
         methods::THREAD_GRAPH_GET => match serde_json::from_value::<ThreadGraphGetResult>(result) {
             Ok(result) => Ok(Some(autonomy_event(AutonomyResult::ThreadGraph(result)))),
             Err(err) => Ok(Some(autonomy_decode_error(methods::THREAD_GRAPH_GET, err))),
@@ -2697,8 +3646,33 @@ fn success_response_to_app_event(
                 ))),
             }
         }
+        crate::model::APPUI_METHOD_PROFILE_LLM_FETCH_MODELS => {
+            Ok(Some(profile_llm_fetch_models_event(&result)))
+        }
         _ => Ok(None),
     }
+}
+
+/// `profile/llm/fetch_models` result → status event.
+///
+/// The server result (`{profile_id, family_id, models: [String], reason?}` —
+/// see `raw_profile_llm_fetch_models` in octos-cli's `ui_protocol.rs`)
+/// carries a plain model-id list, not the provider configuration
+/// `ProfileLlmListResult` describes, and this client cannot add new
+/// `ClientEvent` variants, so the outcome surfaces as a status line the way
+/// `approval/respond` acks do. Without this arm the response was silently
+/// dropped and onboarding's "Fetch models" button looked dead on a real
+/// backend.
+fn profile_llm_fetch_models_event(result: &Value) -> ClientEvent {
+    let count = result
+        .get("models")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let message = match result.get("reason").and_then(Value::as_str) {
+        Some(reason) => format!("Fetched {count} models ({reason})"),
+        None => format!("Fetched {count} models"),
+    };
+    AppUiEvent::Status(AppUiStatus { message }).into()
 }
 
 fn autonomy_event(result: AutonomyResult) -> ClientEvent {
@@ -2731,14 +3705,13 @@ fn capabilities_event(result: ConfigCapabilitiesListResult) -> ClientEvent {
 }
 
 fn session_status_event(result: SessionStatusReadResult) -> ClientEvent {
-    let label = result
-        .runtime_policy_stamp
-        .as_ref()
-        .and_then(|stamp| stamp.model.as_deref())
-        .or_else(|| result.model.as_ref().map(|model| model.model.as_str()))
-        .unwrap_or("runtime");
+    // The active model is shown persistently on the composer's bottom
+    // border (bottom-right) since #257; repeating it in this transient
+    // status line duplicated the model one row away. Keep the message
+    // model-free — `result` still carries the model data that refreshes
+    // the composer footer.
     ClientEvent::SessionStatus(SessionStatusClientEvent {
-        message: format!("Runtime status refreshed: {label}"),
+        message: "Runtime status refreshed".to_string(),
         result,
     })
 }
@@ -2755,7 +3728,10 @@ fn model_list_event(result: ModelListResult) -> ClientEvent {
     })
 }
 
-fn model_select_event(result: ModelSelectResult) -> ClientEvent {
+fn model_select_event(
+    result: ModelSelectResult,
+    initiating_session: Option<SessionKey>,
+) -> ClientEvent {
     let prefix = if result.applied {
         "Model selected"
     } else {
@@ -2767,6 +3743,7 @@ fn model_select_event(result: ModelSelectResult) -> ClientEvent {
             result.selected.provider, result.selected.model
         ),
         result,
+        initiating_session,
     })
 }
 
@@ -2803,6 +3780,77 @@ fn profile_llm_mutation_event(result: ProfileLlmMutationResult) -> ClientEvent {
         _ => format!("Provider profile updated: {count} configured provider(s)"),
     };
     ClientEvent::ProfileLlmMutation(ProfileLlmMutationClientEvent { message, result })
+}
+
+fn snapshot_list_event(result: crate::model::SnapshotListResult) -> ClientEvent {
+    let count = result.snapshots.len();
+    let message = if let Some(restored) = result.restored.as_deref() {
+        format!(
+            "Workspace restored to snapshot {}",
+            &restored[..restored.len().min(8)]
+        )
+    } else if !result.available {
+        "Snapshots unavailable for this session".into()
+    } else {
+        match count {
+            0 => "No snapshots yet".into(),
+            1 => "1 snapshot".into(),
+            _ => format!("{count} snapshots"),
+        }
+    };
+    ClientEvent::SnapshotList(crate::client_event::SnapshotListClientEvent { message, result })
+}
+
+fn peer_prepare_event(result: crate::model::PeerPrepareResult) -> ClientEvent {
+    let message = format!("Peer session prepared: {}", result.slug);
+    ClientEvent::PeerPrepared(crate::client_event::PeerPreparedClientEvent { message, result })
+}
+
+/// octos#1807: decode a `turn/steer` result into the typed
+/// [`ClientEvent::TurnSteered`]. The store owns the user-facing status line;
+/// this message is diagnostic.
+fn turn_steered_event(result: crate::model::TurnSteerResult) -> ClientEvent {
+    let message = if result.steered {
+        format!("Steered into active turn {}", result.turn_id.0)
+    } else {
+        format!("No active turn; started turn {}", result.turn_id.0)
+    };
+    ClientEvent::TurnSteered(crate::client_event::TurnSteeredClientEvent { message, result })
+}
+
+fn peer_gather_event(result: crate::model::PeerGatherResult) -> ClientEvent {
+    let with_results = result
+        .peers
+        .iter()
+        .filter(|peer| peer.result.is_some())
+        .count();
+    let message = match result.peers.len() {
+        0 => "No peers staged on the blackboard".into(),
+        total => format!("Gathered {with_results}/{total} peer result(s)"),
+    };
+    ClientEvent::PeerGathered(crate::client_event::PeerGatheredClientEvent { message, result })
+}
+
+fn sub_providers_list_event(result: SubProvidersListResult) -> ClientEvent {
+    let count = result.sub_providers.len();
+    ClientEvent::SubProvidersList(SubProvidersListClientEvent {
+        message: match count {
+            0 => "Research lanes refreshed: none configured".into(),
+            1 => "Research lanes refreshed: 1 lane".into(),
+            _ => format!("Research lanes refreshed: {count} lanes"),
+        },
+        result,
+    })
+}
+
+fn sub_providers_mutation_event(result: SubProvidersMutationResult) -> ClientEvent {
+    let count = result.sub_providers.len();
+    let message = if result.applied {
+        format!("Research lanes updated: {count} configured — restart to apply")
+    } else {
+        "Research lane unchanged".into()
+    };
+    ClientEvent::SubProvidersMutation(SubProvidersMutationClientEvent { message, result })
 }
 
 fn profile_skills_list_event(result: ProfileSkillsListResult) -> ClientEvent {
@@ -2898,13 +3946,19 @@ fn auth_logout_event(result: AuthLogoutResult) -> ClientEvent {
 
 fn profile_local_create_event(result: ProfileLocalCreateResult) -> ClientEvent {
     let action = if result.created { "created" } else { "loaded" };
-    ClientEvent::ProfileLocalCreate(ProfileLocalCreateClientEvent {
-        message: format!(
+    // Surface the server-assigned final id (it may be collision-suffixed, e.g.
+    // `glm-2`). The email suffix is only shown when present — the nameable
+    // (requested_id) flow sends no email, so the message reads cleanly as
+    // "Local solo profile created: glm-2" instead of a dangling "( )".
+    let message = if result.email.trim().is_empty() {
+        format!("Local solo profile {action}: {}", result.profile_id)
+    } else {
+        format!(
             "Local solo profile {action}: {} ({})",
             result.profile_id, result.email
-        ),
-        result,
-    })
+        )
+    };
+    ClientEvent::ProfileLocalCreate(ProfileLocalCreateClientEvent { message, result })
 }
 
 fn auth_status_message(result: &AuthStatusResult) -> String {
@@ -3170,6 +4224,45 @@ fn response_id(
             "malformed_frame",
             "UI protocol response id must be a string, integer, or null",
         ))),
+    }
+}
+
+/// octos#1801 v3: decodes the durable `peer/staged` notification into the
+/// typed [`ClientEvent::PeerStaged`] via the tui-local
+/// [`crate::model::PeerStagedParams`] mirror (the vendored octos-core rev has
+/// no `UiNotification` variant for it yet). Malformed params surface as the
+/// standard `invalid_params` error event rather than wedging the stream.
+fn peer_staged_notification_to_client_event(params: Value) -> ClientEvent {
+    match serde_json::from_value::<crate::model::PeerStagedParams>(params) {
+        Ok(staged) => ClientEvent::PeerStaged(staged),
+        Err(err) => app_error(
+            "invalid_params",
+            format!(
+                "failed to decode UI protocol params for {}: {err}",
+                crate::model::APPUI_METHOD_PEER_STAGED
+            ),
+        )
+        .into(),
+    }
+}
+
+/// octos#1801 v3: decodes the durable `peer/closed` notification into the
+/// typed [`ClientEvent::PeerClosed`] via the tui-local
+/// [`crate::model::PeerClosedParams`] mirror (the vendored octos-core rev has
+/// no `UiNotification` variant for it yet). Mirror of
+/// [`peer_staged_notification_to_client_event`]: malformed params surface as
+/// the standard `invalid_params` error event rather than wedging the stream.
+fn peer_closed_notification_to_client_event(params: Value) -> ClientEvent {
+    match serde_json::from_value::<crate::model::PeerClosedParams>(params) {
+        Ok(closed) => ClientEvent::PeerClosed(closed),
+        Err(err) => app_error(
+            "invalid_params",
+            format!(
+                "failed to decode UI protocol params for {}: {err}",
+                crate::model::APPUI_METHOD_PEER_CLOSED
+            ),
+        )
+        .into(),
     }
 }
 
@@ -3548,6 +4641,19 @@ impl AppUiBackend for MockAppUiBackend {
                     )));
                 Ok(())
             }
+            AppUiCommand::SessionBtw(params) => {
+                self.queue
+                    .push_back(ClientEvent::SessionBtw(SessionBtwClientEvent {
+                        result: octos_core::ui_protocol::SessionBtwResult {
+                            session_id: params.session_id,
+                            answer: "Mock aside answer — the prototype backend has no LLM, \
+                                     but the /btw card, busy gate, and dismissal all work."
+                                .into(),
+                            model: Some("mock".into()),
+                        },
+                    }));
+                Ok(())
+            }
             AppUiCommand::InterruptTurn(_) => {
                 self.enqueue_protocol(UiNotification::Warning(WarningEvent {
                     session_id: SessionKey("local:prototype#interrupt".into()),
@@ -3581,12 +4687,15 @@ impl AppUiBackend for MockAppUiBackend {
                     queue_mode: Some("interactive".into()),
                     qoe_policy: Some("mock".into()),
                 };
-                self.queue.push_back(model_select_event(ModelSelectResult {
-                    session_id: params.session_id,
-                    selected,
-                    applied: true,
-                    runtime_policy_stamp: None,
-                }));
+                self.queue.push_back(model_select_event(
+                    ModelSelectResult {
+                        session_id: params.session_id.clone(),
+                        selected,
+                        applied: true,
+                        runtime_policy_stamp: None,
+                    },
+                    Some(params.session_id),
+                ));
                 Ok(())
             }
             AppUiCommand::ProfileLlmCatalog(_) => {
@@ -3606,12 +4715,19 @@ impl AppUiBackend for MockAppUiBackend {
                     queue_mode: None,
                     qoe_policy: None,
                 };
-                self.queue.push_back(model_select_event(ModelSelectResult {
-                    session_id: Self::mock_session_key(&self.profile_id(), "m9"),
-                    selected,
-                    applied: true,
-                    runtime_policy_stamp: None,
-                }));
+                let initiating = params
+                    .session_id
+                    .clone()
+                    .unwrap_or_else(|| Self::mock_session_key(&self.profile_id(), "m9"));
+                self.queue.push_back(model_select_event(
+                    ModelSelectResult {
+                        session_id: initiating.clone(),
+                        selected,
+                        applied: true,
+                        runtime_policy_stamp: None,
+                    },
+                    Some(initiating),
+                ));
                 Ok(())
             }
             AppUiCommand::ProfileLlmUpsert(_)
@@ -3692,12 +4808,14 @@ impl AppUiBackend for MockAppUiBackend {
                 Ok(())
             }
             AppUiCommand::ProfileLlmFetchModels(_) => {
-                self.queue.push_back(
-                    AppUiEvent::Status(AppUiStatus {
-                        message: "Mock fetch_models returned no additional models".into(),
-                    })
-                    .into(),
-                );
+                // Same event shape as the real decode arm
+                // (profile_llm_fetch_models_event) so the mock cannot mask a
+                // missing real-backend mapping.
+                self.queue
+                    .push_back(profile_llm_fetch_models_event(&serde_json::json!({
+                        "models": [],
+                        "reason": "mock backend",
+                    })));
                 Ok(())
             }
             AppUiCommand::ProfileSkillsList(_) => {
@@ -3953,6 +5071,74 @@ impl AppUiBackend for MockAppUiBackend {
             AppUiCommand::HydrateSession(_) => Err(eyre!(
                 "mock app-ui backend does not implement session hydrate yet"
             )),
+            // Stub a small `session/list` so `--mock` and tests can exercise the
+            // `/resume` picker end-to-end. Mirrors the server's `SessionInfo`
+            // shape (`{id, message_count, title?}`); `updated_at` is included on
+            // one row to exercise the ordering path.
+            AppUiCommand::ListSessions(_) => {
+                self.queue
+                    .push_back(ClientEvent::SessionList(SessionListResult {
+                        sessions: serde_json::json!([
+                            {
+                                "id": "local:mock#alpha",
+                                "message_count": 12,
+                                "title": "Mock session alpha",
+                                "updated_at": "2026-06-30T10:00:00Z"
+                            },
+                            {
+                                "id": "local:mock#bravo",
+                                "message_count": 3,
+                                "title": "Mock session bravo",
+                                "updated_at": "2026-07-01T09:30:00Z"
+                            },
+                            {
+                                "id": "local:mock#charlie",
+                                "message_count": 47
+                            }
+                        ]),
+                    }));
+                Ok(())
+            }
+            // Stub a `session/rollback` so `--mock` and tests can exercise the
+            // `/rewind` picker end-to-end: drop one user turn and return a
+            // trimmed `thread` (same shape as `session/hydrate`) with a single
+            // surviving user message, echoing the request's session id.
+            AppUiCommand::SessionRollback(params) => {
+                let session_id = params.session_id.clone();
+                self.queue
+                    .push_back(ClientEvent::SessionRollback(SessionRollbackResult {
+                        dropped_turns: 1,
+                        thread: SessionHydrateResult {
+                            session_id: session_id.clone(),
+                            cursor: UiCursor {
+                                stream: session_id.0.clone(),
+                                seq: 1,
+                            },
+                            context: None,
+                            context_state: None,
+                            replayed_tool_envelopes: None,
+                            messages: Some(vec![HydratedMessage {
+                                seq: 1,
+                                role: "user".into(),
+                                content: "first mock prompt".into(),
+                                turn_id: None,
+                                thread_id: None,
+                                client_message_id: None,
+                                persisted_at: Utc::now(),
+                                reasoning_content: None,
+                                message_id: None,
+                                source: None,
+                                media: Vec::new(),
+                            }]),
+                            threads: None,
+                            turns: None,
+                            pending_approvals: None,
+                            pending_questions: None,
+                            replayed_envelopes: None,
+                        },
+                    }));
+                Ok(())
+            }
             AppUiCommand::GetThreadGraph(_) => Err(eyre!(
                 "mock app-ui backend does not implement thread graph reads yet"
             )),
@@ -4555,6 +5741,14 @@ mod tests {
         assert!(modern.contains(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1));
         assert!(modern.contains(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1));
         assert!(modern.contains(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(modern.contains(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2));
+        // Modern advertises the plan/todo checklist so the server streams
+        // `plan/updated`; old-server mode drops it.
+        assert!(modern.contains(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1));
+        assert!(!appui_feature_header_for(true).contains(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1));
+        assert!(
+            !appui_feature_header_for(true).contains(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
+        );
 
         // Old-server mode drops autonomy/agent-control/goal/loop/task-control
         // so the backend behaves as a pre-autonomy server and the TUI hides
@@ -4568,6 +5762,14 @@ mod tests {
         // Baseline features remain so the session still works.
         assert!(legacy.contains(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1));
         assert!(legacy.contains(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
+    }
+
+    #[test]
+    fn tui_capabilities_advertise_projection_envelope_v2() {
+        assert!(
+            tui_capabilities().supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
+            "the TUI capability response must opt into canonical v2 envelopes"
+        );
     }
 
     fn unwrap_app_event(event: ClientEvent) -> AppUiEvent {
@@ -4626,6 +5828,27 @@ mod tests {
         assert_eq!(event.exit_code, Some(0));
         assert!(event.stdout.contains("hi"));
         assert!(!event.truncated);
+        // With no explicit cwd the child inherits the process cwd — the event
+        // labels that so the transcript card can show WHERE the command ran.
+        assert_eq!(
+            event.cwd,
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.display().to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn run_local_shell_labels_explicit_cwd() {
+        let dir = std::env::temp_dir();
+        let event =
+            run_local_shell_command("echo hi".into(), Some(dir.clone()), "local-shell:t2".into())
+                .await;
+        assert_eq!(event.exit_code, Some(0));
+        assert_eq!(
+            event.cwd.as_deref(),
+            Some(dir.display().to_string().as_str())
+        );
     }
 
     struct ProtocolCaptureServer {
@@ -5344,9 +6567,11 @@ mod tests {
         let local_profile = rpc_request_from_command(
             "tui-11b".into(),
             AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
+                requested_id: None,
                 name: "Ada Lovelace".into(),
                 username: "ada".into(),
                 email: "ada@example.com".into(),
+                make_default: None,
             }),
         )
         .expect("local profile request encodes");
@@ -5677,6 +6902,7 @@ mod tests {
         pending.insert(
             "skills-list".into(),
             PendingRequest {
+                select_session: None,
                 method: crate::model::APPUI_METHOD_PROFILE_SKILLS_LIST.into(),
             },
         );
@@ -5706,6 +6932,654 @@ mod tests {
         assert_eq!(event.result.profile_id.as_deref(), Some("coding"));
         assert_eq!(event.result.skills[0].name, "deep-search");
         assert_eq!(event.result.skills[0].status.as_deref(), Some("installed"));
+    }
+
+    /// #395: `peer/prepare` requests encode brief/worktree/cwd/session_id and
+    /// omit the unused optionals; results decode into the typed
+    /// `ClientEvent::PeerPrepared` carrying the tui-local result struct.
+    #[test]
+    fn peer_prepare_request_encodes_and_result_decodes_to_client_event() {
+        let request = rpc_request_from_command(
+            "peer-1".into(),
+            AppUiCommand::PeerPrepare(crate::model::PeerPrepareParams {
+                brief: "fix the nav flicker".into(),
+                n: None,
+                title: None,
+                worktree: true,
+                cwd: Some("/repo".into()),
+                session_id: Some(SessionKey("coding:local:tui#coding".into())),
+                profile_id: None,
+            }),
+        )
+        .expect("peer/prepare request encodes");
+        assert_eq!(request.method, crate::model::APPUI_METHOD_PEER_PREPARE);
+        assert_eq!(request.params["brief"], "fix the nav flicker");
+        assert_eq!(request.params["worktree"], true);
+        assert_eq!(request.params["cwd"], "/repo");
+        assert_eq!(request.params["session_id"], "coding:local:tui#coding");
+        assert!(
+            request.params.get("profile_id").is_none(),
+            "profile_id: None must be omitted from the wire shape"
+        );
+        assert!(
+            request.params.get("title").is_none(),
+            "title: None must be omitted from the wire shape"
+        );
+
+        let mut pending = HashMap::new();
+        pending.insert(
+            "peer-1".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_PEER_PREPARE.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "peer-1",
+            "result": {
+                "slug": "fix-nav-flicker",
+                "topic": "peer-fix-nav-flicker",
+                "brief_path": "/repo/.octos/peers/fix-nav-flicker/BRIEF.md",
+                "cwd": "/repo",
+                "worktree_branch": "peer/fix-nav-flicker",
+                "profile_id": "coding"
+            }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::PeerPrepared(event) = event else {
+            panic!("expected peer prepared event, got {event:?}");
+        };
+        assert_eq!(event.result.slug, "fix-nav-flicker");
+        assert_eq!(event.result.topic, "peer-fix-nav-flicker");
+        assert_eq!(
+            event.result.brief_path,
+            "/repo/.octos/peers/fix-nav-flicker/BRIEF.md"
+        );
+        assert_eq!(event.result.cwd, "/repo");
+        assert_eq!(
+            event.result.worktree_branch.as_deref(),
+            Some("peer/fix-nav-flicker")
+        );
+        assert_eq!(event.result.profile_id, "coding");
+        assert!(event.message.contains("fix-nav-flicker"));
+        assert!(
+            event.result.peers.is_empty(),
+            "a v1 scalar-only result decodes with the serde-default empty fleet"
+        );
+    }
+
+    /// octos#1801 v2: `peer/prepare` fleet requests encode `n` (omitted when
+    /// absent), and fleet results decode the `peers` array alongside the
+    /// scalar head.
+    #[test]
+    fn peer_prepare_fleet_n_encodes_and_peers_decode() {
+        let request = rpc_request_from_command(
+            "peer-2".into(),
+            AppUiCommand::PeerPrepare(crate::model::PeerPrepareParams {
+                brief: "fix the nav".into(),
+                n: Some(3),
+                title: None,
+                worktree: false,
+                cwd: None,
+                session_id: None,
+                profile_id: None,
+            }),
+        )
+        .expect("peer/prepare fleet request encodes");
+        assert_eq!(request.params["n"], 3);
+
+        let mut pending = HashMap::new();
+        pending.insert(
+            "peer-2".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_PEER_PREPARE.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "peer-2",
+            "result": {
+                "slug": "fix-nav",
+                "topic": "peer-fix-nav",
+                "brief_path": "/repo/.octos/peers/fix-nav/brief.md",
+                "cwd": "/repo",
+                "worktree_branch": null,
+                "profile_id": "coding",
+                "peers": [
+                    {
+                        "slug": "fix-nav",
+                        "topic": "peer-fix-nav",
+                        "brief_path": "/repo/.octos/peers/fix-nav/brief.md",
+                        "cwd": "/repo",
+                        "worktree_branch": null,
+                        "profile_id": "coding"
+                    },
+                    {
+                        "slug": "fix-nav-2",
+                        "topic": "peer-fix-nav-2",
+                        "brief_path": "/repo/.octos/peers/fix-nav-2/brief.md",
+                        "cwd": "/repo",
+                        "worktree_branch": null,
+                        "profile_id": "coding"
+                    }
+                ]
+            }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::PeerPrepared(event) = event else {
+            panic!("expected peer prepared event, got {event:?}");
+        };
+        assert_eq!(event.result.peers.len(), 2);
+        assert_eq!(event.result.peers[1].slug, "fix-nav-2");
+        assert_eq!(event.result.peers[1].topic, "peer-fix-nav-2");
+    }
+
+    /// octos#1807: `turn/steer` requests encode session/expected-turn/input
+    /// (`expected_turn_id: None` omitted from the wire), and both result
+    /// shapes decode into the typed `ClientEvent::TurnSteered`.
+    #[test]
+    fn turn_steer_request_encodes_and_result_decodes_to_client_event() {
+        let expected_turn = TurnId::new();
+        let request = rpc_request_from_command(
+            "steer-1".into(),
+            AppUiCommand::TurnSteer(crate::model::TurnSteerParams {
+                session_id: SessionKey("coding:local:tui#coding".into()),
+                expected_turn_id: Some(expected_turn.clone()),
+                input: vec![octos_core::ui_protocol::InputItem::Text {
+                    text: "also check the tests".into(),
+                }],
+            }),
+        )
+        .expect("turn/steer request encodes");
+        assert_eq!(request.method, crate::model::APPUI_METHOD_TURN_STEER);
+        assert_eq!(request.params["session_id"], "coding:local:tui#coding");
+        assert_eq!(
+            request.params["expected_turn_id"],
+            expected_turn.0.to_string()
+        );
+        assert_eq!(request.params["input"][0]["text"], "also check the tests");
+
+        let absent = rpc_request_from_command(
+            "steer-2".into(),
+            AppUiCommand::TurnSteer(crate::model::TurnSteerParams {
+                session_id: SessionKey("coding:local:tui#coding".into()),
+                expected_turn_id: None,
+                input: vec![octos_core::ui_protocol::InputItem::Text {
+                    text: "steer whatever is live".into(),
+                }],
+            }),
+        )
+        .expect("turn/steer request without expected turn encodes");
+        assert!(
+            absent.params.get("expected_turn_id").is_none(),
+            "expected_turn_id: None must be omitted from the wire shape"
+        );
+
+        // steered:true — the ACTIVE turn's id echoes back.
+        let mut pending = HashMap::new();
+        pending.insert(
+            "steer-1".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_TURN_STEER.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "steer-1",
+            "result": { "turn_id": expected_turn.0.to_string(), "steered": true }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::TurnSteered(event) = event else {
+            panic!("expected turn steered event, got {event:?}");
+        };
+        assert!(event.result.steered);
+        assert_eq!(event.result.turn_id, expected_turn);
+
+        // steered:false — the server-minted NEW turn id comes back.
+        let new_turn = TurnId::new();
+        let mut pending = HashMap::new();
+        pending.insert(
+            "steer-3".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_TURN_STEER.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "steer-3",
+            "result": { "turn_id": new_turn.0.to_string(), "steered": false }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::TurnSteered(event) = event else {
+            panic!("expected turn steered event, got {event:?}");
+        };
+        assert!(!event.result.steered);
+        assert_eq!(event.result.turn_id, new_turn);
+    }
+
+    /// octos#1801 v3: the durable `peer/staged` NOTIFICATION decodes via the
+    /// tui-local string-keyed match into `ClientEvent::PeerStaged` — the
+    /// vendored octos-core rev predates the `UiNotification` variant, so
+    /// routing it through `from_method_and_params` would degrade it to an
+    /// `unknown_notification` error event.
+    #[test]
+    fn peer_staged_notification_decodes_to_client_event() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "peer/staged",
+            "params": {
+                "session_id": "coding:local:tui#coding",
+                "topic": "peer-fix-nav",
+                "slug": "fix-nav",
+                "brief": "fix the nav",
+                "brief_path": "/repo/.octos/peers/fix-nav/BRIEF.md",
+                "cwd": "/repo",
+                "worktree_branch": null,
+                "profile_id": "coding"
+            }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut HashMap::new())
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::PeerStaged(staged) = event else {
+            panic!("expected peer staged event, got {event:?}");
+        };
+        assert_eq!(
+            staged.session_id,
+            SessionKey("coding:local:tui#coding".into())
+        );
+        assert_eq!(staged.topic, "peer-fix-nav");
+        assert_eq!(staged.slug, "fix-nav");
+        assert_eq!(staged.brief, "fix the nav");
+        assert_eq!(staged.brief_path, "/repo/.octos/peers/fix-nav/BRIEF.md");
+        assert_eq!(staged.cwd, "/repo");
+        assert!(staged.worktree_branch.is_none());
+        assert_eq!(staged.profile_id, "coding");
+    }
+
+    /// Malformed `peer/staged` params surface as the standard
+    /// `invalid_params` error event instead of wedging the stream (durable
+    /// replay would re-deliver the same frame on every reconnect).
+    #[test]
+    fn peer_staged_notification_with_bad_params_yields_invalid_params_error() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "peer/staged",
+            "params": { "topic": "peer-fix-nav" }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut HashMap::new())
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::App(event) = event else {
+            panic!("expected an app error event, got {event:?}");
+        };
+        let AppUiEvent::Error(error) = *event else {
+            panic!("expected an error event, got {event:?}");
+        };
+        assert_eq!(error.code, "invalid_params");
+        assert!(error.message.contains("peer/staged"));
+    }
+
+    /// octos#1801 v3: the durable `peer/closed` NOTIFICATION decodes via the
+    /// tui-local string-keyed match into `ClientEvent::PeerClosed` — the mirror
+    /// of the `peer/staged` decode (the vendored octos-core rev predates the
+    /// `UiNotification` variant, so `from_method_and_params` would degrade it to
+    /// an `unknown_notification` error event).
+    #[test]
+    fn peer_closed_notification_decodes_to_client_event() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "peer/closed",
+            "params": {
+                "session_id": "coding:local:tui#coding",
+                "topic": "peer-fix-nav",
+                "slug": "fix-nav",
+                "profile_id": "coding"
+            }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut HashMap::new())
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::PeerClosed(closed) = event else {
+            panic!("expected peer closed event, got {event:?}");
+        };
+        assert_eq!(
+            closed.session_id,
+            SessionKey("coding:local:tui#coding".into())
+        );
+        assert_eq!(closed.topic, "peer-fix-nav");
+        assert_eq!(closed.slug, "fix-nav");
+        assert_eq!(closed.profile_id, "coding");
+    }
+
+    /// Malformed `peer/closed` params surface as the standard `invalid_params`
+    /// error event instead of wedging the stream (durable replay would
+    /// re-deliver the same frame on every reconnect).
+    #[test]
+    fn peer_closed_notification_with_bad_params_yields_invalid_params_error() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "peer/closed",
+            "params": { "topic": "peer-fix-nav" }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut HashMap::new())
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::App(event) = event else {
+            panic!("expected an app error event, got {event:?}");
+        };
+        let AppUiEvent::Error(error) = *event else {
+            panic!("expected an error event, got {event:?}");
+        };
+        assert_eq!(error.code, "invalid_params");
+        assert!(error.message.contains("peer/closed"));
+    }
+
+    /// octos#1801 v2: `peer/gather` requests encode the slug filter (omitted
+    /// for gather-all) and results decode into
+    /// `ClientEvent::PeerGathered` — including a peer with no result yet.
+    #[test]
+    fn peer_gather_request_encodes_and_result_decodes_to_client_event() {
+        let request = rpc_request_from_command(
+            "gather-1".into(),
+            AppUiCommand::PeerGather(crate::model::PeerGatherParams {
+                slugs: None,
+                session_id: Some(SessionKey("coding:local:tui#coding".into())),
+                profile_id: None,
+            }),
+        )
+        .expect("peer/gather request encodes");
+        assert_eq!(request.method, crate::model::APPUI_METHOD_PEER_GATHER);
+        assert_eq!(request.params["session_id"], "coding:local:tui#coding");
+        assert!(
+            request.params.get("slugs").is_none(),
+            "slugs: None (gather all) must be omitted from the wire shape"
+        );
+        assert!(request.params.get("profile_id").is_none());
+
+        let filtered = rpc_request_from_command(
+            "gather-2".into(),
+            AppUiCommand::PeerGather(crate::model::PeerGatherParams {
+                slugs: Some(vec!["fix-nav".into()]),
+                session_id: None,
+                profile_id: None,
+            }),
+        )
+        .expect("filtered peer/gather request encodes");
+        assert_eq!(filtered.params["slugs"], json!(["fix-nav"]));
+
+        let mut pending = HashMap::new();
+        pending.insert(
+            "gather-1".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_PEER_GATHER.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "gather-1",
+            "result": {
+                "profile_id": "coding",
+                "peers": [
+                    {
+                        "slug": "fix-nav",
+                        "topic": "peer-fix-nav",
+                        "brief": "make the nav not flicker",
+                        "brief_truncated": false,
+                        "result": "Nav fixed.",
+                        "result_truncated": false,
+                        "result_updated_unix": 1753000000,
+                        "has_worktree": true
+                    },
+                    {
+                        "slug": "fix-nav-2",
+                        "topic": "peer-fix-nav-2",
+                        "brief": "make the nav not flicker",
+                        "brief_truncated": false,
+                        "result": null,
+                        "result_truncated": false,
+                        "result_updated_unix": null,
+                        "has_worktree": false
+                    }
+                ]
+            }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::PeerGathered(event) = event else {
+            panic!("expected peer gathered event, got {event:?}");
+        };
+        assert_eq!(event.result.profile_id, "coding");
+        assert_eq!(event.result.peers.len(), 2);
+        assert_eq!(event.result.peers[0].result.as_deref(), Some("Nav fixed."));
+        assert_eq!(event.result.peers[0].result_updated_unix, Some(1753000000));
+        assert!(event.result.peers[0].has_worktree);
+        assert!(event.result.peers[1].result.is_none());
+        assert!(event.message.contains("1/2"));
+    }
+
+    /// Realistic `session/status/read` result body as emitted by an octos
+    /// server (protocol 1.1.0) for a fresh data dir where onboarding has not
+    /// saved a provider yet — captured verbatim from `octos serve --stdio`
+    /// (capabilities trimmed to a representative subset). `model_member`
+    /// controls the `model` key: `Some(value)` inserts it, `None` omits it.
+    fn server_status_read_result(model_member: Option<Value>) -> Value {
+        let mut result = json!({
+            "session_id": "local:tui#coding",
+            "profile_id": "ada",
+            "runtime_policy_stamp": {
+                "runtime_mode": "solo",
+                "profile_id": "ada",
+                "workspace_root": null,
+                "approval_policy": "on-request",
+                "sandbox_mode": "workspace-write",
+                "permission_profile": "workspace_write",
+                "filesystem_scope": "workspace",
+                "network": "blocked",
+                "model": null,
+                "provider": null,
+                "tool_policy_id": "profile",
+                "mcp_servers": [],
+                "memory_scope": "profile-session",
+                "qoe_policy": "profile",
+                "queue_mode": "adaptive",
+                "tool_contract_id": "codex-compatible-coding-v1",
+                "tool_contract_version": "1",
+                "model_toolset": "coding",
+                "dynamic_tool_discovery": "enabled"
+            },
+            "context": null,
+            "context_state": null,
+            "permission_profile": "workspace_write",
+            "sandbox": "workspace-write",
+            "health": { "status": "ok" },
+            "mcp_summary": { "connected": 0, "connecting": 0, "failed": 0, "disabled": 0 },
+            "tool_summary": { "visible": 0, "enabled": 0, "denied": 0, "policy_id": "profile" },
+            "usage": {},
+            "cursor": { "healthy": true, "replay_supported": true },
+            "capabilities": {
+                "version": { "protocol": "octos-ui/v1alpha1", "schema_version": 1, "jsonrpc": "2.0" },
+                "capabilities_schema_version": 2,
+                "supported_methods": ["session/open", "session/status/read"],
+                "supported_notifications": ["turn/started"]
+            }
+        });
+        if let Some(model) = model_member {
+            result["model"] = model;
+        }
+        result
+    }
+
+    fn decode_status_read_frame(result: Value) -> ClientEvent {
+        let mut pending = HashMap::new();
+        pending.insert(
+            "status-1".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_SESSION_STATUS_READ.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "status-1",
+            "result": result,
+        })
+        .to_string();
+        rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event")
+    }
+
+    fn expect_session_status(event: ClientEvent) -> crate::model::SessionStatusReadResult {
+        let ClientEvent::SessionStatus(event) = event else {
+            panic!("expected session status event, got {event:?}");
+        };
+        event.result
+    }
+
+    /// The version-skew shape that used to fail the whole decode: a server
+    /// with no resolved model emits
+    /// `"model": {"model": null, "provider": null, "selected": true}`.
+    /// That null-member object MEANS "no model resolved" and must decode to
+    /// `model == None` — never take the entire SessionStatusReadResult down
+    /// with an `invalid_result` error that degrades the composer footer to
+    /// the `<server authenticated profile>` placeholder.
+    #[test]
+    fn session_status_null_member_model_object_decodes_as_no_model() {
+        let status = expect_session_status(decode_status_read_frame(server_status_read_result(
+            Some(json!({
+                "model": null,
+                "provider": null,
+                "selected": true
+            })),
+        )));
+
+        assert_eq!(status.model, None);
+        // The rest of the result must land — this is what keeps the footer
+        // on real data instead of the placeholder.
+        assert_eq!(status.profile_id.as_deref(), Some("ada"));
+        assert_eq!(status.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(
+            status
+                .runtime_policy_stamp
+                .as_ref()
+                .and_then(|stamp| stamp.profile_id.as_deref()),
+            Some("ada")
+        );
+    }
+
+    #[test]
+    fn session_status_resolved_model_object_still_decodes() {
+        let status = expect_session_status(decode_status_read_frame(server_status_read_result(
+            Some(json!({
+                "model": "deepseek-v4-pro",
+                "provider": "deepseek",
+                "selected": true
+            })),
+        )));
+
+        let model = status.model.expect("resolved model decodes to Some");
+        assert_eq!(model.model, "deepseek-v4-pro");
+        assert_eq!(model.provider, "deepseek");
+        assert!(model.selected);
+    }
+
+    #[test]
+    fn session_status_null_model_decodes_as_no_model() {
+        let status = expect_session_status(decode_status_read_frame(server_status_read_result(
+            Some(Value::Null),
+        )));
+        assert_eq!(status.model, None);
+        assert_eq!(status.profile_id.as_deref(), Some("ada"));
+    }
+
+    #[test]
+    fn session_status_missing_model_key_decodes_as_no_model() {
+        let status =
+            expect_session_status(decode_status_read_frame(server_status_read_result(None)));
+        assert_eq!(status.model, None);
+        assert_eq!(status.profile_id.as_deref(), Some("ada"));
+    }
+
+    /// Tolerance is ONLY for the no-model shapes. A model object whose
+    /// members are present but wrongly typed is a real protocol error and
+    /// must keep surfacing `invalid_result` — the deserializer must not
+    /// silently swallow it as `None`.
+    #[test]
+    fn session_status_malformed_model_object_still_reports_invalid_result() {
+        let event = decode_status_read_frame(server_status_read_result(Some(json!({
+            "model": 42,
+            "provider": "deepseek",
+            "selected": true
+        }))));
+
+        let ClientEvent::App(event) = event else {
+            panic!("expected app error event, got {event:?}");
+        };
+        let AppUiEvent::Error(error) = *event else {
+            panic!("expected invalid_result error, got {event:?}");
+        };
+        assert_eq!(error.code, "invalid_result");
+    }
+
+    /// A null `model` member must not become a validation bypass: siblings
+    /// that ARE present still have to be well-typed, otherwise the
+    /// no-model mapping would mask a genuinely malformed result.
+    #[test]
+    fn session_status_null_model_member_with_malformed_sibling_still_errors() {
+        let event = decode_status_read_frame(server_status_read_result(Some(json!({
+            "model": null,
+            "provider": 42,
+            "selected": true
+        }))));
+
+        let ClientEvent::App(event) = event else {
+            panic!("expected app error event, got {event:?}");
+        };
+        let AppUiEvent::Error(error) = *event else {
+            panic!("expected invalid_result error, got {event:?}");
+        };
+        assert_eq!(error.code, "invalid_result");
+    }
+
+    #[test]
+    fn session_status_no_model_shape_with_malformed_selected_still_errors() {
+        let event = decode_status_read_frame(server_status_read_result(Some(json!({
+            "model": null,
+            "provider": null,
+            "selected": "yes"
+        }))));
+
+        let ClientEvent::App(event) = event else {
+            panic!("expected app error event, got {event:?}");
+        };
+        let AppUiEvent::Error(error) = *event else {
+            panic!("expected invalid_result error, got {event:?}");
+        };
+        assert_eq!(error.code, "invalid_result");
     }
 
     #[test]
@@ -5750,6 +7624,7 @@ mod tests {
                 after: None,
                 include: Vec::new(),
             }),
+            AppUiCommand::ListSessions(octos_core::ui_protocol::SessionListParams { cwd: None }),
             AppUiCommand::GetThreadGraph(ThreadGraphGetParams {
                 session_id: session_id.clone(),
                 at: None,
@@ -5770,6 +7645,14 @@ mod tests {
             AppUiCommand::ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchParams {
                 profile_id: Some("coding".into()),
                 q: Some("search".into()),
+            }),
+            // octos#1801 v2: `peer/gather` only reads the blackboard —
+            // readonly viewers may gather (the follow-up SubmitPrompt is
+            // where readonly blocks).
+            AppUiCommand::PeerGather(crate::model::PeerGatherParams {
+                slugs: None,
+                session_id: Some(session_id.clone()),
+                profile_id: None,
             }),
         ];
         for command in &read_style_commands {
@@ -5797,6 +7680,10 @@ mod tests {
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
             }),
+            AppUiCommand::SessionRollback(octos_core::ui_protocol::SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            }),
             AppUiCommand::StartReview(ReviewStartParams {
                 session_id: session_id.clone(),
                 profile_id: Some("coding".into()),
@@ -5818,9 +7705,11 @@ mod tests {
                 ApprovalDecision::Deny,
             )),
             AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
+                requested_id: None,
                 name: "Ada Lovelace".into(),
                 username: "ada".into(),
                 email: "ada@example.com".into(),
+                make_default: None,
             }),
             AppUiCommand::SetPermissionProfile(PermissionProfileSetParams {
                 session_id,
@@ -5841,12 +7730,179 @@ mod tests {
                 profile_id: Some("coding".into()),
                 name: "deep-search".into(),
             }),
+            // #395: `peer/prepare` writes the brief file (and may create a
+            // worktree) server-side — a mutation, blocked in read-only mode.
+            AppUiCommand::PeerPrepare(crate::model::PeerPrepareParams {
+                brief: "fix the thing".into(),
+                n: None,
+                title: None,
+                worktree: false,
+                cwd: None,
+                session_id: None,
+                profile_id: None,
+            }),
+            // octos#1807: `turn/steer` injects input into a running turn —
+            // the same mutation class as `turn/start`, blocked in read-only.
+            AppUiCommand::TurnSteer(crate::model::TurnSteerParams {
+                session_id: SessionKey("local:test".into()),
+                expected_turn_id: Some(TurnId::new()),
+                input: vec![octos_core::ui_protocol::InputItem::Text {
+                    text: "steer".into(),
+                }],
+            }),
         ];
         for command in &mutating_commands {
             assert!(
                 !ProtocolAppUiBackend::readonly_allows_command(command),
                 "{} should be blocked in read-only mode",
                 command.method()
+            );
+        }
+    }
+
+    /// `task/list` is a pure read (M15-E inspection); `--readonly` viewers
+    /// must keep it, like the other task/agent/goal/loop reads.
+    #[test]
+    fn readonly_allows_task_list() {
+        assert!(ProtocolAppUiBackend::readonly_allows_command(
+            &AppUiCommand::ListTasks(TaskListParams {
+                session_id: SessionKey("local:test".into()),
+                topic: None,
+            })
+        ));
+    }
+
+    /// M15-era mutating commands blocked in readonly mode must be labeled as
+    /// ordinary readonly blocks (code "readonly"), not fall into the
+    /// "unexpectedly blocked read-style" readonly_policy arm that claims a
+    /// policy bug.
+    #[test]
+    fn readonly_blocks_m15_mutations_with_proper_label() {
+        let session_id = SessionKey("local:test".into());
+        let mutations = [
+            AppUiCommand::SessionRollback(octos_core::ui_protocol::SessionRollbackParams {
+                session_id: session_id.clone(),
+                num_turns: 1,
+            }),
+            AppUiCommand::StartReview(ReviewStartParams {
+                session_id: session_id.clone(),
+                profile_id: None,
+                turn_id: None,
+                target: None,
+                prompt: None,
+                instructions: None,
+                delivery: None,
+            }),
+            AppUiCommand::SelectModel(ModelSelectParams {
+                session_id: session_id.clone(),
+                model: "deepseek-v4-pro".into(),
+                provider: None,
+                route: None,
+            }),
+            AppUiCommand::CancelTask(TaskCancelParams {
+                task_id: TaskId::new(),
+                session_id: Some(session_id.clone()),
+                profile_id: None,
+            }),
+            AppUiCommand::RestartTaskFromNode(TaskRestartFromNodeParams {
+                session_id: Some(session_id.clone()),
+                task_id: TaskId::new(),
+                node_id: Some("node-1".into()),
+                profile_id: None,
+            }),
+            AppUiCommand::InterruptAgent(crate::model::AgentInterruptParams {
+                session_id: session_id.clone(),
+                agent_id: "ag-1".into(),
+            }),
+            AppUiCommand::CloseAgent(crate::model::AgentCloseParams {
+                session_id: session_id.clone(),
+                agent_id: "ag-1".into(),
+            }),
+            AppUiCommand::SetSessionGoal(crate::model::SessionGoalSetParams {
+                session_id: session_id.clone(),
+                profile_id: None,
+                objective: "goal".into(),
+                status: None,
+                token_budget: None,
+                transition_actor: None,
+                action: Default::default(),
+            }),
+            AppUiCommand::ClearSessionGoal(crate::model::SessionGoalClearParams {
+                session_id: session_id.clone(),
+                profile_id: None,
+            }),
+            AppUiCommand::CreateLoop(crate::model::LoopCreateParams {
+                session_id: session_id.clone(),
+                profile_id: None,
+                prompt: "poll".into(),
+                mode: crate::model::LoopMode::FixedInterval,
+                interval_seconds: Some(60),
+            }),
+            AppUiCommand::DeleteLoop(crate::model::LoopIdParams {
+                session_id: session_id.clone(),
+                loop_id: "loop-1".into(),
+            }),
+            AppUiCommand::PauseLoop(crate::model::LoopIdParams {
+                session_id: session_id.clone(),
+                loop_id: "loop-1".into(),
+            }),
+            AppUiCommand::ResumeLoop(crate::model::LoopIdParams {
+                session_id: session_id.clone(),
+                loop_id: "loop-1".into(),
+            }),
+            AppUiCommand::FireLoopNow(crate::model::LoopIdParams {
+                session_id: session_id.clone(),
+                loop_id: "loop-1".into(),
+            }),
+            // #395: `/peer`'s prepare RPC — a labeled readonly block, not the
+            // "unexpectedly blocked read-style" policy-bug arm.
+            AppUiCommand::PeerPrepare(crate::model::PeerPrepareParams {
+                brief: "fix the thing".into(),
+                n: None,
+                title: None,
+                worktree: false,
+                cwd: None,
+                session_id: Some(session_id.clone()),
+                profile_id: None,
+            }),
+        ];
+
+        for command in mutations {
+            let method = command.method().to_string();
+            assert!(
+                !ProtocolAppUiBackend::readonly_allows_command(&command),
+                "{method} must be blocked in read-only mode"
+            );
+
+            let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+                endpoint: Some(AppUiEndpoint::websocket(
+                    "wss://example.test/ui-protocol",
+                    None,
+                )),
+                readonly: true,
+                ..AppUiLaunch::default()
+            });
+            backend
+                .send(command)
+                .expect("readonly block is reported as an app event");
+            let event = backend.next_event().expect("poll").expect("queued event");
+            let AppUiEvent::Error(error) = unwrap_app_event(event) else {
+                panic!("expected readonly error event for {method}");
+            };
+            assert_eq!(
+                error.code, "readonly",
+                "{method} must use the ordinary readonly label, got {}: {}",
+                error.code, error.message
+            );
+            assert!(
+                error.message.contains(&method),
+                "message names the blocked method: {}",
+                error.message
+            );
+            assert!(
+                !error.message.contains("unexpectedly"),
+                "{method} is an expected block, not a policy bug: {}",
+                error.message
             );
         }
     }
@@ -5932,9 +7988,7 @@ mod tests {
             Some(" coding "),
         )
         .expect("request builds");
-        let expected_features = format!(
-            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1}, {UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1}, {UI_PROTOCOL_FEATURE_USER_QUESTION_V1}"
-        );
+        let expected_features = appui_feature_header_for(false);
 
         assert_eq!(
             request
@@ -5959,6 +8013,211 @@ mod tests {
         );
     }
 
+    // --- ReconnectBackoff state machine (no networks involved) ---
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn reconnect_backoff_allows_first_attempt_immediately() {
+        let backoff = ReconnectBackoff::default();
+        assert!(backoff.should_attempt(Instant::now()));
+    }
+
+    #[test]
+    fn reconnect_backoff_schedule_doubles_and_caps_at_five_seconds() {
+        let t0 = Instant::now();
+        let mut backoff = ReconnectBackoff::default();
+
+        // Failure 1 → wait 500ms.
+        backoff.record_failure(t0);
+        assert!(!backoff.should_attempt(t0 + ms(499)));
+        assert!(backoff.should_attempt(t0 + ms(500)));
+
+        // Failure 2 → wait 1s.
+        let t1 = t0 + ms(500);
+        backoff.record_failure(t1);
+        assert!(!backoff.should_attempt(t1 + ms(999)));
+        assert!(backoff.should_attempt(t1 + ms(1000)));
+
+        // Failures 3/4 → 2s/4s.
+        let t2 = t1 + ms(1000);
+        backoff.record_failure(t2);
+        assert!(!backoff.should_attempt(t2 + ms(1999)));
+        assert!(backoff.should_attempt(t2 + ms(2000)));
+        let t3 = t2 + ms(2000);
+        backoff.record_failure(t3);
+        assert!(!backoff.should_attempt(t3 + ms(3999)));
+        assert!(backoff.should_attempt(t3 + ms(4000)));
+
+        // Failure 5+ → capped at 5s (8s uncapped).
+        let t4 = t3 + ms(4000);
+        backoff.record_failure(t4);
+        assert!(!backoff.should_attempt(t4 + ms(4999)));
+        assert!(backoff.should_attempt(t4 + ms(5000)));
+        let t5 = t4 + ms(5000);
+        backoff.record_failure(t5);
+        assert!(!backoff.should_attempt(t5 + ms(4999)));
+        assert!(backoff.should_attempt(t5 + ms(5000)));
+    }
+
+    #[test]
+    fn reconnect_backoff_treats_instant_exit_loop_as_failures() {
+        // The storm scenario: spawn always "succeeds", the child dies
+        // instantly. Successful connects must NOT reset the streak; the
+        // short-lived disconnect keeps growing it.
+        let t0 = Instant::now();
+        let mut backoff = ReconnectBackoff::default();
+
+        assert!(backoff.should_attempt(t0));
+        backoff.record_success(t0);
+        backoff.record_disconnect(t0 + ms(10)); // died 10ms after connect
+        assert_eq!(backoff.consecutive_failures(), 1);
+        let t1 = t0 + ms(10);
+        assert!(!backoff.should_attempt(t1 + ms(489)));
+        assert!(backoff.should_attempt(t1 + ms(500)));
+
+        backoff.record_success(t1 + ms(500));
+        backoff.record_disconnect(t1 + ms(510));
+        assert_eq!(backoff.consecutive_failures(), 2);
+        let t2 = t1 + ms(510);
+        assert!(!backoff.should_attempt(t2 + ms(999)));
+        assert!(backoff.should_attempt(t2 + ms(1000)));
+    }
+
+    #[test]
+    fn reconnect_backoff_long_lived_connection_resets_failures() {
+        let t0 = Instant::now();
+        let mut backoff = ReconnectBackoff::default();
+        backoff.record_failure(t0);
+        backoff.record_failure(t0 + ms(500));
+        assert_eq!(backoff.consecutive_failures(), 2);
+
+        // Connection survives past the short-lived window before dying.
+        let connect = t0 + ms(1500);
+        backoff.record_success(connect);
+        backoff.record_disconnect(connect + ms(1500));
+        assert_eq!(backoff.consecutive_failures(), 0);
+        assert!(backoff.should_attempt(connect + ms(1500)));
+    }
+
+    #[test]
+    fn reconnect_backoff_frame_delivery_resets_failures() {
+        let t0 = Instant::now();
+        let mut backoff = ReconnectBackoff::default();
+        backoff.record_failure(t0);
+        backoff.record_failure(t0 + ms(500));
+
+        // Connect, receive a data frame, die 100ms in: the frame proved the
+        // connection, so the quick death does not count as a failure.
+        let connect = t0 + ms(1500);
+        backoff.record_success(connect);
+        backoff.record_frame();
+        backoff.record_disconnect(connect + ms(100));
+        assert_eq!(backoff.consecutive_failures(), 0);
+        assert!(backoff.should_attempt(connect + ms(100)));
+    }
+
+    #[test]
+    fn reconnect_backoff_ignores_disconnects_while_already_disconnected() {
+        // The quiet ensure_connected error path calls mark_disconnected on
+        // every tick; that must not slide the schedule forward.
+        let t0 = Instant::now();
+        let mut backoff = ReconnectBackoff::default();
+        backoff.record_success(t0);
+        backoff.record_disconnect(t0 + ms(10));
+        assert_eq!(backoff.consecutive_failures(), 1);
+
+        for tick in 1..100u64 {
+            backoff.record_disconnect(t0 + ms(10 + tick * 25));
+        }
+        assert_eq!(backoff.consecutive_failures(), 1);
+        assert!(backoff.should_attempt(t0 + ms(10) + ms(500)));
+    }
+
+    /// End-to-end storm guard: an instantly-exiting stdio child must be
+    /// respawned on the backoff schedule, not once per event-loop poll.
+    #[cfg(unix)]
+    #[test]
+    fn stdio_reconnect_backs_off_for_instantly_exiting_child() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is valid")
+            .as_nanos();
+        let marker = std::env::temp_dir().join(format!("octos-tui-backoff-{nonce}.log"));
+        let command = format!("echo spawned >> {}; exit 7", marker.display());
+
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::stdio(command)),
+            ..AppUiLaunch::default()
+        });
+
+        // Bootstrap performs the first connect; then poll aggressively for
+        // ~1.2s the way the event loop would.
+        let _ = backend.bootstrap();
+        let deadline = Instant::now() + Duration::from_millis(1200);
+        while Instant::now() < deadline {
+            let _ = backend.next_event();
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let spawns = std::fs::read_to_string(&marker)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            (1..=4).contains(&spawns),
+            "instantly-exiting stdio child should respawn on the backoff \
+             schedule (expected 1..=4 spawns in 1.2s, got {spawns})"
+        );
+    }
+
+    /// The WS connect path must give up after WS_CONNECT_TIMEOUT instead of
+    /// blocking the UI thread until the OS TCP timeout: a listener that
+    /// accepts but never answers the handshake simulates a blackholed
+    /// endpoint.
+    #[test]
+    fn websocket_connect_times_out_against_unresponsive_endpoint() {
+        let listener = match StdTcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind test listener: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener addr");
+        let hold = thread::spawn(move || {
+            // Accept the TCP connection and then never answer the WS
+            // handshake until the client hangs up.
+            if let Ok((stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut buf = [0u8; 1024];
+                use std::io::Read;
+                let mut stream = stream;
+                while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+            }
+        });
+
+        let runtime = Runtime::new().expect("test runtime");
+        let mut driver = WebSocketTransportDriver::new(format!("ws://{addr}/ui"), None, None);
+        let started = Instant::now();
+        let err = driver
+            .connect(&runtime)
+            .expect_err("handshake-less endpoint must not connect");
+        let elapsed = started.elapsed();
+
+        assert!(
+            format!("{err:#}").contains("timed out"),
+            "expected connect timeout error, got: {err:#}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "connect must be bounded by WS_CONNECT_TIMEOUT, took {elapsed:?}"
+        );
+        drop(driver);
+        hold.join().expect("hold thread exits");
+    }
+
     #[test]
     fn stdio_transport_driver_rejects_empty_command() {
         let err = match StdioTransportDriver::new("   ".into()) {
@@ -5979,6 +8238,322 @@ mod tests {
 
         assert_eq!(driver.label(), "octos serve --stdio");
         assert!(!driver.is_connected());
+    }
+
+    // --- CappedLineReader: bounded stdio line buffering ---
+
+    #[tokio::test]
+    async fn capped_line_reader_discards_giant_line_and_recovers() {
+        // A 3 MB line (newline-terminated) followed by a normal line: the
+        // giant line must be discarded without ever buffering it whole, and
+        // the reader must resync on the next line.
+        let giant = 3 * 1024 * 1024;
+        let mut input = vec![b'a'; giant];
+        input.push(b'\n');
+        input.extend_from_slice(b"next line\n");
+
+        let mut reader = CappedLineReader::new(BufReader::new(&input[..]), 1024);
+        match reader.next_line().await.expect("read giant line") {
+            CappedLine::TooLong { discarded } => {
+                assert_eq!(discarded, (giant + 1) as u64, "content + newline discarded");
+            }
+            other => panic!("expected TooLong for the giant line, got {other:?}"),
+        }
+        assert_eq!(
+            reader.next_line().await.expect("read next line"),
+            CappedLine::Line("next line".into())
+        );
+        assert_eq!(reader.next_line().await.expect("read eof"), CappedLine::Eof);
+    }
+
+    #[tokio::test]
+    async fn capped_line_reader_discards_giant_line_without_trailing_newline() {
+        // Giant input with NO newline at all (the pathological
+        // never-newline stream): must terminate with TooLong at EOF, not
+        // accumulate unboundedly. A small BufReader capacity exercises the
+        // incremental chunked path a real pipe produces.
+        let input = vec![b'b'; 256 * 1024];
+        let mut reader = CappedLineReader::new(BufReader::with_capacity(64, &input[..]), 1024);
+
+        match reader.next_line().await.expect("read") {
+            CappedLine::TooLong { discarded } => {
+                assert_eq!(discarded, input.len() as u64);
+            }
+            other => panic!("expected TooLong, got {other:?}"),
+        }
+        assert_eq!(reader.next_line().await.expect("read eof"), CappedLine::Eof);
+    }
+
+    #[tokio::test]
+    async fn capped_line_reader_keeps_lines_at_the_cap_boundary() {
+        // len == cap passes; len == cap+1 is dropped.
+        let mut input = vec![b'x'; 8];
+        input.push(b'\n');
+        input.extend_from_slice(&[b'y'; 9]);
+        input.push(b'\n');
+        let mut reader = CappedLineReader::new(BufReader::new(&input[..]), 8);
+
+        assert_eq!(
+            reader.next_line().await.expect("read"),
+            CappedLine::Line("xxxxxxxx".into())
+        );
+        assert!(matches!(
+            reader.next_line().await.expect("read"),
+            CappedLine::TooLong { discarded: 10 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn capped_line_reader_handles_crlf_final_partial_and_non_utf8() {
+        let input: &[u8] = b"first\r\ncaf\xE9 latte\nlast-no-newline";
+        let mut reader = CappedLineReader::new(BufReader::new(input), 1024);
+
+        assert_eq!(
+            reader.next_line().await.expect("read"),
+            CappedLine::Line("first".into()),
+            "trailing CR is stripped"
+        );
+        assert_eq!(
+            reader.next_line().await.expect("read"),
+            CappedLine::NotUtf8 {
+                lossy: "caf\u{FFFD} latte".into()
+            },
+            "invalid UTF-8 is surfaced as NotUtf8 (skipped on the frame path, \
+             lossy for stderr diagnostics) — delivering it lossily decoded as \
+             malformed_json and leaked the pending request (codex round-2 P2)"
+        );
+        assert_eq!(
+            reader.next_line().await.expect("read"),
+            CappedLine::Line("last-no-newline".into()),
+            "final unterminated line is still delivered"
+        );
+        assert_eq!(reader.next_line().await.expect("read"), CappedLine::Eof);
+    }
+
+    /// Shell snippet emitting one giant `x…x` line (`over` bytes, newline
+    /// terminated) followed by `after-too-long`. head/tr instead of awk: BSD
+    /// awk's gsub is quadratic on a 1 MB string (~9 s), which starves test
+    /// deadlines.
+    #[cfg(unix)]
+    fn giant_line_script(over: usize) -> String {
+        format!("head -c {over} /dev/zero | tr '\\000' 'x'; echo; echo after-too-long")
+    }
+
+    /// Same discard-and-recover contract, but over a real child pipe (chunked
+    /// delivery + backpressure) rather than an in-memory slice.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capped_line_reader_discards_giant_line_on_a_real_pipe() {
+        let over = MAX_TEXT_FRAME_BYTES + 512;
+        let script = giant_line_script(over);
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn awk child");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let mut reader = CappedLineReader::new(BufReader::new(stdout), MAX_TEXT_FRAME_BYTES);
+
+        match tokio::time::timeout(Duration::from_secs(5), reader.next_line())
+            .await
+            .expect("giant line read within budget")
+            .expect("read")
+        {
+            CappedLine::TooLong { discarded } => assert_eq!(discarded, (over + 1) as u64),
+            other => panic!("expected TooLong, got {other:?}"),
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), reader.next_line())
+                .await
+                .expect("next line within budget")
+                .expect("read"),
+            CappedLine::Line("after-too-long".into())
+        );
+        let _ = child.wait().await;
+    }
+
+    #[test]
+    fn stdio_skipped_frame_error_does_not_disconnect() {
+        let TransportEvent::Error {
+            code,
+            message,
+            disconnect,
+        } = stdio_frame_too_large_skipped_event(2048)
+        else {
+            panic!("expected error event");
+        };
+        assert_eq!(code, "frame_too_large");
+        assert!(message.contains("2048 bytes discarded"));
+        assert!(!disconnect, "a skipped frame must keep the child session");
+    }
+
+    // --- StderrRing + exit disconnect message ---
+
+    #[test]
+    fn stderr_ring_keeps_only_the_most_recent_lines() {
+        let mut ring = StderrRing::default();
+        for index in 0..40 {
+            ring.push(format!("line-{index}"));
+        }
+        let tail = ring.tail().expect("tail present");
+        assert!(!tail.contains("line-19"), "old lines evicted: {tail}");
+        assert!(tail.contains("line-20") && tail.contains("line-39"));
+        assert_eq!(tail.lines().count(), STDIO_STDERR_RING_MAX_LINES);
+    }
+
+    #[test]
+    fn stderr_ring_bounds_bytes_but_keeps_newest_line() {
+        let mut ring = StderrRing::default();
+        ring.push("first".into());
+        ring.push("z".repeat(STDIO_STDERR_RING_MAX_BYTES + 100));
+        let tail = ring.tail().expect("tail present");
+        assert!(!tail.contains("first"), "byte budget evicts older lines");
+        assert!(tail.starts_with("zzz"), "newest line survives even if huge");
+    }
+
+    #[test]
+    fn stdio_exit_message_attaches_stderr_tail_only_on_failure() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            let failing = std::process::ExitStatus::from_raw(3 << 8);
+            let message =
+                stdio_exit_disconnect_message(&Ok(failing), Some("boom: bad config".into()));
+            assert!(message.contains("exited with"));
+            assert!(message.contains("stderr tail:"));
+            assert!(message.contains("boom: bad config"));
+
+            let clean = std::process::ExitStatus::from_raw(0);
+            let message = stdio_exit_disconnect_message(&Ok(clean), Some("noise".into()));
+            assert!(!message.contains("stderr tail:"), "clean exit stays terse");
+            assert!(!message.contains("noise"));
+        }
+
+        let message = stdio_exit_disconnect_message(
+            &Err(std::io::Error::other("wait failed")),
+            Some("diagnostic".into()),
+        );
+        assert!(message.contains("wait failed"));
+        assert!(
+            message.contains("diagnostic"),
+            "wait errors count as failure"
+        );
+    }
+
+    // --- stdio driver end-to-end: exit race + stderr tail + oversized skip ---
+
+    fn drive_stdio_until_disconnect(
+        command: &str,
+    ) -> (Vec<String>, Vec<(String, String, bool)>, String) {
+        let runtime = Runtime::new().expect("test runtime");
+        let mut driver = StdioTransportDriver::new(command.into()).expect("driver builds");
+        driver.connect(&runtime).expect("stdio child spawns");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut frames = Vec::new();
+        let mut errors = Vec::new();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for stdio disconnect; frames={frames:?} errors={errors:?}"
+            );
+            match driver.poll_event().expect("poll stdio driver") {
+                Some(TransportEvent::Frame(TransportFrame::Text(text))) => frames.push(text),
+                Some(TransportEvent::Frame(_)) => {}
+                Some(TransportEvent::Error {
+                    code,
+                    message,
+                    disconnect,
+                }) => errors.push((code, message, disconnect)),
+                Some(TransportEvent::Disconnected(message)) => return (frames, errors, message),
+                None => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
+
+    /// Child-exit race: the final stdout line written right before death must
+    /// be delivered before Disconnected, and a nonzero exit must carry the
+    /// stderr tail instead of discarding it.
+    #[cfg(unix)]
+    #[test]
+    fn stdio_child_exit_delivers_final_stdout_and_stderr_tail() {
+        let (frames, _errors, message) = drive_stdio_until_disconnect(
+            "echo final-response; echo 'boom: config invalid' >&2; exit 3",
+        );
+
+        assert_eq!(
+            frames,
+            vec!["final-response".to_string()],
+            "final stdout line survives the child-exit race"
+        );
+        assert!(
+            message.contains("exited with") && message.contains("3"),
+            "exit status reported: {message}"
+        );
+        assert!(
+            message.contains("boom: config invalid"),
+            "stderr tail attached on nonzero exit: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_clean_exit_reports_no_stderr_tail() {
+        let (frames, _errors, message) =
+            drive_stdio_until_disconnect("echo done; echo routine-noise >&2; exit 0");
+
+        assert_eq!(frames, vec!["done".to_string()]);
+        assert!(
+            message.contains("exited with"),
+            "status reported: {message}"
+        );
+        assert!(
+            !message.contains("routine-noise"),
+            "clean exits stay terse: {message}"
+        );
+    }
+
+    /// End-to-end (real child process): when the spawned `octos serve` refuses to
+    /// start because another serve owns the data dir, it prints
+    /// `DATA_DIR_LOCKED_MARKER` to stderr and exits nonzero. That marker must
+    /// survive into the Disconnected message so `mark_disconnected` can latch the
+    /// fatal, no-reconnect state — this pins the driver→message seam that the
+    /// `mark_disconnected` unit test then keys on.
+    #[cfg(unix)]
+    #[test]
+    fn stdio_child_exit_preserves_data_dir_locked_marker() {
+        let (_frames, _errors, message) = drive_stdio_until_disconnect(&format!(
+            "echo '{DATA_DIR_LOCKED_MARKER}: another octos server already owns data directory /x' \
+             >&2; exit 1"
+        ));
+        assert!(
+            message.contains(DATA_DIR_LOCKED_MARKER),
+            "the data-dir-lock marker must reach the disconnect message: {message}"
+        );
+    }
+
+    /// An oversized stdout line must surface as a non-fatal frame_too_large
+    /// error and the stream must keep delivering subsequent lines.
+    #[cfg(unix)]
+    #[test]
+    fn stdio_oversized_line_is_skipped_without_killing_the_session() {
+        let over = MAX_TEXT_FRAME_BYTES + 512;
+        let command = giant_line_script(over);
+        let (frames, errors, _message) = drive_stdio_until_disconnect(&command);
+
+        let (code, message, disconnect) = errors
+            .iter()
+            .find(|(code, _, _)| code == "frame_too_large")
+            .expect("oversized line reported");
+        assert_eq!(code, "frame_too_large");
+        assert!(message.contains("discarded"));
+        assert!(!disconnect, "skip must not tear down the session");
+        assert_eq!(
+            frames,
+            vec!["after-too-long".to_string()],
+            "stream recovers on the next line"
+        );
     }
 
     #[test]
@@ -6024,6 +8599,100 @@ mod tests {
                 .as_ref()
                 .map(|endpoint| endpoint.label().to_string()),
             Some("octos serve --stdio".into())
+        );
+    }
+
+    /// `profile/llm/fetch_models` responses must produce an event: this arm
+    /// was missing, so the result was silently dropped and onboarding's
+    /// "Fetch models" button appeared dead against a real backend (the mock
+    /// faked a status, masking it).
+    #[test]
+    fn protocol_decodes_profile_llm_fetch_models_result_as_status() {
+        let mut exchange = ProtocolExchange::default();
+        let request = exchange
+            .build_tracked_request(AppUiCommand::ProfileLlmFetchModels(
+                crate::model::ProfileLlmFetchModelsParams {
+                    profile_id: Some("ada".into()),
+                    selection: Default::default(),
+                    api_key: None,
+                },
+            ))
+            .expect("request builds");
+
+        // Server result shape (see raw_profile_llm_fetch_models in
+        // octos-cli's ui_protocol.rs): profile_id/family_id/models[String]
+        // plus an optional reason. It does NOT carry provider config, so it
+        // must not be decoded as ProfileLlmListResult.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": {
+                "profile_id": "ada",
+                "family_id": "openai",
+                "models": ["gpt-a", "gpt-b", "gpt-c"],
+            }
+        })
+        .to_string();
+
+        let event = exchange
+            .decode_rpc_text(&response)
+            .expect("response decodes")
+            .expect("fetch_models result must yield an event, not be dropped");
+        let AppUiEvent::Status(status) = unwrap_app_event(event) else {
+            panic!("expected a status event for fetch_models");
+        };
+        assert!(
+            status.message.contains("Fetched 3 models"),
+            "count surfaces: {}",
+            status.message
+        );
+        assert!(exchange.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn protocol_fetch_models_status_reports_server_reason() {
+        let event = profile_llm_fetch_models_event(&json!({
+            "profile_id": "ada",
+            "family_id": "openai",
+            "models": [],
+            "reason": "no_api_key",
+        }));
+        let AppUiEvent::Status(status) = unwrap_app_event(event) else {
+            panic!("expected a status event");
+        };
+        assert!(
+            status.message.contains("Fetched 0 models") && status.message.contains("no_api_key"),
+            "reason surfaces: {}",
+            status.message
+        );
+    }
+
+    /// The mock backend must produce the same event shape as the real decode
+    /// arm so it cannot mask a missing real-backend mapping again.
+    #[test]
+    fn mock_fetch_models_matches_real_decode_arm_shape() {
+        let mut backend = MockAppUiBackend::new(AppUiLaunch::default());
+        backend
+            .send(AppUiCommand::ProfileLlmFetchModels(
+                crate::model::ProfileLlmFetchModelsParams {
+                    profile_id: Some("ada".into()),
+                    selection: Default::default(),
+                    api_key: None,
+                },
+            ))
+            .expect("mock accepts fetch_models");
+
+        let event = backend
+            .next_event()
+            .expect("poll mock")
+            .expect("mock emits an event");
+        let AppUiEvent::Status(status) = unwrap_app_event(event) else {
+            panic!("expected a status event from the mock");
+        };
+        assert!(
+            status.message.starts_with("Fetched 0 models"),
+            "mock aligns with the real arm: {}",
+            status.message
         );
     }
 
@@ -6178,6 +8847,7 @@ mod tests {
         assert_eq!(
             exchange.pending_requests.get(&request.id),
             Some(&PendingRequest {
+                select_session: None,
                 method: methods::APPROVAL_SCOPES_LIST.into(),
             })
         );
@@ -6279,6 +8949,184 @@ mod tests {
         assert!(error.message.contains("transport closed for test"));
     }
 
+    /// Two octos-tui competing for the DB: the spawned backend refuses to start
+    /// (its stderr tail carries `DATA_DIR_LOCKED_MARKER`). The client must latch
+    /// a fatal state — surface ONE clean terminal error (not the raw stderr
+    /// status) and suppress reconnect so it stops the silent respawn crash-loop.
+    #[test]
+    fn data_dir_lock_conflict_latches_fatal_and_stops_reconnect() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        backend.mark_connected("wss://example.test/ui-protocol");
+
+        // The stdio child died at startup; its exit message carries the server's
+        // stable marker in the stderr tail.
+        backend.mark_disconnected(format!(
+            "UI protocol stdio child exited with exit status: 1; reconnect will relaunch on next \
+             send/read.\nstderr tail:\n{DATA_DIR_LOCKED_MARKER}: another octos server is already \
+             running for this data directory (/tmp/x)."
+        ));
+
+        // Exactly one user-facing event: the clean, actionable terminal error —
+        // the raw stderr Status is suppressed so it can't overwrite it.
+        let event = unwrap_app_event(backend.queue.pop_front().expect("a surfaced event"));
+        let AppUiEvent::Error(error) = event else {
+            panic!("data-dir conflict must surface as an Error, got: {event:?}");
+        };
+        assert_eq!(error.code, DATA_DIR_LOCKED_CODE);
+        assert!(
+            error.message.contains("Close the other octos-tui"),
+            "message must be the actionable explanation; got: {}",
+            error.message
+        );
+        assert!(
+            backend.queue.is_empty(),
+            "only the clean error should surface; the raw stderr Status must be suppressed",
+        );
+
+        // Latched fatal → reconnect refuses (no respawn = the loop is broken).
+        assert!(backend.fatal_error.is_some(), "fatal state must latch");
+        assert!(
+            backend.ensure_connected().is_err(),
+            "a latched data-dir conflict must never attempt to reconnect",
+        );
+    }
+
+    /// Regression guard: an ordinary transport disconnect (no marker) must NOT
+    /// latch fatal — it still reports a status and stays retryable, or a healthy
+    /// server restart would never reconnect.
+    #[test]
+    fn ordinary_disconnect_does_not_latch_fatal() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        backend.mark_connected("wss://example.test/ui-protocol");
+        backend.mark_disconnected("UI protocol stdio child exited with exit status: 0");
+
+        assert!(
+            backend.fatal_error.is_none(),
+            "a normal disconnect must stay retryable",
+        );
+        let event = unwrap_app_event(backend.queue.pop_front().expect("a status event"));
+        assert!(
+            matches!(event, AppUiEvent::Status(_)),
+            "a normal disconnect still reports its raw status",
+        );
+    }
+
+    #[test]
+    fn skipped_oversized_frame_cancels_pending_requests_without_disconnect() {
+        // codex P2 (deep-review wave): a skipped over-cap stdio line may have
+        // BEEN the response to an in-flight request — its id is unknowable, so
+        // the pending entry leaked forever and repeated large responses wedged
+        // sends at MAX_PENDING_REQUESTS. The skip now cancels pending requests
+        // like the disconnect path does, while keeping the connection up.
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        let request = backend
+            .build_tracked_request(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+            }))
+            .expect("request builds");
+        backend.mark_connected("wss://example.test/ui-protocol");
+
+        let first = backend
+            .handle_transport_event(stdio_frame_too_large_skipped_event(2_000_000))
+            .expect("event handled")
+            .expect("event surfaced");
+
+        assert!(backend.protocol.pending_requests.is_empty());
+        let AppUiEvent::Error(error) = unwrap_app_event(first) else {
+            panic!("expected cancellation error first");
+        };
+        assert_eq!(error.code, "request_cancelled");
+        assert!(error.message.contains(&request.id));
+
+        let next = backend.queue.pop_front().expect("frame_too_large error");
+        let AppUiEvent::Error(error) = unwrap_app_event(next) else {
+            panic!("expected frame_too_large error");
+        };
+        assert_eq!(error.code, "frame_too_large");
+        assert!(
+            matches!(backend.connection_state, ProtocolConnectionState::Connected),
+            "the child stays alive; a skipped frame must not disconnect"
+        );
+        assert!(
+            backend.queue.is_empty(),
+            "no disconnect status may be queued"
+        );
+    }
+
+    #[test]
+    fn skipped_not_utf8_frame_cancels_pending_requests_without_disconnect() {
+        // codex round-2 P2: an invalid-UTF-8 stdio line used to be delivered
+        // LOSSILY — decoding as malformed_json with an unknowable id and
+        // silently leaking its pending-request entry. It is now skipped like
+        // an over-cap frame, with pending requests cancelled.
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        let request = backend
+            .build_tracked_request(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+            }))
+            .expect("request builds");
+        backend.mark_connected("wss://example.test/ui-protocol");
+
+        let first = backend
+            .handle_transport_event(stdio_frame_not_utf8_skipped_event(42))
+            .expect("event handled")
+            .expect("event surfaced");
+
+        assert!(backend.protocol.pending_requests.is_empty());
+        let AppUiEvent::Error(error) = unwrap_app_event(first) else {
+            panic!("expected cancellation error first");
+        };
+        assert_eq!(error.code, "request_cancelled");
+        assert!(error.message.contains(&request.id));
+        let next = backend.queue.pop_front().expect("frame_not_utf8 error");
+        let AppUiEvent::Error(error) = unwrap_app_event(next) else {
+            panic!("expected frame_not_utf8 error");
+        };
+        assert_eq!(error.code, "frame_not_utf8");
+        assert!(matches!(
+            backend.connection_state,
+            ProtocolConnectionState::Connected
+        ));
+    }
+
+    #[test]
+    fn take_line_yields_not_utf8_for_invalid_bytes() {
+        let mut buf = vec![0xf0, 0x9f, b'x', 0xff, b'\r'];
+        let CappedLine::NotUtf8 { lossy } = take_line(&mut buf) else {
+            panic!("expected NotUtf8 for invalid bytes");
+        };
+        assert!(lossy.contains('x'), "lossy text keeps readable bytes");
+        // Strict UTF-8 still yields Line.
+        let mut ok = b"hello\r".to_vec();
+        assert_eq!(take_line(&mut ok), CappedLine::Line("hello".into()));
+    }
+
     #[test]
     fn protocol_backend_retries_cancelled_capabilities_without_surfacing_error() {
         let server = match spawn_capabilities_reconnect_server() {
@@ -6352,6 +9200,7 @@ mod tests {
             backend.protocol.pending_requests.insert(
                 format!("existing-{index}"),
                 PendingRequest {
+                    select_session: None,
                     method: methods::APPROVAL_SCOPES_LIST.into(),
                 },
             );
@@ -6429,6 +9278,7 @@ mod tests {
         assert_eq!(
             backend.protocol.pending_requests.get(&request.id),
             Some(&PendingRequest {
+                select_session: None,
                 method: methods::TURN_START.into(),
             })
         );
@@ -6758,9 +9608,11 @@ mod tests {
 
         let local_profile_request = backend
             .build_tracked_request(AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
+                requested_id: None,
                 name: "Ada Lovelace".into(),
                 username: "ada".into(),
                 email: "ada@example.com".into(),
+                make_default: None,
             }))
             .expect("local profile request builds");
         let local_profile_frame = json!({
@@ -7175,6 +10027,54 @@ mod tests {
     }
 
     #[test]
+    fn protocol_session_list_request_includes_workspace_cwd_when_launch_has_one() {
+        // `session/list` carries the SAME launch workspace cwd the client
+        // already sends on `session/open` (see `fill_session_list_cwd`), so a
+        // server with per-project session storage lists THIS project's
+        // sessions. The store constructs the command with `cwd: None`; the
+        // transport stamps `launch.cwd`.
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            cwd: Some("/tmp/project".into()),
+            ..AppUiLaunch::default()
+        });
+        let request = backend
+            .build_tracked_request(AppUiCommand::ListSessions(
+                octos_core::ui_protocol::SessionListParams { cwd: None },
+            ))
+            .expect("request builds");
+
+        assert_eq!(request.method, methods::SESSION_LIST);
+        assert_eq!(request.params["cwd"], json!("/tmp/project"));
+    }
+
+    #[test]
+    fn protocol_session_list_request_is_empty_object_when_launch_has_no_cwd() {
+        // Backward compat: with no launch cwd the `session/list` request
+        // serializes to the historical empty object `{}` (no `cwd` key), so an
+        // old server deserializes it unchanged.
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            cwd: None,
+            ..AppUiLaunch::default()
+        });
+        let request = backend
+            .build_tracked_request(AppUiCommand::ListSessions(
+                octos_core::ui_protocol::SessionListParams { cwd: None },
+            ))
+            .expect("request builds");
+
+        assert_eq!(request.method, methods::SESSION_LIST);
+        assert_eq!(request.params, json!({}));
+    }
+
+    #[test]
     fn protocol_backend_captures_cursor_and_reuses_it_on_session_open() {
         let session_id = SessionKey("local:test".into());
         let opened_cursor = UiCursor {
@@ -7421,6 +10321,96 @@ mod tests {
         assert_eq!(request.params["cwd"], "/tmp/workspace");
         assert_eq!(request.params["after"]["stream"], "local:test");
         assert_eq!(request.params["after"]["seq"], 42);
+    }
+
+    #[test]
+    fn reconnect_reopens_current_session_not_launch_session() {
+        // Regression: a reconnect must re-open the session the user is CURRENTLY
+        // on (set by /resume, tab-switch, …), not the fixed launch `--session`.
+        // The old code always re-sent the launch session, silently yanking the
+        // selection back to it and auto-draining its staged prompts.
+        let launch_session = SessionKey("local:launch".into());
+        let resumed_session = SessionKey("local:resumed".into());
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            profile_id: Some("coding".into()),
+            session_id: Some(launch_session.clone()),
+            cwd: Some("/tmp/workspace".into()),
+            ..AppUiLaunch::default()
+        });
+
+        // Before any open, reconnect falls back to the launch session.
+        let fallback = backend
+            .reopen_session_open_command()
+            .expect("launch session is the fallback reopen target");
+        let AppUiCommand::OpenSession(fallback) = fallback else {
+            panic!("reopen command must be an OpenSession");
+        };
+        assert_eq!(fallback.session_id, launch_session);
+
+        // The user /resumes a different session (profile differs too). `send`
+        // records the reopen target via `record_reopen_target` before any
+        // network I/O; drive that helper directly so the test never dials out.
+        backend.record_reopen_target(&AppUiCommand::OpenSession(SessionOpenParams {
+            session_id: resumed_session.clone(),
+            topic: None,
+            profile_id: Some("research".into()),
+            cwd: Some("/tmp/other".into()),
+            sandbox: None,
+            after: Some(UiCursor {
+                stream: resumed_session.0.clone(),
+                seq: 7,
+            }),
+        }));
+
+        let reopen = backend
+            .reopen_session_open_command()
+            .expect("a reopen target is recorded after opening a session");
+        let AppUiCommand::OpenSession(reopen) = reopen else {
+            panic!("reopen command must be an OpenSession");
+        };
+        assert_eq!(
+            reopen.session_id, resumed_session,
+            "reconnect must reopen the currently-selected session, not the launch session"
+        );
+        assert_eq!(
+            reopen.profile_id.as_deref(),
+            Some("research"),
+            "the reopen carries the resumed session's own profile"
+        );
+        assert!(
+            reopen.after.is_none(),
+            "the stored reopen resets the cursor; command_with_resume_cursor refills it at send time"
+        );
+
+        // /resume emits a HydrateSession (NOT an OpenSession); it must also
+        // update the reopen target, else a reconnect after /resume reopens the
+        // stale prior session (codex P1). The reopen is re-expressed as an
+        // OpenSession carrying the launch profile/cwd.
+        let hydrated_session = SessionKey("local:hydrated".into());
+        backend.record_reopen_target(&AppUiCommand::HydrateSession(SessionHydrateParams {
+            session_id: hydrated_session.clone(),
+            after: None,
+            include: vec!["messages".into(), "turns".into()],
+        }));
+        let reopen = backend
+            .reopen_session_open_command()
+            .expect("a HydrateSession updates the reopen target");
+        let AppUiCommand::OpenSession(reopen) = reopen else {
+            panic!("reopen command must be an OpenSession");
+        };
+        assert_eq!(
+            reopen.session_id, hydrated_session,
+            "a /resume (HydrateSession) must become the reconnect reopen target"
+        );
+        assert_eq!(
+            reopen.profile_id.as_deref(),
+            Some("coding"),
+            "a hydrate-sourced reopen carries the launch profile (hydrate has none)"
+        );
     }
 
     #[test]

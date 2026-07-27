@@ -13,6 +13,9 @@
 //!   shadowing installs.
 //! - **Terminal**: TERM/terminfo, UTF-8 locale, CJK width, color support.
 //! - **Config & data**: config dir + data dir writability.
+//! - **Profiles & sessions**: on-disk profiles, the default (`*`), the LLM each
+//!   is configured for, and an on-disk session count. Per-session *folders*
+//!   need a live `session/list` (the session→cwd map is in-process only).
 //! - **Backend**: stdio-command resolves (+ `octos --version`); configured WS
 //!   endpoints are probed with `config/capabilities/list`, falling back to a
 //!   structural protocol-skew check against the compiled-in `octos-core`.
@@ -27,10 +30,10 @@ use octos_core::ui_protocol::{
     JSON_RPC_VERSION, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
-    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
-    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_KNOWN_FEATURES, UI_PROTOCOL_SCHEMA_VERSION,
-    UI_PROTOCOL_V1, UiProtocolCapabilities,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    UI_PROTOCOL_KNOWN_FEATURES, UI_PROTOCOL_SCHEMA_VERSION, UI_PROTOCOL_V1, UiProtocolCapabilities,
 };
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio_tungstenite::{
@@ -56,6 +59,7 @@ pub const TUI_REQUIRED_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
     UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
     UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
 ];
 
 /// Parsed `octos-tui doctor` flags.
@@ -71,6 +75,8 @@ pub struct DoctorArgs {
     pub stdio_command: Option<String>,
     /// WS endpoint, if configured.
     pub endpoint: Option<String>,
+    /// Bearer token for UI Protocol authentication. Falls back to OCTOS_AUTH_TOKEN.
+    pub auth_token: Option<String>,
     /// Data dir override (defaults to `~/.octos`).
     pub data_dir: Option<PathBuf>,
 }
@@ -287,8 +293,10 @@ impl Report {
 pub fn run(args: DoctorArgs) -> Result<i32> {
     let mut checks = Vec::new();
     checks.extend(binary_checks(&args));
+    checks.extend(installations_checks());
     checks.extend(terminal_checks());
     checks.extend(config_checks(&args));
+    checks.extend(profiles_checks(&args));
     checks.extend(backend_checks(&args));
     checks.extend(network_checks());
 
@@ -529,6 +537,41 @@ pub fn locate_octos_tui() -> LocatedBinaries {
     } else {
         "octos-tui"
     };
+    locate_binary(exe_name, &default_install_dirs())
+}
+
+/// `octos` (the backend) discovered across `$PATH` + the known install prefixes,
+/// plus `~/.octos/bin` where octos-tui's auto-provisioner drops it. Same
+/// PATH-vs-off-PATH bookkeeping as [`locate_octos_tui`].
+fn locate_octos() -> LocatedBinaries {
+    let exe_name = if cfg!(windows) { "octos.exe" } else { "octos" };
+    let mut dirs = default_install_dirs();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(&home).join(".octos").join("bin"));
+    }
+    locate_binary(exe_name, &dirs)
+}
+
+/// Extra known-install prefixes to probe beyond `$PATH` (Homebrew, `/usr`,
+/// cargo's `~/.cargo/bin`, the shell-installer's `~/.local/bin`). Kept distinct
+/// from `$PATH` hits so "on PATH" reflects bare-name runnability, not mere
+/// on-disk presence.
+fn default_install_dirs() -> Vec<PathBuf> {
+    let mut extras: Vec<PathBuf> = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    if let Some(home) = std::env::var_os("HOME") {
+        extras.push(PathBuf::from(&home).join(".cargo").join("bin"));
+        extras.push(PathBuf::from(&home).join(".local").join("bin"));
+    }
+    extras
+}
+
+/// Enumerate every `exe_name` on `$PATH` plus `extra_dirs`, de-duplicated by
+/// canonical path, preserving PATH precedence (first wins). `$PATH` resolutions
+/// are tracked separately from the extra prefixes.
+fn locate_binary(exe_name: &str, extra_dirs: &[PathBuf]) -> LocatedBinaries {
     let mut located = LocatedBinaries::default();
     let mut seen: Vec<PathBuf> = Vec::new();
 
@@ -551,22 +594,124 @@ pub fn locate_octos_tui() -> LocatedBinaries {
             push_if_present(&dir, &mut located.on_path, &mut seen);
         }
     }
-
-    // Extra known-install prefixes that may NOT be on `$PATH`. These count for
-    // shadow detection but are kept distinct from `$PATH` hits.
-    let mut extras: Vec<PathBuf> = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
-        .iter()
-        .map(PathBuf::from)
-        .collect();
-    if let Some(home) = std::env::var_os("HOME") {
-        extras.push(PathBuf::from(&home).join(".cargo").join("bin"));
-        extras.push(PathBuf::from(&home).join(".local").join("bin"));
-    }
-    for dir in extras {
-        push_if_present(&dir, &mut located.off_path, &mut seen);
+    // Extra known-install prefixes that may NOT be on `$PATH`.
+    for dir in extra_dirs {
+        push_if_present(dir, &mut located.off_path, &mut seen);
     }
 
     located
+}
+
+// ---------------------------------------------------------------------------
+// Installations (every octos-tui + octos on the machine, with versions)
+// ---------------------------------------------------------------------------
+
+const CAT_INSTALLS: &str = "Installations";
+
+/// Best-effort install-method guess from a binary's on-disk path, so the user
+/// knows which package manager put each copy there when cleaning up duplicates.
+fn install_method_label(path: &Path) -> &'static str {
+    let p = path.to_string_lossy();
+    if p.contains("/.cargo/bin/") {
+        "cargo"
+    } else if p.contains("node_modules") {
+        "npm"
+    } else if p.contains("/homebrew/") || p.contains("/Cellar/") || p.starts_with("/usr/local/") {
+        "brew"
+    } else if p.contains("/.octos/bin/") {
+        "octos-tui auto-install"
+    } else if p.contains("/.local/bin/") {
+        "shell installer"
+    } else if p.starts_with("/usr/bin/") || p.starts_with("/bin/") {
+        "system"
+    } else {
+        "unknown"
+    }
+}
+
+/// Run `<path> --version` and return its first non-empty line, or `None` if the
+/// binary can't be run / prints nothing. No timeout — these are our own
+/// fast-responding binaries (same as the backend probe in `backend_ensure`).
+fn probe_version(path: &Path) -> Option<String> {
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+}
+
+/// One display row per located binary: `<path> [<method>, on/off PATH] → <version>`.
+fn install_rows(located: &LocatedBinaries) -> Vec<String> {
+    located
+        .all()
+        .iter()
+        .map(|p| {
+            let method = install_method_label(p);
+            let on = if located.on_path.contains(p) {
+                "on PATH"
+            } else {
+                "off PATH"
+            };
+            let version = probe_version(p).unwrap_or_else(|| "no --version".to_string());
+            format!("{} [{method}, {on}] → {version}", p.display())
+        })
+        .collect()
+}
+
+/// Summarize one binary's installs: PASS on exactly one, WARN on duplicates (so
+/// the user can clean them up — the first on `$PATH` wins and the rest can
+/// confuse updates), WARN on none.
+fn installs_check(display_name: &str, located: &LocatedBinaries) -> Check {
+    let rows = install_rows(located);
+    match rows.len() {
+        0 => Check::warn(
+            CAT_INSTALLS,
+            format!("{display_name} installs"),
+            "none found on $PATH or known install dirs",
+            format!("install {display_name}"),
+        ),
+        1 => Check::pass(
+            CAT_INSTALLS,
+            format!("{display_name} installs"),
+            rows[0].clone(),
+        ),
+        n => Check::warn(
+            CAT_INSTALLS,
+            format!("{display_name} installs"),
+            format!("{n} installs found — the first on $PATH wins; the rest can confuse updates"),
+            format!(
+                "remove the copies you don't want: {}",
+                rows[1..].join(" ; ")
+            ),
+        )
+        .with_value(rows.join(" | ")),
+    }
+}
+
+/// #5: enumerate every octos-tui AND octos on the machine (across `$PATH`,
+/// Homebrew, cargo, the shell installer's `~/.local/bin`, and octos-tui's
+/// `~/.octos/bin`), showing each copy's version + install method, plus the
+/// octos version this client needs — so duplicate/mismatched installs are
+/// visible at a glance.
+fn installations_checks() -> Vec<Check> {
+    vec![
+        Check::pass(
+            CAT_INSTALLS,
+            "octos-tui needs octos",
+            format!(
+                ">= {} (this is octos-tui v{}; auto-install bundle {})",
+                crate::backend_ensure::MIN_OCTOS_VERSION,
+                env!("CARGO_PKG_VERSION"),
+                crate::backend_ensure::REQUIRED_OCTOS_RELEASE,
+            ),
+        ),
+        installs_check("octos-tui", &locate_octos_tui()),
+        installs_check("octos", &locate_octos()),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -715,12 +860,31 @@ fn color_check(term: Option<&str>, colorterm: Option<&str>) -> Check {
 const CAT_CONFIG: &str = "Config & data";
 
 fn config_checks(args: &DoctorArgs) -> Vec<Check> {
-    let data_dir = args
-        .data_dir
-        .clone()
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".octos")))
-        .unwrap_or_else(|| PathBuf::from(".octos"));
+    let data_dir = data_dir_from_env(
+        args.data_dir.clone(),
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+    );
     vec![writability_check("octos data dir", &data_dir)]
+}
+
+/// Pure resolver for the octos data dir: explicit `--data-dir` first, then
+/// `HOME`, then `USERPROFILE`. Native Windows shells set no `HOME`, so the old
+/// HOME-only probe silently fell back to a CWD-relative `.octos` there.
+/// Mirrors `crate::history`'s home resolution (empty values ignored); split
+/// out so it is testable without mutating process env.
+fn data_dir_from_env(
+    override_dir: Option<PathBuf>,
+    home: Option<std::ffi::OsString>,
+    userprofile: Option<std::ffi::OsString>,
+) -> PathBuf {
+    override_dir
+        .or_else(|| {
+            home.filter(|value| !value.is_empty())
+                .or_else(|| userprofile.filter(|value| !value.is_empty()))
+                .map(|base| PathBuf::from(base).join(".octos"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".octos"))
 }
 
 /// Check that a directory exists and is writable (or creatable). A missing dir
@@ -777,6 +941,182 @@ fn is_writable(dir: &Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Profiles & sessions
+// ---------------------------------------------------------------------------
+
+const CAT_PROFILES: &str = "Profiles & sessions";
+
+/// Inventory of on-disk profiles — every `<data_dir>/profiles/<id>.json`, the
+/// default marked `*`, and the LLM each is configured for — plus an on-disk
+/// session count. The data dir is resolved the same way as the `octos data dir`
+/// check. Secrets (`config.env_vars`) are never surfaced; only family/model/
+/// route. Per-session *folders* are intentionally not read: the session→cwd map
+/// is an in-process registry (`session_workspaces()`), so folder attribution
+/// needs a live `session/list` rather than the on-disk stores (hashed by design).
+fn profiles_checks(args: &DoctorArgs) -> Vec<Check> {
+    let data_dir = data_dir_from_env(
+        args.data_dir.clone(),
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+    );
+    profiles_checks_in(&data_dir)
+}
+
+/// Testable core of [`profiles_checks`]: build the inventory from a resolved
+/// data dir.
+fn profiles_checks_in(data_dir: &Path) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let profiles_dir = data_dir.join("profiles");
+    let ids = crate::profiles::enumerate_profile_ids(&profiles_dir);
+    let default = read_default_profile(data_dir);
+
+    if ids.is_empty() {
+        checks.push(Check::warn(
+            CAT_PROFILES,
+            "profiles",
+            "no profiles found",
+            format!(
+                "run onboarding (launch octos-tui in a folder) — expected under {}",
+                profiles_dir.display()
+            ),
+        ));
+        return checks;
+    }
+
+    // Summary: count + default-pointer health.
+    checks.push(match &default {
+        Some(d) if ids.iter().any(|id| id == d) => Check::pass(
+            CAT_PROFILES,
+            "profiles",
+            format!("{} found; default: {d}", ids.len()),
+        ),
+        Some(d) => Check::warn(
+            CAT_PROFILES,
+            "profiles",
+            format!(
+                "{} found; default pointer → '{d}' has no matching profile",
+                ids.len()
+            ),
+            format!(
+                "fix {}/default-profile, or create profile '{d}'",
+                data_dir.display()
+            ),
+        ),
+        None => Check::warn(
+            CAT_PROFILES,
+            "profiles",
+            format!("{} found; no default set", ids.len()),
+            "set a default during onboarding (make-default) so a bare launch can resume it",
+        ),
+    });
+
+    // One line per profile: the default gets a `*`, the detail is its LLM.
+    for id in &ids {
+        let name = if default.as_deref() == Some(id.as_str()) {
+            format!("{id} *")
+        } else {
+            id.clone()
+        };
+        let detail =
+            read_profile_llm(&profiles_dir, id).unwrap_or_else(|| "LLM not configured".to_string());
+        checks.push(Check::pass(CAT_PROFILES, name, detail));
+    }
+
+    // Sessions: on-disk count only. The session→folder map lives in an
+    // in-process registry, so per-folder attribution needs a live `session/list`.
+    let sessions = count_on_disk_sessions(data_dir);
+    checks.push(if sessions == 0 {
+        Check::pass(CAT_PROFILES, "sessions", "none on disk yet")
+    } else {
+        Check::pass(
+            CAT_PROFILES,
+            "sessions",
+            format!("{sessions} on disk; per-folder mapping needs a live `session/list`"),
+        )
+    });
+
+    checks
+}
+
+/// Read the `default-profile` pointer (a bare profile id), trimmed; `None` when
+/// the file is absent or empty.
+fn read_default_profile(data_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(data_dir.join("default-profile")).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Summarize a profile's primary LLM as `family/model via route (api_type)`
+/// (plus a fallback count), from `<profiles_dir>/<id>.json`. Deliberately reads
+/// only `config.llm` — never `config.env_vars`, which holds API-key secrets.
+/// `None` when the descriptor is unreadable or has no primary LLM.
+fn read_profile_llm(profiles_dir: &Path, id: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(profiles_dir.join(format!("{id}.json"))).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let llm = value.get("config")?.get("llm")?;
+    let primary = llm.get("primary")?;
+    let family = primary
+        .get("family_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let model = primary
+        .get("model_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let mut detail = format!("{family}/{model}");
+    if let Some(route) = primary.get("route") {
+        let route_id = route.get("route_id").and_then(serde_json::Value::as_str);
+        let api_type = route.get("api_type").and_then(serde_json::Value::as_str);
+        match (route_id, api_type) {
+            (Some(r), Some(a)) => detail.push_str(&format!(" via {r} ({a})")),
+            (Some(r), None) => detail.push_str(&format!(" via {r}")),
+            _ => {}
+        }
+    }
+    let fallbacks = llm
+        .get("fallbacks")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    if fallbacks > 0 {
+        detail.push_str(&format!("; {fallbacks} fallback(s)"));
+    }
+    Some(detail)
+}
+
+/// Count session JSONL descriptors across both on-disk layouts the server
+/// writes: the legacy flat `<data_dir>/sessions/*.jsonl` and the per-user
+/// `<data_dir>/users/<base_key>/sessions/*.jsonl`. `.tasks.jsonl` sidecars are
+/// excluded. Best-effort — unreadable dirs count as zero.
+fn count_on_disk_sessions(data_dir: &Path) -> usize {
+    let mut count = count_session_jsonl(&data_dir.join("sessions"));
+    if let Ok(users) = std::fs::read_dir(data_dir.join("users")) {
+        for user in users.flatten() {
+            count += count_session_jsonl(&user.path().join("sessions"));
+        }
+    }
+    count
+}
+
+/// Count `*.jsonl` files in `dir`, excluding `*.tasks.jsonl` sidecars.
+fn count_session_jsonl(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return false;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name.ends_with(".jsonl") && !name.ends_with(".tasks.jsonl")
+        })
+        .count()
+}
+
+// ---------------------------------------------------------------------------
 // Backend connectivity + protocol skew
 // ---------------------------------------------------------------------------
 
@@ -790,7 +1130,12 @@ fn backend_checks(args: &DoctorArgs) -> Vec<Check> {
     if let Some(cmd) = &args.stdio_command {
         checks.push(stdio_command_check(cmd));
     } else if let Some(endpoint) = &args.endpoint {
-        match probe_ws_capabilities(endpoint) {
+        let auth_token = args.auth_token.clone().or_else(|| {
+            std::env::var("OCTOS_AUTH_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+        });
+        match probe_ws_capabilities(endpoint, auth_token) {
             Ok(capabilities) => {
                 checks.push(
                     Check::pass(
@@ -961,9 +1306,25 @@ fn stdio_command_check(command: &str) -> Check {
 }
 
 const WS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Overall deadline for the capabilities receive loop. The per-frame
+/// `WS_PROBE_TIMEOUT` resets on EVERY incoming frame, so a chatty
+/// non-conforming endpoint that streams unrelated notifications could keep
+/// the probe alive forever without this.
+const WS_PROBE_OVERALL_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_PROBE_ID: &str = "octos-tui-doctor-capabilities";
 
-fn probe_ws_capabilities(endpoint: &str) -> std::result::Result<UiProtocolCapabilities, String> {
+fn probe_ws_capabilities(
+    endpoint: &str,
+    auth_token: Option<String>,
+) -> std::result::Result<UiProtocolCapabilities, String> {
+    probe_ws_capabilities_with_deadline(endpoint, auth_token, WS_PROBE_OVERALL_TIMEOUT)
+}
+
+fn probe_ws_capabilities_with_deadline(
+    endpoint: &str,
+    auth_token: Option<String>,
+    overall: Duration,
+) -> std::result::Result<UiProtocolCapabilities, String> {
     let runtime = TokioRuntimeBuilder::new_current_thread()
         .enable_all()
         .build()
@@ -980,6 +1341,14 @@ fn probe_ws_capabilities(endpoint: &str) -> std::result::Result<UiProtocolCapabi
                 .parse()
                 .map_err(|err| format!("failed to build feature header: {err}"))?,
         );
+        if let Some(token) = auth_token {
+            request.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {token}")
+                    .parse()
+                    .map_err(|err| format!("failed to build Authorization header: {err}"))?,
+            );
+        }
 
         let (mut ws, _) = tokio::time::timeout(WS_PROBE_TIMEOUT, connect_async(request))
             .await
@@ -1000,38 +1369,52 @@ fn probe_ws_capabilities(endpoint: &str) -> std::result::Result<UiProtocolCapabi
         .map_err(|_| "timed out sending config/capabilities/list".to_string())?
         .map_err(|err| format!("failed to send config/capabilities/list: {err}"))?;
 
-        loop {
-            let Some(message) = tokio::time::timeout(WS_PROBE_TIMEOUT, ws.next())
-                .await
-                .map_err(|_| {
-                    "timed out waiting for config/capabilities/list response".to_string()
-                })?
-            else {
-                return Err("server closed before config/capabilities/list response".to_string());
-            };
-            let message =
-                message.map_err(|err| format!("failed to read capabilities response: {err}"))?;
-            match message {
-                WsMessage::Text(text) => {
-                    if let Some(capabilities) = decode_matching_capabilities_response(&text)? {
-                        return Ok(capabilities);
-                    }
-                }
-                WsMessage::Binary(bytes) => {
-                    let text = String::from_utf8(bytes.to_vec())
-                        .map_err(|err| format!("capabilities response is not UTF-8: {err}"))?;
-                    if let Some(capabilities) = decode_matching_capabilities_response(&text)? {
-                        return Ok(capabilities);
-                    }
-                }
-                WsMessage::Ping(_) | WsMessage::Pong(_) => {}
-                WsMessage::Close(_) => {
+        // The per-frame timeout resets on every frame; the whole receive loop
+        // additionally runs under ONE overall deadline so a chatty endpoint
+        // that never answers the request cannot keep the probe alive forever.
+        let receive = async {
+            loop {
+                let Some(message) = tokio::time::timeout(WS_PROBE_TIMEOUT, ws.next())
+                    .await
+                    .map_err(|_| {
+                        "timed out waiting for config/capabilities/list response".to_string()
+                    })?
+                else {
                     return Err(
                         "server closed before config/capabilities/list response".to_string()
                     );
+                };
+                let message = message
+                    .map_err(|err| format!("failed to read capabilities response: {err}"))?;
+                match message {
+                    WsMessage::Text(text) => {
+                        if let Some(capabilities) = decode_matching_capabilities_response(&text)? {
+                            return Ok(capabilities);
+                        }
+                    }
+                    WsMessage::Binary(bytes) => {
+                        let text = String::from_utf8(bytes.to_vec())
+                            .map_err(|err| format!("capabilities response is not UTF-8: {err}"))?;
+                        if let Some(capabilities) = decode_matching_capabilities_response(&text)? {
+                            return Ok(capabilities);
+                        }
+                    }
+                    WsMessage::Ping(_) | WsMessage::Pong(_) => {}
+                    WsMessage::Close(_) => {
+                        return Err(
+                            "server closed before config/capabilities/list response".to_string()
+                        );
+                    }
+                    WsMessage::Frame(_) => {}
                 }
-                WsMessage::Frame(_) => {}
             }
+        };
+        match tokio::time::timeout(overall, receive).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "timed out waiting for config/capabilities/list response \
+                 ({overall:?} overall deadline)"
+            )),
         }
     })
 }
@@ -1348,10 +1731,107 @@ mod tests {
             });
         });
 
-        let caps = probe_ws_capabilities(&format!("ws://{addr}/ui-protocol"))
+        let caps = probe_ws_capabilities(&format!("ws://{addr}/ui-protocol"), None)
             .expect("doctor probe returns capabilities");
         thread.join().expect("test websocket exits");
         assert_eq!(caps.version.protocol, UI_PROTOCOL_V1);
+    }
+
+    #[test]
+    fn ws_probe_chatty_endpoint_hits_the_overall_deadline() {
+        // Fix #10 (b): the per-frame 2s timeout resets on EVERY frame, so an
+        // endpoint that streams unrelated notifications forever kept the probe
+        // alive indefinitely. The receive loop must give up at the overall
+        // deadline (shortened here so the test stays fast).
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind test websocket server: {err}"),
+        };
+        listener
+            .set_nonblocking(true)
+            .expect("test websocket listener nonblocking");
+        let addr = listener.local_addr().expect("test websocket addr");
+
+        let thread = std::thread::spawn(move || {
+            let runtime = TokioRuntimeBuilder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test websocket runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("wrap test websocket listener");
+                let (stream, _) = listener.accept().await.expect("accept doctor probe");
+                let mut ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("accept doctor websocket");
+                let _ = ws.next().await; // the probe's capabilities request
+                // Spam unrelated frames until the probe hangs up.
+                loop {
+                    let sent = ws
+                        .send(WsMessage::Text(
+                            serde_json::json!({
+                                "jsonrpc": JSON_RPC_VERSION,
+                                "method": "server/heartbeat",
+                                "params": {}
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await;
+                    if sent.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            });
+        });
+
+        let started = std::time::Instant::now();
+        let err = probe_ws_capabilities_with_deadline(
+            &format!("ws://{addr}/ui-protocol"),
+            None,
+            Duration::from_millis(500),
+        )
+        .expect_err("chatty endpoint must hit the overall deadline");
+        assert!(
+            err.contains("overall deadline"),
+            "expected the overall-deadline error, got: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "probe must give up promptly, took {:?}",
+            started.elapsed()
+        );
+        thread.join().expect("test websocket exits");
+    }
+
+    #[test]
+    fn data_dir_resolver_prefers_override_then_home_then_userprofile() {
+        // Fix #10 (a): only HOME was consulted, so native Windows (no HOME)
+        // probed a CWD-relative `.octos` instead of the real user data dir.
+        assert_eq!(
+            data_dir_from_env(
+                Some(PathBuf::from("/custom")),
+                Some("/home/u".into()),
+                Some("C:\\Users\\u".into())
+            ),
+            PathBuf::from("/custom")
+        );
+        assert_eq!(
+            data_dir_from_env(None, Some("/home/u".into()), Some("C:\\Users\\u".into())),
+            PathBuf::from("/home/u").join(".octos")
+        );
+        assert_eq!(
+            data_dir_from_env(None, None, Some("C:\\Users\\u".into())),
+            PathBuf::from("C:\\Users\\u").join(".octos")
+        );
+        // Empty values are ignored; with nothing set, fall back to CWD-relative.
+        assert_eq!(
+            data_dir_from_env(None, Some("".into()), Some("".into())),
+            PathBuf::from(".octos")
+        );
+        assert_eq!(data_dir_from_env(None, None, None), PathBuf::from(".octos"));
     }
 
     #[test]
@@ -1396,6 +1876,80 @@ mod tests {
             UI_PROTOCOL_SCHEMA_VERSION
         );
         assert!(json["checks"].is_array());
+    }
+
+    #[test]
+    fn install_method_label_infers_from_path() {
+        assert_eq!(
+            install_method_label(Path::new("/home/u/.cargo/bin/octos")),
+            "cargo"
+        );
+        assert_eq!(
+            install_method_label(Path::new("/opt/homebrew/bin/octos-tui")),
+            "brew"
+        );
+        assert_eq!(
+            install_method_label(Path::new("/home/u/.local/bin/octos-tui")),
+            "shell installer"
+        );
+        assert_eq!(
+            install_method_label(Path::new("/home/u/.octos/bin/octos")),
+            "octos-tui auto-install"
+        );
+        assert_eq!(install_method_label(Path::new("/usr/bin/octos")), "system");
+        assert_eq!(
+            install_method_label(Path::new(
+                "/x/node_modules/@octos-org/octos-tui/.bin_real/octos-tui"
+            )),
+            "npm"
+        );
+    }
+
+    #[test]
+    fn installs_check_passes_on_one_and_warns_on_duplicates() {
+        // Exactly one → PASS.
+        let one = installs_check(
+            "octos",
+            &LocatedBinaries {
+                on_path: vec![PathBuf::from("/opt/homebrew/bin/octos")],
+                off_path: vec![],
+            },
+        );
+        assert_eq!(one.status, CheckStatus::Pass);
+
+        // Duplicates → WARN, and the fix names the extra copy to remove.
+        let dup = installs_check(
+            "octos",
+            &LocatedBinaries {
+                on_path: vec![PathBuf::from("/opt/homebrew/bin/octos")],
+                off_path: vec![PathBuf::from("/home/u/.cargo/bin/octos")],
+            },
+        );
+        assert_eq!(dup.status, CheckStatus::Warn);
+        assert!(dup.fix.as_deref().unwrap().contains(".cargo/bin/octos"));
+
+        // None → WARN.
+        assert_eq!(
+            installs_check("octos", &LocatedBinaries::default()).status,
+            CheckStatus::Warn
+        );
+    }
+
+    #[test]
+    fn installations_checks_surface_required_octos_and_both_binaries() {
+        let checks = installations_checks();
+        let needs = checks
+            .iter()
+            .find(|c| c.name == "octos-tui needs octos")
+            .expect("required-octos row present");
+        assert!(
+            needs
+                .detail
+                .contains(crate::backend_ensure::MIN_OCTOS_VERSION)
+        );
+        // Both binaries get an install-summary row.
+        assert!(checks.iter().any(|c| c.name == "octos-tui installs"));
+        assert!(checks.iter().any(|c| c.name == "octos installs"));
     }
 
     #[test]
@@ -1729,5 +2283,178 @@ mod tests {
         let fix = check.fix.unwrap();
         assert!(fix.contains("remove the file"));
         assert!(!fix.contains("mkdir -p"));
+    }
+
+    // --- Profiles & sessions -------------------------------------------------
+
+    /// Minimal self-cleaning temp dir for the profile-inventory tests.
+    struct DoctorTempDir(PathBuf);
+
+    impl DoctorTempDir {
+        fn new(tag: &str) -> Self {
+            let mut dir = std::env::temp_dir();
+            dir.push(format!(
+                "octos-tui-doctor-{tag}-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for DoctorTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Seed `<data_dir>/profiles/<id>.json` with a glm-like descriptor carrying
+    /// a primary LLM, an empty fallback list, and a secret in `env_vars`.
+    fn seed_profile(
+        data_dir: &Path,
+        id: &str,
+        family: &str,
+        model: &str,
+        route: &str,
+        secret: &str,
+    ) {
+        let profiles = data_dir.join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        let body = serde_json::json!({
+            "id": id,
+            "config": {
+                "llm": {
+                    "primary": {
+                        "family_id": family,
+                        "model_id": model,
+                        "route": {
+                            "route_id": route,
+                            "api_type": "openai",
+                            "api_key_env": "ZAI_API_KEY"
+                        }
+                    },
+                    "fallbacks": []
+                },
+                "env_vars": { "ZAI_API_KEY": secret }
+            }
+        });
+        std::fs::write(
+            profiles.join(format!("{id}.json")),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn find_check<'a>(checks: &'a [Check], name: &str) -> &'a Check {
+        checks.iter().find(|c| c.name == name).unwrap_or_else(|| {
+            let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
+            panic!("no check named `{name}` in {names:?}")
+        })
+    }
+
+    #[test]
+    fn profiles_inventory_lists_profiles_marks_default_and_shows_llm() {
+        let tmp = DoctorTempDir::new("inv");
+        seed_profile(tmp.path(), "glm", "zai", "glm-5.2", "zai", "SECRET-A");
+        seed_profile(
+            tmp.path(),
+            "deepseek",
+            "deepseek",
+            "deepseek-chat",
+            "deepseek",
+            "SECRET-B",
+        );
+        std::fs::write(tmp.path().join("default-profile"), "glm\n").unwrap();
+
+        let checks = profiles_checks_in(tmp.path());
+
+        let summary = find_check(&checks, "profiles");
+        assert_eq!(summary.status, CheckStatus::Pass);
+        assert!(summary.detail.contains("2 found"), "{}", summary.detail);
+        assert!(
+            summary.detail.contains("default: glm"),
+            "{}",
+            summary.detail
+        );
+
+        // The default profile carries the `*` marker and its LLM detail.
+        let glm = find_check(&checks, "glm *");
+        assert_eq!(glm.detail, "zai/glm-5.2 via zai (openai)");
+        // Non-default profile: no star, still shows its LLM.
+        let ds = find_check(&checks, "deepseek");
+        assert!(
+            ds.detail.contains("deepseek/deepseek-chat"),
+            "{}",
+            ds.detail
+        );
+    }
+
+    #[test]
+    fn profiles_inventory_never_leaks_api_key_secret() {
+        let tmp = DoctorTempDir::new("secret");
+        seed_profile(
+            tmp.path(),
+            "glm",
+            "zai",
+            "glm-5.2",
+            "zai",
+            "SUPER-SECRET-TOKEN",
+        );
+        std::fs::write(tmp.path().join("default-profile"), "glm").unwrap();
+
+        let rendered = Report::new(profiles_checks_in(tmp.path())).render(true, false);
+        assert!(
+            !rendered.contains("SUPER-SECRET-TOKEN"),
+            "doctor must never print API-key secrets:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn profiles_inventory_warns_when_no_profiles() {
+        let tmp = DoctorTempDir::new("empty");
+        let checks = profiles_checks_in(tmp.path());
+        let summary = find_check(&checks, "profiles");
+        assert_eq!(summary.status, CheckStatus::Warn);
+        assert!(summary.detail.contains("no profiles"), "{}", summary.detail);
+    }
+
+    #[test]
+    fn profiles_inventory_warns_on_dangling_default_pointer() {
+        let tmp = DoctorTempDir::new("dangling");
+        seed_profile(tmp.path(), "glm", "zai", "glm-5.2", "zai", "s");
+        std::fs::write(tmp.path().join("default-profile"), "ghost").unwrap();
+
+        let checks = profiles_checks_in(tmp.path());
+        let summary = find_check(&checks, "profiles");
+        assert_eq!(summary.status, CheckStatus::Warn);
+        assert!(summary.detail.contains("ghost"), "{}", summary.detail);
+    }
+
+    #[test]
+    fn on_disk_sessions_counted_across_both_layouts_excluding_task_sidecars() {
+        let tmp = DoctorTempDir::new("sessions");
+        // Legacy flat layout.
+        let flat = tmp.path().join("sessions");
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(flat.join("a.jsonl"), "").unwrap();
+        std::fs::write(flat.join("a.tasks.jsonl"), "").unwrap(); // sidecar → excluded
+        // Per-user layout.
+        let user = tmp
+            .path()
+            .join("users")
+            .join("glm%3Alocal%3Atui")
+            .join("sessions");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join("coding.jsonl"), "").unwrap();
+
+        assert_eq!(count_on_disk_sessions(tmp.path()), 2);
     }
 }

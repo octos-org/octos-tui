@@ -57,7 +57,9 @@ estimate: 0.5d
   测试: onboarding_create_menu_offers_existing_profile_row
   假设 后端广告 profile/local/create 且尚无 profile
   当 首启自动打开 onboarding 向导
-  那么 创建表单包含 id 为 onboard.local.profile_id 的编辑行
+  那么 创建表单包含 id 为 onboard.local.exit 的退出行
+  # 注：onboard.local.profile_id 编辑行已于 70183a1 有意移除——选择既有 profile
+  # 是启动选择器的职责，创建步骤只用于新建。`/onboard profile <id>` 路由不变。
 
 场景: 输入已有 profile id 后向导跳过创建步骤
   测试: existing_profile_id_skips_creation_step
