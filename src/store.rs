@@ -10969,6 +10969,15 @@ impl Store {
             // octos-core is ahead of this crate and added `VoiceExit`; handling
             // it here keeps the match exhaustive so the workspace compiles.)
             UiNotification::VoiceExit(_) => None,
+            // Same octos-core drift as `VoiceExit` above: the path-overridden
+            // crate has since added a typed `PeerClosed` variant. This client
+            // does NOT route peer teardown through here — `handle_notification`
+            // (transport.rs) intercepts `peer/closed` BEFORE the vendored
+            // `UiNotification::from_method_and_params` and decodes it into
+            // `ClientEvent::PeerClosed`, which `apply_peer_closed_event` owns.
+            // So this arm is unreachable from the wire and must stay a no-op:
+            // handling it here would double-apply the teardown.
+            UiNotification::PeerClosed(_) => None,
         }
     }
 
@@ -11493,11 +11502,22 @@ impl Store {
                             session_result: None,
                         })
                     }
-                    TurnTerminalOutcome::Errored | TurnTerminalOutcome::Interrupted => {
+                    // `RateLimited` is octos-core drift (same as `PeerClosed`
+                    // above): a newer terminal outcome this crate predates. It
+                    // is a FAILED terminal like `Errored` — the turn produced no
+                    // answer — so it takes the error finalizer, not the commit
+                    // path. Only its default label differs, so a server that
+                    // sends no error payload doesn't get mislabelled
+                    // "Turn errored." when it was actually throttled.
+                    TurnTerminalOutcome::Errored
+                    | TurnTerminalOutcome::Interrupted
+                    | TurnTerminalOutcome::RateLimited => {
                         let is_interrupted = outcome == TurnTerminalOutcome::Interrupted;
                         let error = error.unwrap_or_else(|| {
                             let (code, message) = if is_interrupted {
                                 ("interrupted", "Turn interrupted.")
+                            } else if outcome == TurnTerminalOutcome::RateLimited {
+                                ("rate_limited", "Turn stopped: rate limited.")
                             } else {
                                 ("turn_errored", "Turn errored.")
                             };
@@ -17009,6 +17029,76 @@ now analyzing the bus module"
         assert!(
             line.contains("Run shell command?"),
             "blocked reason leads: {line}"
+        );
+    }
+
+    /// A finished message is truncated from the HEAD (`start…`), not the tail.
+    /// Tail-truncating a settled sentence slices it mid-word and hides the part
+    /// that identifies it — the peer dock rendered
+    /// `…bove or continue the turn with a more specific instruction.` where the
+    /// line actually began `Fix the error above or continue …`. A LIVE reply
+    /// keeps the tail: there the newest streamed text is the point.
+    #[test]
+    fn session_activity_line_truncates_finished_text_from_the_head_live_from_the_tail() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+        let long = "Fix the error above or continue the turn with a more specific instruction.";
+        assert!(long.chars().count() > 60, "fixture must exceed the cap");
+
+        if let Some(session) = store
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == b)
+        {
+            session.messages.push(octos_core::Message {
+                role: octos_core::MessageRole::Assistant,
+                content: long.into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        let line = store
+            .state
+            .session_activity_line(&b)
+            .expect("activity line present");
+        assert!(
+            line.starts_with("Fix the error above"),
+            "a finished message keeps its opening words; got: {line}"
+        );
+        assert!(
+            line.ends_with('…'),
+            "head truncation marks the cut at the END; got: {line}"
+        );
+        assert!(
+            !line.starts_with('…'),
+            "a finished message must not be tail-sliced; got: {line}"
+        );
+
+        // A live reply still shows the newest text, so it keeps the tail.
+        if let Some(session) = store
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == b)
+        {
+            session.live_reply = Some(octos_core::app_ui::AppUiLiveReply {
+                turn_id: octos_core::ui_protocol::TurnId::new(),
+                text: long.into(),
+            });
+        }
+        let live = store
+            .state
+            .session_activity_line(&b)
+            .expect("live activity line present");
+        assert!(
+            live.starts_with('…') && live.ends_with("instruction."),
+            "a live reply keeps its tail; got: {live}"
         );
     }
 

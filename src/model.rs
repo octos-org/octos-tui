@@ -4420,6 +4420,12 @@ pub struct AppState {
     /// Distinct from the agent dock's collapse so the two surfaces stay
     /// independently controllable.
     pub peer_dock_collapsed: bool,
+    /// Peer Dock FULL state — the third stop in the Alt+P / Ctrl+L cycle
+    /// (capped rows → full roster → pill). When true the dock drops the
+    /// `PEER_STRIP_MAX_PEER_ROWS` cap and draws every peer, bounded only by the
+    /// rows the terminal can spare, so a fleet larger than the cap is readable
+    /// without switching sessions. Meaningless while `peer_dock_collapsed`.
+    pub peer_dock_expanded: bool,
     /// ◆ Goal banner fold preference (Ctrl+P). See [`GoalObjectiveFold`]: a huge
     /// pasted objective folds to one compact row by default, a short one shows
     /// in full, and an explicit Ctrl+P choice sticks. A global UI preference,
@@ -6522,6 +6528,7 @@ impl AppState {
             transcript_pager_active: false,
             agent_dock_collapsed: false,
             peer_dock_collapsed: false,
+            peer_dock_expanded: false,
             goal_objective_fold: GoalObjectiveFold::default(),
             goal_objective_folded_effective: std::cell::Cell::new(false),
             pinned_scroll: false,
@@ -9045,7 +9052,19 @@ impl AppState {
     /// stream's tail, then the last transcript line. Single-line, char-capped
     /// for the menu row.
     pub fn session_activity_line(&self, session_id: &SessionKey) -> Option<String> {
-        const ACTIVITY_CHARS: usize = 60;
+        self.session_activity_line_capped(session_id, 60)
+    }
+
+    /// [`Self::session_activity_line`] with a caller-supplied char budget, so a
+    /// surface that knows its own width (the Peer Dock rows) can spend it
+    /// instead of inheriting the menu's fixed 60. A wide terminal otherwise
+    /// left half the dock row blank while still cutting the peer's task off.
+    pub fn session_activity_line_capped(
+        &self,
+        session_id: &SessionKey,
+        activity_chars: usize,
+    ) -> Option<String> {
+        let activity_chars = activity_chars.max(1);
         fn last_line_tail(text: &str, cap: usize) -> Option<String> {
             let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
             let line = line.trim();
@@ -9060,6 +9079,22 @@ impl AppState {
                 line.to_owned()
             })
         }
+        /// A SETTLED line keeps its opening words and marks the cut at the end.
+        /// Tail-slicing a finished sentence (`last_line_tail`) drops the words
+        /// that identify it and usually starts mid-word — the peer dock rendered
+        /// `…bove or continue the turn with a more specific instruction.` for a
+        /// line that began `Fix the error above or continue …`. Only a LIVE
+        /// stream wants the tail, because there the newest text is the point.
+        fn last_line_head(text: &str, cap: usize) -> Option<String> {
+            let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
+            let line = line.trim();
+            Some(if line.chars().count() > cap {
+                let head: String = line.chars().take(cap.saturating_sub(1)).collect();
+                format!("{head}…")
+            } else {
+                line.to_owned()
+            })
+        }
         if let Some(reason) = self.session_blocked_reason(session_id) {
             return Some(t!("menu.sessions.item.blocked_reason", reason = reason).into_owned());
         }
@@ -9068,7 +9103,7 @@ impl AppState {
             .iter()
             .find(|session| &session.id == session_id)?;
         if let Some(live) = session.live_reply.as_ref() {
-            if let Some(tail) = last_line_tail(&live.text, ACTIVITY_CHARS) {
+            if let Some(tail) = last_line_tail(&live.text, activity_chars) {
                 return Some(tail);
             }
         }
@@ -9077,7 +9112,7 @@ impl AppState {
             .iter()
             .rev()
             .find(|message| !message.content.trim().is_empty())
-            .and_then(|message| last_line_tail(&message.content, ACTIVITY_CHARS))
+            .and_then(|message| last_line_head(&message.content, activity_chars))
     }
 
     pub fn refresh_run_state_from_selection(&mut self) {
