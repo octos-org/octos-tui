@@ -7259,7 +7259,7 @@ impl Store {
                 None
             }
             ClientEvent::SessionHydrate(result) => {
-                let drain = self.apply_session_hydrate_result(result);
+                let drain = self.apply_session_hydrate_result(result, EmptyProjection::Ignore);
                 self.refresh_active_menu_if_open();
                 drain
             }
@@ -8835,7 +8835,7 @@ impl Store {
         // deliberate rollback must NOT auto-submit a stale staged prompt into the
         // just-trimmed session, so the drain command is discarded here (the stale
         // live_reply is still cleared, which is what matters for the repaint).
-        let _ = self.apply_session_hydrate_result(result.thread);
+        let _ = self.apply_session_hydrate_result(result.thread, EmptyProjection::Authoritative);
         // Rebuild the `/rewind` picker rows from the now-trimmed transcript. The
         // snapshot taken when the picker opened still lists the just-dropped
         // turns; if the picker is still open (the caller then calls
@@ -8951,11 +8951,35 @@ impl Store {
     fn apply_session_hydrate_result(
         &mut self,
         result: SessionHydrateResult,
+        empty_projection: EmptyProjection,
     ) -> Option<AppUiCommand> {
         let session_id = result.session_id.clone();
         // Staged-queue drain released when a stale live turn is finalized below.
         let mut drain: Option<AppUiCommand> = None;
-        let projected_messages = hydrated_projection_messages(&result);
+        let mut projected_messages = hydrated_projection_messages(&result);
+        // An EMPTY projection from a hydrate READ is not evidence that the
+        // session has no history — the rows may not be persisted under this key,
+        // or none survived `hydrated_row_is_displayable`. A peer accumulates its
+        // transcript locally from streamed notifications while it runs in the
+        // background, so honouring an empty read erased the whole thing the
+        // instant you switched into it (Ctrl+S → `resume_session_command` →
+        // hydrate). Drop the projection instead and keep what we hold. The
+        // rollback repaint passes `Authoritative` because there the server has
+        // genuinely just trimmed the turns away.
+        if matches!(empty_projection, EmptyProjection::Ignore)
+            && projected_messages.as_ref().is_some_and(Vec::is_empty)
+            && self
+                .state
+                .sessions
+                .iter()
+                .any(|session| session.id == session_id && !session.messages.is_empty())
+        {
+            projected_messages = None;
+        }
+        // Reported in the status line below. Reads the POST-discard projection so
+        // a dropped empty read doesn't announce "0 messages" over a transcript we
+        // deliberately kept.
+        let projection_applied = projected_messages.is_some();
         let message_count = projected_messages.as_ref().map_or(0, Vec::len);
         let thread_count = result.threads.as_ref().map_or(0, Vec::len);
         let turn_count = result.turns.as_ref().map_or(0, Vec::len);
@@ -9147,7 +9171,7 @@ impl Store {
         }
 
         let mut sections = Vec::new();
-        if result.messages.is_some() {
+        if projection_applied {
             sections.push(t!("status.message_count", count = message_count).into_owned());
         }
         if result.threads.is_some() {
@@ -13751,6 +13775,18 @@ impl HydratedProjection {
             Self::BackgroundChildCompleted(envelope) => envelope.seq,
         }
     }
+}
+
+/// How [`Store::apply_session_hydrate_result`] should read an EMPTY message
+/// projection. A plain `session/hydrate` READ is `Ignore`: empty means "this
+/// read told us nothing", never "this session has no history" — see the comment
+/// at the discard site. The rollback repaint is `Authoritative`: the server
+/// returns the trimmed thread as a `SessionHydrateResult`, so an empty one is a
+/// real instruction to clear the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyProjection {
+    Ignore,
+    Authoritative,
 }
 
 fn hydrated_projection_messages(result: &SessionHydrateResult) -> Option<Vec<Message>> {
@@ -19352,6 +19388,96 @@ now analyzing the bus module"
             store.state.status.contains("Rewound 1"),
             "status reports how many turns were dropped: {}",
             store.state.status
+        );
+    }
+
+    /// Build a hydrate result carrying `messages` verbatim for `session_id`.
+    fn hydrate_result_with_messages(
+        session_id: &SessionKey,
+        messages: Vec<HydratedMessage>,
+    ) -> SessionHydrateResult {
+        SessionHydrateResult {
+            replayed_tool_envelopes: None,
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 1,
+            },
+            context: None,
+            context_state: None,
+            messages: Some(messages),
+            threads: None,
+            turns: None,
+            pending_approvals: None,
+            pending_questions: None,
+            replayed_envelopes: None,
+        }
+    }
+
+    /// Switching to a peer via Ctrl+S sends `session/hydrate` for it
+    /// (`resume_session_command`). A peer's transcript is accumulated locally
+    /// from streamed notifications while it runs in the background, and the
+    /// server's projection for that key can come back EMPTY — either the rows
+    /// aren't persisted under it or none survive `hydrated_row_is_displayable`.
+    /// Replacing the transcript with that empty projection wiped the peer's
+    /// whole history the instant you switched in: the switcher row still showed
+    /// its last line (read from `session.messages`), then the peer rendered as
+    /// a fresh `0 msgs` session behind the launch banner. An empty read is not
+    /// evidence that a session has no history.
+    #[test]
+    fn hydrate_with_empty_projection_keeps_the_existing_transcript() {
+        use crate::client_event::ClientEvent;
+
+        let mut store = store_with_two_sessions("local:main", "local:main#peer-alpha");
+        let peer = store.state.sessions[1].id.clone();
+        store.state.sessions[1].messages = vec![
+            Message::user("read readme.md for 10sec"),
+            Message::assistant("Risks / follow-up: Fix the error above."),
+        ];
+
+        store.apply_client_event(ClientEvent::SessionHydrate(hydrate_result_with_messages(
+            &peer,
+            Vec::new(),
+        )));
+
+        let messages = &store.state.sessions[1].messages;
+        assert_eq!(
+            messages.len(),
+            2,
+            "an empty projection must not clobber the peer's local transcript: {messages:?}"
+        );
+        assert_eq!(messages[0].content, "read readme.md for 10sec");
+        assert!(
+            store
+                .state
+                .session_activity_line(&peer)
+                .is_some_and(|line| line.contains("Risks / follow-up")),
+            "the switcher row keeps resolving the peer's last line"
+        );
+    }
+
+    /// The counterweight to the guard above: `apply_session_rollback_result`
+    /// repaints through the SAME hydrate path, and there an empty projection is
+    /// authoritative — the server just trimmed every turn away. Rewinding to
+    /// nothing must still clear the transcript.
+    #[test]
+    fn rollback_trimming_every_turn_still_clears_the_transcript() {
+        use crate::client_event::ClientEvent;
+
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.sessions[0].messages =
+            vec![Message::user("only question"), Message::assistant("ok")];
+
+        store.apply_client_event(ClientEvent::SessionRollback(SessionRollbackResult {
+            dropped_turns: 1,
+            thread: hydrate_result_with_messages(&session_id, Vec::new()),
+        }));
+
+        assert!(
+            store.state.sessions[0].messages.is_empty(),
+            "a rollback that drops every turn empties the transcript: {:?}",
+            store.state.sessions[0].messages
         );
     }
 
