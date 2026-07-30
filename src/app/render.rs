@@ -1608,16 +1608,6 @@ pub(super) fn render_harness_status_row(
 }
 
 pub(super) fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
-    if app.focused_session_is_peer() {
-        // Read-only peer watch surface: no editable composer box. A single dim
-        // status row instead (steer peers from the master); the reclaimed rows
-        // go to the transcript. No border, no placeholder, no caret.
-        return Paragraph::new(Line::from(Span::styled(
-            format!(" {}", t!("app.composer_hint.peer_readonly")),
-            palette.muted().bg(palette.surface),
-        )))
-        .style(Style::default().bg(palette.surface));
-    }
     let mut lines = Vec::new();
     let composer = app.composer_presentation();
     let input_view = match &composer {
@@ -1629,7 +1619,19 @@ pub(super) fn render_composer(app: &AppState, palette: Palette, area: Rect) -> P
         )),
         ComposerPresentation::Empty | ComposerPresentation::Collapsed(_) => None,
     };
-    if !app.pending_messages.is_empty() {
+    if app.focused_session_is_peer() {
+        // A focused peer is a read-only WATCH surface for PLAIN PROMPTS only:
+        // `submit_composer` refuses those but routes slash/bang commands
+        // (`/resume`, `!ls`, …) first, and deliberately KEEPS the draft so the
+        // text survives switching back to the master. So the box, the draft and
+        // the caret all stay — collapsing the pane to a bare status row left the
+        // user typing into a surface that wasn't drawn. The read-only notice
+        // rides the hint row instead, where the mode is still stated outright.
+        lines.push(Line::from(vec![Span::styled(
+            t!("app.composer_hint.peer_readonly").to_string(),
+            palette.muted().bg(palette.surface),
+        )]));
+    } else if !app.pending_messages.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             t!(
                 "app.composer_hint.queued_messages",
@@ -1675,6 +1677,12 @@ pub(super) fn render_composer(app: &AppState, palette: Palette, area: Rect) -> P
                 ),
             ]))
         }
+        // A peer refuses plain prompts, so "Ask Octos to change code…" would be
+        // a false affordance — the caret row stays bare and the hint row above
+        // carries the mode. Slash/bang input still echoes via `Inline` below.
+        ComposerPresentation::Empty if app.focused_session_is_peer() => lines.push(Line::from(
+            vec![Span::styled(" › ", palette.selected().bg(palette.surface))],
+        )),
         ComposerPresentation::Empty => lines.push(Line::from(vec![
             Span::styled(" › ", palette.selected().bg(palette.surface)),
             Span::styled(

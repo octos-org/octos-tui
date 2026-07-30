@@ -3809,11 +3809,16 @@ mod tests {
         assert_eq!(pending_style.bg, Some(palette.diff_context_bg));
     }
 
+    /// A focused peer refuses PLAIN PROMPTS, but the store still accepts typed
+    /// input on it: `submit_composer` routes slash/bang commands (`/resume`,
+    /// `!ls`, …) before the peer guard, and the guard deliberately KEEPS the
+    /// draft "so the text isn't lost when the user switches back to the master"
+    /// (store.rs). Collapsing the pane to a 1-row bar made all of that
+    /// invisible — you type into a surface that isn't drawn, with no caret and
+    /// no echo of the kept draft. The composer box must stay, carrying the
+    /// read-only notice as its hint row.
     #[test]
-    fn render_composer_peer_is_readonly_bar_not_editable_box() {
-        // Option B: a focused peer is a READ-ONLY watch surface — a single dim
-        // status row, not the bordered composer. No placeholder, no caret, and
-        // the reclaimed rows go to the transcript (1 reserved row, not 5).
+    fn render_composer_on_peer_keeps_editable_box_with_readonly_hint() {
         let peer = SessionKey("coding:local:tui#peer-alpha".into());
         let mut app = AppState::new(
             vec![
@@ -3840,15 +3845,17 @@ mod tests {
             false,
         );
         app.opened_peer_sessions.insert(peer.clone());
-        // Focus on the composer pane makes the no-caret assertion meaningful:
-        // even here the peer bar must not place a cursor.
         app.focus = crate::model::FocusPane::Composer;
+        // A client-local command the store still honours on a peer — the very
+        // input the collapsed bar gave the user nowhere to see.
+        app.composer = "/resume".into();
+        app.composer_cursor = Some(app.composer.chars().count());
         assert!(app.focused_session_is_peer(), "precondition: peer focused");
 
         assert_eq!(
             composer_height(&app),
-            1,
-            "peer reserves a slim 1-row bar, not the 5-row composer box"
+            5,
+            "a peer keeps the full composer box — slash/bang input still works there"
         );
 
         let palette = Palette::for_theme(ThemeName::Codex);
@@ -3860,22 +3867,80 @@ mod tests {
             .collect::<String>();
 
         assert!(
+            text.contains("/resume"),
+            "the typed draft is echoed in the composer: {text:?}"
+        );
+        assert!(
             text.contains("read-only peer"),
-            "shows the read-only bar: {text:?}"
+            "the read-only notice rides the composer hint row: {text:?}"
         );
         assert!(text.contains("steer from the master"));
-        assert!(
-            !text.contains("Ask Octos"),
-            "no editable-composer placeholder on a peer"
-        );
-        // render never placed a caret, so the backend cursor stays at its
-        // top-left default — not down in the (absent) composer input.
-        assert_eq!(
+        assert_ne!(
             (cursor.x, cursor.y),
             (0, 0),
-            "no caret placed for a read-only peer"
+            "a caret is placed in the peer's composer input"
         );
     }
+
+    /// The composer box stays on a peer, but its "Ask Octos to change code…"
+    /// placeholder must not: a plain prompt is exactly what `submit_composer`
+    /// refuses there, so inviting one is a false affordance. The empty peer
+    /// composer shows the caret row bare — the hint row already states the mode.
+    #[test]
+    fn render_composer_on_empty_peer_suppresses_the_prompt_placeholder() {
+        let peer = SessionKey("coding:local:tui#peer-alpha".into());
+        let mut app = AppState::new(
+            vec![
+                SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "master".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+                SessionView {
+                    id: peer.clone(),
+                    title: "peer-alpha".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::assistant("peer output")],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+            ],
+            1, // focus the peer
+            "ready".into(),
+            None,
+            false,
+        );
+        app.opened_peer_sessions.insert(peer.clone());
+        app.focus = crate::model::FocusPane::Composer;
+        assert!(app.composer.is_empty(), "precondition: empty draft");
+        assert!(app.focused_session_is_peer(), "precondition: peer focused");
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let buffer = rendered_buffer(&app, palette);
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(
+            !text.contains("Ask Octos"),
+            "no plain-prompt invitation on a read-only peer: {text:?}"
+        );
+        assert!(
+            text.contains("read-only peer"),
+            "the mode is still stated on the hint row: {text:?}"
+        );
+    }
+
+    // `render_composer_peer_is_readonly_bar_not_editable_box` lived here. It
+    // pinned the 1-row collapse (height 1, no caret) that made a focused peer's
+    // still-working slash/bang input invisible; the two tests above replace it,
+    // keeping its assertions that survive — the read-only notice is shown and no
+    // plain-prompt placeholder invites a refused prompt.
 
     #[test]
     fn render_composer_is_tall_and_places_cursor_in_input() {
