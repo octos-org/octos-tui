@@ -286,7 +286,17 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PLAN: ${{ needs.plan.outputs.val }}
-    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    # LOCAL CUSTOMIZATION — re-apply after any `dist generate` (see the publish
+    # step below and dist-workspace.toml's `publish-prereleases` comment).
+    # dist's default gate here was:
+    #   !announcement_is_prerelease || publish_prereleases
+    # which (with publish-prereleases=false) skips npm entirely for prereleases,
+    # and dist's own publish would push to the `latest` dist-tag. We instead run
+    # on ANY publishing tag — stable OR prerelease — and choose the dist-tag in
+    # the publish step (`latest` vs `next`) so a prerelease never moves `latest`.
+    # `needs: [plan, host]` + the implicit success() gate still keep this to
+    # publishing tag pushes only (host is skipped on PRs, so this is too).
+    if: ${{ needs.plan.outputs.publishing == 'true' }}
     steps:
       - name: Fetch npm packages
         uses: actions/download-artifact@v8
@@ -298,13 +308,26 @@ jobs:
         with:
           node-version: '20.x'
           registry-url: 'https://registry.npmjs.org'
-      - run: |
+      # LOCAL CUSTOMIZATION — two-channel npm publish (re-apply after `dist
+      # generate`). Stable tags publish to the `latest` dist-tag (the default
+      # `npm i -g @octos-org/octos-tui`); prereleases publish to `next`
+      # (`npm i -g @octos-org/octos-tui@next`) so they NEVER move `latest`.
+      - name: Publish to npm (stable -> latest, prerelease -> next)
+        run: |
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            npm_tag=next
+          else
+            npm_tag=latest
+          fi
+          echo "Publishing npm packages to dist-tag '${npm_tag}' (prerelease=${IS_PRERELEASE})."
           for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith("-npm-package.tar.gz")] | any)'); do
             pkg=$(echo "$release" | jq '.artifacts[] | select(endswith("-npm-package.tar.gz"))' --raw-output)
-            npm publish --access public "./npm/${pkg}"
+            npm publish --access public --tag "$npm_tag" "./npm/${pkg}"
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Boolean from the plan; becomes the string "true"/"false" in the env.
+          IS_PRERELEASE: ${{ fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
 
   announce:
     needs:

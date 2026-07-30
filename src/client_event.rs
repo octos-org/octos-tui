@@ -17,7 +17,8 @@ use crate::model::{
     ProfileLlmMutationResult, ProfileLocalCreateResult, ProfileSkillsListResult,
     ProfileSkillsMutationResult, ProfileSkillsRegistrySearchResult, ReviewStartResult,
     SessionGoalClearResult, SessionGoalGetResult, SessionGoalSetResult, SessionStatusReadResult,
-    ToolConfigListResult, ToolConfigMutationResult, ToolStatusListResult,
+    SubProvidersListResult, SubProvidersMutationResult, ToolConfigListResult,
+    ToolConfigMutationResult, ToolStatusListResult,
 };
 
 #[derive(Debug, Clone)]
@@ -54,6 +55,37 @@ pub enum ClientEvent {
     ProfileLlmCatalog(ProfileLlmCatalogClientEvent),
     ProfileLlmList(ProfileLlmListClientEvent),
     ProfileLlmMutation(ProfileLlmMutationClientEvent),
+    SubProvidersList(SubProvidersListClientEvent),
+    /// #1768: snapshot list/restore result (restore echoes refreshed rows).
+    SnapshotList(SnapshotListClientEvent),
+    /// #395: `peer/prepare` result — the server minted a peer slug/topic and
+    /// wrote the durable brief; the store mints the peer session key, stashes
+    /// the kickoff, and follows up with `session/open`.
+    PeerPrepared(PeerPreparedClientEvent),
+    /// octos#1807: `turn/steer` result. `steered:true` — the typed text
+    /// joined the ACTIVE turn (status only; run-state/pre-token untouched,
+    /// the turn was already live). `steered:false` — no active turn existed
+    /// server-side and a NEW real turn started with the input; the store arms
+    /// the client like a normal submit (pre-token marker + run-state
+    /// in-progress) for the returned turn id.
+    TurnSteered(TurnSteeredClientEvent),
+    /// octos#1801 v3: durable `peer/staged` notification — a server-side
+    /// agent staged a peer (its `peer_spawn` tool); the store auto-opens it
+    /// in the background via the same stash → `session/opened` kickoff flow
+    /// as `/peer`. Durable ⇒ replayed on reconnect, so the store handler is
+    /// idempotent (a peer whose session already exists is a no-op).
+    PeerStaged(crate::model::PeerStagedParams),
+    /// octos#1801 v3: durable `peer/closed` notification — a peer session the
+    /// server tore down; the store removes it from the peer dock (Ctrl+L) and
+    /// the session switcher (Ctrl+S). Durable ⇒ replayed on reconnect, so the
+    /// store handler is idempotent (an already-removed peer is a no-op).
+    PeerClosed(crate::model::PeerClosedParams),
+    /// octos#1801 v2: `peer/gather` result — the peer blackboard rows
+    /// (brief + latest result per staged peer). The store composes the
+    /// `/gather` synthesis prompt from these and submits it into the CURRENT
+    /// session (staging-aware).
+    PeerGathered(PeerGatheredClientEvent),
+    SubProvidersMutation(SubProvidersMutationClientEvent),
     ProfileSkillsList(ProfileSkillsListClientEvent),
     ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchClientEvent),
     ProfileSkillsMutation(ProfileSkillsMutationClientEvent),
@@ -189,6 +221,46 @@ pub struct ProfileLlmMutationClientEvent {
     pub message: String,
 }
 
+/// #1768 snapshot undo list (also carries restore acknowledgements).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotListClientEvent {
+    pub message: String,
+    pub result: crate::model::SnapshotListResult,
+}
+
+/// #395 `peer/prepare` result for the `/peer` flow.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerPreparedClientEvent {
+    pub message: String,
+    pub result: crate::model::PeerPrepareResult,
+}
+
+/// octos#1807 `turn/steer` result for the mid-turn steer flow.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnSteeredClientEvent {
+    pub message: String,
+    pub result: crate::model::TurnSteerResult,
+}
+
+/// octos#1801 v2 `peer/gather` result for the `/gather` fan-in flow.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerGatheredClientEvent {
+    pub message: String,
+    pub result: crate::model::PeerGatherResult,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubProvidersListClientEvent {
+    pub result: SubProvidersListResult,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubProvidersMutationClientEvent {
+    pub result: SubProvidersMutationResult,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileSkillsListClientEvent {
     pub result: ProfileSkillsListResult,
@@ -287,6 +359,10 @@ pub struct LocalShellResultEvent {
     pub local_id: String,
     /// The command line as typed (after the `!`), for display.
     pub cmdline: String,
+    /// Display form of the directory the command ran in (the TUI process cwd),
+    /// so the transcript card can label WHERE the local command executed.
+    /// `None` only when the cwd could not be resolved at spawn time.
+    pub cwd: Option<String>,
     /// Captured stdout (already truncated to fit the combined 10 KB cap).
     pub stdout: String,
     /// Captured stderr (already truncated to fit the combined 10 KB cap).

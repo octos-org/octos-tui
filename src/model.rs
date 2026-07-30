@@ -3,7 +3,7 @@ use std::time::Instant;
 use octos_core::app_ui::{APP_UI_API_V1, AppUiLiveReply, AppUiSession, AppUiSnapshot, AppUiTask};
 use octos_core::ui_protocol::{
     ApprovalDecision, ApprovalId, ApprovalRenderHints, ApprovalRequestedEvent,
-    ApprovalScopesListParams, ApprovalTypedDetails, DiffPreviewGetParams, OutputCursor,
+    ApprovalScopesListParams, ApprovalTypedDetails, DiffPreviewGetParams, InputItem, OutputCursor,
     PermissionProfileListParams, PermissionProfileSelection, PermissionProfileSetParams, PreviewId,
     QuestionId, SessionHydrateParams, SessionListParams, SessionOrchestrationEvent,
     SessionRollbackParams, TaskArtifactReadParams, TaskCancelParams, TaskListParams,
@@ -27,6 +27,17 @@ use crate::menu::{
 pub type LiveReply = AppUiLiveReply;
 pub type SessionView = AppUiSession;
 pub type TaskView = AppUiTask;
+
+/// One canonical `projection.envelope.v2` assistant content segment within a
+/// live turn. The transcript still accumulates its bytes in [`LiveReply`] so
+/// the legacy and v2 paths share the same commit/render lifecycle; this record
+/// prevents a later segment's durable row from replacing an earlier segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct V2AssistantSegment {
+    pub(crate) id: String,
+    pub(crate) start_offset: usize,
+    pub(crate) finalized: bool,
+}
 
 pub const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str = "config/capabilities/list";
 pub const APPUI_METHOD_SESSION_STATUS_READ: &str = "session/status/read";
@@ -55,6 +66,43 @@ pub const APPUI_METHOD_PROFILE_LOCAL_CREATE: &str = "profile/local/create";
 pub const APPUI_METHOD_PROFILE_LLM_CATALOG: &str = "profile/llm/catalog";
 pub const APPUI_METHOD_PROFILE_LLM_UPSERT: &str = "profile/llm/upsert";
 pub const APPUI_METHOD_PROFILE_LLM_DELETE: &str = "profile/llm/delete";
+pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST: &str = "profile/sub_providers/list";
+/// #1768 workspace snapshot undo.
+pub const APPUI_METHOD_SNAPSHOT_LIST: &str = "snapshot/list";
+pub const APPUI_METHOD_SNAPSHOT_RESTORE: &str = "snapshot/restore";
+/// #395 peer agents v1 (octos#1800): prepare a peer session (durable brief
+/// file + slug/topic + optional worktree) for `/peer`. A MUTATING method.
+pub const APPUI_METHOD_PEER_PREPARE: &str = "peer/prepare";
+/// octos#1801 peer v2: read the profile's peer blackboard — every staged
+/// peer's brief + latest result file (written server-side on the peer's turn
+/// terminals). Backs `/gather`. A READ (non-mutating) method, allowed in
+/// read-only mode like [`APPUI_METHOD_SNAPSHOT_LIST`].
+pub const APPUI_METHOD_PEER_GATHER: &str = "peer/gather";
+/// octos#1801 peer v3: durable SERVER→CLIENT notification — a server-side
+/// agent staged a peer via its `peer_spawn` tool; the client auto-opens it in
+/// the background. Not a request method (never appears in
+/// `AppUiCommand::method()`); decoded tui-locally in the transport because
+/// the vendored octos-core rev predates the variant.
+pub const APPUI_METHOD_PEER_STAGED: &str = "peer/staged";
+/// octos#1801 peer v3: durable SERVER→CLIENT notification — a peer session the
+/// server tore down (its turn ended, or it was reaped). The client removes the
+/// matching `peer-<slug>` session from the peer dock and the session switcher.
+/// Not a request method (never appears in `AppUiCommand::method()`); decoded
+/// tui-locally in the transport because the vendored octos-core rev predates
+/// the variant, mirroring [`APPUI_METHOD_PEER_STAGED`].
+pub const APPUI_METHOD_PEER_CLOSED: &str = "peer/closed";
+/// octos#1807: `turn/steer` — mid-turn prompt injection into the ACTIVE
+/// turn. Params `{session_id, expected_turn_id?, input}`; result
+/// `{turn_id, steered}`. `steered:true` = the text joined the live turn
+/// (the id echoes THAT turn; the server persists it at drain time as a
+/// normal v2 `UserMessage` envelope, so it echoes back like any persisted
+/// user row). `steered:false` = no active turn existed and the server
+/// started a NEW real turn with the input (the id names the new turn).
+/// `expected_turn_id` mismatch → `invalid_params`. A MUTATING method
+/// (blocked in read-only mode like `turn/start`).
+pub const APPUI_METHOD_TURN_STEER: &str = "turn/steer";
+pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT: &str = "profile/sub_providers/upsert";
+pub const APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE: &str = "profile/sub_providers/remove";
 pub const APPUI_METHOD_PROFILE_LLM_TEST: &str = "profile/llm/test";
 pub const APPUI_METHOD_PROFILE_LLM_FETCH_MODELS: &str = "profile/llm/fetch_models";
 pub const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
@@ -735,6 +783,27 @@ pub enum AppUiCommand {
     ProfileLlmSelect(ProfileLlmSelectParams),
     ProfileLlmTest(ProfileLlmTestParams),
     ProfileLlmFetchModels(ProfileLlmFetchModelsParams),
+    ProfileSubProvidersList(SubProvidersListParams),
+    /// #1768: list the session workspace's snapshot undo points.
+    SnapshotList(SnapshotListParams),
+    /// #1768: restore the session workspace to a snapshot.
+    SnapshotRestore(SnapshotRestoreParams),
+    /// #395: prepare a peer session for `/peer` (durable brief + slug/topic).
+    /// A MUTATING method — intentionally NOT listed in
+    /// [`ProtocolAppUiBackend::readonly_allows_command`], so it is blocked in
+    /// read-only mode (like `SnapshotRestore` and the config upserts).
+    PeerPrepare(PeerPrepareParams),
+    /// octos#1807: steer typed input into the ACTIVE turn instead of staging
+    /// it until turn-end. A MUTATING method — NOT listed in
+    /// [`ProtocolAppUiBackend::readonly_allows_command`] (it injects input
+    /// into a running turn, the same class as `turn/start`).
+    TurnSteer(TurnSteerParams),
+    /// octos#1801 v2: read the peer blackboard for `/gather`. A READ
+    /// (non-mutating) method — listed in
+    /// [`ProtocolAppUiBackend::readonly_allows_command`] like `SnapshotList`.
+    PeerGather(PeerGatherParams),
+    ProfileSubProvidersUpsert(SubProvidersUpsertParams),
+    ProfileSubProvidersRemove(SubProvidersRemoveParams),
     ProfileSkillsList(ProfileSkillsListParams),
     ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchParams),
     ProfileSkillsInstall(ProfileSkillsInstallParams),
@@ -829,6 +898,14 @@ impl AppUiCommand {
             Self::ProfileLlmDelete(_) => APPUI_METHOD_PROFILE_LLM_DELETE,
             Self::ProfileLlmTest(_) => APPUI_METHOD_PROFILE_LLM_TEST,
             Self::ProfileLlmFetchModels(_) => APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+            Self::ProfileSubProvidersList(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+            Self::SnapshotList(_) => APPUI_METHOD_SNAPSHOT_LIST,
+            Self::SnapshotRestore(_) => APPUI_METHOD_SNAPSHOT_RESTORE,
+            Self::PeerPrepare(_) => APPUI_METHOD_PEER_PREPARE,
+            Self::TurnSteer(_) => APPUI_METHOD_TURN_STEER,
+            Self::PeerGather(_) => APPUI_METHOD_PEER_GATHER,
+            Self::ProfileSubProvidersUpsert(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+            Self::ProfileSubProvidersRemove(_) => APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
             Self::ProfileSkillsList(_) => APPUI_METHOD_PROFILE_SKILLS_LIST,
             Self::ProfileSkillsRegistrySearch(_) => APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
             Self::ProfileSkillsInstall(_) => APPUI_METHOD_PROFILE_SKILLS_INSTALL,
@@ -2198,6 +2275,11 @@ pub enum OnboardingProviderPending {
 pub enum OnboardingProviderSaveTarget {
     Primary,
     Fallback,
+    /// Save the staged provider as a research sub-provider lane (the `/research`
+    /// add flow reuses the model wizard, but the result lands in
+    /// `profile/sub_providers/upsert` as a named lane, not the profile's
+    /// primary/fallback provider).
+    ResearchLane,
 }
 
 /// M22-E: product-grade lifecycle status for the provider setup
@@ -2418,7 +2500,26 @@ pub struct OnboardingWizardState {
     /// the confirm menu (`MENU_MODEL_REMOVE_CONFIRM`), whose Yes row sends
     /// `profile/llm/delete` with these coordinates.
     pub pending_model_removal: Option<ModelRemovalRequest>,
+    /// A research lane staged for removal by the `/research` menu — read by the
+    /// confirm menu (`MENU_RESEARCH_REMOVE_CONFIRM`), whose Yes row sends
+    /// `profile/sub_providers/remove` with the captured `profile_id` + `key`.
+    pub pending_research_lane_removal: Option<ResearchLaneRemoval>,
+    /// #1768: snapshot staged for restore by `/undo` — read by
+    /// `MENU_UNDO_CONFIRM`, whose Yes row sends `snapshot/restore`.
+    pub pending_snapshot_restore: Option<SnapshotRestoreRequest>,
     pub provider_save_target: Option<OnboardingProviderSaveTarget>,
+    /// Persistent "this wizard session is creating a RESEARCH lane" intent, set
+    /// by bare `/research add` and kept for the WHOLE flow. Unlike
+    /// `provider_save_target` (a pending-op field cleared on every staged-input
+    /// edit), this is NOT cleared by `mark_onboarding_provider_dirty` /
+    /// `apply_selection` / key updates, so the Save routing stays lane-targeted
+    /// across normal wizard interaction (codex PR384 review).
+    pub research_lane_intent: bool,
+    /// The lane key ("cheap"/"strong") chosen in `MENU_RESEARCH_LANE_KEY` for
+    /// the lane save currently in flight. Stashed at dispatch so the applied
+    /// event can name the key in the confirmation; taken on consume, dropped
+    /// on error/timeout alongside `provider_pending`.
+    pub pending_research_lane_key: Option<String>,
     pub last_saved_provider_label: Option<String>,
     pub last_saved_provider_target: Option<OnboardingProviderSaveTarget>,
     pub saved_primary_provider_label: Option<String>,
@@ -2469,7 +2570,11 @@ impl Default for OnboardingWizardState {
             provider_pending: None,
             provider_pending_since: None,
             pending_model_removal: None,
+            pending_research_lane_removal: None,
+            pending_snapshot_restore: None,
             provider_save_target: None,
+            research_lane_intent: false,
+            pending_research_lane_key: None,
             last_saved_provider_label: None,
             last_saved_provider_target: None,
             saved_primary_provider_label: None,
@@ -2693,9 +2798,9 @@ impl OnboardingWizardState {
                 Some(OnboardingProviderSaveTarget::Fallback) => {
                     OnboardingProviderStatus::SavedFallback
                 }
-                Some(OnboardingProviderSaveTarget::Primary) | None => {
-                    OnboardingProviderStatus::SavedPrimary
-                }
+                Some(OnboardingProviderSaveTarget::Primary)
+                | Some(OnboardingProviderSaveTarget::ResearchLane)
+                | None => OnboardingProviderStatus::SavedPrimary,
             };
         }
         if !self.selection_ready() {
@@ -2768,6 +2873,48 @@ impl OnboardingWizardState {
         self.selection_ready().then(|| ProfileLlmFetchModelsParams {
             profile_id: self.effective_profile_id(current_profile),
             selection: self.provider.clone(),
+            api_key: self.api_key.clone(),
+        })
+    }
+
+    /// Build the `/research` sub-provider lane upsert from the wizard's staged
+    /// provider selection. Maps the wizard's `LlmSelectionConfig` onto a
+    /// `SubProviderView` (family→provider, model→model, route→base_url /
+    /// api_key_env / api_type) so the rich model-setting flow lands as a named
+    /// research lane instead of the profile's primary/fallback provider. The
+    /// lane `key` is the caller's explicit choice from `MENU_RESEARCH_LANE_KEY`
+    /// ("cheap"/"strong") — the deep_research palette requests lanes by those
+    /// LITERAL keys (`contract_for`), so a family-id key would produce a lane
+    /// the router never selects (PR384 review P1-b).
+    pub fn build_research_lane_params(
+        &self,
+        current_profile: Option<&str>,
+        key: &str,
+    ) -> Option<SubProvidersUpsertParams> {
+        if !self.selection_ready() {
+            return None;
+        }
+        let key = key.trim();
+        if key.is_empty() {
+            return None;
+        }
+        let route = &self.provider.route;
+        let key = key.to_string();
+        Some(SubProvidersUpsertParams {
+            // Use the caller-resolved ACTIVE profile directly (codex PR384 F3):
+            // do NOT fall back to `effective_profile_id`, which prefers a stale
+            // `onboarding.profile_id` and could retarget the lane to the wrong
+            // profile or the server default.
+            profile_id: current_profile.map(str::to_owned),
+            sub_provider: SubProviderView {
+                key,
+                provider: non_empty(self.provider.family_id.trim().to_string()),
+                model: non_empty(self.provider.model_id.trim().to_string()),
+                api_key_env: route.api_key_env.clone(),
+                base_url: route.base_url.clone(),
+                api_type: route.api_type.clone(),
+                ..Default::default()
+            },
             api_key: self.api_key.clone(),
         })
     }
@@ -3238,6 +3385,49 @@ pub struct ModelRemovalRequest {
     pub label: String,
 }
 
+/// #324: one session-strip / Ctrl+S/Alt+S-popup chip, computed per frame from the
+/// live store state (focused flag, live-turn signal, unread count).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionChipView {
+    pub session_id: SessionKey,
+    pub title: String,
+    pub focused: bool,
+    pub live: bool,
+    pub unread: usize,
+    /// tui#398: the session is waiting on an approval/question in the
+    /// background — strip renders `⚠`, the Ctrl+S/Alt+S row names the reason.
+    pub blocked: bool,
+    /// True when this session is a peer (present in `peer_session_meta`). The
+    /// switcher marks peers `↳` and non-peers (main/parent windows) `⌂` so a
+    /// user inside a peer can tell which row is the parent to return to.
+    pub is_peer: bool,
+    /// One-line activity summary for the Ctrl+S/Alt+S row: blocked reason, else the
+    /// live stream tail, else the last transcript line.
+    pub activity: Option<String>,
+}
+
+/// A snapshot restore staged from the `/undo` picker (#1768). `session_id`
+/// and `snapshot_id` are captured at menu-BUILD time and carried through the
+/// Yes/No confirm, so a session switch mid-confirm can never retarget the
+/// restore (same contract as [`ResearchLaneRemoval`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotRestoreRequest {
+    pub session_id: SessionKey,
+    pub snapshot_id: String,
+    pub label: String,
+}
+
+/// A research provider lane staged for removal (`/research` menu → lane row).
+/// The `profile_id` is captured at menu-BUILD time (the profile whose lanes are
+/// on screen) and carried through the Yes/No confirm, so a profile switch
+/// between selecting the row and confirming can never retarget the delete to a
+/// different profile — the exact cross-profile hazard a bare composer draft has.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResearchLaneRemoval {
+    pub profile_id: Option<String>,
+    pub key: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProfileLlmDeleteParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3259,6 +3449,358 @@ pub struct ProfileLlmSelectParams {
     pub family_id: String,
     pub model_id: String,
     pub route_id: String,
+}
+
+/// One named provider lane (`sub_providers`) as seen by the `/research` menu —
+/// mirrors the server `SubProviderConfig`. `key` addresses the lane; the rest
+/// are the editable fields.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SubProviderView {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_type: Option<String>,
+}
+
+/// `peer/prepare` request (#395, octos#1800 peer agents v1). `brief` is the
+/// raw peer brief text (required, non-empty, ≤64 KiB server-side); `worktree`
+/// asks the server to spin the peer up on its own git worktree; `cwd` pins an
+/// explicit workspace. `session_id` carries the ACTIVE session so the server
+/// can default the workspace root and scope the profile; `profile_id` stays
+/// `None` in v1 (the server derives it from the session).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerPrepareParams {
+    pub brief: String,
+    /// octos#1801 v2 fleet staging: ask the server for N peers from this ONE
+    /// brief (suffixed slugs, per-peer worktrees when `worktree`). `None`
+    /// keeps the v1 single-peer wire shape (omitted entirely, so old servers
+    /// never see an unknown field with `deny_unknown_fields`-style parsing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub worktree: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+/// `peer/prepare` result: the server-minted `slug`, its `topic`
+/// (`peer-<slug>`), the durable brief file path, the resolved workspace
+/// `cwd`, the worktree branch (when one was created), and the profile the
+/// peer session must open under. octos#1801 v2 adds `peers` — the whole
+/// staged fleet (the scalar fields mirror its FIRST entry); serde-defaulted
+/// to empty so v1 servers' scalar-only responses still decode.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerPrepareResult {
+    pub slug: String,
+    pub topic: String,
+    pub brief_path: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
+    pub profile_id: String,
+    #[serde(default)]
+    pub peers: Vec<PeerFleetEntry>,
+}
+
+/// One staged peer of a `peer/prepare` fleet (octos#1801 v2) — the same
+/// fields as the scalar [`PeerPrepareResult`] head, per peer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerFleetEntry {
+    pub slug: String,
+    pub topic: String,
+    pub brief_path: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
+    pub profile_id: String,
+}
+
+/// Params of the durable [`APPUI_METHOD_PEER_STAGED`] notification
+/// (octos#1801 v3): a server-side agent staged a peer and the client
+/// auto-opens it in the background. `session_id` is the ORIGINATING session
+/// (the one whose agent ran `peer_spawn`), NOT the peer's — the peer key is
+/// minted client-side from `profile_id` + `topic` exactly like the `/peer`
+/// flow. Tui-local wire mirror: the vendored octos-core rev predates the
+/// `UiNotification` variant, so the transport decodes the method string into
+/// this struct directly. Durable ⇒ replayed on reconnect; the store handler
+/// is idempotent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerStagedParams {
+    pub session_id: SessionKey,
+    pub topic: String,
+    pub slug: String,
+    pub brief: String,
+    pub brief_path: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
+    pub profile_id: String,
+}
+
+/// Params of the durable [`APPUI_METHOD_PEER_CLOSED`] notification: a peer
+/// session the server tore down. The client removes the matching `peer-<slug>`
+/// session from the peer dock and the session switcher. Tui-local wire mirror
+/// (the vendored octos-core rev predates the `UiNotification` variant), decoded
+/// in the transport exactly like [`PeerStagedParams`]. Durable ⇒ replayed on
+/// reconnect; the store handler is idempotent (an already-removed peer is a
+/// no-op).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerClosedParams {
+    pub session_id: SessionKey,
+    pub topic: String,
+    pub slug: String,
+    pub profile_id: String,
+}
+
+/// `peer/gather` request (octos#1801 v2): read the peer blackboard.
+/// `slugs: None` = every staged peer; `session_id` carries the ACTIVE
+/// session so the server scopes the profile (mirrors
+/// [`PeerPrepareParams`]); `profile_id` stays `None` in the TUI flow.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerGatherParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slugs: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+/// `peer/gather` result: the resolved profile + per staged peer its brief
+/// and latest `result.md` (present only once a turn of that peer session has
+/// terminated). Truncation flags mark server-side caps.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerGatherResult {
+    pub profile_id: String,
+    #[serde(default)]
+    pub peers: Vec<PeerGatherEntry>,
+}
+
+/// One blackboard row of a `peer/gather` result (octos#1801 v2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerGatherEntry {
+    pub slug: String,
+    #[serde(default)]
+    pub topic: String,
+    pub brief: String,
+    #[serde(default)]
+    pub brief_truncated: bool,
+    #[serde(default)]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub result_truncated: bool,
+    #[serde(default)]
+    pub result_updated_unix: Option<u64>,
+    #[serde(default)]
+    pub has_worktree: bool,
+}
+
+/// `turn/steer` request (octos#1807): mid-turn prompt injection into the
+/// ACTIVE turn. `expected_turn_id` pins the turn the client believes is live
+/// — a mismatch is rejected server-side (`invalid_params`) and the client
+/// falls back to staging; an ABSENT id steers whatever turn is live. `input`
+/// mirrors `turn/start`'s items (text only in the TUI flow).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnSteerParams {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_turn_id: Option<TurnId>,
+    pub input: Vec<InputItem>,
+}
+
+/// `turn/steer` result (octos#1807). `steered:true` = appended into the
+/// ACTIVE turn (`turn_id` echoes that turn; the text is persisted
+/// server-side AT DRAIN TIME as a normal v2 `UserMessage` envelope, so it
+/// echoes back like any persisted user row). `steered:false` = no active
+/// turn existed; the server started a NEW real turn with the input
+/// (`turn_id` names the new turn).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnSteerResult {
+    pub turn_id: TurnId,
+    #[serde(default)]
+    pub steered: bool,
+}
+
+/// An in-flight `turn/steer` (octos#1807): the client-local copy of the
+/// steered text so a steer that positively DIES (server rejection /
+/// cancel-all / send-layer failure) can fall back to STAGING the prompt
+/// without losing what the user typed. FIFO — the `TurnSteered` result and
+/// the method-attributed error frames each consume exactly one entry from
+/// the front (every dead steer produces exactly one attributed error event,
+/// see the transport's send/cancel paths).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingTurnSteer {
+    pub session_id: SessionKey,
+    /// The EXPECTED (live) turn id the steer named — also the id the
+    /// optimistic transcript row was recorded under, so the error fallback
+    /// can withdraw precisely that row and the `steered:false` apply can
+    /// re-key it onto the real new turn.
+    pub turn_id: TurnId,
+    pub prompt: String,
+}
+
+/// An in-flight `/peer` dispatch (#395): the client-local halves of the flow
+/// (`brief` for the kickoff text, `go` for the focus decision) that
+/// `peer/prepare`'s result does NOT echo back. Stashed at dispatch, consumed
+/// when the [`crate::client_event::ClientEvent::PeerPrepared`] result lands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingPeerPrepare {
+    pub brief: String,
+    pub go: bool,
+    pub created: std::time::Instant,
+}
+
+/// A prepared peer session waiting for its `session/opened` to land
+/// (#395). Keyed by the minted peer [`SessionKey`] in
+/// [`AppState::pending_peer_kickoffs`]; popped when the session appears in
+/// `state.sessions`, at which point the kickoff turn is submitted TO THAT
+/// SESSION. Entries older than [`PEER_KICKOFF_TTL`] are pruned (dead open —
+/// matches the `pre_token_turns` TTL self-heal).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerKickoff {
+    pub brief: String,
+    pub brief_path: String,
+    pub go: bool,
+    /// #407 review P2: origin of this peer — `true` when the model staged it
+    /// via `peer/staged` (agent-initiated), `false` for a user `/peer`. Read
+    /// by `take_pending_peer_kickoff` into `PeerMeta.agent_staged` so the dock
+    /// labels the origin correctly instead of hardcoding it.
+    pub agent_staged: bool,
+    pub created: std::time::Instant,
+}
+
+/// #407 (review F1): durable peer roster entry. `PeerKickoff` is popped the
+/// moment `session/opened` lands, so keying "is this a peer" off
+/// `pending_peer_kickoffs` makes peers disappear from the dock the instant
+/// they start running. `PeerMeta` is recorded at the same chokepoint
+/// (`take_pending_peer_kickoff`) and lives for the session's whole lifetime —
+/// it carries the slug/brief-path the peek overlay needs, which `SessionView`
+/// does not. The dock reads union(this, pending_peer_kickoffs); pending-only
+/// peers (still opening) count toward `total` only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerMeta {
+    pub slug: String,
+    pub brief_path: String,
+    /// True if the peer was staged by the agent via `peer_handoff` (vs
+    /// `/peer --prepare` by the user). Reserved for future differentiated
+    /// rendering; not yet surfaced.
+    pub agent_staged: bool,
+    pub created: std::time::Instant,
+    /// When this peer's most recent turn TERMINATED (done/error/interrupted),
+    /// stamped by `mark_peer_finished`. Drives the dock's `✓ done` state (vs a
+    /// never-run `○ idle`) and freezes its elapsed at the run duration instead
+    /// of letting it tick up forever. `None` until the first turn ends; a
+    /// currently-live turn (`session_turn_live`) still renders `✻` regardless.
+    pub finished_at: Option<std::time::Instant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotListParams {
+    pub session_id: SessionKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotRestoreParams {
+    pub session_id: SessionKey,
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotInfoView {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub timestamp_unix: i64,
+}
+
+/// `snapshot/list` result — also the shape `snapshot/restore` echoes back
+/// (refreshed rows) so the picker updates in place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotListResult {
+    #[serde(default)]
+    pub session_id: Option<SessionKey>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub snapshots: Vec<SnapshotInfoView>,
+    #[serde(default)]
+    pub restored: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubProvidersListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubProvidersUpsertParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub sub_provider: SubProviderView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretString>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubProvidersRemoveParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SubProvidersListResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub sub_providers: Vec<SubProviderView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SubProvidersMutationResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub sub_providers: Vec<SubProviderView>,
+    #[serde(default)]
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
+}
+
+impl SubProvidersMutationResult {
+    pub fn to_list_result(&self) -> SubProvidersListResult {
+        SubProvidersListResult {
+            profile_id: self.profile_id.clone(),
+            sub_providers: self.sub_providers.clone(),
+            runtime_policy_stamp: self.runtime_policy_stamp.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3741,6 +4283,24 @@ impl SessionRunState {
 
 type SessionUsage = (Option<u64>, Option<u64>, Option<f64>);
 
+/// Fold preference for the ◆ Goal banner's objective, toggled by Ctrl+P.
+///
+/// `Auto` is the default: the fold is derived EACH FRAME from the objective's
+/// wrapped length at the real render width — a short goal (≤ a few wrapped rows)
+/// shows in full, a long one (a huge pasted objective) is compact by default so
+/// it can't dominate the screen. Once the user presses Ctrl+P the choice becomes
+/// explicit (`Folded`/`Unfolded`) and is honored on every subsequent frame
+/// regardless of length. A global UI preference, not per-session state — the
+/// same discipline as [`AppState::agent_dock_collapsed`]; `Auto` adapts to
+/// whichever session's goal is on screen, so only an explicit toggle is sticky.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GoalObjectiveFold {
+    #[default]
+    Auto,
+    Folded,
+    Unfolded,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     /// Active TUI palette, chosen at launch (`--theme`/config) and switchable
@@ -3853,6 +4413,25 @@ pub struct AppState {
     /// rows. Toggled by Alt+D or the `/agents` menu; a UI preference, not
     /// per-session state.
     pub agent_dock_collapsed: bool,
+    /// #407: Peer Dock collapsed state. Mirrors [`Self::agent_dock_collapsed`]:
+    /// when true, the peer strip renders as a single-line summary pill
+    /// (`Peers: N · M live · K⚠`) instead of per-peer chips. Toggled by
+    /// Alt+P (or the Ctrl+L alias for terminals without Option-as-Meta).
+    /// Distinct from the agent dock's collapse so the two surfaces stay
+    /// independently controllable.
+    pub peer_dock_collapsed: bool,
+    /// ◆ Goal banner fold preference (Ctrl+P). See [`GoalObjectiveFold`]: a huge
+    /// pasted objective folds to one compact row by default, a short one shows
+    /// in full, and an explicit Ctrl+P choice sticks. A global UI preference,
+    /// not per-session state (like `agent_dock_collapsed`).
+    pub goal_objective_fold: GoalObjectiveFold,
+    /// Last EFFECTIVE goal-objective fold the banner rendered — `Auto` resolved
+    /// from the objective's wrapped length at the REAL render width. A `Cell`
+    /// because the render/height paths borrow `&AppState`; Ctrl+P reads it to
+    /// flip whatever is currently on screen (the banner always draws before a
+    /// key is read, so it is stale by at most one frame — the same discipline as
+    /// [`AppState::agent_view_scroll_max`]).
+    pub goal_objective_folded_effective: std::cell::Cell<bool>,
     /// `--scroll-mode pinned`: capture the mouse in the chat flow so wheel-up
     /// auto-enters the pager (composer stays pinned) and wheel-down at the
     /// pager bottom drops back to the inline tail. False = `native` (default):
@@ -3880,7 +4459,23 @@ pub struct AppState {
     pub git: GitPaneState,
     pub composer: String,
     pub composer_cursor: Option<usize>,
+    /// True when the composer currently holds a large UNEDITED paste, so it
+    /// renders as a compact `[paste]` block. Set only by the paste path (real
+    /// paste events), cleared on any manual edit (type/delete/clear/submit) —
+    /// so TYPED multi-line input is never collapsed, only pastes are.
+    pub composer_pasted: bool,
+    /// Byte range of the collapsed paste inside `composer` (#382): lets the
+    /// atomic block delete drain ONLY the pasted bytes so typed text around
+    /// the chip survives. `None` (e.g. state predating the span) falls back
+    /// to clearing the whole draft. Maintained by `insert_pasted_text`
+    /// (unioned across consecutive pastes) and invalidated wherever
+    /// `composer_pasted` is cleared.
+    pub composer_paste_span: Option<std::ops::Range<usize>>,
     pub composer_drafts: Vec<ComposerDraft>,
+    /// Snapshot backing the `@` composer file picker (#363): the workspace
+    /// file list scanned when the picker was last opened. `Some` only feeds
+    /// the `file-picker` menu build; rebuilt on every `@` (never stale-served).
+    pub file_picker: Option<crate::file_picker::FilePickerState>,
     /// Cross-session command history for Up/Down recall (codex/claude-code
     /// style); persisted to `~/.config/octos-tui/history.jsonl`. See
     /// [`crate::history::ComposerHistory`].
@@ -3929,6 +4524,17 @@ pub struct AppState {
     /// markdown. Kept out-of-band so coverage/dedup can keep comparing the
     /// unmodified live text against committed content.
     pub live_reply_segment_boundaries: std::collections::HashMap<(SessionKey, TurnId), Vec<usize>>,
+    /// Canonical v2 assistant segments currently projected into a live reply,
+    /// keyed by session and resolved local turn id. Segment identity is kept
+    /// separately from the text so a later `assistant_segment_id` can open a
+    /// fresh segment without overwriting a prior persisted one.
+    pub(crate) v2_live_assistant_segments:
+        std::collections::HashMap<(SessionKey, TurnId), Vec<V2AssistantSegment>>,
+    /// Maps the string turn id carried by v2 envelopes to the typed local
+    /// [`TurnId`] used by the established live-reply lifecycle. V2 permits
+    /// non-UUID wire ids during compatibility projection, so the map lets the
+    /// reducer retain stable identity without weakening the existing model.
+    pub(crate) v2_turn_ids: std::collections::HashMap<(SessionKey, String), TurnId>,
     /// Accumulated streamed reasoning fragments per active turn (legacy
     /// `ReasoningDelta` path). `commit_live_reply` moves them onto the committed
     /// message's `reasoning_content`, which the transcript renders as a separate
@@ -3940,27 +4546,133 @@ pub struct AppState {
     /// fullness bar.
     pub live_compaction: std::collections::HashMap<SessionKey, LiveCompaction>,
     pub status: String,
+    /// Transient error shown in the status bar with `danger` styling instead of
+    /// the normal muted `status` text. Cleared on the next key press so it
+    /// behaves like a dismissable inline toast.
+    pub status_error: Option<String>,
     pub target: Option<String>,
     pub readonly: bool,
     pub protocol_version: &'static str,
     pub run_state: SessionRunState,
     pub run_state_started_at: Option<Instant>,
+    /// Sessions with a SUBMITTED turn that has not yet streamed its first
+    /// delta (`live_reply` absent). `initial_run_state` derives run-state from
+    /// `live_reply` presence alone, so without this marker a rapid
+    /// switch-away-and-back inside the pre-first-token window read the session
+    /// as Idle and let a submit start a SECOND concurrent turn (#379 review
+    /// F3). Armed at submit, cleared on turn/started + both terminals; entries
+    /// older than [`PRE_TOKEN_TURN_TTL`] are ignored (dead submit — matches
+    /// the staged-gate TTL self-heal).
+    pub pre_token_turns: std::collections::HashMap<SessionKey, Instant>,
+
+    /// Turns the user has locally interrupted (Esc/Ctrl+C) whose server
+    /// terminal has not yet landed. The mirror image of `pre_token_turns`:
+    /// where that FORCES the run-state in-progress, this FORCES it idle and
+    /// freezes the live reply, so a turn stops on screen the instant Esc is
+    /// pressed instead of after a full client→server→terminal round trip (the
+    /// server interrupt is cooperative and can lag seconds). Keyed by session;
+    /// the value is the interrupted turn id, so a LATER turn on the same
+    /// session is never gated. Cleared on the turn's terminal.
+    pub interrupted_turns: std::collections::HashMap<SessionKey, TurnId>,
+
+    /// Turns whose output the freeze above ACTUALLY suppressed: a delta or a
+    /// canonical persisted frame arrived after the Esc and was dropped.
+    ///
+    /// Only these turns can have lost content, so only these earn the
+    /// "incomplete" marker when the turn goes on to complete normally. Esc at
+    /// 99% — where nothing further arrived — commits clean, with no false
+    /// warning. Cleared with the turn's terminal (and on backend relaunch,
+    /// like `interrupted_turns`).
+    pub interrupt_dropped_output: std::collections::HashSet<(SessionKey, TurnId)>,
+    /// #324 Phase C: per-session unread counters — turns that reached a
+    /// terminal while the session was NOT focused. Incremented by the store's
+    /// terminal appliers, cleared when the session gains focus.
+    pub unread_turns: std::collections::HashMap<SessionKey, usize>,
+    /// octos#1807: in-flight `turn/steer` dispatches, FIFO. Each steer's
+    /// prompt lives ONLY here between dispatch and its result/error — a steer
+    /// that positively dies (attributed error frame) is re-staged from this
+    /// stash so the typed text is never lost, and a `steered:false` result
+    /// re-keys its optimistic row onto the server's real new turn. Consumed
+    /// front-first by [`crate::client_event::ClientEvent::TurnSteered`] and
+    /// the attributed error fallback (exactly one of which arrives per
+    /// steer). Bounded by the transport's pending-request cap.
+    pub pending_turn_steers: std::collections::VecDeque<PendingTurnSteer>,
+    /// #395: the in-flight `/peer` dispatch. `peer/prepare`'s result does not
+    /// echo the brief (and `go` never crosses the wire), so the dispatcher
+    /// stashes them here; the `PeerPrepared` apply consumes the stash to build
+    /// the kickoff. A second `/peer` before the first result replaces it.
+    pub pending_peer_prepare: Option<PendingPeerPrepare>,
+    /// #395: prepared peer sessions waiting for their `session/opened`, keyed
+    /// by the minted peer session key. Popped when the session lands in
+    /// `sessions` (the kickoff turn is then submitted to the PEER key);
+    /// entries older than [`PEER_KICKOFF_TTL`] are pruned like
+    /// `pre_token_turns`.
+    pub pending_peer_kickoffs: std::collections::HashMap<SessionKey, PeerKickoff>,
+    /// #407 (review F1): durable peer roster — survives the
+    /// `session/opened` pop that empties `pending_peer_kickoffs`. Recorded
+    /// at [`Self::take_pending_peer_kickoff`] (the single chokepoint both
+    /// the background and `--go` paths flow through). The Peer Dock and
+    /// its pill read the UNION of this map and `pending_peer_kickoffs` so
+    /// a running fleet stays visible. Note: `app.sessions` entries are
+    /// never removed in-process today (no session-close path), so no
+    /// removal hook is wired here — if close ever lands, prune the
+    /// matching `PeerMeta` at the same site.
+    pub peer_session_meta: std::collections::HashMap<SessionKey, PeerMeta>,
+    /// Durable set of session keys EVER registered as a peer (via the
+    /// `take_pending_peer_kickoff` open chokepoint). Unlike `peer_session_meta`
+    /// — the mutable DOCK roster that `/peer clear` prunes — a `/peer clear` (dock
+    /// prune) NEVER removes from this set, so a cleared done-peer STAYS a
+    /// read-only peer; only a full `peer/closed` teardown (which also removes the
+    /// `sessions` row) drops the key. And unlike a `topic().starts_with("peer-")`
+    /// string check it cannot false-positive on an ordinary session whose
+    /// API-supplied topic merely starts with `peer-`. This is the identity
+    /// `focused_session_is_peer` reads.
+    pub opened_peer_sessions: std::collections::HashSet<SessionKey>,
+    /// Peer keys retired by a recent `peer/closed`, each stamped at close time.
+    /// A `session/opened` that races BEHIND its `peer/closed` (the kickoff
+    /// already dropped) would otherwise fall through to the generic open path and
+    /// resurrect the peer as a focused generic row; a hit here within
+    /// `RECENTLY_CLOSED_PEER_TTL` swallows that stale open. Time-bounded (pruned
+    /// on access) so it stays small AND so a later peer that legitimately REUSES
+    /// the slug — restaged past the TTL, or explicitly un-stamped on restage — is
+    /// never suppressed.
+    pub recently_closed_peers: std::collections::HashMap<SessionKey, Instant>,
     pub approval_auto_open: bool,
     pub approval: Option<ApprovalModalState>,
     /// Pending AskUserQuestion picker (UPCR-2026-023), mirroring `approval`.
     pub user_question: Option<UserQuestionPickerState>,
     pub user_question_auto_open: bool,
+    /// tui#398: approvals that arrived for a NON-focused session. The global
+    /// `approval` slot belongs to the focused session — a background session's
+    /// approval must not hijack the foreground modal/run-state; it waits here
+    /// (latest per session, mirroring the hydrate replay's `last()`), marks
+    /// the session's strip chip `⚠`, and is PROMOTED to the global slot when
+    /// the session is focused. NOT snapshot-carried: `session/hydrate` replays
+    /// pending approvals per session, so a reconnect repopulates these.
+    pub pending_session_approvals: std::collections::HashMap<SessionKey, ApprovalModalState>,
+    /// tui#398: AskUserQuestions for non-focused sessions, mirroring
+    /// [`Self::pending_session_approvals`].
+    pub pending_session_questions: std::collections::HashMap<SessionKey, UserQuestionPickerState>,
     pub task_output: TaskOutputDetailState,
     pub artifact_detail: ArtifactDetailState,
     pub thread_graph_detail: ThreadGraphDetailState,
     pub turn_state_detail: TurnStateDetailState,
     pub task_output_cursors: Vec<TaskOutputCursor>,
     pub diff_preview: DiffPreviewPaneState,
+    /// Terminal width of the last drawn frame (0 = not drawn yet, e.g. in
+    /// tests). Lets key handlers apply width gates — the side-by-side diff
+    /// toggle is a no-op when the transcript is too narrow to split.
+    pub last_terminal_width: u16,
+    /// Terminal HEIGHT of the last drawn frame (0 = not drawn yet). Lets key
+    /// handlers apply height gates — the Peer Dock approve/deny keys must only
+    /// fire when the dock (and the acted-on peer's row) was actually DRAWN this
+    /// frame, which `peer_strip_height` / `peer_strip_lines` decide from height.
+    pub last_terminal_height: u16,
     pub activity: Vec<ActivityItem>,
     pub turn_activity_logs: Vec<TurnActivityLog>,
-    /// Hydrate-replayed tool envelopes already applied, keyed by
+    /// Hydrate-replayed v2 tool envelopes already applied, keyed by
     /// `(session, thread_id, seq)` — `seq` is the envelope's identity within
-    /// its thread (#1515). Hydrate re-runs on every reconnect; without this
+    /// its thread. Hydrate re-runs on every reconnect; without this
     /// ledger each re-run would duplicate the per-action rows.
     pub applied_hydrate_tool_envelopes: std::collections::HashSet<(String, String, u64)>,
     pub turn_activity_summaries: Vec<TurnActivitySummary>,
@@ -3992,6 +4704,13 @@ pub struct AppState {
     pub session_runtime_statuses: Vec<SessionRuntimeStatus>,
     pub profile_llm_catalog: Option<ProfileLlmCatalogResult>,
     pub profile_llm_state: Option<ProfileLlmListResult>,
+    /// Named provider lanes (`sub_providers`) shown by the `/research` menu,
+    /// populated from `profile/sub_providers/list`.
+    pub sub_providers_state: Option<SubProvidersListResult>,
+    /// #1768: last `snapshot/list` (or restore-echo) for the /undo picker.
+    /// Session-stamped by the server; the menu displays it only for the
+    /// session it belongs to.
+    pub snapshots_state: Option<SnapshotListResult>,
     pub profile_skills: Option<ProfileSkillsListResult>,
     pub profile_skill_registry: Option<ProfileSkillsRegistrySearchResult>,
     pub session_model_catalogs: Vec<SessionModelCatalog>,
@@ -4034,64 +4753,6 @@ pub struct AppState {
     /// operator's *local* clipboard — and the store has no terminal handle, so
     /// the work is split across this field.
     pub pending_clipboard: Option<String>,
-    /// Prior sessions fetched via `session/list` to populate the `/resume`
-    /// picker. Local-only client state the server never echoes in a snapshot —
-    /// preserved across snapshot replays (see `apply_event(Snapshot)`), and
-    /// mirrored into `MenuAppSnapshot` so the resume menu can render it. Empty
-    /// until `/resume` triggers the first fetch.
-    pub resume_sessions: Vec<ResumeSessionRow>,
-    /// Whether a `session/list` result has landed yet, distinguishing "the fetch
-    /// is still in flight" from "the fetch returned zero prior sessions". Without
-    /// it an empty [`Self::resume_sessions`] is ambiguous and the `/resume`
-    /// picker would render `Loading` forever when the server has no sessions.
-    /// Set true when the first (and every subsequent) `session/list` result is
-    /// applied. Local-only client state — preserved across snapshot replays.
-    pub resume_list_loaded: bool,
-    /// Active-session user turns for the `/rewind` picker, newest-first.
-    /// Populated locally (from the active session's transcript) when
-    /// `OpenRewindPicker` is dispatched, and mirrored into `MenuAppSnapshot` so
-    /// `rewind_menu` can render one row per turn. Local-only client state the
-    /// server never echoes — preserved across snapshot replays.
-    pub rewind_turns: Vec<RewindTurnRow>,
-    /// The full text of the user message chosen in the `/rewind` picker, keyed
-    /// by the session the rewind was issued in, stashed while
-    /// `session/rollback` is in flight. When the `SessionRollback` result for
-    /// THAT session lands it is placed back into the composer (so the user can
-    /// edit and resend that turn) — unless the user switched sessions
-    /// meanwhile, in which case it becomes that session's composer draft
-    /// instead of clobbering the live composer. Local-only, preserved across
-    /// snapshot replays.
-    pub pending_rewind_prefill: Option<(SessionKey, String)>,
-    /// Prompts of turns the user interrupted (Esc/Ctrl+C), stashed until each
-    /// turn actually SETTLES (its `turn/completed`/`turn/error` terminal, or
-    /// the hydrate finalize after a backend restart). Restoring at
-    /// interrupt-REQUEST time filled the composer while the turn was still
-    /// streaming, and a non-empty composer silently blocks the `/` slash
-    /// popup (it only opens on an empty composer) — the reported "slash menu
-    /// is not usable while the LLM is outputting". At most ONE entry per
-    /// session (flat `Vec`, consistent with `permission_profiles` /
-    /// `session_runtime_statuses` neighbours; codex round-2 P2: a single
-    /// global slot let session B's interrupt overwrite session A's). Applied
-    /// by the settle handlers into the live composer (active session,
-    /// still-empty composer, no open menu), or into the session's saved draft
-    /// when the user switched away (the `pending_rewind_prefill` convention);
-    /// an entry is dropped when staged messages own its session's next turn
-    /// slot or a newer turn/submit supersedes it. Local-only, preserved
-    /// across snapshot replays.
-    pub pending_interrupt_restores: Vec<PendingInterruptRestore>,
-}
-
-/// See [`AppState::pending_interrupt_restores`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingInterruptRestore {
-    pub session_id: SessionKey,
-    pub turn_id: TurnId,
-    pub prompt: String,
-    /// The turn's terminal already arrived but a menu was open at that
-    /// moment, so the composer fill was deferred once more (codex round-3
-    /// P2: consuming it there lost the prompt permanently). A settled entry
-    /// applies when the menu stack empties.
-    pub settled: bool,
 }
 
 /// M16-G2 per-session lifecycle ledger entry. The TUI keeps these in
@@ -4364,14 +5025,8 @@ pub struct ActivityItem {
     pub duration_ms: Option<u64>,
     pub turn_id: Option<TurnId>,
     pub tool_call_id: Option<String>,
-    /// Owning session for items created on a session-scoped path. Set by the
-    /// projection-envelope `ToolStart` emit (`apply_envelope`) — the one path
-    /// whose items carry NO turn identity and so cannot be reconciled by
-    /// `turn_id` (the envelope `TurnCompleted` self-heal,
-    /// [`AppState::reconcile_envelope_thread_running_activity`], filters on it
-    /// so a thread_id shared across sessions cannot over-suppress a sibling
-    /// session's genuinely-active chip) — and by the session-scoped protocol
-    /// arms (`ToolStarted`, progress events), where
+    /// Owning session for items created by session-scoped protocol arms
+    /// (`ToolStarted`, progress events, and v2 projection payloads), where
     /// [`AppState::push_activity`] / [`AppState::update_tool_activity`] use it
     /// to keep a background session's activity from drifting the ACTIVE
     /// transcript's scroll (P2 tri-repo #246). `None` = unattributed (treated
@@ -5120,6 +5775,18 @@ pub struct GitHistoryItem {
     pub summary: String,
 }
 
+/// Minimum transcript wrap width (columns) for the side-by-side diff view.
+/// Below this the two columns are too cramped to read, so rendering
+/// auto-falls back to unified and the toggle is disabled.
+pub const DIFF_SIDE_BY_SIDE_MIN_WIDTH: usize = 100;
+
+/// The transcript wrap width for a terminal of `width` columns — single
+/// source for the render path (`app::transcript_wrap_width`) and the
+/// side-by-side toggle gate, so they can never disagree about the threshold.
+pub fn transcript_wrap_width_for(width: u16) -> usize {
+    usize::from(width.saturating_sub(2)).max(1)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiffPreviewPaneState {
     pub active: bool,
@@ -5133,6 +5800,10 @@ pub struct DiffPreviewPaneState {
     pub scroll: usize,
     pub selected_file: usize,
     pub selected_hunk: usize,
+    /// `v` toggles unified <-> side-by-side while the preview is open. A view
+    /// preference, not per-preview data: it survives `apply_result` and a
+    /// reload (`open_loading_for_turn`); only `close()` resets it.
+    pub side_by_side: bool,
 }
 
 impl DiffPreviewPaneState {
@@ -5153,7 +5824,15 @@ impl DiffPreviewPaneState {
             scroll: 0,
             selected_file: 0,
             selected_hunk: 0,
+            side_by_side: self.side_by_side,
         };
+    }
+
+    /// Flip unified <-> side-by-side. Touches ONLY the mode bit — scroll and
+    /// hunk selection are the user's place in the diff and must survive the
+    /// round trip.
+    pub fn toggle_view_mode(&mut self) {
+        self.side_by_side = !self.side_by_side;
     }
 
     pub fn apply_result(&mut self, result: DiffPreviewGetResult) {
@@ -5788,6 +6467,9 @@ impl AppState {
             agent_view_scroll_max: std::cell::Cell::new(usize::MAX),
             transcript_pager_active: false,
             agent_dock_collapsed: false,
+            peer_dock_collapsed: false,
+            goal_objective_fold: GoalObjectiveFold::default(),
+            goal_objective_folded_effective: std::cell::Cell::new(false),
             pinned_scroll: false,
             vim_mode: false,
             composer_mode: ComposerMode::Insert,
@@ -5800,7 +6482,10 @@ impl AppState {
             git: panes.git,
             composer: String::new(),
             composer_cursor: None,
+            composer_pasted: false,
+            composer_paste_span: None,
             composer_drafts: Vec::new(),
+            file_picker: None,
             composer_history: crate::history::ComposerHistory::default(),
             pending_messages: Vec::new(),
             pending_messages_by_session: std::collections::HashMap::new(),
@@ -5808,14 +6493,29 @@ impl AppState {
             optimistic_user_messages: Vec::new(),
             turn_prompt_anchors: Vec::new(),
             live_reply_segment_boundaries: std::collections::HashMap::new(),
+            v2_live_assistant_segments: std::collections::HashMap::new(),
+            v2_turn_ids: std::collections::HashMap::new(),
             live_reasoning: std::collections::HashMap::new(),
             live_compaction: std::collections::HashMap::new(),
             status,
+            status_error: None,
             target,
             readonly,
             protocol_version: APP_UI_API_V1,
             run_state,
             run_state_started_at,
+            pre_token_turns: std::collections::HashMap::new(),
+            interrupted_turns: std::collections::HashMap::new(),
+            interrupt_dropped_output: std::collections::HashSet::new(),
+            unread_turns: std::collections::HashMap::new(),
+            pending_turn_steers: std::collections::VecDeque::new(),
+            pending_peer_prepare: None,
+            pending_peer_kickoffs: std::collections::HashMap::new(),
+            peer_session_meta: std::collections::HashMap::new(),
+            opened_peer_sessions: std::collections::HashSet::new(),
+            recently_closed_peers: std::collections::HashMap::new(),
+            pending_session_approvals: std::collections::HashMap::new(),
+            pending_session_questions: std::collections::HashMap::new(),
             approval_auto_open: true,
             approval: None,
             user_question: None,
@@ -5826,6 +6526,8 @@ impl AppState {
             turn_state_detail: TurnStateDetailState::default(),
             task_output_cursors: Vec::new(),
             diff_preview: DiffPreviewPaneState::default(),
+            last_terminal_width: 0,
+            last_terminal_height: 0,
             activity: Vec::new(),
             turn_activity_logs: Vec::new(),
             applied_hydrate_tool_envelopes: std::collections::HashSet::new(),
@@ -5842,6 +6544,8 @@ impl AppState {
             session_runtime_statuses: Vec::new(),
             profile_llm_catalog: None,
             profile_llm_state: None,
+            sub_providers_state: None,
+            snapshots_state: None,
             profile_skills: None,
             profile_skill_registry: None,
             session_model_catalogs: Vec::new(),
@@ -5855,11 +6559,6 @@ impl AppState {
             pending_goal_transition: None,
             exit_requested: false,
             pending_clipboard: None,
-            resume_sessions: Vec::new(),
-            resume_list_loaded: false,
-            rewind_turns: Vec::new(),
-            pending_rewind_prefill: None,
-            pending_interrupt_restores: Vec::new(),
         }
     }
 
@@ -6114,6 +6813,22 @@ impl AppState {
         let entry = self.session_autonomy_mut(session_id);
         entry.goal = goal;
         entry.goal_transition_actor = transition_actor;
+    }
+
+    /// Ctrl+P: flip the ◆ Goal banner objective between folded and unfolded.
+    ///
+    /// Reads the EFFECTIVE fold the banner last rendered (which resolves `Auto`
+    /// from the objective's wrapped length at the real width) and pins the
+    /// explicit opposite, so the first Ctrl+P always visibly flips whatever is on
+    /// screen and every later frame honors the choice. The caller gates this on
+    /// the active session actually having a goal, so an unfolded short goal is
+    /// still a meaningful (re-fold) toggle rather than a no-op.
+    pub fn toggle_goal_objective_fold(&mut self) {
+        self.goal_objective_fold = if self.goal_objective_folded_effective.get() {
+            GoalObjectiveFold::Unfolded
+        } else {
+            GoalObjectiveFold::Folded
+        };
     }
 
     /// Replace the cached plan/todo checklist for a session. The `update_plan`
@@ -6486,6 +7201,40 @@ impl AppState {
         Some((&session.id, &live_reply.turn_id))
     }
 
+    /// Whether the FOCUSED (displayed) session is a peer. Keyed off the DURABLE
+    /// `opened_peer_sessions` identity set (populated at the peer-open
+    /// chokepoint) — NOT the mutable `peer_session_meta` dock roster that
+    /// `/peer clear` empties (a cleared-but-focused peer must STAY read-only),
+    /// and NOT a `topic().starts_with("peer-")` string check that would
+    /// false-positive on an ordinary session whose API-supplied topic merely
+    /// starts with `peer-`. Peer views are read-only WATCH surfaces: the
+    /// composer refuses plain prompts (steer peers from the master with
+    /// `peer_send_input`) and a focused peer's output is kept out of the
+    /// master's immutable native scrollback. A non-peer or absent focus reads
+    /// `false`.
+    pub fn focused_session_is_peer(&self) -> bool {
+        self.active_session()
+            .is_some_and(|session| self.opened_peer_sessions.contains(&session.id))
+    }
+
+    /// The topmost peer with a stashed approval that is ACTUALLY VISIBLE in the
+    /// Peer Dock this frame — the target of the dock's approve/deny keys, so the
+    /// operator answers a peer's approval WITHOUT switching to it. Restricted to
+    /// the rows the dock actually draws at `terminal_height` (collapsed pill →
+    /// none; capped exactly as `peer_strip_lines`): a peer whose ⚠ row is
+    /// off-screen (below the row cap) or hidden (collapsed / height-0) must NOT
+    /// be actionable, or the key would act on an affordance the user cannot see.
+    /// Only APPROVALS qualify (a question-blocked peer needs the picker, not a
+    /// yes/no key). `None` when no visible peer has a pending approval.
+    pub(crate) fn first_blocked_peer_with_approval(
+        &self,
+        terminal_height: u16,
+    ) -> Option<SessionKey> {
+        crate::app::visible_peer_dock_keys(self, terminal_height)
+            .into_iter()
+            .find(|session_id| self.pending_session_approvals.contains_key(session_id))
+    }
+
     /// Per-session cap on the [`AppState::completed_turns`] terminal-turn set —
     /// the same bounded-FIFO pattern (and cap value) as
     /// [`Self::FINALIZED_BY_SWITCH_CAP`]: only the most recent terminals can
@@ -6742,6 +7491,173 @@ impl AppState {
                 .or_default()
                 .insert(0, prompt);
         }
+    }
+
+    /// Stage a prompt at the BACK of its session's queue — the `turn/steer`
+    /// error fallback (octos#1807). Unlike the dead staged-DRAIN re-stage
+    /// (front — the drain had already dequeued it), a failed steer's text was
+    /// typed AFTER anything already staged, so appending preserves the
+    /// chronological order the user produced it in.
+    pub fn stage_prompt_back(&mut self, session_id: &SessionKey, prompt: String) {
+        let is_active = self
+            .active_session()
+            .is_some_and(|session| &session.id == session_id);
+        if is_active {
+            self.pending_messages.push(prompt);
+        } else {
+            self.pending_messages_by_session
+                .entry(session_id.clone())
+                .or_default()
+                .push(prompt);
+        }
+    }
+
+    /// Withdraw the optimistic row a DEAD `turn/steer` recorded (octos#1807):
+    /// like [`Self::withdraw_optimistic_user_prompt`], but content-matched —
+    /// the steer shares its turn id with the LIVE turn, whose ORIGINAL
+    /// prompt's optimistic entry (same session + turn, different content)
+    /// must survive. The turn-prompt anchor is deliberately left alone too:
+    /// the turn it names is still running.
+    pub fn withdraw_steered_user_prompt(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+        content: &str,
+    ) {
+        let Some(position) = self
+            .optimistic_user_messages
+            .iter()
+            .rposition(|optimistic| {
+                &optimistic.session_id == session_id
+                    && &optimistic.turn_id == turn_id
+                    && optimistic.content == content
+            })
+        else {
+            return;
+        };
+        let optimistic = self.optimistic_user_messages.remove(position);
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| &session.id == session_id)
+        else {
+            return;
+        };
+        // Only remove a row that is genuinely OUR optimistic insert (count
+        // above the pre-insert baseline); take the LAST matching row — the
+        // optimistic row is the most recent insert of this content.
+        if matching_user_message_count(session, &optimistic.content)
+            > optimistic.prior_matching_user_count
+            && let Some(row) = session.messages.iter().rposition(|message| {
+                message.role.as_str() == "user" && message.content == optimistic.content
+            })
+        {
+            session.messages.remove(row);
+        }
+    }
+
+    /// Re-key the optimistic row (and its turn-prompt anchor) a steer
+    /// recorded under the EXPECTED turn onto the REAL turn the server minted
+    /// (octos#1807 `steered:false`): the expected turn had already settled
+    /// server-side, so the text actually started `to_turn` — interrupt
+    /// restore and the turn card must resolve it under that id.
+    pub fn rekey_turn_prompt_records(
+        &mut self,
+        session_id: &SessionKey,
+        from_turn: &TurnId,
+        content: &str,
+        to_turn: &TurnId,
+    ) {
+        if let Some(optimistic) =
+            self.optimistic_user_messages
+                .iter_mut()
+                .rev()
+                .find(|optimistic| {
+                    &optimistic.session_id == session_id
+                        && &optimistic.turn_id == from_turn
+                        && optimistic.content == content
+                })
+        {
+            optimistic.turn_id = to_turn.clone();
+        }
+        if let Some(anchor) = self.turn_prompt_anchors.iter_mut().rev().find(|anchor| {
+            &anchor.session_id == session_id
+                && &anchor.turn_id == from_turn
+                && anchor.content == content
+        }) {
+            anchor.turn_id = to_turn.clone();
+        }
+    }
+
+    /// Apply a persisted v2 `UserMessage` envelope row. Dedup is two-layer:
+    ///
+    /// 1. thread-id identity — a replayed envelope whose row is already
+    ///    present is a no-op (pre-existing replay dedup);
+    /// 2. optimistic reconciliation (the #381-era count-baseline scheme,
+    ///    extended to the LIVE echo lane for `turn/steer`): when the echo's
+    ///    content matches a row this client already rendered optimistically
+    ///    ([`Self::record_submitted_user_prompt`]), PROMOTE that row — stamp
+    ///    the canonical thread id (and media) onto it and drop the optimistic
+    ///    tracking entry — instead of appending a duplicate. This is what
+    ///    keeps a steered row from appearing twice when its drain-time echo
+    ///    arrives mid-turn (and reconciles the normal submit path's own echo
+    ///    identically).
+    ///
+    /// Without an optimistic match the canonical row appends as before.
+    pub fn apply_user_row_echo(
+        &mut self,
+        session_id: &SessionKey,
+        thread_id: String,
+        text: String,
+        media: Vec<String>,
+    ) {
+        let Some(session_index) = self
+            .sessions
+            .iter()
+            .position(|session| &session.id == session_id)
+        else {
+            return;
+        };
+        let already_present = self.sessions[session_index].messages.iter().any(|message| {
+            message.role == octos_core::MessageRole::User
+                && message.thread_id.as_deref() == Some(thread_id.as_str())
+        });
+        if already_present {
+            return;
+        }
+        if let Some(tracked) = self
+            .optimistic_user_messages
+            .iter()
+            .rposition(|optimistic| {
+                &optimistic.session_id == session_id && optimistic.content == text
+            })
+        {
+            let baseline = self.optimistic_user_messages[tracked].prior_matching_user_count;
+            let session = &mut self.sessions[session_index];
+            // Promote only when our optimistic insert is genuinely present
+            // (count above the pre-insert baseline) and still un-stamped.
+            if matching_user_message_count(session, &text) > baseline
+                && let Some(row) = session.messages.iter().rposition(|message| {
+                    message.role.as_str() == "user"
+                        && message.content == text
+                        && message.thread_id.is_none()
+                })
+            {
+                let message = &mut session.messages[row];
+                message.thread_id = Some(thread_id);
+                if !media.is_empty() {
+                    message.media = media;
+                }
+                self.optimistic_user_messages.remove(tracked);
+                return;
+            }
+            // Tracked but its row is gone (withdrawn/replaced) — drop the
+            // stale tracking entry and fall through to the canonical append.
+            self.optimistic_user_messages.remove(tracked);
+        }
+        let mut message = Message::user(text).with_thread_id(octos_core::ThreadId::new(thread_id));
+        message.media = media;
+        self.sessions[session_index].messages.push(message);
     }
 
     pub fn record_turn_prompt_anchor_from_latest_user(
@@ -7038,7 +7954,7 @@ impl AppState {
     /// session means the frame must re-emit the coherent committed+live
     /// block, and that decision must survive the turn settling before the
     /// next draw.
-    fn request_transcript_reflush(&mut self, session_id: &SessionKey) {
+    pub(crate) fn request_transcript_reflush(&mut self, session_id: &SessionKey) {
         let live_streaming = self
             .sessions
             .iter()
@@ -7170,60 +8086,6 @@ impl AppState {
             .retain(|summary| live_turns.contains(&summary.turn_id));
     }
 
-    /// Detail marker stamped on activity items created by the M9-γ
-    /// projection-envelope `ToolStart` path. The envelope wire shape carries NO
-    /// turn identity (it is keyed on `thread_id`/`seq`), so envelope tool items
-    /// have `turn_id == None` and the turn-scoped reconcile cannot match them.
-    /// This thread-scoped marker is how the envelope `TurnCompleted` reconcile
-    /// (GAP 2) finds the items the envelope path itself started, keeping emit and
-    /// reconcile in lockstep (same discipline as the running-status set).
-    pub fn envelope_tool_detail_for_thread(thread_id: &str) -> String {
-        format!("thread {thread_id}")
-    }
-
-    /// GAP 2 — orphan activity-chip self-heal on the projection-envelope path.
-    /// An envelope `TurnCompleted` is a hard terminal barrier for its
-    /// `(session_id, thread_id)` pair: no further tool activity can legitimately
-    /// run for that thread in that session. Reconcile any turn-less running item
-    /// the envelope `ToolStart` path created for this session's thread (a
-    /// `ToolStart` whose `ToolEnd` never arrived) to
-    /// [`ACTIVITY_STATUS_INTERRUPTED`] so it can no longer pin a turn-less
-    /// "Orchestrating…" chip.
-    ///
-    /// Scoped tightly to NOT over-suppress, on FOUR independent guards:
-    /// - `session_id` — `thread_id` is NOT globally unique (two sessions can run
-    ///   envelope tools under the same projection thread), so the sweep is
-    ///   confined to items the envelope path stamped for THIS session. Without
-    ///   it, session A's `TurnCompleted` would suppress session B's
-    ///   genuinely-active chip on the same `thread_id`.
-    /// - [`ActivityKind::Tool`] — the envelope `ToolStart` path only ever creates
-    ///   `Tool` items; a non-tool turn-less row is never touched.
-    /// - `turn_id == None` — all envelope items are turn-less; turn-scoped items
-    ///   reconcile via [`Self::reconcile_terminal_turn_running_activity`].
-    /// - the thread's envelope-tool marker (kept in lockstep with the emit via
-    ///   the shared [`Self::envelope_tool_detail_for_thread`] source) — so legacy
-    ///   turn-less sub-agent progress rows are left alone.
-    pub fn reconcile_envelope_thread_running_activity(
-        &mut self,
-        session_id: &SessionKey,
-        thread_id: &str,
-    ) -> usize {
-        let marker = Self::envelope_tool_detail_for_thread(thread_id);
-        let mut flipped = 0;
-        for item in self.activity.iter_mut().filter(|item| {
-            item.session_id.as_ref() == Some(session_id)
-                && item.kind == ActivityKind::Tool
-                && item.turn_id.is_none()
-                && item.detail.as_deref() == Some(marker.as_str())
-        }) {
-            if activity_status_is_running(&item.status) {
-                item.status = ACTIVITY_STATUS_INTERRUPTED.to_string();
-                flipped += 1;
-            }
-        }
-        flipped
-    }
-
     pub fn has_pending_messages(&self) -> bool {
         !self.pending_messages.is_empty()
     }
@@ -7249,6 +8111,16 @@ impl AppState {
             .as_deref()
             .and_then(preview_id_from_text)
             .or_else(|| preview_id_from_text(&task.output_tail))
+    }
+
+    /// Whether the side-by-side diff toggle may take effect at the last drawn
+    /// terminal width. Below `DIFF_SIDE_BY_SIDE_MIN_WIDTH` transcript columns
+    /// the renderer falls back to unified anyway, so the toggle is a gated
+    /// no-op there instead of silently arming a mode that cannot show. An
+    /// unknown width (0: no frame drawn yet) does not gate.
+    pub fn diff_side_by_side_toggle_enabled(&self) -> bool {
+        self.last_terminal_width == 0
+            || transcript_wrap_width_for(self.last_terminal_width) >= DIFF_SIDE_BY_SIDE_MIN_WIDTH
     }
 
     /// Switch the selected session to `index`, running the FULL housekeeping
@@ -7277,6 +8149,29 @@ impl AppState {
         self.load_composer_draft_for_selected_session();
         self.load_pending_messages_for_selected_session();
         self.refresh_run_state_from_selection();
+        // #324: focusing a session marks it read.
+        if let Some(session_id) = self.active_session().map(|session| session.id.clone()) {
+            self.unread_turns.remove(&session_id);
+            // tui#398: promote the session's stashed approval/question into
+            // the global slots now that it owns the foreground — hard-visible
+            // (a pending decision is why the user came here; the render-last
+            // discipline keeps the card on screen).
+            if let Some(mut approval) = self.pending_session_approvals.remove(&session_id) {
+                approval.visible = true;
+                let title = approval.title.clone();
+                self.approval = Some(approval);
+                self.focus = FocusPane::Composer;
+                self.set_run_state_blocked(title);
+            }
+            if let Some(mut picker) = self.pending_session_questions.remove(&session_id) {
+                picker.visible = true;
+                self.user_question_auto_open = true;
+                let title = picker.title.clone();
+                self.user_question = Some(picker);
+                self.focus = FocusPane::Composer;
+                self.set_run_state_blocked(title);
+            }
+        }
         // A session that raced the capabilities response missed its open-time
         // status probe; probe it the moment it becomes active so the composer
         // footer's model/cwd reflect it (no-op once a status is cached).
@@ -7474,8 +8369,27 @@ impl AppState {
         {
             return Some(text);
         }
-        self.active_agent_record(agent_id)
-            .and_then(|agent| agent.output_tail.as_deref())
+        let agent = self.active_agent_record(agent_id)?;
+        if let Some(tail) = agent.output_tail.as_deref()
+            && !tail.is_empty()
+        {
+            return Some(tail);
+        }
+        // Fallback for `spawn`/`spawn_only` background children (deep review):
+        // their streaming output rides `task/output/delta` into the PER-TASK
+        // store (`AppUiTask.output_tail`), NOT the per-agent `agent_outputs`
+        // cache the dock reads first, and the per-agent `output_tail` snapshot
+        // only lands on the terminal `agent/updated`. While the child runs,
+        // surface its live per-task tail so the dock shows output instead of
+        // the empty placeholder.
+        let task_id = agent.task_id.as_deref()?.parse::<TaskId>().ok()?;
+        let session = self.active_session()?;
+        let task = session.tasks.iter().find(|task| task.id == task_id)?;
+        if task.output_tail.is_empty() {
+            None
+        } else {
+            Some(task.output_tail.as_str())
+        }
     }
 
     /// The record for a sub-agent of the active session, by id.
@@ -7764,6 +8678,36 @@ impl AppState {
         }
     }
 
+    /// A session goal is ONE persistent entity, not a stream of events. Its
+    /// status transitions (`active` -> `budget_limited` -> ...) must update a
+    /// SINGLE activity row, not append a fresh "session goal" row per transition
+    /// — otherwise a thrashing goal renders as N stacked rows (mini5: one goal
+    /// showed as 3 rows "active / budget_limited / budget_limited"), and each
+    /// row with a running-ish status inflates the "N active" aggregate.
+    ///
+    /// Dedup on the HIDDEN stable key in `tool_call_id` (`session_goal:{session}:
+    /// {goal_id}`), NOT the localized title — a title match would collide across
+    /// distinct goals in a session, break on a locale change, and snag any other
+    /// Progress row that reused the label (codex review). Replace the row with
+    /// the matching key in place; append only when none exists.
+    pub fn push_or_replace_goal_activity(&mut self, item: ActivityItem) {
+        if let Some(key) = item.tool_call_id.as_deref() {
+            if let Some(existing) = self
+                .activity
+                .iter_mut()
+                .rev()
+                .find(|a| a.tool_call_id.as_deref() == Some(key))
+            {
+                existing.status = item.status;
+                existing.detail = item.detail;
+                existing.success = item.success;
+                existing.title = item.title;
+                return;
+            }
+        }
+        self.push_activity(item);
+    }
+
     pub fn preserve_transcript_position_after_append(&mut self, estimated_rows: usize) {
         if self.transcript_scroll > 0 && estimated_rows > 0 {
             self.transcript_scroll = self.transcript_scroll.saturating_add(estimated_rows);
@@ -7824,13 +8768,89 @@ impl AppState {
     }
 
     pub fn set_run_state_in_progress(&mut self) {
+        // Optimistic-idle guard: once the user interrupts the active session's
+        // live turn, no event may flip the spinner back on until the terminal
+        // reconciles. This is the single chokepoint every in-progress source
+        // funnels through (delta-first bind, tool starts, reasoning, …), so
+        // gating it here covers all of them at once.
+        if self.active_live_turn_interrupted() {
+            return;
+        }
         if !self.run_state.is_active() {
             self.run_state_started_at = Some(Instant::now());
         }
         self.run_state = SessionRunState::InProgress;
     }
 
+    /// True when the user has locally interrupted `turn_id` on `session_id`
+    /// (Esc/Ctrl+C) and the server terminal has not yet reconciled it. Used to
+    /// freeze the live reply and keep the run-state idle.
+    pub fn turn_locally_interrupted(&self, session_id: &SessionKey, turn_id: &TurnId) -> bool {
+        self.interrupted_turns.get(session_id) == Some(turn_id)
+    }
+
+    /// True when the ACTIVE session's live turn is one the user just
+    /// interrupted — the signal that keeps the run-state optimistically idle
+    /// (spinner off) until the terminal lands.
+    pub fn active_live_turn_interrupted(&self) -> bool {
+        let Some(session) = self.active_session() else {
+            return false;
+        };
+        match session.live_reply.as_ref() {
+            Some(live) => self.interrupted_turns.get(&session.id) == Some(&live.turn_id),
+            None => false,
+        }
+    }
+
+    /// Record a user interrupt so the turn stops on screen immediately. Cleared
+    /// on the turn's terminal (`commit_live_reply` / `fail_live_reply`).
+    pub fn mark_turn_interrupted(&mut self, session_id: SessionKey, turn_id: TurnId) {
+        self.interrupted_turns.insert(session_id, turn_id);
+    }
+
+    /// Clear a turn's interrupt marker once its terminal lands — but ONLY when
+    /// the marker still belongs to THIS turn. A stale / duplicate / reconnect-
+    /// replayed terminal for an OLD turn must not clear a NEWER interrupted
+    /// turn's marker on the same session (that would resurrect the killed turn:
+    /// its trailing deltas un-freeze and the spinner re-arms). (review P2)
+    pub fn clear_interrupted_turn(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        if self.interrupted_turns.get(session_id) == Some(turn_id) {
+            self.interrupted_turns.remove(session_id);
+        }
+    }
+
+    /// Record that the freeze dropped output for this turn — a delta or a
+    /// canonical frame that arrived after the user's Esc. See
+    /// [`Self::interrupt_dropped_output`].
+    pub fn mark_interrupt_dropped_output(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        self.interrupt_dropped_output
+            .insert((session_id.clone(), turn_id.clone()));
+    }
+
+    /// Consume the "freeze dropped output" flag for this turn, if any. Called
+    /// from both terminals so the entry can never outlive its turn.
+    pub fn take_interrupt_dropped_output(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> bool {
+        self.interrupt_dropped_output
+            .remove(&(session_id.clone(), turn_id.clone()))
+    }
+
     pub fn set_run_state_blocked(&mut self, message: impl Into<String>) {
+        // Same optimistic-idle guard as `set_run_state_in_progress`. An
+        // `approval/requested` / `user_question/requested` frame already on the
+        // wire when the user hits Esc must not flip the killed turn's chip from
+        // Idle back to Blocked: a re-Esc could not clear that state either
+        // (`interrupt_command` only downgrades an InProgress turn), so the user
+        // was wedged on a stale `Blocked{…}` until the terminal landed. The
+        // decision's own modal still opens — suppressing that would risk hiding
+        // a real approval when the interrupt does not land — but it is torn down
+        // by the server's `approval/cancelled` moments later.
+        if self.active_live_turn_interrupted() {
+            return;
+        }
         if !self.run_state.is_active() {
             self.run_state_started_at = Some(Instant::now());
         }
@@ -7851,8 +8871,177 @@ impl AppState {
         self.run_state_started_at = None;
     }
 
+    /// #395: pop the pending peer kickoff for `session_id`, pruning stale
+    /// entries first so an aged stash (dead `session/open`) can never fire a
+    /// kickoff turn into a session opened much later under the same key.
+    ///
+    /// #407 (review F1): also records into the durable `peer_session_meta`
+    /// roster so the Peer Dock keeps tracking this session AFTER the pop —
+    /// `pending_peer_kickoffs` is the in-flight staging map, the roster is
+    /// the lifetime map. Both consumers (background open + `--go` focus)
+    /// flow through this single chokepoint.
+    pub fn take_pending_peer_kickoff(&mut self, session_id: &SessionKey) -> Option<PeerKickoff> {
+        self.prune_stale_peer_kickoffs();
+        let kickoff = self.pending_peer_kickoffs.remove(session_id)?;
+        // Slug derivation mirrors `Store::peer_slug_for_key` (store.rs): a
+        // peer session's topic is `peer-<slug>`; strip the prefix for display.
+        let slug = session_id
+            .topic()
+            .and_then(|topic| topic.strip_prefix("peer-"))
+            .unwrap_or(session_id.0.as_str())
+            .to_owned();
+        // Durable peer identity — this is the single production chokepoint where
+        // a peer session is registered, so record it here (insert-only; never
+        // pruned, unlike the dock roster below).
+        self.opened_peer_sessions.insert(session_id.clone());
+        self.peer_session_meta.insert(
+            session_id.clone(),
+            PeerMeta {
+                slug,
+                brief_path: kickoff.brief_path.clone(),
+                agent_staged: kickoff.agent_staged,
+                created: kickoff.created,
+                finished_at: None,
+            },
+        );
+        Some(kickoff)
+    }
+
+    /// #395: drop peer kickoffs older than [`PEER_KICKOFF_TTL`] (the same
+    /// retain-by-age sweep `pre_token_turns` gets in
+    /// [`Self::refresh_run_state_from_selection`]).
+    pub fn prune_stale_peer_kickoffs(&mut self) {
+        self.pending_peer_kickoffs
+            .retain(|_, kickoff| kickoff.created.elapsed() < PEER_KICKOFF_TTL);
+    }
+
+    /// #324: whether `session_id`'s turn is live RIGHT NOW — streaming
+    /// (`live_reply` bound) or submitted-but-pre-first-token (fresh marker).
+    pub fn session_turn_live(&self, session_id: &SessionKey) -> bool {
+        self.sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .is_some_and(|session| session.live_reply.is_some())
+            || self
+                .pre_token_turns
+                .get(session_id)
+                .is_some_and(|armed| armed.elapsed() < PRE_TOKEN_TURN_TTL)
+    }
+
+    /// Stamp a peer's most recent turn terminal (done/error/interrupted) so the
+    /// dock can render `✓ done` (vs a never-run `○ idle`) and freeze its
+    /// elapsed. No-op for non-peer sessions; called from every turn-terminal
+    /// handler. A subsequent live turn still renders `✻` — `peer_is_done`
+    /// checks `session_turn_live` first — and re-terminating refreshes the
+    /// stamp, so the frozen duration tracks the latest run.
+    pub(crate) fn mark_peer_finished(&mut self, session_id: &SessionKey) {
+        if let Some(meta) = self.peer_session_meta.get_mut(session_id) {
+            meta.finished_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// A peer is "done" when its last turn terminated and it is neither live nor
+    /// blocked — the dock renders `✓` + a frozen elapsed. `created→finished_at`
+    /// is the run duration; a never-run peer (`finished_at == None`) is `○ idle`.
+    pub(crate) fn peer_is_done(&self, session_id: &SessionKey) -> bool {
+        self.peer_session_meta
+            .get(session_id)
+            .is_some_and(|meta| meta.finished_at.is_some())
+            && !self.session_turn_live(session_id)
+            && self.session_blocked_reason(session_id).is_none()
+    }
+
+    /// tui#398: the reason a BACKGROUND session is waiting on the user (a
+    /// stashed approval or question), if any. Drives the strip's `⚠` and the
+    /// Ctrl+S/Alt+S row's blocked line. The focused session never reads as blocked
+    /// here — its pending decision lives in the global modal slots.
+    pub fn session_blocked_reason(&self, session_id: &SessionKey) -> Option<&str> {
+        self.pending_session_approvals
+            .get(session_id)
+            .map(|approval| approval.title.as_str())
+            .or_else(|| {
+                self.pending_session_questions
+                    .get(session_id)
+                    .map(|picker| picker.title.as_str())
+            })
+    }
+
+    /// Row index in the session switcher (= index in `sessions`) of the parent
+    /// window to pre-highlight when the switcher is opened from a peer: the
+    /// first non-peer ("main") session. `None` when the focused session is not
+    /// a peer (nothing to return to) or no main session exists — the switcher
+    /// then keeps its default first-selectable cursor. Lets `Ctrl+S → Enter`
+    /// drop you home from a peer without hunting for the parent row.
+    pub fn parent_session_row_index(&self) -> Option<usize> {
+        let focused = self.sessions.get(self.selected_session)?;
+        if !self.peer_session_meta.contains_key(&focused.id) {
+            return None;
+        }
+        self.sessions
+            .iter()
+            .position(|session| !self.peer_session_meta.contains_key(&session.id))
+    }
+
+    /// One-line "what is this session doing" summary for the Ctrl+S/Alt+S rows
+    /// (tui#398): blocked reason first (it needs the user), then the live
+    /// stream's tail, then the last transcript line. Single-line, char-capped
+    /// for the menu row.
+    pub fn session_activity_line(&self, session_id: &SessionKey) -> Option<String> {
+        const ACTIVITY_CHARS: usize = 60;
+        fn last_line_tail(text: &str, cap: usize) -> Option<String> {
+            let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
+            let line = line.trim();
+            let chars = line.chars().count();
+            Some(if chars > cap {
+                let tail: String = line
+                    .chars()
+                    .skip(chars.saturating_sub(cap.saturating_sub(1)))
+                    .collect();
+                format!("…{tail}")
+            } else {
+                line.to_owned()
+            })
+        }
+        if let Some(reason) = self.session_blocked_reason(session_id) {
+            return Some(t!("menu.sessions.item.blocked_reason", reason = reason).into_owned());
+        }
+        let session = self
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)?;
+        if let Some(live) = session.live_reply.as_ref() {
+            if let Some(tail) = last_line_tail(&live.text, ACTIVITY_CHARS) {
+                return Some(tail);
+            }
+        }
+        session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| !message.content.trim().is_empty())
+            .and_then(|message| last_line_tail(&message.content, ACTIVITY_CHARS))
+    }
+
     pub fn refresh_run_state_from_selection(&mut self) {
         self.run_state = initial_run_state(&self.sessions, self.selected_session);
+        // Pre-first-token turns have no live_reply, so the derivation above
+        // reads them as Idle — restore InProgress from the submit marker so a
+        // switch round-trip inside that window cannot start a concurrent turn
+        // (#379 review F3). Stale markers (dead submits) are pruned here.
+        self.pre_token_turns
+            .retain(|_, armed| armed.elapsed() < PRE_TOKEN_TURN_TTL);
+        if !self.run_state.is_active()
+            && let Some(session_id) = self.active_session().map(|session| session.id.clone())
+            && self.pre_token_turns.contains_key(&session_id)
+        {
+            self.run_state = SessionRunState::InProgress;
+        }
+        // An interrupted live turn wins over the in-progress derivation, so it
+        // stays optimistically idle across a session switch too, until the
+        // terminal lands.
+        if self.active_live_turn_interrupted() {
+            self.run_state = SessionRunState::Idle;
+        }
         self.run_state_started_at = self.run_state.is_active().then(Instant::now);
     }
 
@@ -7890,6 +9079,9 @@ impl AppState {
     }
 
     pub fn load_composer_draft_for_selected_session(&mut self) {
+        // A restored draft is editable text, not a fresh paste — render it inline.
+        self.composer_pasted = false;
+        self.composer_paste_span = None;
         let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
             self.composer.clear();
             self.composer_cursor = None;
@@ -7908,6 +9100,8 @@ impl AppState {
         let session_id = self.active_session().map(|session| session.id.clone());
         self.composer.clear();
         self.composer_cursor = None;
+        self.composer_pasted = false;
+        self.composer_paste_span = None;
         // Clearing the composer (e.g. Ctrl+U) ends any history browse, so the
         // next Up recalls the newest entry instead of comparing the now-empty
         // composer against a stale recalled entry (which would scroll and need a
@@ -7922,6 +9116,46 @@ impl AppState {
     pub fn set_composer_text(&mut self, text: impl Into<String>) {
         self.composer = text.into();
         self.composer_cursor = None;
+        self.composer_pasted = false;
+        self.composer_paste_span = None;
+    }
+
+    /// Insert PASTED text at the cursor. When the paste is large enough to be
+    /// worth boxing up (see [`paste_should_collapse`]), the composer is marked as
+    /// holding a paste so it renders as a compact `[paste]` block; small pastes
+    /// insert inline like typing. Only this path (real paste events) sets the
+    /// flag — typed input is never collapsed.
+    pub fn insert_pasted_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let large = paste_should_collapse(text);
+        let cursor = self.composer_cursor_index();
+        self.insert_composer_text(text);
+        if large {
+            // Record the pasted byte range; a second paste while collapsed
+            // unions with the existing span (the chip presents them as one
+            // block), shifting it when the insertion landed before/inside it.
+            let inserted = cursor..cursor + text.len();
+            let span = match self
+                .composer_paste_span
+                .take()
+                .filter(|_| self.composer_pasted)
+            {
+                Some(mut existing) => {
+                    if cursor <= existing.start {
+                        existing.start += text.len();
+                        existing.end += text.len();
+                    } else if cursor < existing.end {
+                        existing.end += text.len();
+                    }
+                    existing.start.min(inserted.start)..existing.end.max(inserted.end)
+                }
+                None => inserted,
+            };
+            self.composer_paste_span = Some(span);
+            self.composer_pasted = true;
+        }
     }
 
     pub fn composer_cursor_index(&self) -> usize {
@@ -7938,12 +9172,68 @@ impl AppState {
     }
 
     pub fn insert_composer_char(&mut self, ch: char) {
+        // Typing edits the composer → it's no longer an unedited paste; show it
+        // inline (editable) rather than a collapsed `[paste]` block.
+        self.composer_pasted = false;
+        self.composer_paste_span = None;
         let cursor = self.composer_cursor_index();
         self.composer.insert(cursor, ch);
         self.composer_cursor = Some(cursor + ch.len_utf8());
     }
 
+    /// Atomic collapsed-paste delete (#380/#382/#383): when the composer is
+    /// presented as a collapsed `[paste]` chip, ANY delete removes the paste
+    /// as ONE unit — never expands it. With a recorded span only the pasted
+    /// bytes are drained, so typed text around the chip survives (#382);
+    /// without a valid span the whole draft clears (the #380 behavior).
+    /// Returns true when the delete was handled here.
+    fn take_collapsed_paste_block(&mut self) -> bool {
+        // A collapsed block (the `[paste] N lines · M chars` chip) is an ATOMIC
+        // unit: one Backspace/Delete removes the whole block, never one char.
+        // Gate on the Collapsed PRESENTATION, not `composer_pasted` — a paste
+        // whose terminal delivered it as keystrokes (no bracketed-paste event,
+        // so the flag was never set / was cleared by the typed chars) still
+        // renders the chip, and Backspace on it must delete the block, not chip
+        // away one char at a time. With a real recorded paste span we drain just
+        // that span (keeping surrounding text); otherwise we clear the draft.
+        if !matches!(
+            self.composer_presentation(),
+            ComposerPresentation::Collapsed(_)
+        ) {
+            return false;
+        }
+        match self
+            .composer_paste_span
+            .take()
+            .filter(|_| self.composer_pasted)
+        {
+            Some(span)
+                if span.start < span.end
+                    && span.end <= self.composer.len()
+                    && self.composer.is_char_boundary(span.start)
+                    && self.composer.is_char_boundary(span.end) =>
+            {
+                self.composer.drain(span.clone());
+                self.composer_pasted = false;
+                if self.composer.trim().is_empty() {
+                    // Nothing but the paste (± whitespace): behave like #380
+                    // and clear the draft entirely.
+                    self.clear_current_composer_draft();
+                } else {
+                    self.composer_cursor = Some(self.clamp_composer_cursor(span.start));
+                }
+            }
+            _ => self.clear_current_composer_draft(),
+        }
+        true
+    }
+
     pub fn delete_composer_prev_char(&mut self) {
+        if self.take_collapsed_paste_block() {
+            return;
+        }
+        self.composer_pasted = false;
+        self.composer_paste_span = None;
         let cursor = self.composer_cursor_index();
         let Some(prev) = prev_char_boundary(&self.composer, cursor) else {
             self.composer_cursor = Some(0);
@@ -7954,6 +9244,12 @@ impl AppState {
     }
 
     pub fn delete_composer_next_char(&mut self) {
+        // Same atomic-block rule as `delete_composer_prev_char`.
+        if self.take_collapsed_paste_block() {
+            return;
+        }
+        self.composer_pasted = false;
+        self.composer_paste_span = None;
         let cursor = self.composer_cursor_index();
         let Some(next) = next_char_boundary(&self.composer, cursor) else {
             self.composer_cursor = Some(self.composer.len());
@@ -8060,6 +9356,11 @@ impl AppState {
 
     /// Vim `dw`: delete from the cursor to the start of the next word.
     pub fn delete_composer_word_forward(&mut self) {
+        // #383: word/line deletes bypassed the collapsed-paste atomicity and
+        // silently edited text HIDDEN under the chip. Same rule as Backspace.
+        if self.take_collapsed_paste_block() {
+            return;
+        }
         let cursor = self.composer_cursor_index();
         let end = vim_word_forward_boundary(&self.composer, cursor);
         self.composer.drain(cursor..end);
@@ -8079,6 +9380,11 @@ impl AppState {
     /// Vim `dd`: delete the current logical line. Removes its trailing newline
     /// (or, on the last line, the preceding one) so lines don't pile up empty.
     pub fn delete_composer_line(&mut self) {
+        // #383: word/line deletes bypassed the collapsed-paste atomicity and
+        // silently edited text HIDDEN under the chip. Same rule as Backspace.
+        if self.take_collapsed_paste_block() {
+            return;
+        }
         let cursor = self.composer_cursor_index();
         let line_start = self.composer[..cursor]
             .rfind('\n')
@@ -8102,6 +9408,11 @@ impl AppState {
     /// Vim `cc` body: clear the current logical line's content, cursor at line
     /// start (the caller switches to Insert).
     pub fn clear_composer_line(&mut self) {
+        // #383: word/line deletes bypassed the collapsed-paste atomicity and
+        // silently edited text HIDDEN under the chip. Same rule as Backspace.
+        if self.take_collapsed_paste_block() {
+            return;
+        }
         let cursor = self.composer_cursor_index();
         let line_start = self.composer[..cursor]
             .rfind('\n')
@@ -8135,6 +9446,11 @@ impl AppState {
     }
 
     pub fn delete_composer_prev_word(&mut self) {
+        // #383: word/line deletes bypassed the collapsed-paste atomicity and
+        // silently edited text HIDDEN under the chip. Same rule as Backspace.
+        if self.take_collapsed_paste_block() {
+            return;
+        }
         let cursor = self.composer_cursor_index();
         let start = prev_word_boundary(&self.composer, cursor);
         self.composer.drain(start..cursor);
@@ -8142,6 +9458,11 @@ impl AppState {
     }
 
     pub fn delete_composer_next_word(&mut self) {
+        // #383: word/line deletes bypassed the collapsed-paste atomicity and
+        // silently edited text HIDDEN under the chip. Same rule as Backspace.
+        if self.take_collapsed_paste_block() {
+            return;
+        }
         let cursor = self.composer_cursor_index();
         let end = next_word_boundary(&self.composer, cursor);
         self.composer.drain(cursor..end);
@@ -8149,6 +9470,11 @@ impl AppState {
     }
 
     pub fn kill_composer_to_line_end(&mut self) {
+        // #383: word/line deletes bypassed the collapsed-paste atomicity and
+        // silently edited text HIDDEN under the chip. Same rule as Backspace.
+        if self.take_collapsed_paste_block() {
+            return;
+        }
         let cursor = self.composer_cursor_index();
         let end = self.composer[cursor..]
             .find('\n')
@@ -8159,7 +9485,7 @@ impl AppState {
     }
 
     pub fn composer_presentation(&self) -> ComposerPresentation {
-        composer_presentation_for_text(&self.composer)
+        composer_presentation_for_text(&self.composer, self.composer_pasted)
     }
 
     fn clamp_composer_cursor(&self, cursor: usize) -> usize {
@@ -8304,9 +9630,24 @@ fn next_word_boundary(text: &str, cursor: usize) -> usize {
     idx
 }
 
-fn composer_presentation_for_text(text: &str) -> ComposerPresentation {
-    const COLLAPSE_LINE_THRESHOLD: usize = 32;
-    const COLLAPSE_CHAR_THRESHOLD: usize = 4_000;
+/// A paste is worth boxing up into a `[paste]` block once it reaches these
+/// (aggressive) sizes — matched against the pasted text so a small paste inserts
+/// inline like typing. Applied ONLY to real pastes (see [`AppState::composer_pasted`]).
+const PASTE_COLLAPSE_LINE_THRESHOLD: usize = 4;
+const PASTE_COLLAPSE_CHAR_THRESHOLD: usize = 400;
+/// Content this large collapses even when NOT flagged as a paste — a safety net
+/// for a huge blob that arrived some other way (nobody types this much). Kept
+/// high so ordinary typed multi-line prose / long single-line prompts stay inline.
+const TYPED_COLLAPSE_LINE_THRESHOLD: usize = 32;
+const TYPED_COLLAPSE_CHAR_THRESHOLD: usize = 4_000;
+
+/// Whether a pasted string is large enough to collapse into a `[paste]` block.
+fn paste_should_collapse(text: &str) -> bool {
+    text.chars().count() >= PASTE_COLLAPSE_CHAR_THRESHOLD
+        || text.lines().count().max(1) >= PASTE_COLLAPSE_LINE_THRESHOLD
+}
+
+fn composer_presentation_for_text(text: &str, from_paste: bool) -> ComposerPresentation {
     const PREVIEW_CHARS: usize = 88;
 
     if text.is_empty() {
@@ -8315,17 +9656,23 @@ fn composer_presentation_for_text(text: &str) -> ComposerPresentation {
 
     let char_count = text.chars().count();
     let line_count = text.lines().count().max(1);
-    let should_collapse =
-        line_count >= COLLAPSE_LINE_THRESHOLD || char_count >= COLLAPSE_CHAR_THRESHOLD;
+    // Pastes collapse aggressively; anything else only when huge (typed input is
+    // never collapsed at the low paste thresholds).
+    let should_collapse = if from_paste {
+        paste_should_collapse(text)
+    } else {
+        line_count >= TYPED_COLLAPSE_LINE_THRESHOLD || char_count >= TYPED_COLLAPSE_CHAR_THRESHOLD
+    };
 
     if !should_collapse {
         return ComposerPresentation::Inline(text.to_string());
     }
 
-    let summary = if line_count >= COLLAPSE_LINE_THRESHOLD {
-        format!("Pasted block: {line_count} lines, {char_count} chars")
+    // Renders after the `[paste] ` prefix, e.g. "[paste] 18 lines · 1240 chars".
+    let summary = if line_count > 1 {
+        format!("{line_count} lines · {char_count} chars")
     } else {
-        format!("Long prompt: {char_count} chars")
+        format!("{char_count} chars")
     };
     let preview_source = text
         .lines()
@@ -8607,6 +9954,31 @@ fn is_plan_heading(line: &str) -> bool {
             | "checklist"
     )
 }
+
+/// How long a [`AppState::pre_token_turns`] marker stays authoritative. A
+/// submit whose turn/started never arrives within this window is treated as
+/// dead (mirrors the staged-gate TTL in `store.rs`).
+const PRE_TOKEN_TURN_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a [`AppState::pending_peer_kickoffs`] entry stays live (#395). A
+/// prepared peer whose `session/opened` never arrives within this window is a
+/// dead open — the stash is pruned so a much-later open of the same key can
+/// never fire a stale kickoff turn (mirrors [`PRE_TOKEN_TURN_TTL`]).
+/// Generous (2 min, not the prepare TTL): once pruned, a late `session/opened`
+/// for the peer key falls through to the NORMAL focused-open path — i.e. it
+/// steals focus — so a slow-but-alive open should be hard-pressed to outlive
+/// its kickoff (K3 review of #395).
+pub(crate) const PEER_KICKOFF_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long an in-flight [`AppState::pending_peer_prepare`] stash stays
+/// consumable (#395, K3 review). Bounds two hazards symmetrically: a SECOND
+/// `/peer` is refused while a fresh prepare is in flight (the stash is
+/// single-slot — letting the second dispatch overwrite it would cross-wire
+/// the first result's session with the second brief), and a STALE result
+/// landing past the window opens nothing (a lost-response prepare must not
+/// pop a session open + an unprompted turn minutes later). Short: a prepare
+/// is one RPC round-trip.
+pub(crate) const PEER_PREPARE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn initial_run_state(sessions: &[SessionView], selected_session: usize) -> SessionRunState {
     if sessions
@@ -9205,6 +10577,32 @@ mod tests {
     }
 
     #[test]
+    fn diff_view_mode_toggle_preserves_scroll_and_survives_reopen() {
+        let mut diff = DiffPreviewPaneState::default();
+        let preview_id = PreviewId::new();
+        diff.open_loading(preview_id.clone());
+        diff.scroll = 7;
+        diff.selected_file = 0;
+        diff.selected_hunk = 1;
+
+        assert!(!diff.side_by_side, "unified is the default view mode");
+        diff.toggle_view_mode();
+        assert!(diff.side_by_side);
+        assert_eq!(diff.scroll, 7, "toggle must preserve scroll position");
+        assert_eq!(diff.selected_hunk, 1, "toggle must preserve hunk selection");
+        diff.toggle_view_mode();
+        assert!(!diff.side_by_side, "toggle round-trips back to unified");
+        assert_eq!(diff.scroll, 7);
+        assert_eq!(diff.selected_hunk, 1);
+
+        // Re-requesting the preview (a fresh `d`) must not silently flip the
+        // view mode back to unified.
+        diff.toggle_view_mode();
+        diff.open_loading(preview_id);
+        assert!(diff.side_by_side, "view mode survives a preview reload");
+    }
+
+    #[test]
     fn runtime_policy_stamp_accepts_coding_contract_extensions() {
         let json = serde_json::json!({
             "tool_policy_id": "coding-v3",
@@ -9414,6 +10812,68 @@ mod tests {
         assert_eq!(state.composer, pasted_text);
         assert!(collapse.summary.contains("40 lines"));
         assert_eq!(collapse.preview, "first pasted line");
+    }
+
+    #[test]
+    fn small_paste_collapses_but_the_same_text_typed_stays_inline() {
+        let mut state = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // A 6-line block: well under the 32-line "typed" safety threshold, so it
+        // ONLY collapses because it arrived via paste.
+        let block = (1..=6)
+            .map(|i| format!("pasted code line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Pasted → compact [paste] block.
+        state.insert_pasted_text(&block);
+        assert!(state.composer_pasted, "a large paste sets the paste flag");
+        let ComposerPresentation::Collapsed(collapse) = state.composer_presentation() else {
+            panic!("a 6-line paste should collapse");
+        };
+        assert!(collapse.summary.contains("6 lines"));
+        assert_eq!(state.composer, block, "collapse never mutates the text");
+
+        // The SAME text typed (not pasted) must stay inline — no collapse.
+        state.clear_current_composer_draft();
+        for ch in block.chars() {
+            state.insert_composer_char(ch);
+        }
+        assert!(!state.composer_pasted, "typing never sets the paste flag");
+        assert!(
+            matches!(
+                state.composer_presentation(),
+                ComposerPresentation::Inline(_)
+            ),
+            "typed multi-line input must NOT collapse",
+        );
+
+        // Editing a collapsed paste re-opens it inline (so it stays editable).
+        state.insert_pasted_text(&block);
+        assert!(state.composer_pasted);
+        state.insert_composer_char('!');
+        assert!(!state.composer_pasted, "an edit clears the paste flag");
+        assert!(matches!(
+            state.composer_presentation(),
+            ComposerPresentation::Inline(_)
+        ));
+
+        // A tiny paste stays inline (nothing to box up).
+        state.clear_current_composer_draft();
+        state.insert_pasted_text("hi");
+        assert!(!state.composer_pasted, "a small paste does not collapse");
     }
 
     #[test]
@@ -9890,5 +11350,205 @@ mod tests {
         };
         let wire = serde_json::to_value(&params).expect("SessionListParams serializes");
         assert_eq!(wire, serde_json::json!({ "cwd": "/tmp/project" }));
+    }
+
+    /// Deleting a collapsed `[paste]` block removes the WHOLE block in one
+    /// action instead of expanding the full pasted text into the composer
+    /// first (which made a single backspace appear to just explode the block).
+    #[test]
+    fn backspace_on_collapsed_paste_deletes_the_whole_block() {
+        let mut state = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let block = (1..=20)
+            .map(|i| format!("pasted line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.insert_pasted_text(&block);
+        assert!(state.composer_pasted);
+        assert!(matches!(
+            state.composer_presentation(),
+            ComposerPresentation::Collapsed(_)
+        ));
+
+        state.delete_composer_prev_char();
+        assert!(
+            state.composer.is_empty(),
+            "backspace on a collapsed paste deletes the whole block, got: {:?}",
+            state.composer
+        );
+        assert!(matches!(
+            state.composer_presentation(),
+            ComposerPresentation::Empty
+        ));
+
+        // Forward-delete behaves the same.
+        state.insert_pasted_text(&block);
+        assert!(state.composer_pasted);
+        state.delete_composer_next_char();
+        assert!(
+            state.composer.is_empty(),
+            "forward-delete on a collapsed paste deletes the whole block, got: {:?}",
+            state.composer
+        );
+    }
+
+    fn paste_test_state() -> AppState {
+        AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        )
+    }
+
+    fn big_paste_block() -> String {
+        (1..=20)
+            .map(|i| format!("pasted line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// #382: the atomic delete drains ONLY the pasted span — typed text
+    /// around the chip survives (it used to be wiped with the block).
+    #[test]
+    fn atomic_paste_delete_spares_the_typed_prefix() {
+        let mut state = paste_test_state();
+        for ch in "look at this error: ".chars() {
+            state.insert_composer_char(ch);
+        }
+        state.insert_pasted_text(&big_paste_block());
+        assert!(state.composer_pasted);
+        assert!(matches!(
+            state.composer_presentation(),
+            ComposerPresentation::Collapsed(_)
+        ));
+
+        state.delete_composer_prev_char();
+        assert_eq!(
+            state.composer, "look at this error: ",
+            "the typed prefix must survive the atomic paste delete"
+        );
+        assert!(!state.composer_pasted);
+        assert_eq!(
+            state.composer_cursor_index(),
+            "look at this error: ".len(),
+            "cursor lands where the block was"
+        );
+    }
+
+    /// #383: word/line deletes obey the same atomic rule — they used to gnaw
+    /// text HIDDEN under the collapsed chip.
+    #[test]
+    fn word_and_line_deletes_are_atomic_on_collapsed_paste() {
+        // Ctrl+W (delete_composer_prev_word)
+        let mut state = paste_test_state();
+        for ch in "fix: ".chars() {
+            state.insert_composer_char(ch);
+        }
+        state.insert_pasted_text(&big_paste_block());
+        state.delete_composer_prev_word();
+        assert_eq!(
+            state.composer, "fix: ",
+            "Ctrl+W removes the block atomically"
+        );
+
+        // Ctrl+K (kill_composer_to_line_end) from inside the hidden text.
+        let mut state = paste_test_state();
+        state.insert_pasted_text(&big_paste_block());
+        state.composer_cursor = Some(4);
+        state.kill_composer_to_line_end();
+        assert!(
+            state.composer.is_empty(),
+            "Ctrl+K on a paste-only chip clears the block, got {:?}",
+            state.composer
+        );
+
+        // vim dd (delete_composer_line)
+        let mut state = paste_test_state();
+        state.insert_pasted_text(&big_paste_block());
+        state.delete_composer_line();
+        assert!(state.composer.is_empty(), "dd removes the whole block");
+    }
+
+    /// #382: consecutive large pastes union into ONE atomic block; a single
+    /// delete removes both while the typed prefix survives.
+    #[test]
+    fn consecutive_pastes_union_into_one_atomic_block() {
+        let mut state = paste_test_state();
+        for ch in "ctx: ".chars() {
+            state.insert_composer_char(ch);
+        }
+        state.insert_pasted_text(&big_paste_block());
+        state.insert_pasted_text(&big_paste_block());
+        assert!(state.composer_pasted);
+
+        state.delete_composer_prev_char();
+        assert_eq!(
+            state.composer, "ctx: ",
+            "one delete removes the unioned block, sparing the prefix"
+        );
+    }
+
+    /// #382 fallback: a collapsed paste WITHOUT a recorded span (legacy state)
+    /// falls back to the #380 whole-draft clear rather than exploding.
+    #[test]
+    fn collapsed_paste_without_span_falls_back_to_full_clear() {
+        let mut state = paste_test_state();
+        state.insert_pasted_text(&big_paste_block());
+        state.composer_paste_span = None;
+        state.delete_composer_prev_char();
+        assert!(state.composer.is_empty(), "no span -> #380 full clear");
+        assert!(!state.composer_pasted);
+    }
+
+    #[test]
+    fn backspace_on_a_typed_collapsed_block_clears_it_not_char_by_char() {
+        // A paste the terminal delivered as keystrokes (no bracketed-paste
+        // event) leaves `composer_pasted` FALSE, yet the text still collapses
+        // via the typed line/char threshold and renders the `[paste]` chip.
+        // Backspace on that chip must delete the WHOLE block — the user reported
+        // it chipping away one char at a time because the block-delete used to be
+        // gated on `composer_pasted`.
+        let mut state = paste_test_state();
+        state.composer = (0..40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.composer_pasted = false;
+        state.composer_paste_span = None;
+        state.composer_cursor = Some(state.composer.len());
+        assert!(
+            matches!(
+                state.composer_presentation(),
+                ComposerPresentation::Collapsed(_)
+            ),
+            "40 lines collapses via the typed threshold even without a paste flag"
+        );
+
+        state.delete_composer_prev_char();
+        assert!(
+            state.composer.is_empty(),
+            "one Backspace clears the whole collapsed block, not one char"
+        );
     }
 }

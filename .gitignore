@@ -11,3 +11,4 @@
 e2e/test-results*/
 .octos-workspace.toml
 octos-data/
+octos

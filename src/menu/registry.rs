@@ -52,6 +52,22 @@ pub const MENU_MODEL_REMOVE_CONFIRM: &str = "model-remove-confirm";
 pub const MENU_COMPACT_CONFIRM: &str = "compact-confirm";
 pub const MENU_CONTEXT: &str = "context";
 pub const MENU_MODEL: &str = "model";
+/// Named provider lanes (`sub_providers`) for the deep_research pipeline lane —
+/// the `/research` menu lists them and `/research add|rm` mutates them.
+pub const MENU_RESEARCH: &str = "research";
+/// Yes/No confirm for removing a staged research lane via
+/// `profile/sub_providers/remove`.
+pub const MENU_RESEARCH_REMOVE_CONFIRM: &str = "research-remove-confirm";
+/// Lane-key picker for the wizard's research-lane Save: deep_research requests
+/// lanes by the literal keys `cheap`/`strong` (`contract_for`), so the Save
+/// must land on one of those — a family-id key would never be routed to.
+pub const MENU_RESEARCH_LANE_KEY: &str = "research-lane-key";
+/// `/undo` snapshot picker (#1768).
+pub const MENU_UNDO: &str = "undo";
+/// #324: Ctrl+S/Alt+S session switcher popup (open sessions, live/unread badges).
+pub const MENU_SESSIONS: &str = "sessions";
+/// Yes/No confirm for restoring the staged snapshot via `snapshot/restore`.
+pub const MENU_UNDO_CONFIRM: &str = "undo-confirm";
 pub const MENU_COST: &str = "cost";
 /// `/resume` session picker menu.
 pub const MENU_RESUME: &str = "resume";
@@ -71,6 +87,10 @@ pub const MENU_PERMISSIONS: &str = "permissions";
 pub const MENU_MCP: &str = "mcp";
 pub const MENU_TOOL_SETTINGS: &str = "tool-settings";
 pub const MENU_SKILLS: &str = "skills";
+/// `@` composer file picker (#363): searchable path list over the workspace
+/// file tree; selecting inserts the relative path at the composer cursor.
+/// Opened by typing `@` at a word boundary in the composer — no slash command.
+pub const MENU_FILE_PICKER: &str = "file-picker";
 
 pub const APPUI_METHOD_MODEL_LIST: &str = crate::model::APPUI_METHOD_MODEL_LIST;
 pub const APPUI_METHOD_MODEL_SELECT: &str = crate::model::APPUI_METHOD_MODEL_SELECT;
@@ -635,6 +655,84 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             inline_args: InlineArgMode::None,
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_MODEL)),
         },
+        // `/research` — manage the named provider lanes (`sub_providers`) that
+        // back the isolated deep_research pipeline router. Bare opens the lanes
+        // menu; `add`/`rm` mutate a lane inline (Custom, like the autonomy
+        // verbs). Gated on the sub_providers list method so old servers hide it.
+        // `/undo` (#1768) — the workspace snapshot picker: roll agent file
+        // mutations back to a pre-mutation undo point. Gated on the snapshot
+        // list method so old servers hide it.
+        // #324: the session switcher popup (same surface as Ctrl+S/Alt+S).
+        CommandSpec {
+            name: "sessions",
+            aliases: &["ss"],
+            description: "command.sessions.desc",
+            category: CommandCategory::Session,
+            availability: CommandAvailability::always(),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::OpenMenu(MenuId::from(crate::menu::registry::MENU_SESSIONS)),
+        },
+        CommandSpec {
+            name: "undo",
+            aliases: &["snapshots"],
+            description: "command.undo.desc",
+            category: CommandCategory::Session,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_when_capabilities(&[
+                    crate::model::APPUI_METHOD_SNAPSHOT_LIST,
+                ]),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::LocalAction(LocalAction::Custom("undo")),
+        },
+        // `/peer` (#395, octos#1800 peer agents v1) — spin off a peer agent
+        // session seeded with a durable brief. Gated on `peer/prepare` (same
+        // treatment as `/undo` on `snapshot/list`) so old servers hide it;
+        // `app_ui_mutating` because `peer/prepare` mutates server state, so
+        // read-only mode hides the command too.
+        CommandSpec {
+            name: "peer",
+            aliases: &[],
+            description: "command.peer.desc",
+            category: CommandCategory::Session,
+            availability: CommandAvailability::app_ui_mutating(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_when_capabilities(&[
+                    crate::model::APPUI_METHOD_PEER_PREPARE,
+                ]),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::Custom("peer")),
+        },
+        // `/gather` (octos#1801 v2) — fan the peer blackboard (briefs +
+        // results) back into the current session as a synthesis prompt. Gated
+        // on `peer/gather` (same treatment as `/undo` on `snapshot/list`);
+        // `app_ui_read` because the RPC only READS the blackboard — the
+        // prompt turn it triggers afterwards is an ordinary submit, blocked
+        // in read-only mode by the transport like any other prompt.
+        CommandSpec {
+            name: "gather",
+            aliases: &[],
+            description: "command.gather.desc",
+            category: CommandCategory::Session,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_when_capabilities(&[crate::model::APPUI_METHOD_PEER_GATHER]),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::Custom("gather")),
+        },
+        CommandSpec {
+            name: "research",
+            aliases: &["lanes"],
+            description: "command.research.desc",
+            category: CommandCategory::Settings,
+            availability: CommandAvailability::app_ui_read(&[])
+                .with_session(SessionRequirement::Any)
+                .with_required_methods_when_capabilities(&[
+                    crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+                ]),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::Custom("research")),
+        },
         CommandSpec {
             name: "status",
             aliases: &[],
@@ -700,7 +798,9 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         },
         CommandSpec {
             name: "resume",
-            aliases: &["sessions"],
+            // #324: the "sessions" alias moved to the Ctrl+S/Alt+S open-session
+            // switcher popup; /resume keeps its primary name.
+            aliases: &[],
             description: "Switch to a prior session and reload its transcript.",
             category: CommandCategory::Session,
             // Gated on ALL of `APPUI_RESUME_MENU_METHODS_ALL` (`session/list` +
@@ -1004,10 +1104,12 @@ mod tests {
         let resume = registry.find("resume").expect("/resume is registered");
         assert_eq!(resume.name, "resume");
         assert!(resume.history_safe(), "/resume must be history-safe");
+        // #324: the "sessions" name now belongs to the Ctrl+S/Alt+S open-session
+        // switcher popup, not /resume.
         assert_eq!(
             registry.find("/sessions").map(|command| command.name),
-            Some("resume"),
-            "/sessions must alias /resume"
+            Some("sessions"),
+            "/sessions is the open-session switcher popup"
         );
 
         // `/resume` fetches the list via `session/list` AND loads the chosen
@@ -1124,6 +1226,111 @@ mod tests {
                 .into_iter()
                 .any(|command| command.name == "rewind"),
             "/rewind hides in read-only mode (mutating command)"
+        );
+    }
+
+    /// #395: `/peer` is gated on `peer/prepare` (hidden on old servers) and,
+    /// because the method mutates server state, hidden in read-only mode too.
+    #[test]
+    fn peer_command_gated_on_peer_prepare_and_hidden_in_readonly() {
+        let registry = CommandRegistry::with_core_commands();
+        assert_eq!(
+            registry.find("peer").map(|command| command.name),
+            Some("peer"),
+            "/peer is registered"
+        );
+
+        let base_caps = CapabilitySet::from_methods([methods::TURN_INTERRUPT]);
+        let peer_caps = CapabilitySet::from_methods([crate::model::APPUI_METHOD_PEER_PREPARE]);
+        let without = AvailabilityContext {
+            task: TaskActivity::Idle,
+            approval_modal_visible: false,
+            readonly: false,
+            runtime: RuntimeMode::Protocol,
+            connection: ConnectionState::Connected,
+            capabilities: Some(&base_caps),
+            feature_flags: &[],
+            session_open: true,
+        };
+        let lists_peer = |ctx: &AvailabilityContext<'_>| {
+            registry
+                .available_commands(ctx)
+                .into_iter()
+                .any(|command| command.name == "peer")
+        };
+        assert!(!lists_peer(&without), "/peer hides without peer/prepare");
+
+        let with = AvailabilityContext {
+            capabilities: Some(&peer_caps),
+            ..without
+        };
+        assert!(
+            lists_peer(&with),
+            "/peer appears once peer/prepare is advertised"
+        );
+
+        let readonly = AvailabilityContext {
+            readonly: true,
+            ..with
+        };
+        assert!(
+            !lists_peer(&readonly),
+            "/peer hides in read-only mode (peer/prepare mutates)"
+        );
+    }
+
+    /// octos#1801 v2: `/gather` is gated on `peer/gather` (hidden on old
+    /// servers) but — unlike `/peer` — stays VISIBLE in read-only mode: the
+    /// RPC only reads the blackboard (the transport blocks the follow-up
+    /// prompt submit there, like any prompt).
+    #[test]
+    fn gather_command_gated_on_peer_gather_and_visible_in_readonly() {
+        let registry = CommandRegistry::with_core_commands();
+        assert_eq!(
+            registry.find("gather").map(|command| command.name),
+            Some("gather"),
+            "/gather is registered"
+        );
+
+        let base_caps = CapabilitySet::from_methods([crate::model::APPUI_METHOD_PEER_PREPARE]);
+        let gather_caps = CapabilitySet::from_methods([crate::model::APPUI_METHOD_PEER_GATHER]);
+        let without = AvailabilityContext {
+            task: TaskActivity::Idle,
+            approval_modal_visible: false,
+            readonly: false,
+            runtime: RuntimeMode::Protocol,
+            connection: ConnectionState::Connected,
+            capabilities: Some(&base_caps),
+            feature_flags: &[],
+            session_open: true,
+        };
+        let lists_gather = |ctx: &AvailabilityContext<'_>| {
+            registry
+                .available_commands(ctx)
+                .into_iter()
+                .any(|command| command.name == "gather")
+        };
+        assert!(
+            !lists_gather(&without),
+            "/gather hides without peer/gather (peer/prepare alone is not enough)"
+        );
+
+        let with = AvailabilityContext {
+            capabilities: Some(&gather_caps),
+            ..without
+        };
+        assert!(
+            lists_gather(&with),
+            "/gather appears once peer/gather is advertised"
+        );
+
+        let readonly = AvailabilityContext {
+            readonly: true,
+            ..with
+        };
+        assert!(
+            lists_gather(&readonly),
+            "/gather stays available in read-only mode (a pure read)"
         );
     }
 
