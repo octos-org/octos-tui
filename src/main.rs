@@ -1,5 +1,5 @@
 use eyre::Result;
-use octos_tui::{cli::Cli, cmd, event_loop};
+use octos_tui::{backend_ensure, cli::Cli, cmd, event_loop};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -12,7 +12,14 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
-    let cli = Cli::parse()?;
+    let mut cli = Cli::parse()?;
+    // Provision the `octos` server backend if a local stdio launch needs it and
+    // it isn't installed — BEFORE the event loop claims the terminal, so the
+    // installer's output prints cleanly. May rewrite `cli.stdio_command` to an
+    // explicit `~/.octos/bin/octos` path when a fresh install isn't on PATH.
+    // No-op for WebSocket/mock launches, a user-managed octos path/command, or
+    // when a compatible backend is already present.
+    backend_ensure::ensure_octos_backend(&mut cli)?;
     event_loop::run(cli)
 }
 

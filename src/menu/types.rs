@@ -4,7 +4,7 @@ use crate::menu::availability::{AvailabilityContext, CommandAvailability};
 use crate::model::{
     AppUiCommand, OnboardingAction, OnboardingWizardState, ProfileLlmCatalogResult,
     ProfileLlmListResult, ProfileSkillsListResult, ProfileSkillsRegistrySearchResult,
-    SessionMcpCatalog, SessionModelCatalog, SessionRuntimeStatus,
+    SessionMcpCatalog, SessionModelCatalog, SessionRuntimeStatus, SubProvidersListResult,
 };
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -280,6 +280,13 @@ impl AppUiActionKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocalAction {
+    /// Switch the main pane to a sub-agent's live view (`Some(agent_id)`) or
+    /// back to the session transcript (`None`) — the `/agents` picker's row
+    /// action (#323).
+    SwitchChatView(Option<String>),
+    /// Toggle the Agent Dock between the summary pill and per-agent rows
+    /// (#323); same effect as Alt+D.
+    ToggleAgentDock,
     ShowProcessStatus,
     ActivityNavigator,
     StopActiveTurn,
@@ -291,6 +298,10 @@ pub enum LocalAction {
     SaveKeymap,
     RefreshMenu(MenuId),
     EditComposer(String),
+    /// Insert `text` into the composer AT THE CURSOR (unlike `EditComposer`,
+    /// which replaces the whole draft). The `@` file picker's row action
+    /// (#363): the picked relative path lands where the user typed `@`.
+    InsertComposerText(String),
     /// Codex Enter semantics for the slash popup: dispatch the highlighted
     /// command IMMEDIATELY (one Enter goes straight to the command's
     /// page/menu/action) instead of completing its name into the composer
@@ -365,6 +376,44 @@ pub enum LocalAction {
     /// current turn keeps working (no tools, ephemeral). The question is taken
     /// from the command's inline args.
     Btw,
+    /// `/profiles` — refresh the on-disk profile list + default pointer into
+    /// state and open the profiles surface (the picker, now a manager).
+    OpenProfilesSurface,
+    /// "Create a new profile" from the profiles surface: reset the create/wizard
+    /// state to a clean slate (so it doesn't resume the ACTIVE profile's setup
+    /// mid-session) and open onboarding at the "Name this profile" step.
+    CreateNewProfile,
+    /// Drill into the per-profile action menu for the given profile id.
+    SelectProfileForActions(String),
+    /// Set the given profile as the machine default (writes `default-profile`).
+    SetProfileDefault(String),
+    /// "Use this profile" from the profiles surface: switch the active session to
+    /// this profile by opening (or resuming) its session in the current folder.
+    SwitchToProfile(String),
+    /// Open the Yes/No delete confirm for the given profile id.
+    RequestDeleteProfile(String),
+    /// Confirmed: delete the given profile (descriptor + data dir) from disk.
+    ConfirmDeleteProfile(String),
+    /// Stage a configured model for removal and open its Yes/No confirm
+    /// (`/model` → "Remove a model…" picker row). The confirmed Yes row sends
+    /// `profile/llm/delete`.
+    RequestRemoveModel(Box<crate::model::ModelRemovalRequest>),
+    /// Stage a research provider lane for removal and open its Yes/No confirm
+    /// (`/research` menu → lane row). The captured `profile_id` + `key` are
+    /// carried to the confirm's Yes row, which sends
+    /// `profile/sub_providers/remove` — so a profile switch between select and
+    /// confirm cannot retarget the delete.
+    RequestRemoveResearchLane(Box<crate::model::ResearchLaneRemoval>),
+    /// Save the wizard's staged provider as the research lane with this key
+    /// (`MENU_RESEARCH_LANE_KEY` row: "cheap"/"strong"). Fires the
+    /// `profile/sub_providers/upsert` dispatch — the staged selection cannot
+    /// change while the picker is open (menus block composer + wizard edits),
+    /// so building the params at fire time reads exactly what the row showed.
+    SaveResearchLaneAs(String),
+    /// Stage a workspace-snapshot restore and open its Yes/No confirm
+    /// (`/undo` picker row, #1768). The captured session + snapshot id are
+    /// carried to the confirm's Yes row (`snapshot/restore`).
+    RequestRestoreSnapshot(Box<crate::model::SnapshotRestoreRequest>),
     Custom(&'static str),
 }
 
@@ -661,6 +710,9 @@ pub struct MenuAppSnapshot<'a> {
     pub model_catalog: Option<&'a SessionModelCatalog>,
     pub profile_llm_catalog: Option<&'a ProfileLlmCatalogResult>,
     pub profile_llm_state: Option<&'a ProfileLlmListResult>,
+    pub sub_providers_state: Option<&'a SubProvidersListResult>,
+    /// #1768: last snapshot list for the /undo picker.
+    pub snapshots_state: Option<&'a crate::model::SnapshotListResult>,
     pub profile_skills: Option<&'a ProfileSkillsListResult>,
     pub profile_skill_registry: Option<&'a ProfileSkillsRegistrySearchResult>,
     pub mcp_catalog: Option<&'a SessionMcpCatalog>,
@@ -680,6 +732,8 @@ pub struct MenuAppSnapshot<'a> {
     /// render one row per session. Empty until the first fetch lands (the menu
     /// renders `Loading` in that window).
     pub resume_sessions: &'a [crate::model::ResumeSessionRow],
+    /// #324: open-session chips for the Ctrl+S/Alt+S switcher popup.
+    pub session_chips: Vec<crate::model::SessionChipView>,
     /// Whether a `session/list` result has landed, mirrored from
     /// `AppState::resume_list_loaded`. Lets `resume_menu` tell a genuinely
     /// in-flight fetch (render `Loading`) apart from a completed fetch that
@@ -691,6 +745,26 @@ pub struct MenuAppSnapshot<'a> {
     /// Empty when the active session has no user messages (the menu renders
     /// `Unavailable` in that case).
     pub rewind_turns: &'a [crate::model::RewindTurnRow],
+    /// `(used_tokens, window_tokens)` for the selected session — the numbers
+    /// behind the harness `ctx N%` gauge — so the `/context` menu can render
+    /// the live `used / max (pct%)` context-window usage. `None` until a token
+    /// estimate is known for the session.
+    pub context_window_usage: Option<(u64, u64)>,
+    /// Active-session sub-agent roster for the `/agents` picker (#323),
+    /// mirrored from `AppState::active_session_agents`.
+    pub agents: &'a [octos_core::ui_protocol::UiAgentRecord],
+    /// Agent ids with unread terminal outcomes (Agent Dock badges, #323).
+    pub unseen_agent_ids: &'a [String],
+    /// The agent currently shown in the main pane, when peeking one —
+    /// lets the picker mark the active row.
+    pub chat_view_agent_id: Option<&'a str>,
+    /// Whether the Agent Dock is collapsed to its summary pill, so the
+    /// picker's toggle row can label itself expand vs collapse.
+    pub agent_dock_collapsed: bool,
+    /// Workspace file list scanned when the `@` composer file picker was
+    /// opened, mirrored from `AppState::file_picker` so `file_picker_menu`
+    /// can render one row per file. `None` when the picker is not open.
+    pub file_picker: Option<&'a crate::file_picker::FilePickerState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

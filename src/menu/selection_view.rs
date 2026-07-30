@@ -155,7 +155,7 @@ impl Widget for SelectionViewWidget<'_> {
             buf,
             self.palette,
             self.view.footer_hint.as_deref(),
-            "Enter accept | Esc cancel | Up/Down move",
+            &t!("menu.footer.select"),
         );
 
         if self.view.preview.is_some() && inner.width >= WIDE_PREVIEW_WIDTH {
@@ -212,7 +212,7 @@ fn render_selection_list(view: &SelectionView, area: Rect, buf: &mut Buffer, pal
             .or(view.search_placeholder.as_deref())
             .unwrap_or_default();
         header.push(Line::from(vec![
-            Span::styled("Search ", palette.title()),
+            Span::styled(t!("menu.search.label").to_string(), palette.title()),
             Span::styled(query.to_string(), palette.text()),
         ]));
     }
@@ -243,7 +243,7 @@ fn selection_rows(
     }
     if view.items.is_empty() {
         return vec![Line::from(Span::styled(
-            "No options available",
+            t!("menu.empty").to_string(),
             palette.muted(),
         ))];
     }
@@ -343,7 +343,7 @@ fn selection_row(
         text.push_str(description);
     }
     if item.default {
-        text.push_str(" default");
+        text.push_str(&t!("menu.item.default_suffix"));
     }
 
     let mut spans = vec![Span::styled(fit_text(&text, width), style)];

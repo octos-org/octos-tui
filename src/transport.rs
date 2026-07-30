@@ -25,8 +25,9 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
     UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
     UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
-    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
-    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    UI_PROTOCOL_V1,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde_json::Value;
@@ -55,8 +56,9 @@ use crate::{
         PermissionProfileClientEvent, ProfileLlmCatalogClientEvent, ProfileLlmListClientEvent,
         ProfileLlmMutationClientEvent, ProfileLocalCreateClientEvent, ProfileSkillsListClientEvent,
         ProfileSkillsMutationClientEvent, ProfileSkillsRegistrySearchClientEvent,
-        SessionBtwClientEvent, SessionStatusClientEvent, ToolConfigListClientEvent,
-        ToolConfigMutationClientEvent, ToolStatusClientEvent,
+        SessionBtwClientEvent, SessionStatusClientEvent, SubProvidersListClientEvent,
+        SubProvidersMutationClientEvent, ToolConfigListClientEvent, ToolConfigMutationClientEvent,
+        ToolStatusClientEvent,
     },
     model::{
         AppUiAuthToken, AppUiCommand, AuthLogoutResult, AuthMeResult, AuthSendCodeResult,
@@ -69,8 +71,9 @@ use crate::{
         ProfileSkillEntry, ProfileSkillRegistryPackage, ProfileSkillsListResult,
         ProfileSkillsMutationResult, ProfileSkillsRegistrySearchResult, ReviewStartResult,
         RuntimeHealthStatus, RuntimePolicyMcpServer, RuntimePolicyStamp, SessionStatusReadResult,
-        ToolConfigEntry, ToolConfigListResult, ToolConfigMutationResult, ToolPolicyDenial,
-        ToolStatus, ToolStatusListResult, ToolStatusSummary, auth_me_email, auth_me_profile_id,
+        SubProvidersListResult, SubProvidersMutationResult, ToolConfigEntry, ToolConfigListResult,
+        ToolConfigMutationResult, ToolPolicyDenial, ToolStatus, ToolStatusListResult,
+        ToolStatusSummary, auth_me_email, auth_me_profile_id,
     },
 };
 
@@ -198,6 +201,18 @@ fn clean_auth_token(token: String) -> Option<String> {
     (!token.is_empty()).then(|| token.to_owned())
 }
 
+/// Stable marker the `octos serve` backend prints to stderr when it refuses to
+/// start because another serve already owns the data directory (redb is
+/// single-writer-single-process). We spawn `octos serve --stdio` as a child; on
+/// its exit we grep the captured stderr for this token to recognize the conflict
+/// and STOP relaunching — instead of respawning it in a silent crash-loop. MUST
+/// match the server verbatim (octos `commands/serve.rs` DATA_DIR_LOCKED_MARKER).
+const DATA_DIR_LOCKED_MARKER: &str = "OCTOS_DATA_DIR_LOCKED";
+
+/// User-facing explanation shown (once, as an error) when [`DATA_DIR_LOCKED_MARKER`]
+/// is seen — and the code the store keys on to render it terminally.
+const DATA_DIR_LOCKED_CODE: &str = "data_dir_locked";
+
 pub struct ProtocolAppUiBackend {
     launch: AppUiLaunch,
     runtime: Option<Runtime>,
@@ -206,6 +221,11 @@ pub struct ProtocolAppUiBackend {
     connection_state: ProtocolConnectionState,
     reconnect: ReconnectBackoff,
     disconnected_status_reported: bool,
+    /// Latched when the spawned backend refuses to start because another serve
+    /// owns the data dir ([`DATA_DIR_LOCKED_MARKER`]). While set, reconnect is
+    /// suppressed so we don't respawn a backend that will only crash again —
+    /// the fix for the "two octos-tui competing for the DB" silent crash-loop.
+    fatal_error: Option<String>,
     /// The session to re-open after a reconnect: the MOST RECENTLY opened
     /// session, which tracks the user's current selection (set by `/resume`, a
     /// tab-switch, or the initial launch open) — NOT the fixed launch
@@ -825,6 +845,19 @@ impl StdioTransportDriver {
         let mut child = runtime
             .block_on(async {
                 let mut command = shell_command(&self.command);
+                // Multi-instance stdio: isolate this window's runtime (redb
+                // stores, sessions, goals, the serve flock) under a per-cwd
+                // instance dir so several octos-tui windows can run at once
+                // while sharing one profile registry. No-op for explicit
+                // --data-dir launches, remote launches, or when opted out via
+                // OCTOS_TUI_SHARED_INSTANCE. Re-spawns (reconnects) resolve to
+                // the same dir, so a reconnect re-attaches, not forks.
+                if let Some(instance_dir) = crate::profiles::instance_data_dir_for_launch(
+                    Some(&self.command),
+                    &std::env::current_dir().unwrap_or_default(),
+                ) {
+                    command.env("OCTOS_INSTANCE_DATA_DIR", &instance_dir);
+                }
                 command
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
@@ -1378,15 +1411,27 @@ fn bounded_send_error(
 }
 
 fn shell_command(command: &str) -> Command {
-    #[cfg(windows)]
-    {
+    // `cfg!(windows)` (runtime) rather than `#[cfg(windows)]` so BOTH branches
+    // type-check on every host — the Windows path can't be cross-compiled from
+    // macOS/Linux, so keeping it compiled everywhere is our only static check.
+    if cfg!(windows) {
         let mut process = Command::new("cmd");
         process.arg("/C").arg(command);
+        // Prepend the auto-installer's dir (`~\.octos\bin`) to the CHILD's PATH
+        // so a bare `octos` in `command` resolves to the exe `backend_ensure`
+        // dropped there — WITHOUT embedding a path in the command string, which
+        // `cmd /C` + Rust arg-quoting mangle (that was the exit-1 launch bug).
+        // Setting the child's env is not `unsafe` and never touches our own PATH.
+        if let Some(bin) = crate::backend_ensure::install_bin_dir() {
+            let mut path = bin.into_os_string();
+            if let Some(existing) = std::env::var_os("PATH") {
+                path.push(";"); // Windows PATH separator (this branch is Windows-only at runtime)
+                path.push(existing);
+            }
+            process.env("PATH", path);
+        }
         process
-    }
-
-    #[cfg(not(windows))]
-    {
+    } else {
         let mut process = Command::new("sh");
         process.arg("-c").arg(command);
         process
@@ -1410,6 +1455,7 @@ impl ProtocolAppUiBackend {
             connection_state: ProtocolConnectionState::Disconnected,
             reconnect: ReconnectBackoff::default(),
             disconnected_status_reported: false,
+            fatal_error: None,
             reopen_session: None,
             refresh_capabilities_on_reconnect: false,
             queue: VecDeque::new(),
@@ -1450,6 +1496,7 @@ impl ProtocolAppUiBackend {
             let _ = tx.send(LocalShellResultEvent {
                 local_id,
                 cmdline: cmd,
+                cwd: cwd.as_ref().map(|path| path.display().to_string()),
                 stdout: String::new(),
                 stderr: runtime_unavailable(self.runtime_error.as_deref()).to_string(),
                 exit_code: None,
@@ -1485,6 +1532,14 @@ impl ProtocolAppUiBackend {
             .is_some_and(ProtocolTransportDriver::is_connected)
         {
             return Ok(());
+        }
+
+        // Fatal, non-retryable: the backend refused to start because another
+        // serve owns the data dir. Never respawn — that was the crash-loop. The
+        // user-facing error was already emitted once in `mark_disconnected`; keep
+        // this return quiet (like the backoff gate below).
+        if let Some(reason) = &self.fatal_error {
+            return Err(eyre!("{reason}"));
         }
 
         // Backoff gate: `ensure_connected` runs on every event-loop tick and
@@ -1565,6 +1620,32 @@ impl ProtocolAppUiBackend {
 
     fn mark_disconnected(&mut self, message: impl Into<String>) {
         let message = message.into();
+
+        // The backend refused to start because another octos serve already owns
+        // this data directory (redb single-writer). Respawning it would only
+        // crash again — the silent ~5s loop the user hit with two octos-tui
+        // windows. Latch a fatal state (suppresses reconnect in
+        // `ensure_connected`) and surface one clear, terminal error INSTEAD OF
+        // the raw stderr status (suppressed below). Latch once so a
+        // backoff-driven repeat is quiet.
+        let is_fatal_conflict = message.contains(DATA_DIR_LOCKED_MARKER);
+        if is_fatal_conflict && self.fatal_error.is_none() {
+            let explanation =
+                "Another octos-tui is already running and using this data directory, so this \
+                 window can't start its own backend (the database allows only one at a time). \
+                 Close the other octos-tui window (or any `octos serve`), then restart this one. \
+                 To run two at once, start this one in a workspace with its own data directory."
+                    .to_string();
+            self.fatal_error = Some(explanation.clone());
+            self.queue.push_back(
+                AppUiEvent::Error(AppUiError {
+                    code: DATA_DIR_LOCKED_CODE.to_string(),
+                    message: explanation,
+                })
+                .into(),
+            );
+        }
+
         if let Some(driver) = self.driver.as_mut() {
             driver.disconnect();
         }
@@ -1580,8 +1661,13 @@ impl ProtocolAppUiBackend {
         self.connection_state = ProtocolConnectionState::Disconnected;
 
         if should_report {
-            self.queue
-                .push_back(AppUiEvent::Status(AppUiStatus { message }).into());
+            // Suppress the raw stderr-tail status for the fatal-conflict case:
+            // the clean, actionable error above is what the user should read, and
+            // a following Status would overwrite it in the status line.
+            if !is_fatal_conflict {
+                self.queue
+                    .push_back(AppUiEvent::Status(AppUiStatus { message }).into());
+            }
             self.disconnected_status_reported = true;
         }
         self.queue
@@ -1595,9 +1681,9 @@ impl ProtocolAppUiBackend {
             AppUiCommand::OpenSession(SessionOpenParams {
                 session_id,
                 topic: None,
+                sandbox: None,
                 profile_id: self.launch.profile_id.clone(),
                 cwd: self.launch.cwd.clone(),
-                sandbox: None,
                 after: None,
             })
         })
@@ -1674,7 +1760,36 @@ impl ProtocolAppUiBackend {
         &mut self,
         command: AppUiCommand,
     ) -> Result<RpcRequest<serde_json::Value>> {
+        let command = self.fill_session_list_cwd(command);
         self.protocol.build_tracked_request(command)
+    }
+
+    /// Stamp the launch workspace cwd onto an outgoing `session/list` request
+    /// so a server with per-project session storage (`appui.sessions_in_cwd`)
+    /// lists THIS project's sessions rather than the global/per-profile store.
+    ///
+    /// Reuses the exact same `self.launch.cwd` the client already sends on
+    /// `session/open` (see [`Self::launch_session_open_command`] and
+    /// `bootstrap`), so `/resume` and the `/sessions` picker scope to the
+    /// current project. Only fills when the caller left `cwd` unset — the
+    /// store always constructs `SessionListParams { cwd: None }`, and an
+    /// explicit cwd (e.g. a test) is preserved.
+    ///
+    /// Backward compatible with old servers: when `launch.cwd` is `None` the
+    /// params still serialize to the historical empty object `{}`, and a
+    /// server without the `appui.sessions_in_cwd` flag (or one that never
+    /// negotiated `session.workspace_cwd.v1`) simply ignores the field. This
+    /// mirrors how `session/open` already sends `cwd` unconditionally from
+    /// this layer — the transport does not track the negotiated capability
+    /// set (the store does), and sending an ignored `cwd` is harmless.
+    fn fill_session_list_cwd(&self, command: AppUiCommand) -> AppUiCommand {
+        let AppUiCommand::ListSessions(mut params) = command else {
+            return command;
+        };
+        if params.cwd.is_none() {
+            params.cwd = self.launch.cwd.clone();
+        }
+        AppUiCommand::ListSessions(params)
     }
 
     fn decode_rpc_text(&mut self, text: &str) -> Result<Option<ClientEvent>> {
@@ -1700,6 +1815,7 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ReadTaskArtifact(_)
                 | AppUiCommand::HydrateSession(_)
                 | AppUiCommand::ListSessions(_)
+                | AppUiCommand::LaunchResolve(_)
                 | AppUiCommand::ListTasks(_)
                 | AppUiCommand::GetThreadGraph(_)
                 | AppUiCommand::GetTurnState(_)
@@ -1708,6 +1824,11 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ProfileLlmCatalog(_)
                 | AppUiCommand::ProfileLlmList(_)
                 | AppUiCommand::ProfileLlmFetchModels(_)
+                | AppUiCommand::ProfileSubProvidersList(_)
+                | AppUiCommand::SnapshotList(_)
+                // octos#1801 v2: `peer/gather` only reads brief/result files
+                // off the peer blackboard — readonly viewers may gather.
+                | AppUiCommand::PeerGather(_)
                 | AppUiCommand::ProfileSkillsList(_)
                 | AppUiCommand::ProfileSkillsRegistrySearch(_)
                 // M15-E read-only autonomy inspection. Reconnect
@@ -1908,6 +2029,11 @@ impl ProtocolAppUiBackend {
             | AppUiCommand::ProfileLocalCreate(_)
             | AppUiCommand::ProfileLlmUpsert(_)
             | AppUiCommand::ProfileLlmDelete(_)
+            | AppUiCommand::SnapshotRestore(_)
+            | AppUiCommand::PeerPrepare(_)
+            | AppUiCommand::TurnSteer(_)
+            | AppUiCommand::ProfileSubProvidersUpsert(_)
+            | AppUiCommand::ProfileSubProvidersRemove(_)
             | AppUiCommand::ProfileLlmSelect(_)
             | AppUiCommand::ProfileLlmTest(_)
             | AppUiCommand::ProfileSkillsInstall(_)
@@ -1937,7 +2063,9 @@ impl ProtocolAppUiBackend {
             | AppUiCommand::DeleteLoop(_)
             | AppUiCommand::PauseLoop(_)
             | AppUiCommand::ResumeLoop(_)
-            | AppUiCommand::FireLoopNow(_) => {
+            | AppUiCommand::FireLoopNow(_)
+            | AppUiCommand::CompactContext(_)
+            | AppUiCommand::SetCompactionMode(_) => {
                 self.queue.push_back(
                     AppUiEvent::Error(AppUiError {
                         code: "readonly".into(),
@@ -1992,9 +2120,9 @@ impl AppUiBackend for ProtocolAppUiBackend {
                 octos_core::ui_protocol::SessionOpenParams {
                     session_id,
                     topic: None,
+                    sandbox: None,
                     profile_id: self.launch.profile_id.clone(),
                     cwd: self.launch.cwd.clone(),
-                    sandbox: None,
                     after: None,
                 },
             ))?;
@@ -2172,6 +2300,17 @@ async fn run_local_shell_command(
     local_id: String,
 ) -> LocalShellResultEvent {
     let started = std::time::Instant::now();
+    // Display form of the directory the command runs in, for the transcript
+    // card's cwd label. An explicit `cwd` wins; otherwise the child inherits
+    // this process's working directory, so resolve that for the label.
+    let cwd_display = cwd
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.display().to_string())
+        });
     let (program, args) = local_shell_command_args(&cmd);
 
     let mut builder = Command::new(program);
@@ -2195,6 +2334,7 @@ async fn run_local_shell_command(
             return LocalShellResultEvent {
                 local_id,
                 cmdline: cmd,
+                cwd: cwd_display,
                 stdout: String::new(),
                 stderr: format!("failed to spawn local shell command: {err}"),
                 exit_code: None,
@@ -2242,6 +2382,7 @@ async fn run_local_shell_command(
             return LocalShellResultEvent {
                 local_id,
                 cmdline: cmd,
+                cwd: cwd_display,
                 stdout: String::new(),
                 stderr: format!("local shell command failed: {err}"),
                 exit_code: None,
@@ -2297,6 +2438,7 @@ async fn run_local_shell_command(
     LocalShellResultEvent {
         local_id,
         cmdline: cmd,
+        cwd: cwd_display,
         stdout,
         stderr,
         exit_code,
@@ -2361,7 +2503,7 @@ fn appui_feature_header_for(old_server: bool) -> String {
         );
     }
     format!(
-        "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1}, {UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1}, {UI_PROTOCOL_FEATURE_USER_QUESTION_V1}, {UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1}, {UI_PROTOCOL_FEATURE_PLAN_TODOS_V1}"
+        "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1}, {UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1}, {UI_PROTOCOL_FEATURE_USER_QUESTION_V1}, {UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1}, {UI_PROTOCOL_FEATURE_PLAN_TODOS_V1}, {UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2}"
     )
 }
 
@@ -2452,6 +2594,15 @@ fn protocol_transport_description(endpoint: &str) -> &'static str {
 
 fn tui_capabilities() -> UiProtocolCapabilities {
     let mut capabilities = UiProtocolCapabilities::first_server_slice();
+    if !capabilities
+        .supported_features
+        .iter()
+        .any(|feature| feature == UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
+    {
+        capabilities
+            .supported_features
+            .push(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2.into());
+    }
     for method in [
         crate::model::APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
         crate::model::APPUI_METHOD_SESSION_STATUS_READ,
@@ -2507,6 +2658,8 @@ fn rpc_request_from_command(
         AppUiCommand::ListConfigCapabilities(params) => serde_json::to_value(params),
         AppUiCommand::ReadSessionStatus(params) => serde_json::to_value(params),
         AppUiCommand::SessionBtw(params) => serde_json::to_value(params),
+        AppUiCommand::CompactContext(params) => serde_json::to_value(params),
+        AppUiCommand::SetCompactionMode(params) => serde_json::to_value(params),
         AppUiCommand::SubmitPrompt(params) => serde_json::to_value(params),
         AppUiCommand::InterruptTurn(params) => serde_json::to_value(params),
         AppUiCommand::ListModels(params) => serde_json::to_value(params),
@@ -2546,10 +2699,19 @@ fn rpc_request_from_command(
         AppUiCommand::AuthMe(params) => serde_json::to_value(params),
         AppUiCommand::AuthLogout(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLocalCreate(params) => serde_json::to_value(params),
+        AppUiCommand::LaunchResolve(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmCatalog(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmList(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmUpsert(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmDelete(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileSubProvidersList(params) => serde_json::to_value(params),
+        AppUiCommand::SnapshotList(params) => serde_json::to_value(params),
+        AppUiCommand::SnapshotRestore(params) => serde_json::to_value(params),
+        AppUiCommand::PeerPrepare(params) => serde_json::to_value(params),
+        AppUiCommand::TurnSteer(params) => serde_json::to_value(params),
+        AppUiCommand::PeerGather(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileSubProvidersUpsert(params) => serde_json::to_value(params),
+        AppUiCommand::ProfileSubProvidersRemove(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmSelect(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmTest(params) => serde_json::to_value(params),
         AppUiCommand::ProfileLlmFetchModels(params) => serde_json::to_value(params),
@@ -2672,6 +2834,17 @@ fn rpc_value_to_app_event(
         let params = frame.get("params").cloned().unwrap_or(Value::Null);
         if method == "server/heartbeat" {
             return Ok(None);
+        }
+        // octos#1801 v3: `peer/staged` is decoded tui-locally BEFORE the
+        // vendored `UiNotification::from_method_and_params` — the pinned
+        // octos-core rev predates the variant, so routing it through the
+        // vendored decoder would degrade it to an `unknown_notification`
+        // error event.
+        if method == crate::model::APPUI_METHOD_PEER_STAGED {
+            return Ok(Some(peer_staged_notification_to_client_event(params)));
+        }
+        if method == crate::model::APPUI_METHOD_PEER_CLOSED {
+            return Ok(Some(peer_closed_notification_to_client_event(params)));
         }
         return Ok(Some(notification_to_app_event(method, params).into()));
     }
@@ -2938,6 +3111,21 @@ fn success_response_to_app_event(
                 )),
             }
         }
+        crate::model::APPUI_METHOD_LAUNCH_RESOLVE => {
+            match serde_json::from_value::<crate::model::LaunchResolveResult>(result) {
+                Ok(result) => Ok(Some(ClientEvent::LaunchResolve(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_LAUNCH_RESOLVE
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
         crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG => {
             match serde_json::from_value::<ProfileLlmCatalogResult>(result) {
                 Ok(result) => Ok(Some(profile_llm_catalog_event(result))),
@@ -2962,6 +3150,94 @@ fn success_response_to_app_event(
                         "invalid_result",
                         format!(
                             "failed to decode UI protocol result for profile/llm mutation: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_SNAPSHOT_LIST | crate::model::APPUI_METHOD_SNAPSHOT_RESTORE => {
+            match serde_json::from_value::<crate::model::SnapshotListResult>(result) {
+                Ok(result) => Ok(Some(snapshot_list_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for snapshot list/restore: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PEER_PREPARE => {
+            match serde_json::from_value::<crate::model::PeerPrepareResult>(result) {
+                Ok(result) => Ok(Some(peer_prepare_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_PEER_PREPARE
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PEER_GATHER => {
+            match serde_json::from_value::<crate::model::PeerGatherResult>(result) {
+                Ok(result) => Ok(Some(peer_gather_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_PEER_GATHER
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_TURN_STEER => {
+            match serde_json::from_value::<crate::model::TurnSteerResult>(result) {
+                Ok(result) => Ok(Some(turn_steered_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for {}: {err}",
+                            crate::model::APPUI_METHOD_TURN_STEER
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST => {
+            match serde_json::from_value::<SubProvidersListResult>(result) {
+                Ok(result) => Ok(Some(sub_providers_list_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for profile/sub_providers/list: {err}"
+                        ),
+                    )
+                    .into(),
+                )),
+            }
+        }
+        crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT
+        | crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE => {
+            match serde_json::from_value::<SubProvidersMutationResult>(result) {
+                Ok(result) => Ok(Some(sub_providers_mutation_event(result))),
+                Err(err) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!(
+                            "failed to decode UI protocol result for profile/sub_providers mutation: {err}"
                         ),
                     )
                     .into(),
@@ -3506,6 +3782,77 @@ fn profile_llm_mutation_event(result: ProfileLlmMutationResult) -> ClientEvent {
     ClientEvent::ProfileLlmMutation(ProfileLlmMutationClientEvent { message, result })
 }
 
+fn snapshot_list_event(result: crate::model::SnapshotListResult) -> ClientEvent {
+    let count = result.snapshots.len();
+    let message = if let Some(restored) = result.restored.as_deref() {
+        format!(
+            "Workspace restored to snapshot {}",
+            &restored[..restored.len().min(8)]
+        )
+    } else if !result.available {
+        "Snapshots unavailable for this session".into()
+    } else {
+        match count {
+            0 => "No snapshots yet".into(),
+            1 => "1 snapshot".into(),
+            _ => format!("{count} snapshots"),
+        }
+    };
+    ClientEvent::SnapshotList(crate::client_event::SnapshotListClientEvent { message, result })
+}
+
+fn peer_prepare_event(result: crate::model::PeerPrepareResult) -> ClientEvent {
+    let message = format!("Peer session prepared: {}", result.slug);
+    ClientEvent::PeerPrepared(crate::client_event::PeerPreparedClientEvent { message, result })
+}
+
+/// octos#1807: decode a `turn/steer` result into the typed
+/// [`ClientEvent::TurnSteered`]. The store owns the user-facing status line;
+/// this message is diagnostic.
+fn turn_steered_event(result: crate::model::TurnSteerResult) -> ClientEvent {
+    let message = if result.steered {
+        format!("Steered into active turn {}", result.turn_id.0)
+    } else {
+        format!("No active turn; started turn {}", result.turn_id.0)
+    };
+    ClientEvent::TurnSteered(crate::client_event::TurnSteeredClientEvent { message, result })
+}
+
+fn peer_gather_event(result: crate::model::PeerGatherResult) -> ClientEvent {
+    let with_results = result
+        .peers
+        .iter()
+        .filter(|peer| peer.result.is_some())
+        .count();
+    let message = match result.peers.len() {
+        0 => "No peers staged on the blackboard".into(),
+        total => format!("Gathered {with_results}/{total} peer result(s)"),
+    };
+    ClientEvent::PeerGathered(crate::client_event::PeerGatheredClientEvent { message, result })
+}
+
+fn sub_providers_list_event(result: SubProvidersListResult) -> ClientEvent {
+    let count = result.sub_providers.len();
+    ClientEvent::SubProvidersList(SubProvidersListClientEvent {
+        message: match count {
+            0 => "Research lanes refreshed: none configured".into(),
+            1 => "Research lanes refreshed: 1 lane".into(),
+            _ => format!("Research lanes refreshed: {count} lanes"),
+        },
+        result,
+    })
+}
+
+fn sub_providers_mutation_event(result: SubProvidersMutationResult) -> ClientEvent {
+    let count = result.sub_providers.len();
+    let message = if result.applied {
+        format!("Research lanes updated: {count} configured — restart to apply")
+    } else {
+        "Research lane unchanged".into()
+    };
+    ClientEvent::SubProvidersMutation(SubProvidersMutationClientEvent { message, result })
+}
+
 fn profile_skills_list_event(result: ProfileSkillsListResult) -> ClientEvent {
     let count = result.skills.len();
     ClientEvent::ProfileSkillsList(ProfileSkillsListClientEvent {
@@ -3599,13 +3946,19 @@ fn auth_logout_event(result: AuthLogoutResult) -> ClientEvent {
 
 fn profile_local_create_event(result: ProfileLocalCreateResult) -> ClientEvent {
     let action = if result.created { "created" } else { "loaded" };
-    ClientEvent::ProfileLocalCreate(ProfileLocalCreateClientEvent {
-        message: format!(
+    // Surface the server-assigned final id (it may be collision-suffixed, e.g.
+    // `glm-2`). The email suffix is only shown when present — the nameable
+    // (requested_id) flow sends no email, so the message reads cleanly as
+    // "Local solo profile created: glm-2" instead of a dangling "( )".
+    let message = if result.email.trim().is_empty() {
+        format!("Local solo profile {action}: {}", result.profile_id)
+    } else {
+        format!(
             "Local solo profile {action}: {} ({})",
             result.profile_id, result.email
-        ),
-        result,
-    })
+        )
+    };
+    ClientEvent::ProfileLocalCreate(ProfileLocalCreateClientEvent { message, result })
 }
 
 fn auth_status_message(result: &AuthStatusResult) -> String {
@@ -3871,6 +4224,45 @@ fn response_id(
             "malformed_frame",
             "UI protocol response id must be a string, integer, or null",
         ))),
+    }
+}
+
+/// octos#1801 v3: decodes the durable `peer/staged` notification into the
+/// typed [`ClientEvent::PeerStaged`] via the tui-local
+/// [`crate::model::PeerStagedParams`] mirror (the vendored octos-core rev has
+/// no `UiNotification` variant for it yet). Malformed params surface as the
+/// standard `invalid_params` error event rather than wedging the stream.
+fn peer_staged_notification_to_client_event(params: Value) -> ClientEvent {
+    match serde_json::from_value::<crate::model::PeerStagedParams>(params) {
+        Ok(staged) => ClientEvent::PeerStaged(staged),
+        Err(err) => app_error(
+            "invalid_params",
+            format!(
+                "failed to decode UI protocol params for {}: {err}",
+                crate::model::APPUI_METHOD_PEER_STAGED
+            ),
+        )
+        .into(),
+    }
+}
+
+/// octos#1801 v3: decodes the durable `peer/closed` notification into the
+/// typed [`ClientEvent::PeerClosed`] via the tui-local
+/// [`crate::model::PeerClosedParams`] mirror (the vendored octos-core rev has
+/// no `UiNotification` variant for it yet). Mirror of
+/// [`peer_staged_notification_to_client_event`]: malformed params surface as
+/// the standard `invalid_params` error event rather than wedging the stream.
+fn peer_closed_notification_to_client_event(params: Value) -> ClientEvent {
+    match serde_json::from_value::<crate::model::PeerClosedParams>(params) {
+        Ok(closed) => ClientEvent::PeerClosed(closed),
+        Err(err) => app_error(
+            "invalid_params",
+            format!(
+                "failed to decode UI protocol params for {}: {err}",
+                crate::model::APPUI_METHOD_PEER_CLOSED
+            ),
+        )
+        .into(),
     }
 }
 
@@ -5349,10 +5741,14 @@ mod tests {
         assert!(modern.contains(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1));
         assert!(modern.contains(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1));
         assert!(modern.contains(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(modern.contains(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2));
         // Modern advertises the plan/todo checklist so the server streams
         // `plan/updated`; old-server mode drops it.
         assert!(modern.contains(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1));
         assert!(!appui_feature_header_for(true).contains(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1));
+        assert!(
+            !appui_feature_header_for(true).contains(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
+        );
 
         // Old-server mode drops autonomy/agent-control/goal/loop/task-control
         // so the backend behaves as a pre-autonomy server and the TUI hides
@@ -5366,6 +5762,14 @@ mod tests {
         // Baseline features remain so the session still works.
         assert!(legacy.contains(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1));
         assert!(legacy.contains(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
+    }
+
+    #[test]
+    fn tui_capabilities_advertise_projection_envelope_v2() {
+        assert!(
+            tui_capabilities().supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
+            "the TUI capability response must opt into canonical v2 envelopes"
+        );
     }
 
     fn unwrap_app_event(event: ClientEvent) -> AppUiEvent {
@@ -5424,6 +5828,27 @@ mod tests {
         assert_eq!(event.exit_code, Some(0));
         assert!(event.stdout.contains("hi"));
         assert!(!event.truncated);
+        // With no explicit cwd the child inherits the process cwd — the event
+        // labels that so the transcript card can show WHERE the command ran.
+        assert_eq!(
+            event.cwd,
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.display().to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn run_local_shell_labels_explicit_cwd() {
+        let dir = std::env::temp_dir();
+        let event =
+            run_local_shell_command("echo hi".into(), Some(dir.clone()), "local-shell:t2".into())
+                .await;
+        assert_eq!(event.exit_code, Some(0));
+        assert_eq!(
+            event.cwd.as_deref(),
+            Some(dir.display().to_string().as_str())
+        );
     }
 
     struct ProtocolCaptureServer {
@@ -6142,9 +6567,11 @@ mod tests {
         let local_profile = rpc_request_from_command(
             "tui-11b".into(),
             AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
+                requested_id: None,
                 name: "Ada Lovelace".into(),
                 username: "ada".into(),
                 email: "ada@example.com".into(),
+                make_default: None,
             }),
         )
         .expect("local profile request encodes");
@@ -6507,6 +6934,453 @@ mod tests {
         assert_eq!(event.result.skills[0].status.as_deref(), Some("installed"));
     }
 
+    /// #395: `peer/prepare` requests encode brief/worktree/cwd/session_id and
+    /// omit the unused optionals; results decode into the typed
+    /// `ClientEvent::PeerPrepared` carrying the tui-local result struct.
+    #[test]
+    fn peer_prepare_request_encodes_and_result_decodes_to_client_event() {
+        let request = rpc_request_from_command(
+            "peer-1".into(),
+            AppUiCommand::PeerPrepare(crate::model::PeerPrepareParams {
+                brief: "fix the nav flicker".into(),
+                n: None,
+                title: None,
+                worktree: true,
+                cwd: Some("/repo".into()),
+                session_id: Some(SessionKey("coding:local:tui#coding".into())),
+                profile_id: None,
+            }),
+        )
+        .expect("peer/prepare request encodes");
+        assert_eq!(request.method, crate::model::APPUI_METHOD_PEER_PREPARE);
+        assert_eq!(request.params["brief"], "fix the nav flicker");
+        assert_eq!(request.params["worktree"], true);
+        assert_eq!(request.params["cwd"], "/repo");
+        assert_eq!(request.params["session_id"], "coding:local:tui#coding");
+        assert!(
+            request.params.get("profile_id").is_none(),
+            "profile_id: None must be omitted from the wire shape"
+        );
+        assert!(
+            request.params.get("title").is_none(),
+            "title: None must be omitted from the wire shape"
+        );
+
+        let mut pending = HashMap::new();
+        pending.insert(
+            "peer-1".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_PEER_PREPARE.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "peer-1",
+            "result": {
+                "slug": "fix-nav-flicker",
+                "topic": "peer-fix-nav-flicker",
+                "brief_path": "/repo/.octos/peers/fix-nav-flicker/BRIEF.md",
+                "cwd": "/repo",
+                "worktree_branch": "peer/fix-nav-flicker",
+                "profile_id": "coding"
+            }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::PeerPrepared(event) = event else {
+            panic!("expected peer prepared event, got {event:?}");
+        };
+        assert_eq!(event.result.slug, "fix-nav-flicker");
+        assert_eq!(event.result.topic, "peer-fix-nav-flicker");
+        assert_eq!(
+            event.result.brief_path,
+            "/repo/.octos/peers/fix-nav-flicker/BRIEF.md"
+        );
+        assert_eq!(event.result.cwd, "/repo");
+        assert_eq!(
+            event.result.worktree_branch.as_deref(),
+            Some("peer/fix-nav-flicker")
+        );
+        assert_eq!(event.result.profile_id, "coding");
+        assert!(event.message.contains("fix-nav-flicker"));
+        assert!(
+            event.result.peers.is_empty(),
+            "a v1 scalar-only result decodes with the serde-default empty fleet"
+        );
+    }
+
+    /// octos#1801 v2: `peer/prepare` fleet requests encode `n` (omitted when
+    /// absent), and fleet results decode the `peers` array alongside the
+    /// scalar head.
+    #[test]
+    fn peer_prepare_fleet_n_encodes_and_peers_decode() {
+        let request = rpc_request_from_command(
+            "peer-2".into(),
+            AppUiCommand::PeerPrepare(crate::model::PeerPrepareParams {
+                brief: "fix the nav".into(),
+                n: Some(3),
+                title: None,
+                worktree: false,
+                cwd: None,
+                session_id: None,
+                profile_id: None,
+            }),
+        )
+        .expect("peer/prepare fleet request encodes");
+        assert_eq!(request.params["n"], 3);
+
+        let mut pending = HashMap::new();
+        pending.insert(
+            "peer-2".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_PEER_PREPARE.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "peer-2",
+            "result": {
+                "slug": "fix-nav",
+                "topic": "peer-fix-nav",
+                "brief_path": "/repo/.octos/peers/fix-nav/brief.md",
+                "cwd": "/repo",
+                "worktree_branch": null,
+                "profile_id": "coding",
+                "peers": [
+                    {
+                        "slug": "fix-nav",
+                        "topic": "peer-fix-nav",
+                        "brief_path": "/repo/.octos/peers/fix-nav/brief.md",
+                        "cwd": "/repo",
+                        "worktree_branch": null,
+                        "profile_id": "coding"
+                    },
+                    {
+                        "slug": "fix-nav-2",
+                        "topic": "peer-fix-nav-2",
+                        "brief_path": "/repo/.octos/peers/fix-nav-2/brief.md",
+                        "cwd": "/repo",
+                        "worktree_branch": null,
+                        "profile_id": "coding"
+                    }
+                ]
+            }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::PeerPrepared(event) = event else {
+            panic!("expected peer prepared event, got {event:?}");
+        };
+        assert_eq!(event.result.peers.len(), 2);
+        assert_eq!(event.result.peers[1].slug, "fix-nav-2");
+        assert_eq!(event.result.peers[1].topic, "peer-fix-nav-2");
+    }
+
+    /// octos#1807: `turn/steer` requests encode session/expected-turn/input
+    /// (`expected_turn_id: None` omitted from the wire), and both result
+    /// shapes decode into the typed `ClientEvent::TurnSteered`.
+    #[test]
+    fn turn_steer_request_encodes_and_result_decodes_to_client_event() {
+        let expected_turn = TurnId::new();
+        let request = rpc_request_from_command(
+            "steer-1".into(),
+            AppUiCommand::TurnSteer(crate::model::TurnSteerParams {
+                session_id: SessionKey("coding:local:tui#coding".into()),
+                expected_turn_id: Some(expected_turn.clone()),
+                input: vec![octos_core::ui_protocol::InputItem::Text {
+                    text: "also check the tests".into(),
+                }],
+            }),
+        )
+        .expect("turn/steer request encodes");
+        assert_eq!(request.method, crate::model::APPUI_METHOD_TURN_STEER);
+        assert_eq!(request.params["session_id"], "coding:local:tui#coding");
+        assert_eq!(
+            request.params["expected_turn_id"],
+            expected_turn.0.to_string()
+        );
+        assert_eq!(request.params["input"][0]["text"], "also check the tests");
+
+        let absent = rpc_request_from_command(
+            "steer-2".into(),
+            AppUiCommand::TurnSteer(crate::model::TurnSteerParams {
+                session_id: SessionKey("coding:local:tui#coding".into()),
+                expected_turn_id: None,
+                input: vec![octos_core::ui_protocol::InputItem::Text {
+                    text: "steer whatever is live".into(),
+                }],
+            }),
+        )
+        .expect("turn/steer request without expected turn encodes");
+        assert!(
+            absent.params.get("expected_turn_id").is_none(),
+            "expected_turn_id: None must be omitted from the wire shape"
+        );
+
+        // steered:true — the ACTIVE turn's id echoes back.
+        let mut pending = HashMap::new();
+        pending.insert(
+            "steer-1".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_TURN_STEER.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "steer-1",
+            "result": { "turn_id": expected_turn.0.to_string(), "steered": true }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::TurnSteered(event) = event else {
+            panic!("expected turn steered event, got {event:?}");
+        };
+        assert!(event.result.steered);
+        assert_eq!(event.result.turn_id, expected_turn);
+
+        // steered:false — the server-minted NEW turn id comes back.
+        let new_turn = TurnId::new();
+        let mut pending = HashMap::new();
+        pending.insert(
+            "steer-3".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_TURN_STEER.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "steer-3",
+            "result": { "turn_id": new_turn.0.to_string(), "steered": false }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::TurnSteered(event) = event else {
+            panic!("expected turn steered event, got {event:?}");
+        };
+        assert!(!event.result.steered);
+        assert_eq!(event.result.turn_id, new_turn);
+    }
+
+    /// octos#1801 v3: the durable `peer/staged` NOTIFICATION decodes via the
+    /// tui-local string-keyed match into `ClientEvent::PeerStaged` — the
+    /// vendored octos-core rev predates the `UiNotification` variant, so
+    /// routing it through `from_method_and_params` would degrade it to an
+    /// `unknown_notification` error event.
+    #[test]
+    fn peer_staged_notification_decodes_to_client_event() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "peer/staged",
+            "params": {
+                "session_id": "coding:local:tui#coding",
+                "topic": "peer-fix-nav",
+                "slug": "fix-nav",
+                "brief": "fix the nav",
+                "brief_path": "/repo/.octos/peers/fix-nav/BRIEF.md",
+                "cwd": "/repo",
+                "worktree_branch": null,
+                "profile_id": "coding"
+            }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut HashMap::new())
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::PeerStaged(staged) = event else {
+            panic!("expected peer staged event, got {event:?}");
+        };
+        assert_eq!(
+            staged.session_id,
+            SessionKey("coding:local:tui#coding".into())
+        );
+        assert_eq!(staged.topic, "peer-fix-nav");
+        assert_eq!(staged.slug, "fix-nav");
+        assert_eq!(staged.brief, "fix the nav");
+        assert_eq!(staged.brief_path, "/repo/.octos/peers/fix-nav/BRIEF.md");
+        assert_eq!(staged.cwd, "/repo");
+        assert!(staged.worktree_branch.is_none());
+        assert_eq!(staged.profile_id, "coding");
+    }
+
+    /// Malformed `peer/staged` params surface as the standard
+    /// `invalid_params` error event instead of wedging the stream (durable
+    /// replay would re-deliver the same frame on every reconnect).
+    #[test]
+    fn peer_staged_notification_with_bad_params_yields_invalid_params_error() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "peer/staged",
+            "params": { "topic": "peer-fix-nav" }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut HashMap::new())
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::App(event) = event else {
+            panic!("expected an app error event, got {event:?}");
+        };
+        let AppUiEvent::Error(error) = *event else {
+            panic!("expected an error event, got {event:?}");
+        };
+        assert_eq!(error.code, "invalid_params");
+        assert!(error.message.contains("peer/staged"));
+    }
+
+    /// octos#1801 v3: the durable `peer/closed` NOTIFICATION decodes via the
+    /// tui-local string-keyed match into `ClientEvent::PeerClosed` — the mirror
+    /// of the `peer/staged` decode (the vendored octos-core rev predates the
+    /// `UiNotification` variant, so `from_method_and_params` would degrade it to
+    /// an `unknown_notification` error event).
+    #[test]
+    fn peer_closed_notification_decodes_to_client_event() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "peer/closed",
+            "params": {
+                "session_id": "coding:local:tui#coding",
+                "topic": "peer-fix-nav",
+                "slug": "fix-nav",
+                "profile_id": "coding"
+            }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut HashMap::new())
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::PeerClosed(closed) = event else {
+            panic!("expected peer closed event, got {event:?}");
+        };
+        assert_eq!(
+            closed.session_id,
+            SessionKey("coding:local:tui#coding".into())
+        );
+        assert_eq!(closed.topic, "peer-fix-nav");
+        assert_eq!(closed.slug, "fix-nav");
+        assert_eq!(closed.profile_id, "coding");
+    }
+
+    /// Malformed `peer/closed` params surface as the standard `invalid_params`
+    /// error event instead of wedging the stream (durable replay would
+    /// re-deliver the same frame on every reconnect).
+    #[test]
+    fn peer_closed_notification_with_bad_params_yields_invalid_params_error() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "peer/closed",
+            "params": { "topic": "peer-fix-nav" }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut HashMap::new())
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::App(event) = event else {
+            panic!("expected an app error event, got {event:?}");
+        };
+        let AppUiEvent::Error(error) = *event else {
+            panic!("expected an error event, got {event:?}");
+        };
+        assert_eq!(error.code, "invalid_params");
+        assert!(error.message.contains("peer/closed"));
+    }
+
+    /// octos#1801 v2: `peer/gather` requests encode the slug filter (omitted
+    /// for gather-all) and results decode into
+    /// `ClientEvent::PeerGathered` — including a peer with no result yet.
+    #[test]
+    fn peer_gather_request_encodes_and_result_decodes_to_client_event() {
+        let request = rpc_request_from_command(
+            "gather-1".into(),
+            AppUiCommand::PeerGather(crate::model::PeerGatherParams {
+                slugs: None,
+                session_id: Some(SessionKey("coding:local:tui#coding".into())),
+                profile_id: None,
+            }),
+        )
+        .expect("peer/gather request encodes");
+        assert_eq!(request.method, crate::model::APPUI_METHOD_PEER_GATHER);
+        assert_eq!(request.params["session_id"], "coding:local:tui#coding");
+        assert!(
+            request.params.get("slugs").is_none(),
+            "slugs: None (gather all) must be omitted from the wire shape"
+        );
+        assert!(request.params.get("profile_id").is_none());
+
+        let filtered = rpc_request_from_command(
+            "gather-2".into(),
+            AppUiCommand::PeerGather(crate::model::PeerGatherParams {
+                slugs: Some(vec!["fix-nav".into()]),
+                session_id: None,
+                profile_id: None,
+            }),
+        )
+        .expect("filtered peer/gather request encodes");
+        assert_eq!(filtered.params["slugs"], json!(["fix-nav"]));
+
+        let mut pending = HashMap::new();
+        pending.insert(
+            "gather-1".into(),
+            PendingRequest {
+                method: crate::model::APPUI_METHOD_PEER_GATHER.into(),
+                select_session: None,
+            },
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "gather-1",
+            "result": {
+                "profile_id": "coding",
+                "peers": [
+                    {
+                        "slug": "fix-nav",
+                        "topic": "peer-fix-nav",
+                        "brief": "make the nav not flicker",
+                        "brief_truncated": false,
+                        "result": "Nav fixed.",
+                        "result_truncated": false,
+                        "result_updated_unix": 1753000000,
+                        "has_worktree": true
+                    },
+                    {
+                        "slug": "fix-nav-2",
+                        "topic": "peer-fix-nav-2",
+                        "brief": "make the nav not flicker",
+                        "brief_truncated": false,
+                        "result": null,
+                        "result_truncated": false,
+                        "result_updated_unix": null,
+                        "has_worktree": false
+                    }
+                ]
+            }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::PeerGathered(event) = event else {
+            panic!("expected peer gathered event, got {event:?}");
+        };
+        assert_eq!(event.result.profile_id, "coding");
+        assert_eq!(event.result.peers.len(), 2);
+        assert_eq!(event.result.peers[0].result.as_deref(), Some("Nav fixed."));
+        assert_eq!(event.result.peers[0].result_updated_unix, Some(1753000000));
+        assert!(event.result.peers[0].has_worktree);
+        assert!(event.result.peers[1].result.is_none());
+        assert!(event.message.contains("1/2"));
+    }
+
     /// Realistic `session/status/read` result body as emitted by an octos
     /// server (protocol 1.1.0) for a fresh data dir where onboarding has not
     /// saved a provider yet — captured verbatim from `octos serve --stdio`
@@ -6750,7 +7624,7 @@ mod tests {
                 after: None,
                 include: Vec::new(),
             }),
-            AppUiCommand::ListSessions(octos_core::ui_protocol::SessionListParams {}),
+            AppUiCommand::ListSessions(octos_core::ui_protocol::SessionListParams { cwd: None }),
             AppUiCommand::GetThreadGraph(ThreadGraphGetParams {
                 session_id: session_id.clone(),
                 at: None,
@@ -6771,6 +7645,14 @@ mod tests {
             AppUiCommand::ProfileSkillsRegistrySearch(ProfileSkillsRegistrySearchParams {
                 profile_id: Some("coding".into()),
                 q: Some("search".into()),
+            }),
+            // octos#1801 v2: `peer/gather` only reads the blackboard —
+            // readonly viewers may gather (the follow-up SubmitPrompt is
+            // where readonly blocks).
+            AppUiCommand::PeerGather(crate::model::PeerGatherParams {
+                slugs: None,
+                session_id: Some(session_id.clone()),
+                profile_id: None,
             }),
         ];
         for command in &read_style_commands {
@@ -6823,9 +7705,11 @@ mod tests {
                 ApprovalDecision::Deny,
             )),
             AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
+                requested_id: None,
                 name: "Ada Lovelace".into(),
                 username: "ada".into(),
                 email: "ada@example.com".into(),
+                make_default: None,
             }),
             AppUiCommand::SetPermissionProfile(PermissionProfileSetParams {
                 session_id,
@@ -6845,6 +7729,26 @@ mod tests {
             AppUiCommand::ProfileSkillsRemove(ProfileSkillsRemoveParams {
                 profile_id: Some("coding".into()),
                 name: "deep-search".into(),
+            }),
+            // #395: `peer/prepare` writes the brief file (and may create a
+            // worktree) server-side — a mutation, blocked in read-only mode.
+            AppUiCommand::PeerPrepare(crate::model::PeerPrepareParams {
+                brief: "fix the thing".into(),
+                n: None,
+                title: None,
+                worktree: false,
+                cwd: None,
+                session_id: None,
+                profile_id: None,
+            }),
+            // octos#1807: `turn/steer` injects input into a running turn —
+            // the same mutation class as `turn/start`, blocked in read-only.
+            AppUiCommand::TurnSteer(crate::model::TurnSteerParams {
+                session_id: SessionKey("local:test".into()),
+                expected_turn_id: Some(TurnId::new()),
+                input: vec![octos_core::ui_protocol::InputItem::Text {
+                    text: "steer".into(),
+                }],
             }),
         ];
         for command in &mutating_commands {
@@ -6949,6 +7853,17 @@ mod tests {
             AppUiCommand::FireLoopNow(crate::model::LoopIdParams {
                 session_id: session_id.clone(),
                 loop_id: "loop-1".into(),
+            }),
+            // #395: `/peer`'s prepare RPC — a labeled readonly block, not the
+            // "unexpectedly blocked read-style" policy-bug arm.
+            AppUiCommand::PeerPrepare(crate::model::PeerPrepareParams {
+                brief: "fix the thing".into(),
+                n: None,
+                title: None,
+                worktree: false,
+                cwd: None,
+                session_id: Some(session_id.clone()),
+                profile_id: None,
             }),
         ];
 
@@ -7599,6 +8514,25 @@ mod tests {
         );
     }
 
+    /// End-to-end (real child process): when the spawned `octos serve` refuses to
+    /// start because another serve owns the data dir, it prints
+    /// `DATA_DIR_LOCKED_MARKER` to stderr and exits nonzero. That marker must
+    /// survive into the Disconnected message so `mark_disconnected` can latch the
+    /// fatal, no-reconnect state — this pins the driver→message seam that the
+    /// `mark_disconnected` unit test then keys on.
+    #[cfg(unix)]
+    #[test]
+    fn stdio_child_exit_preserves_data_dir_locked_marker() {
+        let (_frames, _errors, message) = drive_stdio_until_disconnect(&format!(
+            "echo '{DATA_DIR_LOCKED_MARKER}: another octos server already owns data directory /x' \
+             >&2; exit 1"
+        ));
+        assert!(
+            message.contains(DATA_DIR_LOCKED_MARKER),
+            "the data-dir-lock marker must reach the disconnect message: {message}"
+        );
+    }
+
     /// An oversized stdout line must surface as a non-fatal frame_too_large
     /// error and the stream must keep delivering subsequent lines.
     #[cfg(unix)]
@@ -8013,6 +8947,80 @@ mod tests {
         assert!(error.message.contains(methods::DIFF_PREVIEW_GET));
         assert!(error.message.contains(&request.id));
         assert!(error.message.contains("transport closed for test"));
+    }
+
+    /// Two octos-tui competing for the DB: the spawned backend refuses to start
+    /// (its stderr tail carries `DATA_DIR_LOCKED_MARKER`). The client must latch
+    /// a fatal state — surface ONE clean terminal error (not the raw stderr
+    /// status) and suppress reconnect so it stops the silent respawn crash-loop.
+    #[test]
+    fn data_dir_lock_conflict_latches_fatal_and_stops_reconnect() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        backend.mark_connected("wss://example.test/ui-protocol");
+
+        // The stdio child died at startup; its exit message carries the server's
+        // stable marker in the stderr tail.
+        backend.mark_disconnected(format!(
+            "UI protocol stdio child exited with exit status: 1; reconnect will relaunch on next \
+             send/read.\nstderr tail:\n{DATA_DIR_LOCKED_MARKER}: another octos server is already \
+             running for this data directory (/tmp/x)."
+        ));
+
+        // Exactly one user-facing event: the clean, actionable terminal error —
+        // the raw stderr Status is suppressed so it can't overwrite it.
+        let event = unwrap_app_event(backend.queue.pop_front().expect("a surfaced event"));
+        let AppUiEvent::Error(error) = event else {
+            panic!("data-dir conflict must surface as an Error, got: {event:?}");
+        };
+        assert_eq!(error.code, DATA_DIR_LOCKED_CODE);
+        assert!(
+            error.message.contains("Close the other octos-tui"),
+            "message must be the actionable explanation; got: {}",
+            error.message
+        );
+        assert!(
+            backend.queue.is_empty(),
+            "only the clean error should surface; the raw stderr Status must be suppressed",
+        );
+
+        // Latched fatal → reconnect refuses (no respawn = the loop is broken).
+        assert!(backend.fatal_error.is_some(), "fatal state must latch");
+        assert!(
+            backend.ensure_connected().is_err(),
+            "a latched data-dir conflict must never attempt to reconnect",
+        );
+    }
+
+    /// Regression guard: an ordinary transport disconnect (no marker) must NOT
+    /// latch fatal — it still reports a status and stays retryable, or a healthy
+    /// server restart would never reconnect.
+    #[test]
+    fn ordinary_disconnect_does_not_latch_fatal() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            ..AppUiLaunch::default()
+        });
+        backend.mark_connected("wss://example.test/ui-protocol");
+        backend.mark_disconnected("UI protocol stdio child exited with exit status: 0");
+
+        assert!(
+            backend.fatal_error.is_none(),
+            "a normal disconnect must stay retryable",
+        );
+        let event = unwrap_app_event(backend.queue.pop_front().expect("a status event"));
+        assert!(
+            matches!(event, AppUiEvent::Status(_)),
+            "a normal disconnect still reports its raw status",
+        );
     }
 
     #[test]
@@ -8600,9 +9608,11 @@ mod tests {
 
         let local_profile_request = backend
             .build_tracked_request(AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
+                requested_id: None,
                 name: "Ada Lovelace".into(),
                 username: "ada".into(),
                 email: "ada@example.com".into(),
+                make_default: None,
             }))
             .expect("local profile request builds");
         let local_profile_frame = json!({
@@ -9014,6 +10024,54 @@ mod tests {
             .expect("request builds");
 
         assert_eq!(request.params["cwd"], json!("/tmp/project"));
+    }
+
+    #[test]
+    fn protocol_session_list_request_includes_workspace_cwd_when_launch_has_one() {
+        // `session/list` carries the SAME launch workspace cwd the client
+        // already sends on `session/open` (see `fill_session_list_cwd`), so a
+        // server with per-project session storage lists THIS project's
+        // sessions. The store constructs the command with `cwd: None`; the
+        // transport stamps `launch.cwd`.
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            cwd: Some("/tmp/project".into()),
+            ..AppUiLaunch::default()
+        });
+        let request = backend
+            .build_tracked_request(AppUiCommand::ListSessions(
+                octos_core::ui_protocol::SessionListParams { cwd: None },
+            ))
+            .expect("request builds");
+
+        assert_eq!(request.method, methods::SESSION_LIST);
+        assert_eq!(request.params["cwd"], json!("/tmp/project"));
+    }
+
+    #[test]
+    fn protocol_session_list_request_is_empty_object_when_launch_has_no_cwd() {
+        // Backward compat: with no launch cwd the `session/list` request
+        // serializes to the historical empty object `{}` (no `cwd` key), so an
+        // old server deserializes it unchanged.
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            cwd: None,
+            ..AppUiLaunch::default()
+        });
+        let request = backend
+            .build_tracked_request(AppUiCommand::ListSessions(
+                octos_core::ui_protocol::SessionListParams { cwd: None },
+            ))
+            .expect("request builds");
+
+        assert_eq!(request.method, methods::SESSION_LIST);
+        assert_eq!(request.params, json!({}));
     }
 
     #[test]

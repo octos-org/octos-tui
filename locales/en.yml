@@ -22,6 +22,8 @@ app:
   pane:
     sessions: "Sessions"
     tasks: "Tasks"
+    tasks_subagents: "Sub-agents"
+    tasks_other: "Other tasks"
     artifacts: "Artifacts"
     plan: "Plan"
     workspace: "Workspace"
@@ -82,15 +84,25 @@ app:
     inline_patch: "Inline patch"
     loading: "Loading diff preview..."
     select_stage_hint: "[/] select hunk | c stage selected diff context"
-    more_files_hidden: "+%{count} more file(s) hidden (Tab inspector)"
+    toggle_side_by_side_hint: "v side-by-side"
+    toggle_unified_hint: "v unified"
+    side_by_side_too_narrow: "side-by-side needs %{min}+ cols"
+    more_files_hidden: "+%{count} more file(s) hidden"
     line_unavailable: "line diff unavailable for this mutation"
     more_lines_hidden: "%{count} more diff line(s) hidden (Ctrl+O expand)"
+    more_rows_hidden: "%{count} more diff row(s) hidden (Ctrl+O expand)"
     more_hunks_hidden: "+%{count} more hunk(s) hidden (Ctrl+O expand)"
   autonomy:
     goal_prefix: "Goal: "
     loops_running: "Loops: %{count} active"
     loops_paused_suffix: " · %{count} paused"
     goal_meta: " (%{status} · %{used}/%{budget} tokens)"
+    goal_fold_hint: " · Ctrl+P expand"
+    status_active: "active"
+    status_paused: "paused"
+    status_budget_limited: "budget limited"
+    status_blocked: "blocked"
+    status_complete: "complete"
   statusbar:
     agents: "%{count} agents"
     re_entering: "re-entering"
@@ -104,6 +116,8 @@ app:
     ps_to_view: "/ps to view"
     esc_interrupt: "Esc interrupt"
     stop_to_close: "/stop to close"
+    pending_decision_help: "Waiting on you — Ctrl+R/Alt+A answer · Ctrl+C interrupt"
+    parked_decision_banner: "⚠ Parked on you for %{elapsed} — Ctrl+R/Alt+A answer · Ctrl+C interrupt"
     tool_output_expanded: "tool output expanded"
   btw:
     answering: "Answering…"
@@ -118,6 +132,7 @@ app:
     state_label: "state"
     idle: "Idle"
     working: "Working"
+    thinking: "Thinking"
     waiting: "Waiting"
     blocked: "Blocked"
     done: "Done"
@@ -138,11 +153,34 @@ app:
     large_paste: "Large paste collapsed | Enter sends full text | Ctrl+U clear"
     multiline_tail_lines: "Multiline input | showing tail, %{count} earlier line(s) hidden | Enter sends full text | Ctrl+U clear"
     multiline_tail_line: "Multiline input | showing tail of long line | Enter sends full text | Ctrl+U clear"
+    peer_readonly: "↳ read-only peer · steer from the master · Ctrl+S switch · Ctrl+C interrupt"
   hint:
     # Pane/modal footer hints (keyboard keys kept literal).
     list_nav: "j/k or Up/Down"
-    composer_send: "Enter send | Shift+Enter / Ctrl+J newline | Tab inspector"
-    statusbar_keys: "Tab inspector | Ctrl+O expand"
+    composer_send: "Enter send | Shift+Enter / Ctrl+J newline | Tab agents"
+    statusbar_keys: "Tab agents | Ctrl+O expand"
+    statusbar_keys_peers: "Tab agents | Ctrl+L peers | Ctrl+S sessions | Ctrl+O expand"
+    agent_peek_keys: " Tab next · Shift+Tab prev · ↑/↓ scroll · x cancel · Esc back to chat "
+    agent_task_prefix: "task: %{task}"
+    agent_deliverables: "Deliverables"
+    agent_strip_main: "main"
+    agent_strip_title: " agents "
+    agent_strip_more: "+%{count} more (Tab)"
+    agent_dock_pill: "🐙 %{count} agents · %{running} running"
+    agent_dock_pill_unread: " · %{count}● unread"
+    agent_dock_toggle_hint: "Ctrl+G/Alt+G"
+    # Peer Dock (#407): collapsed fleet summary shown in place of per-peer
+    # chips when the session strip overflows, and the expanded peer dock's
+    # (Alt+P / Ctrl+L) per-row labels. Mirrors the agent-dock pill's shape.
+    peer_dock_pill: "👥 %{count} peers · %{live} live"
+    peer_dock_pill_blocked: " · %{count}⚠ waiting"
+    peer_dock_pill_unread: " · %{count}● unread"
+    peer_dock_toggle_hint: "Alt+P/Ctrl+L peek"
+    peer_dock_title: " peers "
+    peer_dock_row_blocked: "waiting on you: %{reason}"
+    peer_dock_row_idle: "idle"
+    peer_dock_row_opening: "opening…"
+    agent_no_output: "(no output captured yet — this agent streams its result here as it works)"
     menu: "Menu | j/k move | Enter accept | Esc close"
     onboarding: "Onboarding | Enter continue | type to edit fields"
     approval: "Approval | y once | s session | n deny | d diff"
@@ -244,13 +282,21 @@ app:
 onboarding:
   welcome_title: "Welcome to Octos"
   value_saved: "%{value} (saved)"
+  value_suggested: "%{value} (suggested)"
   api_key_saved: "saved in profile"
   value_not_set: "not set"
   action_edit: "Enter edit"
+  make_default:
+    label: "Make this your default brain"
+    desc: "The brain a bare launch opens in a folder it hasn't seen before."
+    enabled: "on"
+    disabled: "off"
   field:
     full_name: "Full name"
     username: "Username"
     email: "Email"
+    profile_name: "Name this profile"
+    profile_name_desc: "Enter to edit — a short id like glm or deepseek (used to store this setup)."
     existing_profile: "Use existing profile (ID)"
   local:
     title: "Create your local Octos profile"
@@ -258,6 +304,7 @@ onboarding:
     subtitle: "Set up a local solo profile to continue."
     continue: "Continue"
     create_action: "Create profile"
+    family_desc: "Enter to pick your model family — it suggests a profile name (e.g. glm)."
     footer: "Up/Down choose | Enter edit or continue | type value, Enter save"
   language:
     title: "Choose Language"
@@ -293,6 +340,10 @@ onboarding:
     status_ok: "Status: OK (%{writable}%{toml})"
     status_invalid: "Status: INVALID — %{reason}"
   provider:
+    add_model_label: "Add a model"
+    add_model_desc: "Set up the AI model for this profile: family, model, provider route, and API key."
+    add_another_model_label: "Add another model"
+    add_another_model_desc: "Add a fallback or a different model: family, model, provider route, and API key."
     test: "Test connection"
     test_testing: "Testing connection..."
     test_unavailable_saving: "Test unavailable while saving"
@@ -309,6 +360,8 @@ onboarding:
     saved_status_none: "Saved provider: none"
     primary: "primary"
     fallback: "fallback"
+    research_lane: "research lane"
+    save_research_lane: "Save as research lane"
   disabled:
     name_empty: "name is empty"
     username_empty: "username is empty"
@@ -368,7 +421,7 @@ onboarding:
     explain_now: "Now: %{title}"
     explain:
       language: "Choose the language Octos uses while you finish setup.\nEnglish is selected by default. Pick 中文 if you want the rest of onboarding and the app to switch immediately.\nYou can change this later with `/lang`."
-      profile: "Octos needs a local identity to attach your settings, providers, and history to.\nFill in your name, a short username, and an email (kept locally as metadata — no code is sent), then continue.\nThis profile stays on this machine."
+      profile: "Octos needs a local profile to attach your settings, providers, and history to.\nGive it a short name (like work or research) and continue. The name is just a label — it has nothing to do with which model you run; you choose that next, and can add or change models anytime with /add-model. (Older servers ask for name, username, and email instead.)\nThis profile stays on this machine; nothing is sent."
       provider: "Choose which AI model powers Octos.\nPick a model family (e.g. GPT, Claude), then a specific model, then the provider route that serves it (official or an alternative).\nThis decides who Octos talks to and how good the coding help is — you can change it later."
       connect: "Prove the model actually answers before you rely on it.\nPaste your provider API key, then run the live test. Octos sends one small request and reports success or the exact error.\nThis catches a bad key or wrong route now, not mid-task."
       save: "Persist the verified provider into your profile JSON so it survives restarts.\nSave it as your primary provider (or add it as a fallback). Until you save, the route lives only in this session.\nAfter saving, the workspace step unlocks."
@@ -380,6 +433,8 @@ onboarding:
     workspace_open_label: "Continue to Workspace →"
     workspace_open_description: "Stage and validate the project folder Octos will code in, then activate."
     workspace_locked_reason: "save a provider first"
+    finish_label: "Finish — brain ready →"
+    finish_description: "Your brain is set up. Relaunch Octos here to start a session with it."
     # Activate row (provider-setup screen) label + description.
     activate_ready_label: "▶ Activate workspace — open coding session (Enter)"
     activate_blocked_label: "Activate workspace — open coding session"
@@ -428,6 +483,27 @@ thinking:
   display_off: Reasoning hidden from the transcript (spinner + inspector only).
 
 status:
+  undo_no_session: "No active session to undo in."
+  peer_usage: "Usage: /peer [--go] [--worktree] [--cwd <path>] [--n <2-8>] <brief>"
+  peer_preparing: "Preparing peer session…"
+  session_blocked_hint: "%{session} is waiting on you: %{reason} — Ctrl+S/Alt+S to answer."
+  peer_prepare_in_flight: "A peer is already being prepared — wait for it to open (or ~30s) before starting another."
+  peer_opening: "Opening peer %{slug}…"
+  peer_started: "Peer %{slug} is working in the background — watch its badge in the session strip (Ctrl+S/Alt+S)."
+  peer_switched: "Peer %{slug} started — you are in its session now."
+  peer_fleet_opening: "Opening a fleet of %{n} peers (first: %{slug})…"
+  peer_staged_by_agent: "Agent spun off peer %{slug} — working in the background (Ctrl+S/Alt+S)."
+  peer_staged_known: "Peer %{slug} is already staged — duplicate notice ignored."
+  gather_requesting: "Gathering peer results from the blackboard…"
+  gather_no_peers: "No peers staged on the blackboard — /peer to spin some up first."
+  gather_submitted: "Gathered %{n} peer(s) from the blackboard into this session."
+  peer_clear_none: "No finished peers to clear — running and waiting peers are kept."
+  peer_clear_removed: "Cleared %{n} finished peer(s) from the dock."
+  research_usage: "Usage: /research | /research add <key> <provider> <model> [base_url] [api_key_env] | /research rm <key>"
+  research_add_usage: "Usage: /research add <key> <provider> <model> [base_url] [api_key_env]"
+  research_rm_usage: "Usage: /research rm <key>"
+  research_profile_unresolved: "Active profile not resolved yet — try again once the session is ready."
+  research_lane_saved: "Research lane %{key} saved: %{label} — restart to apply."
   opening_diff_preview: "Opening diff preview: %{operation} %{path}"
   opening_inline_diff_preview: "Opening inline diff preview: %{title}"
   approval_requested: "Approval requested: %{title}"
@@ -458,6 +534,7 @@ status:
   list_more: ", +%{count} more"
   no_session_send_prompt: "No coding session open. Run /onboard open-session before sending a prompt."
   message_staged: "Message staged; it will submit after the active turn. Press Esc to interrupt/send."
+  steered_into_turn: "Steered into the running turn."
   btw_usage: "Usage: /btw <question> — ask a quick aside while the turn keeps working"
   btw_answering: "btw: answering…"
   btw_answered: "btw: answered"
@@ -541,7 +618,21 @@ status:
   onboarding_otp_code_updated: "Onboarding OTP code updated"
   profile_updated: "Profile updated"
   onboarding_profile_updated: "Onboarding profile updated"
+  profile_name_updated: "Profile name updated"
+  onboarding_profile_name_updated: "Onboarding profile name updated"
+  make_default_updated: "Default-brain preference updated"
+  attached_profile: "Attached profile %{profile}"
+  new_profile_launch: "Creating a new profile — name it, then set its AI model"
+  profiles_no_data_dir: "Can't manage profiles here — no local data directory is known for this launch."
+  profile_default_set: "Default profile is now %{profile}"
+  profile_default_failed: "Couldn't set the default profile: %{error}"
+  profile_deleted: "Deleted profile %{profile}"
+  profile_delete_failed: "Couldn't delete the profile: %{error}"
+  profile_delete_active_blocked: "Can't delete %{profile} — it's the profile this session is using. Switch to another profile first."
+  switching_profile: "Switching to profile %{profile}…"
   provider_route_selected: "Provider route selected; enter API key"
+  provider_request_failed: "Provider request failed: %{message}"
+  provider_request_timeout: "Provider request timed out with no response — try again"
   provider_family_updated: "Provider family updated"
   provider_model_updated: "Provider model updated"
   provider_route_updated: "Provider route updated"
@@ -659,6 +750,7 @@ status:
   approval_shown: "Approval shown: %{title}"
   question_progress: "Question %{active}/%{total}"
   question_no_options: "This question has no answerable options; press Esc to dismiss it"
+  question_needs_answer: "Pick an option (↑/↓ then Enter) or type an answer before continuing"
   no_active_question: "No active question to answer"
   answered_question: "Answered question: %{title}"
   no_pending_question: "No pending question to show"
@@ -683,6 +775,9 @@ status:
   selected_diff_hunk: "Selected diff hunk: %{path} %{header}"
   no_diff_hunk: "No diff hunk is available to select"
   no_diff_hunk_context: "No selected diff hunk context to stage"
+  diff_view_side_by_side: "Side-by-side diff view"
+  diff_view_unified: "Unified diff view"
+  diff_view_too_narrow: "Terminal too narrow for side-by-side diff (needs %{min}+ cols)"
   staged_diff_context: "Staged selected diff hunk context for next turn: %{path}"
   added_diff_context: "Added selected diff hunk context to composer: %{path}"
   accepted: "accepted"
@@ -710,7 +805,15 @@ status:
   cannot_transition_goal_state: "Cannot transition goal in `%{state}` state (model-owned)."
   goal_verb_pausing: "Pausing"
   goal_verb_resuming: "Resuming"
+  goal_verb_stopping: "Stopping"
   goal_verb_updating: "Updating"
+  goal_resume_over_budget: "Goal resumed but still over budget — it will not fire until you raise it: /goal %{objective} --budget <N>"
+  goal_now_active: "Goal active — autonomous continuations resume"
+  goal_now_paused: "Goal paused — no autonomous continuations until /goal resume"
+  goal_now_blocked: "Goal blocked after repeated failed turns — /goal resume to retry, /goal stop to end it"
+  goal_now_budget_limited: "Goal budget exhausted — wrapping up; raise with /goal %{objective} --budget <N>"
+  goal_now_complete: "Goal complete"
+  goal_now_status: "Goal status: %{status}"
   verb_goal: "%{verb} goal"
   local_create_cancelled_transport: "Local profile create cancelled by transport error [%{code}]: %{message}"
   local_create_cancelled: "Local profile create cancelled [%{code}]: %{message}"
@@ -756,6 +859,11 @@ status:
   bang_failed: "failed"
   bang_usage: "usage: !<command>"
   bang_no_output: "(no output)"
+  bang_mode_hint: "local shell — Enter runs on this machine in %{cwd} · Esc cancels"
+  bang_mode_cancelled: "local shell cancelled"
+  bang_cwd: "cwd: %{cwd}"
+  inserted_at_cursor: "Inserted %{text}"
+  file_picker_closed: "File picker closed (nothing inserted)"
   # Review / goal / staged-message status lines
   cannot_start_review_active_turn: "Cannot start review while a turn is active"
   cannot_spawn_active_turn: "Cannot spawn agents while a turn is active"
@@ -781,6 +889,8 @@ status:
   # Staged diff-hunk context prompt (inserted into the composer / sent to the agent)
   diff_hunk_prompt: "Use this selected diff hunk as context for the next coding turn.\nfile: %{path}\nstatus: %{status}\nhunk: %{hunk}\n```diff\n"
   # Turn-completion fallback "Session Summary" assistant cards
+  summary_title: "Session Summary"
+  summary_error_label: "Error"
   summary_completed_no_answer: "Session Summary\n- Result: Turn completed, but the TUI did not receive a final assistant answer.\n- Activity: %{count} action(s) recorded.\n- Files changed: %{files}.\n- Validation: %{validation}.\n- Risks / follow-up: Review the activity above and continue the turn if the requested answer is incomplete."
   summary_partial_answer: "Session Summary\n- Result: Turn completed, but the TUI only received a partial live answer.\n- Activity: %{count} action(s) recorded.\n- Files changed: %{files}.\n- Validation: %{validation}.\n- Risks / follow-up: The server may have persisted a fuller answer; continue if the visible answer is incomplete."
   summary_failed: "Session Summary\n- Result: Turn failed before producing a final answer.\n- Error: %{code}: %{message}\n- Activity: %{count} action(s) recorded.\n- Failures: %{failed}.\n- Risks / follow-up: Fix the error above or continue the turn with a more specific instruction."
@@ -791,20 +901,36 @@ status:
   # own turn (Esc/Ctrl+C). Deliberately terse: a user stop is not a failure, so
   # it does not get the verbose Session-Summary card that genuine errors do.
   turn_interrupted: "Turn interrupted"
+  # Appended to the committed answer when a turn the user interrupted went on to
+  # COMPLETE normally on the server — the interrupt was declined, never sent, or
+  # simply lost the race. The client froze its view at the Esc, so the text above
+  # is a truncated view of an answer that did finish. Only shown when output was
+  # genuinely withheld, never for an Esc that arrived after the last token.
+  turn_interrupted_truncated: "⚠ Interrupted — output after this point was dropped, so this answer is incomplete. The turn finished on the server; re-ask to see the rest."
 
 # --- menu chrome + command descriptions (full i18n pass) ---
 command:
   activity:
     desc: Search and filter sessions, tasks, and activity.
+  add_model:
+    desc: Add or change the profile's AI model (family, model, and provider route).
   agents:
     desc: Inspect or interrupt backend-owned subagents.
   aliases_label: 'Aliases:'
+  context:
+    desc: Context-window controls — compact now, and choose LLM vs heuristic summarization.
+  copy:
+    desc: Copy the last assistant reply to your clipboard (works over SSH).
   cost:
     desc: Show server-reported token and cost usage.
+  dock:
+    desc: Sub-agent dock — switch views, unread results, collapse or expand the strip.
   exit:
     desc: Quit the TUI.
+  profiles:
+    desc: Manage local profiles — list, set the default, delete, or create one.
   goal:
-    desc: View, set, pause, resume, or clear the persisted session goal.
+    desc: "Set: /goal <objective> [--budget 2m|500k]. Manage: pause, resume, stop, clear. Plain /goal shows the current goal."
   help:
     desc: Show available commands.
   keymap:
@@ -819,6 +945,16 @@ command:
     desc: List or configure server-owned MCP entries when supported.
   model:
     desc: Choose a server-returned profile LLM model.
+  sessions:
+    desc: Switch between open sessions (Ctrl+S/Alt+S) — live turns and unread badges.
+  undo:
+    desc: Roll workspace files back to a pre-mutation snapshot (#1768).
+  peer:
+    desc: "Spin off a peer agent session with a durable brief: /peer [--go] [--worktree] [--cwd <path>] [--n <2-8>] <brief>."
+  gather:
+    desc: "Gather peer results from the blackboard into this session: /gather [all | <slug> …]."
+  research:
+    desc: Manage research provider lanes (deep_research cheap/strong models).
   onboard:
     desc: Open the setup wizard to configure or reconfigure your profile, provider, model, and workspace.
   permissions:
@@ -858,10 +994,164 @@ command:
   turn:
     desc: Inspect backend turn lifecycle state.
 menu:
+  file_picker:
+    title: "Insert file path"
+    search: "Type to filter workspace files"
+    footer: "Enter insert relative path at cursor | Esc close without inserting"
+    item:
+      empty:
+        label: "No files found in this workspace"
+        desc: "The scan found no listable files under the workspace root (`.git`, `target`, and `node_modules` are skipped)."
+      truncated:
+        label: "Showing the first %{count} files — type to narrow the search"
+  sessions:
+    title: Sessions
+    subtitle: "⌂ main · ↳ peer · ✻ turn running · (n) turns finished since you last looked."
+    footer: Enter switch | Esc close
+    item:
+      blocked_reason: "⚠ waiting on you: %{reason}"
+      current: This is the focused session.
+      switch_desc: Switch to this session.
+      empty: No open sessions
+      empty_desc: Open a session first.
+  undo:
+    title: Workspace Snapshots
+    subtitle: "Undo points taken before agent file mutations. Select one to roll the workspace back."
+    footer: Enter restore a snapshot (asks to confirm) | Esc close
+    age:
+      just_now: just now
+    item:
+      refresh:
+        label: Refresh snapshots
+        desc: Uses snapshot/list for the active session.
+      stale:
+        label: Snapshots not loaded for this session
+        desc: Select Refresh to load the active session's snapshots.
+      unavailable:
+        label: Snapshots unavailable
+        desc: No workspace for this session, or git is not installed.
+      disabled:
+        label: "Snapshot capture is OFF (snapshots.enabled)"
+        desc: Existing snapshots below remain restorable; new edits are not being snapshotted.
+      empty:
+        label: No snapshots yet
+        desc: "Snapshots are taken automatically before agent file mutations (opt-in: snapshots.enabled)."
+      snap:
+        desc: Select to restore — asks to confirm first.
+  undo_confirm:
+    title: "Restore a snapshot"
+    subtitle: "Rolls the workspace files back. A pre-restore snapshot is taken first, so this is itself undoable."
+    confirm_title: "Restore %{snapshot}?"
+    "yes": "Yes, restore %{snapshot}"
+    yes_desc: "Uses snapshot/restore; refused while a turn is running."
+    "no": "No, keep current files"
+    item:
+      empty:
+        label: "No snapshot staged for restore"
+  research:
+    title: Research Provider Lanes
+    subtitle: "Named provider lanes (cheap/strong) for the deep_research pipeline. Restart to apply."
+    footer: Enter remove a lane (asks to confirm) | Esc close
+    item:
+      refresh:
+        label: Refresh lanes
+        desc: Uses profile/sub_providers/list.
+      empty:
+        label: No research lanes configured
+        desc: "Add one with /research add <key> <provider> <model>."
+      stale:
+        label: Lanes not loaded for this profile
+        desc: Select Refresh to load this profile's research lanes.
+      lane:
+        desc: Select to remove this lane — asks to confirm first.
+      add:
+        label: Add a lane…
+        desc: "Opens the model picker, then choose the fast or strong lane."
+  research_remove:
+    title: "Remove a research lane"
+    item:
+      empty:
+        label: "No lane staged for removal"
+    confirm:
+      title: "Remove lane %{lane}?"
+      subtitle: "Deletes this lane from the profile's sub_providers. Restart to apply."
+      yes: "Yes, remove %{lane}"
+      yes_desc: "Uses profile/sub_providers/remove; the lane list refreshes when it completes."
+      no: "No, keep it"
+  research_lane_key:
+    title: "Save research lane as…"
+    subtitle: "Deep research routes by lane key — %{provider} becomes the lane you pick. Restart to apply."
+    occupied: "currently %{current} (saving replaces it)"
+    vacant: "not configured yet"
+    item:
+      cheap:
+        desc: "The fast/cheap lane — deep_research uses it for scanning and summarization stages."
+      strong:
+        desc: "The strong lane — deep_research uses it for deep-reasoning and synthesis stages."
+  agents:
+    item:
+      dock_collapse:
+        label: Collapse the dock to a summary pill
+      dock_expand:
+        label: Expand the dock to per-agent rows
+      dock_toggle:
+        desc: Same as Ctrl+G/Alt+G.
+      main:
+        desc: Show the session transcript in the main pane.
+        label: main session
+      viewing_marker: (viewing)
+    subtitle: "%{count} agents · %{running} running · %{unread} unread"
+    title: Sub-agents
+    unavailable_empty: No sub-agents in this session yet — they appear here when the model spawns workers.
+    unavailable_title: Sub-agent dock
+  availability:
+    approval_has_focus: approval modal has keyboard focus
+    blocked_read_only: blocked in read-only mode
+    feature_flag_disabled: "feature flag `%{flag}` is disabled"
+    feature_unavailable: "Octos UI feature `%{feature}` is not available"
+    method_unavailable: "Octos UI method `%{method}` is not available"
+    method_unsupported: "Octos UI method `%{method}` is unsupported: %{reason}"
+    requires_active_turn: requires an active turn or background task
+    requires_approval_modal: requires a visible approval modal
+    requires_disconnected: requires disconnected mode
+    requires_idle_turn: requires the current turn to be idle
+    requires_mock_mode: requires mock mode
+    requires_one_of: "requires one of %{methods}"
+    requires_open_session: requires an open session
+    requires_protocol_mode: requires protocol mode
+    requires_ui_server: requires a connected Octos UI server
+    ui_unavailable: Octos UI capabilities are not available
   component:
     footer: Space toggle | Enter save | Esc close
     preview_title: Preview
     search: Filter components
+  compact:
+    item:
+      cancel:
+        label: 'No, keep context'
+      confirm:
+        desc: Runs session/compact now.
+        label: 'Yes, compact now'
+    subtitle: Summarize older messages to free up the context window.
+    title: Compact context now?
+    unavailable_no_session: Compaction requires an open Octos UI session.
+    unavailable_title: Compaction unavailable
+  context:
+    item:
+      compact:
+        desc: Summarize older messages now to free up the context window.
+        label: Compact now
+      heuristic:
+        desc: Strip tool args and keep first lines — fast, no model call.
+        label: Summarize with heuristic
+      llm:
+        desc: Summarize with the model for a higher-quality checkpoint.
+        label: Summarize with LLM
+    subtitle: Manage the context window for this session.
+    subtitle_usage: "%{used} / %{max} — %{pct}% of context window used"
+    title: Context
+    unavailable_no_session: Context controls require an open Octos UI session.
+    unavailable_title: Context unavailable
   cost:
     footer: Enter refresh | Esc close
     item:
@@ -885,16 +1175,23 @@ menu:
     title: Cost
     unavailable_no_session: Usage totals require an open Octos UI session.
     unavailable_title: Cost unavailable
+  empty: No options available
+  filter:
+    placeholder: Filter options
   footer:
     enter_apply_esc_close: Enter apply | Esc close
     enter_run_esc_close: Enter run | Esc close
     esc_back: Esc back
     esc_close: Esc close
+    multi: "Up/Down move | Enter confirm | Esc cancel"
+    select: "Enter accept | Esc cancel | Up/Down move"
   help:
     footer: Enter open/run | Esc close
     search: Filter commands
     subtitle: Commands are resolved by the shared registry.
     title: Slash Commands
+  item:
+    default_suffix: " default"
   keymap:
     item:
       composer_delete_word:
@@ -985,6 +1282,12 @@ menu:
   model:
     footer: Enter select or refresh | Esc close
     item:
+      add:
+        label: "Add a model…"
+        desc: "Pick a model family, model, and provider route, then paste an API key — the same staged flow as onboarding."
+      remove:
+        label: "Remove a model…"
+        desc: "Delete one of this profile's configured models (a broken key or retired model) — add a replacement first if it's the only one."
       cached:
         label: Server model list
       empty:
@@ -994,6 +1297,124 @@ menu:
     search: Filter models
     subtitle: Server-returned profile LLM models.
     title: Model
+  model_remove:
+    title: "Remove a model"
+    subtitle: "Pick a configured model to remove from this profile."
+    item:
+      empty:
+        label: "No configured models"
+        desc: "Refresh models in /model first — only configured models can be removed."
+    confirm:
+      title: "Remove %{model}?"
+      subtitle: "Deletes this entry from the profile's LLM config. Cannot be undone."
+      yes: "Yes, remove %{model}"
+      yes_desc: "Uses profile/llm/delete; the model list refreshes when it completes."
+      no: "No, keep it"
+  model_config:
+    title: "Add a model"
+    subtitle: "Stage a model for this profile: family, model, route, API key — then Test and Save."
+    search: Filter steps
+    unavailable_title: "Model config unavailable"
+    item:
+      fallback:
+        desc: "Append or replace the staged provider under config.llm.fallbacks."
+    preview:
+      title: "Saved models"
+      profile: "profile"
+      primary: "primary"
+      fallbacks: "fallbacks"
+      fallback_n: "fallback %{n}"
+      none: "none"
+      not_loaded: "not loaded — refresh models in /model"
+  onboard_done:
+    title: "You're all set"
+    subtitle: "Brain \"%{profile}\" is ready."
+    subtitle_generic: "Your brain is ready."
+    footer: "Enter select | Esc close"
+    item:
+      ready:
+        label: "Next: start a session with “%{profile}”"
+        desc: "Run `octos-tui` here (this folder is activated for “%{profile}”), or `octos-tui --profile-id %{profile}` from another folder."
+        label_generic: "Next: start a session"
+        desc_generic: "Run `octos-tui` here — this folder is now activated for your brain."
+      open:
+        label: "Open a session here now"
+        desc: "Start working with “%{profile}” in this folder right now — no relaunch needed."
+      exit:
+        label: "Close"
+        desc: "Leave onboarding."
+  launch_prompt:
+    unavailable: "No launch decision is pending."
+    footer: "Enter choose | Up/Down move | Esc cancel"
+    item:
+      cancel:
+        label: "Not now"
+        desc: "Return without opening a session."
+    activate:
+      title: "Activate this folder?"
+      subtitle: "%{cwd}"
+      item:
+        activate:
+          label: "Activate with %{profile}"
+          desc: "Start this folder's conversation for %{profile}."
+    cross:
+      title: "This folder belongs to another brain"
+      subtitle: "%{cwd}"
+      item:
+        start:
+          label: "Start %{profile} here"
+          desc: "Begin a new conversation for %{profile} in this folder."
+        switch:
+          label: "Switch to %{profile}"
+          desc: "Resume this folder's %{profile} conversation."
+  profile_picker:
+    title: "Attach a profile"
+    subtitle: "Pick which local profile to use for this session."
+    search: "Filter profiles"
+    footer: "Enter attach | Up/Down move | Esc close"
+    item:
+      attach:
+        desc: "Attach this profile for the session."
+      create:
+        label: "Create a new profile"
+        desc: "Start onboarding to create a fresh local profile instead."
+  profiles:
+    title: "Profiles"
+    subtitle: "Manage your local profiles — set the default, delete, or create one."
+    footer: "Enter manage | Up/Down move | Esc close"
+    default_marker: "*default"
+    preview_title: "Profiles"
+    preview_hint: "Pick a profile to see its model and set it as default or delete it. Use “Create a new profile” to add one."
+    item:
+      manage:
+        desc: "Open this profile — use it, set default, or delete."
+    actions:
+      title: "Profile"
+      title_named: "Profile: %{profile}"
+      subtitle: "Use this profile, make it the default, or delete it."
+      none: "No profile selected."
+      use: "Open a session here"
+      use_desc: "Switch to this profile — open (or resume) its session in the current folder."
+      set_default: "Set as default"
+      set_default_desc: "Make this the profile a bare launch opens."
+      already_default: "Already the default"
+      delete: "Delete"
+      delete_desc: "Remove this profile's config and data (asks to confirm)."
+      back: "Back"
+    info:
+      title: "About this profile"
+      name: "Profile: %{profile}"
+      model: "Model: %{model}"
+      no_model: "Model: not configured yet"
+      is_default: "Default: yes — a bare launch opens this"
+      not_default: "Default: no"
+    delete:
+      title: "Delete profile?"
+      title_named: "Delete “%{profile}”?"
+      subtitle: "Removes this profile's config and all its data. Cannot be undone."
+      yes: "Yes, delete %{profile}"
+      yes_desc: "Permanently remove this profile and its data."
+      no: "No, keep it"
   onboard:
     family:
       footer: Enter choose family | Esc back
@@ -1072,6 +1493,8 @@ menu:
       save_provider:
         desc: Uses profile/llm/upsert and persists to the same profile JSON as the dashboard.
         label: Save provider to profile
+      save_research_lane:
+        desc: "Saves the staged provider as a deep_research lane (profile/sub_providers/upsert) — you pick which lane next: cheap or strong."
       saved_provider:
         desc: Last successful primary or fallback save
       selected_provider:
@@ -1142,34 +1565,9 @@ menu:
     title: Update Model Permissions
     unavailable_no_session: Permissions require an open Octos UI session.
     unavailable_title: Permissions unavailable
-  provider:
-    item:
-      catalog_refresh:
-        label: Refresh provider catalog
-      list_refresh:
-        label: Refresh configured providers
-      saved_fallback:
-        prefix: Saved fallback %{n}
-      saved_fallback_empty:
-        desc: Use Add fallback model to persist secondary routes.
-        label: 'Saved fallbacks: none'
-      saved_primary:
-        prefix: Saved primary
-      saved_primary_empty:
-        desc: Save a tested provider as primary before opening a coding session.
-        label: 'Saved primary: not set'
-      saved_unloaded:
-        desc: Run Refresh configured providers to read profile/llm/list.
-        label: 'Saved providers: not loaded'
-      staged:
-        desc: Use /provider select <family> <model> <route> [base_url] [api_key_env], or choose a catalog row.
-        label: Staged provider
-    preview_title: Provider State
-    search: Filter providers
-    subtitle: Profile-owned LLM setup; catalog and state come from Octos UI.
-    title: Provider
-    unavailable_title: Providers unavailable
   runtime_preview_title: Runtime
+  search:
+    label: "Search "
   skills:
     item:
       cache_empty:
@@ -1305,3 +1703,4 @@ menu:
     subtitle: Server-owned search, web, browser, and MCP tool settings.
     title: Tool Settings
     unavailable_title: Tool settings unavailable
+  unavailable: Menu unavailable

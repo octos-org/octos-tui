@@ -112,6 +112,11 @@ impl Lang {
     }
 }
 
+/// The stdio backend command a bare launch defaults to (and that
+/// `backend_ensure` auto-provisions). Mirrors the documented
+/// `octos serve --stdio --solo`.
+pub const DEFAULT_STDIO_COMMAND: &str = "octos serve --stdio --solo";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cli {
     /// JSON config file used as launch defaults.
@@ -142,11 +147,41 @@ pub struct Cli {
     pub vim_mode: bool,
 }
 
+/// Version string like `0.2.2-rc.7 (94e43fd 2026-07-17)` — the Cargo version
+/// plus the git short hash + build date captured by `build.rs`. Mirrors the
+/// octos server so an unreleased branch build is distinguishable from the
+/// published release of the same Cargo version (the hash is empty for a build
+/// outside a git checkout, in which case only the bare version is shown).
+fn version_string() -> &'static str {
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    const GIT_HASH: &str = match option_env!("OCTOS_TUI_GIT_HASH") {
+        Some(v) => v,
+        None => "",
+    };
+    const BUILD_DATE: &str = match option_env!("OCTOS_TUI_BUILD_DATE") {
+        Some(v) => v,
+        None => "",
+    };
+    #[allow(clippy::const_is_empty)]
+    if GIT_HASH.is_empty() {
+        VERSION
+    } else {
+        Box::leak(format!("{VERSION} ({GIT_HASH} {BUILD_DATE})").into_boxed_str())
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "octos-tui",
-    version = env!("CARGO_PKG_VERSION"),
-    about = "Mock-backed Octos TUI prototype on the Octos UI Protocol boundary"
+    version = version_string(),
+    about = "Mock-backed Octos TUI prototype on the Octos UI Protocol boundary",
+    // These leading positionals are handled before clap (see `cmd::dispatch`),
+    // so they don't appear as clap subcommands above. (Profiles are created in
+    // the TUI — first-launch onboarding, or `/profiles` → "Create a new profile".)
+    after_help = "Subcommands:\n  \
+        doctor   Diagnose octos-tui's environment, install, and connectivity\n  \
+        update   Update octos-tui in place (or print the upgrade command)\n  \
+        config   Show or locate the TUI config file"
 )]
 struct CliArgs {
     /// JSON config file used as launch defaults. CLI flags override config values.
@@ -316,23 +351,28 @@ impl Cli {
             file_config.readonly.unwrap_or(false)
         };
 
-        // Mode resolution: explicit (CLI flag, then config) always wins.
-        // When neither sets a mode but a transport IS configured
-        // (stdio-command or endpoint), infer Protocol — otherwise
-        // `octos-tui --stdio-command '…'` would silently launch the MOCK
-        // backend and ignore the transport. Mock stays the default only
-        // for a transport-less launch.
-        let mode = args.mode.or(file_config.mode).unwrap_or_else(|| {
-            if stdio_command.is_some() || base_url.is_some() {
-                Mode::Protocol
+        // Mode resolution: an explicit mode (CLI flag, then config) always
+        // wins. With NO explicit mode, default to the real backend
+        // (`Protocol`) — a bare `octos-tui` launch spawns/auto-provisions
+        // `octos serve --stdio` (see `backend_ensure`) rather than the mock
+        // demo. The mock is now reachable only via an explicit `--mode mock`
+        // or `"mode": "mock"` in config.
+        let mode = args.mode.or(file_config.mode).unwrap_or(Mode::Protocol);
+
+        // A Protocol launch with no transport configured (the bare case, or a
+        // lone `--mode protocol`) gets the default stdio command, which
+        // `backend_ensure` provisions. An explicit `--endpoint`/`--stdio-command`
+        // is honored as-is; Mock needs no transport.
+        let stdio_command =
+            if mode == Mode::Protocol && stdio_command.is_none() && base_url.is_none() {
+                Some(DEFAULT_STDIO_COMMAND.to_string())
             } else {
-                Mode::Mock
-            }
-        });
+                stdio_command
+            };
 
         Ok(Self {
             config: args.config,
-            mode,
+            mode: args.mode.or(file_config.mode).unwrap_or(Mode::Mock),
             base_url,
             stdio_command,
             session: args.session.or(file_config.session),
@@ -378,29 +418,45 @@ pub fn load_config_file(path: &Path) -> Result<CliFileConfig> {
 /// session was launched without `--config`) so saved UI settings round-trip on
 /// the next plain launch. `None` when no default path resolves or the file is
 /// absent/unreadable (see [`load_config_file_if_present`]).
+///
+/// A corrupt/unreadable auto-discovered config is NON-FATAL — startup proceeds
+/// with built-in defaults — but the user is told why their saved settings were
+/// ignored, via a prominent stderr notice (an explicit `--config` still
+/// hard-errors, in `from_args`). The notice is produced by the pure loader and
+/// only *printed* here, so its content stays unit-testable without capturing
+/// stderr.
 fn load_default_config_file() -> Option<CliFileConfig> {
-    load_config_file_if_present(&default_config_path()?)
+    let (config, notice) = load_config_file_if_present(&default_config_path()?);
+    if let Some(notice) = notice {
+        eprintln!("{notice}");
+    }
+    config
 }
 
-/// Leniently load an *auto-discovered* config file: a missing file is the
-/// normal first-run case and yields `None`; a present-but-unreadable/corrupt
-/// file must NOT block startup — unlike an explicit `--config`, the user didn't
-/// ask for this file — so we warn and fall back to built-in defaults rather
-/// than propagating the error. (Kept path-injectable so it's testable without
-/// mutating the process-global `$HOME`.)
-fn load_config_file_if_present(path: &Path) -> Option<CliFileConfig> {
+/// Leniently load an *auto-discovered* config file, returning `(maybe-config,
+/// maybe-notice)`. A missing file is the normal first-run case → `(None, None)`.
+/// A present-but-unreadable/corrupt file must NOT block startup — unlike an
+/// explicit `--config`, the user didn't ask for this file — so it yields
+/// `(None, Some(notice))`: no config (the caller falls back to built-in
+/// defaults) plus a user-facing notice (path + parse error + the defaults
+/// fallback) for the caller to surface on stderr. Returning the notice instead
+/// of printing it keeps this pure and unit-testable without capturing stderr,
+/// and keeps it path-injectable (no `$HOME` mutation).
+fn load_config_file_if_present(path: &Path) -> (Option<CliFileConfig>, Option<String>) {
     if !path.exists() {
-        return None;
+        return (None, None);
     }
     match load_config_file(path) {
-        Ok(config) => Some(config),
-        Err(error) => {
-            eprintln!(
-                "warning: ignoring unreadable default TUI config {}: {error}",
-                path.display()
-            );
-            None
-        }
+        Ok(config) => (Some(config), None),
+        // `{error:#}` renders the whole eyre chain — "failed to parse TUI config
+        // <path>: <serde error>" — so the notice carries both the offending path
+        // and the exact parse error, then we name the defaults fallback.
+        Err(error) => (
+            None,
+            Some(format!(
+                "warning: {error:#}. Starting with built-in defaults instead."
+            )),
+        ),
     }
 }
 
@@ -445,6 +501,25 @@ pub fn save_ui_settings(
     scroll_mode: ScrollMode,
     vim_mode: bool,
 ) -> Result<()> {
+    let mut entries = serde_json::Map::new();
+    entries.insert("theme".into(), theme.as_str().into());
+    entries.insert("lang".into(), lang.code().into());
+    entries.insert("scroll-mode".into(), scroll_mode.as_str().into());
+    entries.insert("vim-mode".into(), vim_mode.into());
+    merge_into_config(path, &entries)
+}
+
+/// Merge `entries` (kebab-case config keys → JSON values) into the config file,
+/// PRESERVING whatever is already there: the existing JSON is read as a generic
+/// object and only these keys are patched, so any keys the caller didn't touch
+/// (transport, UI, unknown) survive. A missing or empty file starts from an
+/// empty object. For each kebab key written, the legacy snake_case alias is
+/// dropped so the canonical key is authoritative. This is the one write path
+/// behind both `/saveconfig` (UI keys) and `octos-tui config` (all keys).
+pub fn merge_into_config(
+    path: &Path,
+    entries: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
     let mut root = match fs::read_to_string(path) {
         Ok(contents) if contents.trim().is_empty() => {
             serde_json::Value::Object(serde_json::Map::new())
@@ -457,8 +532,8 @@ pub fn save_ui_settings(
         }
         // Any OTHER read error (permissions, invalid UTF-8, …) must NOT be
         // treated as empty: that would overwrite an existing config with only
-        // the UI keys, dropping the transport/unknown keys it otherwise
-        // preserves. Surface it so the save aborts instead of clobbering.
+        // these keys, dropping the ones it otherwise preserves. Surface it so
+        // the save aborts instead of clobbering.
         Err(error) => {
             return Err(error)
                 .wrap_err_with(|| format!("failed to read TUI config {}", path.display()));
@@ -467,13 +542,22 @@ pub fn save_ui_settings(
     let object = root
         .as_object_mut()
         .ok_or_else(|| eyre!("TUI config {} is not a JSON object", path.display()))?;
-    object.insert("theme".into(), theme.as_str().into());
-    object.insert("lang".into(), lang.code().into());
-    object.insert("scroll-mode".into(), scroll_mode.as_str().into());
-    object.insert("vim-mode".into(), vim_mode.into());
-    // Drop any legacy snake_case aliases so the canonical keys are authoritative.
-    object.remove("scroll_mode");
-    object.remove("vim_mode");
+    for (key, value) in entries {
+        // A `null` value means "remove this key" (JSON-merge-patch semantics),
+        // so the wizard can clear the unused transport when the user picks the
+        // other one; any other value is written as-is.
+        if value.is_null() {
+            object.remove(key);
+        } else {
+            object.insert(key.clone(), value.clone());
+        }
+        // Drop the legacy snake_case alias of any kebab key so the canonical
+        // key stays authoritative (e.g. writing `scroll-mode` removes a stale
+        // `scroll_mode`).
+        if key.contains('-') {
+            object.remove(&key.replace('-', "_"));
+        }
+    }
 
     if let Some(parent) = path
         .parent()
@@ -487,6 +571,13 @@ pub fn save_ui_settings(
     serialized.push('\n');
     fs::write(path, serialized)
         .wrap_err_with(|| format!("failed to write TUI config {}", path.display()))
+}
+
+/// The clap `Command` for the top-level TUI args — exposed so `octos-tui config`
+/// can introspect every option (help text, defaults, enum choices) and stay in
+/// sync as flags are added, rather than hand-mirroring the list.
+pub fn cli_command() -> clap::Command {
+    <CliArgs as clap::CommandFactory>::command()
 }
 
 pub fn parse_websocket_url(value: &str) -> std::result::Result<String, String> {
@@ -597,22 +688,59 @@ mod tests {
     fn default_config_load_is_lenient_and_path_injectable() {
         let path = write_config("default-config", r#"{ "theme": "claude" }"#);
 
-        // Present + valid → loaded (this is what makes /saveconfig round-trip).
-        let cfg = super::load_config_file_if_present(&path).expect("present default config loads");
-        assert_eq!(cfg.theme, Some(ThemeName::Claude));
+        // Present + valid → loaded (this is what makes /saveconfig round-trip),
+        // with no notice.
+        let (cfg, notice) = super::load_config_file_if_present(&path);
+        assert_eq!(
+            cfg.expect("present default config loads").theme,
+            Some(ThemeName::Claude)
+        );
+        assert!(notice.is_none(), "a valid config produces no notice");
 
-        // Absent → None.
+        // Absent → None, silently (the normal first-run case).
         fs::remove_file(&path).expect("remove config");
+        let (cfg, notice) = super::load_config_file_if_present(&path);
+        assert!(cfg.is_none(), "absent default config yields None");
+        assert!(notice.is_none(), "absent config is silent");
+
+        // Present but corrupt → None (skipped, not a fatal startup error) WITH a
+        // user-facing notice.
+        fs::write(&path, "{ not valid json").expect("write corrupt config");
+        let (cfg, notice) = super::load_config_file_if_present(&path);
         assert!(
-            super::load_config_file_if_present(&path).is_none(),
-            "absent default config yields None"
+            cfg.is_none(),
+            "corrupt default config is skipped, not fatal"
+        );
+        assert!(notice.is_some(), "corrupt default config surfaces a notice");
+        let _ = fs::remove_file(&path);
+    }
+
+    // A corrupt auto-discovered config must be NON-FATAL (startup proceeds with
+    // built-in defaults) yet VISIBLE (the user is told why their saved settings
+    // were ignored — the path + the parse error). An explicit `--config` still
+    // hard-errors; that propagation is exercised by `load_config_file` in
+    // `from_args`, e.g. `rejects_model_provider_fields_in_tui_config`.
+    #[test]
+    fn should_surface_a_notice_and_yield_defaults_when_auto_config_is_corrupt() {
+        let path = write_config("corrupt-auto-config", "{ not valid json");
+        let (config, notice) = super::load_config_file_if_present(&path);
+
+        // Non-fatal: no config → the caller falls back to built-in defaults.
+        assert!(
+            config.is_none(),
+            "corrupt auto-config must not block startup"
         );
 
-        // Present but corrupt → None (skipped, not a fatal startup error).
-        fs::write(&path, "{ not valid json").expect("write corrupt config");
+        // Prominent + actionable: names the offending path, the parse error, and
+        // the defaults fallback.
+        let notice = notice.expect("a corrupt auto-config surfaces a user notice");
         assert!(
-            super::load_config_file_if_present(&path).is_none(),
-            "corrupt default config is skipped, not fatal"
+            notice.contains(&path.display().to_string()),
+            "notice names the offending path: {notice}"
+        );
+        assert!(
+            notice.contains("built-in defaults"),
+            "notice explains the defaults fallback: {notice}"
         );
         let _ = fs::remove_file(&path);
     }
@@ -654,71 +782,18 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_mock_mode() {
+    fn should_default_bare_launch_to_stdio_protocol() {
+        // A bare launch (no mode, no transport, no config) now connects to the
+        // real backend over stdio (auto-provisioned) instead of the mock demo.
         let cli = Cli::try_parse_from(["octos-tui"]).expect("cli parses");
 
-        assert_eq!(cli.mode, Mode::Mock);
+        assert_eq!(cli.mode, Mode::Protocol);
         assert!(cli.base_url.is_none());
-        assert!(cli.stdio_command.is_none());
+        assert_eq!(
+            cli.stdio_command.as_deref(),
+            Some(super::DEFAULT_STDIO_COMMAND)
+        );
         assert_eq!(cli.theme, ThemeName::Codex);
-    }
-
-    // A configured transport with no explicit mode must NOT silently
-    // launch the mock backend (the transport flag would be ignored and
-    // the user would chat with fake data). Absent mode + a transport
-    // infers Protocol.
-    #[test]
-    fn should_infer_protocol_mode_when_stdio_command_set_without_mode() {
-        let cli = Cli::try_parse_from(["octos-tui", "--stdio-command", "octos serve --stdio"])
-            .expect("cli parses");
-
-        assert_eq!(cli.mode, Mode::Protocol);
-        assert_eq!(cli.stdio_command.as_deref(), Some("octos serve --stdio"));
-    }
-
-    #[test]
-    fn should_infer_protocol_mode_when_endpoint_set_without_mode() {
-        let cli = Cli::try_parse_from(["octos-tui", "--endpoint", "ws://127.0.0.1:1/ui"])
-            .expect("cli parses");
-
-        assert_eq!(cli.mode, Mode::Protocol);
-        assert_eq!(cli.base_url.as_deref(), Some("ws://127.0.0.1:1/ui"));
-    }
-
-    #[test]
-    fn should_infer_protocol_mode_from_config_transport_without_mode() {
-        let path = write_config(
-            "infer-mode",
-            r#"{ "stdio_command": "octos serve --stdio" }"#,
-        );
-
-        let cli = Cli::try_parse_from(["octos-tui", "--config", path.to_str().unwrap()])
-            .expect("cli parses");
-
-        assert_eq!(cli.mode, Mode::Protocol);
-    }
-
-    #[test]
-    fn explicit_mock_mode_wins_over_transport_inference() {
-        let cli = Cli::try_parse_from([
-            "octos-tui",
-            "--mode",
-            "mock",
-            "--stdio-command",
-            "octos serve --stdio",
-        ])
-        .expect("cli parses");
-
-        assert_eq!(cli.mode, Mode::Mock);
-
-        // Config-level explicit mode also wins over inference.
-        let path = write_config(
-            "explicit-mock",
-            r#"{ "mode": "mock", "stdio_command": "octos serve --stdio" }"#,
-        );
-        let cli = Cli::try_parse_from(["octos-tui", "--config", path.to_str().unwrap()])
-            .expect("cli parses");
-        assert_eq!(cli.mode, Mode::Mock);
     }
 
     #[test]

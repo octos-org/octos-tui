@@ -28,15 +28,16 @@ use crate::menu::{
         APPUI_METHOD_PROFILE_LLM_TEST, APPUI_METHOD_PROFILE_LLM_UPSERT,
         APPUI_METHOD_PROFILE_LOCAL_CREATE, APPUI_METHOD_PROFILE_SKILLS_INSTALL,
         APPUI_METHOD_PROFILE_SKILLS_LIST, APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
-        APPUI_METHOD_PROFILE_SKILLS_REMOVE, APPUI_METHOD_TOOL_CONFIG_DELETE,
+        APPUI_METHOD_PROFILE_SKILLS_REMOVE, APPUI_METHOD_SESSION_COMPACT,
+        APPUI_METHOD_SESSION_COMPACT_MODE_SET, APPUI_METHOD_TOOL_CONFIG_DELETE,
         APPUI_METHOD_TOOL_CONFIG_LIST, APPUI_METHOD_TOOL_CONFIG_SET_ENABLED,
         APPUI_METHOD_TOOL_CONFIG_TEST, APPUI_METHOD_TOOL_CONFIG_UPSERT,
         APPUI_METHOD_TOOL_STATUS_LIST, APPUI_ONBOARDING_METHODS_ANY,
         APPUI_PERMISSION_MENU_METHODS_ANY, APPUI_PROVIDER_MENU_METHODS_ANY,
-        APPUI_TOOL_SETTINGS_MENU_METHODS_ANY, MENU_COST, MENU_HELP, MENU_KEYMAP, MENU_LOGIN,
-        MENU_MCP, MENU_MODEL, MENU_ONBOARD, MENU_ONBOARD_LANGUAGE, MENU_PERMISSIONS, MENU_PROVIDER,
-        MENU_RESUME, MENU_REWIND, MENU_SKILLS, MENU_STATUS, MENU_STATUS_LINE, MENU_THEME,
-        MENU_TITLE, MENU_TOOL_SETTINGS,
+        APPUI_TOOL_SETTINGS_MENU_METHODS_ANY, MENU_COMPACT_CONFIRM, MENU_CONTEXT, MENU_COST,
+        MENU_HELP, MENU_KEYMAP, MENU_LOGIN, MENU_MCP, MENU_MODEL, MENU_MODEL_CONFIG, MENU_ONBOARD,
+        MENU_ONBOARD_LANGUAGE, MENU_PERMISSIONS, MENU_RESUME, MENU_REWIND, MENU_SKILLS,
+        MENU_STATUS, MENU_STATUS_LINE, MENU_THEME, MENU_TITLE, MENU_TOOL_SETTINGS,
     },
 };
 use crate::model::{
@@ -44,9 +45,9 @@ use crate::model::{
     LlmRouteConfig, LlmSelectionConfig, McpConfigDeleteParams, McpConfigEntry, McpConfigListParams,
     McpConfigSetEnabledParams, McpConfigTestParams, McpStatus, McpStatusListParams, ModelStatus,
     OnboardingAction, OnboardingProviderPending, OnboardingProviderSaveTarget,
-    OnboardingProviderStatus, OnboardingWizardState, ProfileLlmCatalogParams, ProfileLlmListParams,
-    ProfileLlmSelectParams, ProfileLlmTestParams, ProfileSkillsInstallParams,
-    ProfileSkillsListParams, ProfileSkillsRemoveParams, RuntimePolicyMcpServer,
+    OnboardingProviderStatus, OnboardingWizardState, ProfileLlmListParams, ProfileLlmSelectParams,
+    ProfileSkillsInstallParams, ProfileSkillsListParams, ProfileSkillsRemoveParams,
+    RuntimePolicyMcpServer, SessionCompactModeParams, SessionCompactParams,
     SessionStatusReadParams, ToolConfigDeleteParams, ToolConfigEntry, ToolConfigListParams,
     ToolConfigSetEnabledParams, ToolConfigTestParams, ToolStatus, ToolStatusListParams,
 };
@@ -61,6 +62,11 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::OnboardModel,
         Provider::OnboardRoute,
         Provider::OnboardWorkspace,
+        Provider::OnboardDone,
+        Provider::ProfilePicker,
+        Provider::ProfileActions,
+        Provider::ProfileDeleteConfirm,
+        Provider::LaunchPrompt,
         Provider::Login,
         Provider::Theme,
         Provider::Thinking,
@@ -70,14 +76,26 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::Keymap,
         Provider::Status,
         Provider::Cost,
+        Provider::CompactConfirm,
+        Provider::Context,
         Provider::Resume,
+        Provider::Agents,
         Provider::Rewind,
         Provider::Model,
-        Provider::Llm,
+        Provider::ModelConfig,
+        Provider::ModelRemove,
+        Provider::ModelRemoveConfirm,
         Provider::Permissions,
         Provider::Mcp,
         Provider::ToolSettings,
         Provider::Skills,
+        Provider::Research,
+        Provider::ResearchRemoveConfirm,
+        Provider::ResearchLaneKey,
+        Provider::Undo,
+        Provider::UndoConfirm,
+        Provider::Sessions,
+        Provider::FilePicker,
     ] {
         registry
             .register_provider(provider)
@@ -90,11 +108,16 @@ pub fn core_menu_registry() -> MenuRegistry {
 enum Provider {
     Help,
     Onboard,
+    ProfilePicker,
+    ProfileActions,
+    ProfileDeleteConfirm,
+    LaunchPrompt,
     OnboardLanguage,
     OnboardFamily,
     OnboardModel,
     OnboardRoute,
     OnboardWorkspace,
+    OnboardDone,
     Login,
     Theme,
     Thinking,
@@ -104,14 +127,26 @@ enum Provider {
     Keymap,
     Status,
     Cost,
+    CompactConfirm,
+    Context,
     Resume,
+    Agents,
     Rewind,
     Model,
-    Llm,
+    ModelConfig,
+    ModelRemove,
+    ModelRemoveConfirm,
     Permissions,
     Mcp,
     ToolSettings,
     Skills,
+    Research,
+    ResearchRemoveConfirm,
+    ResearchLaneKey,
+    FilePicker,
+    Undo,
+    UndoConfirm,
+    Sessions,
 }
 
 impl MenuProvider for Provider {
@@ -119,11 +154,16 @@ impl MenuProvider for Provider {
         MenuId::from(match self {
             Self::Help => MENU_HELP,
             Self::Onboard => MENU_ONBOARD,
+            Self::ProfilePicker => crate::menu::registry::MENU_PROFILE_PICKER,
+            Self::ProfileActions => crate::menu::registry::MENU_PROFILE_ACTIONS,
+            Self::ProfileDeleteConfirm => crate::menu::registry::MENU_PROFILE_DELETE_CONFIRM,
+            Self::LaunchPrompt => crate::menu::registry::MENU_LAUNCH_PROMPT,
             Self::OnboardLanguage => MENU_ONBOARD_LANGUAGE,
             Self::OnboardFamily => crate::menu::registry::MENU_ONBOARD_FAMILY,
             Self::OnboardModel => crate::menu::registry::MENU_ONBOARD_MODEL,
             Self::OnboardRoute => crate::menu::registry::MENU_ONBOARD_ROUTE,
             Self::OnboardWorkspace => crate::menu::registry::MENU_ONBOARD_WORKSPACE,
+            Self::OnboardDone => crate::menu::registry::MENU_ONBOARD_DONE,
             Self::Login => MENU_LOGIN,
             Self::Theme => MENU_THEME,
             Self::Thinking => crate::menu::registry::MENU_THINKING,
@@ -133,14 +173,26 @@ impl MenuProvider for Provider {
             Self::Keymap => MENU_KEYMAP,
             Self::Status => MENU_STATUS,
             Self::Cost => MENU_COST,
+            Self::CompactConfirm => MENU_COMPACT_CONFIRM,
+            Self::Context => MENU_CONTEXT,
             Self::Resume => MENU_RESUME,
+            Self::Agents => crate::menu::registry::MENU_AGENTS,
             Self::Rewind => MENU_REWIND,
             Self::Model => MENU_MODEL,
-            Self::Llm => MENU_PROVIDER,
+            Self::ModelConfig => MENU_MODEL_CONFIG,
+            Self::ModelRemove => crate::menu::registry::MENU_MODEL_REMOVE,
+            Self::ModelRemoveConfirm => crate::menu::registry::MENU_MODEL_REMOVE_CONFIRM,
             Self::Permissions => MENU_PERMISSIONS,
             Self::Mcp => MENU_MCP,
             Self::ToolSettings => MENU_TOOL_SETTINGS,
             Self::Skills => MENU_SKILLS,
+            Self::Research => crate::menu::registry::MENU_RESEARCH,
+            Self::ResearchRemoveConfirm => crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM,
+            Self::ResearchLaneKey => crate::menu::registry::MENU_RESEARCH_LANE_KEY,
+            Self::FilePicker => crate::menu::registry::MENU_FILE_PICKER,
+            Self::Undo => crate::menu::registry::MENU_UNDO,
+            Self::UndoConfirm => crate::menu::registry::MENU_UNDO_CONFIRM,
+            Self::Sessions => crate::menu::registry::MENU_SESSIONS,
         })
     }
 
@@ -148,11 +200,16 @@ impl MenuProvider for Provider {
         match self {
             Self::Help => MenuBuildResult::Ready(help_menu(ctx)),
             Self::Onboard => onboarding_menu(ctx),
+            Self::ProfilePicker => profile_picker_menu(ctx),
+            Self::ProfileActions => profile_actions_menu(ctx),
+            Self::ProfileDeleteConfirm => profile_delete_confirm_menu(ctx),
+            Self::LaunchPrompt => launch_prompt_menu(ctx),
             Self::OnboardLanguage => MenuBuildResult::Ready(onboarding_language_menu()),
             Self::OnboardFamily => onboarding_family_menu(ctx),
             Self::OnboardModel => onboarding_model_menu(ctx),
             Self::OnboardRoute => onboarding_route_menu(ctx),
             Self::OnboardWorkspace => onboarding_workspace_menu(ctx),
+            Self::OnboardDone => onboarding_done_menu(ctx),
             Self::Login => login_menu(ctx),
             Self::Theme => MenuBuildResult::Ready(theme_menu(ctx)),
             Self::Thinking => MenuBuildResult::Ready(thinking_menu(ctx)),
@@ -162,14 +219,26 @@ impl MenuProvider for Provider {
             Self::Keymap => MenuBuildResult::Ready(keymap_menu()),
             Self::Status => MenuBuildResult::Ready(status_menu(ctx)),
             Self::Cost => cost_menu(ctx),
+            Self::CompactConfirm => compact_confirm_menu(ctx),
+            Self::Context => context_menu(ctx),
             Self::Resume => resume_menu(ctx),
+            Self::Agents => agents_menu(ctx),
             Self::Rewind => rewind_menu(ctx),
             Self::Model => model_menu(ctx),
-            Self::Llm => provider_menu(ctx),
+            Self::ModelConfig => model_config_menu(ctx),
+            Self::ModelRemove => model_remove_menu(ctx),
+            Self::ModelRemoveConfirm => model_remove_confirm_menu(ctx),
             Self::Permissions => permissions_menu(ctx),
             Self::Mcp => mcp_menu(ctx),
             Self::ToolSettings => tool_settings_menu(ctx),
             Self::Skills => skills_menu(ctx),
+            Self::Research => research_menu(ctx),
+            Self::ResearchRemoveConfirm => research_remove_confirm_menu(ctx),
+            Self::ResearchLaneKey => research_lane_key_menu(ctx),
+            Self::FilePicker => file_picker_menu(ctx),
+            Self::Undo => undo_menu(ctx),
+            Self::UndoConfirm => undo_confirm_menu(ctx),
+            Self::Sessions => sessions_menu(ctx),
         }
     }
 
@@ -842,11 +911,275 @@ fn cost_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     })
 }
 
+/// A 2-item Yes/No confirm for `/compact`. "Yes" sends `session/compact`
+/// (force-compact the current session); "No" closes the menu. Modeled on
+/// [`cost_menu`]; gated on the server advertising `session/compact` and on a
+/// session being selected.
+fn compact_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let Some(session_id) = ctx.app.selected_session_id.cloned() else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(MENU_COMPACT_CONFIRM),
+            title: t!("menu.compact.unavailable_title").into_owned(),
+            message: t!("menu.compact.unavailable_no_session").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        });
+    };
+
+    if !ctx
+        .availability
+        .supports_method(APPUI_METHOD_SESSION_COMPACT)
+    {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(MENU_COMPACT_CONFIRM),
+            title: t!("menu.compact.unavailable_title").into_owned(),
+            message: method_missing_reason(ctx, APPUI_METHOD_SESSION_COMPACT),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        });
+    }
+
+    let items = vec![
+        MenuItem::new(
+            "compact.confirm",
+            t!("menu.compact.item.confirm.label"),
+            MenuAction::send_appui(AppUiCommand::CompactContext(SessionCompactParams {
+                session_id,
+            })),
+        )
+        .with_description(t!("menu.compact.item.confirm.desc").into_owned()),
+        MenuItem::new(
+            "compact.cancel",
+            t!("menu.compact.item.cancel.label"),
+            MenuAction::Close,
+        ),
+    ];
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(MENU_COMPACT_CONFIRM),
+        title: t!("menu.compact.title").into_owned(),
+        subtitle: Some(t!("menu.compact.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// `/context` — context-window controls. Folds in the former `/compact`
+/// command (now the "Compact now" row, which opens the [`compact_confirm_menu`]
+/// confirm) and adds a session-wide toggle for how compaction summarizes: an
+/// LLM summary vs the heuristic first-lines strip. The chosen mode persists for
+/// the session — auto *and* manual compaction — via `session/compact/mode/set`,
+/// taking precedence over the serve `--llm-compaction` flag.
+fn context_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let Some(session_id) = ctx.app.selected_session_id.cloned() else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(MENU_CONTEXT),
+            title: t!("menu.context.unavailable_title").into_owned(),
+            message: t!("menu.context.unavailable_no_session").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        });
+    };
+
+    if !ctx
+        .availability
+        .supports_method(APPUI_METHOD_SESSION_COMPACT)
+    {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(MENU_CONTEXT),
+            title: t!("menu.context.unavailable_title").into_owned(),
+            message: method_missing_reason(ctx, APPUI_METHOD_SESSION_COMPACT),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        });
+    }
+
+    // "Compact now" is always offered (folds in the former `/compact`). The
+    // mode toggle needs `session/compact/mode/set`; older backends that only
+    // advertise `session/compact` still get a usable menu without dead rows.
+    let mut items = vec![
+        MenuItem::new(
+            "context.compact",
+            t!("menu.context.item.compact.label"),
+            MenuAction::OpenMenu(MenuId::from(MENU_COMPACT_CONFIRM)),
+        )
+        .with_description(t!("menu.context.item.compact.desc").into_owned()),
+    ];
+
+    if ctx
+        .availability
+        .supports_method(APPUI_METHOD_SESSION_COMPACT_MODE_SET)
+    {
+        items.push(
+            MenuItem::new(
+                "context.mode.llm",
+                t!("menu.context.item.llm.label"),
+                MenuAction::send_appui(AppUiCommand::SetCompactionMode(SessionCompactModeParams {
+                    session_id: session_id.clone(),
+                    mode: "llm".to_string(),
+                })),
+            )
+            .with_description(t!("menu.context.item.llm.desc").into_owned()),
+        );
+        items.push(
+            MenuItem::new(
+                "context.mode.heuristic",
+                t!("menu.context.item.heuristic.label"),
+                MenuAction::send_appui(AppUiCommand::SetCompactionMode(SessionCompactModeParams {
+                    session_id,
+                    mode: "heuristic".to_string(),
+                })),
+            )
+            .with_description(t!("menu.context.item.heuristic.desc").into_owned()),
+        );
+    }
+
+    // Live context-window usage in the subtitle: `used / max — pct% …` (e.g.
+    // `128K / 1M — 13% of context window used`), so the operator sees how full
+    // the window is before deciding to compact. Falls back to the static hint
+    // until a token estimate is known for the session.
+    let subtitle = match ctx.app.context_window_usage {
+        Some((used, window)) if window > 0 => {
+            let percent = ((used as f64 / window as f64) * 100.0).round().min(100.0) as u16;
+            t!(
+                "menu.context.subtitle_usage",
+                used = crate::app::format_tokens_human(used),
+                max = crate::app::format_tokens_human(window),
+                pct = percent,
+            )
+            .into_owned()
+        }
+        _ => t!("menu.context.subtitle").into_owned(),
+    };
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(MENU_CONTEXT),
+        title: t!("menu.context.title").into_owned(),
+        subtitle: Some(subtitle),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
 /// `/resume` session picker. Renders `Loading` until the `session/list` result
 /// lands (see `Store::apply_session_list_result` refreshing the open menu),
 /// then one selectable row per prior session — picking a row switches to it and
 /// hydrates its transcript. Modeled on `cost_menu`'s fetch-then-refresh async
 /// pattern; strings are plain English (no new i18n keys), mirroring `/copy`.
+/// `/agents` picker (#323): one row per sub-agent in the active session's
+/// roster — status glyph, name, status, unread dot — Enter switches the main
+/// pane to that agent's live view. Plus a "back to session" row and the Agent
+/// Dock collapse/expand toggle. Purely local: reads the client-side roster
+/// mirror, no AppUI round-trip.
+fn agents_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    if ctx.app.agents.is_empty() {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(crate::menu::registry::MENU_AGENTS),
+            title: t!("menu.agents.unavailable_title").into_owned(),
+            message: t!("menu.agents.unavailable_empty").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        });
+    }
+
+    let mut items = vec![
+        MenuItem::new(
+            "agents.main",
+            format!("⌂ {}", t!("menu.agents.item.main.label")),
+            MenuAction::Local(LocalAction::SwitchChatView(None)),
+        )
+        .with_description(t!("menu.agents.item.main.desc").into_owned()),
+    ];
+    for agent in ctx.app.agents {
+        let name = if agent.nickname.trim().is_empty() {
+            agent.role.clone()
+        } else {
+            agent.nickname.clone()
+        };
+        let unseen = ctx
+            .app
+            .unseen_agent_ids
+            .iter()
+            .any(|id| id == &agent.agent_id);
+        let viewing = ctx.app.chat_view_agent_id == Some(agent.agent_id.as_str());
+        let mut label = format!(
+            "{} {name} — {}",
+            crate::app::agent_status_glyph(&agent.status),
+            agent.status
+        );
+        if unseen {
+            label.push_str(" ●");
+        }
+        if viewing {
+            label.push_str(&format!(" {}", t!("menu.agents.item.viewing_marker")));
+        }
+        let description = [
+            agent.last_task.as_deref(),
+            agent.summary.as_deref(),
+            Some(agent.role.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|text| text.lines())
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string();
+        items.push(
+            MenuItem::new(
+                format!("agents.switch.{}", agent.agent_id),
+                label,
+                MenuAction::Local(LocalAction::SwitchChatView(Some(agent.agent_id.clone()))),
+            )
+            .with_description(description),
+        );
+    }
+    items.push(
+        MenuItem::new(
+            "agents.dock.toggle",
+            if ctx.app.agent_dock_collapsed {
+                t!("menu.agents.item.dock_expand.label").into_owned()
+            } else {
+                t!("menu.agents.item.dock_collapse.label").into_owned()
+            },
+            MenuAction::Local(LocalAction::ToggleAgentDock),
+        )
+        .with_description(t!("menu.agents.item.dock_toggle.desc").into_owned()),
+    );
+
+    let running = ctx
+        .app
+        .agents
+        .iter()
+        .filter(|agent| !crate::model::agent_status_is_terminal(&agent.status))
+        .count();
+    let subtitle = t!(
+        "menu.agents.subtitle",
+        count = ctx.app.agents.len().to_string(),
+        running = running.to_string(),
+        unread = ctx.app.unseen_agent_ids.len().to_string(),
+    )
+    .into_owned();
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_AGENTS),
+        title: t!("menu.agents.title").into_owned(),
+        subtitle: Some(subtitle),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
 fn resume_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     if ctx.app.resume_sessions.is_empty() {
         // Distinguish "the fetch already returned zero sessions" from "the fetch
@@ -1057,8 +1390,19 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     };
     let current_profile = ctx.app.current_profile;
     let local_profile_create = local_profile_create_supported(ctx);
-    if local_profile_create && state.effective_profile_id(current_profile).is_none() {
-        return onboarding_local_profile_menu(state);
+    // "Create a new profile" forces the create step even mid-session, where the
+    // active session's profile would otherwise route the wizard to provider
+    // setup. (Cleared once the profile is created, so the wizard then advances
+    // to setting up the new profile's model.)
+    let force_create = state.creating_new_profile && local_profile_create;
+    if force_create
+        || (local_profile_create && state.effective_profile_id(current_profile).is_none())
+    {
+        return onboarding_local_profile_menu(
+            state,
+            local_profile_requested_id_supported(ctx),
+            local_profile_make_default_supported(ctx),
+        );
     }
     if state.effective_profile_id(current_profile).is_some() {
         return onboarding_provider_setup_menu(ctx, state, current_profile);
@@ -1237,14 +1581,22 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         )),
         MenuItem::new(
             "onboard.provider.save",
-            t!("menu.onboard.item.save_provider.label"),
+            if state.research_lane_intent {
+                t!("onboarding.provider.save_research_lane").into_owned()
+            } else {
+                t!("menu.onboard.item.save_provider.label").into_owned()
+            },
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SaveProvider)),
         )
-        .with_description(t!("menu.onboard.item.save_provider.desc"))
+        .with_description(if state.research_lane_intent {
+            t!("menu.onboard.item.save_research_lane.desc").into_owned()
+        } else {
+            t!("menu.onboard.item.save_provider.desc").into_owned()
+        })
         .maybe_disabled(onboarding_provider_disabled_reason(
             ctx,
             state,
-            APPUI_METHOD_PROFILE_LLM_UPSERT,
+            onboarding_save_capability_method(state),
         )),
         MenuItem::new(
             "onboard.providers.refresh",
@@ -1294,6 +1646,437 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     })
 }
 
+/// Phase 3 startup picker: "attach which profile?". Lists the local profiles
+/// discovered at launch; selecting one attaches it (via `SetProfileId`, the
+/// same path `/onboard profile <id>` uses) and the wizard advances straight to
+/// provider setup for that profile. A trailing row starts a fresh profile
+/// through the normal onboarding create step. Only reached when more than one
+/// profile exists and no `--profile-id` was pinned (see
+/// `maybe_open_onboarding_on_first_launch`).
+fn profile_picker_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let onboarding = ctx.app.onboarding;
+    let profiles = onboarding
+        .map(|onboarding| onboarding.available_profiles.as_slice())
+        .unwrap_or(&[]);
+    let default = onboarding.and_then(|onboarding| onboarding.default_profile.as_deref());
+
+    let mut items: Vec<MenuItem> = profiles
+        .iter()
+        .enumerate()
+        .map(|(index, profile)| {
+            // Mark the machine default with a trailing `*default`.
+            let label = if default == Some(profile.as_str()) {
+                format!("{profile}  {}", t!("menu.profiles.default_marker"))
+            } else {
+                profile.clone()
+            };
+            // Selecting a profile drills into its per-profile action menu (info
+            // in the right pane + set-default / delete); "use it" is a row there.
+            let mut item = MenuItem::new(
+                format!("profile.pick.{index}"),
+                label,
+                MenuAction::Local(LocalAction::SelectProfileForActions(profile.clone())),
+            )
+            .with_description(t!("menu.profiles.item.manage.desc"));
+            if let Some(shortcut) = numeric_shortcut(index) {
+                item = item.with_shortcut(shortcut);
+            }
+            item
+        })
+        .collect();
+
+    items.push(
+        MenuItem::new(
+            "profile.pick.new",
+            t!("menu.profile_picker.item.create.label"),
+            // Reset the wizard to a clean slate, then open the create step
+            // (Name-this-profile) — so it starts FRESH rather than resuming the
+            // active profile's already-configured setup.
+            MenuAction::Local(LocalAction::CreateNewProfile),
+        )
+        .with_description(t!("menu.profile_picker.item.create.desc")),
+    );
+    items.push(
+        MenuItem::new(
+            "profile.pick.exit",
+            t!("menu.onboard.item.exit.label"),
+            MenuAction::Local(LocalAction::Exit),
+        )
+        .with_description(t!("menu.onboard.item.exit.desc")),
+    );
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_PROFILE_PICKER),
+        title: t!("menu.profiles.title").into_owned(),
+        subtitle: Some(t!("menu.profiles.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: profiles.len() > 8,
+        search_placeholder: Some(t!("menu.profile_picker.search").into_owned()),
+        footer_hint: Some(t!("menu.profiles.footer").into_owned()),
+        preview: Some(MenuPreview::Text {
+            title: Some(t!("menu.profiles.preview_title").into_owned()),
+            body: t!("menu.profiles.preview_hint").into_owned(),
+        }),
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Per-profile action drill-in: shows the selected profile's info in the right
+/// pane and offers Use / Set-default / Delete. Reached from the profiles list.
+fn profile_actions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let onboarding = ctx.app.onboarding;
+    let Some(profile) = onboarding.and_then(|onboarding| onboarding.selected_profile.clone())
+    else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(crate::menu::registry::MENU_PROFILE_ACTIONS),
+            title: t!("menu.profiles.actions.title").into_owned(),
+            message: t!("menu.profiles.actions.none").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        });
+    };
+    let is_default =
+        onboarding.and_then(|o| o.default_profile.as_deref()) == Some(profile.as_str());
+
+    let mut items = vec![
+        MenuItem::new(
+            "profile.action.use",
+            t!("menu.profiles.actions.use"),
+            MenuAction::Local(LocalAction::SwitchToProfile(profile.clone())),
+        )
+        .with_description(t!("menu.profiles.actions.use_desc")),
+    ];
+    let set_default = MenuItem::new(
+        "profile.action.default",
+        t!("menu.profiles.actions.set_default"),
+        MenuAction::Local(LocalAction::SetProfileDefault(profile.clone())),
+    )
+    .with_description(t!("menu.profiles.actions.set_default_desc"));
+    items.push(if is_default {
+        set_default.maybe_disabled(Some(
+            t!("menu.profiles.actions.already_default").into_owned(),
+        ))
+    } else {
+        set_default
+    });
+    items.push(
+        MenuItem::new(
+            "profile.action.delete",
+            t!("menu.profiles.actions.delete"),
+            MenuAction::Local(LocalAction::RequestDeleteProfile(profile.clone())),
+        )
+        .with_description(t!("menu.profiles.actions.delete_desc")),
+    );
+    items.push(MenuItem::new(
+        "profile.action.back",
+        t!("menu.profiles.actions.back"),
+        MenuAction::Close,
+    ));
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_PROFILE_ACTIONS),
+        title: t!(
+            "menu.profiles.actions.title_named",
+            profile = profile.clone()
+        )
+        .into_owned(),
+        subtitle: Some(t!("menu.profiles.actions.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        preview: Some(profile_info_preview(onboarding, &profile, is_default)),
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Right-pane info for a profile: its model summary + default status.
+fn profile_info_preview(
+    onboarding: Option<&OnboardingWizardState>,
+    profile: &str,
+    is_default: bool,
+) -> MenuPreview {
+    let mut body = t!("menu.profiles.info.name", profile = profile.to_string()).into_owned();
+    let model = onboarding
+        .and_then(|o| o.profiles_data_dir.as_deref())
+        .and_then(|dir| {
+            crate::profiles::profile_llm_summary(
+                &std::path::Path::new(dir).join("profiles"),
+                profile,
+            )
+        });
+    body.push('\n');
+    match model {
+        Some(model) => body.push_str(&t!("menu.profiles.info.model", model = model)),
+        None => body.push_str(&t!("menu.profiles.info.no_model")),
+    }
+    body.push('\n');
+    body.push_str(&if is_default {
+        t!("menu.profiles.info.is_default")
+    } else {
+        t!("menu.profiles.info.not_default")
+    });
+    MenuPreview::Text {
+        title: Some(t!("menu.profiles.info.title").into_owned()),
+        body,
+    }
+}
+
+/// Yes/No confirm for deleting the selected profile (destructive).
+fn profile_delete_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let Some(profile) = ctx
+        .app
+        .onboarding
+        .and_then(|onboarding| onboarding.selected_profile.clone())
+    else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(crate::menu::registry::MENU_PROFILE_DELETE_CONFIRM),
+            title: t!("menu.profiles.delete.title").into_owned(),
+            message: t!("menu.profiles.actions.none").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        });
+    };
+    let items = vec![
+        MenuItem::new(
+            "profile.delete.yes",
+            t!("menu.profiles.delete.yes", profile = profile.clone()),
+            MenuAction::Local(LocalAction::ConfirmDeleteProfile(profile.clone())),
+        )
+        .with_description(t!("menu.profiles.delete.yes_desc")),
+        MenuItem::new(
+            "profile.delete.no",
+            t!("menu.profiles.delete.no"),
+            MenuAction::Close,
+        ),
+    ];
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_PROFILE_DELETE_CONFIRM),
+        title: t!(
+            "menu.profiles.delete.title_named",
+            profile = profile.clone()
+        )
+        .into_owned(),
+        subtitle: Some(t!("menu.profiles.delete.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Per-project launch prompt (Model A). Renders the Activate / CrossProfile
+/// choice raised from a `launch/resolve` decision: Activate confirms opening the
+/// resolved brain in an as-yet-unused folder; CrossProfile offers to start the
+/// launching brain here or switch to one already used in this folder. Every
+/// choice sends `session/open` carrying this folder's cwd so the session lands
+/// in the folder's per-project store. Renders Unavailable if no prompt is
+/// staged (defensive — the store only opens this menu with one set).
+fn launch_prompt_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let Some(prompt) = ctx
+        .app
+        .onboarding
+        .and_then(|onboarding| onboarding.launch_prompt.as_ref())
+    else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec::new(
+            MenuId::from(crate::menu::registry::MENU_LAUNCH_PROMPT),
+            t!("menu.launch_prompt.activate.title").into_owned(),
+            t!("menu.launch_prompt.unavailable").into_owned(),
+        ));
+    };
+
+    let open_session = |profile: &str| -> MenuAction {
+        let session_id =
+            octos_core::SessionKey::with_profile_topic(profile, "local", "tui", "coding");
+        MenuAction::send_appui(AppUiCommand::OpenSession(
+            octos_core::ui_protocol::SessionOpenParams {
+                session_id,
+                topic: None,
+                profile_id: Some(profile.to_owned()),
+                cwd: Some(prompt.cwd.clone()),
+                sandbox: None,
+                after: None,
+            },
+        ))
+    };
+
+    let (title, subtitle, mut items) = match prompt.decision {
+        crate::model::LaunchDecisionKind::Activate => {
+            let mut activate = MenuItem::new(
+                "launch.activate",
+                t!(
+                    "menu.launch_prompt.activate.item.activate.label",
+                    profile = prompt.resolved_profile.clone()
+                ),
+                open_session(&prompt.resolved_profile),
+            )
+            .with_description(t!(
+                "menu.launch_prompt.activate.item.activate.desc",
+                profile = prompt.resolved_profile.clone()
+            ));
+            if let Some(shortcut) = numeric_shortcut(0) {
+                activate = activate.with_shortcut(shortcut);
+            }
+            (
+                t!("menu.launch_prompt.activate.title").into_owned(),
+                t!(
+                    "menu.launch_prompt.activate.subtitle",
+                    cwd = prompt.cwd.clone()
+                )
+                .into_owned(),
+                vec![activate],
+            )
+        }
+        // CrossProfile (and any non-Activate decision that reached the prompt):
+        // "start the launching brain here" first, then one switch row per
+        // profile already used in this folder.
+        _ => {
+            let mut items = vec![
+                MenuItem::new(
+                    "launch.start",
+                    t!(
+                        "menu.launch_prompt.cross.item.start.label",
+                        profile = prompt.resolved_profile.clone()
+                    ),
+                    open_session(&prompt.resolved_profile),
+                )
+                .with_description(t!(
+                    "menu.launch_prompt.cross.item.start.desc",
+                    profile = prompt.resolved_profile.clone()
+                )),
+            ];
+            for (index, existing) in prompt.existing_profiles.iter().enumerate() {
+                let mut item = MenuItem::new(
+                    format!("launch.switch.{index}"),
+                    t!(
+                        "menu.launch_prompt.cross.item.switch.label",
+                        profile = existing.clone()
+                    ),
+                    open_session(existing),
+                )
+                .with_description(t!(
+                    "menu.launch_prompt.cross.item.switch.desc",
+                    profile = existing.clone()
+                ));
+                // Reserve shortcut 1 for "start here"; switch rows follow.
+                if let Some(shortcut) = numeric_shortcut(index + 1) {
+                    item = item.with_shortcut(shortcut);
+                }
+                items.push(item);
+            }
+            (
+                t!("menu.launch_prompt.cross.title").into_owned(),
+                t!(
+                    "menu.launch_prompt.cross.subtitle",
+                    cwd = prompt.cwd.clone()
+                )
+                .into_owned(),
+                items,
+            )
+        }
+    };
+
+    items.push(
+        MenuItem::new(
+            "launch.cancel",
+            t!("menu.launch_prompt.item.cancel.label"),
+            MenuAction::Local(LocalAction::Exit),
+        )
+        .with_description(t!("menu.launch_prompt.item.cancel.desc")),
+    );
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_LAUNCH_PROMPT),
+        title,
+        subtitle: Some(subtitle),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.launch_prompt.footer").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Terminal onboarding screen on a launch-flow server (Model A). The profile and
+/// its LLM provider are already set up, so onboarding ends here with launch
+/// instructions instead of staging a workspace or opening a session —
+/// launch-time activation (`launch/resolve`) opens the session on the next
+/// start. Renders an Exit row to leave the wizard. Reached only when
+/// [`launch_flow_supported`] (older servers keep the workspace/Activate step).
+fn onboarding_done_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let profile = ctx
+        .app
+        .onboarding
+        .and_then(|onboarding| onboarding.effective_profile_id(ctx.app.current_profile))
+        .unwrap_or_default();
+    let subtitle = if profile.is_empty() {
+        t!("menu.onboard_done.subtitle_generic").into_owned()
+    } else {
+        t!("menu.onboard_done.subtitle", profile = profile).into_owned()
+    };
+    // Name the concrete command to start a session with this profile, rather
+    // than a vague "relaunch Octos here" (user feedback).
+    let (ready_label, ready_desc) = if profile.is_empty() {
+        (
+            t!("menu.onboard_done.item.ready.label_generic").into_owned(),
+            t!("menu.onboard_done.item.ready.desc_generic").into_owned(),
+        )
+    } else {
+        (
+            t!("menu.onboard_done.item.ready.label", profile = &profile).into_owned(),
+            t!("menu.onboard_done.item.ready.desc", profile = &profile).into_owned(),
+        )
+    };
+    let mut items = vec![
+        MenuItem::new("onboard.done.status", ready_label, MenuAction::Noop)
+            .with_description(ready_desc)
+            // A read-only "what's next" instruction, not an action: mark it
+            // non-selectable so the cursor skips it (the action rows below act).
+            .with_state(MenuItemState {
+                non_selectable: true,
+                ..MenuItemState::default()
+            }),
+    ];
+    // Skip the relaunch: open a session on the just-created profile in this
+    // folder right now (the cursor lands here — the primary next step). Same
+    // `session/open` the launch-time "Activate this folder?" prompt does.
+    if !profile.is_empty() {
+        items.push(
+            MenuItem::new(
+                "onboard.done.open_session",
+                t!("menu.onboard_done.item.open.label"),
+                MenuAction::Local(LocalAction::SwitchToProfile(profile.clone())),
+            )
+            .with_description(t!("menu.onboard_done.item.open.desc", profile = &profile)),
+        );
+    }
+    items.push(
+        MenuItem::new(
+            "onboard.done.exit",
+            t!("menu.onboard_done.item.exit.label"),
+            MenuAction::Local(LocalAction::Exit),
+        )
+        .with_description(t!("menu.onboard_done.item.exit.desc")),
+    );
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_ONBOARD_DONE),
+        title: t!("menu.onboard_done.title").into_owned(),
+        subtitle: Some(subtitle),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.onboard_done.footer").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
 fn onboarding_provider_setup_menu(
     ctx: &MenuContext<'_>,
     state: &OnboardingWizardState,
@@ -1303,169 +2086,74 @@ fn onboarding_provider_setup_menu(
     // provider) are `Noop` — the user can't act on them by selecting — so they
     // move to the right info pane (`onboarding_provider_preview`) and the left
     // list holds only the actionable provider-config rows.
-    let mut items = vec![
-        MenuItem::new(
-            "onboard.catalog.refresh",
-            if ctx.app.profile_llm_catalog.is_some() {
-                t!("menu.onboard.item.catalog_reload.label")
-            } else {
-                t!("menu.onboard.item.catalog_load.label")
-            },
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::RefreshCatalog)),
-        )
-        .with_description(t!("menu.onboard.item.catalog_load.desc"))
-        .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG)),
-    ];
+    //
+    // The staged rows themselves are shared with the mid-session
+    // `MENU_MODEL_CONFIG` surface (`/model` → "Add a model"). Onboarding hides
+    // the fallback save: first-run is about getting ONE model working, and the
+    // fallback concept confused users here — fallbacks live on the mid-session
+    // surface.
+    let mut items = provider_config_rows(
+        ctx,
+        state,
+        current_profile,
+        ProviderConfigRowOpts {
+            include_fallback: false,
+            api_key_edit_prefix: "/onboard key ",
+        },
+    );
 
-    let saved_primary = onboarding_saved_primary(ctx, state, current_profile);
-
-    items.extend([
-        MenuItem::new(
-            "onboard.provider.family",
-            format!(
-                "{}: {}",
-                t!("menu.onboard.item.family.label"),
-                onboarding_family_label(state, saved_primary)
-            ),
-            MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY)),
-        )
-        .with_description(t!("menu.onboard.item.family.desc"))
-        .with_state(MenuItemState::required(
-            !state.provider.family_id.trim().is_empty(),
-        )),
-        MenuItem::new(
-            "onboard.provider.model",
-            format!(
-                "{}: {}",
-                t!("menu.onboard.item.model.label"),
-                onboarding_model_label(state, saved_primary)
-            ),
-            MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL)),
-        )
-        .with_description(t!("menu.onboard.item.model.desc"))
-        .with_state(MenuItemState::required(
-            !state.provider.model_id.trim().is_empty(),
-        ))
-        .maybe_disabled({
-            state
-                .provider
-                .family_id
-                .trim()
-                .is_empty()
-                .then(|| t!("onboarding.disabled.choose_family_first").into_owned())
-        }),
-        MenuItem::new(
-            "onboard.provider.route",
-            format!(
-                "{}: {}",
-                t!("menu.onboard.item.route.label"),
-                onboarding_route_label(state, saved_primary)
-            ),
-            MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE)),
-        )
-        .with_description(t!("menu.onboard.item.route.desc"))
-        .with_state(MenuItemState::required(
-            !state.provider.route.route_id.trim().is_empty(),
-        ))
-        .maybe_disabled(
-            (!onboarding_model_selected(state))
-                .then(|| t!("onboarding.disabled.choose_family_model_first").into_owned()),
-        ),
-    ]);
-
-    // Draft-first, saved-fallback for the API key row: a key already saved in
-    // the profile (server-confirmed `has_api_key`) must not read as "not set".
-    let api_key_display = if state.has_api_key() {
-        Some(state.api_key_label().to_string())
-    } else if saved_primary.is_some_and(|provider| provider.has_api_key) {
-        Some(t!("onboarding.api_key_saved").into_owned())
-    } else {
-        None
-    };
-    let api_key_present = api_key_display.is_some();
-
-    items.extend([
-        onboarding_edit_item(
-            "onboard.provider.key",
-            t!("menu.onboard.item.api_key.label").as_ref(),
-            api_key_display.as_deref(),
-            "/onboard key ",
-        )
-        .with_state(MenuItemState::required(api_key_present))
-        .maybe_disabled(
-            (!state.selection_ready())
-                .then(|| t!("onboarding.disabled.choose_provider_first").into_owned()),
-        ),
-        MenuItem::new(
-            "onboard.provider.test",
-            onboarding_provider_test_label(state),
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::TestProvider)),
-        )
-        .with_description(t!("menu.onboard.item.verify_provider.desc"))
-        .with_state(onboarding_provider_test_state(state))
-        .maybe_disabled(onboarding_provider_disabled_reason(
-            ctx,
-            state,
-            APPUI_METHOD_PROFILE_LLM_TEST,
-        )),
-        MenuItem::new(
-            "onboard.provider.save",
-            onboarding_provider_save_label(state),
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SaveProvider)),
-        )
-        .with_description(t!("menu.onboard.item.persist_provider.desc"))
-        .with_state(onboarding_provider_save_state(state))
-        .maybe_disabled(onboarding_provider_disabled_reason(
-            ctx,
-            state,
-            APPUI_METHOD_PROFILE_LLM_UPSERT,
-        )),
-        MenuItem::new(
-            "onboard.provider.fallback",
-            onboarding_provider_fallback_label(state),
-            MenuAction::Local(LocalAction::Onboarding(
-                OnboardingAction::SaveProviderFallback,
-            )),
-        )
-        .with_description(t!("menu.onboard.item.fallback_provider.desc"))
-        .with_state(onboarding_provider_save_state(state))
-        .maybe_disabled(onboarding_provider_disabled_reason(
-            ctx,
-            state,
-            APPUI_METHOD_PROFILE_LLM_UPSERT,
-        )),
-        // UX2 B.2: workspace staging + validation moved to its OWN step screen
-        // (`MENU_ONBOARD_WORKSPACE`). This provider menu now configures the LLM
-        // provider/model only; the user continues to the workspace screen,
-        // which also owns the final Activate action. Disabled until a provider
-        // is saved so the steps stay ordered.
-        {
+    // Terminal workspace/Activate + Exit rows — SKIPPED in the `/research add`
+    // lane flow: a lane save has no workspace/Activate phase (it saves a lane,
+    // not a profile) and always runs with an active session, so Esc backs out
+    // normally and no Exit escape hatch is needed. Gated on `research_lane_intent`
+    // so first-launch onboarding (intent = false) is unchanged.
+    if !state.research_lane_intent {
+        // Terminal step (always shown — collapsed or expanded). On a launch-flow
+        // server (Model A) the provider step ends at the launch-instructions screen
+        // (`MENU_ONBOARD_DONE`) — the redundant workspace/Activate screen is skipped
+        // and launch-time activation opens the session on the next start. Older
+        // servers keep the workspace step (`MENU_ONBOARD_WORKSPACE`), which owns the
+        // final Activate. Either way it is disabled until a provider is saved so the
+        // steps stay ordered.
+        items.push({
             let blocked = (!onboarding_has_saved_primary_provider(ctx, state, current_profile))
                 .then(|| t!("onboarding.wizard.workspace_locked_reason").into_owned());
-            MenuItem::new(
-                "onboard.workspace.open",
-                t!("onboarding.wizard.workspace_open_label"),
-                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_WORKSPACE)),
-            )
-            .with_description(t!("onboarding.wizard.workspace_open_description"))
-            .with_state(MenuItemState::required(
-                state.workspace_validation.is_valid(),
-            ))
-            .maybe_disabled(blocked)
-        },
-    ]);
+            if launch_flow_supported(ctx) {
+                MenuItem::new(
+                    "onboard.done.open",
+                    t!("onboarding.wizard.finish_label"),
+                    MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_DONE)),
+                )
+                .with_description(t!("onboarding.wizard.finish_description"))
+                .maybe_disabled(blocked)
+            } else {
+                MenuItem::new(
+                    "onboard.workspace.open",
+                    t!("onboarding.wizard.workspace_open_label"),
+                    MenuAction::OpenMenu(MenuId::from(
+                        crate::menu::registry::MENU_ONBOARD_WORKSPACE,
+                    )),
+                )
+                .with_description(t!("onboarding.wizard.workspace_open_description"))
+                .with_state(MenuItemState::required(
+                    state.workspace_validation.is_valid(),
+                ))
+                .maybe_disabled(blocked)
+            }
+        });
 
-    // Same escape hatch as the create-profile step: this menu also lives under
-    // the root MENU_ONBOARD id, where Esc is swallowed while no session is
-    // open — without a visible Exit row the user would be trapped here.
-    items.push(
-        MenuItem::new(
-            "onboard.local.exit",
-            t!("menu.onboard.item.exit.label"),
-            MenuAction::Local(LocalAction::Exit),
-        )
-        .with_description(t!("menu.onboard.item.exit.desc")),
-    );
+        // Same escape hatch as the create-profile step: this menu also lives under
+        // the root MENU_ONBOARD id, where Esc is swallowed while no session is
+        // open — without a visible Exit row the user would be trapped here.
+        items.push(
+            MenuItem::new(
+                "onboard.local.exit",
+                t!("menu.onboard.item.exit.label"),
+                MenuAction::Local(LocalAction::Exit),
+            )
+            .with_description(t!("menu.onboard.item.exit.desc")),
+        );
+    }
 
     for (idx, item) in items.iter_mut().enumerate() {
         if let Some(shortcut) = numeric_shortcut(idx) {
@@ -1498,6 +2186,481 @@ fn onboarding_provider_setup_menu(
             state,
             current_profile,
         )),
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Options for the shared staged model-config rows ([`provider_config_rows`]).
+struct ProviderConfigRowOpts {
+    /// Show the "Save as fallback" row. Only the mid-session surface sets this
+    /// — onboarding deliberately hides fallbacks (first-run is about ONE
+    /// working model).
+    include_fallback: bool,
+    /// Composer draft prefix for the API-key edit row (`"/onboard key "` in
+    /// the wizard, `"/add-model key "` mid-session — both inline forms route
+    /// to `OnboardingAction::SetApiKey`).
+    api_key_edit_prefix: &'static str,
+}
+
+/// The staged model-config rows shared by the onboarding wizard's provider
+/// step and the mid-session `MENU_MODEL_CONFIG` surface: a collapsed
+/// "Add a model"/"Add another model" entry that expands — while a not-yet-saved
+/// selection is staged — into family/model/route pickers plus API key / Test /
+/// Save (and optionally Save-as-fallback).
+///
+/// Row ids stay `onboard.provider.*` VERBATIM under BOTH menus:
+/// `focus_provider_api_key_row` / `focus_provider_start_row` and the post-save
+/// collapse/refocus in `apply_profile_llm_mutation_event` key on these ids
+/// regardless of which surface is active, so the whole save flow works
+/// unchanged wherever the rows are rendered.
+fn provider_config_rows(
+    ctx: &MenuContext<'_>,
+    state: &OnboardingWizardState,
+    current_profile: Option<&str>,
+    opts: ProviderConfigRowOpts,
+) -> Vec<MenuItem> {
+    let saved_primary = onboarding_saved_primary(ctx, state, current_profile);
+
+    // Profile↔model decoupling (user feedback: "collapse to one Add model").
+    // The detailed model config stays behind a single "Add a model" entry. It
+    // expands to the family/model/route/key/save rows ONLY while the user is
+    // actively setting up a model — i.e. a staged selection that is NOT yet the
+    // saved primary. A profile whose provider is already saved (or freshly
+    // saved, or resumed) collapses back to "Add another model", rather than
+    // dumping the raw form (which reads as "no Add-a-model option").
+    let has_staged = !state.provider.family_id.trim().is_empty();
+    // The staged selection has already been saved as this profile's primary
+    // when EITHER: the session just saved this exact selection (its label
+    // matches `saved_primary_provider_label`, set only on a primary save and
+    // never reset by re-staging), OR the server reports a matching saved
+    // primary (a resumed/hydrated profile). Comparing labels/ids — not just a
+    // "was anything ever saved" flag — is what lets staging a DIFFERENT model
+    // still expand (add another / fallback).
+    let staged_label = state.provider_label();
+    let staged_is_saved_primary = has_staged
+        && (state.saved_primary_provider_label.as_deref() == Some(staged_label.as_str())
+            || saved_primary.is_some_and(|saved| {
+                saved.family_id.as_deref() == Some(state.provider.family_id.trim())
+                    && saved.model_id.as_deref() == Some(state.provider.model_id.trim())
+            }));
+    let configuring = has_staged && !staged_is_saved_primary;
+
+    let mut items: Vec<MenuItem> = Vec::new();
+    if !configuring {
+        // "Add another model" once a primary exists (you can add a fallback or
+        // replace it); plain "Add a model" on a fresh profile.
+        let (label, desc) = if saved_primary.is_some() {
+            (
+                t!("onboarding.provider.add_another_model_label"),
+                t!("onboarding.provider.add_another_model_desc"),
+            )
+        } else {
+            (
+                t!("onboarding.provider.add_model_label"),
+                t!("onboarding.provider.add_model_desc"),
+            )
+        };
+        items.push(
+            MenuItem::new(
+                "onboard.provider.add_model",
+                label,
+                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY)),
+            )
+            .with_description(desc)
+            .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG)),
+        );
+    }
+
+    if configuring {
+        items.push(
+            MenuItem::new(
+                "onboard.catalog.refresh",
+                if ctx.app.profile_llm_catalog.is_some() {
+                    t!("menu.onboard.item.catalog_reload.label")
+                } else {
+                    t!("menu.onboard.item.catalog_load.label")
+                },
+                MenuAction::Local(LocalAction::Onboarding(OnboardingAction::RefreshCatalog)),
+            )
+            .with_description(t!("menu.onboard.item.catalog_load.desc"))
+            .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG)),
+        );
+
+        items.extend([
+            MenuItem::new(
+                "onboard.provider.family",
+                format!(
+                    "{}: {}",
+                    t!("menu.onboard.item.family.label"),
+                    onboarding_family_label(state, saved_primary)
+                ),
+                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY)),
+            )
+            .with_description(t!("menu.onboard.item.family.desc"))
+            .with_state(MenuItemState::required(
+                !state.provider.family_id.trim().is_empty(),
+            )),
+            MenuItem::new(
+                "onboard.provider.model",
+                format!(
+                    "{}: {}",
+                    t!("menu.onboard.item.model.label"),
+                    onboarding_model_label(state, saved_primary)
+                ),
+                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL)),
+            )
+            .with_description(t!("menu.onboard.item.model.desc"))
+            .with_state(MenuItemState::required(
+                !state.provider.model_id.trim().is_empty(),
+            ))
+            .maybe_disabled({
+                state
+                    .provider
+                    .family_id
+                    .trim()
+                    .is_empty()
+                    .then(|| t!("onboarding.disabled.choose_family_first").into_owned())
+            }),
+            MenuItem::new(
+                "onboard.provider.route",
+                format!(
+                    "{}: {}",
+                    t!("menu.onboard.item.route.label"),
+                    onboarding_route_label(state, saved_primary)
+                ),
+                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE)),
+            )
+            .with_description(t!("menu.onboard.item.route.desc"))
+            .with_state(MenuItemState::required(
+                !state.provider.route.route_id.trim().is_empty(),
+            ))
+            .maybe_disabled(
+                (!onboarding_model_selected(state))
+                    .then(|| t!("onboarding.disabled.choose_family_model_first").into_owned()),
+            ),
+        ]);
+
+        // Draft-first, saved-fallback for the API key row: a key already saved in
+        // the profile (server-confirmed `has_api_key`) must not read as "not set".
+        let api_key_display = if state.has_api_key() {
+            Some(state.api_key_label().to_string())
+        } else if saved_primary.is_some_and(|provider| provider.has_api_key) {
+            Some(t!("onboarding.api_key_saved").into_owned())
+        } else {
+            None
+        };
+        let api_key_present = api_key_display.is_some();
+
+        items.extend([
+            onboarding_edit_item(
+                "onboard.provider.key",
+                t!("menu.onboard.item.api_key.label").as_ref(),
+                api_key_display.as_deref(),
+                opts.api_key_edit_prefix,
+            )
+            .with_state(MenuItemState::required(api_key_present))
+            .maybe_disabled(
+                (!state.selection_ready())
+                    .then(|| t!("onboarding.disabled.choose_provider_first").into_owned()),
+            ),
+            MenuItem::new(
+                "onboard.provider.test",
+                onboarding_provider_test_label(state),
+                MenuAction::Local(LocalAction::Onboarding(OnboardingAction::TestProvider)),
+            )
+            .with_description(t!("menu.onboard.item.verify_provider.desc"))
+            .with_state(onboarding_provider_test_state(state))
+            .maybe_disabled(onboarding_provider_disabled_reason(
+                ctx,
+                state,
+                APPUI_METHOD_PROFILE_LLM_TEST,
+            )),
+            MenuItem::new(
+                "onboard.provider.save",
+                onboarding_provider_save_label(state),
+                MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SaveProvider)),
+            )
+            .with_description(if state.research_lane_intent {
+                t!("menu.onboard.item.save_research_lane.desc").into_owned()
+            } else {
+                t!("menu.onboard.item.persist_provider.desc").into_owned()
+            })
+            .with_state(onboarding_provider_save_state(state))
+            .maybe_disabled(onboarding_provider_disabled_reason(
+                ctx,
+                state,
+                onboarding_save_capability_method(state),
+            )),
+        ]);
+
+        // No fallback save inside the research-lane flow: `SaveProviderFallback`
+        // writes a PROFILE fallback regardless of the lane intent, which is
+        // never what the lane flow means (PR384 review P3-g). Entry-point
+        // clears make a live intent unreachable here today; the gate keeps the
+        // invariant local if surfaces are ever reshuffled.
+        if opts.include_fallback && !state.research_lane_intent {
+            items.push(
+                MenuItem::new(
+                    "onboard.provider.fallback",
+                    onboarding_provider_fallback_label(state),
+                    MenuAction::Local(LocalAction::Onboarding(
+                        OnboardingAction::SaveProviderFallback,
+                    )),
+                )
+                .with_description(t!("menu.model_config.item.fallback.desc"))
+                .with_state(onboarding_provider_save_state(state))
+                .maybe_disabled(onboarding_provider_disabled_reason(
+                    ctx,
+                    state,
+                    APPUI_METHOD_PROFILE_LLM_UPSERT,
+                )),
+            );
+        }
+    }
+
+    items
+}
+
+/// Mid-session staged model config (`MENU_MODEL_CONFIG`): the `/model` →
+/// "Add a model" flow and the (menu-hidden) `/add-model` command. Renders the
+/// same staged rows as the wizard's provider step (shared
+/// [`provider_config_rows`]) plus the fallback save and a read-only summary of
+/// what the profile already has — deliberately NO catalog enumeration (the
+/// retired `MENU_PROVIDER` dashboard listed every family×model×route choice
+/// plus a test row per catalog model).
+fn model_config_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    if !supports_any_method(ctx, APPUI_PROVIDER_MENU_METHODS_ANY) {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(MENU_MODEL_CONFIG),
+            title: t!("menu.model_config.unavailable_title").into_owned(),
+            message: method_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        });
+    }
+
+    let current_profile = ctx.app.current_profile;
+    let default_state;
+    let state = if let Some(state) = ctx.app.onboarding {
+        state
+    } else {
+        default_state = OnboardingWizardState::default();
+        &default_state
+    };
+
+    let saved_primary_exists = ctx
+        .app
+        .profile_llm_state
+        .is_some_and(|profile_llm| profile_llm.primary_provider().is_some())
+        || onboarding_saved_primary(ctx, state, current_profile).is_some();
+
+    let mut items = provider_config_rows(
+        ctx,
+        state,
+        current_profile,
+        ProviderConfigRowOpts {
+            // F3b rule carried over: fallback is only a meaningful choice once
+            // a primary exists.
+            include_fallback: saved_primary_exists,
+            api_key_edit_prefix: "/add-model key ",
+        },
+    );
+
+    for (idx, item) in items.iter_mut().enumerate() {
+        if let Some(shortcut) = numeric_shortcut(idx) {
+            item.shortcut = Some(shortcut);
+        }
+    }
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(MENU_MODEL_CONFIG),
+        title: t!("menu.model_config.title").into_owned(),
+        subtitle: Some(t!("menu.model_config.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: true,
+        search_placeholder: Some(t!("menu.model_config.search").into_owned()),
+        footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        // What the profile already has (primary + fallbacks) is read-only
+        // status — UX2/F1 rule: non-actionable info lives in the right pane,
+        // never as Noop rows in the action list ("Saved fallbacks: none" as a
+        // selectable row was the last remnant of the old dashboard).
+        preview: Some(model_config_saved_preview(ctx)),
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Right-pane summary for the model-config surface: the profile's saved
+/// primary and fallback models from `profile/llm/list` (server truth), plus
+/// the profile id. Replaces the old dashboard's Noop status rows.
+fn model_config_saved_preview(ctx: &MenuContext<'_>) -> MenuPreview {
+    let mut rows = vec![MenuPreviewRow {
+        label: t!("menu.model_config.preview.profile").into_owned(),
+        value: ctx
+            .app
+            .current_profile
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+    }];
+    let summary = |provider: &LlmConfiguredProvider| {
+        format!(
+            "{} — {}",
+            configured_provider_label(provider),
+            configured_provider_description(provider)
+        )
+    };
+    match ctx.app.profile_llm_state {
+        Some(profile_llm) => {
+            rows.push(MenuPreviewRow {
+                label: t!("menu.model_config.preview.primary").into_owned(),
+                value: profile_llm
+                    .primary_provider()
+                    .map(summary)
+                    .unwrap_or_else(|| t!("menu.model_config.preview.none").into_owned()),
+            });
+            let fallbacks = profile_llm.fallback_providers();
+            if fallbacks.is_empty() {
+                rows.push(MenuPreviewRow {
+                    label: t!("menu.model_config.preview.fallbacks").into_owned(),
+                    value: t!("menu.model_config.preview.none").into_owned(),
+                });
+            } else {
+                rows.extend(
+                    fallbacks
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, provider)| MenuPreviewRow {
+                            label: t!("menu.model_config.preview.fallback_n", n = idx + 1)
+                                .into_owned(),
+                            value: summary(provider),
+                        }),
+                );
+            }
+        }
+        None => rows.push(MenuPreviewRow {
+            label: t!("menu.model_config.preview.primary").into_owned(),
+            value: t!("menu.model_config.preview.not_loaded").into_owned(),
+        }),
+    }
+    MenuPreview::KeyValues {
+        title: Some(t!("menu.model_config.preview.title").into_owned()),
+        rows,
+    }
+}
+
+/// `/model` → "Remove a model…": pick one of the profile's CONFIGURED models
+/// (primary + fallbacks from `profile/llm/list` — never the catalog) to stage
+/// for removal. Selecting a row opens the Yes/No confirm.
+fn model_remove_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let profile_models;
+    let models = if let Some(profile_llm_state) = ctx.app.profile_llm_state {
+        profile_models = profile_llm_state.models();
+        profile_models.as_slice()
+    } else {
+        &[]
+    };
+
+    let mut items: Vec<MenuItem> = Vec::new();
+    if models.is_empty() {
+        items.push(
+            MenuItem::new(
+                "model.remove.empty",
+                t!("menu.model_remove.item.empty.label"),
+                MenuAction::Noop,
+            )
+            .disabled(t!("menu.model_remove.item.empty.desc").into_owned()),
+        );
+    }
+    for (idx, model) in models.iter().enumerate() {
+        let request = crate::model::ModelRemovalRequest {
+            family_id: model
+                .family
+                .clone()
+                .unwrap_or_else(|| model.provider.clone()),
+            model_id: model.model.clone(),
+            route_id: model.route.clone().unwrap_or_else(|| "official".into()),
+            label: model_label(model),
+        };
+        let mut item = MenuItem::new(
+            format!("model.remove.{idx}"),
+            model_label(model),
+            MenuAction::Local(LocalAction::RequestRemoveModel(Box::new(request))),
+        )
+        .with_description(model_description(model))
+        .with_state(MenuItemState {
+            current: model.selected,
+            ..MenuItemState::default()
+        })
+        .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_DELETE));
+        if let Some(shortcut) = numeric_shortcut(idx) {
+            item = item.with_shortcut(shortcut);
+        }
+        items.push(item);
+    }
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_MODEL_REMOVE),
+        title: t!("menu.model_remove.title").into_owned(),
+        subtitle: Some(t!("menu.model_remove.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: true,
+        search_placeholder: Some(t!("menu.model.search").into_owned()),
+        footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Yes/No confirm for removing the staged model. Yes sends
+/// `profile/llm/delete`; the mutation result refreshes the profile LLM state
+/// (and every open model surface) through the standard apply path.
+fn model_remove_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let Some(request) = ctx
+        .app
+        .onboarding
+        .and_then(|onboarding| onboarding.pending_model_removal.clone())
+    else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(crate::menu::registry::MENU_MODEL_REMOVE_CONFIRM),
+            title: t!("menu.model_remove.title").into_owned(),
+            message: t!("menu.model_remove.item.empty.label").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        });
+    };
+    let items = vec![
+        MenuItem::new(
+            "model.remove.yes",
+            t!(
+                "menu.model_remove.confirm.yes",
+                model = request.label.clone()
+            ),
+            MenuAction::send_appui(AppUiCommand::ProfileLlmDelete(
+                crate::model::ProfileLlmDeleteParams {
+                    profile_id: ctx.app.current_profile.map(str::to_owned),
+                    family_id: request.family_id.clone(),
+                    model_id: request.model_id.clone(),
+                    route_id: request.route_id.clone(),
+                },
+            )),
+        )
+        .with_description(t!("menu.model_remove.confirm.yes_desc")),
+        MenuItem::new(
+            "model.remove.no",
+            t!("menu.model_remove.confirm.no"),
+            MenuAction::Close,
+        ),
+    ];
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_MODEL_REMOVE_CONFIRM),
+        title: t!("menu.model_remove.confirm.title", model = request.label).into_owned(),
+        subtitle: Some(t!("menu.model_remove.confirm.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        preview: None,
         mode: MenuMode::SingleSelect,
     })
 }
@@ -1739,36 +2902,63 @@ fn onboarding_next_action_hint(
     t!("onboarding.wizard.next.finish_remaining").into_owned()
 }
 
-fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResult {
-    let items = vec![
-        onboarding_language_row(),
-        MenuItem::new(
-            "onboard.local.status",
-            t!("onboarding.local.title"),
-            MenuAction::Noop,
-        )
-        .with_description(t!("onboarding.local.description")),
-        onboarding_edit_item(
-            "onboard.local.name",
-            t!("onboarding.field.full_name"),
-            state.has_name().then_some(state.name.as_str()),
-            "/onboard name ",
-        )
-        .with_state(MenuItemState::required(state.has_name())),
-        onboarding_edit_item(
-            "onboard.local.username",
-            t!("onboarding.field.username"),
-            state.has_username().then_some(state.username.as_str()),
-            "/onboard username ",
-        )
-        .with_state(MenuItemState::required(state.has_username())),
-        onboarding_edit_item(
-            "onboard.local.email",
-            t!("onboarding.field.email"),
-            state.has_email().then_some(state.email.as_str()),
-            "/onboard email ",
-        )
-        .with_state(MenuItemState::required(state.has_email())),
+fn onboarding_local_profile_menu(
+    state: &OnboardingWizardState,
+    requested_id_supported: bool,
+    make_default_supported: bool,
+) -> MenuBuildResult {
+    // The "Create your local Octos profile / stays on this machine, no OTP"
+    // framing is NOT a menu row — it is non-actionable info, so it lives in the
+    // right-hand teaching panel (`WizardProgress::explanation_preview`) instead
+    // of taking a dead `Noop` slot in the action list.
+    let mut items = vec![onboarding_language_row()];
+
+    if requested_id_supported {
+        // Phase 2: a solo local tool does not need a full identity. Collapse the
+        // step to ONE prompt — "Name this profile".
+        //
+        // Profile identity is DECOUPLED from the model: naming a profile has
+        // nothing to do with which model family it will run, so the profile step
+        // no longer offers a family picker (which also derived the name). The
+        // model is chosen separately in provider setup after the profile exists
+        // (and added/changed anytime via `/add-model`).
+        items.push(onboarding_requested_id_row(state));
+        // Decision #3: let the user mark this new brain as the machine default —
+        // the one a bare launch opens in a folder it hasn't seen before. Only
+        // offered when the server can honor it.
+        if make_default_supported {
+            items.push(onboarding_make_default_row(state));
+        }
+    } else {
+        // Legacy fallback for older servers that do not advertise the nameable
+        // feature: keep the full name/username/email create so the TUI still
+        // works end-to-end against an older octos.
+        items.extend([
+            onboarding_edit_item(
+                "onboard.local.name",
+                t!("onboarding.field.full_name"),
+                state.has_name().then_some(state.name.as_str()),
+                "/onboard name ",
+            )
+            .with_state(MenuItemState::required(state.has_name())),
+            onboarding_edit_item(
+                "onboard.local.username",
+                t!("onboarding.field.username"),
+                state.has_username().then_some(state.username.as_str()),
+                "/onboard username ",
+            )
+            .with_state(MenuItemState::required(state.has_username())),
+            onboarding_edit_item(
+                "onboard.local.email",
+                t!("onboarding.field.email"),
+                state.has_email().then_some(state.email.as_str()),
+                "/onboard email ",
+            )
+            .with_state(MenuItemState::required(state.has_email())),
+        ]);
+    }
+
+    items.push(
         MenuItem::new(
             "onboard.local.create",
             t!("onboarding.local.continue"),
@@ -1777,24 +2967,27 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
             )),
         )
         .with_description(t!("onboarding.local.create_action"))
-        .maybe_disabled(onboarding_local_profile_disabled_reason(state)),
-        // Escape hatches (issue: the wizard auto-opens and swallows Esc, so it
-        // MUST offer visible ways out). An existing profile id routes the
-        // wizard straight to provider setup via the same `/onboard profile`
-        // path; Exit quits without creating anything.
-        onboarding_edit_item(
-            "onboard.local.profile_id",
-            t!("onboarding.field.existing_profile"),
-            state.profile_id.as_deref(),
-            "/onboard profile ",
-        ),
+        .maybe_disabled(if requested_id_supported {
+            // The effective id is always non-empty (typed or suggested), so
+            // Continue is never blocked in the nameable flow.
+            None
+        } else {
+            onboarding_local_profile_disabled_reason(state)
+        }),
+    );
+
+    items.push(
+        // Escape hatch: the wizard auto-opens and swallows Esc, so it MUST offer
+        // a visible way out. (Choosing an existing profile is the startup
+        // picker's job — this create step is only ever reached to make a NEW
+        // one — so the confusing "use existing profile (ID)" row is gone.)
         MenuItem::new(
             "onboard.local.exit",
             t!("menu.onboard.item.exit.label"),
             MenuAction::Local(LocalAction::Exit),
         )
         .with_description(t!("menu.onboard.item.exit.desc")),
-    ];
+    );
 
     // Wizard framing: the language step is already satisfied by the default
     // English locale, so this screen is the first required profile input step.
@@ -1803,7 +2996,7 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
     // `local_create_supported = true`, `current_profile = None`, and no saved
     // provider (no profile means nothing can be hydrated).
     let progress = crate::menu::wizard::WizardProgress::from_state(state, None, true, false);
-    let next_action = if state.local_profile_ready() {
+    let next_action = if requested_id_supported || state.local_profile_ready() {
         t!("onboarding.wizard.next.local_continue")
     } else {
         t!("onboarding.wizard.next.local_fill_fields")
@@ -2072,6 +3265,54 @@ fn onboarding_edit_item(
         MenuAction::Local(LocalAction::EditComposer(draft.into())),
     )
     .with_description(t!("onboarding.action_edit"))
+}
+
+/// Phase 2: the single "Name this profile" row. Shows the user's typed id or,
+/// while untouched, the provider-derived suggestion tagged `(suggested)`. Enter
+/// pre-fills the composer with `/onboard profile-name <id>` seeded with the
+/// current value/suggestion so the user can accept it verbatim or edit it. The
+/// draft is dynamic (the suggestion varies), so this row is built inline rather
+/// than through `onboarding_edit_item`'s `&'static str` draft.
+fn onboarding_requested_id_row(state: &OnboardingWizardState) -> MenuItem {
+    let label = t!("onboarding.field.profile_name");
+    let (rendered_value, seed) = if state.has_requested_id() {
+        let typed = state.requested_id.trim().to_owned();
+        (typed.clone(), typed)
+    } else {
+        let suggestion = state.suggested_profile_id();
+        (
+            t!("onboarding.value_suggested", value = &suggestion).into_owned(),
+            suggestion,
+        )
+    };
+    MenuItem::new(
+        "onboard.local.requested_id",
+        format!("{label}: {rendered_value}"),
+        MenuAction::Local(LocalAction::EditComposer(format!(
+            "/onboard profile-name {seed}"
+        ))),
+    )
+    .with_description(t!("onboarding.field.profile_name_desc"))
+    .with_state(MenuItemState::required(state.has_requested_id()))
+}
+
+/// Toggle row (nameable flow) for decision #3: mark this new brain as the
+/// machine's global default. Flips [`OnboardingWizardState::make_default`]; the
+/// value rides on `profile/local/create` as `make_default`.
+fn onboarding_make_default_row(state: &OnboardingWizardState) -> MenuItem {
+    let value = if state.make_default {
+        t!("onboarding.make_default.enabled")
+    } else {
+        t!("onboarding.make_default.disabled")
+    };
+    MenuItem::new(
+        "onboard.local.make_default",
+        format!("{}: {}", t!("onboarding.make_default.label"), value),
+        MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SetMakeDefault(
+            !state.make_default,
+        ))),
+    )
+    .with_description(t!("onboarding.make_default.desc"))
 }
 
 /// The server-saved primary provider for the wizard's effective profile, read
@@ -2472,10 +3713,27 @@ fn onboarding_provider_save_label(state: &OnboardingWizardState) -> String {
         Some(OnboardingProviderPending::Test) => {
             t!("onboarding.provider.save_unavailable_testing").into_owned()
         }
+        // Lane mode (bare `/research add`): the Save routes to a sub-provider
+        // lane, and any earlier primary-save checkmark state is not about THIS
+        // flow — say what the button will actually do.
+        None if state.research_lane_intent => {
+            t!("onboarding.provider.save_research_lane").into_owned()
+        }
         None if state.provider_saved && state.provider_tested => {
             t!("onboarding.provider.saved").into_owned()
         }
         None => t!("onboarding.provider.save").into_owned(),
+    }
+}
+
+/// The RPC gating the wizard's Save row: a research-lane save dispatches
+/// `profile/sub_providers/upsert`, not `profile/llm/upsert` (PR384) — gate
+/// (and word the missing-capability reason around) the method it will use.
+fn onboarding_save_capability_method(state: &OnboardingWizardState) -> &'static str {
+    if state.research_lane_intent {
+        crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT
+    } else {
+        APPUI_METHOD_PROFILE_LLM_UPSERT
     }
 }
 
@@ -2507,18 +3765,13 @@ fn onboarding_provider_saved_status_label(state: &OnboardingWizardState) -> Stri
     }
 }
 
-fn onboarding_provider_saved_status_state(state: &OnboardingWizardState) -> MenuItemState {
-    MenuItemState {
-        checked: state.last_saved_provider_label.is_some().then_some(true),
-        required_valid: state.last_saved_provider_label.as_ref().map(|_| true),
-        ..MenuItemState::default()
-    }
-}
-
 fn save_target_label(target: OnboardingProviderSaveTarget) -> String {
     match target {
         OnboardingProviderSaveTarget::Primary => t!("onboarding.provider.primary").into_owned(),
         OnboardingProviderSaveTarget::Fallback => t!("onboarding.provider.fallback").into_owned(),
+        OnboardingProviderSaveTarget::ResearchLane => {
+            t!("onboarding.provider.research_lane").into_owned()
+        }
     }
 }
 
@@ -2636,15 +3889,6 @@ fn onboarding_catalog_items(ctx: &MenuContext<'_>, state: &OnboardingWizardState
         state,
         "onboard.catalog",
         "run Refresh dashboard provider catalog first",
-    )
-}
-
-fn provider_catalog_items(ctx: &MenuContext<'_>, state: &OnboardingWizardState) -> Vec<MenuItem> {
-    catalog_menu_items(
-        ctx,
-        state,
-        "provider.catalog.choice",
-        "run Refresh provider catalog first",
     )
 }
 
@@ -2976,6 +4220,631 @@ fn login_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     })
 }
 
+/// `/research` — the named provider lanes (`sub_providers`) backing the isolated
+/// deep_research pipeline router. Lists configured lanes (select a lane to
+/// remove it), plus an "Add a lane" row that pre-fills the `/research add`
+/// inline command. Changes are restart-to-apply on a pinned solo profile.
+fn research_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let can_list = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST);
+    let can_remove = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE);
+    let can_upsert = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT);
+    // Target the ACTIVE profile (the same resolver the inline /research dispatcher
+    // uses via `active_profile_id`). Do NOT prefer the cached list's profile —
+    // after a profile switch the cache lags, and targeting it would list/mutate
+    // the wrong profile.
+    let profile_id = ctx.app.current_profile.map(str::to_owned);
+
+    let refresh_action = if can_list {
+        MenuAction::send_appui(AppUiCommand::ProfileSubProvidersList(
+            crate::model::SubProvidersListParams {
+                profile_id: profile_id.clone(),
+            },
+        ))
+    } else {
+        MenuAction::Noop
+    };
+    let mut refresh = MenuItem::new(
+        "research.refresh",
+        t!("menu.research.item.refresh.label"),
+        refresh_action,
+    )
+    .with_description(t!("menu.research.item.refresh.desc"));
+    if !can_list {
+        refresh = refresh.disabled(method_missing_reason(
+            ctx,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+        ));
+    }
+    let mut items = vec![refresh];
+
+    // Only show lanes we KNOW belong to the active profile: the server always
+    // echoes the resolved profile in the list result, so a cache left over from a
+    // different (e.g. pre-switch) profile is withheld rather than shown as if it
+    // were this profile's. When the active profile is unresolvable locally
+    // (`profile_id` None, e.g. before runtime status arrives) we DON'T trust the
+    // cache — showing it would let a removal target the server's default profile,
+    // not the one the user thinks they're viewing. Hidden-until-resolved is the
+    // safe choice; the stale hint tells the user to Refresh once resolved.
+    let cached_matches_active = profile_id.is_some()
+        && ctx
+            .app
+            .sub_providers_state
+            .map(|state| state.profile_id.as_deref() == profile_id.as_deref())
+            .unwrap_or(false);
+    let lanes: &[crate::model::SubProviderView] = if cached_matches_active {
+        ctx.app
+            .sub_providers_state
+            .map(|state| state.sub_providers.as_slice())
+            .unwrap_or_default()
+    } else {
+        &[]
+    };
+    if lanes.is_empty() {
+        // Distinguish "this profile has no lanes" from "we're showing a stale/
+        // unloaded cache" — the latter tells the user to Refresh rather than
+        // implying the profile is empty.
+        let item = if cached_matches_active {
+            MenuItem::new(
+                "research.empty",
+                t!("menu.research.item.empty.label"),
+                MenuAction::Noop,
+            )
+            .disabled(t!("menu.research.item.empty.desc").into_owned())
+        } else {
+            MenuItem::new(
+                "research.stale",
+                t!("menu.research.item.stale.label"),
+                MenuAction::Noop,
+            )
+            .disabled(t!("menu.research.item.stale.desc").into_owned())
+        };
+        items.push(item);
+    } else {
+        for (idx, lane) in lanes.iter().enumerate() {
+            let label = format!(
+                "{} — {}{}",
+                lane.key,
+                lane.provider.as_deref().unwrap_or("?"),
+                lane.model
+                    .as_deref()
+                    .map(|m| format!("/{m}"))
+                    .unwrap_or_default()
+            );
+            // Open a Yes/No confirm that CAPTURES this row's profile (the profile
+            // whose lanes are on screen). A bare composer draft carries no
+            // profile, so a profile switch between select and Enter would retarget
+            // the delete; binding `profile_id` here makes that impossible, and the
+            // confirm keeps a lane deletion from being a single accidental
+            // keystroke. Lanes only render when `profile_id` is Some (the
+            // display-match above), so the captured profile is always resolved.
+            let action = if can_remove {
+                MenuAction::Local(crate::menu::types::LocalAction::RequestRemoveResearchLane(
+                    Box::new(crate::model::ResearchLaneRemoval {
+                        profile_id: profile_id.clone(),
+                        key: lane.key.clone(),
+                    }),
+                ))
+            } else {
+                MenuAction::Noop
+            };
+            let mut item = MenuItem::new(format!("research.lane.{idx}"), label, action)
+                .with_description(t!("menu.research.item.lane.desc"));
+            if !can_remove {
+                item = item.disabled(method_missing_reason(
+                    ctx,
+                    crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+                ));
+            }
+            items.push(item);
+        }
+    }
+
+    let mut add = MenuItem::new(
+        "research.add",
+        t!("menu.research.item.add.label"),
+        if can_upsert {
+            // Open the add-lane wizard directly (the bare `/research add` path:
+            // set research_lane_intent + open the model picker) instead of
+            // dumping "/research add " into the composer for the user to
+            // complete by hand.
+            MenuAction::Local(crate::menu::types::LocalAction::RunSlashCommand(
+                "/research add".to_string(),
+            ))
+        } else {
+            MenuAction::Noop
+        },
+    )
+    .with_description(t!("menu.research.item.add.desc"));
+    if !can_upsert {
+        add = add.disabled(method_missing_reason(
+            ctx,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+        ));
+    }
+    items.push(add);
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_RESEARCH),
+        title: t!("menu.research.title").into_owned(),
+        subtitle: Some(t!("menu.research.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.research.footer").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Yes/No confirm for removing the staged research lane. Yes sends
+/// `profile/sub_providers/remove` with the profile + key CAPTURED when the row
+/// was selected (not re-resolved now), so a profile switch while the confirm is
+/// open cannot retarget the delete. The mutation result refreshes the lane list
+/// through the standard apply path.
+fn research_remove_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let staged = ctx
+        .app
+        .onboarding
+        .and_then(|onboarding| onboarding.pending_research_lane_removal.clone());
+    // A staged removal must carry a resolved profile — lanes only render when the
+    // active profile is Some, so this is always true today. Treat a None-profile
+    // stage as "nothing staged" rather than firing a `profile_id: None` remove
+    // (which the server would resolve to its DEFAULT profile): a defensive
+    // tripwire pinning the capture-site invariant this change relies on.
+    let Some(request) = staged.filter(|request| request.profile_id.is_some()) else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM),
+            title: t!("menu.research_remove.title").into_owned(),
+            message: t!("menu.research_remove.item.empty.label").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        });
+    };
+    let can_remove = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE);
+    let mut yes = MenuItem::new(
+        "research.remove.yes",
+        t!(
+            "menu.research_remove.confirm.yes",
+            lane = request.key.clone()
+        ),
+        if can_remove {
+            MenuAction::send_appui(AppUiCommand::ProfileSubProvidersRemove(
+                crate::model::SubProvidersRemoveParams {
+                    profile_id: request.profile_id.clone(),
+                    key: request.key.clone(),
+                },
+            ))
+        } else {
+            MenuAction::Noop
+        },
+    )
+    .with_description(t!("menu.research_remove.confirm.yes_desc"));
+    // Gate the row that FIRES the delete, not just the lane row that staged it —
+    // the server can drop the remove capability while this confirm is open.
+    if !can_remove {
+        yes = yes.disabled(method_missing_reason(
+            ctx,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+        ));
+    }
+    let items = vec![
+        yes,
+        MenuItem::new(
+            "research.remove.no",
+            t!("menu.research_remove.confirm.no"),
+            MenuAction::Close,
+        ),
+    ];
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM),
+        title: t!("menu.research_remove.confirm.title", lane = request.key).into_owned(),
+        subtitle: Some(t!("menu.research_remove.confirm.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// `key — provider/model` summary for a configured lane (occupancy line in the
+/// lane-key picker; same shape as the `/research` menu's lane rows).
+fn research_lane_summary(lane: &crate::model::SubProviderView) -> String {
+    format!(
+        "{}{}",
+        lane.provider.as_deref().unwrap_or("?"),
+        lane.model
+            .as_deref()
+            .map(|m| format!("/{m}"))
+            .unwrap_or_default()
+    )
+}
+
+/// Lane-key picker for the wizard's research-lane Save (PR384 review P1-b):
+/// deep_research's palette requests lanes by the LITERAL keys `cheap`/`strong`
+/// (octos `contract_for`), so the guided flow must land the save on one of
+/// those — a family-id key would create a lane the router never selects. Rows
+/// show current occupancy (display-matched to the active profile, same rule as
+/// `research_menu`) so replacing an existing lane is visible BEFORE the save
+/// fires (P3-e). Custom keys remain available via the inline
+/// `/research add <key> <provider> <model>` form.
+fn research_lane_key_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let staged_label = ctx
+        .app
+        .onboarding
+        .map(|onboarding| onboarding.provider_label())
+        .unwrap_or_default();
+    let can_upsert = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT);
+    // Occupancy: only trust the lane cache when it provably belongs to the
+    // active profile (the `research_menu` display-match). A cold or foreign
+    // cache renders the bare key rather than another profile's occupancy.
+    let profile_id = ctx.app.current_profile;
+    let cached_matches_active = profile_id.is_some()
+        && ctx
+            .app
+            .sub_providers_state
+            .map(|state| state.profile_id.as_deref() == profile_id)
+            .unwrap_or(false);
+    let occupancy = |key: &str| -> Option<String> {
+        if !cached_matches_active {
+            return None;
+        }
+        let lanes = ctx
+            .app
+            .sub_providers_state
+            .map(|state| state.sub_providers.as_slice())
+            .unwrap_or_default();
+        Some(match lanes.iter().find(|lane| lane.key == key) {
+            Some(lane) => t!(
+                "menu.research_lane_key.occupied",
+                current = research_lane_summary(lane)
+            )
+            .into_owned(),
+            None => t!("menu.research_lane_key.vacant").into_owned(),
+        })
+    };
+    let mut items = Vec::new();
+    for (key, desc) in [
+        (
+            "cheap",
+            t!("menu.research_lane_key.item.cheap.desc").into_owned(),
+        ),
+        (
+            "strong",
+            t!("menu.research_lane_key.item.strong.desc").into_owned(),
+        ),
+    ] {
+        let label = match occupancy(key) {
+            Some(occupancy) => format!("{key} — {occupancy}"),
+            None => key.to_string(),
+        };
+        let mut item = MenuItem::new(
+            format!("research.lane_key.{key}"),
+            label,
+            if can_upsert {
+                MenuAction::Local(crate::menu::types::LocalAction::SaveResearchLaneAs(
+                    key.to_string(),
+                ))
+            } else {
+                MenuAction::Noop
+            },
+        )
+        .with_description(desc);
+        if !can_upsert {
+            item = item.disabled(method_missing_reason(
+                ctx,
+                crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+            ));
+        }
+        items.push(item);
+    }
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+        title: t!("menu.research_lane_key.title").into_owned(),
+        subtitle: Some(t!("menu.research_lane_key.subtitle", provider = staged_label).into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// `/undo` picker (#1768): the ACTIVE session's workspace snapshot undo
+/// points, newest first. Selecting a row stages a restore and opens the
+/// Yes/No confirm with the session + snapshot CAPTURED at build time.
+fn undo_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let can_list = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_SNAPSHOT_LIST);
+    let can_restore = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_SNAPSHOT_RESTORE);
+    let session_id = ctx.app.selected_session_id.cloned();
+
+    let refresh_action = match (can_list, session_id.as_ref()) {
+        (true, Some(session_id)) => MenuAction::send_appui(AppUiCommand::SnapshotList(
+            crate::model::SnapshotListParams {
+                session_id: session_id.clone(),
+            },
+        )),
+        _ => MenuAction::Noop,
+    };
+    let mut refresh = MenuItem::new(
+        "undo.refresh",
+        t!("menu.undo.item.refresh.label"),
+        refresh_action,
+    )
+    .with_description(t!("menu.undo.item.refresh.desc"));
+    if !can_list {
+        refresh = refresh.disabled(method_missing_reason(
+            ctx,
+            crate::model::APPUI_METHOD_SNAPSHOT_LIST,
+        ));
+    }
+    let mut items = vec![refresh];
+
+    // Display-match: only show a cache that belongs to the ACTIVE session —
+    // a stale list from another session must never stage a restore here.
+    let cached = ctx.app.snapshots_state.filter(|state| {
+        state.session_id.is_some() && state.session_id.as_ref() == session_id.as_ref()
+    });
+    match cached {
+        None => {
+            items.push(
+                MenuItem::new(
+                    "undo.stale",
+                    t!("menu.undo.item.stale.label"),
+                    MenuAction::Noop,
+                )
+                .disabled(t!("menu.undo.item.stale.desc").into_owned()),
+            );
+        }
+        Some(state) if !state.available => {
+            items.push(
+                MenuItem::new(
+                    "undo.unavailable",
+                    t!("menu.undo.item.unavailable.label"),
+                    MenuAction::Noop,
+                )
+                .disabled(t!("menu.undo.item.unavailable.desc").into_owned()),
+            );
+        }
+        Some(state) => {
+            if !state.enabled {
+                items.push(
+                    MenuItem::new(
+                        "undo.disabled_hint",
+                        t!("menu.undo.item.disabled.label"),
+                        MenuAction::Noop,
+                    )
+                    .disabled(t!("menu.undo.item.disabled.desc").into_owned()),
+                );
+            }
+            if state.snapshots.is_empty() {
+                items.push(
+                    MenuItem::new(
+                        "undo.empty",
+                        t!("menu.undo.item.empty.label"),
+                        MenuAction::Noop,
+                    )
+                    .disabled(t!("menu.undo.item.empty.desc").into_owned()),
+                );
+            }
+            for (idx, snap) in state.snapshots.iter().enumerate() {
+                let short = &snap.id[..snap.id.len().min(8)];
+                let label = format!(
+                    "{} · {} · {}",
+                    short,
+                    if snap.label.is_empty() {
+                        "snapshot"
+                    } else {
+                        &snap.label
+                    },
+                    snapshot_age(snap.timestamp_unix)
+                );
+                let action = match (can_restore, session_id.as_ref()) {
+                    (true, Some(session_id)) => {
+                        MenuAction::Local(crate::menu::types::LocalAction::RequestRestoreSnapshot(
+                            Box::new(crate::model::SnapshotRestoreRequest {
+                                session_id: session_id.clone(),
+                                snapshot_id: snap.id.clone(),
+                                label: label.clone(),
+                            }),
+                        ))
+                    }
+                    _ => MenuAction::Noop,
+                };
+                let mut item = MenuItem::new(format!("undo.snap.{idx}"), label, action)
+                    .with_description(t!("menu.undo.item.snap.desc"));
+                if !can_restore {
+                    item = item.disabled(method_missing_reason(
+                        ctx,
+                        crate::model::APPUI_METHOD_SNAPSHOT_RESTORE,
+                    ));
+                }
+                items.push(item);
+            }
+        }
+    }
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_UNDO),
+        title: t!("menu.undo.title").into_owned(),
+        subtitle: Some(t!("menu.undo.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.undo.footer").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Rough relative age for a snapshot row ("just now" / "3m" / "2h" / "5d").
+fn snapshot_age(timestamp_unix: i64) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let delta = (now - timestamp_unix).max(0);
+    if delta < 60 {
+        t!("menu.undo.age.just_now").into_owned()
+    } else if delta < 3600 {
+        format!("{}m", delta / 60)
+    } else if delta < 86_400 {
+        format!("{}h", delta / 3600)
+    } else {
+        format!("{}d", delta / 86_400)
+    }
+}
+
+/// Yes/No confirm for the staged snapshot restore (#1768). Yes sends
+/// `snapshot/restore` with the session + snapshot CAPTURED when the row was
+/// selected — a session switch while the confirm is open cannot retarget it.
+fn undo_confirm_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let Some(request) = ctx
+        .app
+        .onboarding
+        .and_then(|onboarding| onboarding.pending_snapshot_restore.clone())
+    else {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(crate::menu::registry::MENU_UNDO_CONFIRM),
+            title: t!("menu.undo_confirm.title").into_owned(),
+            message: t!("menu.undo_confirm.item.empty.label").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        });
+    };
+    let can_restore = ctx
+        .availability
+        .supports_method(crate::model::APPUI_METHOD_SNAPSHOT_RESTORE);
+    let mut yes = MenuItem::new(
+        "undo.confirm.yes",
+        t!("menu.undo_confirm.yes", snapshot = request.label.clone()),
+        if can_restore {
+            MenuAction::send_appui(AppUiCommand::SnapshotRestore(
+                crate::model::SnapshotRestoreParams {
+                    session_id: request.session_id.clone(),
+                    snapshot_id: request.snapshot_id.clone(),
+                },
+            ))
+        } else {
+            MenuAction::Noop
+        },
+    )
+    .with_description(t!("menu.undo_confirm.yes_desc"));
+    if !can_restore {
+        yes = yes.disabled(method_missing_reason(
+            ctx,
+            crate::model::APPUI_METHOD_SNAPSHOT_RESTORE,
+        ));
+    }
+    let items = vec![
+        yes,
+        MenuItem::new(
+            "undo.confirm.no",
+            t!("menu.undo_confirm.no"),
+            MenuAction::Close,
+        ),
+    ];
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_UNDO_CONFIRM),
+        title: t!("menu.undo_confirm.confirm_title", snapshot = request.label).into_owned(),
+        subtitle: Some(t!("menu.undo_confirm.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// #324: Ctrl+S/Alt+S / `/sessions` — the open-session switcher popup. Rows carry
+/// the same live-turn `✻` and unread `(n)` annotations as the top strip;
+/// selecting a row switches through the resume path (full switch bundle).
+fn sessions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let mut items = Vec::new();
+    for (idx, chip) in ctx.app.session_chips.iter().enumerate() {
+        // ⌂ marks a main/parent window, ↳ a peer — so a user inside a peer can
+        // tell at a glance which row is the parent to return to (the switcher
+        // also pre-highlights that parent row when opened from a peer).
+        let marker = if chip.is_peer { "↳" } else { "⌂" };
+        let mut label = format!(
+            "{marker} {} {}",
+            if chip.focused { "●" } else { "○" },
+            chip.title
+        );
+        if chip.blocked {
+            label.push_str(" ⚠");
+        } else if chip.live {
+            label.push_str(" ✻");
+        }
+        if chip.unread > 0 {
+            label.push_str(&format!(" ({})", chip.unread));
+        }
+        // tui#398: the row's description is the session's one-line activity —
+        // blocked reason first (it needs the user), else the live tail / last
+        // transcript line — so "what is this one doing" is answerable without
+        // switching.
+        let activity = chip.activity.clone();
+        if chip.focused {
+            items.push(
+                MenuItem::new(format!("sessions.row.{idx}"), label, MenuAction::Noop)
+                    .disabled(t!("menu.sessions.item.current").into_owned()),
+            );
+        } else {
+            items.push(
+                MenuItem::new(
+                    format!("sessions.row.{idx}"),
+                    label,
+                    MenuAction::Local(crate::menu::types::LocalAction::ResumeSession(
+                        chip.session_id.0.clone(),
+                    )),
+                )
+                .with_description(
+                    activity.unwrap_or_else(|| t!("menu.sessions.item.switch_desc").into_owned()),
+                ),
+            );
+        }
+    }
+    if items.is_empty() {
+        items.push(
+            MenuItem::new(
+                "sessions.empty",
+                t!("menu.sessions.item.empty"),
+                MenuAction::Noop,
+            )
+            .disabled(t!("menu.sessions.item.empty_desc").into_owned()),
+        );
+    }
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_SESSIONS),
+        title: t!("menu.sessions.title").into_owned(),
+        subtitle: Some(t!("menu.sessions.subtitle").into_owned()),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.sessions.footer").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
 fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let can_list = ctx.availability.supports_method(APPUI_METHOD_MODEL_LIST);
     let can_select = ctx.availability.supports_method(APPUI_METHOD_MODEL_SELECT);
@@ -3024,14 +4893,24 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 .disabled("profile/llm/list returned no models for this profile"),
             );
         } else {
+            // Exactly ONE row is the active model. The catalog's `selected`
+            // primary wins (the server marks precisely one, by
+            // family+model+route); only if none is selected do we fall back to
+            // the row matching the live runtime model id. Resolving a single
+            // index — rather than an OR per row — guarantees at most one `*`
+            // even when a backend erroneously marks several rows `selected` (a
+            // mock/misbehaving server — the "everything shows *" symptom) or two
+            // configured entries share a model id (same model via two providers
+            // or routes), where the old id-only OR lit up every match.
+            let current_idx = models.iter().position(|model| model.selected).or_else(|| {
+                ctx.app
+                    .current_model
+                    .and_then(|current| models.iter().position(|model| model.model == current))
+            });
             for (idx, model) in models.iter().enumerate() {
                 let id = format!("model.select.{idx}");
                 let state = MenuItemState {
-                    current: model.selected
-                        || ctx
-                            .app
-                            .current_model
-                            .is_some_and(|current| current == model.model),
+                    current: current_idx == Some(idx),
                     ..MenuItemState::default()
                 };
                 let action = if can_select {
@@ -3078,6 +4957,33 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         );
     }
 
+    // The staged add-model entry (absorbed from the retired `/add-model`
+    // dashboard): opens the same family→model→route chain the onboarding
+    // wizard uses; the route pick lands on `MENU_MODEL_CONFIG` (API key /
+    // Test / Save) because this stack does not contain `MENU_ONBOARD` — see
+    // `OnboardingAction::SetProviderSelection` in store.rs. Plain OpenMenu so
+    // the catalog auto-fetch hook (`auto_fetch_for_menu`) keeps firing.
+    items.push(
+        MenuItem::new(
+            "model.add",
+            t!("menu.model.item.add.label"),
+            MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY)),
+        )
+        .with_description(t!("menu.model.item.add.desc"))
+        .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG)),
+    );
+    // Models can go bad (revoked key, retired model id) — the profile keeps
+    // working by adding a replacement and REMOVING the broken entry here.
+    items.push(
+        MenuItem::new(
+            "model.remove",
+            t!("menu.model.item.remove.label"),
+            MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_MODEL_REMOVE)),
+        )
+        .with_description(t!("menu.model.item.remove.desc"))
+        .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_DELETE)),
+    );
+
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_MODEL),
         title: t!("menu.model.title").into_owned(),
@@ -3092,279 +4998,6 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             rows: model_preview_rows(ctx),
         }),
         mode: MenuMode::SingleSelect,
-    })
-}
-
-fn provider_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
-    if !supports_any_method(ctx, APPUI_PROVIDER_MENU_METHODS_ANY) {
-        return MenuBuildResult::Unavailable(MenuStatusSpec {
-            id: MenuId::from(MENU_PROVIDER),
-            title: t!("menu.provider.unavailable_title").into_owned(),
-            message: method_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG),
-            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
-        });
-    }
-
-    let profile_id = ctx.app.current_profile.map(str::to_owned);
-    let default_state;
-    let state = if let Some(state) = ctx.app.onboarding {
-        state
-    } else {
-        default_state = OnboardingWizardState::default();
-        &default_state
-    };
-    let mut items = vec![
-        MenuItem::new(
-            "provider.catalog",
-            t!("menu.provider.item.catalog_refresh.label"),
-            MenuAction::send_appui(AppUiCommand::ProfileLlmCatalog(
-                ProfileLlmCatalogParams::default(),
-            )),
-        )
-        .with_description("Uses profile/llm/catalog.")
-        .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG)),
-        MenuItem::new(
-            "provider.list",
-            t!("menu.provider.item.list_refresh.label"),
-            MenuAction::send_appui(AppUiCommand::ProfileLlmList(ProfileLlmListParams {
-                profile_id: profile_id.clone(),
-            })),
-        )
-        .with_description("Uses profile/llm/list.")
-        .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_MODEL_LIST)),
-    ];
-
-    items.extend(provider_saved_items(ctx));
-    items.extend(provider_catalog_items(ctx, state));
-    items.extend([
-        MenuItem::new(
-            "provider.current",
-            format!("Staged provider: {}", state.provider_label()),
-            MenuAction::Noop,
-        )
-        .with_description(t!("menu.provider.item.staged.desc"))
-        .with_state(MenuItemState::required(state.selection_ready())),
-        MenuItem::new(
-            "provider.saved",
-            onboarding_provider_saved_status_label(state),
-            MenuAction::Noop,
-        )
-        .with_description(t!("menu.onboard.item.saved_provider.desc"))
-        .with_state(onboarding_provider_saved_status_state(state)),
-        MenuItem::new(
-            "provider.key",
-            if state.has_api_key() {
-                format!("API key: {}", state.api_key_label())
-            } else {
-                "API key: not set".into()
-            },
-            MenuAction::Noop,
-        )
-        .with_description(
-            "Use /provider key <secret>. The secret is masked in state, logs, and snapshots.",
-        )
-        .with_state(MenuItemState::required(state.has_api_key())),
-        MenuItem::new(
-            "provider.fetch",
-            t!("menu.onboard.item.fetch_models.label"),
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::FetchModels)),
-        )
-        .with_description(t!("menu.onboard.item.fetch_models.desc"))
-        .maybe_disabled(onboarding_fetch_models_disabled_reason(ctx, state)),
-        MenuItem::new(
-            "provider.test",
-            onboarding_provider_test_label(state),
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::TestProvider)),
-        )
-        .with_description("Uses profile/llm/test with the dashboard-shaped selection.")
-        .with_state(onboarding_provider_test_state(state))
-        .maybe_disabled(onboarding_provider_disabled_reason(
-            ctx,
-            state,
-            APPUI_METHOD_PROFILE_LLM_TEST,
-        )),
-        MenuItem::new(
-            "provider.save",
-            onboarding_provider_save_label(state),
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SaveProvider)),
-        )
-        .with_description(t!("menu.onboard.item.save_provider.desc"))
-        .with_state(onboarding_provider_save_state(state))
-        .maybe_disabled(onboarding_provider_disabled_reason(
-            ctx,
-            state,
-            APPUI_METHOD_PROFILE_LLM_UPSERT,
-        )),
-        MenuItem::new(
-            "provider.fallback",
-            onboarding_provider_fallback_label(state),
-            MenuAction::Local(LocalAction::Onboarding(
-                OnboardingAction::SaveProviderFallback,
-            )),
-        )
-        .with_description("Append or replace the staged provider under config.llm.fallbacks.")
-        .with_state(onboarding_provider_save_state(state))
-        .maybe_disabled(onboarding_provider_disabled_reason(
-            ctx,
-            state,
-            APPUI_METHOD_PROFILE_LLM_UPSERT,
-        )),
-    ]);
-
-    if let Some(catalog) = ctx.app.model_catalog {
-        for model in &catalog.models {
-            let family_id = model
-                .family
-                .clone()
-                .unwrap_or_else(|| model.provider.clone());
-            let route_id = model.route.clone().unwrap_or_else(|| "official".into());
-            items.push(
-                MenuItem::new(
-                    format!("provider.test.{family_id}.{}.{}", model.model, route_id),
-                    format!("Test {} / {}", model.provider, model.model),
-                    MenuAction::send_appui(AppUiCommand::ProfileLlmTest(ProfileLlmTestParams {
-                        profile_id: profile_id.clone(),
-                        selection: LlmSelectionConfig {
-                            family_id: family_id.clone(),
-                            model_id: model.model.clone(),
-                            route: LlmRouteConfig {
-                                route_id,
-                                label: None,
-                                base_url: None,
-                                api_key_env: None,
-                                api_type: Some("openai".into()),
-                            },
-                            ..LlmSelectionConfig::default()
-                        },
-                        api_key: None,
-                    })),
-                )
-                .with_description("Uses profile/llm/test; API key is never rendered.")
-                .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_TEST)),
-            );
-        }
-    }
-
-    MenuBuildResult::Ready(MenuSpec {
-        id: MenuId::from(MENU_PROVIDER),
-        title: t!("menu.provider.title").into_owned(),
-        subtitle: Some(t!("menu.provider.subtitle").into_owned()),
-        items,
-        tabs: Vec::new(),
-        searchable: true,
-        search_placeholder: Some(t!("menu.provider.search").into_owned()),
-        footer_hint: Some(t!("menu.footer.enter_run_esc_close").into_owned()),
-        preview: Some(MenuPreview::KeyValues {
-            title: Some(t!("menu.provider.preview_title").into_owned()),
-            rows: [
-                MenuPreviewRow {
-                    label: "profile".into(),
-                    value: state.profile_label(ctx.app.current_profile),
-                },
-                MenuPreviewRow {
-                    label: "staged".into(),
-                    value: state.provider_label(),
-                },
-                MenuPreviewRow {
-                    label: "api_key".into(),
-                    value: if state.has_api_key() {
-                        state.api_key_label().into()
-                    } else {
-                        "<unset>".into()
-                    },
-                },
-            ]
-            .into_iter()
-            .chain(
-                [
-                    APPUI_METHOD_PROFILE_LLM_CATALOG,
-                    APPUI_METHOD_MODEL_LIST,
-                    APPUI_METHOD_PROFILE_LLM_UPSERT,
-                    APPUI_METHOD_PROFILE_LLM_DELETE,
-                    APPUI_METHOD_MODEL_SELECT,
-                    APPUI_METHOD_PROFILE_LLM_TEST,
-                ]
-                .into_iter()
-                .map(|method| permission_method_row(ctx, method)),
-            )
-            .collect(),
-        }),
-        mode: MenuMode::SingleSelect,
-    })
-}
-
-fn provider_saved_items(ctx: &MenuContext<'_>) -> Vec<MenuItem> {
-    let Some(profile_llm) = ctx.app.profile_llm_state else {
-        return vec![
-            MenuItem::new(
-                "provider.saved.unloaded",
-                t!("menu.provider.item.saved_unloaded.label"),
-                MenuAction::Noop,
-            )
-            .with_description(t!("menu.provider.item.saved_unloaded.desc"))
-            .disabled("not loaded"),
-        ];
-    };
-
-    let mut items = Vec::new();
-    if let Some(primary) = profile_llm.primary_provider() {
-        items.push(configured_provider_item(
-            "provider.saved.primary",
-            t!("menu.provider.item.saved_primary.prefix").as_ref(),
-            primary,
-        ));
-    } else {
-        items.push(
-            MenuItem::new(
-                "provider.saved.primary.empty",
-                t!("menu.provider.item.saved_primary_empty.label"),
-                MenuAction::Noop,
-            )
-            .with_description(t!("menu.provider.item.saved_primary_empty.desc"))
-            .with_state(MenuItemState::required(false)),
-        );
-    }
-
-    let fallbacks = profile_llm.fallback_providers();
-    if fallbacks.is_empty() {
-        items.push(
-            MenuItem::new(
-                "provider.saved.fallback.empty",
-                t!("menu.provider.item.saved_fallback_empty.label"),
-                MenuAction::Noop,
-            )
-            .with_description(t!("menu.provider.item.saved_fallback_empty.desc"))
-            .with_state(MenuItemState::required(false)),
-        );
-    } else {
-        items.extend(fallbacks.iter().enumerate().map(|(idx, provider)| {
-            configured_provider_item(
-                format!("provider.saved.fallback.{idx}"),
-                t!("menu.provider.item.saved_fallback.prefix", n = idx + 1).as_ref(),
-                provider,
-            )
-        }));
-    }
-
-    items
-}
-
-fn configured_provider_item(
-    id: impl Into<String>,
-    prefix: &str,
-    provider: &LlmConfiguredProvider,
-) -> MenuItem {
-    MenuItem::new(
-        id,
-        format!("{prefix}: {}", configured_provider_label(provider)),
-        MenuAction::Noop,
-    )
-    .with_description(configured_provider_description(provider))
-    .with_state(MenuItemState {
-        current: provider.selected,
-        checked: Some(true),
-        required_valid: Some(provider.has_api_key),
-        ..MenuItemState::default()
     })
 }
 
@@ -4083,6 +5716,35 @@ fn local_profile_create_supported(ctx: &MenuContext<'_>) -> bool {
         .supports_method(APPUI_METHOD_PROFILE_LOCAL_CREATE)
 }
 
+/// Phase 2: `true` when the server advertises nameable solo profiles. Selects
+/// the slimmed single-prompt Profile step over the legacy name/username/email
+/// screen. Backward compatible: `false` against older servers.
+fn local_profile_requested_id_supported(ctx: &MenuContext<'_>) -> bool {
+    ctx.availability
+        .supports_feature(crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1)
+}
+
+/// True when the backend advertises the optional `make_default` create field, so
+/// onboarding may offer the "Make this your default brain?" toggle. Backward
+/// compatible: `false` against older servers, which hides the row.
+fn local_profile_make_default_supported(ctx: &MenuContext<'_>) -> bool {
+    ctx.availability
+        .supports_feature(crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_DEFAULT_V1)
+}
+
+/// True when the backend advertises the per-project launch flow
+/// (`session.workspace_cwd.v1` + `launch/resolve`), so onboarding can end at the
+/// launch-instructions screen and defer session activation to launch time.
+/// Backward compatible: `false` against older servers, which keep the in-wizard
+/// workspace/Activate step.
+fn launch_flow_supported(ctx: &MenuContext<'_>) -> bool {
+    ctx.availability
+        .supports_feature(crate::model::APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1)
+        && ctx
+            .availability
+            .supports_method(crate::model::APPUI_METHOD_LAUNCH_RESOLVE)
+}
+
 fn action_missing_reason(ctx: &MenuContext<'_>, method: &'static str) -> Option<String> {
     (!ctx.availability.supports_method(method)).then(|| method_missing_reason(ctx, method))
 }
@@ -4097,7 +5759,7 @@ fn mutating_action_missing_reason(ctx: &MenuContext<'_>, method: &'static str) -
 
 fn permission_menu_missing_reason(ctx: &MenuContext<'_>) -> String {
     if ctx.availability.capabilities.is_none() {
-        "Octos UI capabilities are not available".into()
+        t!("menu.availability.ui_unavailable").into_owned()
     } else if let Some((method, reason)) =
         APPUI_PERMISSION_MENU_METHODS_ANY.iter().find_map(|method| {
             ctx.availability
@@ -4105,7 +5767,12 @@ fn permission_menu_missing_reason(ctx: &MenuContext<'_>) -> String {
                 .map(|reason| (*method, reason))
         })
     {
-        format!("Octos UI method `{method}` is unsupported: {reason}")
+        t!(
+            "menu.availability.method_unsupported",
+            method = method,
+            reason = reason
+        )
+        .into_owned()
     } else {
         format!(
             "Octos UI permission methods are not advertised: {}",
@@ -4512,9 +6179,14 @@ fn permission_method_row(ctx: &MenuContext<'_>, method: &'static str) -> MenuPre
 
 fn method_missing_reason(ctx: &MenuContext<'_>, method: &str) -> String {
     if let Some(reason) = ctx.availability.unsupported_method_reason(method) {
-        format!("Octos UI method `{method}` is unsupported: {reason}")
+        t!(
+            "menu.availability.method_unsupported",
+            method = method,
+            reason = reason
+        )
+        .into_owned()
     } else if ctx.availability.capabilities.is_none() {
-        "Octos UI capabilities are not available".into()
+        t!("menu.availability.ui_unavailable").into_owned()
     } else {
         format!("Octos UI method `{method}` is not advertised by this backend.")
     }
@@ -5592,6 +7264,78 @@ fn numeric_shortcut(index: usize) -> Option<KeyBinding> {
     Some(KeyBinding::new(KeyCode::Char(digit), KeyModifiers::empty()))
 }
 
+/// `@` composer file picker (#363): one searchable row per workspace file,
+/// labeled with the relative path; Enter inserts that path at the composer
+/// cursor (`LocalAction::InsertComposerText`, which also closes the picker).
+///
+/// The rows come from the scan `Store::open_composer_file_picker` stored on
+/// `AppState::file_picker` at open time — the menu build itself never touches
+/// the filesystem, so search-refresh keystrokes stay cheap. No numeric
+/// shortcuts: digits must FILTER here (file names contain digits).
+fn file_picker_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let Some(picker) = ctx.app.file_picker else {
+        // Opened without a scan snapshot (should not happen via `@`): render
+        // an explanatory status instead of an empty shell.
+        return MenuBuildResult::Unavailable(MenuStatusSpec::new(
+            crate::menu::registry::MENU_FILE_PICKER,
+            t!("menu.file_picker.title").into_owned(),
+            t!("menu.file_picker.item.empty.label").into_owned(),
+        ));
+    };
+
+    let mut items: Vec<MenuItem> = picker
+        .files
+        .iter()
+        .map(|path| {
+            MenuItem::new(
+                path.clone(),
+                path.clone(),
+                // Trailing space so the prompt keeps reading naturally after
+                // the inserted `@path` token.
+                MenuAction::Local(LocalAction::InsertComposerText(format!("{path} "))),
+            )
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(
+            MenuItem::new(
+                "file_picker.empty",
+                t!("menu.file_picker.item.empty.label"),
+                MenuAction::Noop,
+            )
+            .disabled(t!("menu.file_picker.item.empty.desc").into_owned()),
+        );
+    } else if picker.truncated {
+        items.push(
+            MenuItem::new(
+                "file_picker.truncated",
+                t!(
+                    "menu.file_picker.item.truncated.label",
+                    count = picker.files.len()
+                ),
+                MenuAction::Noop,
+            )
+            .with_state(MenuItemState {
+                non_selectable: true,
+                ..MenuItemState::default()
+            }),
+        );
+    }
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_FILE_PICKER),
+        title: t!("menu.file_picker.title").into_owned(),
+        subtitle: Some(picker.root.clone()),
+        items,
+        tabs: Vec::new(),
+        searchable: true,
+        search_placeholder: Some(t!("menu.file_picker.search").into_owned()),
+        footer_hint: Some(t!("menu.file_picker.footer").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5611,6 +7355,376 @@ mod tests {
             panic!("expected AppUI action");
         };
         command.as_ref()
+    }
+
+    fn ready_spec(result: MenuBuildResult) -> MenuSpec {
+        match result {
+            MenuBuildResult::Ready(spec) => spec,
+            other => panic!("expected a ready menu, got {other:?}"),
+        }
+    }
+
+    fn has_row(spec: &MenuSpec, id: &str) -> bool {
+        spec.items.iter().any(|item| item.id == id)
+    }
+
+    #[test]
+    fn profile_step_shows_single_name_prompt_when_requested_id_supported() {
+        let state = OnboardingWizardState::default();
+        let spec = ready_spec(onboarding_local_profile_menu(&state, true, false));
+
+        assert!(
+            has_row(&spec, "onboard.local.requested_id"),
+            "nameable flow shows the single Name-this-profile row"
+        );
+        // Profile identity is decoupled from the model — no family picker here.
+        assert!(
+            !has_row(&spec, "onboard.local.family"),
+            "the profile step never offers a model-family choice"
+        );
+        // And the non-actionable "stays local" blurb is not a dead menu row.
+        assert!(
+            !has_row(&spec, "onboard.local.status"),
+            "the info blurb lives in the right panel, not the action list"
+        );
+        assert!(
+            !has_row(&spec, "onboard.local.name")
+                && !has_row(&spec, "onboard.local.username")
+                && !has_row(&spec, "onboard.local.email"),
+            "nameable flow drops the name/username/email rows"
+        );
+        // Continue is never blocked — a suggestion is always available.
+        let create = spec
+            .items
+            .iter()
+            .find(|item| item.id == "onboard.local.create")
+            .expect("create row present");
+        assert!(
+            create.disabled_reason.is_none(),
+            "Continue is enabled (accepts the suggested id)"
+        );
+    }
+
+    #[test]
+    fn profile_step_shows_make_default_toggle_only_when_supported() {
+        // Off by default: the row flips the toggle ON when activated.
+        let state = OnboardingWizardState::default();
+        let spec = ready_spec(onboarding_local_profile_menu(&state, true, true));
+        let row = spec
+            .items
+            .iter()
+            .find(|item| item.id == "onboard.local.make_default")
+            .expect("make-default toggle present when supported");
+        assert!(
+            matches!(
+                &row.action,
+                MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SetMakeDefault(
+                    true
+                )))
+            ),
+            "an off toggle flips ON when activated"
+        );
+
+        // Already on: the row flips it OFF.
+        let on = OnboardingWizardState {
+            make_default: true,
+            ..OnboardingWizardState::default()
+        };
+        let spec_on = ready_spec(onboarding_local_profile_menu(&on, true, true));
+        let row_on = spec_on
+            .items
+            .iter()
+            .find(|item| item.id == "onboard.local.make_default")
+            .unwrap();
+        assert!(matches!(
+            &row_on.action,
+            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SetMakeDefault(
+                false
+            )))
+        ));
+
+        // Unsupported server → the row is hidden entirely.
+        let unsupported = ready_spec(onboarding_local_profile_menu(&state, true, false));
+        assert!(!has_row(&unsupported, "onboard.local.make_default"));
+    }
+
+    #[test]
+    fn provider_step_ends_at_done_screen_on_launch_flow_server() {
+        let onboarding = OnboardingWizardState {
+            profile_id: Some("glm".into()),
+            local_profile_created: true,
+            ..OnboardingWizardState::default()
+        };
+
+        // Launch-flow server (feature + method): the terminal row is the done
+        // screen, and the redundant workspace step is skipped.
+        let launch_caps = CapabilitySet::from_methods_and_features(
+            [
+                crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
+                crate::model::APPUI_METHOD_LAUNCH_RESOLVE,
+            ],
+            [crate::model::APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1],
+        );
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&launch_caps),
+            app: MenuAppSnapshot {
+                current_profile: Some("glm"),
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(onboarding_provider_setup_menu(
+            &ctx,
+            &onboarding,
+            Some("glm"),
+        ));
+        assert!(
+            has_row(&spec, "onboard.done.open"),
+            "launch-flow onboarding ends at the done screen"
+        );
+        assert!(
+            !has_row(&spec, "onboard.workspace.open"),
+            "the redundant workspace step is skipped"
+        );
+
+        // Older server (no launch flow): keep the workspace/Activate step so the
+        // user is never stranded without a way to start a session.
+        let legacy_caps =
+            CapabilitySet::from_methods([crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT]);
+        let legacy_ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&legacy_caps),
+            app: MenuAppSnapshot {
+                current_profile: Some("glm"),
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let legacy = ready_spec(onboarding_provider_setup_menu(
+            &legacy_ctx,
+            &onboarding,
+            Some("glm"),
+        ));
+        assert!(has_row(&legacy, "onboard.workspace.open"));
+        assert!(!has_row(&legacy, "onboard.done.open"));
+    }
+
+    #[test]
+    fn onboard_done_menu_shows_launch_instructions_and_exit() {
+        let onboarding = OnboardingWizardState {
+            profile_id: Some("glm".into()),
+            ..OnboardingWizardState::default()
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(onboarding_done_menu(&ctx));
+        assert!(
+            has_row(&spec, "onboard.done.status"),
+            "shows the ready line"
+        );
+        assert!(has_row(&spec, "onboard.done.exit"), "offers a way out");
+        assert!(
+            spec.subtitle.as_deref().unwrap_or_default().contains("glm"),
+            "names the created brain in the subtitle"
+        );
+    }
+
+    #[test]
+    fn profile_step_falls_back_to_full_fields_without_feature() {
+        let state = OnboardingWizardState::default();
+        let spec = ready_spec(onboarding_local_profile_menu(&state, false, false));
+
+        assert!(
+            has_row(&spec, "onboard.local.name")
+                && has_row(&spec, "onboard.local.username")
+                && has_row(&spec, "onboard.local.email"),
+            "legacy flow keeps name/username/email for older servers"
+        );
+        assert!(
+            !has_row(&spec, "onboard.local.requested_id"),
+            "legacy flow has no requested_id prompt"
+        );
+        // The family choice is nameable-flow only.
+        assert!(!has_row(&spec, "onboard.local.family"));
+    }
+
+    #[test]
+    fn onboarding_menu_routes_to_single_prompt_when_feature_negotiated() {
+        let capabilities = CapabilitySet::from_methods_and_features(
+            [APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            [crate::model::APPUI_FEATURE_PROFILE_LOCAL_CREATE_REQUESTED_ID_V1],
+        );
+        let onboarding = OnboardingWizardState::default();
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(onboarding_menu(&ctx));
+        assert!(has_row(&spec, "onboard.local.requested_id"));
+        assert!(!has_row(&spec, "onboard.local.email"));
+    }
+
+    #[test]
+    fn profile_picker_lists_profiles_marks_default_and_offers_create() {
+        let onboarding = OnboardingWizardState {
+            available_profiles: vec!["glm".into(), "deepseek".into()],
+            default_profile: Some("glm".into()),
+            ..OnboardingWizardState::default()
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(profile_picker_menu(&ctx));
+
+        // Each profile row now drills into its action menu (info + set-default /
+        // delete), rather than attaching directly.
+        let glm = spec
+            .items
+            .iter()
+            .find(|item| item.id == "profile.pick.0")
+            .expect("glm row present");
+        assert!(
+            glm.label.contains("glm") && glm.label.contains("default"),
+            "the default profile is marked: {:?}",
+            glm.label
+        );
+        assert!(matches!(
+            &glm.action,
+            MenuAction::Local(LocalAction::SelectProfileForActions(id)) if id == "glm"
+        ));
+        // The non-default profile is listed without the marker.
+        let deepseek = spec
+            .items
+            .iter()
+            .find(|item| item.id == "profile.pick.1")
+            .expect("deepseek row present");
+        assert_eq!(deepseek.label, "deepseek");
+        assert!(has_row(&spec, "profile.pick.new"), "offers a create row");
+    }
+
+    #[test]
+    fn launch_prompt_cross_profile_offers_start_here_and_switch_rows() {
+        let onboarding = OnboardingWizardState {
+            launch_prompt: Some(crate::model::LaunchPromptState {
+                decision: crate::model::LaunchDecisionKind::CrossProfile,
+                resolved_profile: "glm".into(),
+                existing_profiles: vec!["deepseek".into()],
+                cwd: "/tmp/proj".into(),
+            }),
+            ..OnboardingWizardState::default()
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(launch_prompt_menu(&ctx));
+
+        // "Start <launching> here" opens the launching brain in this folder.
+        let start = spec
+            .items
+            .iter()
+            .find(|item| item.id == "launch.start")
+            .expect("start-here row present");
+        let AppUiCommand::OpenSession(params) = appui_command(&start.action) else {
+            panic!("start row must open a session");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("glm"));
+        assert_eq!(params.cwd.as_deref(), Some("/tmp/proj"));
+
+        // One switch row per profile already used in this folder.
+        let switch = spec
+            .items
+            .iter()
+            .find(|item| item.id == "launch.switch.0")
+            .expect("switch row present");
+        let AppUiCommand::OpenSession(switch_params) = appui_command(&switch.action) else {
+            panic!("switch row must open a session");
+        };
+        assert_eq!(switch_params.profile_id.as_deref(), Some("deepseek"));
+        assert!(has_row(&spec, "launch.cancel"), "offers a cancel escape");
+    }
+
+    #[test]
+    fn launch_prompt_activate_confirms_single_profile() {
+        let onboarding = OnboardingWizardState {
+            launch_prompt: Some(crate::model::LaunchPromptState {
+                decision: crate::model::LaunchDecisionKind::Activate,
+                resolved_profile: "glm".into(),
+                existing_profiles: Vec::new(),
+                cwd: "/tmp/proj".into(),
+            }),
+            ..OnboardingWizardState::default()
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(launch_prompt_menu(&ctx));
+
+        let activate = spec
+            .items
+            .iter()
+            .find(|item| item.id == "launch.activate")
+            .expect("activate row present");
+        let AppUiCommand::OpenSession(params) = appui_command(&activate.action) else {
+            panic!("activate row must open a session");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("glm"));
+        // Activate is a single-profile confirm — no switch rows.
+        assert!(!has_row(&spec, "launch.switch.0"));
+        // Both the label AND description must interpolate the profile, not leave
+        // a literal "%{profile}" placeholder (regression: the desc dropped the arg).
+        assert!(
+            activate.label.contains("glm") && !activate.label.contains("%{profile}"),
+            "activate label: {:?}",
+            activate.label
+        );
+        assert!(
+            activate
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("glm") && !d.contains("%{profile}")),
+            "activate desc must name the profile: {:?}",
+            activate.description
+        );
     }
 
     fn runtime_status(session_id: &SessionKey) -> SessionRuntimeStatus {
@@ -5781,7 +7895,16 @@ mod tests {
             APPUI_METHOD_PROFILE_LLM_CATALOG,
             APPUI_METHOD_PROFILE_LLM_UPSERT,
         ]);
-        let onboarding = OnboardingWizardState::default();
+        // Stage a model family so the provider step renders its expanded config
+        // rows (family/model/route/key). Without a staged model the step is
+        // collapsed to a single "Add a model" entry, which hides those rows.
+        let onboarding = OnboardingWizardState {
+            provider: LlmSelectionConfig {
+                family_id: "moonshot".into(),
+                ..LlmSelectionConfig::default()
+            },
+            ..OnboardingWizardState::default()
+        };
         let mut families = serde_json::Map::new();
         families.insert(
             "moonshot".into(),
@@ -5937,6 +8060,116 @@ mod tests {
         assert_eq!(
             selection.route.api_key_env.as_deref(),
             Some("AUTODL_API_KEY")
+        );
+    }
+
+    /// Profile↔model decoupling: after naming a profile, the provider step is
+    /// collapsed to a single "Add a model" entry — the family/model/route/key
+    /// config rows are hidden until a model is actually being set up. Once a
+    /// family is staged the step expands to those rows. Either way the terminal
+    /// (finish/workspace) row stays, so onboarding can always progress.
+    #[test]
+    fn provider_step_collapses_model_config_behind_add_a_model() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            APPUI_METHOD_AUTH_STATUS,
+            APPUI_METHOD_PROFILE_LLM_CATALOG,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+        ]);
+        let build = |onboarding: &OnboardingWizardState| {
+            let ctx = MenuContext {
+                availability: AvailabilityContext::protocol(&capabilities),
+                app: MenuAppSnapshot {
+                    current_profile: Some("coding"),
+                    onboarding: Some(onboarding),
+                    ..MenuAppSnapshot::default()
+                },
+                terminal: TerminalSize::default(),
+                theme_name: None,
+                selected_path: &[],
+            };
+            let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_ONBOARD), &ctx)
+            else {
+                panic!("expected provider setup menu");
+            };
+            spec
+        };
+
+        // Nothing configured yet → collapsed.
+        let collapsed = build(&OnboardingWizardState::default());
+        assert!(
+            has_row(&collapsed, "onboard.provider.add_model"),
+            "collapsed step offers a single Add-a-model entry"
+        );
+        assert!(
+            !has_row(&collapsed, "onboard.provider.family")
+                && !has_row(&collapsed, "onboard.provider.key"),
+            "the inline model config rows are hidden until setup begins"
+        );
+        assert!(
+            has_row(&collapsed, "onboard.workspace.open")
+                || has_row(&collapsed, "onboard.done.open"),
+            "the terminal (finish/workspace) row still lets onboarding progress"
+        );
+
+        // A staged, UNSAVED selection means the user is actively setting up a
+        // model → expanded config rows.
+        let configuring = OnboardingWizardState {
+            provider: LlmSelectionConfig {
+                family_id: "glm-4.6".into(),
+                model_id: "glm-5.2".into(),
+                route: LlmRouteConfig {
+                    route_id: "zai".into(),
+                    ..LlmRouteConfig::default()
+                },
+                ..LlmSelectionConfig::default()
+            },
+            ..OnboardingWizardState::default()
+        };
+        let expanded = build(&configuring);
+        assert!(
+            has_row(&expanded, "onboard.provider.family")
+                && has_row(&expanded, "onboard.provider.key"),
+            "an unsaved staged selection expands to the detailed model rows"
+        );
+        assert!(
+            !has_row(&expanded, "onboard.provider.add_model"),
+            "the collapsed entry is replaced while actively configuring"
+        );
+        // Onboarding never surfaces "Add as fallback" — first-run is about one
+        // model; fallbacks live behind `/add-model` (MENU_PROVIDER).
+        assert!(
+            !has_row(&expanded, "onboard.provider.fallback"),
+            "onboarding does not offer the fallback save"
+        );
+
+        // Once the staged selection has been SAVED as the primary (session
+        // label matches), the step collapses back to "Add another model" — it
+        // must NOT dump the raw form (the user's "still no add_model option"
+        // report). The saved model shows via the right-pane summary.
+        let mut saved = configuring.clone();
+        saved.provider_saved = true;
+        saved.saved_primary_provider_label = Some(saved.provider_label());
+        let after_save = build(&saved);
+        assert!(
+            has_row(&after_save, "onboard.provider.add_model"),
+            "a saved primary collapses back to the Add-another-model entry"
+        );
+        assert!(
+            !has_row(&after_save, "onboard.provider.family")
+                && !has_row(&after_save, "onboard.provider.key"),
+            "the raw config rows are hidden once the primary is saved"
+        );
+
+        // Staging a DIFFERENT model than the saved primary re-expands (to
+        // replace it) — but still without a fallback row (that's `/add-model`).
+        let mut adding_second = saved.clone();
+        adding_second.provider.model_id = "glm-4.7".into();
+        let second = build(&adding_second);
+        assert!(
+            has_row(&second, "onboard.provider.family")
+                && !has_row(&second, "onboard.provider.fallback"),
+            "staging a different model re-expands, still with no fallback row"
         );
     }
 
@@ -6152,7 +8385,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_menu_shows_api_test_progress() {
+    fn model_config_menu_shows_api_test_progress() {
         let registry = core_menu_registry();
         let capabilities = CapabilitySet::from_methods([
             APPUI_METHOD_PROFILE_LLM_TEST,
@@ -6186,50 +8419,74 @@ mod tests {
             selected_path: &[],
         };
 
-        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_PROVIDER), &ctx)
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL_CONFIG), &ctx)
         else {
-            panic!("expected provider menu");
+            panic!("expected model-config menu");
         };
         let test_item = spec
             .items
             .iter()
-            .find(|item| item.id == "provider.test")
-            .expect("provider test row");
+            .find(|item| item.id == "onboard.provider.test")
+            .expect("staged test row");
         assert_eq!(
             test_item.label,
             t!("onboarding.provider.test_testing").into_owned()
         );
         assert!(test_item.state.loading);
         assert_eq!(test_item.disabled_reason, None);
-        let fallback_item = spec
-            .items
-            .iter()
-            .find(|item| item.id == "provider.fallback")
-            .expect("provider fallback row");
-        assert_eq!(
-            fallback_item.label,
-            t!("onboarding.provider.fallback_unavailable_testing").into_owned()
+        // No saved primary anywhere -> the fallback save is not a meaningful
+        // choice yet, so the row is absent (F3b rule carried to this surface).
+        assert!(
+            !spec
+                .items
+                .iter()
+                .any(|item| item.id == "onboard.provider.fallback"),
+            "fallback row must be hidden until a primary exists"
         );
-        assert_eq!(fallback_item.disabled_reason, None);
     }
 
     #[test]
-    fn provider_menu_shows_last_saved_provider_status() {
+    fn model_config_menu_offers_fallback_save_once_primary_exists() {
         let registry = core_menu_registry();
-        let capabilities = CapabilitySet::from_methods([APPUI_METHOD_PROFILE_LLM_CATALOG]);
+        let capabilities = CapabilitySet::from_methods([
+            APPUI_METHOD_PROFILE_LLM_TEST,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+        ]);
+        // Staged selection differs from the saved primary -> expanded form.
         let onboarding = OnboardingWizardState {
-            last_saved_provider_label: Some(
-                "minimax / MiniMax-M2.5-highspeed via wisemodel".into(),
-            ),
-            last_saved_provider_target: Some(OnboardingProviderSaveTarget::Fallback),
-            saved_primary_provider_label: Some("moonshot / kimi-k2.5 via autodl".into()),
+            provider: LlmSelectionConfig {
+                family_id: "deepseek".into(),
+                model_id: "deepseek-reasoner".into(),
+                route: LlmRouteConfig {
+                    route_id: "deepseek".into(),
+                    api_type: Some("openai".into()),
+                    ..LlmRouteConfig::default()
+                },
+                ..LlmSelectionConfig::default()
+            },
+            api_key: Some(crate::model::SecretString::new("sk-test-secret")),
             ..OnboardingWizardState::default()
+        };
+        let llm_state = crate::model::ProfileLlmListResult {
+            profile_id: Some("coding".into()),
+            primary: Some(LlmConfiguredProvider {
+                family_id: Some("moonshot".into()),
+                model_id: Some("kimi-k2.5".into()),
+                route_id: Some("autodl".into()),
+                has_api_key: true,
+                selected: true,
+                ..configured_provider_for_test()
+            }),
+            fallbacks: Vec::new(),
+            llm: None,
+            runtime_policy_stamp: None,
         };
         let ctx = MenuContext {
             availability: AvailabilityContext::protocol(&capabilities),
             app: MenuAppSnapshot {
                 current_profile: Some("coding"),
                 onboarding: Some(&onboarding),
+                profile_llm_state: Some(&llm_state),
                 ..MenuAppSnapshot::default()
             },
             terminal: TerminalSize::default(),
@@ -6237,26 +8494,85 @@ mod tests {
             selected_path: &[],
         };
 
-        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_PROVIDER), &ctx)
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL_CONFIG), &ctx)
         else {
-            panic!("expected provider menu");
+            panic!("expected model-config menu");
         };
-        let saved_item = spec
+        let fallback_item = spec
             .items
             .iter()
-            .find(|item| item.id == "provider.saved")
-            .expect("saved provider row");
-
+            .find(|item| item.id == "onboard.provider.fallback")
+            .expect("fallback row once a primary exists");
         assert_eq!(
-            saved_item.label,
-            onboarding_provider_saved_status_label(&onboarding)
+            fallback_item.label,
+            onboarding_provider_fallback_label(&onboarding)
         );
-        assert_eq!(saved_item.state.checked, Some(true));
-        assert_eq!(saved_item.state.required_valid, Some(true));
+        assert_eq!(fallback_item.disabled_reason, None);
+    }
+
+    /// The mid-session surface mirrors the wizard's collapse rule: with a
+    /// saved primary and nothing (new) staged it collapses to a single
+    /// "Add another model" entry — never the raw expanded form.
+    #[test]
+    fn model_config_matches_wizard_collapse_when_primary_saved() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            APPUI_METHOD_PROFILE_LLM_CATALOG,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+        ]);
+        let llm_state = crate::model::ProfileLlmListResult {
+            profile_id: Some("coding".into()),
+            primary: Some(LlmConfiguredProvider {
+                family_id: Some("moonshot".into()),
+                model_id: Some("kimi-k2.5".into()),
+                route_id: Some("autodl".into()),
+                has_api_key: true,
+                selected: true,
+                ..configured_provider_for_test()
+            }),
+            fallbacks: Vec::new(),
+            llm: None,
+            runtime_policy_stamp: None,
+        };
+        let onboarding = OnboardingWizardState::default();
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                onboarding: Some(&onboarding),
+                profile_llm_state: Some(&llm_state),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL_CONFIG), &ctx)
+        else {
+            panic!("expected model-config menu");
+        };
+        let add_row = spec
+            .items
+            .iter()
+            .find(|item| item.id == "onboard.provider.add_model")
+            .expect("collapsed add-model entry");
+        assert_eq!(
+            add_row.label,
+            t!("onboarding.provider.add_another_model_label").into_owned(),
+            "a saved primary relabels the entry to add-another"
+        );
+        assert!(
+            !spec
+                .items
+                .iter()
+                .any(|item| item.id == "onboard.provider.family"),
+            "collapsed surface must not dump the raw expanded form"
+        );
     }
 
     #[test]
-    fn provider_menu_shows_configured_provider_list_from_appui() {
+    fn model_config_menu_shows_configured_provider_list_from_appui() {
         let registry = core_menu_registry();
         let capabilities = CapabilitySet::from_methods([APPUI_METHOD_MODEL_LIST]);
         let llm_state = crate::model::ProfileLlmListResult {
@@ -6298,25 +8614,40 @@ mod tests {
             selected_path: &[],
         };
 
-        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_PROVIDER), &ctx)
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL_CONFIG), &ctx)
         else {
-            panic!("expected provider menu");
+            panic!("expected model-config menu");
         };
-        let rendered = rendered_menu_text(&spec);
 
-        assert!(rendered.contains("Saved primary: moonshot / kimi-k2.5 via autodl"));
+        // UX2/F1 rule: the saved primary/fallback summary is read-only status,
+        // so it lives in the right-pane preview — NEVER as Noop rows in the
+        // action list ("Saved fallbacks: none" as a selectable row was the
+        // last remnant of the retired dashboard).
         assert!(
-            rendered.contains("Saved fallback 1: minimax / MiniMax-M2.5-highspeed via wisemodel")
+            !spec
+                .items
+                .iter()
+                .any(|item| item.id.starts_with("provider.saved")),
+            "no Noop saved-status rows in the action list"
         );
-        assert!(rendered.contains("env: AUTODL_API_KEY"));
-        assert!(rendered.contains("env: WISEMODEL_API_KEY"));
-        let primary = spec
-            .items
+        let Some(MenuPreview::KeyValues { rows, .. }) = &spec.preview else {
+            panic!("expected the saved-models preview pane");
+        };
+        let flat: Vec<String> = rows
             .iter()
-            .find(|item| item.id == "provider.saved.primary")
-            .expect("saved primary row");
-        assert!(primary.state.current);
-        assert_eq!(primary.state.required_valid, Some(true));
+            .map(|row| format!("{}: {}", row.label, row.value))
+            .collect();
+        let joined = flat.join("\n");
+        assert!(
+            joined.contains("moonshot / kimi-k2.5 via autodl"),
+            "primary summary in the pane: {joined}"
+        );
+        assert!(
+            joined.contains("minimax / MiniMax-M2.5-highspeed via wisemodel"),
+            "fallback summary in the pane: {joined}"
+        );
+        assert!(joined.contains("env: AUTODL_API_KEY"));
+        assert!(joined.contains("env: WISEMODEL_API_KEY"));
     }
 
     fn configured_provider_for_test() -> LlmConfiguredProvider {
@@ -6336,6 +8667,53 @@ mod tests {
             cost_per_m: None,
             strong: None,
         }
+    }
+
+    #[test]
+    fn context_menu_subtitle_shows_live_window_usage() {
+        let capabilities = CapabilitySet::from_methods([APPUI_METHOD_SESSION_COMPACT]);
+        let session_id = SessionKey("local:test".into());
+
+        // With a known estimate + window, the subtitle renders `used / max`
+        // plus the percent (128k of a 1M window → `128K / 1M — 13% …`).
+        let usage_ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                selected_session_id: Some(&session_id),
+                context_window_usage: Some((128_000, 1_000_000)),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(context_menu(&usage_ctx));
+        let subtitle = spec.subtitle.expect("context menu carries a subtitle");
+        assert!(
+            subtitle.contains("128K / 1M"),
+            "subtitle shows used/max in human units: {subtitle:?}"
+        );
+        assert!(
+            subtitle.contains("13%"),
+            "subtitle shows the rounded fill percent: {subtitle:?}"
+        );
+
+        // Before any estimate is known, fall back to the static hint rather
+        // than inventing a `0 / 0` gauge.
+        let empty_ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                selected_session_id: Some(&session_id),
+                context_window_usage: None,
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let fallback = ready_spec(context_menu(&empty_ctx));
+        let expected = t!("menu.context.subtitle").into_owned();
+        assert_eq!(fallback.subtitle.as_deref(), Some(expected.as_str()));
     }
 
     #[test]
@@ -6746,6 +9124,111 @@ mod tests {
         assert_eq!(cost.description.as_deref(), Some("$0.0025"));
     }
 
+    fn dock_agent(id: &str, status: &str) -> octos_core::ui_protocol::UiAgentRecord {
+        octos_core::ui_protocol::UiAgentRecord {
+            agent_id: id.into(),
+            parent_agent_id: None,
+            session_id: octos_core::SessionKey("local:test".into()),
+            task_id: None,
+            path: "/root".into(),
+            role: "worker".into(),
+            nickname: id.into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: status.into(),
+            last_task: Some("review the repo".into()),
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    /// `/dock` picker (#323): a row per roster agent with a SwitchChatView
+    /// action, a back-to-main row, the dock toggle, and unread/viewing
+    /// markers; Unavailable when the roster is empty.
+    #[test]
+    fn agents_menu_lists_roster_with_switch_and_toggle() {
+        let agents = vec![
+            dock_agent("edison", "running"),
+            dock_agent("thomas", "completed"),
+        ];
+        let unseen = vec!["thomas".to_string()];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                agents: &agents,
+                unseen_agent_ids: &unseen,
+                chat_view_agent_id: Some("edison"),
+                agent_dock_collapsed: false,
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(agents_menu(&ctx));
+
+        assert!(spec.items.iter().any(|item| item.id == "agents.main"));
+        let edison = spec
+            .items
+            .iter()
+            .find(|item| item.id == "agents.switch.edison")
+            .expect("edison row");
+        assert!(
+            matches!(
+                &edison.action,
+                MenuAction::Local(LocalAction::SwitchChatView(Some(id))) if id == "edison"
+            ),
+            "row action switches the chat view"
+        );
+        assert!(
+            edison.label.contains("（正在查看）") || edison.label.contains("(viewing)"),
+            "current view row is marked: {}",
+            edison.label
+        );
+        let thomas = spec
+            .items
+            .iter()
+            .find(|item| item.id == "agents.switch.thomas")
+            .expect("thomas row");
+        assert!(
+            thomas.label.contains('●'),
+            "unread row dotted: {}",
+            thomas.label
+        );
+        assert!(
+            spec.items.iter().any(|item| item.id == "agents.dock.toggle"
+                && matches!(item.action, MenuAction::Local(LocalAction::ToggleAgentDock))),
+            "dock toggle row present"
+        );
+        let subtitle = spec.subtitle.expect("subtitle");
+        assert!(
+            subtitle.contains('2') && subtitle.contains('1'),
+            "subtitle carries counts: {subtitle}"
+        );
+    }
+
+    #[test]
+    fn agents_menu_unavailable_when_roster_empty() {
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot::default(),
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        assert!(
+            matches!(agents_menu(&ctx), MenuBuildResult::Unavailable(_)),
+            "empty roster renders the placeholder"
+        );
+    }
+
     #[test]
     fn resume_menu_is_loading_until_session_list_lands() {
         let capabilities = CapabilitySet::from_methods([methods::SESSION_LIST]);
@@ -7104,6 +9587,95 @@ mod tests {
     }
 
     #[test]
+    fn model_menu_marks_exactly_one_active_row() {
+        // Bug 3 hardening: the `*` marker must land on exactly one row. Two
+        // failure inputs the old id-only `current_model == model.model` OR
+        // painted wrong: (1) two entries sharing a model id, and (2) a
+        // misbehaving/mock backend that marks every row `selected` (the
+        // reported "everything shows *"). A real SSOT backend marks exactly one
+        // (verified live), so this is defensive robustness against bad inputs.
+        let registry = core_menu_registry();
+        let capabilities =
+            CapabilitySet::from_methods([APPUI_METHOD_MODEL_LIST, APPUI_METHOD_MODEL_SELECT]);
+        let session_id = SessionKey("local:test".into());
+        let model = |name: &str, provider: &str, selected: bool| ModelStatus {
+            model: name.into(),
+            provider: provider.into(),
+            title: Some(format!("{provider} / {name}")),
+            family: Some(provider.into()),
+            route: Some("official".into()),
+            selected,
+            available: Some(true),
+            queue_mode: None,
+            qoe_policy: None,
+        };
+        let marked_ids = |catalog: &SessionModelCatalog, current: Option<&'static str>| {
+            let ctx = MenuContext {
+                availability: AvailabilityContext::protocol(&capabilities),
+                app: MenuAppSnapshot {
+                    selected_session_id: Some(&session_id),
+                    model_catalog: Some(catalog),
+                    current_model: current,
+                    ..MenuAppSnapshot::default()
+                },
+                terminal: TerminalSize::default(),
+                theme_name: None,
+                selected_path: &[],
+            };
+            let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL), &ctx)
+            else {
+                panic!("expected model menu");
+            };
+            spec.items
+                .iter()
+                .filter(|item| item.id.starts_with("model.select.") && item.state.current)
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Same model id via two providers (a real failover config). Only the
+        // primary is `selected`; the live model id matches BOTH rows.
+        let dup = SessionModelCatalog {
+            session_id: session_id.clone(),
+            models: vec![
+                model("shared-model", "openai", true),
+                model("shared-model", "openrouter", false),
+            ],
+        };
+        assert_eq!(
+            marked_ids(&dup, Some("shared-model")),
+            vec!["model.select.0".to_string()],
+            "duplicate model ids must mark only the selected (primary) row",
+        );
+
+        // A backend that marks EVERY row selected → client still shows one.
+        let all_selected = SessionModelCatalog {
+            session_id: session_id.clone(),
+            models: vec![
+                model("m-a", "openai", true),
+                model("m-b", "zai", true),
+                model("m-c", "deepseek", true),
+            ],
+        };
+        assert_eq!(
+            marked_ids(&all_selected, None).len(),
+            1,
+            "a multi-selected backend must not paint every row active",
+        );
+
+        // No row selected → fall back to the live runtime model (first match).
+        let none_selected = SessionModelCatalog {
+            session_id: session_id.clone(),
+            models: vec![model("m-a", "openai", false), model("m-b", "zai", false)],
+        };
+        assert_eq!(
+            marked_ids(&none_selected, Some("m-b")),
+            vec!["model.select.1".to_string()],
+            "with nothing selected, the live runtime model marks its row",
+        );
+    }
+
+    #[test]
     fn model_menu_can_refresh_profile_models_before_session_open() {
         let registry = core_menu_registry();
         let capabilities =
@@ -7258,7 +9830,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_menu_uses_dashboard_catalog_and_has_no_hardcoded_shortcuts() {
+    fn model_config_has_no_catalog_enumeration_and_never_leaks_secrets() {
         let registry = core_menu_registry();
         let capabilities = CapabilitySet::from_methods([
             APPUI_METHOD_PROFILE_LLM_CATALOG,
@@ -7301,40 +9873,813 @@ mod tests {
             selected_path: &[],
         };
 
-        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_PROVIDER), &ctx)
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL_CONFIG), &ctx)
         else {
-            panic!("expected provider menu");
+            panic!("expected model-config menu");
         };
         let rendered = rendered_menu_text(&spec);
         assert!(!rendered.contains("top-secret"));
+        // The retired MENU_PROVIDER dashboard flat-enumerated the catalog
+        // (family×model×route choice rows) plus a test row per catalog model.
+        // The staged surface must never enumerate — choices live behind the
+        // family→model→route chain.
         assert!(
             !spec
                 .items
                 .iter()
-                .any(|item| item.id == "provider.add.moonshot.autodl")
+                .any(|item| item.id.starts_with("provider.catalog.choice")
+                    || item.id.starts_with("provider.test.")
+                    || item.id.starts_with("provider.add.")),
+            "model-config must not enumerate catalog/test rows: {:?}",
+            spec.items.iter().map(|item| &item.id).collect::<Vec<_>>()
         );
-        let wisemodel = spec
+        // Nothing staged and no saved primary -> collapsed to the single
+        // add-model entry, exactly like the wizard's provider step.
+        let add_row = spec
             .items
             .iter()
-            .find(|item| item.label.contains("WiseModel"))
-            .expect("WiseModel endpoint from catalog");
-        let MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SetProviderSelection(
-            selection,
-        ))) = &wisemodel.action
-        else {
-            panic!("expected catalog selection action");
+            .find(|item| item.id == "onboard.provider.add_model")
+            .expect("collapsed add-model entry");
+        assert!(matches!(
+            &add_row.action,
+            MenuAction::OpenMenu(id)
+                if id.as_str() == crate::menu::registry::MENU_ONBOARD_FAMILY
+        ));
+
+        // The catalog data itself still drives the CHAIN: the route step keeps
+        // carrying the full endpoint config (covered by the onboarding chain
+        // tests); the WiseModel endpoint must therefore NOT be a row here.
+        assert!(
+            !rendered.contains("WiseModel"),
+            "endpoint choices belong to the route step, not the config surface"
+        );
+    }
+
+    /// The remove picker lists ONLY configured models (never the catalog) and
+    /// each row stages a `RequestRemoveModel` with the model's coordinates.
+    #[test]
+    fn model_remove_picker_stages_configured_models() {
+        let registry = core_menu_registry();
+        let capabilities =
+            CapabilitySet::from_methods([APPUI_METHOD_MODEL_LIST, APPUI_METHOD_PROFILE_LLM_DELETE]);
+        let llm_state = crate::model::ProfileLlmListResult {
+            profile_id: Some("coding".into()),
+            primary: Some(LlmConfiguredProvider {
+                family_id: Some("deepseek".into()),
+                model_id: Some("deepseek-v4-flash".into()),
+                route_id: Some("autodl".into()),
+                has_api_key: true,
+                selected: true,
+                ..configured_provider_for_test()
+            }),
+            fallbacks: vec![LlmConfiguredProvider {
+                family_id: Some("minimax".into()),
+                model_id: Some("MiniMax-M3".into()),
+                route_id: Some("minimax".into()),
+                has_api_key: true,
+                ..configured_provider_for_test()
+            }],
+            llm: None,
+            runtime_policy_stamp: None,
         };
-        assert_eq!(selection.family_id, "minimax");
-        assert_eq!(selection.model_id, "MiniMax-M2.5-highspeed");
-        assert_eq!(selection.route.route_id, "wisemodel");
-        assert_eq!(
-            selection.route.base_url.as_deref(),
-            Some("https://open.ospreyai.cn/v1")
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                profile_llm_state: Some(&llm_state),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+
+        let MenuBuildResult::Ready(spec) = registry.build(
+            &MenuId::from(crate::menu::registry::MENU_MODEL_REMOVE),
+            &ctx,
+        ) else {
+            panic!("expected model-remove menu");
+        };
+        let rows: Vec<_> = spec
+            .items
+            .iter()
+            .filter(|item| item.id.starts_with("model.remove."))
+            .collect();
+        assert_eq!(rows.len(), 2, "one row per configured model");
+        let MenuAction::Local(LocalAction::RequestRemoveModel(request)) = &rows[0].action else {
+            panic!("expected RequestRemoveModel");
+        };
+        assert_eq!(request.family_id, "deepseek");
+        assert_eq!(request.model_id, "deepseek-v4-flash");
+        assert_eq!(request.route_id, "autodl");
+
+        // `/model` itself carries the entry row, gated on profile/llm/delete.
+        let MenuBuildResult::Ready(model_spec) = registry.build(&MenuId::from(MENU_MODEL), &ctx)
+        else {
+            panic!("expected model menu");
+        };
+        let remove_row = model_spec
+            .items
+            .iter()
+            .find(|item| item.id == "model.remove")
+            .expect("remove entry present");
+        assert_eq!(remove_row.disabled_reason, None);
+    }
+
+    fn research_lane(key: &str) -> crate::model::SubProviderView {
+        crate::model::SubProviderView {
+            key: key.into(),
+            provider: Some("moonshot".into()),
+            model: Some("k3".into()),
+            ..Default::default()
+        }
+    }
+
+    /// PR384 fix P1-b/P3-e: the lane-key picker offers exactly cheap/strong
+    /// (the literal keys deep_research routes by), shows current occupancy for
+    /// the ACTIVE profile so a replace is visible before saving, and each row
+    /// fires the save with its key.
+    #[test]
+    fn research_lane_key_picker_offers_cheap_strong_with_occupancy() {
+        let registry = core_menu_registry();
+        let capabilities =
+            CapabilitySet::from_methods([crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT]);
+        let lanes = crate::model::SubProvidersListResult {
+            profile_id: Some("coding".into()),
+            sub_providers: vec![research_lane("cheap")],
+            runtime_policy_stamp: None,
+        };
+        let onboarding = crate::model::OnboardingWizardState::default();
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                sub_providers_state: Some(&lanes),
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) = registry.build(
+            &MenuId::from(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+            &ctx,
+        ) else {
+            panic!("expected the lane-key picker");
+        };
+        let cheap = spec
+            .items
+            .iter()
+            .find(|item| item.id == "research.lane_key.cheap")
+            .expect("cheap row");
+        let strong = spec
+            .items
+            .iter()
+            .find(|item| item.id == "research.lane_key.strong")
+            .expect("strong row");
+        // Occupancy: cheap exists on this profile (replace is visible), strong
+        // is vacant.
+        assert!(
+            cheap.label.contains("moonshot/k3"),
+            "occupied lane shows its current provider: {}",
+            cheap.label
         );
-        assert_eq!(
-            selection.route.api_key_env.as_deref(),
-            Some("WISEMODEL_API_KEY")
+        assert_ne!(
+            strong.label, "strong",
+            "vacant lane still gets an explicit occupancy hint: {}",
+            strong.label
         );
+        let MenuAction::Local(LocalAction::SaveResearchLaneAs(key)) = &cheap.action else {
+            panic!("cheap row fires SaveResearchLaneAs");
+        };
+        assert_eq!(key, "cheap");
+        let MenuAction::Local(LocalAction::SaveResearchLaneAs(key)) = &strong.action else {
+            panic!("strong row fires SaveResearchLaneAs");
+        };
+        assert_eq!(key, "strong");
+    }
+
+    /// A cold or foreign lane cache must NOT paint another profile's occupancy
+    /// onto the picker rows (same display-match rule as the /research menu).
+    #[test]
+    fn research_lane_key_picker_withholds_foreign_cache_occupancy() {
+        let registry = core_menu_registry();
+        let capabilities =
+            CapabilitySet::from_methods([crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT]);
+        let lanes = crate::model::SubProvidersListResult {
+            profile_id: Some("other-profile".into()),
+            sub_providers: vec![research_lane("cheap")],
+            runtime_policy_stamp: None,
+        };
+        let onboarding = crate::model::OnboardingWizardState::default();
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                sub_providers_state: Some(&lanes),
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) = registry.build(
+            &MenuId::from(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+            &ctx,
+        ) else {
+            panic!("expected the lane-key picker");
+        };
+        let cheap = spec
+            .items
+            .iter()
+            .find(|item| item.id == "research.lane_key.cheap")
+            .expect("cheap row");
+        assert_eq!(
+            cheap.label, "cheap",
+            "a foreign profile's cache paints no occupancy"
+        );
+    }
+
+    /// K3 review of the fix set (coverage): the picker must build with NO
+    /// onboarding snapshot (menus rebuild from the frame stack on theme/locale
+    /// refresh), and its rows go disabled — never silently Noop-enabled — when
+    /// the upsert capability drops mid-flow.
+    #[test]
+    fn research_lane_key_picker_survives_missing_snapshot_and_lost_capability() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods(["session/hydrate"]);
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot::default(),
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) = registry.build(
+            &MenuId::from(crate::menu::registry::MENU_RESEARCH_LANE_KEY),
+            &ctx,
+        ) else {
+            panic!("the picker must still build with no onboarding snapshot");
+        };
+        for key in ["cheap", "strong"] {
+            let row = spec
+                .items
+                .iter()
+                .find(|item| item.id == format!("research.lane_key.{key}"))
+                .expect("row present");
+            assert!(
+                row.disabled_reason.is_some(),
+                "{key} row must be disabled (with a reason) without the upsert capability"
+            );
+        }
+    }
+
+    /// PR384 fix P3-g: in lane mode the wizard's Save row gates on the RPC it
+    /// will actually use (`profile/sub_providers/upsert`), and the fallback
+    /// save row is withheld — `SaveProviderFallback` writes a PROFILE
+    /// fallback, which is never what the lane flow means.
+    #[test]
+    fn lane_intent_gates_save_row_on_sub_providers_and_hides_fallback() {
+        let mut state = crate::model::OnboardingWizardState::default();
+        assert_eq!(
+            onboarding_save_capability_method(&state),
+            APPUI_METHOD_PROFILE_LLM_UPSERT
+        );
+        state.research_lane_intent = true;
+        assert_eq!(
+            onboarding_save_capability_method(&state),
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT
+        );
+
+        // Staged selection so provider_config_rows renders the expanded form.
+        state.provider.family_id = "moonshot".into();
+        state.provider.model_id = "k3".into();
+        state.provider.route.route_id = "official".into();
+        let capabilities = CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+            APPUI_METHOD_PROFILE_LLM_TEST,
+        ]);
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                onboarding: Some(&state),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let rows = provider_config_rows(
+            &ctx,
+            &state,
+            Some("coding"),
+            ProviderConfigRowOpts {
+                include_fallback: true,
+                api_key_edit_prefix: "/add-model key ",
+            },
+        );
+        assert!(
+            rows.iter().any(|item| item.id == "onboard.provider.save"),
+            "the save row renders in lane mode"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|item| item.id == "onboard.provider.fallback"),
+            "the fallback save row is withheld in lane mode"
+        );
+    }
+
+    #[test]
+    fn research_menu_shows_active_profile_lanes_and_stages_removal() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_UPSERT,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+        ]);
+        let lanes = crate::model::SubProvidersListResult {
+            profile_id: Some("coding".into()),
+            sub_providers: vec![research_lane("cheap")],
+            runtime_policy_stamp: None,
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                sub_providers_state: Some(&lanes),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) =
+            registry.build(&MenuId::from(crate::menu::registry::MENU_RESEARCH), &ctx)
+        else {
+            panic!("expected research menu");
+        };
+        // The active-profile lane is shown, and selecting it opens a confirm that
+        // CAPTURES the displayed profile ("coding") + key — not a bare composer
+        // string that would re-resolve the profile at Enter time.
+        let lane = spec
+            .items
+            .iter()
+            .find(|item| item.id == "research.lane.0")
+            .expect("active-profile lane is listed");
+        let MenuAction::Local(crate::menu::types::LocalAction::RequestRemoveResearchLane(request)) =
+            &lane.action
+        else {
+            panic!("expected a RequestRemoveResearchLane action");
+        };
+        assert_eq!(request.profile_id.as_deref(), Some("coding"));
+        assert_eq!(request.key, "cheap");
+        // Refresh targets the active profile, and there is no stale hint.
+        let refresh = spec
+            .items
+            .iter()
+            .find(|item| item.id == "research.refresh")
+            .expect("refresh row present");
+        let AppUiCommand::ProfileSubProvidersList(params) = appui_command(&refresh.action) else {
+            panic!("expected list command");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+        assert!(spec.items.iter().all(|item| item.id != "research.stale"));
+    }
+
+    #[test]
+    fn research_menu_hides_lanes_from_a_different_profile() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+        ]);
+        // A cache left over from profile "other" while "coding" is active.
+        let lanes = crate::model::SubProvidersListResult {
+            profile_id: Some("other".into()),
+            sub_providers: vec![research_lane("cheap")],
+            runtime_policy_stamp: None,
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                sub_providers_state: Some(&lanes),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) =
+            registry.build(&MenuId::from(crate::menu::registry::MENU_RESEARCH), &ctx)
+        else {
+            panic!("expected research menu");
+        };
+        // The stale profile's lanes must NOT be shown as the active profile's —
+        // otherwise selecting one would stage `rm` against a lane not in `coding`.
+        assert!(
+            spec.items
+                .iter()
+                .all(|item| !item.id.starts_with("research.lane.")),
+            "stale-profile lanes must not be listed"
+        );
+        assert!(
+            spec.items.iter().any(|item| item.id == "research.stale"),
+            "a refresh-to-load hint is shown instead"
+        );
+        // Refresh still targets the ACTIVE profile, so it loads coding's lanes.
+        let refresh = spec
+            .items
+            .iter()
+            .find(|item| item.id == "research.refresh")
+            .expect("refresh row present");
+        let AppUiCommand::ProfileSubProvidersList(params) = appui_command(&refresh.action) else {
+            panic!("expected list command");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+    }
+
+    #[test]
+    fn research_menu_hides_lanes_when_active_profile_unresolved() {
+        // No active profile resolvable (pre-bootstrap). Even though a cache is
+        // present, lanes must be withheld — showing them would let a removal
+        // target the server's default profile, not the intended one.
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_LIST,
+            crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
+        ]);
+        let lanes = crate::model::SubProvidersListResult {
+            profile_id: Some("coding".into()),
+            sub_providers: vec![research_lane("cheap")],
+            runtime_policy_stamp: None,
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: None,
+                sub_providers_state: Some(&lanes),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) =
+            registry.build(&MenuId::from(crate::menu::registry::MENU_RESEARCH), &ctx)
+        else {
+            panic!("expected research menu");
+        };
+        assert!(
+            spec.items
+                .iter()
+                .all(|item| !item.id.starts_with("research.lane.")),
+            "no removable lane rows when the active profile is unresolved"
+        );
+        assert!(spec.items.iter().any(|item| item.id == "research.stale"));
+    }
+
+    #[test]
+    fn research_remove_confirm_targets_the_captured_profile_not_the_active_one() {
+        let registry = core_menu_registry();
+        let capabilities =
+            CapabilitySet::from_methods([crate::model::APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE]);
+        let onboarding = crate::model::OnboardingWizardState {
+            pending_research_lane_removal: Some(crate::model::ResearchLaneRemoval {
+                profile_id: Some("coding".into()),
+                key: "cheap".into(),
+            }),
+            ..crate::model::OnboardingWizardState::default()
+        };
+        // The active profile has since flipped to "writing"; the confirm must
+        // still delete from the CAPTURED "coding" (the profile whose lane the
+        // user selected), never the now-active profile.
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("writing"),
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) = registry.build(
+            &MenuId::from(crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM),
+            &ctx,
+        ) else {
+            panic!("expected research remove confirm menu");
+        };
+        let yes = spec
+            .items
+            .iter()
+            .find(|item| item.id == "research.remove.yes")
+            .expect("confirm Yes row present");
+        let AppUiCommand::ProfileSubProvidersRemove(params) = appui_command(&yes.action) else {
+            panic!("expected a remove command");
+        };
+        assert_eq!(params.profile_id.as_deref(), Some("coding"));
+        assert_eq!(params.key, "cheap");
+
+        // With nothing staged, the confirm menu is Unavailable (no accidental
+        // empty confirm).
+        let empty = crate::model::OnboardingWizardState::default();
+        let empty_ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                onboarding: Some(&empty),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        assert!(matches!(
+            registry.build(
+                &MenuId::from(crate::menu::registry::MENU_RESEARCH_REMOVE_CONFIRM),
+                &empty_ctx,
+            ),
+            MenuBuildResult::Unavailable(_)
+        ));
+    }
+
+    /// #324: the Ctrl+S/Alt+S popup lists open sessions — the focused row is
+    /// informational, background rows switch via the resume path and carry
+    /// the live `✻` / unread `(n)` annotations.
+    #[test]
+    fn sessions_popup_lists_chips_and_switches_background_rows() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods(["session/hydrate"]);
+        let chips = vec![
+            crate::model::SessionChipView {
+                session_id: octos_core::SessionKey("local:a".into()),
+                title: "api-work".into(),
+                focused: true,
+                live: false,
+                unread: 0,
+                blocked: false,
+                is_peer: false,
+                activity: None,
+            },
+            crate::model::SessionChipView {
+                session_id: octos_core::SessionKey("local:b".into()),
+                title: "octos-web".into(),
+                focused: false,
+                live: true,
+                unread: 3,
+                blocked: false,
+                is_peer: true,
+                activity: Some("now analyzing the bus module".into()),
+            },
+        ];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                session_chips: chips,
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) =
+            registry.build(&MenuId::from(crate::menu::registry::MENU_SESSIONS), &ctx)
+        else {
+            panic!("expected sessions menu");
+        };
+        let focused = spec
+            .items
+            .iter()
+            .find(|item| item.id == "sessions.row.0")
+            .expect("focused row");
+        assert!(
+            focused.disabled_reason.is_some(),
+            "focused row is informational"
+        );
+        let bg = spec
+            .items
+            .iter()
+            .find(|item| item.id == "sessions.row.1")
+            .expect("background row");
+        assert!(bg.label.contains("✻"), "live badge shown: {}", bg.label);
+        assert!(bg.label.contains("(3)"), "unread badge shown: {}", bg.label);
+        // The focused main window is marked ⌂, the peer row ↳, so a user inside
+        // a peer can tell which row is the parent to return to.
+        assert!(
+            focused.label.contains("⌂"),
+            "main marked: {}",
+            focused.label
+        );
+        assert!(bg.label.contains("↳"), "peer marked: {}", bg.label);
+        assert!(matches!(
+            &bg.action,
+            MenuAction::Local(crate::menu::types::LocalAction::ResumeSession(id))
+                if id == "local:b"
+        ));
+    }
+
+    fn snapshot_row(id: &str, label: &str) -> crate::model::SnapshotInfoView {
+        crate::model::SnapshotInfoView {
+            id: id.into(),
+            label: label.into(),
+            timestamp_unix: chrono::Utc::now().timestamp() - 120,
+        }
+    }
+
+    #[test]
+    fn undo_menu_lists_active_session_snapshots_and_captures_restore() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_SNAPSHOT_LIST,
+            crate::model::APPUI_METHOD_SNAPSHOT_RESTORE,
+        ]);
+        let session = octos_core::SessionKey("local:test".into());
+        let snapshots = crate::model::SnapshotListResult {
+            session_id: Some(session.clone()),
+            enabled: true,
+            available: true,
+            snapshots: vec![snapshot_row("deadbeefcafe", "edit_file batch")],
+            restored: None,
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                selected_session_id: Some(&session),
+                snapshots_state: Some(&snapshots),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) =
+            registry.build(&MenuId::from(crate::menu::registry::MENU_UNDO), &ctx)
+        else {
+            panic!("expected undo menu");
+        };
+        let row = spec
+            .items
+            .iter()
+            .find(|item| item.id == "undo.snap.0")
+            .expect("snapshot row listed");
+        let MenuAction::Local(crate::menu::types::LocalAction::RequestRestoreSnapshot(request)) =
+            &row.action
+        else {
+            panic!("expected RequestRestoreSnapshot, got {:?}", row.action);
+        };
+        // Captured at BUILD time: the displayed session + the exact snapshot.
+        assert_eq!(request.session_id, session);
+        assert_eq!(request.snapshot_id, "deadbeefcafe");
+    }
+
+    #[test]
+    fn undo_menu_hides_snapshots_from_a_different_session() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_SNAPSHOT_LIST,
+            crate::model::APPUI_METHOD_SNAPSHOT_RESTORE,
+        ]);
+        let active = octos_core::SessionKey("local:active".into());
+        let stale = crate::model::SnapshotListResult {
+            session_id: Some(octos_core::SessionKey("local:other".into())),
+            enabled: true,
+            available: true,
+            snapshots: vec![snapshot_row("deadbeefcafe", "other session's edit")],
+            restored: None,
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                selected_session_id: Some(&active),
+                snapshots_state: Some(&stale),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) =
+            registry.build(&MenuId::from(crate::menu::registry::MENU_UNDO), &ctx)
+        else {
+            panic!("expected undo menu");
+        };
+        assert!(
+            spec.items
+                .iter()
+                .all(|item| !item.id.starts_with("undo.snap.")),
+            "another session's snapshots must not be restorable here"
+        );
+        assert!(spec.items.iter().any(|item| item.id == "undo.stale"));
+    }
+
+    #[test]
+    fn undo_confirm_targets_the_captured_session_and_snapshot() {
+        let registry = core_menu_registry();
+        let capabilities =
+            CapabilitySet::from_methods([crate::model::APPUI_METHOD_SNAPSHOT_RESTORE]);
+        let onboarding = crate::model::OnboardingWizardState {
+            pending_snapshot_restore: Some(crate::model::SnapshotRestoreRequest {
+                session_id: octos_core::SessionKey("local:captured".into()),
+                snapshot_id: "deadbeefcafe".into(),
+                label: "deadbeef · edit · 2m".into(),
+            }),
+            ..crate::model::OnboardingWizardState::default()
+        };
+        // The active session has since changed — the confirm must still
+        // target the CAPTURED session, never the current one.
+        let active = octos_core::SessionKey("local:now-active".into());
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                selected_session_id: Some(&active),
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) = registry.build(
+            &MenuId::from(crate::menu::registry::MENU_UNDO_CONFIRM),
+            &ctx,
+        ) else {
+            panic!("expected undo confirm menu");
+        };
+        let yes = spec
+            .items
+            .iter()
+            .find(|item| item.id == "undo.confirm.yes")
+            .expect("Yes row");
+        let AppUiCommand::SnapshotRestore(params) = appui_command(&yes.action) else {
+            panic!("expected SnapshotRestore");
+        };
+        assert_eq!(params.session_id.0, "local:captured");
+        assert_eq!(params.snapshot_id, "deadbeefcafe");
+    }
+
+    /// `/model` absorbed the add-model flow: a trailing "Add a model…" row
+    /// opens the staged family→model→route chain (same entry the wizard's
+    /// collapsed row uses).
+    #[test]
+    fn model_menu_offers_add_model_entry() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            APPUI_METHOD_MODEL_LIST,
+            APPUI_METHOD_PROFILE_LLM_CATALOG,
+        ]);
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL), &ctx) else {
+            panic!("expected model menu");
+        };
+        let add_row = spec
+            .items
+            .iter()
+            .find(|item| item.id == "model.add")
+            .expect("model menu carries the add-model entry");
+        assert!(matches!(
+            &add_row.action,
+            MenuAction::OpenMenu(id)
+                if id.as_str() == crate::menu::registry::MENU_ONBOARD_FAMILY
+        ));
+        assert_eq!(add_row.disabled_reason, None);
+
+        // Without the catalog capability the row stays visible but disabled
+        // with a reason (capability-stripped servers).
+        let capabilities = CapabilitySet::from_methods([APPUI_METHOD_MODEL_LIST]);
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("coding"),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_MODEL), &ctx) else {
+            panic!("expected model menu");
+        };
+        let add_row = spec
+            .items
+            .iter()
+            .find(|item| item.id == "model.add")
+            .expect("add-model entry present");
+        assert!(add_row.disabled_reason.is_some());
     }
 
     #[test]
