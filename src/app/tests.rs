@@ -3809,16 +3809,14 @@ mod tests {
         assert_eq!(pending_style.bg, Some(palette.diff_context_bg));
     }
 
-    /// A focused peer refuses PLAIN PROMPTS, but the store still accepts typed
-    /// input on it: `submit_composer` routes slash/bang commands (`/resume`,
-    /// `!ls`, …) before the peer guard, and the guard deliberately KEEPS the
-    /// draft "so the text isn't lost when the user switches back to the master"
-    /// (store.rs). Collapsing the pane to a 1-row bar made all of that
-    /// invisible — you type into a surface that isn't drawn, with no caret and
-    /// no echo of the kept draft. The composer box must stay, carrying the
-    /// read-only notice as its hint row.
+    /// A focused peer accepts typed input and SENDS it, so the composer box,
+    /// the echoed draft and the caret all stay. Collapsing the pane to a 1-row
+    /// bar made that invisible — you typed into a surface that wasn't drawn.
+    /// The hint row now says what Enter does rather than claiming the surface
+    /// is read-only, which stopped being true once `compose_command` dropped
+    /// its peer guard.
     #[test]
-    fn render_composer_on_peer_keeps_editable_box_with_readonly_hint() {
+    fn render_composer_on_peer_keeps_editable_box_with_steer_hint() {
         let peer = SessionKey("coding:local:tui#peer-alpha".into());
         let mut app = AppState::new(
             vec![
@@ -3871,10 +3869,13 @@ mod tests {
             "the typed draft is echoed in the composer: {text:?}"
         );
         assert!(
-            text.contains("read-only peer"),
-            "the read-only notice rides the composer hint row: {text:?}"
+            text.contains("Enter steers this peer"),
+            "the hint row states what Enter does on a peer: {text:?}"
         );
-        assert!(text.contains("steer from the master"));
+        assert!(
+            !text.contains("read-only"),
+            "a peer that accepts prompts must not claim to be read-only: {text:?}"
+        );
         assert_ne!(
             (cursor.x, cursor.y),
             (0, 0),
@@ -3882,12 +3883,12 @@ mod tests {
         );
     }
 
-    /// The composer box stays on a peer, but its "Ask Octos to change code…"
-    /// placeholder must not: a plain prompt is exactly what `submit_composer`
-    /// refuses there, so inviting one is a false affordance. The empty peer
-    /// composer shows the caret row bare — the hint row already states the mode.
+    /// The "Ask Octos to change code…" placeholder stays on a peer. It was
+    /// suppressed while a plain prompt was exactly what `submit_composer`
+    /// refused — a false affordance. Now that a peer sends, hiding the
+    /// invitation would understate what the surface does.
     #[test]
-    fn render_composer_on_empty_peer_suppresses_the_prompt_placeholder() {
+    fn render_composer_on_empty_peer_shows_the_prompt_placeholder() {
         let peer = SessionKey("coding:local:tui#peer-alpha".into());
         let mut app = AppState::new(
             vec![
@@ -3927,11 +3928,12 @@ mod tests {
             .collect::<String>();
 
         assert!(
-            !text.contains("Ask Octos"),
-            "no plain-prompt invitation on a read-only peer: {text:?}"
+            text.contains("Ask Octos"),
+            "a peer accepts plain prompts, so the placeholder is a REAL \
+             affordance and must be shown: {text:?}"
         );
         assert!(
-            text.contains("read-only peer"),
+            text.contains("Enter steers this peer"),
             "the mode is still stated on the hint row: {text:?}"
         );
     }

@@ -1620,13 +1620,12 @@ pub(super) fn render_composer(app: &AppState, palette: Palette, area: Rect) -> P
         ComposerPresentation::Empty | ComposerPresentation::Collapsed(_) => None,
     };
     if app.focused_session_is_peer() {
-        // A focused peer is a read-only WATCH surface for PLAIN PROMPTS only:
-        // `submit_composer` refuses those but routes slash/bang commands
-        // (`/resume`, `!ls`, …) first, and deliberately KEEPS the draft so the
-        // text survives switching back to the master. So the box, the draft and
-        // the caret all stay — collapsing the pane to a bare status row left the
-        // user typing into a surface that wasn't drawn. The read-only notice
-        // rides the hint row instead, where the mode is still stated outright.
+        // A focused peer sends like any other session, so the box, draft, caret
+        // and placeholder are all real affordances now — collapsing the pane to
+        // a bare status row left the user typing into a surface that wasn't
+        // drawn, and keeping a "read-only" notice after `compose_command` began
+        // accepting prompts made the hint row contradict the behaviour. The hint
+        // row states what Enter does instead.
         lines.push(Line::from(vec![Span::styled(
             t!("app.composer_hint.peer_readonly").to_string(),
             palette.muted().bg(palette.surface),
@@ -1677,12 +1676,6 @@ pub(super) fn render_composer(app: &AppState, palette: Palette, area: Rect) -> P
                 ),
             ]))
         }
-        // A peer refuses plain prompts, so "Ask Octos to change code…" would be
-        // a false affordance — the caret row stays bare and the hint row above
-        // carries the mode. Slash/bang input still echoes via `Inline` below.
-        ComposerPresentation::Empty if app.focused_session_is_peer() => lines.push(Line::from(
-            vec![Span::styled(" › ", palette.selected().bg(palette.surface))],
-        )),
         ComposerPresentation::Empty => lines.push(Line::from(vec![
             Span::styled(" › ", palette.selected().bg(palette.surface)),
             Span::styled(

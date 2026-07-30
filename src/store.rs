@@ -456,18 +456,18 @@ impl Store {
             return None;
         }
 
-        // A focused peer is a read-only WATCH surface: plain prompts are refused
-        // (the operator steers peers from the master via `peer_send_input`), and
-        // the draft is KEPT (not cleared) so the text isn't lost when the user
-        // switches back to the master to send it. Slash/bang were handled above,
-        // so client-local commands (`/resume`, `!ls`, …) still work on a peer.
-        if self.state.focused_session_is_peer() {
-            self.state.status =
-                "Peer sessions are read-only — steer peers from the master with peer_send_input."
-                    .into();
-            return None;
-        }
-
+        // A focused peer SENDS like any other session. #453 refused plain
+        // prompts here and pointed at `peer_send_input` — a function that exists
+        // nowhere in this crate, so a peer could not be driven from the peer view
+        // OR the master. Once the composer was restored on a focused peer the
+        // refusal also went invisible: it only set `status`, which live-turn
+        // progress immediately overwrites, so Enter read as a dead key.
+        //
+        // Falling through means a peer with a LIVE turn steers it (the normal
+        // path tries `try_steer_live_turn` first, and `turn/steer` is what the
+        // server advertises for exactly this), and an idle peer starts a turn on
+        // its own session — both addressed to the peer's own session_id, since
+        // every send below resolves the ACTIVE session.
         self.state.clear_current_composer_draft();
         // Accepted plain prompt — record before staging/sending. Slash/bang
         // returned above; readonly/empty/no-session were rejected above, so only
@@ -16733,32 +16733,34 @@ mod tests {
         );
     }
 
-    /// Peer operator console (FIX 2): a peer view is read-only — a plain prompt
-    /// is refused and the draft is KEPT (so the operator can switch to the
-    /// master and send it there).
+    /// A focused peer's composer SENDS. #453 made peer views read-only and
+    /// pointed the user at `peer_send_input` — which does not exist anywhere in
+    /// this crate, so there was no way to drive a peer at all. Once the composer
+    /// was restored on a focused peer (74ecbae) the refusal became invisible:
+    /// `compose_command` set a status string and returned, and that string is
+    /// overwritten by live-turn progress, so Enter looked like a dead key.
     #[test]
-    fn compose_on_peer_focused_session_is_read_only() {
-        // Durable peer identity via the insert-only `opened_peer_sessions` set
-        // (populated at the peer-open chokepoint), not the mutable dock roster.
+    fn compose_on_peer_focused_session_sends_instead_of_silently_refusing() {
         let peer = SessionKey("local:main#peer-refactor".into());
         let mut store = store_with_two_sessions("local:a", "local:main#peer-refactor");
-        store.state.opened_peer_sessions.insert(peer);
+        store.state.opened_peer_sessions.insert(peer.clone());
         store.state.selected_session = 1;
-        assert!(
-            store.state.focused_session_is_peer(),
-            "a focused opened-peer session is read-only"
-        );
-        store.state.composer = "hello peer".into();
+        assert!(store.state.focused_session_is_peer(), "precondition: peer");
+        store.state.composer = "keep going on the retry path".into();
 
         let command = store.compose_command();
-        assert!(command.is_none(), "no turn starts on a read-only peer");
-        assert_eq!(
-            store.state.composer, "hello peer",
-            "the draft is KEPT for the operator to send from the master"
+        assert!(
+            command.is_some(),
+            "Enter on a focused peer produces a command instead of a silent no-op"
         );
         assert!(
-            store.state.status.contains("read-only"),
-            "the status explains the peer is read-only: {}",
+            store.state.composer.is_empty(),
+            "an accepted prompt clears the draft; got: {:?}",
+            store.state.composer
+        );
+        assert!(
+            !store.state.status.contains("read-only"),
+            "no read-only refusal on the status line: {}",
             store.state.status
         );
     }
@@ -16769,7 +16771,7 @@ mod tests {
     /// topic-string check that would false-positive on an ordinary session whose
     /// API topic merely starts with `peer-`.
     #[test]
-    fn cleared_peer_stays_read_only_and_topic_lookalike_is_not_a_peer() {
+    fn cleared_peer_keeps_its_identity_and_topic_lookalike_is_not_a_peer() {
         let peer = SessionKey("local:main#peer-refactor".into());
         let mut store = store_with_two_sessions("local:a", "local:main#peer-refactor");
         // Registered as a peer in BOTH maps, as the open chokepoint does.
@@ -16798,11 +16800,8 @@ mod tests {
         );
         assert!(
             store.state.focused_session_is_peer(),
-            "a cleared-but-focused peer is STILL read-only"
+            "a cleared-but-focused peer KEEPS its peer identity"
         );
-        store.state.composer = "hello".into();
-        assert!(store.compose_command().is_none(), "still read-only");
-        assert_eq!(store.state.composer, "hello", "the draft is kept");
 
         // False-positive guard: an ORDINARY session whose API topic merely
         // starts with `peer-` was never OPENED as a peer, so it is NOT one.
@@ -16823,7 +16822,7 @@ mod tests {
         );
         assert!(
             !store.state.focused_session_is_peer(),
-            "a topic-lookalike never opened as a peer is NOT read-only"
+            "a topic-lookalike never opened as a peer is NOT a peer"
         );
     }
 
