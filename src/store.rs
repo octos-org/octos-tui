@@ -441,7 +441,7 @@ impl Store {
         }
 
         if self.state.readonly {
-            self.state.status_error = Some(t!("status.readonly_turn_disabled").into_owned());
+            self.state.status = t!("status.readonly_turn_disabled").into_owned();
             self.state.clear_current_composer_draft();
             return None;
         }
@@ -451,19 +451,7 @@ impl Store {
         }
 
         if self.active_session().is_none() {
-            // Try to auto-open a session so the user doesn't have to type a
-            // separate /onboard command — stage the message first, then return
-            // the OpenSession command; submit_next_pending_if_idle drains it
-            // once SessionOpened arrives.
-            let command = self.onboarding_finish_command();
-            if command.is_some() {
-                self.state.clear_current_composer_draft();
-                self.state.pending_messages.push(prompt);
-                return command;
-            }
-            // onboarding_finish_command already set self.state.status with the
-            // reason it failed — promote it to danger styling so it's visible.
-            self.state.status_error = Some(self.state.status.clone());
+            self.state.status = t!("status.no_session_send_prompt").into_owned();
             self.state.focus = FocusPane::Composer;
             return None;
         }
@@ -4836,9 +4824,9 @@ impl Store {
         Some(AppUiCommand::OpenSession(SessionOpenParams {
             session_id,
             topic: None,
-            sandbox: None,
             profile_id: Some(profile_id),
             cwd: onboarding_workspace_cwd(&self.state.workspace.root),
+            sandbox: None,
             after: None,
         }))
     }
@@ -9855,6 +9843,12 @@ impl Store {
             if token_cost.session_cost.is_some() {
                 entry.2 = token_cost.session_cost;
             }
+            // Real per-model context window for an honest ctx-fill gauge.
+            if let Some(window) = token_cost.context_window {
+                self.state
+                    .session_context_window
+                    .insert(event.session_id.clone(), window);
+            }
         }
         // Gap 2 fix #3: surface the `UiRetryBackoff` carried on
         // `metadata.retry` (previously ignored) so the harness status row can
@@ -9981,6 +9975,27 @@ impl Store {
             UiNotification::VisualGenerating(_)
             | UiNotification::VisualSucceeded(_)
             | UiNotification::VisualFailed(_) => None,
+            // Streamed voice audio (#1504) — the TUI has no audio surface;
+            // ignore gracefully so newer servers don't wedge the client.
+            UiNotification::VoiceAudioChunk(_) => None,
+            // #1801 v3: against an rc.13+ core the `peer/staged` frame decodes
+            // to this typed variant. (Older cores lacked it, so #405 routes
+            // the raw frame through a transport string-intercept →
+            // `ClientEvent::PeerStaged`.) Route both to the one handler; the
+            // dual idempotency in `apply_peer_staged_event` makes any overlap
+            // a no-op — an already-open peer session is never re-kicked.
+            UiNotification::PeerStaged(event) => {
+                self.apply_peer_staged_event(crate::model::PeerStagedParams {
+                    session_id: event.session_id,
+                    topic: event.topic,
+                    slug: event.slug,
+                    brief: event.brief,
+                    brief_path: event.brief_path,
+                    cwd: event.cwd,
+                    worktree_branch: event.worktree_branch,
+                    profile_id: event.profile_id,
+                })
+            }
             UiNotification::SessionOpened(event) => {
                 let session_id = event.session_id.clone();
                 // Bug 2: a `session/opened` for a peer we JUST closed (its
@@ -10176,9 +10191,7 @@ impl Store {
                         ));
                     }
                 }
-                // Drain any message the user staged before the session was
-                // open (typed and pressed Enter before onboarding finished).
-                self.submit_next_pending_if_idle()
+                None
             }
             UiNotification::TurnStarted(event) => {
                 // The staged-drain submit (if any) has materialized into a
@@ -20643,9 +20656,6 @@ now analyzing the bus module"
 
     #[test]
     fn normal_prompt_without_open_session_is_preserved() {
-        // When there is no session and onboarding cannot open one (no profile
-        // resolved), the composer text is preserved and the reason is surfaced
-        // as status_error (danger-styled) so it's immediately visible.
         let mut store = protocol_store_without_sessions();
         store.state.composer = "please edit src/main.rs".into();
 
@@ -20654,8 +20664,8 @@ now analyzing the bus module"
         assert!(command.is_none());
         assert_eq!(store.state.composer, "please edit src/main.rs");
         assert_eq!(
-            store.state.status_error.as_deref(),
-            Some("Cannot open session: profile unresolved. Use /onboard profile <profile_id>.")
+            store.state.status,
+            "No coding session open. Run /onboard open-session before sending a prompt."
         );
     }
 
@@ -32074,10 +32084,7 @@ now analyzing the bus module"
         assert!(command.is_none());
         assert!(store.state.sessions[0].messages.is_empty());
         assert!(store.state.composer.is_empty());
-        assert_eq!(
-            store.state.status_error.as_deref(),
-            Some("Read-only mode: turn/start disabled")
-        );
+        assert_eq!(store.state.status, "Read-only mode: turn/start disabled");
     }
 
     #[test]

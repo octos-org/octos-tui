@@ -44,8 +44,6 @@ const INITIAL_CAPABILITIES_HANDSHAKE_POLL: Duration = Duration::from_millis(10);
 /// Redraw cadence while a turn is active, so the spinner/status animates without
 /// a fixed-rate repaint when nothing is happening.
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(120);
-/// Total duration for the launch-banner row-by-row reveal (6 rows × 120 ms).
-const BANNER_REVEAL_DURATION: Duration = Duration::from_millis(720);
 const MAX_BACKEND_EVENTS_PER_TICK: usize = 512;
 /// Cap on queued terminal input events handled per frame. High enough that a
 /// momentum-scroll burst coalesces into one repaint, low enough that a
@@ -177,9 +175,18 @@ pub fn run(cli: Cli) -> Result<()> {
         // redraw on the animation cadence so the spinner/status moves; otherwise
         // an idle UI emits no terminal writes and never wipes a live selection.
         let turn_active = store.state.run_state.is_active();
-        if turn_active && last_animation.elapsed() >= ANIMATION_INTERVAL {
-            dirty = true;
-            last_animation = Instant::now();
+        if turn_active {
+            // Watchdog: after a turn has sat parked on an operator decision past
+            // the escalation threshold, re-show a hidden prompt (never
+            // auto-resolves). The prominent banner is driven purely by elapsed
+            // time in the render pass; this handles the modal-visibility side.
+            if store.escalate_parked_decision_if_due() {
+                dirty = true;
+            }
+            if last_animation.elapsed() >= ANIMATION_INTERVAL {
+                dirty = true;
+                last_animation = Instant::now();
+            }
         }
         if dirty {
             let menu_reserved_now = app::menu_surface_active(&store.state);
@@ -195,7 +202,7 @@ pub fn run(cli: Cli) -> Result<()> {
             dirty = false;
         }
 
-        let poll = if turn_active || banner_animating {
+        let poll = if turn_active {
             ANIMATION_INTERVAL.min(UI_EVENT_POLL_INTERVAL)
         } else {
             UI_EVENT_POLL_INTERVAL
@@ -738,16 +745,32 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
-    store.state.status_error = None;
-
     if is_control_char(&key, 'q') {
         return KeyAction::Quit;
     }
 
     if is_control_char(&key, 'c') {
-        return store
-            .interrupt_command()
-            .map_or(KeyAction::Continue, KeyAction::send);
+        // A turn parked on a decision (approval / question) can be waiting BEFORE
+        // any reply streams, so `active_turn()` — hence `interrupt_command()` —
+        // is a no-op there. Route through the decision-aware interrupt so Ctrl+C
+        // reliably cancels a parked turn (and tears down its server-side waiter).
+        let command = if app::active_session_has_pending_decision(&store.state) {
+            store.interrupt_active_decision_command()
+        } else {
+            store.interrupt_command()
+        };
+        return command.map_or(KeyAction::Continue, KeyAction::send);
+    }
+
+    // A live sub-agent peek OWNS the keyboard, exactly like a modal: routed here
+    // — after the always-on quit/interrupt keys but BEFORE every composer /
+    // Ctrl / paste mutation path — so typing, Ctrl+U, word-deletes, Vim edits
+    // and paste can't leak into the composer that is hidden behind the overlay.
+    // `agent_view_active` is false while any modal is up (so the modal keeps the
+    // keyboard) or when the selected agent has vanished (so the inline composer
+    // stays editable).
+    if app::agent_view_active(&store.state) {
+        return handle_agent_peek_key(store, key);
     }
 
     if is_control_char(&key, 'u') {

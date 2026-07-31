@@ -4546,10 +4546,6 @@ pub struct AppState {
     /// fullness bar.
     pub live_compaction: std::collections::HashMap<SessionKey, LiveCompaction>,
     pub status: String,
-    /// Transient error shown in the status bar with `danger` styling instead of
-    /// the normal muted `status` text. Cleared on the next key press so it
-    /// behaves like a dismissable inline toast.
-    pub status_error: Option<String>,
     pub target: Option<String>,
     pub readonly: bool,
     pub protocol_version: &'static str,
@@ -4753,6 +4749,64 @@ pub struct AppState {
     /// operator's *local* clipboard — and the store has no terminal handle, so
     /// the work is split across this field.
     pub pending_clipboard: Option<String>,
+    /// Prior sessions fetched via `session/list` to populate the `/resume`
+    /// picker. Local-only client state the server never echoes in a snapshot —
+    /// preserved across snapshot replays (see `apply_event(Snapshot)`), and
+    /// mirrored into `MenuAppSnapshot` so the resume menu can render it. Empty
+    /// until `/resume` triggers the first fetch.
+    pub resume_sessions: Vec<ResumeSessionRow>,
+    /// Whether a `session/list` result has landed yet, distinguishing "the fetch
+    /// is still in flight" from "the fetch returned zero prior sessions". Without
+    /// it an empty [`Self::resume_sessions`] is ambiguous and the `/resume`
+    /// picker would render `Loading` forever when the server has no sessions.
+    /// Set true when the first (and every subsequent) `session/list` result is
+    /// applied. Local-only client state — preserved across snapshot replays.
+    pub resume_list_loaded: bool,
+    /// Active-session user turns for the `/rewind` picker, newest-first.
+    /// Populated locally (from the active session's transcript) when
+    /// `OpenRewindPicker` is dispatched, and mirrored into `MenuAppSnapshot` so
+    /// `rewind_menu` can render one row per turn. Local-only client state the
+    /// server never echoes — preserved across snapshot replays.
+    pub rewind_turns: Vec<RewindTurnRow>,
+    /// The full text of the user message chosen in the `/rewind` picker, keyed
+    /// by the session the rewind was issued in, stashed while
+    /// `session/rollback` is in flight. When the `SessionRollback` result for
+    /// THAT session lands it is placed back into the composer (so the user can
+    /// edit and resend that turn) — unless the user switched sessions
+    /// meanwhile, in which case it becomes that session's composer draft
+    /// instead of clobbering the live composer. Local-only, preserved across
+    /// snapshot replays.
+    pub pending_rewind_prefill: Option<(SessionKey, String)>,
+    /// Prompts of turns the user interrupted (Esc/Ctrl+C), stashed until each
+    /// turn actually SETTLES (its `turn/completed`/`turn/error` terminal, or
+    /// the hydrate finalize after a backend restart). Restoring at
+    /// interrupt-REQUEST time filled the composer while the turn was still
+    /// streaming, and a non-empty composer silently blocks the `/` slash
+    /// popup (it only opens on an empty composer) — the reported "slash menu
+    /// is not usable while the LLM is outputting". At most ONE entry per
+    /// session (flat `Vec`, consistent with `permission_profiles` /
+    /// `session_runtime_statuses` neighbours; codex round-2 P2: a single
+    /// global slot let session B's interrupt overwrite session A's). Applied
+    /// by the settle handlers into the live composer (active session,
+    /// still-empty composer, no open menu), or into the session's saved draft
+    /// when the user switched away (the `pending_rewind_prefill` convention);
+    /// an entry is dropped when staged messages own its session's next turn
+    /// slot or a newer turn/submit supersedes it. Local-only, preserved
+    /// across snapshot replays.
+    pub pending_interrupt_restores: Vec<PendingInterruptRestore>,
+}
+
+/// See [`AppState::pending_interrupt_restores`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInterruptRestore {
+    pub session_id: SessionKey,
+    pub turn_id: TurnId,
+    pub prompt: String,
+    /// The turn's terminal already arrived but a menu was open at that
+    /// moment, so the composer fill was deferred once more (codex round-3
+    /// P2: consuming it there lost the prompt permanently). A settled entry
+    /// applies when the menu stack empties.
+    pub settled: bool,
 }
 
 /// M16-G2 per-session lifecycle ledger entry. The TUI keeps these in
@@ -6498,7 +6552,6 @@ impl AppState {
             live_reasoning: std::collections::HashMap::new(),
             live_compaction: std::collections::HashMap::new(),
             status,
-            status_error: None,
             target,
             readonly,
             protocol_version: APP_UI_API_V1,
@@ -6559,6 +6612,11 @@ impl AppState {
             pending_goal_transition: None,
             exit_requested: false,
             pending_clipboard: None,
+            resume_sessions: Vec::new(),
+            resume_list_loaded: false,
+            rewind_turns: Vec::new(),
+            pending_rewind_prefill: None,
+            pending_interrupt_restores: Vec::new(),
         }
     }
 
