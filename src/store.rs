@@ -37019,3 +37019,36 @@ now analyzing the bus module"
         assert!(!store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
     }
 }
+
+#[cfg(test)]
+mod activity_line_width_tests {
+    use super::*;
+
+    /// `session_activity_line` capped at 60 CHARS. The peer dock row
+    /// (`app::peer_activity_line`) and the Alt+S switcher rows both budget in
+    /// COLUMNS, so a CJK summary was twice its allowance and overflowed.
+    #[test]
+    fn session_activity_line_caps_columns_not_chars() {
+        use unicode_width::UnicodeWidthStr;
+        let session_id = SessionKey("local:b".into());
+        let long = "正在重构速率限制器并为并发请求增加背压控制以避免上游服务被打满".repeat(3);
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "b".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![Message::assistant(long)],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let state = AppState::new(vec![session], 0, "ready".into(), None, false);
+
+        let line = state
+            .session_activity_line(&session_id)
+            .expect("activity line present");
+        assert!(
+            line.width() <= 60,
+            "the activity line budget is 60 columns, got {} columns: {line:?}",
+            line.width()
+        );
+    }
+}
