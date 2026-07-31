@@ -55,8 +55,6 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # NOT `-D warnings` yet: `main` carries 5 pre-existing warnings
-      # (two too-many-arguments, a manual !Range::contains, a constant-value
-      # assertion, and a loop-counter variable). Clear those in a follow-up,
-      # then flip this to `-- -D warnings` so the job gates instead of reports.
-      - run: cargo clippy --all-targets
+      # Gating, not reporting: the 5 warnings `main` carried are cleared in
+      # this same PR, so the baseline is zero and any new one fails the build.
+      - run: cargo clippy --all-targets -- -D warnings
