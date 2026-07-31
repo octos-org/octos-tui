@@ -12478,3 +12478,40 @@ mod running_row_regression {
         assert!(!text.contains("{\"cmd\""), "raw JSON leaked:\n{text}");
     }
 }
+
+/// `goal_objective_chunks` sliced the objective with `chars.chunks(body)` where
+/// `body` is a COLUMN budget from `goal_objective_body_width`. For CJK every
+/// char is two columns wide, so each row was twice the width it was allotted
+/// and ratatui clipped it at the banner edge.
+#[test]
+fn goal_objective_rows_fit_the_column_budget_for_cjk() {
+    let width: u16 = 80;
+    let body = goal_objective_body_width(width);
+    let objective = "重构速率限制器并为并发请求增加背压控制".repeat(4);
+
+    for chunk in goal_objective_chunks(&objective, width, 0) {
+        assert!(
+            chunk.width() <= body,
+            "a goal row must fit its {body}-column budget, got {} columns: {chunk:?}",
+            chunk.width()
+        );
+    }
+}
+
+/// The same slice split grapheme clusters: `chars.chunks()` is unaware of ZWJ
+/// sequences and combining marks, so a family emoji landed half on one row and
+/// half on the next.
+#[test]
+fn goal_objective_rows_never_split_a_grapheme() {
+    let width: u16 = 80;
+    let body = goal_objective_body_width(width);
+    let objective = format!("{}{}", "a".repeat(body - 1), "👩‍👩‍👧‍👦 done");
+
+    let chunks = goal_objective_chunks(&objective, width, 0);
+    // Rejoining would hide the defect — the cluster must be intact within ONE
+    // row, because each row is drawn on its own line.
+    assert!(
+        chunks.iter().any(|c| c.contains("👩‍👩‍👧‍👦")),
+        "the family emoji must stay within a single row, got: {chunks:?}"
+    );
+}

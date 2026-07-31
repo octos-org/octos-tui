@@ -3289,13 +3289,16 @@ fn goal_objective_chunks(objective: &str, width: u16, tail_len: usize) -> Vec<St
         return Vec::new();
     }
     let body = goal_objective_body_width(width);
-    let chars: Vec<char> = objective.chars().collect();
-    let mut chunks: Vec<String> = chars
-        .chunks(body)
-        .take(GOAL_OBJECTIVE_MAX_ROWS)
-        .map(|c| c.iter().collect())
-        .collect();
-    if chars.len() > GOAL_OBJECTIVE_MAX_ROWS * body {
+    // Pack by GRAPHEME measured in display columns, not by `char`. `body` is a
+    // column budget: slicing `chars` into groups of `body` gave a CJK row twice
+    // its allowance (144 columns in a 72-column banner, clipped by ratatui) and
+    // could cut a multi-codepoint cluster — a family emoji landed half on one
+    // row and half on the next. `wrap_composer_line` is the primitive the
+    // composer already uses for exactly this.
+    let rows = wrap_composer_line(objective, body);
+    let row_count = rows.len();
+    let mut chunks: Vec<String> = rows.into_iter().take(GOAL_OBJECTIVE_MAX_ROWS).collect();
+    if row_count > GOAL_OBJECTIVE_MAX_ROWS {
         // Objective longer than the cap: mark the clip. The parenthetical rides
         // the (full) last row; the cap already bounds height.
         if let Some(last) = chunks.last_mut() {
@@ -3305,7 +3308,7 @@ fn goal_objective_chunks(objective: &str, width: u16, tail_len: usize) -> Vec<St
         // Objective fits: keep the status/budget parenthetical fully on-screen —
         // if it won't fit after the final objective row, give it its own indented
         // line (only while row budget remains).
-        let last_len = chunks.last().map(|c| c.chars().count()).unwrap_or(0);
+        let last_len = chunks.last().map(|c| c.width()).unwrap_or(0);
         if last_len + 1 + tail_len > body && chunks.len() < GOAL_OBJECTIVE_MAX_ROWS {
             chunks.push(String::new());
         }
