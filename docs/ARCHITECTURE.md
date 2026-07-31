@@ -103,50 +103,436 @@ keep wire-specific details inside `src/transport.rs`.
 
 ## Protocol Commands
 
-The stable command surface currently includes:
+Every variant of `AppUiCommand` (`src/model.rs`) and the wire method
+`AppUiCommand::method()` maps it to. The transport turns each into a JSON-RPC
+request and records the result kind it expects back.
 
-| AppUI command | Wire method | Purpose |
-|---|---|---|
-| `OpenSession` | `session/open` | Open or resume a session, request a cwd, and replay after a cursor. |
-| `SubmitPrompt` | `turn/start` | Start a user turn with one or more input items. |
-| `InterruptTurn` | `turn/interrupt` | Interrupt the active turn. |
-| `RespondApproval` | `approval/respond` | Approve or deny a pending approval with an optional scope. |
-| `ListApprovalScopes` | `approval/scopes/list` | Discover server-supported approval scopes. |
-| `GetDiffPreview` | `diff/preview/get` | Fetch the server-authoritative diff preview for a preview id. |
-| `ReadTaskOutput` | `task/output/read` | Fetch a task output snapshot. |
+This list is COMPLETE and kept that way by `tests/docs_drift.rs`, which fails
+if a variant is added to the enum without being documented here. Do not prune
+it by hand.
 
-The transport maps each `AppUiCommand` into a JSON-RPC request and tracks the
-result kind expected back from the server.
+### `profile/`
+
+| AppUI command | Wire method |
+|---|---|
+| `ListModels` | `profile/llm/list` |
+| `ProfileLlmCatalog` | `profile/llm/catalog` |
+| `ProfileLlmDelete` | `profile/llm/delete` |
+| `ProfileLlmFetchModels` | `profile/llm/fetch_models` |
+| `ProfileLlmList` | `profile/llm/list` |
+| `ProfileLlmSelect` | `profile/llm/select` |
+| `ProfileLlmTest` | `profile/llm/test` |
+| `ProfileLlmUpsert` | `profile/llm/upsert` |
+| `ProfileLocalCreate` | `profile/local/create` |
+| `ProfileSkillsInstall` | `profile/skills/install` |
+| `ProfileSkillsList` | `profile/skills/list` |
+| `ProfileSkillsRegistrySearch` | `profile/skills/registry/search` |
+| `ProfileSkillsRemove` | `profile/skills/remove` |
+| `ProfileSubProvidersList` | `profile/sub_providers/list` |
+| `ProfileSubProvidersRemove` | `profile/sub_providers/remove` |
+| `ProfileSubProvidersUpsert` | `profile/sub_providers/upsert` |
+| `SelectModel` | `profile/llm/select` |
+
+### `session/`
+
+| AppUI command | Wire method |
+|---|---|
+| `ClearSessionGoal` | `session/goal/clear` |
+| `CompactContext` | `session/compact` |
+| `GetSessionGoal` | `session/goal/get` |
+| `HydrateSession` | `session/hydrate` |
+| `ListSessions` | `session/list` |
+| `OpenSession` | `session/open` |
+| `ReadSessionStatus` | `session/status/read` |
+| `SessionBtw` | `session/btw` |
+| `SessionRollback` | `session/rollback` |
+| `SetCompactionMode` | `session/compact/mode/set` |
+| `SetSessionGoal` | `session/goal/set` |
+
+### `agent/`
+
+| AppUI command | Wire method |
+|---|---|
+| `CloseAgent` | `agent/close` |
+| `InterruptAgent` | `agent/interrupt` |
+| `ListAgentArtifacts` | `agent/artifact/list` |
+| `ListAgents` | `agent/list` |
+| `ReadAgentArtifact` | `agent/artifact/read` |
+| `ReadAgentOutput` | `agent/output/read` |
+| `ReadAgentStatus` | `agent/status/read` |
+
+### `mcp/`
+
+| AppUI command | Wire method |
+|---|---|
+| `DeleteMcpConfig` | `mcp/config/delete` |
+| `ListMcpConfig` | `mcp/config/list` |
+| `ListMcpStatus` | `mcp/status/list` |
+| `SetMcpConfigEnabled` | `mcp/config/set_enabled` |
+| `TestMcpConfig` | `mcp/config/test` |
+| `UpsertMcpConfig` | `mcp/config/upsert` |
+
+### `tool/`
+
+| AppUI command | Wire method |
+|---|---|
+| `DeleteToolConfig` | `tool/config/delete` |
+| `ListToolConfig` | `tool/config/list` |
+| `ListToolStatus` | `tool/status/list` |
+| `SetToolConfigEnabled` | `tool/config/set_enabled` |
+| `TestToolConfig` | `tool/config/test` |
+| `UpsertToolConfig` | `tool/config/upsert` |
+
+### `loop/`
+
+| AppUI command | Wire method |
+|---|---|
+| `CreateLoop` | `loop/create` |
+| `DeleteLoop` | `loop/delete` |
+| `FireLoopNow` | `loop/fire_now` |
+| `ListLoops` | `loop/list` |
+| `PauseLoop` | `loop/pause` |
+| `ResumeLoop` | `loop/resume` |
+
+### `task/`
+
+| AppUI command | Wire method |
+|---|---|
+| `CancelTask` | `task/cancel` |
+| `ListTasks` | `task/list` |
+| `ReadTaskArtifact` | `task/artifact/read` |
+| `ReadTaskOutput` | `task/output/read` |
+| `RestartTaskFromNode` | `task/restart_from_node` |
+
+### `auth/`
+
+| AppUI command | Wire method |
+|---|---|
+| `AuthLogout` | `auth/logout` |
+| `AuthMe` | `auth/me` |
+| `AuthSendCode` | `auth/send_code` |
+| `AuthStatus` | `auth/status` |
+| `AuthVerify` | `auth/verify` |
+
+### `turn/`
+
+| AppUI command | Wire method |
+|---|---|
+| `GetTurnState` | `turn/state/get` |
+| `InterruptTurn` | `turn/interrupt` |
+| `SubmitPrompt` | `turn/start` |
+| `TurnSteer` | `turn/steer` |
+
+### `approval/`
+
+| AppUI command | Wire method |
+|---|---|
+| `ListApprovalScopes` | `approval/scopes/list` |
+| `RespondApproval` | `approval/respond` |
+
+### `permission/`
+
+| AppUI command | Wire method |
+|---|---|
+| `ListPermissionProfiles` | `permission/profile/list` |
+| `SetPermissionProfile` | `permission/profile/set` |
+
+### `snapshot/`
+
+| AppUI command | Wire method |
+|---|---|
+| `SnapshotList` | `snapshot/list` |
+| `SnapshotRestore` | `snapshot/restore` |
+
+### `peer/`
+
+| AppUI command | Wire method |
+|---|---|
+| `PeerGather` | `peer/gather` |
+| `PeerPrepare` | `peer/prepare` |
+
+### `user_question/`
+
+| AppUI command | Wire method |
+|---|---|
+| `RespondUserQuestion` | `user_question/respond` |
+
+### `diff/`
+
+| AppUI command | Wire method |
+|---|---|
+| `GetDiffPreview` | `diff/preview/get` |
+
+### `launch/`
+
+| AppUI command | Wire method |
+|---|---|
+| `LaunchResolve` | `launch/resolve` |
+
+### `thread/`
+
+| AppUI command | Wire method |
+|---|---|
+| `GetThreadGraph` | `thread/graph/get` |
+
+### `review/`
+
+| AppUI command | Wire method |
+|---|---|
+| `StartReview` | `review/start` |
+
+### `config/`
+
+| AppUI command | Wire method |
+|---|---|
+| `ListConfigCapabilities` | `config/capabilities/list` |
+
+### `local/`
+
+| AppUI command | Wire method |
+|---|---|
+| `LocalShellExec` | `local/shell_exec` |
 
 ## Protocol Notifications
 
-The TUI reducer must defensively handle known notifications and warnings:
+Every `UiNotification` variant the pinned `octos-core` defines, and the wire
+method it arrives as. `Store::apply_notification` currently handles all of
+them — the match is exhaustive on purpose, so a variant added to `octos-core`
+becomes a compile error here rather than silently unhandled.
 
-- `session/opened`
-- `turn/started`, `turn/completed`, `turn/error`
-- `message/delta`
-- `tool/started`, `tool/progress`, `tool/completed`
-- `approval/requested`, `approval/auto_resolved`, `approval/decided`,
-  `approval/cancelled`
-- `task/updated`, `task/output/delta`
-- `progress/updated`
-- `warning`
-- `protocol/replay_lossy`
+An unknown or future notification must never crash the UI. Where it cannot be
+rendered it should degrade to a visible warning or status item.
 
-Unknown or future notifications should not crash the UI. They should degrade to
-a visible warning or status item when possible.
+This list is kept complete by `tests/docs_drift.rs`.
+
+### `session/`
+
+| Notification | Wire method |
+|---|---|
+| `SessionEventBridged` | `session/event` |
+| `SessionGoalCleared` | `session/goal/cleared` |
+| `SessionGoalUpdated` | `session/goal/updated` |
+| `SessionOpened` | `session/open` |
+| `SessionOrchestration` | `session/orchestration` |
+
+### `turn/`
+
+| Notification | Wire method |
+|---|---|
+| `TurnCompleted` | `turn/completed` |
+| `TurnError` | `turn/error` |
+| `TurnSpawnComplete` | `turn/spawn_complete` |
+| `TurnStarted` | `turn/started` |
+
+### `approval/`
+
+| Notification | Wire method |
+|---|---|
+| `ApprovalAutoResolved` | `approval/auto_resolved` |
+| `ApprovalCancelled` | `approval/cancelled` |
+| `ApprovalDecided` | `approval/decided` |
+| `ApprovalRequested` | `approval/requested` |
+
+### `visual/`
+
+| Notification | Wire method |
+|---|---|
+| `VisualFailed` | `visual/failed` |
+| `VisualGenerating` | `visual/generating` |
+| `VisualSucceeded` | `visual/succeeded` |
+
+### `tool/`
+
+| Notification | Wire method |
+|---|---|
+| `ToolCompleted` | `tool/completed` |
+| `ToolProgress` | `tool/progress` |
+| `ToolStarted` | `tool/started` |
+
+### `agent/`
+
+| Notification | Wire method |
+|---|---|
+| `AgentArtifactUpdated` | `agent/artifact/updated` |
+| `AgentOutputDelta` | `agent/output/delta` |
+| `AgentUpdated` | `agent/updated` |
+
+### `loop/`
+
+| Notification | Wire method |
+|---|---|
+| `LoopCompleted` | `loop/completed` |
+| `LoopFired` | `loop/fired` |
+| `LoopUpdated` | `loop/updated` |
+
+### `context/`
+
+| Notification | Wire method |
+|---|---|
+| `ContextCompactionCompleted` | `context/compaction_completed` |
+| `ContextCompactionStarted` | `context/compaction_started` |
+| `ContextNormalizationReported` | `context/normalization_reported` |
+
+### `message/`
+
+| Notification | Wire method |
+|---|---|
+| `MessageDelta` | `message/delta` |
+| `ReasoningDelta` | `message/reasoning_delta` |
+
+### `voice/`
+
+| Notification | Wire method |
+|---|---|
+| `VoiceAudioChunk` | `voice/audio_chunk` |
+| `VoiceExit` | `voice/exit` |
+
+### `task/`
+
+| Notification | Wire method |
+|---|---|
+| `TaskOutputDelta` | `task/output/delta` |
+| `TaskUpdated` | `task/updated` |
+
+### `router/`
+
+| Notification | Wire method |
+|---|---|
+| `RouterFailover` | `router/failover` |
+| `RouterStatus` | `router/status` |
+
+### `projection/`
+
+| Notification | Wire method |
+|---|---|
+| `Envelope` | `projection/envelope` |
+| `EnvelopeV2` | `projection/envelope` |
+
+### `user_question/`
+
+| Notification | Wire method |
+|---|---|
+| `UserQuestionRequested` | `user_question/requested` |
+
+### `plan/`
+
+| Notification | Wire method |
+|---|---|
+| `PlanUpdated` | `plan/updated` |
+
+### `progress/`
+
+| Notification | Wire method |
+|---|---|
+| `ProgressUpdated` | `progress/updated` |
+
+### `warning/`
+
+| Notification | Wire method |
+|---|---|
+| `Warning` | `warning` |
+
+### `protocol/`
+
+| Notification | Wire method |
+|---|---|
+| `ReplayLossy` | `protocol/replay_lossy` |
+
+### `file/`
+
+| Notification | Wire method |
+|---|---|
+| `FileAttached` | `file/attached` |
+
+### `queue/`
+
+| Notification | Wire method |
+|---|---|
+| `QueueState` | `queue/state` |
+
+### `peer/`
+
+| Notification | Wire method |
+|---|---|
+| `PeerStaged` | `peer/staged` |
 
 ## Client Layers
 
-| File | Responsibility |
-|---|---|
-| `src/cli.rs` | Parses `--config` JSON launch defaults plus CLI overrides such as `--mode`, `--endpoint`, `--stdio-command`, `--session`, `--profile-id`, `--cwd`, `--auth-token`, `--readonly`, `--no-readonly`, and `--theme`. It must not own provider/model settings; those stay in Octos server config. |
-| `src/event_loop.rs` | Owns terminal raw mode, alternate screen, draw loop, keyboard dispatch, backend polling, and command send errors. |
-| `src/store.rs` | Reduces snapshots, RPC results, notifications, local commands, approvals, diff previews, task output, and queued prompts into `AppState`. |
-| `src/transport.rs` | Defines `AppUiBackend`, mock backend, protocol backend, WebSocket auth, JSON-RPC framing, reconnect status, in-memory cursors, and command/result routing. |
-| `src/model.rs` | Defines TUI view models and maps AppUI snapshots/tasks/messages into renderable state. |
-| `src/app.rs` | Renders the chat history, sticky work/plan area, activity cards, task list, diff preview, approvals, composer, and status bar with ratatui. |
-| `src/theme.rs` | Defines terminal-aware palettes and theme-specific colors. |
+One row per file under `src/`. `tests/docs_drift.rs` fails if a source file is
+added without a row here.
+
+### Entry and configuration
+
+| File | Lines | Responsibility |
+|---|---:|---|
+| `src/cli.rs` | 1053 | `--config` JSON launch defaults plus CLI overrides. Must not own provider/model settings; those stay in Octos server config. |
+| `src/cmd/config.rs` | 152 | `octos-tui config`: read-only inspection of the client's startup config |
+| `src/cmd/doctor.rs` | 2460 | `octos-tui doctor` — flutter-doctor-style diagnostics (design §B). |
+| `src/cmd/github.rs` | 155 | Minimal GitHub Releases client for `update --check` and `doctor`. |
+| `src/cmd/install_method.rs` | 746 | Install-method detection for `octos-tui update`/`doctor` (design §A.3). |
+| `src/cmd/mod.rs` | 273 | `octos-tui` subcommands: `update` and `doctor` (design doc). |
+| `src/cmd/update.rs` | 606 | `octos-tui update` — install-method-aware updater (design §A). |
+| `src/lib.rs` | 317 | Crate root — module declarations and the shared public surface. |
+| `src/main.rs` | 53 | Binary entry point: subcommand dispatch, then `event_loop::run`. |
+
+### Core loop and state
+
+| File | Lines | Responsibility |
+|---|---:|---|
+| `src/client_event.rs` | 377 | Decoded RPC results and autonomy results, in the shape the store reduces. |
+| `src/event_loop.rs` | 6328 | Terminal raw mode, alternate screen, draw loop, keyboard dispatch, backend polling, send-error handling. |
+| `src/model.rs` | 11612 | `AppState`, the TUI view models, `AppUiCommand`, and the mapping from AppUI snapshots/tasks/messages into renderable state. |
+| `src/store.rs` | 37021 | The AppUI reducer: snapshots, RPC results, notifications, local commands, approvals, diffs, task output and queued prompts folded into `AppState`. |
+
+### Transport and backend
+
+| File | Lines | Responsibility |
+|---|---:|---|
+| `src/backend_ensure.rs` | 1140 | Auto-provision the `octos` server backend so a fresh octos-tui install |
+| `src/profiles.rs` | 544 | Phase 3 startup profile discovery. |
+| `src/transport.rs` | 10721 | `AppUiBackend`, the mock and protocol backends, WebSocket/stdio framing, auth, reconnect status and in-memory cursors. |
+
+### Rendering
+
+| File | Lines | Responsibility |
+|---|---:|---|
+| `src/app.rs` | 5505 | ratatui surfaces — transcript, composer, docks, approvals, diff preview, status bar — and the re-exports for the `app/*` submodules. |
+| `src/app/activity_nav.rs` | 558 | `activity_nav` — extracted from `app.rs` (#365 step 2). Items keep their |
+| `src/app/markdown_highlight.rs` | 516 | Style-only markdown highlighting for the composer draft. |
+| `src/app/render.rs` | 2172 | `render` — extracted from `app.rs` (#365 step 2). Items keep their |
+| `src/app/tests.rs` | 12480 | Test module for [`crate::app`] (#365): moved out of `app.rs`, which was |
+| `src/app/transcript_build.rs` | 3615 | `transcript_build` — extracted from `app.rs` (#365 step 2). Items keep their |
+| `src/highlight.rs` | 172 | Fenced-code-block syntax highlighting for the transcript renderer |
+| `src/insert_history.rs` | 1603 | Insert finalized history lines into the terminal's **normal scrollback**, |
+| `src/sanitize.rs` | 160 | Terminal control-sequence sanitisation for server-supplied text. |
+| `src/terminal_probe.rs` | 243 | Terminal detection and color adaptation for octos-tui. |
+| `src/theme.rs` | 204 | Terminal-aware palettes and theme-specific colors. |
+| `src/tui_terminal.rs` | 1171 | Inline-viewport terminal — ported and trimmed from codex-rs `tui/src/custom_terminal.rs`. |
+| `src/viewport.rs` | 576 | Inline-viewport driver: owns the scrollback-flush bookkeeping that turns |
+
+### Menu framework
+
+| File | Lines | Responsibility |
+|---|---:|---|
+| `src/menu/availability.rs` | 695 | Capability gating — which menus the connected server advertises. |
+| `src/menu/mod.rs` | 21 | Menu framework model and generic render surfaces. |
+| `src/menu/multi_select_view.rs` | 487 | Multi-select menu surface. |
+| `src/menu/providers.rs` | 11355 | Local and capability-backed menu providers for the M9.34 framework. |
+| `src/menu/registry.rs` | 1583 | The canonical slash-command registry: names, aliases and capability gating. |
+| `src/menu/render.rs` | 427 | Generic menu renderer shared by every provider. |
+| `src/menu/selection_view.rs` | 551 | Single-select menu surface. |
+| `src/menu/types.rs` | 890 | `MenuSpec` / `MenuItem` / `MenuAction` — the framework core types. |
+| `src/menu/wizard.rs` | 417 | First-run setup wizard step model. |
+
+### Composer and input
+
+| File | Lines | Responsibility |
+|---|---:|---|
+| `src/autonomy.rs` | 1097 | M15-E autonomy command parsing for `/agents`, `/goal`, and `/loop`. |
+| `src/clipboard.rs` | 378 | Clipboard copy support for the TUI. |
+| `src/file_picker.rs` | 254 | `@` composer file picker (#363, v1: path insert only). |
+| `src/history.rs` | 743 | Composer command-history navigation (codex / claude-code style). |
+| `src/keymap.rs` | 1 | The status-bar key-hint string. |
 
 ## Menu Framework
 
