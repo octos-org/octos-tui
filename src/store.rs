@@ -10543,9 +10543,13 @@ impl Store {
                 // statuses flip the task — a "running" record must never
                 // resurrect a task the client already saw go terminal.
                 self.reconcile_task_from_agent_record(&event.session_id, &event.agent);
+                // Stamp the OWNING session: `agent/updated` arrives for
+                // background sessions too, and an unstamped chip renders in
+                // whichever session is focused.
                 self.state.push_activity(
                     ActivityItem::new(ActivityKind::Progress, title, status_label)
-                        .with_detail(detail),
+                        .with_detail(detail)
+                        .with_session(event.session_id.clone()),
                 );
                 // Don't churn the status bar with "Agent status refreshed: …" on
                 // every agent-status event — during a multi-agent turn that floods

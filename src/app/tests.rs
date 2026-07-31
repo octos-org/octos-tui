@@ -12478,3 +12478,59 @@ mod running_row_regression {
         assert!(!text.contains("{\"cmd\""), "raw JSON leaked:\n{text}");
     }
 }
+
+/// `flow_activity_items` filtered on `turn_id` only. A background session's
+/// `agent/updated` pushes a turn-less chip, so with no turn running in the
+/// focused session it rendered in that session's transcript — the
+/// cross-session bleed #247 closed for other surfaces.
+#[test]
+fn activity_flow_excludes_other_sessions_items() {
+    let mut app = AppState::new(
+        vec![
+            SessionView {
+                id: SessionKey("local:focused".into()),
+                title: "focused".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            },
+            SessionView {
+                id: SessionKey("local:background".into()),
+                title: "background".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            },
+        ],
+        0, // focus the first
+        "ready".into(),
+        None,
+        false,
+    );
+
+    app.push_activity(
+        ActivityItem::new(ActivityKind::Progress, "peer agent".to_string(), "running")
+            .with_session(SessionKey("local:background".into())),
+    );
+    app.push_activity(ActivityItem::new(
+        ActivityKind::Progress,
+        "my agent".to_string(),
+        "running",
+    ));
+
+    let titles: Vec<&str> = flow_activity_items(&app)
+        .iter()
+        .map(|item| item.title.as_str())
+        .collect();
+    assert!(
+        titles.contains(&"my agent"),
+        "the focused session's own activity still renders: {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"peer agent"),
+        "a background session's activity must NOT render in the focused \
+         session's transcript: {titles:?}"
+    );
+}
