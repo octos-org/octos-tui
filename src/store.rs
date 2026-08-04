@@ -416,7 +416,13 @@ impl Store {
 
     pub fn compose_command(&mut self) -> Option<AppUiCommand> {
         let prompt = self.state.composer.trim().to_string();
-        if prompt.starts_with('/') {
+        // `looks_like_slash_command`, not `starts_with('/')`: a prompt that
+        // merely BEGINS with a path (`/Users/me/Downloads/notes.md is broken,
+        // fix it`) parsed as the command `Users/me/Downloads/notes.md`,
+        // resolved to Unknown, and was Rejected — and Rejected yields no
+        // command, so the prompt was silently DISCARDED. Falling through here
+        // sends it as ordinary prose, which is what the user meant.
+        if crate::menu::registry::looks_like_slash_command(&prompt) {
             // Record a history-safe, no-arg slash command ONLY after the
             // dispatcher ACCEPTS (ran) it. Acceptance is the Outcome — a known
             // history-safe verb can still be rejected at dispatch time
