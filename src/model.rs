@@ -10932,7 +10932,10 @@ mod tests {
             ),
             "composer re-opens inline so the typed text echoes"
         );
-        assert!(state.composer.contains('x'), "the typed char is in the text");
+        assert!(
+            state.composer.contains('x'),
+            "the typed char is in the text"
+        );
     }
 
     #[test]

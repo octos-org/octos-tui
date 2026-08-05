@@ -1694,7 +1694,8 @@ impl ProtocolAppUiBackend {
             // the session's server-confirmed root over `launch.cwd` so a
             // relaunch from a different shell directory does not rescope the
             // launch session (#476).
-            let cwd = self.protocol
+            let cwd = self
+                .protocol
                 .session_workspace_roots
                 .get(&session_id)
                 .cloned()
@@ -1763,7 +1764,11 @@ impl ProtocolAppUiBackend {
         self.reopen_session
             .clone()
             .map(|mut params| {
-                if let Some(root) = self.protocol.session_workspace_roots.get(&params.session_id) {
+                if let Some(root) = self
+                    .protocol
+                    .session_workspace_roots
+                    .get(&params.session_id)
+                {
                     params.cwd = Some(root.clone());
                 }
                 AppUiCommand::OpenSession(params)
@@ -10452,7 +10457,13 @@ mod tests {
         backend
             .protocol
             .record_event_state(&AppUiEvent::Protocol(UiNotification::SessionOpened(
-                session_opened_compat(session_id.clone(), None, Some("/real/workspace".into()), None, None),
+                session_opened_compat(
+                    session_id.clone(),
+                    None,
+                    Some("/real/workspace".into()),
+                    None,
+                    None,
+                ),
             )));
 
         // The reconnect reopen (launch-session fallback path) uses the
