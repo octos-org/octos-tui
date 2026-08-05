@@ -3989,17 +3989,29 @@ pub(crate) fn peer_dock_pill_line(app: &AppState, palette: Palette) -> Line<'sta
 /// `opening…` placeholder for still-pending peers, else `idle`. Returns
 /// `String` (review F11: the prior `Cow<'a, str>` was a fiction — every
 /// arm allocated).
-pub(crate) fn peer_activity_line(app: &AppState, session_id: &octos_core::SessionKey) -> String {
+pub(crate) fn peer_activity_line(
+    app: &AppState,
+    session_id: &octos_core::SessionKey,
+    cap: usize,
+) -> String {
     // Blocked reason wins — a peer waiting on you is the row's whole point.
     if let Some(reason) = app.session_blocked_reason(session_id) {
-        return t!(
+        let blocked = t!(
             "app.hint.peer_dock_row_blocked",
             reason = reason.to_string()
         )
         .into_owned();
+        // The reason is server text of unbounded length; the row budget is the
+        // frame's, so clamp here rather than letting ratatui clip mid-glyph.
+        return if blocked.chars().count() > cap {
+            let head: String = blocked.chars().take(cap.saturating_sub(1)).collect();
+            format!("{head}…")
+        } else {
+            blocked
+        };
     }
     if app.sessions.iter().any(|s| &s.id == session_id) {
-        match app.session_activity_line(session_id) {
+        match app.session_activity_line_capped(session_id, cap) {
             Some(line) => line,
             None => t!("app.hint.peer_dock_row_idle").into_owned(),
         }
@@ -4018,6 +4030,11 @@ const PEER_STRIP_MIN_TERMINAL_ROWS: u16 = 12;
 /// stay fully reachable via `+N` on the title row + the session strip (Alt+S).
 /// Mirrors [`AGENT_STRIP_MAX_AGENT_ROWS`].
 const PEER_STRIP_MAX_PEER_ROWS: u16 = 4;
+
+/// Widest a peer slug may render in a dock row. Generous enough that a
+/// descriptive `--n` fleet slug survives intact, bounded so one long slug can't
+/// starve the activity text on a narrow frame.
+const PEER_SLUG_MAX_CHARS: usize = 32;
 
 /// #407: rows the Peer Dock occupies under the composer — mirrors
 /// [`agent_strip_height`]: 0 when no peers / transcript pager active /
@@ -4043,17 +4060,49 @@ pub(crate) fn peer_strip_height(app: &AppState, terminal_height: u16) -> u16 {
 /// Mirrors [`agent_strip_agent_rows`].
 fn peer_strip_peer_rows(app: &AppState, terminal_height: u16) -> u16 {
     let roster = peer_dock_roster(app).len().min(u16::MAX as usize) as u16;
-    roster
-        .min(PEER_STRIP_MAX_PEER_ROWS)
-        .min(terminal_height.saturating_sub(PEER_STRIP_MIN_TERMINAL_ROWS))
+    // The FULL state (3rd stop of the Alt+P cycle) drops the row cap so the
+    // whole fleet is readable; the terminal-height clamp below still applies,
+    // so a short terminal degrades exactly as before.
+    let capped = if app.peer_dock_expanded {
+        roster
+    } else {
+        roster.min(PEER_STRIP_MAX_PEER_ROWS)
+    };
+    capped.min(terminal_height.saturating_sub(PEER_STRIP_MIN_TERMINAL_ROWS))
+}
+
+/// Visible window of the peer roster for the dock — mirrors
+/// [`agent_strip_window`]. The window starts at the top of the roster and
+/// shifts down just enough to keep the FOCUSED peer visible, so a fleet larger
+/// than [`PEER_STRIP_MAX_PEER_ROWS`] stays reachable: focus a peer (Ctrl+S) and
+/// its row scrolls into the dock. Without this the dock is frozen on the first
+/// N peers behind a `+K` marker, and focusing peer 6 of 13 leaves no row for the
+/// session you are actually watching. Returns `(range, hidden)`, where `hidden`
+/// is the count outside the window — what the title row's `+K` reports.
+fn peer_strip_window(app: &AppState, rows: usize) -> (std::ops::Range<usize>, usize) {
+    let roster = peer_dock_roster(app);
+    let len = roster.len();
+    if rows == 0 || len == 0 {
+        return (0..0, len);
+    }
+    let rows = rows.min(len);
+    // Anchor on the focused session when it IS a peer; a focused master leaves
+    // the window at the top of the roster.
+    let selected = app
+        .active_session()
+        .and_then(|session| roster.iter().position(|(id, _)| **id == session.id))
+        .unwrap_or(0);
+    let start = selected.saturating_sub(rows - 1).min(len - rows);
+    (start..start + rows, len - rows)
 }
 
 /// The peer session keys whose rows the Peer Dock ACTUALLY DRAWS at
-/// `terminal_height` this frame — the roster prefix `peer_strip_lines` renders
-/// (`roster.iter().take(rows)`), or empty when the dock is collapsed (the pill
-/// shows no per-peer affordance) or height-0 (pager active / terminal too short
-/// / no peers). Used to gate the dock's approve/deny keys so a peer whose ⚠
-/// affordance is off-screen (below the row cap) or hidden can't be actioned.
+/// `terminal_height` this frame — the roster window `peer_strip_lines` renders,
+/// or empty when the dock is collapsed (the pill shows no per-peer affordance)
+/// or height-0 (pager active / terminal too short / no peers). Used to gate the
+/// dock's approve/deny keys so a peer whose ⚠ affordance is scrolled out of the
+/// window or hidden can't be actioned — this MUST use the same window as
+/// `peer_strip_lines` or the keys act on rows the user cannot see.
 pub(crate) fn visible_peer_dock_keys(
     app: &AppState,
     terminal_height: u16,
@@ -4062,9 +4111,11 @@ pub(crate) fn visible_peer_dock_keys(
         return Vec::new();
     }
     let rows = peer_strip_peer_rows(app, terminal_height) as usize;
+    let (window, _) = peer_strip_window(app, rows);
     peer_dock_roster(app)
         .into_iter()
-        .take(rows)
+        .skip(window.start)
+        .take(window.len())
         .map(|(session_id, _)| session_id.clone())
         .collect()
 }
@@ -4079,14 +4130,13 @@ pub(crate) fn peer_strip_lines(
     app: &AppState,
     palette: Palette,
     peer_rows: u16,
+    width: u16,
 ) -> Vec<Line<'static>> {
     if app.peer_dock_collapsed {
         return vec![peer_dock_pill_line(app, palette)];
     }
     let roster = peer_dock_roster(app);
-    let total = roster.len();
-    let rows = (peer_rows as usize).min(total);
-    let hidden = total - rows;
+    let (window, hidden) = peer_strip_window(app, peer_rows as usize);
     let mut lines: Vec<Line<'static>> = Vec::new();
     // Title row: peer dock title + overflow marker when the roster is larger
     // than the visible window.
@@ -4106,7 +4156,7 @@ pub(crate) fn peer_strip_lines(
     ));
     lines.push(Line::from(title_spans));
     // One row per visible peer.
-    for (session_id, meta) in roster.iter().take(rows) {
+    for (session_id, meta) in &roster[window] {
         let blocked = app.session_blocked_reason(session_id).is_some();
         let live = app.session_turn_live(session_id);
         let done = app.peer_is_done(session_id);
@@ -4134,15 +4184,6 @@ pub(crate) fn peer_strip_lines(
         } else {
             palette.muted().bg(palette.surface)
         };
-        let detail = peer_activity_line(app, session_id);
-        let mut row_spans = vec![
-            Span::styled(format!(" {glyph} "), glyph_style),
-            Span::styled(
-                meta.slug.chars().take(20).collect::<String>(),
-                palette.text().bg(palette.surface),
-            ),
-            Span::styled(format!("  {detail}"), palette.muted().bg(palette.surface)),
-        ];
         // Mirror the agent dock's run stats so the fleet's progress/cost reads
         // at a glance without opening each peer: elapsed since the peer was
         // opened, then cumulative received (↓) tokens for its session. Tokens
@@ -4159,12 +4200,16 @@ pub(crate) fn peer_strip_lines(
             meta.created.elapsed().as_millis() as i64
         };
         let elapsed = format_short_duration(elapsed_ms);
-        row_spans.push(Span::styled(
+        // The trailing stats are built BEFORE the activity text so their width
+        // is known — the activity gets the frame's leftovers rather than a
+        // fixed cap that both overflowed narrow terminals and left wide ones
+        // half empty.
+        let mut trailing: Vec<Span<'static>> = vec![Span::styled(
             format!("  · {elapsed}"),
             palette.muted().bg(palette.surface),
-        ));
+        )];
         if let Some((_input, Some(output), _cost)) = app.session_usage.get(*session_id) {
-            row_spans.push(Span::styled(
+            trailing.push(Span::styled(
                 format!(" · ↓ {}", humanize_token_count(*output)),
                 palette.muted().bg(palette.surface),
             ));
@@ -4177,7 +4222,7 @@ pub(crate) fn peer_strip_lines(
         // reason. Kept INLINE — no extra line — so the one-row-per-peer height
         // reservation (`peer_strip_height`) stays exact.
         if app.pending_session_approvals.contains_key(*session_id) {
-            row_spans.push(Span::styled(
+            trailing.push(Span::styled(
                 "  [Alt+Y approve · Alt+N deny]".to_string(),
                 Style::default()
                     .fg(palette.highlight)
@@ -4185,6 +4230,29 @@ pub(crate) fn peer_strip_lines(
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        let trailing_width: usize = trailing
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum();
+
+        let slug: String = meta.slug.chars().take(PEER_SLUG_MAX_CHARS).collect();
+        // ` glyph ` + slug + the two spaces before the activity text.
+        let fixed = 3 + slug.chars().count() + 2 + trailing_width;
+        let detail_budget = (width as usize).saturating_sub(fixed);
+        let mut row_spans = vec![
+            Span::styled(format!(" {glyph} "), glyph_style),
+            Span::styled(slug, palette.text().bg(palette.surface)),
+        ];
+        // Below a few columns there is nothing useful left to say; drop the
+        // activity rather than render a bare `…`.
+        if detail_budget >= 4 {
+            let detail = peer_activity_line(app, session_id, detail_budget);
+            row_spans.push(Span::styled(
+                format!("  {detail}"),
+                palette.muted().bg(palette.surface),
+            ));
+        }
+        row_spans.extend(trailing);
         lines.push(Line::from(row_spans));
     }
     lines
