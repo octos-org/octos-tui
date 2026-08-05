@@ -6088,6 +6088,8 @@ mod tests {
         let request = rpc_request_from_command(
             "tui-7".into(),
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: SessionKey("local:test".into()),
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
@@ -6116,6 +6118,8 @@ mod tests {
         let request = rpc_request_from_command(
             "tui-9".into(),
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: SessionKey("local:test".into()),
                 turn_id: TurnId::new(),
                 input: vec![
@@ -7703,6 +7707,8 @@ mod tests {
 
         let mutating_commands = [
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
@@ -9300,6 +9306,8 @@ mod tests {
 
         let request = backend
             .build_tracked_request(AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: SessionKey("local:test".into()),
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
@@ -10651,6 +10659,8 @@ mod tests {
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
@@ -10713,6 +10723,8 @@ mod tests {
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: session,
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
@@ -10746,6 +10758,8 @@ mod tests {
         let turn_id = TurnId::new();
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 input: vec![InputItem::Text {
@@ -10898,6 +10912,8 @@ mod tests {
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id,
                 turn_id,
                 input: vec![InputItem::Text {

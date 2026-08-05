@@ -1572,6 +1572,8 @@ impl Store {
         let slug = Self::peer_slug_for_key(&session_id);
         self.state.status = t!("status.peer_started", slug = slug).into_owned();
         Some(AppUiCommand::SubmitPrompt(TurnStartParams {
+            // Ordinary chat turn: context-scoped tools stay unadvertised.
+            tool_context: None,
             session_id,
             turn_id,
             input: vec![InputItem::Text { text: prompt }],
@@ -6275,6 +6277,8 @@ impl Store {
             .get(&session_id)
             .copied();
         Some(AppUiCommand::SubmitPrompt(TurnStartParams {
+            // Ordinary chat turn: context-scoped tools stay unadvertised.
+            tool_context: None,
             session_id,
             turn_id,
             input: vec![InputItem::Text { text: prompt }],
@@ -10541,6 +10545,9 @@ impl Store {
             // but v2-only servers never emit it and the TUI intentionally does
             // not render it.
             UiNotification::Envelope(_) => None,
+            // Added by octos-core v2.0.3-rc.1. Neither has a client
+            // surface yet; drop them rather than guess at a rendering.
+            UiNotification::SkillActionJobUpdated(_) | UiNotification::PeerClosed(_) => None,
             UiNotification::EnvelopeV2(event) => self.apply_envelope_v2(event),
             UiNotification::SessionEventBridged(event) => self.apply_session_event_bridged(event),
             UiNotification::RouterStatus(event) => {
@@ -11549,7 +11556,13 @@ impl Store {
                             session_result: None,
                         })
                     }
-                    TurnTerminalOutcome::Errored | TurnTerminalOutcome::Interrupted => {
+                    // RateLimited (octos-core v2.0.3-rc.1) is a terminal
+                    // FAILURE: the turn ended with no answer, so it must
+                    // settle the live reply like Errored — never be left
+                    // unhandled, which would pin "Working" forever.
+                    TurnTerminalOutcome::Errored
+                    | TurnTerminalOutcome::RateLimited
+                    | TurnTerminalOutcome::Interrupted => {
                         let is_interrupted = outcome == TurnTerminalOutcome::Interrupted;
                         let error = error.unwrap_or_else(|| {
                             let (code, message) = if is_interrupted {

@@ -407,6 +407,8 @@ This list is kept complete by `tests/docs_drift.rs`.
 |---|---|
 | `Envelope` | `projection/envelope` |
 | `EnvelopeV2` | `projection/envelope` |
+| `PeerClosed` | `peer/closed` |
+| `SkillActionJobUpdated` | `skill/action_job_updated` |
 
 ### `user_question/`
 
