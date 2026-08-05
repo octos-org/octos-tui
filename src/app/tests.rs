@@ -452,10 +452,12 @@ mod tests {
         // (codex P2 on the fixed-4s sweep). Same for the origin rest at the
         // cycle tail.
         let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
-        assert!(
-            OCTOPUS_EDGE_DWELL_MS >= 200,
-            "edge rest must cover at least one ~120ms repaint interval"
-        );
+        const {
+            assert!(
+                OCTOPUS_EDGE_DWELL_MS >= 200,
+                "edge rest must cover at least one ~120ms repaint interval"
+            );
+        }
         let leg = OCTOPUS_SWEEP_ONE_WAY_MS + OCTOPUS_EDGE_DWELL_MS;
         for wrap_width in [octopus_width + 2, 20usize, 40, 80, 146, 200, 1000] {
             let max = wrap_width.saturating_sub(octopus_width + 1);
@@ -3807,6 +3809,74 @@ mod tests {
         let pending_style =
             style_for_text(&buffer, "it did not do error recovery?").expect("pending style");
         assert_eq!(pending_style.bg, Some(palette.diff_context_bg));
+    }
+
+    #[test]
+    fn render_composer_peer_is_readonly_bar_not_editable_box() {
+        // Option B: a focused peer is a READ-ONLY watch surface — a single dim
+        // status row, not the bordered composer. No placeholder, no caret, and
+        // the reclaimed rows go to the transcript (1 reserved row, not 5).
+        let peer = SessionKey("coding:local:tui#peer-alpha".into());
+        let mut app = AppState::new(
+            vec![
+                SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "master".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+                SessionView {
+                    id: peer.clone(),
+                    title: "peer-alpha".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::assistant("peer output")],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+            ],
+            1, // focus the peer
+            "ready".into(),
+            None,
+            false,
+        );
+        app.opened_peer_sessions.insert(peer.clone());
+        // Focus on the composer pane makes the no-caret assertion meaningful:
+        // even here the peer bar must not place a cursor.
+        app.focus = crate::model::FocusPane::Composer;
+        assert!(app.focused_session_is_peer(), "precondition: peer focused");
+
+        assert_eq!(
+            composer_height(&app),
+            1,
+            "peer reserves a slim 1-row bar, not the 5-row composer box"
+        );
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let (buffer, cursor) = rendered_buffer_and_cursor(&app, palette);
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(
+            text.contains("read-only peer"),
+            "shows the read-only bar: {text:?}"
+        );
+        assert!(text.contains("steer from the master"));
+        assert!(
+            !text.contains("Ask Octos"),
+            "no editable-composer placeholder on a peer"
+        );
+        // render never placed a caret, so the backend cursor stays at its
+        // top-left default — not down in the (absent) composer input.
+        assert_eq!(
+            (cursor.x, cursor.y),
+            (0, 0),
+            "no caret placed for a read-only peer"
+        );
     }
 
     #[test]
@@ -10233,6 +10303,54 @@ mod tests {
             order_a,
             vec!["alpha", "mike", "zebra"],
             "tie-break on session key; got {order_a:?}"
+        );
+    }
+
+    /// Peer operator console (FIX 3): a peer with a stashed approval renders an
+    /// actionable `[Alt+Y approve · Alt+N deny]` affordance on its dock row, so
+    /// the operator answers it from the master WITHOUT switching to the peer.
+    #[test]
+    fn peer_dock_row_shows_approve_deny_affordance_for_a_stashed_approval() {
+        let mut app = autonomy_app_state();
+        let peer = SessionKey("local:tui#peer-blocked".into());
+        app.peer_session_meta.insert(
+            peer.clone(),
+            crate::model::PeerMeta {
+                slug: "blocked".into(),
+                brief_path: "/tmp/brief.md".into(),
+                agent_staged: false,
+                created: std::time::Instant::now(),
+                finished_at: None,
+            },
+        );
+        app.peer_dock_collapsed = false;
+
+        // No approval yet → no affordance on the row.
+        let before = lines_text(&peer_strip_lines(&app, Palette::for_theme(app.theme), 4));
+        assert!(
+            !before.contains("Alt+Y approve"),
+            "no affordance until an approval is stashed; got: {before}"
+        );
+
+        // Stash an approval for the peer (background — the master is focused).
+        app.pending_session_approvals.insert(
+            peer.clone(),
+            crate::model::ApprovalModalState::from_event(
+                octos_core::ui_protocol::ApprovalRequestedEvent::generic(
+                    peer.clone(),
+                    octos_core::ui_protocol::ApprovalId::new(),
+                    octos_core::ui_protocol::TurnId::new(),
+                    "shell",
+                    "Run shell command?",
+                    "run: rm -rf target",
+                ),
+            ),
+        );
+
+        let after = lines_text(&peer_strip_lines(&app, Palette::for_theme(app.theme), 4));
+        assert!(
+            after.contains("Alt+Y approve · Alt+N deny"),
+            "a stashed peer approval renders the approve/deny affordance; got: {after}"
         );
     }
 

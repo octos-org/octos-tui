@@ -2843,6 +2843,9 @@ fn rpc_value_to_app_event(
         if method == crate::model::APPUI_METHOD_PEER_STAGED {
             return Ok(Some(peer_staged_notification_to_client_event(params)));
         }
+        if method == crate::model::APPUI_METHOD_PEER_CLOSED {
+            return Ok(Some(peer_closed_notification_to_client_event(params)));
+        }
         return Ok(Some(notification_to_app_event(method, params).into()));
     }
 
@@ -4237,6 +4240,26 @@ fn peer_staged_notification_to_client_event(params: Value) -> ClientEvent {
             format!(
                 "failed to decode UI protocol params for {}: {err}",
                 crate::model::APPUI_METHOD_PEER_STAGED
+            ),
+        )
+        .into(),
+    }
+}
+
+/// octos#1801 v3: decodes the durable `peer/closed` notification into the
+/// typed [`ClientEvent::PeerClosed`] via the tui-local
+/// [`crate::model::PeerClosedParams`] mirror (the vendored octos-core rev has
+/// no `UiNotification` variant for it yet). Mirror of
+/// [`peer_staged_notification_to_client_event`]: malformed params surface as
+/// the standard `invalid_params` error event rather than wedging the stream.
+fn peer_closed_notification_to_client_event(params: Value) -> ClientEvent {
+    match serde_json::from_value::<crate::model::PeerClosedParams>(params) {
+        Ok(closed) => ClientEvent::PeerClosed(closed),
+        Err(err) => app_error(
+            "invalid_params",
+            format!(
+                "failed to decode UI protocol params for {}: {err}",
+                crate::model::APPUI_METHOD_PEER_CLOSED
             ),
         )
         .into(),
@@ -7213,6 +7236,63 @@ mod tests {
         };
         assert_eq!(error.code, "invalid_params");
         assert!(error.message.contains("peer/staged"));
+    }
+
+    /// octos#1801 v3: the durable `peer/closed` NOTIFICATION decodes via the
+    /// tui-local string-keyed match into `ClientEvent::PeerClosed` — the mirror
+    /// of the `peer/staged` decode (the vendored octos-core rev predates the
+    /// `UiNotification` variant, so `from_method_and_params` would degrade it to
+    /// an `unknown_notification` error event).
+    #[test]
+    fn peer_closed_notification_decodes_to_client_event() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "peer/closed",
+            "params": {
+                "session_id": "coding:local:tui#coding",
+                "topic": "peer-fix-nav",
+                "slug": "fix-nav",
+                "profile_id": "coding"
+            }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut HashMap::new())
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::PeerClosed(closed) = event else {
+            panic!("expected peer closed event, got {event:?}");
+        };
+        assert_eq!(
+            closed.session_id,
+            SessionKey("coding:local:tui#coding".into())
+        );
+        assert_eq!(closed.topic, "peer-fix-nav");
+        assert_eq!(closed.slug, "fix-nav");
+        assert_eq!(closed.profile_id, "coding");
+    }
+
+    /// Malformed `peer/closed` params surface as the standard `invalid_params`
+    /// error event instead of wedging the stream (durable replay would
+    /// re-deliver the same frame on every reconnect).
+    #[test]
+    fn peer_closed_notification_with_bad_params_yields_invalid_params_error() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "peer/closed",
+            "params": { "topic": "peer-fix-nav" }
+        })
+        .to_string();
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut HashMap::new())
+            .expect("frame decodes")
+            .expect("client event");
+        let ClientEvent::App(event) = event else {
+            panic!("expected an app error event, got {event:?}");
+        };
+        let AppUiEvent::Error(error) = *event else {
+            panic!("expected an error event, got {event:?}");
+        };
+        assert_eq!(error.code, "invalid_params");
+        assert!(error.message.contains("peer/closed"));
     }
 
     /// octos#1801 v2: `peer/gather` requests encode the slug filter (omitted

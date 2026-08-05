@@ -84,6 +84,13 @@ pub const APPUI_METHOD_PEER_GATHER: &str = "peer/gather";
 /// `AppUiCommand::method()`); decoded tui-locally in the transport because
 /// the vendored octos-core rev predates the variant.
 pub const APPUI_METHOD_PEER_STAGED: &str = "peer/staged";
+/// octos#1801 peer v3: durable SERVER→CLIENT notification — a peer session the
+/// server tore down (its turn ended, or it was reaped). The client removes the
+/// matching `peer-<slug>` session from the peer dock and the session switcher.
+/// Not a request method (never appears in `AppUiCommand::method()`); decoded
+/// tui-locally in the transport because the vendored octos-core rev predates
+/// the variant, mirroring [`APPUI_METHOD_PEER_STAGED`].
+pub const APPUI_METHOD_PEER_CLOSED: &str = "peer/closed";
 /// octos#1807: `turn/steer` — mid-turn prompt injection into the ACTIVE
 /// turn. Params `{session_id, expected_turn_id?, input}`; result
 /// `{turn_id, steered}`. `steered:true` = the text joined the live turn
@@ -3549,6 +3556,21 @@ pub struct PeerStagedParams {
     pub profile_id: String,
 }
 
+/// Params of the durable [`APPUI_METHOD_PEER_CLOSED`] notification: a peer
+/// session the server tore down. The client removes the matching `peer-<slug>`
+/// session from the peer dock and the session switcher. Tui-local wire mirror
+/// (the vendored octos-core rev predates the `UiNotification` variant), decoded
+/// in the transport exactly like [`PeerStagedParams`]. Durable ⇒ replayed on
+/// reconnect; the store handler is idempotent (an already-removed peer is a
+/// no-op).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerClosedParams {
+    pub session_id: SessionKey,
+    pub topic: String,
+    pub slug: String,
+    pub profile_id: String,
+}
+
 /// `peer/gather` request (octos#1801 v2): read the peer blackboard.
 /// `slugs: None` = every staged peer; `session_id` carries the ACTIVE
 /// session so the server scopes the profile (mirrors
@@ -3767,6 +3789,16 @@ pub struct SubProvidersMutationResult {
     pub sub_providers: Vec<SubProviderView>,
     #[serde(default)]
     pub applied: bool,
+    /// The server PERSISTED the lane but the live runtime was NOT rebuilt: the
+    /// isolated research router is built once at `ProfileRuntime` bootstrap, so
+    /// the change only takes effect on the next restart.
+    ///
+    /// The server has always sent this ("so the client never presents a
+    /// persisted change as already-live"); the client simply did not
+    /// deserialise it, so an inline `/research add` reported a bare success and
+    /// deep_research kept running on the coding provider.
+    #[serde(default)]
+    pub restart_required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
 }
@@ -4548,6 +4580,16 @@ pub struct AppState {
     /// the value is the interrupted turn id, so a LATER turn on the same
     /// session is never gated. Cleared on the turn's terminal.
     pub interrupted_turns: std::collections::HashMap<SessionKey, TurnId>,
+
+    /// Turns whose output the freeze above ACTUALLY suppressed: a delta or a
+    /// canonical persisted frame arrived after the Esc and was dropped.
+    ///
+    /// Only these turns can have lost content, so only these earn the
+    /// "incomplete" marker when the turn goes on to complete normally. Esc at
+    /// 99% — where nothing further arrived — commits clean, with no false
+    /// warning. Cleared with the turn's terminal (and on backend relaunch,
+    /// like `interrupted_turns`).
+    pub interrupt_dropped_output: std::collections::HashSet<(SessionKey, TurnId)>,
     /// #324 Phase C: per-session unread counters — turns that reached a
     /// terminal while the session was NOT focused. Incremented by the store's
     /// terminal appliers, cleared when the session gains focus.
@@ -4582,6 +4624,25 @@ pub struct AppState {
     /// removal hook is wired here — if close ever lands, prune the
     /// matching `PeerMeta` at the same site.
     pub peer_session_meta: std::collections::HashMap<SessionKey, PeerMeta>,
+    /// Durable set of session keys EVER registered as a peer (via the
+    /// `take_pending_peer_kickoff` open chokepoint). Unlike `peer_session_meta`
+    /// — the mutable DOCK roster that `/peer clear` prunes — a `/peer clear` (dock
+    /// prune) NEVER removes from this set, so a cleared done-peer STAYS a
+    /// read-only peer; only a full `peer/closed` teardown (which also removes the
+    /// `sessions` row) drops the key. And unlike a `topic().starts_with("peer-")`
+    /// string check it cannot false-positive on an ordinary session whose
+    /// API-supplied topic merely starts with `peer-`. This is the identity
+    /// `focused_session_is_peer` reads.
+    pub opened_peer_sessions: std::collections::HashSet<SessionKey>,
+    /// Peer keys retired by a recent `peer/closed`, each stamped at close time.
+    /// A `session/opened` that races BEHIND its `peer/closed` (the kickoff
+    /// already dropped) would otherwise fall through to the generic open path and
+    /// resurrect the peer as a focused generic row; a hit here within
+    /// `RECENTLY_CLOSED_PEER_TTL` swallows that stale open. Time-bounded (pruned
+    /// on access) so it stays small AND so a later peer that legitimately REUSES
+    /// the slug — restaged past the TTL, or explicitly un-stamped on restage — is
+    /// never suppressed.
+    pub recently_closed_peers: std::collections::HashMap<SessionKey, Instant>,
     pub approval_auto_open: bool,
     pub approval: Option<ApprovalModalState>,
     /// Pending AskUserQuestion picker (UPCR-2026-023), mirroring `approval`.
@@ -4608,6 +4669,11 @@ pub struct AppState {
     /// tests). Lets key handlers apply width gates — the side-by-side diff
     /// toggle is a no-op when the transcript is too narrow to split.
     pub last_terminal_width: u16,
+    /// Terminal HEIGHT of the last drawn frame (0 = not drawn yet). Lets key
+    /// handlers apply height gates — the Peer Dock approve/deny keys must only
+    /// fire when the dock (and the acted-on peer's row) was actually DRAWN this
+    /// frame, which `peer_strip_height` / `peer_strip_lines` decide from height.
+    pub last_terminal_height: u16,
     pub activity: Vec<ActivityItem>,
     pub turn_activity_logs: Vec<TurnActivityLog>,
     /// Hydrate-replayed v2 tool envelopes already applied, keyed by
@@ -6503,11 +6569,14 @@ impl AppState {
             run_state_started_at,
             pre_token_turns: std::collections::HashMap::new(),
             interrupted_turns: std::collections::HashMap::new(),
+            interrupt_dropped_output: std::collections::HashSet::new(),
             unread_turns: std::collections::HashMap::new(),
             pending_turn_steers: std::collections::VecDeque::new(),
             pending_peer_prepare: None,
             pending_peer_kickoffs: std::collections::HashMap::new(),
             peer_session_meta: std::collections::HashMap::new(),
+            opened_peer_sessions: std::collections::HashSet::new(),
+            recently_closed_peers: std::collections::HashMap::new(),
             pending_session_approvals: std::collections::HashMap::new(),
             pending_session_questions: std::collections::HashMap::new(),
             approval_auto_open: true,
@@ -6521,6 +6590,7 @@ impl AppState {
             task_output_cursors: Vec::new(),
             diff_preview: DiffPreviewPaneState::default(),
             last_terminal_width: 0,
+            last_terminal_height: 0,
             activity: Vec::new(),
             turn_activity_logs: Vec::new(),
             applied_hydrate_tool_envelopes: std::collections::HashSet::new(),
@@ -7197,6 +7267,40 @@ impl AppState {
         let session = self.active_session()?;
         let live_reply = session.live_reply.as_ref()?;
         Some((&session.id, &live_reply.turn_id))
+    }
+
+    /// Whether the FOCUSED (displayed) session is a peer. Keyed off the DURABLE
+    /// `opened_peer_sessions` identity set (populated at the peer-open
+    /// chokepoint) — NOT the mutable `peer_session_meta` dock roster that
+    /// `/peer clear` empties (a cleared-but-focused peer must STAY read-only),
+    /// and NOT a `topic().starts_with("peer-")` string check that would
+    /// false-positive on an ordinary session whose API-supplied topic merely
+    /// starts with `peer-`. Peer views are read-only WATCH surfaces: the
+    /// composer refuses plain prompts (steer peers from the master with
+    /// `peer_send_input`) and a focused peer's output is kept out of the
+    /// master's immutable native scrollback. A non-peer or absent focus reads
+    /// `false`.
+    pub fn focused_session_is_peer(&self) -> bool {
+        self.active_session()
+            .is_some_and(|session| self.opened_peer_sessions.contains(&session.id))
+    }
+
+    /// The topmost peer with a stashed approval that is ACTUALLY VISIBLE in the
+    /// Peer Dock this frame — the target of the dock's approve/deny keys, so the
+    /// operator answers a peer's approval WITHOUT switching to it. Restricted to
+    /// the rows the dock actually draws at `terminal_height` (collapsed pill →
+    /// none; capped exactly as `peer_strip_lines`): a peer whose ⚠ row is
+    /// off-screen (below the row cap) or hidden (collapsed / height-0) must NOT
+    /// be actionable, or the key would act on an affordance the user cannot see.
+    /// Only APPROVALS qualify (a question-blocked peer needs the picker, not a
+    /// yes/no key). `None` when no visible peer has a pending approval.
+    pub(crate) fn first_blocked_peer_with_approval(
+        &self,
+        terminal_height: u16,
+    ) -> Option<SessionKey> {
+        crate::app::visible_peer_dock_keys(self, terminal_height)
+            .into_iter()
+            .find(|session_id| self.pending_session_approvals.contains_key(session_id))
     }
 
     /// Per-session cap on the [`AppState::completed_turns`] terminal-turn set —
@@ -8783,7 +8887,38 @@ impl AppState {
         }
     }
 
+    /// Record that the freeze dropped output for this turn — a delta or a
+    /// canonical frame that arrived after the user's Esc. See
+    /// [`Self::interrupt_dropped_output`].
+    pub fn mark_interrupt_dropped_output(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        self.interrupt_dropped_output
+            .insert((session_id.clone(), turn_id.clone()));
+    }
+
+    /// Consume the "freeze dropped output" flag for this turn, if any. Called
+    /// from both terminals so the entry can never outlive its turn.
+    pub fn take_interrupt_dropped_output(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> bool {
+        self.interrupt_dropped_output
+            .remove(&(session_id.clone(), turn_id.clone()))
+    }
+
     pub fn set_run_state_blocked(&mut self, message: impl Into<String>) {
+        // Same optimistic-idle guard as `set_run_state_in_progress`. An
+        // `approval/requested` / `user_question/requested` frame already on the
+        // wire when the user hits Esc must not flip the killed turn's chip from
+        // Idle back to Blocked: a re-Esc could not clear that state either
+        // (`interrupt_command` only downgrades an InProgress turn), so the user
+        // was wedged on a stale `Blocked{…}` until the terminal landed. The
+        // decision's own modal still opens — suppressing that would risk hiding
+        // a real approval when the interrupt does not land — but it is torn down
+        // by the server's `approval/cancelled` moments later.
+        if self.active_live_turn_interrupted() {
+            return;
+        }
         if !self.run_state.is_active() {
             self.run_state_started_at = Some(Instant::now());
         }
@@ -8823,6 +8958,10 @@ impl AppState {
             .and_then(|topic| topic.strip_prefix("peer-"))
             .unwrap_or(session_id.0.as_str())
             .to_owned();
+        // Durable peer identity — this is the single production chokepoint where
+        // a peer session is registered, so record it here (insert-only; never
+        // pruned, unlike the dock roster below).
+        self.opened_peer_sessions.insert(session_id.clone());
         self.peer_session_meta.insert(
             session_id.clone(),
             PeerMeta {
