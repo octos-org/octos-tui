@@ -22,23 +22,45 @@ pub struct Palette {
 }
 
 impl Palette {
+    /// The `Terminal` theme as a PURE function of the detected background, so
+    /// both the light and dark branches are unit-testable (the live OSC probe
+    /// can't be forced from a test). `for_theme` calls this with the probed
+    /// value; tests call it directly with an explicit bool.
+    pub fn terminal(is_light: bool) -> Self {
+        Self {
+            surface: Color::Reset,
+            surface_alt: Color::Reset,
+            frame: if is_light {
+                Color::DarkGray
+            } else {
+                Color::Gray
+            },
+            accent: Color::Cyan,
+            highlight: Color::Yellow,
+            text: Color::Reset,
+            muted: if is_light {
+                Color::DarkGray
+            } else {
+                Color::Gray
+            },
+            success: Color::Cyan,
+            success_bg: Color::Reset,
+            danger: Color::Red,
+            danger_bg: Color::Reset,
+            diff_context_bg: Color::Reset,
+            code_theme: if is_light {
+                "base16-github.light"
+            } else {
+                "base16-eighties.dark"
+            },
+        }
+    }
+
     pub fn for_theme(theme: ThemeName) -> Self {
         match theme {
-            ThemeName::Terminal => Self {
-                surface: Color::Reset,
-                surface_alt: Color::Reset,
-                frame: Color::DarkGray,
-                accent: Color::Cyan,
-                highlight: Color::Yellow,
-                text: Color::Reset,
-                muted: Color::DarkGray,
-                success: Color::Cyan,
-                success_bg: Color::Reset,
-                danger: Color::Red,
-                danger_bg: Color::Reset,
-                diff_context_bg: Color::Reset,
-                code_theme: "base16-eighties.dark",
-            },
+            ThemeName::Terminal => {
+                Self::terminal(crate::terminal_probe::terminal_info().is_light_bg())
+            }
             ThemeName::Slate => Self {
                 surface: Color::Rgb(20, 25, 35),
                 surface_alt: Color::Rgb(28, 34, 46),
@@ -140,6 +162,34 @@ mod tests {
         assert_eq!(palette.diff_context_bg, Color::Reset);
         assert_eq!(palette.success_bg, Color::Reset);
         assert_eq!(palette.danger_bg, Color::Reset);
+    }
+
+    #[test]
+    fn terminal_theme_muted_depends_on_detected_bg() {
+        // muted/frame adapt to the detected background. Via the pure
+        // `Palette::terminal(is_light)` both branches are reachable in a test
+        // (the live probe can't be forced), so this actually exercises the
+        // dependency instead of only hitting the dark default.
+        let light = Palette::terminal(true);
+        let dark = Palette::terminal(false);
+        assert_ne!(light.muted, dark.muted);
+        assert_ne!(light.frame, dark.frame);
+    }
+
+    #[test]
+    fn terminal_light_palette() {
+        let palette = Palette::terminal(true);
+        assert_eq!(palette.muted, Color::DarkGray);
+        assert_eq!(palette.frame, Color::DarkGray);
+        assert_eq!(palette.code_theme, "base16-github.light");
+    }
+
+    #[test]
+    fn terminal_dark_palette() {
+        let palette = Palette::terminal(false);
+        assert_eq!(palette.muted, Color::Gray);
+        assert_eq!(palette.frame, Color::Gray);
+        assert_eq!(palette.code_theme, "base16-eighties.dark");
     }
 
     #[test]

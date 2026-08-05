@@ -1,22 +1,40 @@
-class OctosTui < Formula
-  desc "Terminal UI client for the Octos UI Protocol"
+# Prerelease-channel formula for octos-tui (class OctosTuiDev).
+#
+# This is the DEV/prerelease sibling of Formula/octos-tui.rb. It is rendered by
+# .github/workflows/publish-homebrew.yml on a PRERELEASE tag push (a tag with a
+# '-', e.g. v0.2.2-rc.15) into Formula/octos-tui-dev.rb, filling the same
+# __VERSION__/__TAG__/__SHA_*__ placeholders from that prerelease's assets. The
+# stable Formula/octos-tui.rb is NEVER touched by a prerelease tag, so
+# `brew install octos-org/octos-tui/octos-tui` stays on the latest STABLE while
+# `brew install octos-org/octos-tui/octos-tui-dev` tracks the latest prerelease.
+#
+# MUTUALLY EXCLUSIVE with the stable formula: both install a binary named
+# `octos-tui`, so only one may be linked at a time (see `conflicts_with` below).
+# This is the standard `foo` vs `foo-dev` pattern — install one or the other.
+class OctosTuiDev < Formula
+  desc "Terminal UI client for the Octos UI Protocol (prerelease channel)"
   homepage "https://github.com/octos-org/octos-tui"
-  version "0.2.2"
+  version "__VERSION__"
   if OS.mac? && Hardware::CPU.arm?
-    url "https://github.com/octos-org/octos-tui/releases/download/v0.2.2/octos-tui-aarch64-apple-darwin.tar.xz"
-    sha256 "883396735ffe30c1681e97e7c4d71c49a34a788bfff1c46cabeb10fbe3e70820"
+    url "https://github.com/octos-org/octos-tui/releases/download/__TAG__/octos-tui-aarch64-apple-darwin.tar.xz"
+    sha256 "__SHA_DARWIN_ARM__"
   end
   if OS.linux?
     if Hardware::CPU.arm?
-      url "https://github.com/octos-org/octos-tui/releases/download/v0.2.2/octos-tui-aarch64-unknown-linux-gnu.tar.xz"
-      sha256 "0bfd2d992975987def685159d29027030c094b7dc221e79761a97a5181d60c6f"
+      url "https://github.com/octos-org/octos-tui/releases/download/__TAG__/octos-tui-aarch64-unknown-linux-gnu.tar.xz"
+      sha256 "__SHA_LINUX_ARM__"
     end
     if Hardware::CPU.intel?
-      url "https://github.com/octos-org/octos-tui/releases/download/v0.2.2/octos-tui-x86_64-unknown-linux-gnu.tar.xz"
-      sha256 "acc2c8b7f03639b4065ad71686817edc7715b781b7e943fb4dc25ad55fcb1aa9"
+      url "https://github.com/octos-org/octos-tui/releases/download/__TAG__/octos-tui-x86_64-unknown-linux-gnu.tar.xz"
+      sha256 "__SHA_LINUX_X64__"
     end
   end
   license "Apache-2.0"
+
+  # Dev and stable both provide `bin/octos-tui`; they cannot be linked together.
+  # Installing this formula while `octos-tui` is linked (or vice versa) prompts
+  # to `brew unlink` the other first, keeping the two channels cleanly separate.
+  conflicts_with "octos-tui", because: "both install the octos-tui binary (prerelease vs stable channel)"
 
   # octos-tui is a CLIENT; a local launch spawns `octos serve --stdio` as its
   # backend. We deliberately do NOT `depends_on "octos-org/octos/octos"`: Homebrew
@@ -25,6 +43,9 @@ class OctosTui < Formula
   # auto-installs the octos server on first run if it's missing (see caveats).
   def caveats
     <<~EOS
+      octos-tui-dev is the PRERELEASE (rc/beta) channel; the stable formula is
+      `octos-org/octos-tui/octos-tui`. Only one may be linked at a time.
+
       octos-tui talks to the `octos` server backend. If octos isn't installed,
       octos-tui installs the latest release automatically on first run
       (set OCTOS_TUI_NO_AUTO_INSTALL=1 to disable). To install it up front:

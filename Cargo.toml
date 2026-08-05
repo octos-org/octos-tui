@@ -1,6 +1,6 @@
 [package]
 name = "octos-tui"
-version = "0.2.2-rc.7"
+version = "0.2.3-rc.1"
 edition = "2024"
 rust-version = "1.85.0"
 license = "Apache-2.0"
@@ -23,7 +23,7 @@ path = "src/main.rs"
 # per-project `session/list` scoping below. This rev is a clean 1-commit
 # superset of the previous main pin `82b1abf11148`. RE-PIN to the merged main
 # rev once #1662 lands on octos `main`.
-octos-core = { git = "https://github.com/octos-org/octos", rev = "1b19df9b633d" }
+octos-core = { git = "https://github.com/octos-org/octos", rev = "b074918a38cd43e7bc2e1eab39c840e016e3dfd1" }
 clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
 color-eyre = "0.6"
@@ -51,6 +51,10 @@ semver = "1"
 # Optional + default-on via the `update` feature; with the feature OFF, `update`
 # still works as a pure advisor (detect method + print command + `--check`).
 axoupdater = { version = "0.10", default-features = false, features = ["github_releases", "blocking"], optional = true }
+zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
+sha2 = "0.11.0"
+tempfile = "3.27.0"
+rustix = "1.1.4"
 
 [features]
 default = ["update"]
