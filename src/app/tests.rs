@@ -3102,6 +3102,52 @@ mod tests {
     }
 
     #[test]
+    fn markdown_table_divider_renders_without_body_rows() {
+        // A `|---|` separator is what marks row 0 as a header. The header row
+        // used to be inferred from row COUNT, so a table with a header and no
+        // body rows lost both its divider and its bold header and rendered as
+        // a plain one-row box. Tables WITH body rows already worked; this pins
+        // the empty-body case and keeps the populated case honest.
+        for (label, md, want_divider) in [
+            ("header only", "| A | B |\n|---|---|", true),
+            ("header + body", "| A | B |\n|---|---|\n| 1 | 2 |", true),
+            // No separator at all and a single row: nothing proves it is a
+            // header, so it must stay an undivided one-row box.
+            ("lone row, no separator", "| A | B |", false),
+        ] {
+            let app = AppState::new(
+                vec![SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "test".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::assistant(md)],
+                    tasks: vec![],
+                    live_reply: None,
+                }],
+                0,
+                "ready".into(),
+                None,
+                false,
+            );
+            let buffer = rendered_buffer(&app, Palette::for_theme(ThemeName::Codex));
+            let text = rendered_rows(&buffer).join("\n");
+
+            assert!(
+                text.contains('\u{250c}') && text.contains('\u{2514}'),
+                "{label}: the table must still render as a bordered grid"
+            );
+            assert_eq!(
+                text.contains('\u{251c}'),
+                want_divider,
+                "{label}: header divider presence must match (got {:?})",
+                text.contains('\u{251c}')
+            );
+            // The raw separator source must never survive into the transcript.
+            assert!(!text.contains("|---|"), "{label}: raw separator leaked");
+        }
+    }
+
+    #[test]
     fn render_assistant_markdown_hangs_body_without_marker_leakage() {
         let app = AppState::new(
             vec![SessionView {
