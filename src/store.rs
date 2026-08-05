@@ -1367,9 +1367,11 @@ impl Store {
     /// Durable `peer/closed` notification (octos#1801 v3): a peer session the
     /// server tore down must vanish from the peer dock (Ctrl+L) and the session
     /// switcher (Ctrl+S). Mirror of [`Self::apply_peer_staged_event`]'s
-    /// tui-local decode path — the vendored octos-core rev predates the
-    /// `UiNotification` variant, so the transport decodes the method string into
-    /// [`crate::model::PeerClosedParams`] directly.
+    /// tui-local decode path — an older octos-core rev lacks the
+    /// `UiNotification::PeerClosed` variant, so the transport decodes the method
+    /// string into [`crate::model::PeerClosedParams`] directly; against a core
+    /// that carries the variant, `apply_notification` converts and lands here
+    /// too.
     ///
     /// Identity is the EXACT key `apply_peer_staged_event` mints —
     /// `with_profile_topic(profile_id, "local", "tui", topic)` — so a session
@@ -10017,6 +10019,20 @@ impl Store {
                     profile_id: event.profile_id,
                 })
             }
+            // Mirror of the `PeerStaged` dual path above: against a core that
+            // carries the typed variant the `peer/closed` frame decodes here,
+            // while older cores route the raw frame through the transport
+            // string-intercept → `ClientEvent::PeerClosed`. Both land on the one
+            // handler, whose teardown is unconditional and idempotent, so a
+            // double delivery is a no-op.
+            UiNotification::PeerClosed(event) => {
+                self.apply_peer_closed_event(crate::model::PeerClosedParams {
+                    session_id: event.session_id,
+                    topic: event.topic,
+                    slug: event.slug,
+                    profile_id: event.profile_id,
+                })
+            }
             UiNotification::SessionOpened(event) => {
                 let session_id = event.session_id.clone();
                 // Bug 2: a `session/opened` for a peer we JUST closed (its
@@ -11514,13 +11530,25 @@ impl Store {
                             session_result: None,
                         })
                     }
-                    TurnTerminalOutcome::Errored | TurnTerminalOutcome::Interrupted => {
+                    // `RateLimited` is a distinct terminal outcome on the wire
+                    // but still a turn FAILURE for the UI — settle it through
+                    // the same finalizer so a replayed projection can't leave a
+                    // rate-limited turn spinning. Only its default code/message
+                    // differ, so the cause survives when the server sends no
+                    // structured error.
+                    TurnTerminalOutcome::Errored
+                    | TurnTerminalOutcome::Interrupted
+                    | TurnTerminalOutcome::RateLimited => {
                         let is_interrupted = outcome == TurnTerminalOutcome::Interrupted;
                         let error = error.unwrap_or_else(|| {
-                            let (code, message) = if is_interrupted {
-                                ("interrupted", "Turn interrupted.")
-                            } else {
-                                ("turn_errored", "Turn errored.")
+                            let (code, message) = match outcome {
+                                TurnTerminalOutcome::Interrupted => {
+                                    ("interrupted", "Turn interrupted.")
+                                }
+                                TurnTerminalOutcome::RateLimited => {
+                                    ("rate_limited", "Rate limited by the provider.")
+                                }
+                                _ => ("turn_errored", "Turn errored."),
                             };
                             octos_core::ui_protocol::TurnTerminalError {
                                 code: code.into(),
