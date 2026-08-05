@@ -327,6 +327,9 @@ impl CommandRegistry {
         &'registry self,
         input: &'input str,
     ) -> CommandResolution<'registry, 'input> {
+        if !looks_like_slash_command(input) {
+            return CommandResolution::NotCommand;
+        }
         let Some(invocation) = CommandInvocation::parse(input) else {
             return CommandResolution::NotCommand;
         };
@@ -403,6 +406,31 @@ impl<'a> CommandInvocation<'a> {
             args: rest.trim_start(),
         })
     }
+}
+
+/// Whether `input` should be dispatched as a slash COMMAND rather than sent as
+/// an ordinary prompt.
+///
+/// A command NAME cannot contain a path separator. Without this check, a prompt
+/// that merely BEGINS with a path — `/Users/me/Downloads/notes.md is broken,
+/// fix it` — parsed as the command `Users/me/Downloads/notes.md`, resolved to
+/// `Unknown`, and was Rejected. Rejected produces no command, so the user's
+/// prompt was silently DISCARDED: they typed a real question and nothing was
+/// sent anywhere.
+///
+/// A bare `/` still counts, so typing a slash opens the command menu as before.
+pub fn looks_like_slash_command(input: &str) -> bool {
+    let Some(rest) = input.trim_start().strip_prefix('/') else {
+        return false;
+    };
+    let name = rest.split_whitespace().next().unwrap_or("");
+    // Bare `/` (or `/ `): the menu-opening draft, not a path.
+    if name.is_empty() {
+        return true;
+    }
+    // `\` too: a Windows-style path pasted after a leading slash is still a
+    // path, not a command name.
+    !name.contains('/') && !name.contains('\\')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1579,5 +1607,77 @@ mod tests {
             MenuBuildResult::Ready(spec) => assert_eq!(spec.id, MenuId::from("test")),
             _ => panic!("expected ready menu"),
         }
+    }
+}
+
+#[cfg(test)]
+mod slash_vs_path_tests {
+    use super::*;
+
+    /// A prompt that merely BEGINS with a path must not be eaten as a command.
+    ///
+    /// `compose_command` gated on `starts_with('/')`, so
+    /// `/Users/me/Downloads/notes.md is broken, fix it` parsed as the command
+    /// `Users/me/Downloads/notes.md`, resolved to `Unknown`, and was Rejected.
+    /// Rejected yields no command, so the prompt was silently DISCARDED — the
+    /// user asked a real question and nothing was sent anywhere.
+    #[test]
+    fn paths_are_not_slash_commands() {
+        for input in [
+            "/Users/yuechen/Downloads/desktop-vs-mobile-open.md",
+            "/Users/yuechen/Downloads/notes.md is broken, fix it",
+            "/tmp/x/y.txt",
+            "/home/me/repo",
+            "/var/log/system.log  what does this say?",
+        ] {
+            assert!(
+                !looks_like_slash_command(input),
+                "{input:?} is a path the user is talking about, not a command"
+            );
+        }
+    }
+
+    /// Real commands must still dispatch — the guard must not disable slashes.
+    #[test]
+    fn real_slash_commands_still_dispatch() {
+        for input in [
+            "/help",
+            "/context",
+            "/peer clear",
+            "/goal --budget 2M",
+            "/theme dark",
+            "  /help",
+        ] {
+            assert!(
+                looks_like_slash_command(input),
+                "{input:?} must still be treated as a slash command"
+            );
+        }
+    }
+
+    /// A bare `/` opens the command menu; that behaviour is unchanged.
+    #[test]
+    fn bare_slash_still_opens_the_menu() {
+        assert!(looks_like_slash_command("/"));
+        assert!(looks_like_slash_command("/ "));
+    }
+
+    /// Non-slash prose is untouched.
+    #[test]
+    fn prose_is_not_a_command() {
+        assert!(!looks_like_slash_command("hello"));
+        assert!(!looks_like_slash_command("what is /Users/me/x?"));
+        assert!(!looks_like_slash_command(""));
+    }
+
+    /// The registry itself must report `NotCommand` for a path, so nothing
+    /// downstream tries to resolve or reject it.
+    #[test]
+    fn registry_resolves_a_path_as_not_a_command() {
+        let registry = CommandRegistry::with_core_commands();
+        assert_eq!(
+            registry.resolve("/Users/yuechen/Downloads/desktop-vs-mobile-open.md"),
+            CommandResolution::NotCommand
+        );
     }
 }

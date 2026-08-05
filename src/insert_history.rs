@@ -877,19 +877,18 @@ mod tests {
                 }
                 let symbol = cell.symbol();
                 let row = &mut self.rows[usize::from(y)];
-                let mut col = usize::from(x);
+                let col = usize::from(x);
                 if symbol.is_empty() {
                     if let Some(target) = row.get_mut(col) {
                         *target = ' ';
                     }
                     continue;
                 }
-                for ch in symbol.chars() {
+                for (col, ch) in (col..).zip(symbol.chars()) {
                     if col >= row.len() {
                         break;
                     }
                     row[col] = ch;
-                    col += 1;
                 }
             }
             Ok(())

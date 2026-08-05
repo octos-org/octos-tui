@@ -493,7 +493,7 @@ fn parse_token_budget(raw: &str) -> Result<u64, AutonomyParseError> {
     // rejected server-side anyway, but returning InvalidBudget gives the
     // user a hint rather than a silently clamped value.)
     const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
-    if !tokens.is_finite() || tokens < 1.0 || tokens >= TWO_POW_64 {
+    if !tokens.is_finite() || !(1.0..TWO_POW_64).contains(&tokens) {
         return Err(invalid());
     }
     Ok(tokens as u64)

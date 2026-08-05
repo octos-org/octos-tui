@@ -1607,6 +1607,16 @@ pub(super) fn render_harness_status_row(
 }
 
 pub(super) fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
+    if app.focused_session_is_peer() {
+        // Read-only peer watch surface: no editable composer box. A single dim
+        // status row instead (steer peers from the master); the reclaimed rows
+        // go to the transcript. No border, no placeholder, no caret.
+        return Paragraph::new(Line::from(Span::styled(
+            format!(" {}", t!("app.composer_hint.peer_readonly")),
+            palette.muted().bg(palette.surface),
+        )))
+        .style(Style::default().bg(palette.surface));
+    }
     let mut lines = Vec::new();
     let composer = app.composer_presentation();
     let input_view = match &composer {

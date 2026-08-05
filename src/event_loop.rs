@@ -63,6 +63,13 @@ enum RenderMode {
 
 pub fn run(cli: Cli) -> Result<()> {
     enable_raw_mode()?;
+    // Warm the one-shot terminal background probe HERE — after raw mode is on
+    // (so the OSC 11 reply isn't line-buffered or echoed) but BEFORE the input
+    // loop begins. The probe reads `/dev/tty` and discards any non-OSC bytes;
+    // running it lazily on the first frame render (via `Palette::for_theme`)
+    // would race the live event loop and swallow early keystrokes. Caching in
+    // the `OnceLock` means `for_theme` reuses this result and never re-probes.
+    let _ = crate::terminal_probe::terminal_info();
     let mut stdout = io::stdout();
     // Inline-viewport model (codex-style): we do NOT enter the alternate screen
     // for the main chat. The terminal keeps its normal scrollback, so finalized
@@ -328,9 +335,11 @@ where
 
     let size = terminal.size()?;
     let width = size.width;
-    // Key handlers gate on the drawn width (side-by-side diff toggle); record
-    // it on the frame that renders, so gate and render agree.
+    // Key handlers gate on the drawn width (side-by-side diff toggle) and height
+    // (Peer Dock approve/deny keys); record them on the frame that renders, so
+    // gate and render agree.
     store.state.last_terminal_width = width;
+    store.state.last_terminal_height = size.height;
 
     // A slash/command menu is a RESERVED viewport row block (`menu_height` in
     // `render_viewport_with_finalization`), not a floating overlay. Opening it
@@ -883,6 +892,45 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     {
         store.state.peer_dock_collapsed = !store.state.peer_dock_collapsed;
         return KeyAction::Continue;
+    }
+
+    // Peer operator console: when a peer's `[Alt+Y approve · Alt+N deny]`
+    // affordance is ACTUALLY DRAWN this frame, Alt+Y approves / Alt+N denies the
+    // TOPMOST such peer — addressed to that peer's own session, so the operator
+    // answers it WITHOUT switching to the peer. Three visibility guards keep the
+    // key from acting on an affordance the user can't see:
+    //   1. no full-screen overlay / inspector covering the dock;
+    //   2. no modal or `@` picker owning the keyboard;
+    //   3. the peer's row is on screen at the CURRENT terminal height —
+    //      `first_blocked_peer_with_approval` returns None for a collapsed,
+    //      height-0, or below-the-row-cap peer.
+    // The height is queried LIVE (not the cached `last_terminal_height`) so a
+    // resize in the same input batch as the keypress can't act on a row that
+    // just moved off-screen; the cached value is the fallback when the query
+    // fails (e.g. headless CI). Alt (not plain y/n) so a peer-focused composer's
+    // typed text is untouched.
+    if (is_alt_char(&key, 'y') || is_alt_char(&key, 'n'))
+        && !modal_owns_keyboard(store)
+        && store.state.file_picker.is_none()
+        && !app::wants_fullscreen_overlay(&store.state)
+    {
+        let terminal_height = crossterm::terminal::size()
+            .map(|(_cols, rows)| rows)
+            .unwrap_or(store.state.last_terminal_height);
+        if let Some(peer) = store
+            .state
+            .first_blocked_peer_with_approval(terminal_height)
+        {
+            let action = if is_alt_char(&key, 'y') {
+                ApprovalModalAction::ApproveRequest
+            } else {
+                ApprovalModalAction::DenyRequest
+            };
+            if let Some(command) = store.respond_peer_approval_command(&peer, action) {
+                return KeyAction::send(command);
+            }
+            return KeyAction::Continue;
+        }
     }
 
     // #324: Ctrl+S/Alt+S — the session switcher popup (open sessions with live-turn
@@ -2823,6 +2871,75 @@ mod tests {
                 "the dock toggle must flip on {chord:?}"
             );
         }
+    }
+
+    /// Peer operator console (BUG C): Alt+Y answers a peer's stashed approval
+    /// from the dock — but ONLY when the peer's `[Alt+Y approve · Alt+N deny]`
+    /// affordance is actually DRAWN this frame. It fires with the dock expanded
+    /// on a normal terminal, and stays INERT (no command, stash intact) when the
+    /// dock is collapsed or a full-screen overlay covers it. (The height/row-cap
+    /// gate is exercised deterministically by the pure-function unit test
+    /// `respond_peer_approval_targets_the_peer_and_clears_the_stash`, which calls
+    /// `first_blocked_peer_with_approval` with explicit heights — here the height
+    /// is queried live, so those thresholds aren't asserted through the keybind.)
+    #[test]
+    fn peer_dock_alt_y_answers_a_drawn_peer_approval_only_when_visible() {
+        let peer = SessionKey("local:tui#peer-ci-red".into());
+        let stash = |store: &mut Store| {
+            store.state.pending_session_approvals.insert(
+                peer.clone(),
+                crate::model::ApprovalModalState::from_event(ApprovalRequestedEvent::generic(
+                    peer.clone(),
+                    ApprovalId::new(),
+                    TurnId::new(),
+                    "shell",
+                    "Run shell command?",
+                    "run: rm -rf target",
+                )),
+            );
+        };
+        let alt_y = modified_key(KeyCode::Char('y'), KeyModifiers::ALT);
+
+        // Visible: dock expanded, no overlay → the key answers the peer.
+        let mut store = store_with_one_peer();
+        stash(&mut store);
+        store.state.last_terminal_height = 24;
+        store.state.peer_dock_collapsed = false;
+        let AppUiCommand::RespondApproval(params) = sent_command(handle_key(&mut store, alt_y))
+        else {
+            panic!("expected RespondApproval");
+        };
+        assert_eq!(params.session_id, peer, "addressed to the peer's session");
+        assert_eq!(params.decision, ApprovalDecision::Approve);
+        assert!(
+            !store.state.pending_session_approvals.contains_key(&peer),
+            "the peer's stash entry is cleared once answered"
+        );
+
+        // Collapsed dock (pill only, no per-row affordance) → inert, stash intact.
+        let mut store = store_with_one_peer();
+        stash(&mut store);
+        store.state.last_terminal_height = 24;
+        store.state.peer_dock_collapsed = true;
+        assert!(matches!(handle_key(&mut store, alt_y), KeyAction::Continue));
+        assert!(
+            store.state.pending_session_approvals.contains_key(&peer),
+            "a collapsed dock shows no affordance — stash intact"
+        );
+
+        // Full-screen overlay covering the dock (e.g. the transcript pager) →
+        // inert even with a tall height, stash intact.
+        let mut store = store_with_one_peer();
+        stash(&mut store);
+        store.state.last_terminal_height = 24;
+        store.state.peer_dock_collapsed = false;
+        store.state.transcript_pager_active = true;
+        assert!(app::wants_fullscreen_overlay(&store.state));
+        assert!(matches!(handle_key(&mut store, alt_y), KeyAction::Continue));
+        assert!(
+            store.state.pending_session_approvals.contains_key(&peer),
+            "a dock hidden behind a full-screen overlay is not actionable"
+        );
     }
 
     /// Ctrl+S/Alt+S is a TOGGLE and must never stack duplicate MENU_SESSIONS

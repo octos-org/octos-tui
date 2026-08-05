@@ -144,6 +144,7 @@ app:
     large_paste: "大段粘贴已折叠 | Enter 发送全文 | Ctrl+U 清空"
     multiline_tail_lines: "多行输入 | 显示末尾，已隐藏 %{count} 行 | Enter 发送全文 | Ctrl+U 清空"
     multiline_tail_line: "多行输入 | 显示超长行末尾 | Enter 发送全文 | Ctrl+U 清空"
+    peer_readonly: "↳ 只读 peer · 在主智能体处操控 · Ctrl+S 切换 · Ctrl+C 中断"
   hint:
     list_nav: "j/k 或 Up/Down"
     composer_send: "Enter 发送 | Shift+Enter / Ctrl+J 换行 | Tab 智能体"
@@ -1251,6 +1252,7 @@ status:
   research_rm_usage: "用法：/research rm <key>"
   research_profile_unresolved: "当前档案尚未就绪 —— 请在会话准备好后重试。"
   research_lane_saved: "研究通道 %{key} 已保存：%{label} —— 需重启生效。"
+  sub_provider_restart_required: "%{message} —— 需重启生效。"
   opening_diff_preview: "正在打开差异预览：%{operation} %{path}"
   opening_inline_diff_preview: "正在打开内联差异预览：%{title}"
   approval_requested: "请求审批：%{title}"
@@ -1627,6 +1629,8 @@ status:
   # 用户主动中断（Esc/Ctrl+C）自己的轮次时的状态行与简短转录提示。刻意从简：
   # 用户主动停止不是失败，因此不显示真正错误才有的详细“会话摘要”卡片。
   turn_interrupted: "轮次已中断"
+  # 见 en.yml：中断没有生效、轮次在服务端正常跑完时，附加到已提交回答后面的提示。
+  turn_interrupted_truncated: "⚠ 已中断 —— 此处之后的输出被丢弃，本回答不完整。该轮次在服务端已跑完，可重新提问查看剩余内容。"
 saveconfig:
   saved: "设置已保存到 %{path}。"
   failed: "保存配置失败：%{error}"
