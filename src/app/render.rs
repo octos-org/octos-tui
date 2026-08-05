@@ -1724,8 +1724,10 @@ pub(super) fn render_composer(app: &AppState, palette: Palette, area: Rect) -> P
         }
         ComposerPresentation::Collapsed(collapse) => lines.push(Line::from(vec![
             Span::styled(" › ", palette.selected().bg(palette.surface)),
-            Span::styled("[paste] ", palette.selected().bg(palette.surface)),
-            Span::styled(collapse.summary.clone(), palette.text().bg(palette.surface)),
+            Span::styled(
+                format!("[paste {}]", collapse.summary),
+                palette.selected().bg(palette.surface),
+            ),
         ])),
     }
 

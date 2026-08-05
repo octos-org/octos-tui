@@ -4841,7 +4841,7 @@ impl ComposerPresentation {
         match self {
             Self::Empty => 0,
             Self::Inline(text) => text.rsplit('\n').next().unwrap_or("").width(),
-            Self::Collapsed(collapse) => "[paste] ".width() + collapse.summary.width(),
+            Self::Collapsed(collapse) => "[paste ]".width() + collapse.summary.width(),
         }
     }
 }
@@ -9291,7 +9291,7 @@ impl AppState {
     /// without a valid span the whole draft clears (the #380 behavior).
     /// Returns true when the delete was handled here.
     fn take_collapsed_paste_block(&mut self) -> bool {
-        // A collapsed block (the `[paste] N lines · M chars` chip) is an ATOMIC
+        // A collapsed block (the `[paste N lines · M chars]` chip) is an ATOMIC
         // unit: one Backspace/Delete removes the whole block, never one char.
         // Gate on the Collapsed PRESENTATION, not `composer_pasted` — a paste
         // whose terminal delivered it as keystrokes (no bracketed-paste event,
@@ -9771,7 +9771,8 @@ fn composer_presentation_for_text(text: &str, from_paste: bool) -> ComposerPrese
         return ComposerPresentation::Inline(text.to_string());
     }
 
-    // Renders after the `[paste] ` prefix, e.g. "[paste] 18 lines · 1240 chars".
+    // Rendered INSIDE the chip, e.g. "[paste 18 lines · 1240 chars]" — the
+    // counts belong to the bracket rather than trailing it as loose text.
     let summary = if line_count > 1 {
         format!("{line_count} lines · {char_count} chars")
     } else {

@@ -4748,7 +4748,7 @@ fn composer_cursor_row_and_width(
             (view.cursor_row, view.cursor_width)
         }
         ComposerPresentation::Collapsed(collapse) => {
-            (0, "[paste] ".width() + collapse.summary.width())
+            (0, "[paste ]".width() + collapse.summary.width())
         }
     }
 }
