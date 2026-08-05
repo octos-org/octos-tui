@@ -1,0 +1,60 @@
+name: CI
+
+# The point of this workflow: a clean checkout has NO `.cargo/config.toml`, so
+# every job here builds against the `octos-core` rev pinned in Cargo.toml —
+# not against a developer's sibling `../octos` checkout, which the gitignored
+# `.cargo/config.toml.example` override redirects to locally. Protocol drift
+# between the two is the failure mode this catches.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# A force-push supersedes the previous run; don't pay for both.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  test:
+    name: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # --all-targets covers lib, bins, tests and benches, and compiles
+      # everything clippy would — so a separate `cargo check` job would only
+      # repeat this work.
+      - run: cargo test --all-targets
+      # --all-targets skips doctests, so run them separately.
+      - run: cargo test --doc
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Gating, not reporting: the 5 warnings `main` carried are cleared in
+      # this same PR, so the baseline is zero and any new one fails the build.
+      - run: cargo clippy --all-targets -- -D warnings
