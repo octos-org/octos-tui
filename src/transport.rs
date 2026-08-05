@@ -1694,7 +1694,8 @@ impl ProtocolAppUiBackend {
             // the session's server-confirmed root over `launch.cwd` so a
             // relaunch from a different shell directory does not rescope the
             // launch session (#476).
-            let cwd = self.protocol
+            let cwd = self
+                .protocol
                 .session_workspace_roots
                 .get(&session_id)
                 .cloned()
@@ -1763,7 +1764,11 @@ impl ProtocolAppUiBackend {
         self.reopen_session
             .clone()
             .map(|mut params| {
-                if let Some(root) = self.protocol.session_workspace_roots.get(&params.session_id) {
+                if let Some(root) = self
+                    .protocol
+                    .session_workspace_roots
+                    .get(&params.session_id)
+                {
                     params.cwd = Some(root.clone());
                 }
                 AppUiCommand::OpenSession(params)
@@ -6083,6 +6088,8 @@ mod tests {
         let request = rpc_request_from_command(
             "tui-7".into(),
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: SessionKey("local:test".into()),
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
@@ -6111,6 +6118,8 @@ mod tests {
         let request = rpc_request_from_command(
             "tui-9".into(),
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: SessionKey("local:test".into()),
                 turn_id: TurnId::new(),
                 input: vec![
@@ -7698,6 +7707,8 @@ mod tests {
 
         let mutating_commands = [
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
@@ -9295,6 +9306,8 @@ mod tests {
 
         let request = backend
             .build_tracked_request(AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: SessionKey("local:test".into()),
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
@@ -10356,6 +10369,78 @@ mod tests {
         assert_eq!(request.params["after"]["seq"], 42);
     }
 
+    /// #476: a stdio respawn must tell the REPLACEMENT child the workspace
+    /// cwd. `cwd` is what scopes the server's session store — without it the
+    /// new child opens the UNSCOPED store, so the user's transcript stays on
+    /// disk under `<key>\0~cwd-<hash>` while the UI shows an empty session and
+    /// any peer of the dead child is orphaned. Observed live: ~10 MB of ledger
+    /// stranded that way after the child exited.
+    ///
+    /// `reconnect_reopens_current_session_not_launch_session` below pins
+    /// `session_id` and `profile_id` on the same three paths but never pinned
+    /// `cwd`, so a reopen could lose scoping while every reconnect test stayed
+    /// green.
+    #[test]
+    fn reconnect_reopen_carries_the_workspace_cwd() {
+        let launch_session = SessionKey("local:launch".into());
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            profile_id: Some("coding".into()),
+            session_id: Some(launch_session.clone()),
+            cwd: Some("/tmp/workspace".into()),
+            ..AppUiLaunch::default()
+        });
+
+        let expect_reopen = |backend: &ProtocolAppUiBackend| -> SessionOpenParams {
+            match backend
+                .reopen_session_open_command()
+                .expect("a reopen target must exist")
+            {
+                AppUiCommand::OpenSession(params) => params,
+                other => panic!("reopen must be an OpenSession, got {other:?}"),
+            }
+        };
+
+        // 1. Nothing opened yet — the launch fallback must carry the cwd.
+        assert_eq!(
+            expect_reopen(&backend).cwd.as_deref(),
+            Some("/tmp/workspace"),
+            "the launch-fallback reopen must scope to the workspace"
+        );
+
+        // 2. An explicit open carries its OWN cwd, not the launch one.
+        backend.record_reopen_target(&AppUiCommand::OpenSession(SessionOpenParams {
+            session_id: SessionKey("local:other".into()),
+            topic: None,
+            profile_id: Some("research".into()),
+            cwd: Some("/tmp/other".into()),
+            sandbox: None,
+            after: None,
+        }));
+        assert_eq!(
+            expect_reopen(&backend).cwd.as_deref(),
+            Some("/tmp/other"),
+            "an explicitly opened session reopens under its own workspace"
+        );
+
+        // 3. `/resume` emits a HydrateSession, which has no cwd of its own. It
+        //    must inherit the launch cwd — otherwise a respawn after /resume
+        //    reopens unscoped, which is the reported failure.
+        backend.record_reopen_target(&AppUiCommand::HydrateSession(SessionHydrateParams {
+            session_id: SessionKey("local:hydrated".into()),
+            after: None,
+            include: vec!["messages".into(), "turns".into()],
+        }));
+        assert_eq!(
+            expect_reopen(&backend).cwd.as_deref(),
+            Some("/tmp/workspace"),
+            "a hydrate-sourced reopen must inherit the launch workspace cwd"
+        );
+    }
+
     #[test]
     fn reopen_prefers_server_confirmed_workspace_root_over_launch_cwd() {
         // Regression (#476): a bare `octos-tui` (no --cwd) falls back to the
@@ -10380,7 +10465,13 @@ mod tests {
         backend
             .protocol
             .record_event_state(&AppUiEvent::Protocol(UiNotification::SessionOpened(
-                session_opened_compat(session_id.clone(), None, Some("/real/workspace".into()), None, None),
+                session_opened_compat(
+                    session_id.clone(),
+                    None,
+                    Some("/real/workspace".into()),
+                    None,
+                    None,
+                ),
             )));
 
         // The reconnect reopen (launch-session fallback path) uses the
@@ -10568,6 +10659,8 @@ mod tests {
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
@@ -10630,6 +10723,8 @@ mod tests {
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: session,
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
@@ -10663,6 +10758,8 @@ mod tests {
         let turn_id = TurnId::new();
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 input: vec![InputItem::Text {
@@ -10815,6 +10912,8 @@ mod tests {
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id,
                 turn_id,
                 input: vec![InputItem::Text {

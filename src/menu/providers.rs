@@ -9276,18 +9276,21 @@ mod tests {
         let spec = ready_spec(loops_menu(&ctx));
 
         // Active loop gets pause/fire-now/delete rows; paused gets resume/delete.
-        assert!(spec
-            .items
-            .iter()
-            .any(|item| item.id == "loops.pause.build-check"));
-        assert!(spec
-            .items
-            .iter()
-            .any(|item| item.id == "loops.fire-now.build-check"));
-        assert!(spec
-            .items
-            .iter()
-            .any(|item| item.id == "loops.resume.nightly"));
+        assert!(
+            spec.items
+                .iter()
+                .any(|item| item.id == "loops.pause.build-check")
+        );
+        assert!(
+            spec.items
+                .iter()
+                .any(|item| item.id == "loops.fire-now.build-check")
+        );
+        assert!(
+            spec.items
+                .iter()
+                .any(|item| item.id == "loops.resume.nightly")
+        );
         let pause_row = spec
             .items
             .iter()
@@ -9301,7 +9304,10 @@ mod tests {
             "row dispatches the pause slash command"
         );
         assert!(
-            !spec.items.iter().any(|item| item.id == "loops.pause.nightly"),
+            !spec
+                .items
+                .iter()
+                .any(|item| item.id == "loops.pause.nightly"),
             "a paused loop offers resume, not pause"
         );
     }
@@ -9319,10 +9325,7 @@ mod tests {
             theme_name: None,
             selected_path: &[],
         };
-        assert!(matches!(
-            loops_menu(&ctx),
-            MenuBuildResult::Unavailable(_)
-        ));
+        assert!(matches!(loops_menu(&ctx), MenuBuildResult::Unavailable(_)));
     }
 
     fn dock_agent(id: &str, status: &str) -> octos_core::ui_protocol::UiAgentRecord {
