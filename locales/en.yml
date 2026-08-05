@@ -84,15 +84,20 @@ app:
     inline_patch: "Inline patch"
     loading: "Loading diff preview..."
     select_stage_hint: "[/] select hunk | c stage selected diff context"
+    toggle_side_by_side_hint: "v side-by-side"
+    toggle_unified_hint: "v unified"
+    side_by_side_too_narrow: "side-by-side needs %{min}+ cols"
     more_files_hidden: "+%{count} more file(s) hidden"
     line_unavailable: "line diff unavailable for this mutation"
     more_lines_hidden: "%{count} more diff line(s) hidden (Ctrl+O expand)"
+    more_rows_hidden: "%{count} more diff row(s) hidden (Ctrl+O expand)"
     more_hunks_hidden: "+%{count} more hunk(s) hidden (Ctrl+O expand)"
   autonomy:
     goal_prefix: "Goal: "
     loops_running: "Loops: %{count} active"
     loops_paused_suffix: " · %{count} paused"
     goal_meta: " (%{status} · %{used}/%{budget} tokens)"
+    goal_fold_hint: " · Ctrl+P expand"
     status_active: "active"
     status_paused: "paused"
     status_budget_limited: "budget limited"
@@ -111,6 +116,8 @@ app:
     ps_to_view: "/ps to view"
     esc_interrupt: "Esc interrupt"
     stop_to_close: "/stop to close"
+    pending_decision_help: "Waiting on you — Ctrl+R/Alt+A answer · Ctrl+C interrupt"
+    parked_decision_banner: "⚠ Parked on you for %{elapsed} — Ctrl+R/Alt+A answer · Ctrl+C interrupt"
     tool_output_expanded: "tool output expanded"
   btw:
     answering: "Answering…"
@@ -146,11 +153,13 @@ app:
     large_paste: "Large paste collapsed | Enter sends full text | Ctrl+U clear"
     multiline_tail_lines: "Multiline input | showing tail, %{count} earlier line(s) hidden | Enter sends full text | Ctrl+U clear"
     multiline_tail_line: "Multiline input | showing tail of long line | Enter sends full text | Ctrl+U clear"
+    peer_readonly: "↳ read-only peer · steer from the master · Ctrl+S switch · Ctrl+C interrupt"
   hint:
     # Pane/modal footer hints (keyboard keys kept literal).
     list_nav: "j/k or Up/Down"
     composer_send: "Enter send | Shift+Enter / Ctrl+J newline | Tab agents"
     statusbar_keys: "Tab agents | Ctrl+O expand"
+    statusbar_keys_peers: "Tab agents | Ctrl+L peers | Ctrl+S sessions | Ctrl+O expand"
     agent_peek_keys: " Tab next · Shift+Tab prev · ↑/↓ scroll · x cancel · Esc back to chat "
     agent_task_prefix: "task: %{task}"
     agent_deliverables: "Deliverables"
@@ -159,7 +168,18 @@ app:
     agent_strip_more: "+%{count} more (Tab)"
     agent_dock_pill: "🐙 %{count} agents · %{running} running"
     agent_dock_pill_unread: " · %{count}● unread"
-    agent_dock_toggle_hint: "Alt+G"
+    agent_dock_toggle_hint: "Ctrl+G/Alt+G"
+    # Peer Dock (#407): collapsed fleet summary shown in place of per-peer
+    # chips when the session strip overflows, and the expanded peer dock's
+    # (Alt+P / Ctrl+L) per-row labels. Mirrors the agent-dock pill's shape.
+    peer_dock_pill: "👥 %{count} peers · %{live} live"
+    peer_dock_pill_blocked: " · %{count}⚠ waiting"
+    peer_dock_pill_unread: " · %{count}● unread"
+    peer_dock_toggle_hint: "Alt+P/Ctrl+L peek"
+    peer_dock_title: " peers "
+    peer_dock_row_blocked: "waiting on you: %{reason}"
+    peer_dock_row_idle: "idle"
+    peer_dock_row_opening: "opening…"
     agent_no_output: "(no output captured yet — this agent streams its result here as it works)"
     menu: "Menu | j/k move | Enter accept | Esc close"
     onboarding: "Onboarding | Enter continue | type to edit fields"
@@ -340,6 +360,8 @@ onboarding:
     saved_status_none: "Saved provider: none"
     primary: "primary"
     fallback: "fallback"
+    research_lane: "research lane"
+    save_research_lane: "Save as research lane"
   disabled:
     name_empty: "name is empty"
     username_empty: "username is empty"
@@ -461,6 +483,28 @@ thinking:
   display_off: Reasoning hidden from the transcript (spinner + inspector only).
 
 status:
+  undo_no_session: "No active session to undo in."
+  peer_usage: "Usage: /peer [--go] [--worktree] [--cwd <path>] [--n <2-8>] <brief>"
+  peer_preparing: "Preparing peer session…"
+  session_blocked_hint: "%{session} is waiting on you: %{reason} — Ctrl+S/Alt+S to answer."
+  peer_prepare_in_flight: "A peer is already being prepared — wait for it to open (or ~30s) before starting another."
+  peer_opening: "Opening peer %{slug}…"
+  peer_started: "Peer %{slug} is working in the background — watch its badge in the session strip (Ctrl+S/Alt+S)."
+  peer_switched: "Peer %{slug} started — you are in its session now."
+  peer_fleet_opening: "Opening a fleet of %{n} peers (first: %{slug})…"
+  peer_staged_by_agent: "Agent spun off peer %{slug} — working in the background (Ctrl+S/Alt+S)."
+  peer_staged_known: "Peer %{slug} is already staged — duplicate notice ignored."
+  gather_requesting: "Gathering peer results from the blackboard…"
+  gather_no_peers: "No peers staged on the blackboard — /peer to spin some up first."
+  gather_submitted: "Gathered %{n} peer(s) from the blackboard into this session."
+  peer_clear_none: "No finished peers to clear — running and waiting peers are kept."
+  peer_clear_removed: "Cleared %{n} finished peer(s) from the dock."
+  research_usage: "Usage: /research | /research add <key> <provider> <model> [base_url] [api_key_env] | /research rm <key>"
+  research_add_usage: "Usage: /research add <key> <provider> <model> [base_url] [api_key_env]"
+  research_rm_usage: "Usage: /research rm <key>"
+  research_profile_unresolved: "Active profile not resolved yet — try again once the session is ready."
+  research_lane_saved: "Research lane %{key} saved: %{label} — restart to apply."
+  sub_provider_restart_required: "%{message} — restart to apply."
   opening_diff_preview: "Opening diff preview: %{operation} %{path}"
   opening_inline_diff_preview: "Opening inline diff preview: %{title}"
   approval_requested: "Approval requested: %{title}"
@@ -491,6 +535,7 @@ status:
   list_more: ", +%{count} more"
   no_session_send_prompt: "No coding session open. Run /onboard open-session before sending a prompt."
   message_staged: "Message staged; it will submit after the active turn. Press Esc to interrupt/send."
+  steered_into_turn: "Steered into the running turn."
   btw_usage: "Usage: /btw <question> — ask a quick aside while the turn keeps working"
   btw_answering: "btw: answering…"
   btw_answered: "btw: answered"
@@ -729,6 +774,9 @@ status:
   selected_diff_hunk: "Selected diff hunk: %{path} %{header}"
   no_diff_hunk: "No diff hunk is available to select"
   no_diff_hunk_context: "No selected diff hunk context to stage"
+  diff_view_side_by_side: "Side-by-side diff view"
+  diff_view_unified: "Unified diff view"
+  diff_view_too_narrow: "Terminal too narrow for side-by-side diff (needs %{min}+ cols)"
   staged_diff_context: "Staged selected diff hunk context for next turn: %{path}"
   added_diff_context: "Added selected diff hunk context to composer: %{path}"
   accepted: "accepted"
@@ -808,6 +856,11 @@ status:
   bang_failed: "failed"
   bang_usage: "usage: !<command>"
   bang_no_output: "(no output)"
+  bang_mode_hint: "local shell — Enter runs on this machine in %{cwd} · Esc cancels"
+  bang_mode_cancelled: "local shell cancelled"
+  bang_cwd: "cwd: %{cwd}"
+  inserted_at_cursor: "Inserted %{text}"
+  file_picker_closed: "File picker closed (nothing inserted)"
   # Review / goal / staged-message status lines
   cannot_start_review_active_turn: "Cannot start review while a turn is active"
   server_clamped_onboarding_choice: "Server clamped or rejected the staged onboarding choice."
@@ -844,6 +897,12 @@ status:
   # own turn (Esc/Ctrl+C). Deliberately terse: a user stop is not a failure, so
   # it does not get the verbose Session-Summary card that genuine errors do.
   turn_interrupted: "Turn interrupted"
+  # Appended to the committed answer when a turn the user interrupted went on to
+  # COMPLETE normally on the server — the interrupt was declined, never sent, or
+  # simply lost the race. The client froze its view at the Esc, so the text above
+  # is a truncated view of an answer that did finish. Only shown when output was
+  # genuinely withheld, never for an Esc that arrived after the last token.
+  turn_interrupted_truncated: "⚠ Interrupted — output after this point was dropped, so this answer is incomplete. The turn finished on the server; re-ask to see the rest."
 
 # --- menu chrome + command descriptions (full i18n pass) ---
 command:
@@ -867,7 +926,7 @@ command:
   profiles:
     desc: Manage local profiles — list, set the default, delete, or create one.
   goal:
-    desc: View, set, pause, resume, stop, or clear the persisted session goal.
+    desc: "Set: /goal <objective> [--budget 2m|500k]. Manage: pause, resume, stop, clear. Plain /goal shows the current goal."
   help:
     desc: Show available commands.
   keymap:
@@ -882,6 +941,16 @@ command:
     desc: List or configure server-owned MCP entries when supported.
   model:
     desc: Choose a server-returned profile LLM model.
+  sessions:
+    desc: Switch between open sessions (Ctrl+S/Alt+S) — live turns and unread badges.
+  undo:
+    desc: Roll workspace files back to a pre-mutation snapshot (#1768).
+  peer:
+    desc: "Spin off a peer agent session with a durable brief: /peer [--go] [--worktree] [--cwd <path>] [--n <2-8>] <brief>."
+  gather:
+    desc: "Gather peer results from the blackboard into this session: /gather [all | <slug> …]."
+  research:
+    desc: Manage research provider lanes (deep_research cheap/strong models).
   onboard:
     desc: Open the setup wizard to configure or reconfigure your profile, provider, model, and workspace.
   permissions:
@@ -921,6 +990,100 @@ command:
   turn:
     desc: Inspect backend turn lifecycle state.
 menu:
+  file_picker:
+    title: "Insert file path"
+    search: "Type to filter workspace files"
+    footer: "Enter insert relative path at cursor | Esc close without inserting"
+    item:
+      empty:
+        label: "No files found in this workspace"
+        desc: "The scan found no listable files under the workspace root (`.git`, `target`, and `node_modules` are skipped)."
+      truncated:
+        label: "Showing the first %{count} files — type to narrow the search"
+  sessions:
+    title: Sessions
+    subtitle: "⌂ main · ↳ peer · ✻ turn running · (n) turns finished since you last looked."
+    footer: Enter switch | Esc close
+    item:
+      blocked_reason: "⚠ waiting on you: %{reason}"
+      current: This is the focused session.
+      switch_desc: Switch to this session.
+      empty: No open sessions
+      empty_desc: Open a session first.
+  undo:
+    title: Workspace Snapshots
+    subtitle: "Undo points taken before agent file mutations. Select one to roll the workspace back."
+    footer: Enter restore a snapshot (asks to confirm) | Esc close
+    age:
+      just_now: just now
+    item:
+      refresh:
+        label: Refresh snapshots
+        desc: Uses snapshot/list for the active session.
+      stale:
+        label: Snapshots not loaded for this session
+        desc: Select Refresh to load the active session's snapshots.
+      unavailable:
+        label: Snapshots unavailable
+        desc: No workspace for this session, or git is not installed.
+      disabled:
+        label: "Snapshot capture is OFF (snapshots.enabled)"
+        desc: Existing snapshots below remain restorable; new edits are not being snapshotted.
+      empty:
+        label: No snapshots yet
+        desc: "Snapshots are taken automatically before agent file mutations (opt-in: snapshots.enabled)."
+      snap:
+        desc: Select to restore — asks to confirm first.
+  undo_confirm:
+    title: "Restore a snapshot"
+    subtitle: "Rolls the workspace files back. A pre-restore snapshot is taken first, so this is itself undoable."
+    confirm_title: "Restore %{snapshot}?"
+    "yes": "Yes, restore %{snapshot}"
+    yes_desc: "Uses snapshot/restore; refused while a turn is running."
+    "no": "No, keep current files"
+    item:
+      empty:
+        label: "No snapshot staged for restore"
+  research:
+    title: Research Provider Lanes
+    subtitle: "Named provider lanes (cheap/strong) for the deep_research pipeline. Restart to apply."
+    footer: Enter remove a lane (asks to confirm) | Esc close
+    item:
+      refresh:
+        label: Refresh lanes
+        desc: Uses profile/sub_providers/list.
+      empty:
+        label: No research lanes configured
+        desc: "Add one with /research add <key> <provider> <model>."
+      stale:
+        label: Lanes not loaded for this profile
+        desc: Select Refresh to load this profile's research lanes.
+      lane:
+        desc: Select to remove this lane — asks to confirm first.
+      add:
+        label: Add a lane…
+        desc: "Opens the model picker, then choose the fast or strong lane."
+  research_remove:
+    title: "Remove a research lane"
+    item:
+      empty:
+        label: "No lane staged for removal"
+    confirm:
+      title: "Remove lane %{lane}?"
+      subtitle: "Deletes this lane from the profile's sub_providers. Restart to apply."
+      yes: "Yes, remove %{lane}"
+      yes_desc: "Uses profile/sub_providers/remove; the lane list refreshes when it completes."
+      no: "No, keep it"
+  research_lane_key:
+    title: "Save research lane as…"
+    subtitle: "Deep research routes by lane key — %{provider} becomes the lane you pick. Restart to apply."
+    occupied: "currently %{current} (saving replaces it)"
+    vacant: "not configured yet"
+    item:
+      cheap:
+        desc: "The fast/cheap lane — deep_research uses it for scanning and summarization stages."
+      strong:
+        desc: "The strong lane — deep_research uses it for deep-reasoning and synthesis stages."
   agents:
     item:
       dock_collapse:
@@ -928,7 +1091,7 @@ menu:
       dock_expand:
         label: Expand the dock to per-agent rows
       dock_toggle:
-        desc: Same as Alt+G.
+        desc: Same as Ctrl+G/Alt+G.
       main:
         desc: Show the session transcript in the main pane.
         label: main session
@@ -1326,6 +1489,8 @@ menu:
       save_provider:
         desc: Uses profile/llm/upsert and persists to the same profile JSON as the dashboard.
         label: Save provider to profile
+      save_research_lane:
+        desc: "Saves the staged provider as a deep_research lane (profile/sub_providers/upsert) — you pick which lane next: cheap or strong."
       saved_provider:
         desc: Last successful primary or fallback save
       selected_provider:
