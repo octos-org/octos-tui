@@ -80,6 +80,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::Context,
         Provider::Resume,
         Provider::Agents,
+        Provider::Loops,
         Provider::Rewind,
         Provider::Model,
         Provider::ModelConfig,
