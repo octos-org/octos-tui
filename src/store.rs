@@ -2121,6 +2121,20 @@ impl Store {
                     agent_id,
                 }))
             }
+            AgentsCommand::Spawn { count, prompt } => {
+                if self.state.active_turn().is_some() {
+                    self.state.status = t!("status.cannot_spawn_active_turn").into_owned();
+                    return None;
+                }
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_AGENT_LIST) {
+                    return None;
+                }
+                let text =
+                    t!("status.spawn_agents_turn", count = count, prompt = prompt).into_owned();
+                let status =
+                    t!("status.spawning_agents", count = count, prompt = prompt).into_owned();
+                self.start_prompt_turn(text, status)
+            }
         }
     }
 
@@ -7504,7 +7518,6 @@ impl Store {
         use crate::client_event::AutonomyResult;
         match event.result {
             AutonomyResult::AgentList(result) => {
-                let count = result.agents.len();
                 // Stuck-chip reconnect safety net: on session reopen the
                 // `agent/list` snapshot carries the authoritative terminal
                 // status for each background agent. Reconcile any stale
@@ -7515,6 +7528,24 @@ impl Store {
                 for agent in &result.agents {
                     self.reconcile_task_from_agent_record(&result.session_id, agent);
                 }
+                // Count only non-terminal agents so the reported count goes to
+                // 0 once all spawned agents complete (rather than staying at N
+                // forever because terminal agents are still in the list).
+                //
+                // NOTE: deliberately NO per-agent activity chip here. `agent/list`
+                // is auto-fired by `hydrate_autonomy_state_commands` on every
+                // session open/reconnect, and `push_activity` is an append with
+                // no dedup behind an 80-item cap — so pushing one chip per agent
+                // per result floods the feed and evicts meaningful rows. The
+                // `AgentUpdated` arm already emits exactly this chip as each
+                // agent reports in; that is the single producer.
+                let count = result
+                    .agents
+                    .iter()
+                    .filter(|a| {
+                        crate::model::terminal_task_state_from_agent_status(&a.status).is_none()
+                    })
+                    .count();
                 self.state
                     .set_session_agents(&result.session_id, result.agents);
                 self.state.status = t!("status.agent_list_refreshed", count = count).into_owned();
@@ -10564,9 +10595,13 @@ impl Store {
                 // statuses flip the task — a "running" record must never
                 // resurrect a task the client already saw go terminal.
                 self.reconcile_task_from_agent_record(&event.session_id, &event.agent);
+                // Stamp the OWNING session: `agent/updated` arrives for
+                // background sessions too, and an unstamped chip renders in
+                // whichever session is focused.
                 self.state.push_activity(
                     ActivityItem::new(ActivityKind::Progress, title, status_label)
-                        .with_detail(detail),
+                        .with_detail(detail)
+                        .with_session(event.session_id.clone()),
                 );
                 // Don't churn the status bar with "Agent status refreshed: …" on
                 // every agent-status event — during a multi-agent turn that floods
@@ -33190,6 +33225,117 @@ now analyzing the bus module"
     }
 
     #[test]
+    fn spawn_dispatches_submit_prompt_with_formatted_text() {
+        let mut store = protocol_store_with_autonomy();
+        store
+            .state
+            .set_composer_text("/agents spawn 3 run integration tests");
+        let command = store.compose_command().expect("spawn emits a command");
+        match command {
+            AppUiCommand::SubmitPrompt(params) => {
+                let text = match params.input.first().expect("input has text") {
+                    octos_core::ui_protocol::InputItem::Text { text } => text.clone(),
+                    other => panic!("expected Text input item, got {other:?}"),
+                };
+                assert!(
+                    text.contains('3'),
+                    "turn text must contain the count, got: {text}"
+                );
+                assert!(
+                    text.contains("run integration tests"),
+                    "turn text must contain the prompt, got: {text}"
+                );
+            }
+            other => panic!("expected SubmitPrompt, got {other:?}"),
+        }
+    }
+
+    /// Slash dispatch runs BEFORE the plain-prompt staging path, so without this
+    /// guard `/agents spawn` during a live turn would double-submit `turn/start`
+    /// and bypass the staged-drain FIFO. Mirrors `review_start_command`.
+    #[test]
+    fn spawn_rejected_with_active_turn() {
+        let mut store = protocol_store_with_autonomy();
+        let turn_id = TurnId::new();
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id,
+            text: "streaming".into(),
+        });
+        store.state.set_composer_text("/agents spawn 2 do work");
+        let command = store.compose_command();
+        assert!(
+            command.is_none(),
+            "spawn must be rejected while a turn is active"
+        );
+        assert!(
+            store.state.status.contains("active"),
+            "status must mention the active turn, got: {:?}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn spawn_rejected_when_agent_list_not_advertised() {
+        use crate::menu::CapabilitySet;
+        let session = crate::model::SessionView {
+            id: octos_core::SessionKey("local:test".into()),
+            title: "test".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: crate::model::AppState::new(
+                vec![session],
+                0,
+                "ready".into(),
+                Some("ws://example.test/ui-protocol".into()),
+                false,
+            ),
+        };
+        store.state.capabilities = Some(CapabilitySet::from_methods_and_features(
+            [] as [&str; 0],
+            [crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1],
+        ));
+        store.state.set_composer_text("/agents spawn 2 do work");
+        let command = store.compose_command();
+        assert!(
+            command.is_none(),
+            "spawn must be rejected when agent/list is not advertised"
+        );
+        assert!(
+            store.state.status.contains("agent/list"),
+            "status must name the missing method, got: {:?}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn spawn_not_recorded_in_history() {
+        assert!(
+            !should_record_in_history("/agents spawn 3 run tests"),
+            "/agents spawn has non-empty args so it must never be recorded"
+        );
+        assert!(
+            !should_record_in_history("/agents spawn 1 fix lint errors"),
+            "single-agent spawn with a long prompt must not be recorded"
+        );
+    }
+
+    #[test]
+    fn spawn_rejected_in_readonly_mode() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.readonly = true;
+        store.state.set_composer_text("/agents spawn 2 do work");
+        let command = store.compose_command();
+        assert!(
+            command.is_none(),
+            "spawn must be rejected in readonly mode, got {command:?}"
+        );
+    }
+
+    #[test]
     fn agents_list_subcommand_also_dispatches() {
         let mut store = protocol_store_with_autonomy();
         store.state.composer = "/agents list".into();
@@ -34851,7 +34997,179 @@ now analyzing the bus module"
             .session_autonomy_for(&session_id)
             .expect("mirror");
         assert_eq!(mirror.agents.len(), 1);
-        assert!(store.state.status.contains("1 agent"));
+        assert!(store.state.status.contains("1 active agent"));
+    }
+
+    /// `agent/list` must NOT push per-agent activity chips. It is auto-fired by
+    /// `hydrate_autonomy_state_commands` on every session open/reconnect, and
+    /// `push_activity` appends with no dedup behind an 80-item cap — so a chip
+    /// per agent per result floods the feed and evicts meaningful rows. The
+    /// `AgentUpdated` arm is the single chip producer for agents.
+    #[test]
+    fn agent_list_result_pushes_no_activity_chips() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        use octos_core::ui_protocol::UiAgentRecord;
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+
+        let make_agent = |id: &str, status: &str| UiAgentRecord {
+            agent_id: id.into(),
+            parent_agent_id: None,
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "/root".into(),
+            role: "worker".into(),
+            nickname: id.into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: status.into(),
+            last_task: None,
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+
+        let list = |store: &mut Store| {
+            store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+                result: AutonomyResult::AgentList(crate::model::AgentListResult {
+                    session_id: session_id.clone(),
+                    agents: vec![make_agent("ag-1", "running"), make_agent("ag-2", "running")],
+                }),
+            }));
+        };
+
+        // Three refreshes stand in for hydrate-on-reconnect firing repeatedly.
+        list(&mut store);
+        list(&mut store);
+        list(&mut store);
+
+        assert_eq!(
+            store.state.activity.len(),
+            0,
+            "agent/list must never push chips (reconnect would duplicate them); got: {:?}",
+            store.state.activity
+        );
+        // The mirror and the status line still carry the roster.
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror");
+        assert_eq!(mirror.agents.len(), 2);
+        assert!(store.state.status.contains("2 active agent"));
+    }
+
+    /// Regression: when every agent in the list is terminal the status bar must
+    /// report 0 active agents, not the total roster size.
+    #[test]
+    fn agent_list_count_goes_to_zero_when_all_terminal() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        use octos_core::ui_protocol::UiAgentRecord;
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+
+        let make_agent = |id: &str, status: &str| UiAgentRecord {
+            agent_id: id.into(),
+            parent_agent_id: None,
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "/root".into(),
+            role: "worker".into(),
+            nickname: id.into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: status.into(),
+            last_task: None,
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::AgentList(crate::model::AgentListResult {
+                session_id: session_id.clone(),
+                agents: vec![
+                    make_agent("ag-1", "completed"),
+                    make_agent("ag-2", "interrupted"),
+                    make_agent("ag-3", "failed"),
+                ],
+            }),
+        }));
+
+        assert!(
+            store.state.status.contains("0 active agent"),
+            "all-terminal agent list must report 0 active agents, got: {}",
+            store.state.status
+        );
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror");
+        assert_eq!(mirror.agents.len(), 3, "the mirror keeps every agent");
+    }
+
+    /// `ready` / `cleared` / `active` are non-terminal wire statuses the server
+    /// does emit, so they must count as active. `done` is NOT emitted by any
+    /// server path — if that ever changes, `terminal_task_state_from_agent_status`
+    /// needs the arm and this test will catch the drift.
+    #[test]
+    fn agent_list_count_treats_unmapped_statuses_as_active() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        use octos_core::ui_protocol::UiAgentRecord;
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+
+        let make_agent = |id: &str, status: &str| UiAgentRecord {
+            agent_id: id.into(),
+            parent_agent_id: None,
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "/root".into(),
+            role: "worker".into(),
+            nickname: id.into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: status.into(),
+            last_task: None,
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::AgentList(crate::model::AgentListResult {
+                session_id: session_id.clone(),
+                agents: vec![
+                    make_agent("ag-1", "ready"),
+                    make_agent("ag-2", "cleared"),
+                    make_agent("ag-3", "active"),
+                    make_agent("ag-4", "completed"),
+                ],
+            }),
+        }));
+
+        assert!(
+            store.state.status.contains("3 active agent"),
+            "ready/cleared/active are non-terminal; only completed is terminal, got: {}",
+            store.state.status
+        );
     }
 
     #[test]
@@ -36102,6 +36420,127 @@ now analyzing the bus module"
         );
     }
 
+    /// Real-wire reproduction of the duplicate-render report (octos#1916).
+    ///
+    /// The ids here are NOT invented — they are the ones a live
+    /// `dev:local:tui#coding` turn actually received. The server derives a
+    /// delta's segment index from how many persisted rows PRECEDE it, and
+    /// persisted rows only arrive at the end of a turn, so every delta of the
+    /// turn projects to `:assistant:1` — while the persisted rows increment.
+    /// A tool-using turn therefore streams its WHOLE answer under segment 1
+    /// and then persists it as segments 1 and 2:
+    ///
+    ///   1764 deltas       -> <turn>:assistant:1   (preamble + answer)
+    ///   assistant_persisted -> <turn>:assistant:1   52 chars (preamble)
+    ///   assistant_persisted -> <turn>:assistant:2 3683 chars (the answer)
+    ///
+    /// Segment 2 matches nothing the client has seen. This pins that the
+    /// answer still renders exactly once.
+    #[test]
+    fn mismatched_server_segment_ids_do_not_duplicate_the_answer() {
+        let session_id = SessionKey("local:test".into());
+        let wire = "019fd09a-9b0a-7f80-bb04-997cdee903fe";
+        let seg1 = format!("{wire}:assistant:1");
+        let seg2 = format!("{wire}:assistant:2");
+        const PREAMBLE: &str = "Reviewing the design docs first:";
+        const ANSWER: &str = "Here is the critical review of the design.";
+
+        let mut store = Store {
+            state: AppState::new(
+                vec![open_session_on("test")],
+                0,
+                "ready".into(),
+                None,
+                false,
+            ),
+        };
+        let mut seq = 0u64;
+        let mut send = |store: &mut Store, payload: PayloadV2| {
+            seq += 1;
+            store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+                session_id.clone(),
+                seq,
+                wire,
+                payload,
+            )));
+        };
+
+        send(
+            &mut store,
+            PayloadV2::UserMessage {
+                text: "review the design".into(),
+                files: vec![],
+            },
+        );
+        // The whole turn streams under segment 1 — preamble, tool call, answer.
+        for chunk in [PREAMBLE, "\n\n"] {
+            send(
+                &mut store,
+                PayloadV2::AssistantDelta {
+                    text: chunk.into(),
+                    assistant_segment_id: seg1.clone(),
+                },
+            );
+        }
+        send(
+            &mut store,
+            PayloadV2::ToolStart {
+                tool_call_id: "tool-1".into(),
+                name: "read_file".into(),
+                arguments_preview: None,
+            },
+        );
+        send(
+            &mut store,
+            PayloadV2::AssistantDelta {
+                text: ANSWER.into(),
+                assistant_segment_id: seg1.clone(),
+            },
+        );
+        // Canonical rows land at the END, and their indices disagree with the
+        // single segment the deltas opened.
+        for (segment, text) in [(&seg1, PREAMBLE), (&seg2, ANSWER)] {
+            send(
+                &mut store,
+                PayloadV2::AssistantPersisted {
+                    text: text.into(),
+                    assistant_segment_id: segment.clone(),
+                    meta: octos_core::ui_protocol::MessageMeta {
+                        message_id: format!("msg-{segment}"),
+                        persisted_at: chrono::Utc::now(),
+                        media: vec![],
+                    },
+                },
+            );
+        }
+
+        let session = store
+            .state
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .expect("session");
+        let mut seen = session
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>();
+        if let Some(live_reply) = session.live_reply.as_ref() {
+            seen.push(live_reply.text.clone());
+        }
+        let visible = seen.join("\n");
+        assert_eq!(
+            visible.matches(ANSWER).count(),
+            1,
+            "the answer must render exactly once, got: {visible:?}"
+        );
+        assert_eq!(
+            visible.matches(PREAMBLE).count(),
+            1,
+            "the preamble must render exactly once, got: {visible:?}"
+        );
+    }
+
     /// stdio wedge regression (#379 review F1): the persisted v2 rows register
     /// the turn in the v2 maps, but on stdio the legacy `turn/completed` is the
     /// ONLY terminal the client receives — it must still commit the reply (the
@@ -37080,5 +37519,38 @@ now analyzing the bus module"
             "a refused entry must not leave a live lane intent behind"
         );
         assert!(!store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+    }
+}
+
+#[cfg(test)]
+mod activity_line_width_tests {
+    use super::*;
+
+    /// `session_activity_line` capped at 60 CHARS. The peer dock row
+    /// (`app::peer_activity_line`) and the Alt+S switcher rows both budget in
+    /// COLUMNS, so a CJK summary was twice its allowance and overflowed.
+    #[test]
+    fn session_activity_line_caps_columns_not_chars() {
+        use unicode_width::UnicodeWidthStr;
+        let session_id = SessionKey("local:b".into());
+        let long = "正在重构速率限制器并为并发请求增加背压控制以避免上游服务被打满".repeat(3);
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "b".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![Message::assistant(long)],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let state = AppState::new(vec![session], 0, "ready".into(), None, false);
+
+        let line = state
+            .session_activity_line(&session_id)
+            .expect("activity line present");
+        assert!(
+            line.width() <= 60,
+            "the activity line budget is 60 columns, got {} columns: {line:?}",
+            line.width()
+        );
     }
 }
