@@ -371,6 +371,11 @@ struct PendingRequest {
 struct ProtocolExchange {
     pending_requests: HashMap<String, PendingRequest>,
     session_cursors: HashMap<SessionKey, UiCursor>,
+    /// Server-confirmed `workspace_root` per session, captured from
+    /// `session/opened` (see [`Self::record_event_state`]). Used by the
+    /// reconnect/launch reopen to scope to the session's real workspace, not
+    /// `launch.cwd` (#476).
+    session_workspace_roots: HashMap<SessionKey, String>,
     next_request_id: u64,
 }
 
@@ -499,6 +504,13 @@ impl ProtocolExchange {
                 if let Some(cursor) = &opened.cursor {
                     self.session_cursors
                         .insert(opened.session_id.clone(), cursor.clone());
+                }
+                // Capture the server-confirmed workspace root so a respawn
+                // reopen scopes to the session's real workspace (#476), not
+                // `launch.cwd` (the shell's dir for a bare `octos-tui`).
+                if let Some(root) = &opened.workspace_root {
+                    self.session_workspace_roots
+                        .insert(opened.session_id.clone(), root.clone());
                 }
             }
             AppUiEvent::Protocol(UiNotification::TurnCompleted(completed)) => {
@@ -1678,11 +1690,21 @@ impl ProtocolAppUiBackend {
 
     fn launch_session_open_command(&self) -> Option<AppUiCommand> {
         self.launch.session_id.clone().map(|session_id| {
+            // Same workspace-root precedence as the reconnect reopen: prefer
+            // the session's server-confirmed root over `launch.cwd` so a
+            // relaunch from a different shell directory does not rescope the
+            // launch session (#476).
+            let cwd = self
+                .protocol
+                .session_workspace_roots
+                .get(&session_id)
+                .cloned()
+                .or_else(|| self.launch.cwd.clone());
             AppUiCommand::OpenSession(SessionOpenParams {
                 session_id,
                 topic: None,
                 profile_id: self.launch.profile_id.clone(),
-                cwd: self.launch.cwd.clone(),
+                cwd,
                 sandbox: None,
                 after: None,
             })
@@ -1732,9 +1754,25 @@ impl ProtocolAppUiBackend {
     /// session (tracks the current selection), falling back to the launch
     /// `--session` when nothing has been opened yet.
     fn reopen_session_open_command(&self) -> Option<AppUiCommand> {
+        // Prefer the session's server-confirmed workspace root for the reopen
+        // cwd: a bare `octos-tui` (no --cwd) falls back to the shell's
+        // current_dir for `launch.cwd`, which may differ from the session's
+        // workspace. Reopening with the shell's cwd rescopes the session to
+        // the wrong `~cwd-<hash>` and presents an empty session (#476). The
+        // captured root is the authoritative scope; `launch.cwd` is only the
+        // launch-time request and must not override it.
         self.reopen_session
             .clone()
-            .map(AppUiCommand::OpenSession)
+            .map(|mut params| {
+                if let Some(root) = self
+                    .protocol
+                    .session_workspace_roots
+                    .get(&params.session_id)
+                {
+                    params.cwd = Some(root.clone());
+                }
+                AppUiCommand::OpenSession(params)
+            })
             .or_else(|| self.launch_session_open_command())
     }
 
@@ -10321,6 +10359,168 @@ mod tests {
         assert_eq!(request.params["cwd"], "/tmp/workspace");
         assert_eq!(request.params["after"]["stream"], "local:test");
         assert_eq!(request.params["after"]["seq"], 42);
+    }
+
+    /// #476: a stdio respawn must tell the REPLACEMENT child the workspace
+    /// cwd. `cwd` is what scopes the server's session store — without it the
+    /// new child opens the UNSCOPED store, so the user's transcript stays on
+    /// disk under `<key>\0~cwd-<hash>` while the UI shows an empty session and
+    /// any peer of the dead child is orphaned. Observed live: ~10 MB of ledger
+    /// stranded that way after the child exited.
+    ///
+    /// `reconnect_reopens_current_session_not_launch_session` below pins
+    /// `session_id` and `profile_id` on the same three paths but never pinned
+    /// `cwd`, so a reopen could lose scoping while every reconnect test stayed
+    /// green.
+    #[test]
+    fn reconnect_reopen_carries_the_workspace_cwd() {
+        let launch_session = SessionKey("local:launch".into());
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            profile_id: Some("coding".into()),
+            session_id: Some(launch_session.clone()),
+            cwd: Some("/tmp/workspace".into()),
+            ..AppUiLaunch::default()
+        });
+
+        let expect_reopen = |backend: &ProtocolAppUiBackend| -> SessionOpenParams {
+            match backend
+                .reopen_session_open_command()
+                .expect("a reopen target must exist")
+            {
+                AppUiCommand::OpenSession(params) => params,
+                other => panic!("reopen must be an OpenSession, got {other:?}"),
+            }
+        };
+
+        // 1. Nothing opened yet — the launch fallback must carry the cwd.
+        assert_eq!(
+            expect_reopen(&backend).cwd.as_deref(),
+            Some("/tmp/workspace"),
+            "the launch-fallback reopen must scope to the workspace"
+        );
+
+        // 2. An explicit open carries its OWN cwd, not the launch one.
+        backend.record_reopen_target(&AppUiCommand::OpenSession(SessionOpenParams {
+            session_id: SessionKey("local:other".into()),
+            topic: None,
+            profile_id: Some("research".into()),
+            cwd: Some("/tmp/other".into()),
+            sandbox: None,
+            after: None,
+        }));
+        assert_eq!(
+            expect_reopen(&backend).cwd.as_deref(),
+            Some("/tmp/other"),
+            "an explicitly opened session reopens under its own workspace"
+        );
+
+        // 3. `/resume` emits a HydrateSession, which has no cwd of its own. It
+        //    must inherit the launch cwd — otherwise a respawn after /resume
+        //    reopens unscoped, which is the reported failure.
+        backend.record_reopen_target(&AppUiCommand::HydrateSession(SessionHydrateParams {
+            session_id: SessionKey("local:hydrated".into()),
+            after: None,
+            include: vec!["messages".into(), "turns".into()],
+        }));
+        assert_eq!(
+            expect_reopen(&backend).cwd.as_deref(),
+            Some("/tmp/workspace"),
+            "a hydrate-sourced reopen must inherit the launch workspace cwd"
+        );
+    }
+
+    #[test]
+    fn reopen_prefers_server_confirmed_workspace_root_over_launch_cwd() {
+        // Regression (#476): a bare `octos-tui` (no --cwd) falls back to the
+        // shell's current_dir for `launch.cwd`, which may differ from the
+        // session's real workspace. A respawn reopen must scope to the
+        // server-confirmed `workspace_root` from `session/opened`, not
+        // `launch.cwd`, else the session is rescoped to the wrong
+        // `~cwd-<hash>` and presents as empty.
+        let session_id = SessionKey("local:test".into());
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            profile_id: Some("coding".into()),
+            session_id: Some(session_id.clone()),
+            cwd: Some("/shell/cwd".into()),
+            ..AppUiLaunch::default()
+        });
+
+        // The server confirms the session's real workspace via session/opened.
+        backend
+            .protocol
+            .record_event_state(&AppUiEvent::Protocol(UiNotification::SessionOpened(
+                session_opened_compat(
+                    session_id.clone(),
+                    None,
+                    Some("/real/workspace".into()),
+                    None,
+                    None,
+                ),
+            )));
+
+        // The reconnect reopen (launch-session fallback path) uses the
+        // captured workspace root, not `launch.cwd`.
+        let reopen = backend
+            .reopen_session_open_command()
+            .expect("launch session is the fallback reopen target");
+        let AppUiCommand::OpenSession(reopen) = reopen else {
+            panic!("reopen command must be an OpenSession");
+        };
+        assert_eq!(reopen.session_id, session_id);
+        assert_eq!(
+            reopen.cwd.as_deref(),
+            Some("/real/workspace"),
+            "reopen cwd must be the server-confirmed workspace_root, not launch.cwd"
+        );
+
+        // An explicitly recorded reopen target (e.g. after /resume) also gets
+        // its cwd corrected to the confirmed root.
+        backend.record_reopen_target(&AppUiCommand::OpenSession(SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: Some("coding".into()),
+            cwd: Some("/shell/cwd".into()),
+            sandbox: None,
+            after: None,
+        }));
+        let reopen = backend
+            .reopen_session_open_command()
+            .expect("a reopen target is recorded after opening a session");
+        let AppUiCommand::OpenSession(reopen) = reopen else {
+            panic!("reopen command must be an OpenSession");
+        };
+        assert_eq!(
+            reopen.cwd.as_deref(),
+            Some("/real/workspace"),
+            "recorded reopen target cwd must be overridden by the confirmed workspace_root"
+        );
+
+        // A session with no captured root still falls back to `launch.cwd`.
+        let unknown = SessionKey("local:unknown".into());
+        let backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            session_id: Some(unknown.clone()),
+            cwd: Some("/shell/cwd".into()),
+            ..AppUiLaunch::default()
+        });
+        let reopen = backend
+            .launch_session_open_command()
+            .expect("launch session should reopen");
+        let AppUiCommand::OpenSession(reopen) = reopen else {
+            panic!("reopen command must be an OpenSession");
+        };
+        assert_eq!(reopen.cwd.as_deref(), Some("/shell/cwd"));
     }
 
     #[test]
