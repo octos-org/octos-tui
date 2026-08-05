@@ -416,7 +416,13 @@ impl Store {
 
     pub fn compose_command(&mut self) -> Option<AppUiCommand> {
         let prompt = self.state.composer.trim().to_string();
-        if prompt.starts_with('/') {
+        // `looks_like_slash_command`, not `starts_with('/')`: a prompt that
+        // merely BEGINS with a path (`/Users/me/Downloads/notes.md is broken,
+        // fix it`) parsed as the command `Users/me/Downloads/notes.md`,
+        // resolved to Unknown, and was Rejected — and Rejected yields no
+        // command, so the prompt was silently DISCARDED. Falling through here
+        // sends it as ordinary prose, which is what the user meant.
+        if crate::menu::registry::looks_like_slash_command(&prompt) {
             // Record a history-safe, no-arg slash command ONLY after the
             // dispatcher ACCEPTS (ran) it. Acceptance is the Outcome — a known
             // history-safe verb can still be rejected at dispatch time
@@ -9598,12 +9604,27 @@ impl Store {
                 lane_save_completed = true;
             }
         }
+        // A persisted lane is NOT live until the server restarts, and the
+        // wizard path is the only one that said so (`status.research_lane_saved`
+        // carries "restart to apply"). An inline `/research add` fell through to
+        // the bare server message, so the lane looked active while
+        // deep_research kept resolving `cheap`/`strong` to the coding provider.
+        // Say it on every applied mutation the wizard did not already announce.
+        let message = if event.result.restart_required && !lane_save_completed {
+            t!(
+                "status.sub_provider_restart_required",
+                message = event.message
+            )
+            .into_owned()
+        } else {
+            event.message.clone()
+        };
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
             "research",
-            event.message.clone(),
+            message.clone(),
         ));
-        self.state.status = event.message;
+        self.state.status = message;
         if lane_save_completed {
             self.refresh_active_menu_if_open();
             self.focus_provider_start_row();
@@ -36640,6 +36661,72 @@ now analyzing the bus module"
         );
     }
 
+    /// A lane saved OUTSIDE the wizard must still say a restart is required.
+    ///
+    /// The server persists the lane but does NOT rebuild the live runtime — the
+    /// isolated research router is built once at `ProfileRuntime` bootstrap — so
+    /// it sends `restart_required` specifically "so the client never presents a
+    /// persisted change as already-live". The client did not deserialise that
+    /// field, and the only restart notice lived on the WIZARD path
+    /// (`status.research_lane_saved`). An inline `/research add` therefore
+    /// reported a bare success while deep_research kept resolving `cheap` /
+    /// `strong` to the coding provider — the lane looked configured and did
+    /// nothing.
+    #[test]
+    fn inline_lane_save_announces_that_a_restart_is_required() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(lane_capabilities());
+        // No wizard save in flight: this is the inline `/research add` path.
+        assert!(store.state.onboarding.provider_pending.is_none());
+
+        store.apply_sub_providers_mutation_event(SubProvidersMutationClientEvent {
+            result: crate::model::SubProvidersMutationResult {
+                profile_id: Some("coding".into()),
+                sub_providers: vec![crate::model::SubProviderView {
+                    key: "strong".into(),
+                    provider: Some("moonshot".into()),
+                    model: Some("kimi-k3".into()),
+                    ..Default::default()
+                }],
+                applied: true,
+                restart_required: true,
+                runtime_policy_stamp: None,
+            },
+            message: "research lane saved".into(),
+        });
+
+        assert!(
+            store.state.status.contains("restart"),
+            "an applied lane save must tell the user a restart is needed, else the \
+             lane looks live while deep_research still uses the coding provider; \
+             got {:?}",
+            store.state.status
+        );
+    }
+
+    /// A mutation that did NOT apply must not claim a restart is needed.
+    #[test]
+    fn an_unapplied_mutation_does_not_ask_for_a_restart() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(lane_capabilities());
+
+        store.apply_sub_providers_mutation_event(SubProvidersMutationClientEvent {
+            result: crate::model::SubProvidersMutationResult {
+                profile_id: Some("coding".into()),
+                sub_providers: Vec::new(),
+                applied: false,
+                restart_required: false,
+                runtime_policy_stamp: None,
+            },
+            message: "nothing changed".into(),
+        });
+
+        assert_eq!(
+            store.state.status, "nothing changed",
+            "an unapplied mutation must pass the server message through untouched"
+        );
+    }
+
     /// PR384 fix F2 (corrected): an applied lane mutation completes the
     /// wizard's OWN lane save — consumes the pending flag, records the save,
     /// resets the staged selection (like a fallback save), clears the intent,
@@ -36666,6 +36753,7 @@ now analyzing the bus module"
                     ..Default::default()
                 }],
                 applied: true,
+                restart_required: true,
                 runtime_policy_stamp: None,
             },
             message: "research lane saved".into(),
@@ -36718,6 +36806,7 @@ now analyzing the bus module"
                 profile_id: Some("coding".into()),
                 sub_providers: Vec::new(),
                 applied: true,
+                restart_required: true,
                 runtime_policy_stamp: None,
             },
             message: "lane removed".into(),
@@ -36908,6 +36997,7 @@ now analyzing the bus module"
                     })
                     .collect(),
                 applied: true,
+                restart_required: true,
                 runtime_policy_stamp: None,
             },
             message: "lanes updated".into(),
