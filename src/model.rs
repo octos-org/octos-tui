@@ -3789,6 +3789,16 @@ pub struct SubProvidersMutationResult {
     pub sub_providers: Vec<SubProviderView>,
     #[serde(default)]
     pub applied: bool,
+    /// The server PERSISTED the lane but the live runtime was NOT rebuilt: the
+    /// isolated research router is built once at `ProfileRuntime` bootstrap, so
+    /// the change only takes effect on the next restart.
+    ///
+    /// The server has always sent this ("so the client never presents a
+    /// persisted change as already-live"); the client simply did not
+    /// deserialise it, so an inline `/research add` reported a bare success and
+    /// deep_research kept running on the coding provider.
+    #[serde(default)]
+    pub restart_required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
 }
