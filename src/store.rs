@@ -36155,7 +36155,13 @@ now analyzing the bus module"
         const ANSWER: &str = "Here is the critical review of the design.";
 
         let mut store = Store {
-            state: AppState::new(vec![open_session_on("test")], 0, "ready".into(), None, false),
+            state: AppState::new(
+                vec![open_session_on("test")],
+                0,
+                "ready".into(),
+                None,
+                false,
+            ),
         };
         let mut seq = 0u64;
         let mut send = |store: &mut Store, payload: PayloadV2| {
