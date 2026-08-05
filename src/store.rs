@@ -36129,6 +36129,121 @@ now analyzing the bus module"
         );
     }
 
+    /// Real-wire reproduction of the duplicate-render report (octos#1916).
+    ///
+    /// The ids here are NOT invented — they are the ones a live
+    /// `dev:local:tui#coding` turn actually received. The server derives a
+    /// delta's segment index from how many persisted rows PRECEDE it, and
+    /// persisted rows only arrive at the end of a turn, so every delta of the
+    /// turn projects to `:assistant:1` — while the persisted rows increment.
+    /// A tool-using turn therefore streams its WHOLE answer under segment 1
+    /// and then persists it as segments 1 and 2:
+    ///
+    ///   1764 deltas       -> <turn>:assistant:1   (preamble + answer)
+    ///   assistant_persisted -> <turn>:assistant:1   52 chars (preamble)
+    ///   assistant_persisted -> <turn>:assistant:2 3683 chars (the answer)
+    ///
+    /// Segment 2 matches nothing the client has seen. This pins that the
+    /// answer still renders exactly once.
+    #[test]
+    fn mismatched_server_segment_ids_do_not_duplicate_the_answer() {
+        let session_id = SessionKey("local:test".into());
+        let wire = "019fd09a-9b0a-7f80-bb04-997cdee903fe";
+        let seg1 = format!("{wire}:assistant:1");
+        let seg2 = format!("{wire}:assistant:2");
+        const PREAMBLE: &str = "Reviewing the design docs first:";
+        const ANSWER: &str = "Here is the critical review of the design.";
+
+        let mut store = Store {
+            state: AppState::new(vec![open_session_on("test")], 0, "ready".into(), None, false),
+        };
+        let mut seq = 0u64;
+        let mut send = |store: &mut Store, payload: PayloadV2| {
+            seq += 1;
+            store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+                session_id.clone(),
+                seq,
+                wire,
+                payload,
+            )));
+        };
+
+        send(
+            &mut store,
+            PayloadV2::UserMessage {
+                text: "review the design".into(),
+                files: vec![],
+            },
+        );
+        // The whole turn streams under segment 1 — preamble, tool call, answer.
+        for chunk in [PREAMBLE, "\n\n"] {
+            send(
+                &mut store,
+                PayloadV2::AssistantDelta {
+                    text: chunk.into(),
+                    assistant_segment_id: seg1.clone(),
+                },
+            );
+        }
+        send(
+            &mut store,
+            PayloadV2::ToolStart {
+                tool_call_id: "tool-1".into(),
+                name: "read_file".into(),
+                arguments_preview: None,
+            },
+        );
+        send(
+            &mut store,
+            PayloadV2::AssistantDelta {
+                text: ANSWER.into(),
+                assistant_segment_id: seg1.clone(),
+            },
+        );
+        // Canonical rows land at the END, and their indices disagree with the
+        // single segment the deltas opened.
+        for (segment, text) in [(&seg1, PREAMBLE), (&seg2, ANSWER)] {
+            send(
+                &mut store,
+                PayloadV2::AssistantPersisted {
+                    text: text.into(),
+                    assistant_segment_id: segment.clone(),
+                    meta: octos_core::ui_protocol::MessageMeta {
+                        message_id: format!("msg-{segment}"),
+                        persisted_at: chrono::Utc::now(),
+                        media: vec![],
+                    },
+                },
+            );
+        }
+
+        let session = store
+            .state
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .expect("session");
+        let mut seen = session
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>();
+        if let Some(live_reply) = session.live_reply.as_ref() {
+            seen.push(live_reply.text.clone());
+        }
+        let visible = seen.join("\n");
+        assert_eq!(
+            visible.matches(ANSWER).count(),
+            1,
+            "the answer must render exactly once, got: {visible:?}"
+        );
+        assert_eq!(
+            visible.matches(PREAMBLE).count(),
+            1,
+            "the preamble must render exactly once, got: {visible:?}"
+        );
+    }
+
     /// stdio wedge regression (#379 review F1): the persisted v2 rows register
     /// the turn in the v2 maps, but on stdio the legacy `turn/completed` is the
     /// ONLY terminal the client receives — it must still commit the reply (the
