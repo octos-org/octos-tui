@@ -9200,6 +9200,29 @@ impl AppState {
         let large = paste_should_collapse(text);
         let cursor = self.composer_cursor_index();
         self.insert_composer_text(text);
+
+        // Small "paste" that is really typed input: some terminals (bracketed
+        // paste over SSH/tmux, or fast IME bursts) deliver quick keystrokes as a
+        // Paste event. When that lands while a real paste is collapsed, treating
+        // the tiny fragment as another paste keeps `composer_pasted` set and the
+        // chip stays collapsed — the typed text is swallowed into the `[paste]`
+        // block (its char count ticks up) but never echoes. A fragment below the
+        // paste threshold is not a paste worth boxing: union it but CLEAR the
+        // paste flag so the composer re-opens inline and the text echoes.
+        if !large && self.composer_pasted {
+            if let Some(mut existing) = self.composer_paste_span.take() {
+                if cursor <= existing.start {
+                    existing.start += text.len();
+                    existing.end += text.len();
+                } else if cursor < existing.end {
+                    existing.end += text.len();
+                }
+                self.composer_paste_span = Some(existing);
+            }
+            self.composer_pasted = false;
+            return;
+        }
+
         if large {
             // Record the pasted byte range; a second paste while collapsed
             // unions with the existing span (the chip presents them as one
@@ -10849,6 +10872,55 @@ mod tests {
             complete_plan_steps_in_text("1. [ ] Fix model\n2. Run tests"),
             "- [x] Fix model\n- [x] Run tests"
         );
+    }
+
+    #[test]
+    fn typed_fragment_delivered_as_paste_reopens_collapsed_block() {
+        // Regression: some terminals (bracketed paste over SSH/tmux, fast IME
+        // bursts) deliver quick typed keystrokes as a Paste event. When that
+        // lands while a real paste is collapsed, the tiny fragment must clear
+        // the paste flag so the composer re-opens inline and the text echoes —
+        // otherwise the chip stays collapsed, its char count ticks up, and the
+        // typed text never shows.
+        let mut state = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "t".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let block = (1..=10)
+            .map(|i| format!("pasted code line {i} with content"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.insert_pasted_text(&block);
+        assert!(state.composer_pasted);
+        assert!(matches!(
+            state.composer_presentation(),
+            ComposerPresentation::Collapsed(_)
+        ));
+
+        // A short fragment arrives as a Paste event (misdelivered typed input).
+        state.insert_pasted_text("x");
+        assert!(
+            !state.composer_pasted,
+            "a tiny paste-fragment while collapsed clears the paste flag"
+        );
+        assert!(
+            matches!(
+                state.composer_presentation(),
+                ComposerPresentation::Inline(_)
+            ),
+            "composer re-opens inline so the typed text echoes"
+        );
+        assert!(state.composer.contains('x'), "the typed char is in the text");
     }
 
     #[test]
