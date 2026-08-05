@@ -452,10 +452,12 @@ mod tests {
         // (codex P2 on the fixed-4s sweep). Same for the origin rest at the
         // cycle tail.
         let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
-        assert!(
-            OCTOPUS_EDGE_DWELL_MS >= 200,
-            "edge rest must cover at least one ~120ms repaint interval"
-        );
+        const {
+            assert!(
+                OCTOPUS_EDGE_DWELL_MS >= 200,
+                "edge rest must cover at least one ~120ms repaint interval"
+            );
+        }
         let leg = OCTOPUS_SWEEP_ONE_WAY_MS + OCTOPUS_EDGE_DWELL_MS;
         for wrap_width in [octopus_width + 2, 20usize, 40, 80, 146, 200, 1000] {
             let max = wrap_width.saturating_sub(octopus_width + 1);

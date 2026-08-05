@@ -126,7 +126,14 @@ jobs:
           echo "----- rendered ${FORMULA_FILE} (${CHANNEL}) -----"
           cat "$FORMULA_FILE"
 
-          if git diff --quiet -- "$FORMULA_FILE"; then
+          # `git diff` reports TRACKED files only, so a formula that has never
+          # been committed reads as "unchanged" and this step silently no-ops
+          # while still reporting success. That is exactly the prerelease
+          # channel: Formula/octos-tui-dev.rb has never existed, so every RC
+          # tag since the two-channel scheme landed rendered it and threw it
+          # away. Stage first and diff the INDEX, which sees an add as a change.
+          git add -- "$FORMULA_FILE"
+          if git diff --cached --quiet -- "$FORMULA_FILE"; then
             echo "${FORMULA_FILE} unchanged; nothing to commit."
             exit 0
           fi
